@@ -1,0 +1,78 @@
+name: Isolated permission race proof
+
+on:
+  push:
+    branches: ["validate/kernel-permission-fb8a70f"]
+
+permissions:
+  contents: read
+
+jobs:
+  proof:
+    name: Execute PR60 callback and reject negative controls
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fb8a70ff6e8e6392dc59133b630d8baf81ba2101
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify tested source and execute existing regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = fb8a70ff6e8e6392dc59133b630d8baf81ba2101
+          git rev-parse HEAD:kernel/vfs/namespace.rs HEAD:kernel/ci/test-permission-race.py
+          rustc --version
+          python3 kernel/ci/test-permission-race.py -v
+      - name: Prove the regression rejects original code and permission bypasses
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import importlib.util
+          import json
+          from pathlib import Path
+          import subprocess
+
+          path = Path('kernel/ci/test-permission-race.py')
+          spec = importlib.util.spec_from_file_location('permission_proof', path)
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          tests = module.PermissionRemovalRaceTests
+          tests.setUpClass()
+          try:
+              case = tests()
+              original_file = subprocess.check_output([
+                  'git', 'show',
+                  'e0af12b178351ba19af9c356bcf85dd8df15c2ec:kernel/vfs/namespace.rs',
+              ], text=True)
+              original = module.START + original_file.split(module.START, 1)[1].split(module.END, 1)[0]
+              guard = 'Err(error) if error == ENOENT && inode.link_count() == 0 => break,'
+              assert tests.callback.count(guard) == 1
+              variants = [
+                  ('original', original, {'remove': 1, 'rpc_error': -2}, (0, 1, 1)),
+                  ('linked_enoent_bypass', tests.callback.replace(guard,
+                      'Err(error) if error == ENOENT => break,'),
+                   {'rpc_error': -2}, (-2, 1, 0)),
+                  ('permission_bypass', tests.callback.replace(guard,
+                      'Err(error) if error == ENOENT && inode.link_count() == 0 => return Ok(0),'),
+                   {'remove': 1, 'rpc_error': -2, 'permission_error': -13}, (-13, 1, 1)),
+              ]
+              receipts = []
+              for name, source, inputs, expected in variants:
+                  fixed = case.run_case(**inputs)
+                  assert fixed == expected, (name, 'fixed', fixed, expected)
+                  executable = tests.compile(source, name)
+                  actual = case.run_case(executable=executable, **inputs)
+                  assert actual != expected, (name, 'negative control escaped detection', actual)
+                  receipts.append({'control': name, 'fixed': fixed, 'mutant': actual,
+                                   'expected': expected, 'rejected': True})
+              print(json.dumps({'tested_head': 'fb8a70ff6e8e6392dc59133b630d8baf81ba2101',
+                                'scope': 'actual callback with mocked kernel/RPC boundary',
+                                'negative_controls': receipts}, indent=2))
+          finally:
+              tests.doClassCleanups()
+          PY
