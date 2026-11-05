@@ -81,10 +81,16 @@ jobs:
           sudo chmod +x /usr/local/bin/lein
           lein version
 
+      # Verify lifecycle and takeover contracts before mounted HA scenarios.
       - name: Test HA harness contracts
         run: |
           cd "$GITHUB_WORKSPACE/jepsen/ha"
-          lein test zerofs-ha.core-test
+          lein=(lein)
+          if [[ "${{ matrix.mount-client }}" == fuse ]]; then
+            lein=(sudo env HOME=/root LEIN_ROOT=1 JAVA_HOME="$JAVA_HOME"
+              /usr/local/bin/lein)
+          fi
+          "${lein[@]}" test zerofs-ha.core-test
 
       - name: Build pinned MinIO fixture
         uses: ./.github/actions/build-minio-fixture

@@ -820,13 +820,19 @@
                                    (Thread/sleep 500)
                                    (heal-restart! c)
                                    :resumed-minio)
-                 :await-serving (do (await-fn
-                                     (fn [] (or (node-9p-up? c :a)
-                                                (node-9p-up? c :b)
-                                                (throw+ {:type ::no-serving-node})))
-                                     {:retry-interval 500 :log-interval 5000 :timeout 40000
-                                      :log-message "failover: waiting for an authoritative listener"})
-                                    :serving)
+                 :await-serving (let [target (if (= :standby (:target op))
+                                               (standby-node)
+                                               (leader-node))]
+                                  ;; Only the promoted listener proves takeover:
+                                  ;; SIGKILL can leave an old socket accepting briefly,
+                                  ;; and a partitioned Solo leader remains live.
+                                  (await-fn
+                                   (fn [] (or (and target (node-9p-up? c target))
+                                              (throw+ {:type ::no-serving-node
+                                                       :target target})))
+                                   {:retry-interval 500 :log-interval 5000 :timeout 40000
+                                    :log-message "failover: waiting for promoted listener"})
+                                  :serving)
                  ;; Hold the leader through failure detection and claim grace.
                  :pause-leader  (let [n (leader-node) s (standby-node)]
                                   (pause-pid! (node-pid c n))
@@ -1405,7 +1411,7 @@
    ;; Un-fsync'd writes onto the still-serving Solo leader: acked, but never shipped.
    (gen/clients (gen/time-limit 3 (repeat {:f :write :file "h"})))
    ;; The standby promotes + fences the old leader; the client re-routes to it.
-   (gen/nemesis (gen/once {:type :info :f :await-serving}))
+   (gen/nemesis (gen/once {:type :info :f :await-serving :target :standby}))
    ;; fsync of the file on the new leader: must FAIL (the Solo writes are gone).
    (gen/clients (gen/once {:f :fsync :file "h"}))
    (gen/sleep 1)
