@@ -1051,7 +1051,8 @@ impl PrefetchingObjectStore {
             self.sequential_fetch_window_min_bytes,
             self.fetch_window_max_bytes,
         )));
-        self.access_tracker.insert(location.clone(), history.clone());
+        self.access_tracker
+            .insert(location.clone(), history.clone());
         history
     }
 
