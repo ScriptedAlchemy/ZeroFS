@@ -240,8 +240,7 @@ async fn ordinary_open_requires_initialization_and_never_recreates_a_lost_catalo
     let fixture = Fixture::new(8, 16);
     let missing = open_storage(&fixture.settings)
         .await
-        .err()
-        .expect("a new pool must be initialized explicitly");
+        .expect_err("a new pool must be initialized explicitly");
     assert!(format!("{missing:#}").contains("catalog is missing"));
     assert!(!fixture.catalog().exists());
 
@@ -257,8 +256,7 @@ async fn ordinary_open_requires_initialization_and_never_recreates_a_lost_catalo
     assert!(open_storage(&fixture.settings).await.is_err());
     let reinitialize = open_pool_storage(&fixture.settings, true)
         .await
-        .err()
-        .expect("an existing authority must not accept a replacement catalog");
+        .expect_err("an existing authority must not accept a replacement catalog");
     assert!(format!("{reinitialize:#}").contains("catalog is missing"));
     assert!(!fixture.catalog().exists());
     assert_eq!(copies_on_disk(&fixture.members[0], b"retained").await, 1);
@@ -314,8 +312,7 @@ async fn adding_a_configured_disk_preserves_existing_data_and_uses_new_capacity(
 async fn assert_overlap_rejected(settings: &Settings, name: &str) {
     let error = open_pool_storage(settings, true)
         .await
-        .err()
-        .expect("overlapping permanent and evictable roots must be rejected");
+        .expect_err("overlapping permanent and evictable roots must be rejected");
     let message = format!("{error:#}");
     assert!(message.contains("must not overlap"), "{message}");
     assert!(message.contains(name), "{message}");
