@@ -54,6 +54,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Check kernel permission removal race
+        run: python3 ../kernel/ci/test-permission-race.py
       - name: Build
         run: cargo build --verbose
       - name: Run tests

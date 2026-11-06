@@ -230,12 +230,16 @@ install_apt_snapshot_ca() {
     # authenticates the signed repository metadata during this bootstrap.
     apt-get \
         -o Acquire::Check-Valid-Until=false \
+        -o APT::Update::Error-Mode=any \
         -o Acquire::https::Verify-Peer=false \
         update
     DEBIAN_FRONTEND=noninteractive apt-get \
         -o Acquire::https::Verify-Peer=false \
         install -y --no-install-recommends ca-certificates
-    apt-get -o Acquire::Check-Valid-Until=false update
+    apt-get \
+        -o Acquire::Check-Valid-Until=false \
+        -o APT::Update::Error-Mode=any \
+        update
 }
 
 configure_ubuntu() {

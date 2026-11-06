@@ -248,8 +248,7 @@
 
 (defn standby-ready-count [c node-key]
   (try
-    (let [marker (str "HA standby " (name node-key)
-                      ": watching leader heartbeats")]
+    (let [marker "HA standby: accepted leader heartbeat; takeover watch armed"]
       (->> (slurp (get-in c [:nodes node-key :log]))
            (re-seq (re-pattern (java.util.regex.Pattern/quote marker)))
            count))
@@ -697,17 +696,21 @@
                    (try (.sync (.getFD raf)) (assoc op :type :ok :file file)
                         (catch java.io.IOException e
                           (assoc op :type :fail :file file :error (str (.getMessage e))))))
-          ;; Final state per distinct file: {file -> {:values #{values} :size bytes}}.
+          ;; Observe the recovered namespace, not Jepsen's open-fid registry:
+          ;; worker close! may empty shared handles without removing a file.
           :read (assoc op :type :ok
-                       :value (into {}
-                                    (for [f (distinct (keep :file (vals @handles)))]
-                                      [f {:size (.length (dc-file dir f))
-                                          :values (with-open [r (io/reader (dc-file dir f))]
+                       :value (let [files (or (.listFiles (io/file dir))
+                                              (throw (java.io.IOException.
+                                                      (str "Cannot list durability files: " dir))))]
+                                (into {}
+                                      (for [^java.io.File f files :when (.isFile f)]
+                                        [(.getName f)
+                                         {:size (.length f)
+                                          :values (with-open [r (io/reader f)]
                                                     (into (sorted-set)
                                                           (keep #(try (Long/parseLong %)
                                                                       (catch Exception _ nil))
-                                                                (line-seq r))))}])))
-
+                                                                (line-seq r))))}]))))
           ;; Open a directory, fsync it (a force on a dir channel flushes the db, so the
           ;; directory exists durably and only its later un-fsync'd entries are at risk),
           ;; and keep the channel keyed by the directory name.
@@ -752,7 +755,11 @@
                                                              (or (.listFiles (dc-file dir dirname))
                                                                  (into-array java.io.File []))))])))))))
   (teardown! [_ _test] (close-durability-handles! handles))
-  (close! [_ _test] (close-durability-handles! handles)))
+  ;; Jepsen closes a worker before replacing a crashed logical process. These
+  ;; handles belong to the whole test, not that worker: closing them here erases
+  ;; the final read's file inventory and invalidates other workers' open fds.
+  ;; Global teardown still atomically closes every resource exactly once.
+  (close! [_ _test]))
 
 ;; Nemesis: process loss, object-store pauses, replication partitions, blocked
 ;; survivor restart, forced recovery, and cluster repair.
@@ -817,13 +824,19 @@
                                    (Thread/sleep 500)
                                    (heal-restart! c)
                                    :resumed-minio)
-                 :await-serving (do (await-fn
-                                     (fn [] (or (node-9p-up? c :a)
-                                                (node-9p-up? c :b)
-                                                (throw+ {:type ::no-serving-node})))
-                                     {:retry-interval 500 :log-interval 5000 :timeout 40000
-                                      :log-message "failover: waiting for an authoritative listener"})
-                                    :serving)
+                 :await-serving (let [target (if (= :standby (:target op))
+                                               (standby-node)
+                                               (leader-node))]
+                                  ;; Only the promoted listener proves takeover:
+                                  ;; SIGKILL can leave an old socket accepting briefly,
+                                  ;; and a partitioned Solo leader remains live.
+                                  (await-fn
+                                   (fn [] (or (and target (node-9p-up? c target))
+                                              (throw+ {:type ::no-serving-node
+                                                       :target target})))
+                                   {:retry-interval 500 :log-interval 5000 :timeout 40000
+                                    :log-message "failover: waiting for promoted listener"})
+                                  :serving)
                  ;; Hold the leader through failure detection and claim grace.
                  :pause-leader  (let [n (leader-node) s (standby-node)]
                                   (pause-pid! (node-pid c n))
@@ -1402,7 +1415,7 @@
    ;; Un-fsync'd writes onto the still-serving Solo leader: acked, but never shipped.
    (gen/clients (gen/time-limit 3 (repeat {:f :write :file "h"})))
    ;; The standby promotes + fences the old leader; the client re-routes to it.
-   (gen/nemesis (gen/once {:type :info :f :await-serving}))
+   (gen/nemesis (gen/once {:type :info :f :await-serving :target :standby}))
    ;; fsync of the file on the new leader: must FAIL (the Solo writes are gone).
    (gen/clients (gen/once {:f :fsync :file "h"}))
    (gen/sleep 1)
@@ -1607,3 +1620,4 @@
   (cli/run! (merge (cli/single-test-cmd {:test-fn ha-test :opt-spec cli-opts})
                    (cli/serve-cmd))
             args))
+

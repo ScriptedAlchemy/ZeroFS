@@ -200,6 +200,12 @@ class FakeRunner(Runner):
             if self.max_write_zeroes_sectors is None:
                 return CompletedProcess(args, 1, "", "No such file")
             return CompletedProcess(args, 0, self.max_write_zeroes_sectors + "\n", "")
+        # Collector tests use PID 123 as a fixture. It may belong to an
+        # unrelated live process on CI; never read that process's procfs.
+        if args == ("cat", "/proc/123/io"):
+            return CompletedProcess(args, 0, "read_bytes: 0\nwrite_bytes: 0\n", "")
+        if args == ("cat", "/proc/123/status"):
+            return CompletedProcess(args, 0, "Name:\tzerofs\nState:\tS (sleeping)\n", "")
         if args[:1] == ("cat",) and Path(args[1]).is_file():
             return CompletedProcess(args, 0, Path(args[1]).read_text(), "")
         if args[:1] == ("sha256sum",) and Path(args[1]).is_file():
@@ -3532,6 +3538,21 @@ class ProfileTests(unittest.TestCase):
 
         self.assertFalse(control.control_fifo.exists())
         self.assertFalse(control.ack_fifo.exists())
+
+    def test_fake_collector_procfs_is_independent_of_host_pid(self) -> None:
+        runner = FakeRunner()
+        with (
+            mock.patch.object(Path, "is_file", side_effect=AssertionError("host procfs probed")),
+            mock.patch.object(Path, "read_text", side_effect=AssertionError("host procfs read")),
+        ):
+            self.assertEqual(
+                runner.run(["cat", "/proc/123/io"], sudo=True, check=False).stdout,
+                "read_bytes: 0\nwrite_bytes: 0\n",
+            )
+            self.assertEqual(
+                runner.run(["cat", "/proc/123/status"], sudo=True, check=False).stdout,
+                "Name:\tzerofs\nState:\tS (sleeping)\n",
+            )
 
     def test_collectors_wait_for_perf_ack_before_starting_other_samplers(
         self,
