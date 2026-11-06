@@ -17,9 +17,9 @@ use crate::db::SlateDbHandle;
 use crate::fs::{CacheConfig, ZeroFS};
 use crate::key_management;
 use crate::object_trace::{ObjectTracer, TracingObjectStore};
-use crate::parse_object_store::parse_url_opts;
 use crate::replication::transport::{PromotionSnapshot, ReceiverControl};
 use crate::replication::{LineageProof, PromotionRetryGraceProof, ReplicationParams};
+use crate::storage_backend::{BackendSessions, OpenedStorage, open_storage};
 use crate::storage_class_object_store::with_storage_class;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -34,7 +34,7 @@ use tracing::info;
 struct StartupContext {
     object_store: Arc<dyn object_store::ObjectStore>,
     writeback: Option<crate::writeback::store::WritebackObjectStore>,
-    sftp_pool: Option<crate::sftp_transport::SftpSessionPool>,
+    sftp_pool: Option<BackendSessions>,
     wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
     /// Shared by the data and WAL `TracingObjectStore` wrappers and handed to
     /// the filesystem so the RPC server can stream backend requests (`otrace`).
@@ -147,31 +147,23 @@ enum ReconcileOutcome {
 
 impl StartupContext {
     async fn prepare(settings: &Settings, db_mode: DatabaseMode) -> Result<Self> {
-        let url = settings.storage.url.clone();
-
         let cache_config = CacheConfig {
             root_folder: settings.cache.dir.clone(),
             max_cache_size_gb: settings.cache.disk_size_gb,
             memory_cache_size_gb: settings.cache.memory_size_gb,
         };
 
-        let env_vars = settings.cloud_provider_env_vars();
-
         // The one place the backend decides its data-plane tuning; every
         // consumer downstream reads the resolved profile, not the URL.
         let store_profile = settings.store_profile()?;
 
-        let crate::parse_object_store::ParsedStore {
+        let OpenedStorage {
             store: object_store,
             path: path_from_url,
             sftp_pool,
-        } = parse_url_opts(
-            &url.parse().context("Failed to parse storage URL")?,
-            env_vars,
-            settings.sftp.as_ref(),
-        )
-        .await
-        .context("Failed to connect to storage backend")?;
+        } = open_storage(settings)
+            .await
+            .context("Failed to connect to storage backend")?;
         let cleanup_pool = sftp_pool.clone();
         let prepared: Result<Self> = async {
             let object_store = with_storage_class(
@@ -1401,6 +1393,56 @@ mod role_decision_tests {
             store.get(&marker).await,
             Err(object_store::Error::NotFound { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn writable_startup_accepts_native_local_and_initialized_pool_backends() {
+        for pooled in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let metadata = temp.path().join("metadata");
+            let data = temp.path().join("data");
+            std::fs::create_dir_all(&metadata).unwrap();
+            std::fs::create_dir_all(&data).unwrap();
+            let mut settings = crate::config::Settings::generate_default();
+            settings.cache.dir = temp.path().join("cache");
+            settings.cache.disk_size_gb = 0.01;
+            settings.cache.memory_size_gb = Some(0.01);
+            settings.storage.url = url::Url::from_directory_path(&metadata)
+                .unwrap()
+                .to_string();
+            settings.storage.encryption_password = "local-startup-test".to_owned();
+            settings.aws = None;
+            if pooled {
+                settings.storage.pool = Some(crate::config::StoragePoolConfig {
+                    catalog_dir: temp.path().join("catalog"),
+                    members: vec![crate::config::StoragePoolMemberConfig {
+                        id: "local".to_owned(),
+                        url: url::Url::from_directory_path(&data).unwrap().to_string(),
+                        capacity_gb: 1.0,
+                        reserve_free_gb: 0.0,
+                        aws: None,
+                        azure: None,
+                        gcp: None,
+                        sftp: None,
+                        storage_class: None,
+                    }],
+                });
+                let initialized = crate::storage_backend::open_pool_storage(&settings, true)
+                    .await
+                    .unwrap();
+                drop(initialized);
+            }
+            settings.validate().unwrap();
+            let startup = StartupContext::prepare(&settings, DatabaseMode::ReadWrite)
+                .await
+                .unwrap();
+            assert_eq!(
+                startup.object_store.to_string().contains("PoolObjectStore"),
+                pooled
+            );
+            assert!(startup.sftp_pool.is_none());
+            drop(startup);
+        }
     }
 
     #[tokio::test]

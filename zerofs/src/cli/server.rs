@@ -11,6 +11,7 @@ use crate::nbd::{NBDServer, NbdExportGates};
 use crate::ninep::server::P9AcceptedWorkTracker;
 use crate::object_store_prefetch::PrefetchingObjectStore;
 use crate::parse_object_store::{ParsedStore, parse_url_opts};
+use crate::storage_backend::{BackendSessions, OpenedStorage, open_storage};
 use crate::storage_class_object_store::with_storage_class;
 use crate::task::spawn_named;
 use anyhow::{Context, Result};
@@ -104,17 +105,11 @@ fn validate_nbd_database_mode(config: Option<&NbdConfig>, db_mode: DatabaseMode)
 }
 
 async fn resolve_checkpoint_name(settings: &Settings, name: &str) -> Result<uuid::Uuid> {
-    let env_vars = settings.cloud_provider_env_vars();
-    let ParsedStore {
+    let OpenedStorage {
         store: object_store,
         path: path_from_url,
         sftp_pool,
-    } = parse_url_opts(
-        &settings.storage.url.parse()?,
-        env_vars,
-        settings.sftp.as_ref(),
-    )
-    .await?;
+    } = open_storage(settings).await?;
     let object_store = with_storage_class(
         Arc::from(object_store),
         settings.storage.storage_class.as_deref(),
@@ -544,9 +539,7 @@ impl ServingStopCause {
     }
 }
 
-async fn wait_for_sftp_failure(
-    pool: Option<&crate::sftp_transport::SftpSessionPool>,
-) -> anyhow::Error {
+async fn wait_for_sftp_failure(pool: Option<&BackendSessions>) -> anyhow::Error {
     match pool {
         Some(pool) => pool.wait_closed().await,
         None => std::future::pending().await,
@@ -1383,7 +1376,7 @@ pub struct InitResult {
     pub fs: Arc<ZeroFS>,
     pub object_store: Arc<dyn object_store::ObjectStore>,
     pub writeback: Option<crate::writeback::store::WritebackObjectStore>,
-    pub sftp_pool: Option<crate::sftp_transport::SftpSessionPool>,
+    pub(crate) sftp_pool: Option<BackendSessions>,
     pub cache_metrics: Arc<CacheMetrics>,
     pub wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
     pub db_path: String,

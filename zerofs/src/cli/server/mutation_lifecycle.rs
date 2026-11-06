@@ -252,7 +252,7 @@ impl LifecycleOwners {
         dispatched: crate::ninep::server::P9AcceptedWorkTracker,
         fs: Arc<crate::fs::ZeroFS>,
         writeback: Option<crate::writeback::store::WritebackObjectStore>,
-        sftp: Option<crate::sftp_transport::SftpSessionPool>,
+        sftp: Option<crate::storage_backend::BackendSessions>,
         read_only: bool,
     ) -> Self {
         let target_fs = Arc::clone(&fs);
@@ -400,7 +400,7 @@ async fn acquire_flush_barrier(fs: &crate::fs::ZeroFS) -> Result<BarrierGuard, S
 
 async fn close_database(
     fs: &crate::fs::ZeroFS,
-    sftp: Option<&crate::sftp_transport::SftpSessionPool>,
+    sftp: Option<&crate::storage_backend::BackendSessions>,
     read_only: bool,
 ) -> Result<(), ShutdownError> {
     let closing = async {
@@ -423,7 +423,7 @@ async fn close_database(
 
 async fn close_database_with_sftp<F>(
     closing: F,
-    pool: &crate::sftp_transport::SftpSessionPool,
+    pool: &crate::storage_backend::BackendSessions,
 ) -> Result<(), ShutdownError>
 where
     F: Future<Output = Result<(), crate::fs::errors::FsError>> + Send,

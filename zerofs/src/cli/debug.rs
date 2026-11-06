@@ -5,7 +5,9 @@ use crate::db::SlateDbHandle;
 use crate::fs::CacheConfig;
 use crate::fs::key_codec::{EXTENT_DOMAIN, KeyCodec, KeyPrefix, META_DOMAIN, ParsedKey};
 use crate::key_management;
+#[cfg(test)]
 use crate::parse_object_store::parse_url_opts;
+use crate::storage_backend::{OpenedStorage, open_storage};
 use crate::storage_class_object_store::with_storage_class;
 use anyhow::{Context, Result};
 use object_store::ObjectStoreExt;
@@ -101,20 +103,17 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
     let settings = Settings::from_file(&config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
 
-    let url = settings.storage.url.clone();
-
     let cache_config = CacheConfig {
         root_folder: settings.cache.dir.clone(),
         max_cache_size_gb: settings.cache.disk_size_gb,
         memory_cache_size_gb: settings.cache.memory_size_gb,
     };
 
-    let env_vars = settings.cloud_provider_env_vars();
-    let crate::parse_object_store::ParsedStore {
+    let OpenedStorage {
         store: object_store,
         path: path_from_url,
         sftp_pool,
-    } = parse_url_opts(&url.parse()?, env_vars, settings.sftp.as_ref()).await?;
+    } = open_storage(&settings).await?;
     let command_result: Result<()> = async move {
         let object_store = with_storage_class(
             Arc::from(object_store),
@@ -258,17 +257,11 @@ pub async fn reseed_writeback_predecessor(
     {
         anyhow::bail!("[writeback] must be enabled in the supplied config");
     }
-    let env_vars = settings.cloud_provider_env_vars();
-    let crate::parse_object_store::ParsedStore {
+    let OpenedStorage {
         store: remote,
         sftp_pool,
         path: database_path,
-    } = parse_url_opts(
-        &settings.storage.url.parse()?,
-        env_vars,
-        settings.sftp.as_ref(),
-    )
-    .await?;
+    } = open_storage(&settings).await?;
     let remote = with_storage_class(Arc::from(remote), settings.storage.storage_class.as_deref());
     let location = Path::parse(&path).context("invalid remote predecessor path")?;
     let result: Result<()> = async {
@@ -342,17 +335,11 @@ pub async fn accept_remote_writeback_branch(
     {
         anyhow::bail!("[writeback] must be enabled in the supplied config");
     }
-    let env_vars = settings.cloud_provider_env_vars();
-    let crate::parse_object_store::ParsedStore {
+    let OpenedStorage {
         store: remote,
         sftp_pool,
         path: database_path,
-    } = parse_url_opts(
-        &settings.storage.url.parse()?,
-        env_vars,
-        settings.sftp.as_ref(),
-    )
-    .await?;
+    } = open_storage(&settings).await?;
     let remote = with_storage_class(Arc::from(remote), settings.storage.storage_class.as_deref());
     let location = Path::parse(&manifest_path).context("invalid divergent manifest path")?;
     let result: Result<()> = async {
