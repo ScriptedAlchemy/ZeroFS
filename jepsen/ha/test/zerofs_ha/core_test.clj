@@ -2,7 +2,9 @@
   (:require [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
             [jepsen.checker :as checker]
+            [jepsen.client :as client]
             [jepsen.util :as util]
+            [jepsen.nemesis :as nemesis]
             [slingshot.slingshot :refer [try+]]
             [zerofs-ha.core :as core])
   (:import [java.net StandardProtocolFamily UnixDomainSocketAddress]
@@ -73,6 +75,94 @@
     (is (= #{:file :dir} (set @closed)))
     (is (= 2 (count @closed)))))
 
+(deftest durability-worker-replacement-preserves-shared-handles
+  (let [closed (atom [])
+        resource (fn [name]
+                   (proxy [java.io.Closeable] []
+                     (close [] (swap! closed conj name))))
+        entries {"file" {:raf (resource :file) :file "file"}
+                 "dir" {:dirchan (resource :dir) :dirname "dir"}}
+        handles (atom entries)
+        original (core/->DurabilityClient "/unused" handles (atom 0))
+        worker (client/open! original {} "n1")]
+    ;; This is the close/open sequence used by Jepsen 0.3.7's ClientWorker
+    ;; when a crashed process is replaced, before the replacement's next op.
+    (client/close! worker {})
+    (let [replacement (client/open! original {} "n1")]
+      (is (= entries @handles))
+      (is (empty? @closed))
+      (client/close! replacement {})
+      (is (= entries @handles))
+      (client/teardown! original {})
+      (client/teardown! replacement {})
+      (is (empty? @handles))
+      (is (= #{:file :dir} (set @closed)))
+      (is (= 2 (count @closed))))))
+
+(deftest durability-final-read-survives-worker-replacement
+  (let [dir (.toFile (Files/createTempDirectory
+                      "zerofs-ha-replacement" (make-array FileAttribute 0)))
+        handles (atom {})
+        original (core/->DurabilityClient (.getPath dir) handles (atom 0))
+        worker (client/open! original {} "n1")]
+    (try
+      (client/invoke! worker {} {:f :open :file "h"})
+      (let [write (client/invoke! worker {} {:f :write :file "h"})
+            fsync (client/invoke! worker {} {:f :fsync :file "h"})]
+        (is (= :ok (:type write)))
+        (is (= :ok (:type fsync)))
+        (client/close! worker {})
+        (let [replacement (client/open! original {} "n1")
+              read (client/invoke! replacement {} {:f :read})
+              history [write {:type :invoke :f :fsync :file "h" :process 0}
+                       (assoc fsync :process 0) read]
+              check (fn [h] (checker/check (core/fsync-honesty-checker) {} h {}))]
+          (is (= #{(:value write)} (get-in read [:value "h" :values])))
+          (is (:valid? (check history)))
+          ;; Keeping the inventory must not weaken the lost-write oracle.
+          (is (false? (:valid? (check (assoc history 3 (assoc read :value {}))))))))
+      (finally
+        (client/teardown! original {})
+        (.delete (io/file dir "h"))
+        (.delete dir)))))
+
+(deftest final-durability-read-does-not-depend-on-live-handles
+  (let [dir      (.toFile (Files/createTempDirectory
+                           "zerofs-ha-final-read" (make-array FileAttribute 0)))
+        data     (io/file dir "h")
+        child    (io/file dir "directory-not-a-data-file")
+        handles  (atom {})
+        dc       (core/->DurabilityClient (.getPath dir) handles (atom 0))
+        history  [{:type :ok :process 0 :f :write :file "h" :value 1533}
+                  {:type :invoke :process 0 :f :fsync :file "h"}
+                  {:type :ok :process 0 :f :fsync :file "h"}]
+        checked? (fn [op] (:valid? (checker/check
+                                    (core/fsync-honesty-checker)
+                                    {} (conj history op) {})))]
+    (try
+      (spit data "1533\n")
+      (is (.mkdir child))
+      (reset! handles {"h" {:raf (java.io.RandomAccessFile. data "rw")
+                            :file "h"}})
+      (core/close-durability-handles! handles)
+      (is (empty? @handles))
+      ;; An acknowledged fsync must remain verifiable even after a Jepsen
+      ;; worker has closed the shared descriptor registry.
+      (let [observed (client/invoke! dc {} {:f :read})]
+        (is (= #{"h"} (set (keys (:value observed)))))
+        (is (= {:size 5 :values (sorted-set 1533)}
+               (get (:value observed) "h")))
+        (is (true? (checked? observed))))
+      ;; Deleting the actual file must still be detected as a lost fsync.
+      (is (.delete data))
+      (let [missing (client/invoke! dc {} {:f :read})]
+        (is (= {} (:value missing)))
+        (is (false? (checked? missing))))
+      (finally
+        (.delete data)
+        (.delete child)
+        (.delete dir)))))
+
 (deftest unmount-dispatches-to-the-selected-client
   (let [commands (atom [])
         base     {:mount "/tmp/zerofs-ha/mnt"}]
@@ -107,18 +197,59 @@
         (.delete socket)
         (.delete dir)))))
 
-(deftest standby-ready-count-is-node-specific
-  (let [log (java.io.File/createTempFile "zerofs-ha-test" ".log")
-        c   {:nodes {:a {:log (.getPath log)}
-                     :b {:log (.getPath log)}}}]
+(deftest standby-ready-count-requires-an-accepted-heartbeat
+  (let [log-a (java.io.File/createTempFile "zerofs-ha-a" ".log")
+        log-b (java.io.File/createTempFile "zerofs-ha-b" ".log")
+        armed "HA standby: accepted leader heartbeat; takeover watch armed"
+        c {:nodes {:a {:log (.getPath log-a)}
+                   :b {:log (.getPath log-b)}}}]
     (try
-      (spit log (str "HA standby a: watching leader heartbeats\n"
-                     "HA standby b: watching leader heartbeats\n"
-                     "HA standby b: watching leader heartbeats\n"))
+      ;; Starting the watcher alone must not make Jepsen kill the leader.
+      (spit log-a (str "HA standby a: watching leader heartbeats\n"
+                       armed "\n"))
+      (spit log-b "HA standby b: watching leader heartbeats\n")
       (is (= 1 (core/standby-ready-count c :a)))
+      (is (zero? (core/standby-ready-count c :b)))
+      ;; Count only events from this node, emitted after covered liveness arms.
+      (spit log-b (str armed "\n" armed "\n") :append true)
       (is (= 2 (core/standby-ready-count c :b)))
+      (is (= 1 (core/standby-ready-count c :a)))
       (finally
-        (.delete log)))))
+        (.delete log-a)
+        (.delete log-b)))))
+
+(deftest await-serving-requires-promoted-node
+  (let [previous @core/cluster-roles
+        probe (fn [roles op live]
+                (reset! core/cluster-roles roles)
+                (let [seen (atom [])
+                      accepted (atom nil)]
+                  (with-redefs [core/node-9p-up?
+                                (fn [_ node]
+                                  (swap! seen conj node)
+                                  (contains? live node))
+                                util/await-fn
+                                (fn [predicate _]
+                                  (reset! accepted
+                                          (try (boolean (predicate))
+                                               (catch Throwable _ false))))]
+                    (nemesis/invoke! (core/ha-nemesis)
+                                     {:work-dir "/tmp/zerofs-ha-test"} op))
+                  [@accepted @seen]))]
+    (try
+      ;; SIGKILL need not close the old socket before the next poll.
+      (is (= [false [:b]]
+             (probe {:a :dead :b :leader} {:f :await-serving} #{:a})))
+      (is (= [true [:b]]
+             (probe {:a :dead :b :leader} {:f :await-serving} #{:b})))
+      ;; The Solo leader still accepts connections during partition.
+      (is (= [false [:b]]
+             (probe {:a :leader :b :standby}
+                    {:f :await-serving :target :standby} #{:a})))
+      (is (= [true [:b]]
+             (probe {:a :leader :b :standby}
+                    {:f :await-serving :target :standby} #{:b})))
+      (finally (reset! core/cluster-roles previous)))))
 
 (deftest make-bucket-waits-for-a-readable-bucket
   (let [commands (atom [])
@@ -291,3 +422,4 @@
     (is (false? (:valid? result)))
     (is (= 3 (:inodes-grew result)))
     (is (= 2 (:census-grew result)))))
+

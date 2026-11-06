@@ -578,6 +578,9 @@ pub struct PrefetchingObjectStore {
     /// parts before deciding whether it needs a data GET or only a HEAD.
     generations: Cache<Path, CacheGeneration>,
     access_tracker: Cache<Path, Arc<Mutex<AccessHistory>>>,
+    // Serialize first-miss publication so concurrent readers cannot replace
+    // one another's history while fetches are already in flight.
+    access_tracker_init: Mutex<()>,
     object_states: ObjectStates,
     fetches: Fetches,
     /// Clean-cache / cgroup-slack RSS ceiling. `0` disables admission.
@@ -895,6 +898,7 @@ impl PrefetchingObjectStore {
             heads,
             generations,
             access_tracker,
+            access_tracker_init: Mutex::new(()),
             object_states: Arc::new(Mutex::new(HashMap::new())),
             fetches: Arc::new(Mutex::new(HashMap::new())),
             admission_cap_bytes: 0,
@@ -1028,22 +1032,32 @@ impl PrefetchingObjectStore {
             .admit_part(location, generation, part_id, bytes);
     }
 
+    fn access_history(&self, location: &Path) -> Arc<Mutex<AccessHistory>> {
+        if let Some(entry) = self.access_tracker.get(location) {
+            return entry.value().clone();
+        }
+
+        // Cache get+insert is not atomic. Without the second check, racing
+        // first readers can overwrite the tracked stream while its fetches
+        // complete, stranding the confirmed prefetch frontier.
+        let _init = self.access_tracker_init.lock().unwrap();
+        if let Some(entry) = self.access_tracker.get(location) {
+            return entry.value().clone();
+        }
+
+        let history = Arc::new(Mutex::new(AccessHistory::with_windows(
+            self.part_size_bytes,
+            self.fetch_window_min_bytes,
+            self.sequential_fetch_window_min_bytes,
+            self.fetch_window_max_bytes,
+        )));
+        self.access_tracker.insert(location.clone(), history.clone());
+        history
+    }
+
     fn record_access(&self, location: &Path, offset: u64, len: u64) -> RecordDecision {
-        let entry = self
-            .access_tracker
-            .get(location)
-            .map(|e| e.value().clone())
-            .unwrap_or_else(|| {
-                let hist = Arc::new(Mutex::new(AccessHistory::with_windows(
-                    self.part_size_bytes,
-                    self.fetch_window_min_bytes,
-                    self.sequential_fetch_window_min_bytes,
-                    self.fetch_window_max_bytes,
-                )));
-                self.access_tracker.insert(location.clone(), hist.clone());
-                hist
-            });
-        let mut history = entry.lock().unwrap();
+        let history = self.access_history(location);
+        let mut history = history.lock().unwrap();
         history.record(offset, len)
     }
 
@@ -2106,6 +2120,37 @@ mod tests {
 
     const MEM: usize = 4 * 1024 * 1024;
     const DISK: usize = 64 * 1024 * 1024;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_first_access_retains_one_history() {
+        let (store, _inner, _dir) = make_store(1024, MEM, DISK).await;
+        let store = Arc::new(store);
+        for epoch in 0..12 {
+            let location = Path::from(format!("shared-history/{epoch}").as_str());
+            let start = Arc::new(tokio::sync::Barrier::new(16));
+            let mut handles = Vec::new();
+            for _ in 0..16 {
+                let store = store.clone();
+                let location = location.clone();
+                let start = start.clone();
+                handles.push(tokio::spawn(async move {
+                    start.wait().await;
+                    store.access_history(&location)
+                }));
+            }
+
+            let first = handles.remove(0).await.unwrap();
+            for handle in handles {
+                let history = handle.await.unwrap();
+                assert!(
+                    Arc::ptr_eq(&first, &history),
+                    "concurrent first misses published different histories"
+                );
+            }
+            let cached = store.access_tracker.get(&location).unwrap().value().clone();
+            assert!(Arc::ptr_eq(&first, &cached));
+        }
+    }
 
     #[tokio::test]
     async fn oversized_requested_ranges_saturate_without_overflow() {

@@ -44,6 +44,7 @@ pub async fn watch_heartbeats_until_takeover_hint(
                 let observed = *liveness.borrow_and_update();
                 require_compatible_heartbeat_protocol(observed)?;
                 if observed != 0 && observed != baseline {
+                    tracing::info!("HA standby: accepted leader heartbeat; takeover watch armed");
                     break;
                 }
             }
