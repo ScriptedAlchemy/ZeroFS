@@ -64,7 +64,7 @@ jobs:
           # fuse3: the test runs the multi-target FUSE mount. gnuplot: jepsen's
           # default perf checker shells out to it; without it the verdict drops
           # to :unknown.
-          sudo apt-get install -y fuse3 gnuplot
+          sudo apt-get install -y fuse3 gnuplot-nox
           curl -fsSL https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein \
             -o /usr/local/bin/lein
           sudo chmod +x /usr/local/bin/lein
@@ -281,7 +281,7 @@ jobs:
         if: matrix.mount-client == 'fuse'
         run: |
           sudo apt-get update
-          sudo apt-get install -y fuse3 gnuplot
+          sudo apt-get install -y fuse3 gnuplot-nox
           curl -fsSL https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein \
             -o /usr/local/bin/lein
           sudo chmod +x /usr/local/bin/lein
