@@ -120,6 +120,7 @@ pub struct AdminRpcServer {
     fs: Arc<ZeroFS>,
     shutdown: CancellationToken,
     protect_nbd_exports: bool,
+    pool: Option<crate::pool_object_store::PoolObjectStore>,
 }
 
 impl AdminRpcServer {
@@ -133,12 +134,21 @@ impl AdminRpcServer {
             fs,
             shutdown,
             protect_nbd_exports: false,
+            pool: None,
         };
         // Drain anything a previous run left in the trash (a crash or
         // shutdown between RemoveDirectory and its sweep finishing);
         // otherwise the leftovers sit there until the next RemoveDirectory.
         server.spawn_trash_sweep();
         server
+    }
+
+    pub(crate) fn with_pool(
+        mut self,
+        pool: Option<crate::pool_object_store::PoolObjectStore>,
+    ) -> Self {
+        self.pool = pool;
+        self
     }
 
     pub fn with_nbd_export_protection(mut self, enabled: bool) -> Self {
@@ -283,6 +293,53 @@ fn delete_dir_contents<'a>(
 
 #[tonic::async_trait]
 impl AdminService for AdminRpcServer {
+    async fn get_pool_affected(
+        &self,
+        request: Request<proto::GetPoolAffectedRequest>,
+    ) -> Result<Response<proto::GetPoolAffectedResponse>, Status> {
+        let pool = self
+            .pool
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("no permanent pool configured"))?;
+        let member = request.into_inner().member;
+        let segments = pool
+            .affected_segments(&member)
+            .await
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let mut views = Vec::new();
+        let mut errors = Vec::new();
+        match crate::fs::affected::scan(&self.fs.db, "live".into(), &segments).await {
+            Ok(view) => views.push(view),
+            Err(error) => errors.push(format!("live metadata incomplete: {error}")),
+        }
+        match self
+            .checkpoint_manager
+            .affected_checkpoints(&segments)
+            .await
+        {
+            Ok(checkpoints) => views.extend(checkpoints),
+            Err(error) => errors.push(format!("checkpoint metadata incomplete: {error}")),
+        }
+        let json = serde_json::json!({ "member": member, "complete": errors.is_empty(), "views": views, "errors": errors, "pathname_encoding": "absolute byte arrays", "coverage": "separate coherent metadata snapshots; unlinked/unreachable inodes have no paths" }).to_string();
+        self.success_response(proto::GetPoolAffectedResponse { json })
+    }
+
+    async fn get_pool_status(
+        &self,
+        _: Request<proto::GetPoolStatusRequest>,
+    ) -> Result<Response<proto::GetPoolStatusResponse>, Status> {
+        let pool = self
+            .pool
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("no permanent pool configured"))?;
+        let status = pool
+            .status()
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let json = serde_json::to_string(&status).map_err(|e| Status::internal(e.to_string()))?;
+        self.success_response(proto::GetPoolStatusResponse { json })
+    }
+
     type WatchFileAccessStream =
         Pin<Box<dyn tokio_stream::Stream<Item = Result<proto::FileAccessEvent, Status>> + Send>>;
 

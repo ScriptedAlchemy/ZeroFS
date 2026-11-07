@@ -109,6 +109,7 @@ async fn resolve_checkpoint_name(settings: &Settings, name: &str) -> Result<uuid
         store: object_store,
         path: path_from_url,
         sftp_pool,
+        pool: _,
     } = open_storage(settings).await?;
     let object_store = with_storage_class(
         Arc::from(object_store),
@@ -351,6 +352,7 @@ async fn start_nbd_servers(
 }
 
 async fn start_rpc_servers(
+    pool: Option<crate::pool_object_store::PoolObjectStore>,
     config: Option<&RpcConfig>,
     checkpoint_manager: Arc<CheckpointManager>,
     fs: Arc<ZeroFS>,
@@ -363,7 +365,8 @@ async fn start_rpc_servers(
     };
 
     let service = crate::rpc::server::AdminRpcServer::new(checkpoint_manager, fs, shutdown.clone())
-        .with_nbd_export_protection(protect_nbd_exports);
+        .with_nbd_export_protection(protect_nbd_exports)
+        .with_pool(pool);
     let mut handles = Vec::new();
 
     if let Some(addresses) = &config.addresses {
@@ -1373,10 +1376,13 @@ pub async fn build_slatedb(
 }
 
 pub struct InitResult {
+    pub(crate) block_transformer: Arc<dyn BlockTransformer>,
     pub fs: Arc<ZeroFS>,
     pub object_store: Arc<dyn object_store::ObjectStore>,
     pub writeback: Option<crate::writeback::store::WritebackObjectStore>,
     pub(crate) sftp_pool: Option<BackendSessions>,
+    pub(crate) pool: Option<crate::pool_object_store::PoolObjectStore>,
+    pub(crate) disk_monitor: Option<crate::disk_health::PreparedDiskMonitor>,
     pub cache_metrics: Arc<CacheMetrics>,
     pub wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
     pub db_path: String,
@@ -1473,18 +1479,30 @@ pub async fn run_server(
 
     crate::telemetry::send_startup_event(&settings);
 
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let init_result = crate::cli::init::initialize_filesystem(&settings, db_mode).await?;
     let cache_owner = init_result._cache_owner.clone();
     let writeback_for_shutdown = init_result.writeback.clone();
     let writeback_for_metrics = init_result.writeback.clone();
     let writeback_for_checkpoints = init_result.writeback.clone();
     let writeback_for_lifecycle = writeback_for_shutdown.clone();
+    let pool_health = init_result.pool.clone();
+    let pool_settlement = pool_health.clone();
+    let health_failure = CancellationToken::new();
+    let health_workers = Arc::new(tokio::sync::Mutex::new(None));
+    let health_workers_after = health_workers.clone();
     let sftp_pool = init_result.sftp_pool.clone();
     let sftp_pool_for_close = sftp_pool.clone();
     let lifecycle_completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let lifecycle_completed_after = std::sync::Arc::clone(&lifecycle_completed);
     let server_result: anyhow::Result<()> = async move {
         let _cache_owner = cache_owner;
+        if let Some(pool) = &pool_health {
+            let monitor = init_result.disk_monitor.expect("pool startup prepared native monitoring").start(health_failure.clone()).await?;
+            let recovery = if !db_mode.is_read_only() { Some(crate::pool_object_store::PoolRecovery::start(pool.clone(), health_failure.clone())) } else { None };
+            *health_workers.lock().await = Some((monitor, recovery));
+        }
         let prometheus_authority = if let Some(authority_config) = settings
             .prometheus
             .as_ref()
@@ -1523,8 +1541,7 @@ pub async fn run_server(
 
         // Register the only fallible signal source before starting any
         // background object-store consumers.
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
 
         let prometheus_handles = if let Some(ref prometheus_config) = settings.prometheus {
             let slatedb_registry = fs.db.slatedb_metrics();
@@ -1614,6 +1631,7 @@ pub async fn run_server(
             init_result.object_store,
             init_result.wal_object_store.clone(),
         ));
+        checkpoint_manager.set_metadata_transformer(init_result.block_transformer);
         if let Some(writeback) = writeback_for_checkpoints {
             checkpoint_manager.set_post_mutation_durability(Arc::new(move || {
                 let writeback = writeback.clone();
@@ -1643,6 +1661,7 @@ pub async fn run_server(
         let checkpoint_manager_for_webui = Arc::clone(&checkpoint_manager);
         let protect_nbd_exports = nbd_runtime_registry.is_some();
         let rpc_handles = start_rpc_servers(
+            pool_health.clone(),
             settings.servers.rpc.as_ref(),
             checkpoint_manager,
             Arc::clone(&fs),
@@ -1710,7 +1729,8 @@ pub async fn run_server(
                 Arc::clone(&fs),
                 shutdown.clone(),
             )
-            .with_nbd_export_protection(protect_nbd_exports);
+            .with_nbd_export_protection(protect_nbd_exports)
+            .with_pool(pool_health.clone());
             let webui_lock_manager = Arc::new(crate::ninep::lock_manager::FileLockManager::new());
             crate::webui::start(
                 webui_config,
@@ -1748,13 +1768,19 @@ pub async fn run_server(
                 );
                 ServingStopCause::LeadershipLost
             }
-            _ = tokio::signal::ctrl_c() => {
+            _ = sigint.recv() => {
                 info!("Received SIGINT, initiating graceful shutdown...");
                 ServingStopCause::Signal
             }
             _ = sigterm.recv() => {
                 info!("Received SIGTERM, initiating graceful shutdown...");
                 ServingStopCause::Signal
+            }
+            _ = async { match &pool_health { Some(pool) => pool.wait_safety_failure().await, None => std::future::pending::<()>().await } } => {
+                ServingStopCause::BackendFailure(anyhow::anyhow!("pool catalog safety operation failed"))
+            }
+            _ = health_failure.cancelled() => {
+                ServingStopCause::BackendFailure(anyhow::anyhow!("pool health worker stopped"))
             }
             error = wait_for_sftp_failure(sftp_pool_for_close.as_ref()) => {
                 // A pool with unresolved physical-session ownership cannot be
@@ -1863,6 +1889,12 @@ pub async fn run_server(
             if leadership_deposed.is_cancelled() {
                 return Err(leadership_lost_error());
             }
+            if let Some((monitor, recovery)) = health_workers.lock().await.take() {
+                let monitor_result = monitor.shutdown().await;
+                let recovery_result = match recovery { Some(worker) => worker.shutdown().await, None => Ok(()) };
+                monitor_result?;
+                recovery_result?;
+            }
             info!("Performing final flush and closing database...");
             let lifecycle = MutationLifecycle::new(LifecycleOwners::for_process(
                 shutdown.clone(),
@@ -1871,7 +1903,7 @@ pub async fn run_server(
                 writeback_for_lifecycle.clone(),
                 sftp_pool_for_close.clone(),
                 db_mode.is_read_only(),
-            ));
+            ).with_pool(pool_health.clone()));
             let target = crate::fs::mutation::durability::DurabilityTarget::from(
                 fs.write_ack.client_durability_target,
             );
@@ -1929,6 +1961,18 @@ pub async fn run_server(
     }
     .await;
 
+    let recovery_result =
+        if let Some((monitor, recovery)) = health_workers_after.lock().await.take() {
+            let monitor_result = monitor.shutdown().await;
+            let recovery_result = match recovery {
+                Some(worker) => worker.shutdown().await,
+                None => Ok(()),
+            };
+            monitor_result.and(recovery_result)
+        } else {
+            Ok(())
+        };
+    let server_result = server_result.and(recovery_result);
     let writeback_shutdown = if lifecycle_completed_after.load(std::sync::atomic::Ordering::SeqCst)
     {
         Ok(())
@@ -1941,6 +1985,9 @@ pub async fn run_server(
             None => Ok(()),
         }
     };
+    if let Some(pool) = pool_settlement {
+        pool.settle().await;
+    }
     let sftp_shutdown = if lifecycle_completed_after.load(std::sync::atomic::Ordering::SeqCst) {
         Ok(())
     } else {

@@ -5,6 +5,8 @@ package zerofs.admin;
 import "google/protobuf/timestamp.proto";
 
 service AdminService {
+    rpc GetPoolAffected(GetPoolAffectedRequest) returns (GetPoolAffectedResponse);
+    rpc GetPoolStatus(GetPoolStatusRequest) returns (GetPoolStatusResponse);
     rpc CreateCheckpoint(CreateCheckpointRequest) returns (CreateCheckpointResponse);
 
     rpc ListCheckpoints(ListCheckpointsRequest) returns (ListCheckpointsResponse);
@@ -224,3 +226,9 @@ message SegmentGcStatus {
     string reason = 20;
     uint64 unflushed_bytes = 21;
 }
+
+message GetPoolStatusRequest {}
+message GetPoolStatusResponse { string json = 1; }
+
+message GetPoolAffectedRequest { string member = 1; }
+message GetPoolAffectedResponse { string json = 1; }

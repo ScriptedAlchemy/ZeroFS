@@ -68,6 +68,7 @@ pub(crate) struct OpenedStorage {
     pub(crate) store: Box<dyn ObjectStore>,
     pub(crate) path: Path,
     pub(crate) sftp_pool: Option<BackendSessions>,
+    pub(crate) pool: Option<PoolObjectStore>,
 }
 
 pub(crate) async fn open_storage(settings: &Settings) -> Result<OpenedStorage> {
@@ -101,6 +102,7 @@ pub(crate) async fn open_storage(settings: &Settings) -> Result<OpenedStorage> {
         store,
         path,
         sftp_pool: sftp_pool.map(BackendSessions::single),
+        pool: None,
     })
 }
 
@@ -172,6 +174,7 @@ pub(crate) async fn open_pool_storage(
                     None
                 },
                 min_free_bytes: member.reserve_free_bytes()?,
+                health_device: member.health_device.clone(),
             });
         }
         Ok(if initialize {
@@ -196,6 +199,7 @@ pub(crate) async fn open_pool_storage(
     match result {
         Ok(pool) => Ok((
             OpenedStorage {
+                pool: Some(pool.clone()),
                 store: Box::new(pool.clone()),
                 path,
                 sftp_pool: (!sessions.pools.is_empty()).then_some(sessions),

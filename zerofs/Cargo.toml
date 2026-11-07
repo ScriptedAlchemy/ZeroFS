@@ -58,6 +58,7 @@ inherits = "release"
 strip = false
 
 [features]
+disk-health-test-hooks = []
 default = ["vendored-protoc"]
 tokio-console = ["dep:console-subscriber"]
 failpoints = ["dep:fail"]

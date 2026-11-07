@@ -677,6 +677,8 @@ pub struct StoragePoolConfig {
 #[derive(Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct StoragePoolMemberConfig {
+    #[serde(default)]
+    pub(crate) health_device: Option<PathBuf>,
     pub(crate) id: String,
     #[serde(deserialize_with = "deserialize_expandable_string")]
     pub(crate) url: String,
@@ -820,6 +822,13 @@ impl StoragePoolConfig {
             }
             let (scheme, _) = crate::parse_object_store::ObjectStoreScheme::parse(&url)?;
             use crate::parse_object_store::ObjectStoreScheme;
+            if let Some(device) = &member.health_device
+                && (scheme != ObjectStoreScheme::Local || !device.is_absolute())
+            {
+                anyhow::bail!(
+                    "health_device requires a local member and an absolute block-device path"
+                );
+            }
             if !matches!(
                 scheme,
                 ObjectStoreScheme::Local

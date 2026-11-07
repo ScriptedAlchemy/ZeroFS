@@ -31,6 +31,10 @@ pub struct CheckpointInfo {
 pub struct CheckpointManager {
     db_handle: SlateDbHandle,
     admin: Admin,
+    path: Path,
+    store: Arc<dyn ObjectStore>,
+    wal_store: Option<Arc<dyn ObjectStore>>,
+    transformer: OnceLock<Arc<dyn slatedb::BlockTransformer>>,
     /// Set once at bring-up (see [`PreCheckpointFlush`]); unset in tests, which
     /// checkpoint durable state as-is.
     pre_flush: Arc<OnceLock<PreCheckpointFlush>>,
@@ -44,14 +48,19 @@ impl CheckpointManager {
         object_store: Arc<dyn ObjectStore>,
         wal_object_store: Option<Arc<dyn ObjectStore>>,
     ) -> Self {
-        let mut admin_builder = slatedb::admin::AdminBuilder::new(path, object_store);
-        if let Some(wal_store) = wal_object_store {
+        let mut admin_builder =
+            slatedb::admin::AdminBuilder::new(path.clone(), object_store.clone());
+        if let Some(wal_store) = wal_object_store.clone() {
             admin_builder = admin_builder.with_wal_object_store(wal_store);
         }
         let admin = admin_builder.build();
         Self {
             db_handle,
             admin,
+            path,
+            store: object_store,
+            wal_store: wal_object_store,
+            transformer: OnceLock::new(),
             pre_flush: Arc::new(OnceLock::new()),
             post_mutation_durability: Arc::new(OnceLock::new()),
         }
@@ -66,6 +75,53 @@ impl CheckpointManager {
     /// Install the post-mutation local durability barrier (first call wins).
     pub fn set_post_mutation_durability(&self, hook: PostMutationDurability) {
         let _ = self.post_mutation_durability.set(hook);
+    }
+
+    pub(crate) fn set_metadata_transformer(&self, transformer: Arc<dyn slatedb::BlockTransformer>) {
+        let _ = self.transformer.set(transformer);
+    }
+
+    pub(crate) async fn affected_checkpoints(
+        &self,
+        segments: &std::collections::BTreeSet<crate::segment::Segid>,
+    ) -> Result<Vec<crate::fs::affected::AffectedView>> {
+        let checkpoints = self.admin.list_checkpoints(None).await?;
+        let mut views = Vec::new();
+        for checkpoint in &checkpoints {
+            let mut builder = slatedb::DbReader::builder(self.path.clone(), self.store.clone())
+                .with_reader_mode(slatedb::DbReaderMode::Checkpoint(checkpoint.id))
+                .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor));
+            if let Some(transformer) = self.transformer.get() {
+                builder = builder.with_block_transformer(transformer.clone());
+            }
+            if let Some(wal_store) = &self.wal_store {
+                builder = builder.with_wal_object_store(wal_store.clone());
+            }
+            let reader = Arc::new(builder.build().await?);
+            let db = crate::db::Db::new_read_only(arc_swap::ArcSwap::new(reader.clone()));
+            let result = crate::fs::affected::scan(
+                &db,
+                format!(
+                    "checkpoint {} {}",
+                    checkpoint.id,
+                    checkpoint.name.as_deref().unwrap_or("<unnamed>")
+                ),
+                segments,
+            )
+            .await;
+            let close = reader.close().await;
+            views.push(result?);
+            close?;
+        }
+        let after = self.admin.list_checkpoints(None).await?;
+        let before: std::collections::BTreeSet<_> = checkpoints.iter().map(|cp| cp.id).collect();
+        let after: std::collections::BTreeSet<_> = after.iter().map(|cp| cp.id).collect();
+        if before != after {
+            return Err(anyhow!(
+                "retained checkpoints changed during affected report; retry"
+            ));
+        }
+        Ok(views)
     }
 
     pub async fn create_checkpoint(&self, name: &str) -> Result<CheckpointInfo> {
@@ -219,6 +275,51 @@ mod tests {
     use slatedb::DbBuilder;
     use slatedb::object_store::path::Path;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn affected_includes_unnamed_retained_checkpoint_after_live_overwrite() {
+        let store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let path = Path::from("affected-checkpoints");
+        let db = Arc::new(
+            DbBuilder::new(path.clone(), store.clone())
+                .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+                .build()
+                .await
+                .unwrap(),
+        );
+        let codec = crate::fs::key_codec::KeyCodec::new();
+        let segid = crate::segment::Segid::new(1, 7);
+        let loc = crate::segment::FrameLoc {
+            segid,
+            frame_index: 0,
+            byte_offset: 0,
+            byte_len: 64,
+        };
+        db.put(codec.extent_key(9, 0), loc.encode()).await.unwrap();
+        db.flush().await.unwrap();
+        let checkpoint = db
+            .create_checkpoint(
+                slatedb::config::CheckpointScope::Durable,
+                &slatedb::config::CheckpointOptions::default(),
+            )
+            .await
+            .unwrap();
+        db.delete(codec.extent_key(9, 0)).await.unwrap();
+        let manager =
+            CheckpointManager::new(SlateDbHandle::ReadWrite(db.clone()), path, store, None);
+        let views = manager
+            .affected_checkpoints(&std::collections::BTreeSet::from([segid]))
+            .await
+            .unwrap();
+        assert!(
+            views
+                .iter()
+                .any(|v| v.view.contains(&checkpoint.id.to_string())
+                    && v.references.iter().any(|r| r.inode == 9))
+        );
+        db.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn checkpoint_mutations_wait_for_the_installed_local_durability_barrier() {

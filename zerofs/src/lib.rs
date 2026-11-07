@@ -11,6 +11,7 @@ pub mod config;
 mod coordination;
 pub mod db;
 pub mod dedup;
+mod disk_health;
 pub mod frame_codec;
 pub mod fs;
 mod key_management;

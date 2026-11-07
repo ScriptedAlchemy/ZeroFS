@@ -35,6 +35,8 @@ struct StartupContext {
     object_store: Arc<dyn object_store::ObjectStore>,
     writeback: Option<crate::writeback::store::WritebackObjectStore>,
     sftp_pool: Option<BackendSessions>,
+    pool: Option<crate::pool_object_store::PoolObjectStore>,
+    disk_monitor: Option<crate::disk_health::PreparedDiskMonitor>,
     wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
     /// Shared by the data and WAL `TracingObjectStore` wrappers and handed to
     /// the filesystem so the RPC server can stream backend requests (`otrace`).
@@ -161,11 +163,20 @@ impl StartupContext {
             store: object_store,
             path: path_from_url,
             sftp_pool,
+            pool,
         } = open_storage(settings)
             .await
             .context("Failed to connect to storage backend")?;
         let cleanup_pool = sftp_pool.clone();
+        let cleanup_storage_pool = pool.clone();
         let prepared: Result<Self> = async {
+            let disk_monitor = match &pool {
+                Some(pool) => Some(
+                    crate::disk_health::PreparedDiskMonitor::prepare(pool.clone(), settings)
+                        .await?,
+                ),
+                None => None,
+            };
             let object_store = with_storage_class(
                 Arc::from(object_store),
                 settings.storage.storage_class.as_deref(),
@@ -292,6 +303,8 @@ impl StartupContext {
                 object_store,
                 writeback,
                 sftp_pool,
+                pool,
+                disk_monitor,
                 wal_object_store,
                 object_tracer,
                 actual_db_path,
@@ -318,6 +331,9 @@ impl StartupContext {
         match prepared {
             Ok(prepared) => Ok(prepared),
             Err(error) => {
+                if let Some(pool) = cleanup_storage_pool {
+                    pool.settle().await;
+                }
                 finish_with_sftp_cleanup(
                     cleanup_pool.as_ref(),
                     "Failed to shut down SFTP pool after initialization failure",
@@ -931,10 +947,12 @@ impl ReconciledDb {
             object_store,
             writeback,
             sftp_pool,
+            pool,
+            disk_monitor,
             wal_object_store,
             object_tracer,
             actual_db_path,
-            block_transformer: _,
+            block_transformer,
             segment_codec,
             cache_config: _,
             dedup,
@@ -1214,6 +1232,7 @@ impl ReconciledDb {
         }
 
         Ok(InitResult {
+            block_transformer,
             fs,
             // Retry-wrapped for the consumers downstream (the GC's checkpoint-gate
             // admin and the checkpoint manager), whose listings would otherwise
@@ -1221,6 +1240,8 @@ impl ReconciledDb {
             object_store,
             writeback,
             sftp_pool,
+            pool,
+            disk_monitor,
             cache_metrics,
             wal_object_store,
             db_path: actual_db_path,
@@ -1239,6 +1260,7 @@ pub async fn initialize_filesystem(
     let startup = StartupContext::prepare(settings, db_mode).await?;
     let cleanup_writeback = startup.writeback.clone();
     let cleanup_pool = startup.sftp_pool.clone();
+    let cleanup_storage_pool = startup.pool.clone();
     let initialized = async move {
         let mut startup = startup.start_receiver()?;
         'role_election: loop {
@@ -1268,12 +1290,15 @@ pub async fn initialize_filesystem(
     match initialized {
         Ok(initialized) => Ok(initialized),
         Err(error) => {
-            if let Some(writeback) = cleanup_writeback
-                && let Err(cleanup) = writeback.shutdown().await
-            {
-                return Err(error.context(format!(
-                    "writeback cleanup after filesystem initialization failure also failed: {cleanup}"
-                )));
+            let error = match cleanup_writeback {
+                Some(writeback) => match writeback.shutdown().await {
+                    Ok(()) => error,
+                    Err(cleanup) => error.context(format!("writeback cleanup after filesystem initialization failure also failed: {cleanup}")),
+                },
+                None => error,
+            };
+            if let Some(pool) = cleanup_storage_pool {
+                pool.settle().await;
             }
             finish_with_sftp_cleanup(
                 cleanup_pool.as_ref(),
@@ -1416,6 +1441,7 @@ mod role_decision_tests {
                 settings.storage.pool = Some(crate::config::StoragePoolConfig {
                     catalog_dir: temp.path().join("catalog"),
                     members: vec![crate::config::StoragePoolMemberConfig {
+                        health_device: None,
                         id: "local".to_owned(),
                         url: url::Url::from_directory_path(&data).unwrap().to_string(),
                         capacity_gb: 1.0,
@@ -1501,6 +1527,8 @@ mod role_decision_tests {
             object_store: store.clone(),
             writeback: None,
             sftp_pool: None,
+            pool: None,
+            disk_monitor: None,
             wal_object_store: None,
             object_tracer: crate::object_trace::ObjectTracer::new(),
             actual_db_path: "db".into(),

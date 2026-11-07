@@ -247,6 +247,24 @@ fn annotate(error: ShutdownError, phase: ShutdownPhase) -> ShutdownError {
 }
 
 impl LifecycleOwners {
+    pub(crate) fn with_pool(
+        mut self,
+        pool: Option<crate::pool_object_store::PoolObjectStore>,
+    ) -> Self {
+        let stop_sftp = self.stop_sftp.clone();
+        self.stop_sftp = Arc::new(move || {
+            let pool = pool.clone();
+            let stop_sftp = stop_sftp.clone();
+            Box::pin(async move {
+                if let Some(pool) = pool {
+                    pool.settle().await;
+                }
+                stop_sftp().await
+            })
+        });
+        self
+    }
+
     pub(crate) fn for_process(
         shutdown: tokio_util::sync::CancellationToken,
         dispatched: crate::ninep::server::P9AcceptedWorkTracker,
