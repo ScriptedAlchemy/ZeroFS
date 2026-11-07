@@ -329,7 +329,9 @@ fn parse_smart(bytes: &[u8], exit: i32) -> Result<(SmartSample, Option<String>)>
         pending: counter(197),
         uncorrectable: counter(198),
         crc: counter(199),
-        failed: exit & 8 != 0 || json["smart_status"]["passed"].as_bool() == Some(false),
+        // Bit 3 means the overall SMART health check failed; bit 4 means a
+        // current pre-failure attribute has reached its failure threshold.
+        failed: exit & (8 | 16) != 0 || json["smart_status"]["passed"].as_bool() == Some(false),
     };
     let coverage = if exit & 4 != 0 {
         Some(format!(
@@ -374,6 +376,15 @@ mod tests {
         assert_eq!(pending.pending, Some(2));
         assert_eq!(pending.crc, None);
         assert!(smart_coverage(&pending).is_some());
+    }
+
+    #[test]
+    fn disk_health_prefail_threshold_exit_quarantines_despite_overall_pass() {
+        let fixture = br#"{"serial_number":"disk","smart_status":{"passed":true}}"#;
+        let (sample, coverage) = parse_smart(fixture, 16).unwrap();
+        assert!(sample.failed, "SMART exit bit 4 is an active prefail threshold breach");
+        assert!(coverage.is_some(), "missing counters must retain coverage warning");
+        assert!(!parse_smart(fixture, 4).unwrap().0.failed);
     }
 
     #[tokio::test]
