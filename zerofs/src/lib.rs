@@ -17,6 +17,7 @@ mod key_management;
 pub mod length_checked_object_store;
 #[allow(dead_code)]
 mod linux_errno;
+mod local_object_store;
 pub(crate) mod metadata_digest;
 #[cfg(target_os = "linux")]
 mod mount;
@@ -27,6 +28,7 @@ mod ninep;
 pub mod object_store_prefetch;
 pub mod object_trace;
 mod parse_object_store;
+mod pool_object_store;
 mod prometheus;
 mod redis_conditional_store;
 pub mod replication;
@@ -40,6 +42,7 @@ mod sftp_metrics;
 pub mod sftp_object_store;
 mod sftp_protocol;
 pub mod sftp_transport;
+mod storage_backend;
 pub mod storage_class_object_store;
 mod storage_compatibility;
 pub(crate) mod task;
@@ -128,6 +131,9 @@ pub async fn run_cli() -> Result<()> {
             checkpoint,
         } => {
             cli::server::run_server(config, read_only, checkpoint).await?;
+        }
+        cli::Commands::Pool { subcommand } => {
+            cli::pool::run(subcommand).await?;
         }
         cli::Commands::Debug { subcommand } => match subcommand {
             cli::DebugCommands::ListKeys { config } => {

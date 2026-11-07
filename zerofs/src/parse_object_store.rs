@@ -16,10 +16,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::local_object_store::LocalConditionalStore;
 use object_store::ClientConfigKey;
 use object_store::ClientOptions;
 use object_store::ObjectStore;
-use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path;
 use std::sync::Arc;
@@ -75,7 +75,7 @@ impl From<Error> for object_store::Error {
 /// See [`ObjectStoreScheme::parse`] for more details
 ///
 /// # Supported formats:
-/// - `file:///path/to/my/file` -> [`LocalFileSystem`]
+/// - `file:///path/to/my/file` -> [`LocalConditionalStore`]
 /// - `memory:///` -> [`InMemory`]
 /// - `s3://bucket/path` -> [`AmazonS3`](crate::aws::AmazonS3) (also supports `s3a`)
 /// - `gs://bucket/path` -> [`GoogleCloudStorage`](crate::gcp::GoogleCloudStorage)
@@ -92,7 +92,7 @@ impl From<Error> for object_store::Error {
 #[non_exhaustive] // permit new variants
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub enum ObjectStoreScheme {
-    /// Url corresponding to [`LocalFileSystem`]
+    /// Url corresponding to [`LocalConditionalStore`]
     Local,
     /// Url corresponding to [`InMemory`]
     Memory,
@@ -189,7 +189,7 @@ pub struct ParsedStore {
 /// every scheme, including SFTP; `sftp_config` is ignored for other backends.
 ///
 /// For example
-/// * `file:///path/to/my/file` will return a [`LocalFileSystem`] instance
+/// * `file:///path/to/my/file` will return a [`LocalConditionalStore`] instance
 /// * `s3://bucket/path` will return an [`AmazonS3`] instance if the `aws` feature is enabled.
 ///
 /// Arguments:
@@ -223,7 +223,7 @@ where
     let store: Box<dyn ObjectStore> = match scheme {
         // `with_fsync(true)` makes a successful write durable on disk before it
         // returns, matching the implicit contract of the cloud backends
-        ObjectStoreScheme::Local => Box::new(LocalFileSystem::new().with_fsync(true)),
+        ObjectStoreScheme::Local => Box::new(LocalConditionalStore::new()),
         ObjectStoreScheme::Memory => Box::new(InMemory::new()),
         ObjectStoreScheme::AmazonS3 => {
             // Collect options so we can intercept an external conditional-put
@@ -335,10 +335,21 @@ fn validate_sftp_url(url: &Url) -> Result<(), Error> {
 }
 
 /// Build the native async SFTP transport, pool, and store.
-async fn build_sftp_store(
+pub(crate) async fn build_sftp_store(
     url: &Url,
     path: Path,
     sftp_config: Option<&crate::config::SftpConfig>,
+) -> Result<ParsedStore, object_store::Error> {
+    build_sftp_store_with_warmup(url, path, sftp_config, true).await
+}
+
+/// Pool members connect on first access, so a remote outage does not prevent
+/// opening metadata and reading segments on an independent local member.
+pub(crate) async fn build_sftp_store_with_warmup(
+    url: &Url,
+    path: Path,
+    sftp_config: Option<&crate::config::SftpConfig>,
+    warmup: bool,
 ) -> Result<ParsedStore, object_store::Error> {
     validate_sftp_url(url)?;
     crate::sftp_object_store::SftpObjectStore::validate_prefix(&path)?;
@@ -371,12 +382,15 @@ async fn build_sftp_store(
             source: Box::new(source),
         })?,
     );
-    let pool = crate::sftp_transport::SftpSessionPool::from_config_writable(factory, &config)
-        .await
-        .map_err(|source| object_store::Error::Generic {
-            store: "SFTP",
-            source: Box::new(source),
-        })?;
+    let pool = if warmup {
+        crate::sftp_transport::SftpSessionPool::from_config_writable(factory, &config).await
+    } else {
+        crate::sftp_transport::SftpSessionPool::from_config_writable_deferred(factory, &config)
+    }
+    .map_err(|source| object_store::Error::Generic {
+        store: "SFTP",
+        source: Box::new(source),
+    })?;
     let store = crate::sftp_object_store::SftpObjectStore::new(pool.clone(), path.clone())?;
     Ok(ParsedStore {
         store: Box::new(store),

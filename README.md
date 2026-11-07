@@ -356,6 +356,13 @@ url = "file:///path/to/storage" # Local disk; no credentials
 
 Further schemes (`s3a://`, `abfs://`, host-routed `https://`, `memory://`): [Configuration Guide](https://www.zerofs.net/configuration).
 
+For permanent capacity across local HDDs, S3-compatible stores, or SFTP, see
+[Local disks and storage pools](docs/storage-pools.md). Pools keep filesystem
+metadata and a durable placement catalog locally, place segments on ordered
+capacity-bounded members, and support verified migration without changing file
+paths. They require explicit initialization and are separate from caching and
+writeback.
+
 ZeroFS requires conditional writes (put-if-not-exists) for fencing. AWS S3 supports this natively; for stores that don't, set `conditional_put` to a Redis URL.
 
 An optional `storage_class` under `[storage]` is passed verbatim to the backend (S3 `x-amz-storage-class`, GCS `x-goog-storage-class`, Azure `x-ms-access-tier`). Use a hot, standard-access class: archive tiers render the volume unusable, and infrequent-access tiers charge retrieval on ZeroFS's constant reads, usually costing more.

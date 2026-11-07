@@ -58,6 +58,8 @@ jobs:
         run: python3 ../kernel/ci/test-permission-race.py
       - name: Build
         run: cargo build --verbose
+      - name: Exercise local storage pooling over 9P
+        run: python3 ../scripts/test-local-storage-pool.py --binary target/debug/zerofs
       - name: Run tests
         run: cargo test --verbose
       - name: Run deterministic simulation tests
