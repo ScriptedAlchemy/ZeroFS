@@ -238,8 +238,7 @@ async fn sample_all(pool: &PoolObjectStore, bindings: &[Binding]) -> Result<()> 
             continue;
         }
         match smartctl(&binding.device).await {
-            Ok(sample) => {
-                let coverage = smart_coverage(&sample);
+            Ok((sample, coverage)) => {
                 pool.observe_health(&binding.member, sample, coverage)
                     .await?;
             }
@@ -252,7 +251,7 @@ async fn sample_all(pool: &PoolObjectStore, bindings: &[Binding]) -> Result<()> 
     Ok(())
 }
 
-async fn smartctl(device: &Path) -> Result<SmartSample> {
+async fn smartctl(device: &Path) -> Result<(SmartSample, Option<String>)> {
     let mut command = Command::new("smartctl");
     command
         .args(["--json", "--all"])
@@ -309,8 +308,8 @@ async fn bounded_command(mut command: Command, timeout: Duration) -> Result<(i32
     }
 }
 
-fn parse_smart(bytes: &[u8], exit: i32) -> Result<SmartSample> {
-    if exit & 7 != 0 || !(0..=255).contains(&exit) {
+fn parse_smart(bytes: &[u8], exit: i32) -> Result<(SmartSample, Option<String>)> {
+    if exit & 3 != 0 || !(0..=255).contains(&exit) {
         bail!("SMART command or device access failed ({exit})");
     }
     let json: serde_json::Value = serde_json::from_slice(bytes)?;
@@ -332,7 +331,14 @@ fn parse_smart(bytes: &[u8], exit: i32) -> Result<SmartSample> {
         crc: counter(199),
         failed: exit & 8 != 0 || json["smart_status"]["passed"].as_bool() == Some(false),
     };
-    Ok(sample)
+    let coverage = if exit & 4 != 0 {
+        Some(format!(
+            "partial SMART command failure ({exit}); known failure evidence retained"
+        ))
+    } else {
+        smart_coverage(&sample)
+    };
+    Ok((sample, coverage))
 }
 
 fn smart_coverage(sample: &SmartSample) -> Option<String> {
@@ -349,7 +355,7 @@ mod tests {
     #[test]
     fn disk_health_native_exit_bitmask_and_counters() {
         let fixture = br#"{"serial_number":"disk","smart_status":{"passed":false},"ata_smart_attributes":{"table":[{"id":5,"raw":{"value":0}},{"id":197,"raw":{"value":3}},{"id":198,"raw":{"value":0}},{"id":199,"raw":{"value":9}}]}}"#;
-        let sample = parse_smart(fixture, 8).unwrap();
+        let (sample, _) = parse_smart(fixture, 8).unwrap();
         assert!(sample.failed);
         assert_eq!(sample.pending, Some(3));
         assert!(parse_smart(fixture, 2).is_err());
@@ -357,17 +363,83 @@ mod tests {
     }
     #[test]
     fn disk_health_partial_smart_keeps_overall_failure_and_pending_without_crc() {
-        let failed = parse_smart(
+        let (failed, _) = parse_smart(
             br#"{"serial_number":"disk","smart_status":{"passed":false}}"#,
             8,
         )
         .unwrap();
         assert!(failed.failed);
         assert!(smart_coverage(&failed).is_some());
-        let pending = parse_smart(br#"{"serial_number":"disk","ata_smart_attributes":{"table":[{"id":197,"raw":{"value":2}}]}}"#, 0).unwrap();
+        let (pending, _) = parse_smart(br#"{"serial_number":"disk","ata_smart_attributes":{"table":[{"id":197,"raw":{"value":2}}]}}"#, 0).unwrap();
         assert_eq!(pending.pending, Some(2));
         assert_eq!(pending.crc, None);
         assert!(smart_coverage(&pending).is_some());
+    }
+
+    #[tokio::test]
+    async fn disk_health_combined_smart_bits_preserve_failure_and_evacuate() {
+        let (sample, coverage) = parse_smart(
+            br#"{"serial_number":"disk","smart_status":{"passed":false}}"#,
+            12,
+        )
+        .unwrap();
+        assert!(sample.failed);
+        assert!(
+            coverage
+                .as_ref()
+                .unwrap()
+                .contains("partial SMART command failure")
+        );
+        let root = tempfile::tempdir().unwrap();
+        let members = ["source", "target"]
+            .into_iter()
+            .map(|id| crate::pool_object_store::PoolMember {
+                id: id.into(),
+                identity: format!("memory://{id}"),
+                store: std::sync::Arc::new(object_store::memory::InMemory::new()),
+                capacity_bytes: 1024,
+                local_path: None,
+                min_free_bytes: 0,
+                health_device: None,
+            })
+            .collect();
+        let pool = PoolObjectStore::initialize(
+            std::sync::Arc::new(object_store::memory::InMemory::new()),
+            object_store::path::Path::from("db"),
+            root.path().join("catalog"),
+            members,
+        )
+        .await
+        .unwrap();
+        use object_store::{ObjectStore, ObjectStoreExt};
+        let location = object_store::path::Path::from(format!(
+            "db/{}",
+            crate::segment::Segid::new(41, 1202).object_key()
+        ));
+        let mut options = object_store::PutOptions::from(object_store::PutMode::Create);
+        options
+            .extensions
+            .insert(crate::segment_store::GeneratedSegmentCreate);
+        pool.put_opts(
+            &location,
+            bytes::Bytes::from_static(b"healthy").into(),
+            options,
+        )
+        .await
+        .unwrap();
+        pool.observe_health("source", sample, coverage)
+            .await
+            .unwrap();
+        let status = pool.status().await.unwrap();
+        assert!(status.members[0].health.quarantine.is_some());
+        assert!(status.members[0].health.monitoring_error.is_some());
+        pool.evacuate_pass(&CancellationToken::new()).await.unwrap();
+        assert_eq!(pool.placements().await.unwrap()[0].member_id, "target");
+        assert_eq!(
+            pool.get(&location).await.unwrap().bytes().await.unwrap(),
+            bytes::Bytes::from_static(b"healthy")
+        );
+        assert!(pool.status().await.unwrap().members[0].safe_to_remove);
     }
 
     #[tokio::test]

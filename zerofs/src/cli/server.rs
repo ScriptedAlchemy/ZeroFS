@@ -1539,10 +1539,6 @@ pub async fn run_server(
             ensure_nbd_directory(&fs).await?;
         }
 
-        // Register the only fallible signal source before starting any
-        // background object-store consumers.
-
-
         let prometheus_handles = if let Some(ref prometheus_config) = settings.prometheus {
             let slatedb_registry = fs.db.slatedb_metrics();
             crate::prometheus::start(

@@ -694,7 +694,6 @@ impl Db {
     /// caller that finishes or drops the stream therefore drops its iterator
     /// directly. Read-ahead is limited to one block per fetch, with one fetch
     /// task per SST; callers separately bound decoded rows and bytes.
-    /// One iterator and retained snapshot cover both extent and namespace domains.
     pub(crate) async fn scan_metadata_snapshot(
         &self,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<(Bytes, Bytes)>> + Send + '_>>> {

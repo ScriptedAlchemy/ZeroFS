@@ -1843,3 +1843,78 @@ enabled = false
             .is_some()
     );
 }
+
+#[tokio::test]
+async fn disk_health_transient_evacuation_never_authorizes_known_loss() {
+    for streamed in [false, true] {
+        let f = Fixture::new(1024);
+        let pool = f.initialize().await;
+        let path = segment(1200);
+        create(&pool, &path, b"healthy").await;
+        pool.quarantine("hdd-a", "SMART media failure")
+            .await
+            .unwrap();
+        if streamed {
+            f.first
+                .control
+                .stream_transient_payload_len
+                .store(7, Ordering::SeqCst);
+        } else {
+            f.first.control.offline.store(true, Ordering::SeqCst);
+        }
+        pool.evacuate_pass(&tokio_util::sync::CancellationToken::new())
+            .await
+            .unwrap();
+        let status = pool.status().await.unwrap();
+        assert!(status.unreadable.is_empty());
+        assert!(!status.members[0].safe_to_pull_with_known_loss);
+        assert!(!status.members[0].readable_evacuated);
+        f.first.control.offline.store(false, Ordering::SeqCst);
+        f.first
+            .control
+            .stream_transient_payload_len
+            .store(0, Ordering::SeqCst);
+        assert_eq!(read(&pool, &path).await, Bytes::from_static(b"healthy"));
+        pool.evacuate_pass(&tokio_util::sync::CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(placement(&pool, &path).await, "hdd-b");
+        assert_eq!(read(&pool, &path).await, Bytes::from_static(b"healthy"));
+        assert!(pool.status().await.unwrap().members[0].safe_to_remove);
+    }
+}
+
+#[tokio::test]
+async fn disk_health_debt_retry_rechecks_owner_after_key_lock() {
+    let f = Fixture::new(1024);
+    let pool = f.initialize().await;
+    let reserved = Arc::new(Notify::new());
+    let register = Arc::new(Notify::new());
+    let checked = Arc::new(Notify::new());
+    let recover = Arc::new(Notify::new());
+    *pool.inner.reserve_pause.lock().unwrap() = Some((reserved.clone(), register.clone()));
+    *pool.inner.recovery_pause.lock().unwrap() = Some((checked.clone(), recover.clone()));
+    let writer = pool.clone();
+    let creating = tokio::spawn(async move { multipart(&writer, &segment(1201), 4).await });
+    reserved.notified().await;
+    let cleaner = pool.clone();
+    let cleaning = tokio::spawn(async move { cleaner.recover_pending().await });
+    checked.notified().await;
+    register.notify_one();
+    let mut upload = creating.await.unwrap();
+    recover.notify_one();
+    cleaning.await.unwrap().unwrap();
+    assert_eq!(usage(&pool, "hdd-a").await.1, 4);
+    upload
+        .put_part(Bytes::from_static(b"data").into())
+        .await
+        .unwrap();
+    upload.complete().await.unwrap();
+    drop(upload);
+    assert_eq!(
+        read(&pool, &segment(1201)).await,
+        Bytes::from_static(b"data")
+    );
+    assert_eq!(usage(&pool, "hdd-a").await.1, 0);
+    assert!(!pool.inner.safety_failure.is_cancelled());
+}

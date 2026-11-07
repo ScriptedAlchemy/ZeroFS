@@ -131,6 +131,10 @@ struct PoolInner {
     health_changed: tokio::sync::Notify,
     safety_failure: tokio_util::sync::CancellationToken,
     active_uploads: Arc<StdMutex<BTreeSet<String>>>,
+    #[cfg(test)]
+    reserve_pause: StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    #[cfg(test)]
+    recovery_pause: StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 
 struct OwnedUpload {
@@ -458,6 +462,10 @@ impl PoolObjectStore {
                 health_changed: tokio::sync::Notify::new(),
                 safety_failure: tokio_util::sync::CancellationToken::new(),
                 active_uploads: Arc::new(StdMutex::new(BTreeSet::new())),
+                #[cfg(test)]
+                reserve_pause: StdMutex::new(None),
+                #[cfg(test)]
+                recovery_pause: StdMutex::new(None),
                 locks: (0..KEY_LOCKS).map(|_| Arc::new(RwLock::new(()))).collect(),
             }),
         };
@@ -744,6 +752,14 @@ impl PoolObjectStore {
             .await?;
         #[cfg(test)]
         crash_cutpoint("after_reserve");
+        #[cfg(test)]
+        {
+            let pause = self.inner.reserve_pause.lock().unwrap().take();
+            if let Some((entered, resume)) = pause {
+                entered.notify_one();
+                resume.notified().await;
+            }
+        }
         self.inner
             .active_uploads
             .lock()
@@ -1031,7 +1047,7 @@ impl PoolObjectStore {
                 )
                 .await?;
             if result.meta.size != 0 {
-                return Err(error("empty pool source changed during transfer"));
+                return Err(permanent(SourceLengthMismatch));
             }
         }
         while offset < entry.size {
@@ -1049,11 +1065,11 @@ impl PoolObjectStore {
                 )
                 .await?;
             if result.meta.size != entry.size {
-                return Err(error("pool source length changed during transfer"));
+                return Err(permanent(SourceLengthMismatch));
             }
             let chunk = result.bytes().await?;
             if chunk.len() as u64 != end - offset {
-                return Err(error("pool source returned a short range"));
+                return Err(permanent(SourceLengthMismatch));
             }
             bytes.push(chunk);
             offset = end;
@@ -1213,8 +1229,6 @@ impl PoolObjectStore {
             .await
     }
 
-    /// Retry durable debts while excluding reservations with a live owner.
-    /// Unique physical keys and key leases make repeated cleanup idempotent.
     async fn recover_pending(&self) -> object_store::Result<()> {
         let (mut uploads, mut garbage) = self.catalog(Catalog::recovery).await?;
         // Recover local debts first, and bound startup work even when a remote
@@ -1255,10 +1269,27 @@ impl PoolObjectStore {
                 break;
             }
             attempted += 1;
+            #[cfg(test)]
+            {
+                let pause = self.inner.recovery_pause.lock().unwrap().take();
+                if let Some((entered, resume)) = pause {
+                    entered.notify_one();
+                    resume.notified().await;
+                }
+            }
             let path = catalog_path(&upload.location)?;
             let Ok(_guard) = self.key_lock(&path).try_write_owned() else {
                 continue;
             };
+            if self
+                .inner
+                .active_uploads
+                .lock()
+                .unwrap()
+                .contains(&upload.id)
+            {
+                continue;
+            }
             let attempt_deadline =
                 deadline.min(tokio::time::Instant::now() + std::time::Duration::from_secs(1));
             match tokio::time::timeout_at(attempt_deadline, self.cleanup_upload(&upload)).await {
@@ -1497,20 +1528,8 @@ impl PoolObjectStore {
                 let (payload, attributes) = match pool.read_payload(&previous).await {
                     Ok(payload) => payload,
                     Err(error) => {
-                        let key = location.to_string();
-                        let expected = previous.clone();
-                        let reason = error.to_string();
-                        let sick = pool.catalog(Catalog::blocked_members).await?;
-                        if previous
-                            .physical
-                            .member_id()
-                            .is_some_and(|id| sick.contains(id))
-                            || native_media_error(&error)
-                            || has_cause::<SourceObjectMissing>(&error)
-                        {
-                            pool.catalog(move |c| c.record_source_fault(&key, &expected, reason))
-                                .await?;
-                        }
+                        pool.record_read_failure(&location, &previous, &error)
+                            .await?;
                         let _ = pool.cleanup_upload(&upload).await;
                         return Err(MoveFailure::Source(error));
                     }

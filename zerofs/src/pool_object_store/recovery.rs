@@ -4,7 +4,6 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-/// Runtime-owned worker. Shutdown waits for each existing migration's owned task.
 pub(crate) struct PoolRecovery {
     stop: CancellationToken,
     task: JoinHandle<object_store::Result<()>>,
