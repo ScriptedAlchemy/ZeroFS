@@ -445,8 +445,8 @@ def main() -> int:
                 else:
                     receipt = smoke(binary, root)
             except BaseException:
-                for log in sorted(root.glob("server-*.log")):
-                    print(f"\n{log.name}:\n{tail(log.read_text(errors='replace'))}", file=sys.stderr)
+                for log in sorted(root.rglob("server-*.log")):
+                    print(f"\n{log.relative_to(root)}:\n{tail(log.read_text(errors='replace'))}", file=sys.stderr)
                 raise
         print("LOCAL_STORAGE_POOL_SMOKE " + json.dumps(receipt, sort_keys=True), flush=True)
         return 0
