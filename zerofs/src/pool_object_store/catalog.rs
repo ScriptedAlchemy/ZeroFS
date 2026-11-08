@@ -4,6 +4,7 @@
 //! transaction. An unpublished upload remains reserved until its unique object
 //! has been deleted. Superseded objects remain charged until cleanup succeeds.
 
+use super::health::{MemberHealth, SegmentFault, SmartSample};
 use super::{PoolMember, PoolMemberStatus, PoolPlacement, PoolStatus};
 use anyhow::{Context, Result, bail};
 use fs4::fs_std::FileExt;
@@ -20,7 +21,20 @@ use uuid::Uuid;
 
 use crate::writeback::anchored_dir::AnchoredDir;
 
+#[derive(Debug, thiserror::Error)]
+#[error("no pool member has sufficient capacity and local free-space reserve")]
+pub(super) struct NoCapacity;
+
+#[derive(Debug, thiserror::Error)]
+#[error("pool member {member} is allocation-blocked: {reason}")]
+pub(super) struct AllocationBlocked {
+    member: String,
+    reason: String,
+}
+
 pub const CATALOG_FILE_NAME: &str = "pool.redb";
+const HEALTH: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_member_health_v1");
+const FAULTS: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_segment_faults_v1");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_meta");
 const MEMBERS: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_members");
 const OBJECTS: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_objects");
@@ -276,6 +290,19 @@ impl Catalog {
             table.insert("identity", bincode::serialize(&identity)?.as_slice())?;
             identity
         };
+        {
+            let mut meta = tx.open_table(META)?;
+            let version: Option<u32> = meta
+                .get("health_format")?
+                .map(|v| bincode::deserialize(v.value()))
+                .transpose()?;
+            if version.is_some_and(|v| v != 1) {
+                bail!("unsupported pool health version");
+            }
+            meta.insert("health_format", bincode::serialize(&1_u32)?.as_slice())?;
+        }
+        tx.open_table(HEALTH)?;
+        tx.open_table(FAULTS)?;
         tx.open_table(MEMBERS)?;
         tx.open_table(OBJECTS)?;
         tx.open_table(UPLOADS)?;
@@ -409,6 +436,173 @@ impl Catalog {
         Ok(())
     }
 
+    pub fn kernel_observation(
+        &self,
+        member: &str,
+        coverage: String,
+        cursor: Option<(String, u64)>,
+    ) -> Result<()> {
+        let mut tx = self.database.begin_write()?;
+        tx.set_durability(Durability::Immediate)?;
+        let mut health = health_in(&tx, member)?;
+        health.kernel_coverage = Some(coverage);
+        if let Some((boot, sequence)) = cursor
+            && !health
+                .kernel_cursor
+                .as_ref()
+                .is_some_and(|(old_boot, old_seq)| old_boot == &boot && *old_seq >= sequence)
+        {
+            health.quarantine(
+                "kernel block I/O error".into(),
+                chrono::Utc::now().timestamp_millis(),
+            );
+            health.kernel_cursor = Some((boot, sequence));
+        }
+        tx.open_table(HEALTH)?
+            .insert(member, bincode::serialize(&health)?.as_slice())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn blocked_members(&self) -> Result<BTreeSet<String>> {
+        let tx = self.database.begin_read()?;
+        let mut blocked = BTreeSet::new();
+        for row in tx.open_table(HEALTH)?.iter()? {
+            let (id, value) = row?;
+            let health: MemberHealth = bincode::deserialize(value.value())?;
+            if health.quarantine.is_some() || health.monitoring_error.is_some() {
+                blocked.insert(id.value().into());
+            }
+        }
+        Ok(blocked)
+    }
+
+    pub fn require_eligible(&self, member: &str) -> Result<()> {
+        let tx = self.database.begin_read()?;
+        let health: MemberHealth = tx
+            .open_table(HEALTH)?
+            .get(member)?
+            .map(|v| bincode::deserialize(v.value()))
+            .transpose()?
+            .unwrap_or_default();
+        if let Some(reason) = health.quarantine.or(health.monitoring_error) {
+            return Err(AllocationBlocked {
+                member: member.into(),
+                reason,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    pub fn evacuation_error(&self, member: &str, issue: Option<String>) -> Result<()> {
+        let mut tx = self.database.begin_write()?;
+        tx.set_durability(Durability::Immediate)?;
+        let mut health = health_in(&tx, member)?;
+        health.evacuation_error = issue;
+        tx.open_table(HEALTH)?
+            .insert(member, bincode::serialize(&health)?.as_slice())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn monitoring_error(&self, member: &str, error: Option<String>) -> Result<()> {
+        let mut tx = self.database.begin_write()?;
+        tx.set_durability(Durability::Immediate)?;
+        let mut health = health_in(&tx, member)?;
+        health.monitoring_error = error;
+        tx.open_table(HEALTH)?
+            .insert(member, bincode::serialize(&health)?.as_slice())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn observe_health(
+        &self,
+        member: &str,
+        sample: Option<SmartSample>,
+        reason: Option<String>,
+        coverage_error: Option<String>,
+    ) -> Result<()> {
+        let mut tx = self.database.begin_write()?;
+        tx.set_durability(Durability::Immediate)?;
+        if tx.open_table(MEMBERS)?.get(member)?.is_none() {
+            bail!("unknown pool member");
+        }
+        let mut health = health_in(&tx, member)?;
+        let now = chrono::Utc::now().timestamp_millis();
+        if let Some(sample) = sample {
+            health.monitoring_error = coverage_error;
+            health.observe(sample, now);
+        }
+        if let Some(reason) = reason {
+            health.quarantine(reason, now);
+        }
+        tx.open_table(HEALTH)?
+            .insert(member, bincode::serialize(&health)?.as_slice())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn record_source_fault(
+        &self,
+        location: &str,
+        expected: &Entry,
+        reason: String,
+    ) -> Result<()> {
+        let mut tx = self.database.begin_write()?;
+        tx.set_durability(Durability::Immediate)?;
+        let current: Option<Entry> = tx
+            .open_table(OBJECTS)?
+            .get(location)?
+            .map(|v| bincode::deserialize(v.value()))
+            .transpose()?;
+        if current
+            .as_ref()
+            .is_some_and(|e| e.physical.key() == expected.physical.key())
+        {
+            let old: Option<SegmentFault> = tx
+                .open_table(FAULTS)?
+                .get(location)?
+                .map(|v| bincode::deserialize(v.value()))
+                .transpose()?;
+            let attempts = old
+                .filter(|f| f.physical_key == expected.physical.key())
+                .map_or(1, |f| f.attempts.saturating_add(1));
+            let fault = SegmentFault {
+                location: location.into(),
+                physical_key: expected.physical.key().into(),
+                member_id: expected.physical.member_id().unwrap_or("authority").into(),
+                reason,
+                observed_ms: chrono::Utc::now().timestamp_millis(),
+                attempts,
+                next_retry_ms: chrono::Utc::now().timestamp_millis()
+                    + (60_000_i64.saturating_mul(1_i64 << attempts.min(4))).min(600_000),
+            };
+            tx.open_table(FAULTS)?
+                .insert(location, bincode::serialize(&fault)?.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn faults(&self) -> Result<Vec<SegmentFault>> {
+        let tx = self.database.begin_read()?;
+        let objects = tx.open_table(OBJECTS)?;
+        let mut faults = Vec::new();
+        for row in tx.open_table(FAULTS)?.iter()? {
+            let fault: SegmentFault = bincode::deserialize(row?.1.value())?;
+            let current: Option<Entry> = objects
+                .get(fault.location.as_str())?
+                .map(|v| bincode::deserialize(v.value()))
+                .transpose()?;
+            if current.is_some_and(|e| e.physical.key() == fault.physical_key) {
+                faults.push(fault);
+            }
+        }
+        Ok(faults)
+    }
+
     pub fn lookup(&self, location: &str) -> Result<Lookup> {
         let tx = self.database.begin_read()?;
         let objects = tx.open_table(OBJECTS)?;
@@ -454,6 +648,11 @@ impl Catalog {
                 .iter()
                 .filter(|m| target.is_none_or(|id| id == m.id))
             {
+                if health_in(&tx, &member.id)?.quarantine.is_some()
+                    || health_in(&tx, &member.id)?.monitoring_error.is_some()
+                {
+                    continue;
+                }
                 let mut record: MemberRecord = bincode::deserialize(
                     table
                         .get(member.id.as_str())?
@@ -468,9 +667,9 @@ impl Catalog {
                     continue;
                 }
                 if let Some(path) = &member.local_path {
-                    let available = fs4::available_space(path).with_context(|| {
-                        format!("check free space for pool member {}", member.id)
-                    })?;
+                    let Ok(available) = fs4::available_space(path) else {
+                        continue;
+                    };
                     // Outstanding reservations may not have reached the device
                     // yet. Counting all of them is deliberately conservative.
                     let required = member
@@ -490,8 +689,7 @@ impl Catalog {
                 chosen = Some(member.id.clone());
                 break;
             }
-            let member_id = chosen
-                .context("no pool member has sufficient capacity and local free-space reserve")?;
+            let member_id = chosen.ok_or(NoCapacity)?;
             let id = Uuid::new_v4().to_string();
             Upload {
                 physical_key: format!(".zerofs-pool/{}/objects/{id}", self.identity.pool_id),
@@ -519,6 +717,7 @@ impl Catalog {
                     .context("pool upload reservation is missing")?
                     .value(),
             )?;
+            ensure_eligible(&tx, &upload.member_id)?;
             upload.started = true;
             table.insert(id, bincode::serialize(&upload)?.as_slice())?;
         }
@@ -543,6 +742,7 @@ impl Catalog {
                     .value(),
             )?
         };
+        ensure_eligible(&tx, &upload.member_id)?;
         if upload.size != entry.size
             || entry.physical.key() != upload.physical_key
             || entry.physical.member_id() != Some(upload.member_id.as_str())
@@ -575,6 +775,7 @@ impl Catalog {
             bincode::serialize(entry)?.as_slice(),
         )?;
         tx.open_table(UPLOADS)?.remove(id)?;
+        tx.open_table(FAULTS)?.remove(upload.location.as_str())?;
         let garbage = previous.map(|entry| Garbage {
             id: Uuid::new_v4().to_string(),
             location: upload.location.clone(),
@@ -601,6 +802,7 @@ impl Catalog {
         let mut tx = self.database.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
         tx.open_table(OBJECTS)?.remove(location)?;
+        tx.open_table(FAULTS)?.remove(location)?;
         tx.open_table(GARBAGE)?.insert(
             garbage.id.as_str(),
             bincode::serialize(&garbage)?.as_slice(),
@@ -706,6 +908,64 @@ impl Catalog {
         Ok(Snapshot { entries, hidden })
     }
 
+    pub fn placement_page(&self, after: &str) -> Result<Vec<PoolPlacement>> {
+        let tx = self.database.begin_read()?;
+        let table = tx.open_table(OBJECTS)?;
+        let mut result = Vec::new();
+        for row in table.range(after..)? {
+            let (key, value) = row?;
+            if key.value() == after {
+                continue;
+            }
+            let entry: Entry = bincode::deserialize(value.value())?;
+            result.push(PoolPlacement {
+                location: Path::parse(key.value())?,
+                member_id: entry
+                    .physical
+                    .member_id()
+                    .context("placement has no member")?
+                    .into(),
+                size: entry.size,
+            });
+            if result.len() == 128 {
+                break;
+            }
+        }
+        Ok(result)
+    }
+
+    pub fn clear_fault_if_current(&self, location: &str, physical_key: &str) -> Result<()> {
+        let mut tx = self.database.begin_write()?;
+        tx.set_durability(Durability::Immediate)?;
+        let entry: Option<Entry> = tx
+            .open_table(OBJECTS)?
+            .get(location)?
+            .map(|v| bincode::deserialize(v.value()))
+            .transpose()?;
+        let fault: Option<SegmentFault> = tx
+            .open_table(FAULTS)?
+            .get(location)?
+            .map(|v| bincode::deserialize(v.value()))
+            .transpose()?;
+        if entry.is_some_and(|e| e.physical.key() == physical_key)
+            && fault.is_some_and(|f| f.physical_key == physical_key)
+        {
+            tx.open_table(FAULTS)?.remove(location)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn source_fault(&self, location: &str, physical_key: &str) -> Result<Option<SegmentFault>> {
+        let tx = self.database.begin_read()?;
+        let fault: Option<SegmentFault> = tx
+            .open_table(FAULTS)?
+            .get(location)?
+            .map(|v| bincode::deserialize(v.value()))
+            .transpose()?;
+        Ok(fault.filter(|f| f.physical_key == physical_key))
+    }
+
     pub fn placements(&self) -> Result<Vec<PoolPlacement>> {
         self.snapshot(None)?
             .entries
@@ -728,14 +988,53 @@ impl Catalog {
         let tx = self.database.begin_read()?;
         let mut counts = BTreeMap::<String, u64>::new();
         let mut mapped_objects = 0_u64;
+        let mut quarantined_leftovers = Vec::new();
+        let health_table = tx.open_table(HEALTH)?;
         for row in tx.open_table(OBJECTS)?.iter()? {
-            let entry: Entry = bincode::deserialize(row?.1.value())?;
+            let (key, value) = row?;
+            let entry: Entry = bincode::deserialize(value.value())?;
             let id = entry
                 .physical
                 .member_id()
                 .context("mapped object has no member")?;
+            let health: MemberHealth = health_table
+                .get(id)?
+                .map(|v| bincode::deserialize(v.value()))
+                .transpose()?
+                .unwrap_or_default();
+            if health.quarantine.is_some() {
+                quarantined_leftovers.push(PoolPlacement {
+                    location: Path::parse(key.value())?,
+                    member_id: id.into(),
+                    size: entry.size,
+                });
+            }
             *counts.entry(id.to_owned()).or_default() += 1;
             mapped_objects += 1;
+        }
+        let mut unreadable = Vec::new();
+        let object_table = tx.open_table(OBJECTS)?;
+        for row in tx.open_table(FAULTS)?.iter()? {
+            let fault: SegmentFault = bincode::deserialize(row?.1.value())?;
+            let entry: Option<Entry> = object_table
+                .get(fault.location.as_str())?
+                .map(|v| bincode::deserialize(v.value()))
+                .transpose()?;
+            if entry.is_some_and(|e| e.physical.key() == fault.physical_key) {
+                unreadable.push(fault);
+            }
+        }
+        let mut upload_counts = BTreeMap::<String, u64>::new();
+        for row in tx.open_table(UPLOADS)?.iter()? {
+            let upload: Upload = bincode::deserialize(row?.1.value())?;
+            *upload_counts.entry(upload.member_id).or_default() += 1;
+        }
+        let mut garbage_counts = BTreeMap::<String, u64>::new();
+        for row in tx.open_table(GARBAGE)?.iter()? {
+            let garbage: Garbage = bincode::deserialize(row?.1.value())?;
+            if let Some(member) = garbage.entry.physical.member_id() {
+                *garbage_counts.entry(member.into()).or_default() += 1;
+            }
         }
         let table = tx.open_table(MEMBERS)?;
         let mut members = Vec::new();
@@ -746,12 +1045,76 @@ impl Catalog {
                     .context("missing member")?
                     .value(),
             )?;
+            let health: MemberHealth = tx
+                .open_table(HEALTH)?
+                .get(record.id.as_str())?
+                .map(|v| bincode::deserialize(v.value()))
+                .transpose()?
+                .unwrap_or_default();
+            let objects = counts.get(&record.id).copied().unwrap_or(0);
+            let unreadable_objects = unreadable
+                .iter()
+                .filter(|f| f.member_id == record.id)
+                .count() as u64;
+            let pending_uploads = upload_counts.get(&record.id).copied().unwrap_or(0);
+            let cleanup_debts = garbage_counts.get(&record.id).copied().unwrap_or(0);
+            let readable_evacuated = health.quarantine.is_some()
+                && objects == unreadable_objects
+                && record.reserved == 0
+                && pending_uploads == 0;
+            let loss_bytes = unreadable
+                .iter()
+                .filter(|f| f.member_id == record.id)
+                .try_fold(0_u64, |sum, f| -> Result<u64> {
+                    let entry: Entry = bincode::deserialize(
+                        object_table
+                            .get(f.location.as_str())?
+                            .context("fault placement missing")?
+                            .value(),
+                    )?;
+                    sum.checked_add(entry.size)
+                        .context("fault byte count overflow")
+                })?;
+            let safe_to_pull_with_known_loss = readable_evacuated
+                && unreadable_objects > 0
+                && record.used == loss_bytes
+                && cleanup_debts == 0;
+            let safe_to_remove = health.quarantine.is_some()
+                && record.used == 0
+                && record.reserved == 0
+                && objects == 0
+                && pending_uploads == 0
+                && cleanup_debts == 0;
+            let evacuation = if health.quarantine.is_none() {
+                "not_quarantined"
+            } else if safe_to_remove {
+                "complete"
+            } else if readable_evacuated && unreadable_objects > 0 {
+                "readable_evacuated_loss_blocked"
+            } else if objects == 0 {
+                "cleanup_pending"
+            } else if health.evacuation_error.as_deref() == Some("capacity_or_allocation_blocked") {
+                "blocked_capacity_or_admission"
+            } else if health.evacuation_error.is_some() {
+                "blocked_destination"
+            } else {
+                "incomplete"
+            }
+            .to_owned();
             members.push(PoolMemberStatus {
                 id: record.id.clone(),
                 capacity_bytes: record.capacity,
                 used_bytes: record.used,
                 reserved_bytes: record.reserved,
-                objects: counts.get(&record.id).copied().unwrap_or(0),
+                objects,
+                health,
+                safe_to_remove,
+                safe_to_pull_with_known_loss,
+                readable_evacuated,
+                unreadable_objects,
+                pending_uploads,
+                cleanup_debts,
+                evacuation,
             });
         }
         let pending_operations = usize::try_from(tx.open_table(UPLOADS)?.len()?)?
@@ -762,6 +1125,186 @@ impl Catalog {
             members,
             pending_operations,
             mapped_objects,
+            unreadable,
+            quarantined_leftovers,
         })
+    }
+}
+
+fn health_in(tx: &redb::WriteTransaction, member: &str) -> Result<MemberHealth> {
+    Ok(tx
+        .open_table(HEALTH)?
+        .get(member)?
+        .map(|v| bincode::deserialize(v.value()))
+        .transpose()?
+        .unwrap_or_default())
+}
+
+fn ensure_eligible(tx: &redb::WriteTransaction, member: &str) -> Result<()> {
+    let health = health_in(tx, member)?;
+    if let Some(reason) = health.quarantine.or(health.monitoring_error) {
+        return Err(AllocationBlocked {
+            member: member.into(),
+            reason,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod health_format_tests {
+    use super::*;
+    #[test]
+    fn disk_health_unknown_version_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("catalog");
+        let catalog = Catalog::open(&root, "db", true, None).unwrap();
+        let tx = catalog.database.begin_write().unwrap();
+        tx.open_table(META)
+            .unwrap()
+            .insert(
+                "health_format",
+                bincode::serialize(&2_u32).unwrap().as_slice(),
+            )
+            .unwrap();
+        tx.commit().unwrap();
+        drop(catalog);
+        assert!(
+            Catalog::open(&root, "db", true, None)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported pool health version")
+        );
+    }
+}
+
+#[cfg(test)]
+mod legacy_health_compatibility {
+    use super::*;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+    #[derive(Serialize)]
+    enum OldPhysical {
+        Member {
+            member_id: String,
+            key: String,
+            e_tag: Option<String>,
+            version: Option<String>,
+        },
+    }
+
+    #[test]
+    fn disk_health_opens_pre_health_catalog_records_without_reencoding() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("catalog");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(root.join(CATALOG_FILE_NAME))
+            .unwrap();
+        let db = Builder::new().create_file(file).unwrap();
+        let pool_id = "2f8cb3ea-bce5-43e0-bb27-6da74a919427";
+        let directory = root.to_str().unwrap();
+        let identity = bincode::serialize(&(1_u32, pool_id, "db", directory, true)).unwrap();
+        let marker = bincode::serialize(&(1_u32, pool_id, "db", directory)).unwrap();
+        let member = bincode::serialize(&(
+            "old-disk",
+            "memory://old-disk",
+            "old-marker",
+            true,
+            1024_u64,
+            7_u64,
+            0_u64,
+        ))
+        .unwrap();
+        let physical = OldPhysical::Member {
+            member_id: "old-disk".into(),
+            key: format!(".zerofs-pool/{pool_id}/objects/12c50a4d-1447-470d-bb7c-8b0a2e8887af"),
+            e_tag: None,
+            version: None,
+        };
+        let entry = bincode::serialize(&(
+            physical,
+            7_u64,
+            123_i64,
+            456_u32,
+            Some("original-etag".to_owned()),
+            None::<String>,
+            None::<[u8; 32]>,
+            Vec::<u8>::new(),
+        ))
+        .unwrap();
+        let location = format!("db/{}", crate::segment::Segid::new(1, 1).object_key());
+        let mut tx = db.begin_write().unwrap();
+        tx.set_durability(Durability::Immediate).unwrap();
+        tx.open_table(META)
+            .unwrap()
+            .insert("identity", identity.as_slice())
+            .unwrap();
+        tx.open_table(MEMBERS)
+            .unwrap()
+            .insert("old-disk", member.as_slice())
+            .unwrap();
+        tx.open_table(OBJECTS)
+            .unwrap()
+            .insert(location.as_str(), entry.as_slice())
+            .unwrap();
+        tx.open_table(UPLOADS).unwrap();
+        tx.open_table(GARBAGE).unwrap();
+        tx.open_table(HIDDEN_LEGACY).unwrap();
+        tx.commit().unwrap();
+        drop(db);
+        let catalog = Catalog::open(&root, "db", false, Some(&marker)).unwrap();
+        let config = PoolMember {
+            id: "old-disk".into(),
+            identity: "memory://old-disk".into(),
+            store: std::sync::Arc::new(object_store::memory::InMemory::new()),
+            capacity_bytes: 1024,
+            local_path: None,
+            min_free_bytes: 0,
+            health_device: None,
+        };
+        let status = catalog.status(&[config]).unwrap();
+        assert_eq!(status.mapped_objects, 1);
+        assert_eq!(status.members[0].used_bytes, 7);
+        assert!(status.members[0].health.quarantine.is_none());
+        let retained = catalog.lookup(&location).unwrap().entry.unwrap();
+        assert_eq!(retained.e_tag.as_deref(), Some("original-etag"));
+        assert_eq!(retained.last_modified_secs, 123);
+        let read = catalog.database.begin_read().unwrap();
+        assert_eq!(
+            read.open_table(META)
+                .unwrap()
+                .get("identity")
+                .unwrap()
+                .unwrap()
+                .value(),
+            identity
+        );
+        assert_eq!(
+            read.open_table(MEMBERS)
+                .unwrap()
+                .get("old-disk")
+                .unwrap()
+                .unwrap()
+                .value(),
+            member
+        );
+        assert_eq!(
+            read.open_table(OBJECTS)
+                .unwrap()
+                .get(location.as_str())
+                .unwrap()
+                .unwrap()
+                .value(),
+            entry
+        );
     }
 }

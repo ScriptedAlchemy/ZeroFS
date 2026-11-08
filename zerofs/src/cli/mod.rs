@@ -192,6 +192,13 @@ fn parse_transfer_jobs(value: &str) -> std::result::Result<usize, String> {
 
 #[derive(Subcommand)]
 pub enum PoolCommands {
+    /// Report live and retained-checkpoint affected paths without reading data disks
+    Affected {
+        #[arg(long)]
+        endpoint: String,
+        #[arg(long)]
+        member: String,
+    },
     /// Initialize a new placement catalog; never recreates a lost catalog
     Init {
         #[arg(short, long)]
@@ -199,8 +206,15 @@ pub enum PoolCommands {
     },
     /// Print per-member committed capacity and pending reservations as JSON
     Status {
-        #[arg(short, long)]
-        config: PathBuf,
+        #[arg(
+            short,
+            long,
+            required_unless_present = "endpoint",
+            conflicts_with = "endpoint"
+        )]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        endpoint: Option<String>,
     },
     /// List segment placements as JSON
     List {

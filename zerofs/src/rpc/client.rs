@@ -16,6 +16,24 @@ pub struct RpcClient {
 }
 
 impl RpcClient {
+    pub async fn pool_affected(&mut self, member: String) -> Result<String> {
+        Ok(self
+            .client
+            .get_pool_affected(proto::GetPoolAffectedRequest { member })
+            .await?
+            .into_inner()
+            .json)
+    }
+
+    pub async fn pool_status(&mut self) -> Result<String> {
+        Ok(self
+            .client
+            .get_pool_status(proto::GetPoolStatusRequest {})
+            .await?
+            .into_inner()
+            .json)
+    }
+
     pub async fn connect_tcp(addr: SocketAddr) -> Result<Self> {
         let endpoint = format!("http://{}", addr);
         let channel = Channel::from_shared(endpoint)

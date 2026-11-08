@@ -7,11 +7,46 @@ use anyhow::{Context, Result};
 use object_store::path::Path;
 
 pub async fn run(command: PoolCommands) -> Result<()> {
+    if let PoolCommands::Affected { endpoint, member } = &command {
+        let mut client = if let Some(path) = endpoint.strip_prefix("unix:") {
+            crate::rpc::client::RpcClient::connect_unix(path.into()).await?
+        } else {
+            crate::rpc::client::RpcClient::connect_tcp(
+                endpoint
+                    .parse()
+                    .context("endpoint must be unix:/path or IP:port")?,
+            )
+            .await?
+        };
+        println!("{}", client.pool_affected(member.clone()).await?);
+        return Ok(());
+    }
+    if let PoolCommands::Status {
+        endpoint: Some(endpoint),
+        ..
+    } = &command
+    {
+        let mut client = if let Some(path) = endpoint.strip_prefix("unix:") {
+            crate::rpc::client::RpcClient::connect_unix(path.into()).await?
+        } else {
+            crate::rpc::client::RpcClient::connect_tcp(
+                endpoint
+                    .parse()
+                    .context("endpoint must be unix:/path or IP:port")?,
+            )
+            .await?
+        };
+        println!("{}", client.pool_status().await?);
+        return Ok(());
+    }
     let config = match &command {
+        PoolCommands::Affected { .. } => unreachable!(),
         PoolCommands::Init { config }
-        | PoolCommands::Status { config }
         | PoolCommands::List { config }
         | PoolCommands::Migrate { config, .. } => config,
+        PoolCommands::Status { config, .. } => {
+            config.as_ref().context("--config required offline")?
+        }
     };
     let settings = Settings::from_file(config)?;
     let initialize = matches!(command, PoolCommands::Init { .. });
@@ -21,6 +56,7 @@ pub async fn run(command: PoolCommands) -> Result<()> {
     let sessions = opened.sftp_pool.clone();
     let result: Result<()> = async {
         match command {
+            PoolCommands::Affected { .. } => unreachable!(),
             PoolCommands::Init { .. } | PoolCommands::Status { .. } => {
                 println!("{}", serde_json::to_string_pretty(&pool.status().await?)?);
             }

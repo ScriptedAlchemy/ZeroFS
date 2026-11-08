@@ -52,6 +52,7 @@ pub async fn change_password(
         store: object_store,
         path: path_from_url,
         sftp_pool,
+        pool: _,
     } = crate::storage_backend::open_storage(settings)
         .await
         .map_err(|e| PasswordError::Other(e.to_string()))?;

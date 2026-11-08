@@ -1,3 +1,4 @@
+pub(crate) mod affected;
 pub mod errors;
 pub mod filter_policy;
 pub mod flush_coordinator;

@@ -113,6 +113,7 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
         store: object_store,
         path: path_from_url,
         sftp_pool,
+        pool: _,
     } = open_storage(&settings).await?;
     let command_result: Result<()> = async move {
         let object_store = with_storage_class(
@@ -261,6 +262,7 @@ pub async fn reseed_writeback_predecessor(
         store: remote,
         sftp_pool,
         path: database_path,
+        pool: _,
     } = open_storage(&settings).await?;
     let remote = with_storage_class(Arc::from(remote), settings.storage.storage_class.as_deref());
     let location = Path::parse(&path).context("invalid remote predecessor path")?;
@@ -339,6 +341,7 @@ pub async fn accept_remote_writeback_branch(
         store: remote,
         sftp_pool,
         path: database_path,
+        pool: _,
     } = open_storage(&settings).await?;
     let remote = with_storage_class(Arc::from(remote), settings.storage.storage_class.as_deref());
     let location = Path::parse(&manifest_path).context("invalid divergent manifest path")?;

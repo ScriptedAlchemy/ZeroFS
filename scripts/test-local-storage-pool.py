@@ -89,12 +89,13 @@ def command_json(binary: Path, deadline: float, *arguments: str):
 
 
 class Server:
-    def __init__(self, binary: Path, config: Path, root: Path, name: str, deadline: float):
+    def __init__(self, binary: Path, config: Path, root: Path, name: str, deadline: float, health_events: Path | None = None):
         self.binary = binary
         self.config = config
         self.socket_path = root / "9p.sock"
         self.log_path = root / f"{name}.log"
         self.deadline = deadline
+        self.health_events = health_events
         self.process = None
         self.log = None
 
@@ -106,6 +107,8 @@ class Server:
         self.socket_path.unlink(missing_ok=True)
         self.log = self.log_path.open("wb")
         environment = os.environ.copy()
+        if self.health_events is not None:
+            environment["ZEROFS_TEST_DISK_HEALTH"] = str(self.health_events)
         environment.update(RUST_LOG="info", NO_COLOR="1", TERM="dumb")
         try:
             self.process = subprocess.Popen(
@@ -175,6 +178,9 @@ def write_config(root: Path, members: list[tuple[str, int]]) -> Path:
     quote = json.dumps
     config = root / "zerofs.toml"
     sections = [
+        "[runtime]",
+        "memory_limit_gb = 48.0",
+        "",
         "[cache]",
         f"dir = {quote(str(root / 'cache'))}",
         "disk_size_gb = 0.25",
@@ -205,6 +211,9 @@ def write_config(root: Path, members: list[tuple[str, int]]) -> Path:
             'compression = "lz4"',
             "",
             "[servers]",
+            "",
+            "[servers.rpc]",
+            f"unix_socket = {quote(str(root / 'admin.sock'))}",
             "",
             "[servers.ninep]",
             f"unix_socket = {quote(str(root / '9p.sock'))}",
@@ -308,9 +317,120 @@ def smoke(binary: Path, root: Path) -> dict:
     }
 
 
+def health_smoke(binary: Path, root: Path) -> dict:
+    deadline = time.monotonic() + TOTAL_TIMEOUT_SECONDS
+    for directory in ("metadata", "cache", "disk1", "disk2", "disk3", "sources"):
+        (root / directory).mkdir(mode=0o700)
+    config = write_config(root, [("disk1", OTHER_MEMBER_BYTES), ("disk2", OTHER_MEMBER_BYTES)])
+    command_json(binary, deadline, "pool", "init", "--config", config)
+    events = root / "health.json"
+    events.write_text("{}")
+    expected = {}
+    for name in ("first.bin", "second.bin"):
+        data = hashlib.shake_256(f"health/{name}".encode()).digest(PAYLOAD_BYTES)
+        (root / "sources" / name).write_bytes(data)
+        expected[name] = hashlib.sha256(data).hexdigest()
+    endpoint = f"unix:{root / 'admin.sock'}"
+    with Server(binary, config, root, "server-health", deadline, events) as server:
+        for name in expected:
+            command(binary, deadline, "upload", server.target, root / "sources" / name, f"/{name}", "--jobs", "1")
+        before = command_json(binary, deadline, "pool", "status", "--endpoint", endpoint)
+        require(before["members"][0]["objects"] >= 2, "health fixture needs multiple source segments")
+        next_events = root / "health.next"
+        next_events.write_text(json.dumps({"disk1": {"device": "fixture", "pending": 1, "reallocated": 0, "uncorrectable": 0, "crc": 0, "failed": False}}))
+        next_events.replace(events)
+        while True:
+            status = command_json(binary, deadline, "pool", "status", "--endpoint", endpoint)
+            if status["members"][0]["safe_to_remove"]:
+                break
+            require(time.monotonic() < deadline, "automatic evacuation timed out")
+            time.sleep(0.1)
+        require(status["members"][0]["objects"] == 0, "safe removal with remaining placements")
+        require(status["members"][1]["objects"] == before["mapped_objects"], "automatic migration lost placements")
+        data = hashlib.shake_256(b"health/after-quarantine").digest(PAYLOAD_BYTES)
+        (root / "sources" / "after.bin").write_bytes(data)
+        expected["after.bin"] = hashlib.sha256(data).hexdigest()
+        command(binary, deadline, "upload", server.target, root / "sources" / "after.bin", "/after.bin", "--jobs", "1")
+        after = command_json(binary, deadline, "pool", "status", "--endpoint", endpoint)
+        require(after["members"][0]["objects"] == 0, "new application write reached quarantined disk")
+        require(after["members"][1]["objects"] > before["mapped_objects"], "new application write did not seal a fresh segment")
+    shutil.rmtree(root / "cache")
+    (root / "cache").mkdir(mode=0o700)
+    with Server(binary, config, root, "server-health-restart", deadline) as server:
+        download_and_verify(binary, deadline, server, root, "health-cold", expected)
+        status = command_json(binary, deadline, "pool", "status", "--endpoint", endpoint)
+        require(status["members"][0]["health"]["quarantine"] is not None, "restart lost quarantine")
+        report = command_json(binary, deadline, "pool", "affected", "--endpoint", endpoint, "--member", "disk1")
+        require(report["complete"], f"affected report incomplete: {report}")
+    return {"result": "passed", "sha256": expected, "automatic_evacuation": True, "cold_restart": True}
+
+
+def loss_smoke(binary: Path, root: Path, no_space: bool = False) -> dict:
+    root.mkdir()
+    deadline = time.monotonic() + TOTAL_TIMEOUT_SECONDS
+    for directory in ("metadata", "cache", "disk1", "disk2", "disk3", "sources"):
+        (root / directory).mkdir(mode=0o700)
+    config = write_config(root, [("disk1", OTHER_MEMBER_BYTES), ("disk2", 8 if no_space else OTHER_MEMBER_BYTES)])
+    command_json(binary, deadline, "pool", "init", "--config", config)
+    events = root / "health.json"
+    events.write_text("{}")
+    expected = {}
+    missing_body = None
+    with Server(binary, config, root, "server-loss-upload", deadline, events) as server:
+        for name in ("first.bin", "second.bin"):
+            data = hashlib.shake_256(f"loss/{name}".encode()).digest(PAYLOAD_BYTES)
+            (root / "sources" / name).write_bytes(data)
+            expected[name] = hashlib.sha256(data).hexdigest()
+            command(binary, deadline, "upload", server.target, root / "sources" / name, f"/{name}", "--jobs", "1")
+            if missing_body is None:
+                bodies = list((root / "disk1" / ".zerofs-pool").glob("*/objects/*"))
+                require(bool(bodies), "first upload created no physical body")
+                missing_body = max(bodies, key=lambda p: p.stat().st_size)
+        command(binary, deadline, "checkpoint", "create", "--config", config, "before-loss")
+    require(missing_body is not None, "missing source fixture")
+    missing_body.unlink()
+    events.write_text(json.dumps({"disk1": {"device": "fixture", "pending": 1, "reallocated": 0, "uncorrectable": 0, "crc": 0, "failed": False}}))
+    shutil.rmtree(root / "cache")
+    (root / "cache").mkdir(mode=0o700)
+    endpoint = f"unix:{root / 'admin.sock'}"
+    with Server(binary, config, root, "server-loss-recovery", deadline, events) as server:
+        if no_space:
+            failed_read = subprocess.run([str(binary), "download", server.target, "/first.bin", str(root / "first-failed-read"), "--jobs", "1"], capture_output=True, timeout=time_left(deadline, COMMAND_TIMEOUT_SECONDS))
+            require(failed_read.returncode != 0, "missing body unexpectedly readable")
+        while True:
+            status = command_json(binary, deadline, "pool", "status", "--endpoint", endpoint)
+            if no_space and status["unreadable"]:
+                require(not status["members"][0]["readable_evacuated"], "no-space recovery claimed readable data evacuated")
+                require(status["members"][0]["objects"] >= 2, "no-space recovery lost source placements")
+                break
+            if not no_space and status["members"][0]["safe_to_pull_with_known_loss"]:
+                break
+            require(time.monotonic() < deadline, "partial-loss recovery timed out")
+            time.sleep(0.1)
+        require(not status["members"][0]["safe_to_remove"], "loss was marked safe to remove")
+        require(status["members"][0]["safe_to_pull_with_known_loss"] == (not no_space), "known-loss removal assessment does not match remaining readable data")
+        require(len(status["unreadable"]) >= 1, "missing body has no persistent evidence")
+        download_and_verify(binary, deadline, server, root, "loss-healthy", {"second.bin": expected["second.bin"]})
+        report = command_json(binary, deadline, "pool", "affected", "--endpoint", endpoint, "--member", "disk1")
+        require(report["complete"], f"loss report incomplete: {report}")
+        refs = [r for v in report["views"] for r in v["references"]]
+        require(any(list(b"/first.bin") in r["paths"] for r in refs), "affected report omitted damaged pathname")
+        require(any("before-loss" in v["view"] and v["references"] for v in report["views"]), "affected report omitted retained checkpoint")
+        failed_read = subprocess.run([str(binary), "download", server.target, "/first.bin", str(root / "damaged-download"), "--jobs", "1"], capture_output=True, timeout=time_left(deadline, COMMAND_TIMEOUT_SECONDS))
+        require(failed_read.returncode != 0, "damaged file silently read successfully")
+    shutil.rmtree(root / "cache")
+    (root / "cache").mkdir(mode=0o700)
+    with Server(binary, config, root, "server-loss-restart", deadline) as server:
+        status = command_json(binary, deadline, "pool", "status", "--endpoint", endpoint)
+        require(len(status["unreadable"]) >= 1 and not status["members"][0]["safe_to_remove"], "restart lost loss-blocked status")
+        download_and_verify(binary, deadline, server, root, "loss-restart-healthy", {"second.bin": expected["second.bin"]})
+    return {"partial_loss_no_space" if no_space else "partial_loss": True, "healthy_sha256": expected["second.bin"], "checkpoint_affected": True}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path, help="built ZeroFS executable")
+    parser.add_argument("--health-recovery", action="store_true", help="requires a disk-health-test-hooks build")
     arguments = parser.parse_args()
     try:
         binary = arguments.binary.resolve(strict=True)
@@ -318,7 +438,12 @@ def main() -> int:
         with tempfile.TemporaryDirectory(prefix="zpool-") as temporary:
             root = Path(temporary).resolve()
             try:
-                receipt = smoke(binary, root)
+                if arguments.health_recovery:
+                    receipt = health_smoke(binary, root)
+                    receipt.update(loss_smoke(binary, root / "loss"))
+                    receipt.update(loss_smoke(binary, root / "full", no_space=True))
+                else:
+                    receipt = smoke(binary, root)
             except BaseException:
                 for log in sorted(root.glob("server-*.log")):
                     print(f"\n{log.name}:\n{tail(log.read_text(errors='replace'))}", file=sys.stderr)

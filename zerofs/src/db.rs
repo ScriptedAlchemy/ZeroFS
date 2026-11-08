@@ -694,6 +694,37 @@ impl Db {
     /// caller that finishes or drops the stream therefore drops its iterator
     /// directly. Read-ahead is limited to one block per fetch, with one fetch
     /// task per SST; callers separately bound decoded rows and bytes.
+    pub(crate) async fn scan_metadata_snapshot(
+        &self,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<(Bytes, Bytes)>> + Send + '_>>> {
+        self.check_lease()?;
+        let options = ScanOptions {
+            read_ahead_bytes: 1,
+            cache_blocks: false,
+            max_fetch_tasks: 1,
+            ..Default::default()
+        };
+        let (iter, snapshot) = match &self.inner {
+            SlateDbHandle::ReadWrite(db) => {
+                let snapshot = db.snapshot().await?;
+                let iter = snapshot.scan_with_options(.., &options).await?;
+                (iter, Some(snapshot))
+            }
+            SlateDbHandle::ReadOnly(reader) => {
+                (reader.load().scan_with_options(.., &options).await?, None)
+            }
+        };
+        Ok(Box::pin(futures::stream::try_unfold(
+            (iter, snapshot),
+            |(mut iter, snapshot)| async move {
+                match iter.next().await? {
+                    Some(kv) => Ok(Some(((kv.key, kv.value), (iter, snapshot)))),
+                    None => Ok(None),
+                }
+            },
+        )))
+    }
+
     pub(crate) async fn scan_bounded<R: slatedb::ByteRangeBounds + Send>(
         &self,
         range: R,

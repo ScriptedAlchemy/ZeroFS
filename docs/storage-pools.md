@@ -228,3 +228,105 @@ startup checks. `scripts/test-local-storage-pool.py` exercises initialization,
 actual 9P uploads/downloads, local-member overflow, capacity expansion,
 migration, cache removal, and a server restart against isolated temporary data.
 The Rust CI workflow runs that application-level test against its built server.
+
+## Physical disk health
+
+Keep metadata and `catalog_dir` on dependable storage separate from data disks.
+Give each physical disk one mounted directory and one pool member. ZeroFS uses
+ordinary files on these mounts. It does not format disks, manage mounts, build
+RAID, or reconstruct an unreadable single copy.
+
+A Linux local member can opt into read-only ATA SMART and kernel monitoring with
+`health_device = "/dev/disk/by-id/ata-EXAMPLE-part1"` in its
+`[[storage.pool.members]]` entry. The device must be the block device backing the
+mounted filesystem. Whole-disk filesystems use the whole-disk node. Duplicate
+physical disk assignments, device-mapper devices, and ambiguous mappings are
+rejected. Remote members and directory-only members remain supported without
+claiming hardware monitoring coverage.
+
+The server attempts an initial probe before opening listeners. It then samples
+at 60-second intervals. `smartctl --json --all` runs without a shell, with a
+10-second deadline and a 1 MiB output limit. The service account needs read
+access to the configured device and `/dev/kmsg`. ZeroFS does not run `sudo`,
+self-tests, repairs, or device-setting commands. Missing tools, unsupported ATA
+attributes, access errors, and timeouts block monitored allocation and appear
+as `monitoring_error`. Known failed-status or pending-sector evidence still
+quarantines and starts evacuation when optional counters are missing. Missing
+telemetry never becomes a synthetic zero or evidence that data was destroyed. Kernel
+coverage reports restricted access, ring gaps, bounded backlogs, and the limit
+to recognized messages with exact device tokens.
+
+Positive pending or uncorrectable sectors and overall SMART failure quarantine
+immediately. Reallocated-sector growth quarantines relative to the stored
+baseline. The first distinct UDMA CRC increase warns. The second increase
+quarantines, even if stable samples occurred between them. Replayed unchanged
+samples do not count again. Quarantine survives restart and does not clear after
+a good sample or after monitoring is disabled. A missing monitored device or
+lost mount binding at startup quarantines that member and records unavailable
+coverage while the remaining members continue to serve.
+
+Quarantine commits in the same catalog authority used by reserve, upload start,
+and publication. All three reject a quarantined destination, including explicit
+migration targets and late multipart completion. Already submitted bytes may
+finish as unpublished bodies. Their reservation remains charged until cleanup.
+Device binding and member markers are rechecked on writes and before publication.
+
+The running server automatically copies readable quarantined segments through
+the existing verified migration path. One migration at a time shares the
+512 MiB transfer bound with explicit migration. The destination is verified
+before atomic durable remap, and source deletion follows remap. Source read
+failures remain tied to their physical generation. Destination verification
+errors do not label source data unreadable. Recovery continues to other segments
+and retries with bounded polling. The runtime also retries existing deletion
+and abandoned-upload debts, excluding uploads that still have a live owner.
+Ordinary transient or invalid-range reads do not create durable data faults.
+Recorded faults can clear only after the exact physical generation passes its
+stored SHA-256 verification, or after verified migration replaces that generation.
+Without sufficient healthy capacity, remaining
+placements stay visible and completion stays false.
+
+Inspect a running server through its existing admin RPC socket:
+
+```sh
+zerofs pool status --endpoint unix:/run/zerofs/admin.sock
+zerofs pool affected --endpoint unix:/run/zerofs/admin.sock --member disk1
+```
+
+Offline `pool status --config zerofs.toml` still takes the catalog's exclusive
+lock and requires a stopped server. Opening storage or running an offline command
+does not start hardware probes or automatic migration. Read-only and checkpoint
+servers expose status but do not run automatic evacuation.
+
+`quarantined_leftovers` lists remaining source placements. `unreadable` lists
+observed source failures with generation and reason. `readable_evacuated` can be
+true when only these failures remain. That condition reports
+`readable_evacuated_loss_blocked` and keeps the loss-free `safe_to_remove=false`.
+`safe_to_pull_with_known_loss=true` explicitly identifies the brief's condition
+that only listed unreadable leftovers remain. It additionally requires no
+reservations, no old-body cleanup debt, and no active owned operation or read
+lease. Pulling in this state abandons the only persistent copies of the listed
+segments. It never means data was reconstructed.
+`pending_uploads` and `cleanup_debts` count operations even when their byte
+counts are zero. `safe_to_remove` requires zero source placements, zero used bytes including old
+body cleanup debts, zero reservations, and no active owned operation or read
+lease. Status is a snapshot. It does not
+remove configuration, delete damaged files, or authorize a hot unplug.
+
+Affected reports join `FrameLoc.segid` metadata to directory entries in retained
+SlateDB snapshots, including every retained checkpoint. They never read failed
+segment bodies. Paths are lossless absolute byte arrays and include hardlinks.
+Unlinked or unreachable inodes retain inode and extent identities with no paths.
+Segments with no discovered owner are listed as unresolved. Row and path limits,
+metadata errors, cycles, and checkpoint-set changes produce explicit incomplete
+reports. No empty result proves data is recoverable or backed up.
+
+Old catalog record encodings and existing backend layouts are unchanged. New
+health and fault state lives in separate versioned tables. Old binaries ignore
+those tables, so downgrading a health-enabled pool to a pre-health binary is
+unsupported and does not preserve quarantine enforcement.
+
+The optional `disk-health-test-hooks` Cargo feature enables a temporary-file
+observation source for the local integration harness. It is absent from ordinary
+builds and exposes no fault RPC. Run its isolated test with
+`scripts/test-local-storage-pool.py --health-recovery` against a binary built with
+that feature. Do not use that build for production.
