@@ -52,7 +52,11 @@ async fn fault_fixture(count: usize) -> (tempfile::TempDir, PoolObjectStore, Vec
             .unwrap();
         locks.push(lock);
     }
-    assert_eq!(locks.len(), count, "fixture needs distinct key-lock stripes");
+    assert_eq!(
+        locks.len(),
+        count,
+        "fixture needs distinct key-lock stripes"
+    );
     let faults = pool.faults().await.unwrap();
     assert_eq!(faults.len(), count);
     (root, pool, faults)
