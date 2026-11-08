@@ -382,8 +382,14 @@ mod tests {
     fn disk_health_prefail_threshold_exit_quarantines_despite_overall_pass() {
         let fixture = br#"{"serial_number":"disk","smart_status":{"passed":true}}"#;
         let (sample, coverage) = parse_smart(fixture, 16).unwrap();
-        assert!(sample.failed, "SMART exit bit 4 is an active prefail threshold breach");
-        assert!(coverage.is_some(), "missing counters must retain coverage warning");
+        assert!(
+            sample.failed,
+            "SMART exit bit 4 is an active prefail threshold breach"
+        );
+        assert!(
+            coverage.is_some(),
+            "missing counters must retain coverage warning"
+        );
         assert!(!parse_smart(fixture, 4).unwrap().0.failed);
     }
 
