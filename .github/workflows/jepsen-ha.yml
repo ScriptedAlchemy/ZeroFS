@@ -82,6 +82,16 @@ jobs:
           lein version
 
       # Verify lifecycle and takeover contracts before mounted HA scenarios.
+      # Dependency transport failures must not rerun or mask durability assertions.
+      - name: Resolve Jepsen dependencies with bounded retries
+        run: |
+          cd "$GITHUB_WORKSPACE/jepsen/ha"
+          lein=(lein)
+          if [[ "${{ matrix.mount-client }}" == fuse ]]; then
+            lein=(sudo env HOME=/root LEIN_ROOT=1 JAVA_HOME="$JAVA_HOME" /usr/local/bin/lein)
+          fi
+          bash "$GITHUB_WORKSPACE/scripts/ci/retry-lein-deps.sh" "${lein[@]}"
+
       - name: Test HA harness contracts
         run: |
           cd "$GITHUB_WORKSPACE/jepsen/ha"
@@ -296,6 +306,16 @@ jobs:
             -o /usr/local/bin/lein
           sudo chmod +x /usr/local/bin/lein
           lein version
+
+      # Dependency transport failures must not rerun or mask durability assertions.
+      - name: Resolve Jepsen dependencies with bounded retries
+        run: |
+          cd "$GITHUB_WORKSPACE/jepsen/ha"
+          lein=(lein)
+          if [[ "${{ matrix.mount-client }}" == fuse ]]; then
+            lein=(sudo env HOME=/root LEIN_ROOT=1 JAVA_HOME="$JAVA_HOME" /usr/local/bin/lein)
+          fi
+          bash "$GITHUB_WORKSPACE/scripts/ci/retry-lein-deps.sh" "${lein[@]}"
 
       - name: Build pinned MinIO fixture
         uses: ./.github/actions/build-minio-fixture
