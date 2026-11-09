@@ -101,3 +101,10 @@ jobs:
         run: |
           cargo test --features failpoints --test failpoints --verbose
           RUSTFLAGS="$DST_RUSTFLAGS" cargo test --features failpoints --test dst crash_points --verbose
+      # Keep fault injection in this test-only job, after the ordinary binary
+      # checks. Shared CI artifacts and release builds never enable these hooks.
+      - name: Build disk-health acceptance test binary
+        run: cargo build --locked --bin zerofs --features disk-health-test-hooks --verbose
+      - name: Exercise disk-health recovery over 9P
+        timeout-minutes: 20
+        run: python3 ../scripts/test-local-storage-pool.py --binary target/debug/zerofs --health-recovery
