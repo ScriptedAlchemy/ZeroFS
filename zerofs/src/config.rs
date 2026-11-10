@@ -232,10 +232,10 @@ pub struct SftpConfig {
     /// SSH implementation that carries SFTP. Only native `russh` is supported.
     #[serde(default, skip_serializing_if = "SftpSshTransport::is_russh")]
     pub(crate) transport: SftpSshTransport,
-    /// Flush-stall watchdog: when write operations stay pending this many
-    /// seconds without one completing, every pooled session is force-closed
-    /// so replacements reconnect. Catches backends that stall an established
-    /// TCP session without erroring it. 0 disables the watchdog.
+    /// Stall watchdog: when reads, writes, or metadata operations stay pending
+    /// this many seconds without a completion in that class, recycle pooled
+    /// sessions so replacements reconnect. The legacy option name is retained.
+    /// 0 disables the watchdog.
     #[serde(default = "default_sftp_flush_stall_recycle_secs")]
     pub(crate) flush_stall_recycle_secs: u64,
     /// Auth-stall watchdog: when every SSH dial has been rejected at

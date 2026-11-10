@@ -114,11 +114,9 @@ const SFTP_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 const SFTP_SESSION_FORCE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const SFTP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const SFTP_IDLE_REAP_INTERVAL: Duration = Duration::from_secs(10);
-/// A backend can stall an established TCP session without erroring it: write
-/// requests then pend inside their sessions and admission slots drain to
-/// zero throughput while every socket still looks healthy. When write work
-/// stays pending this long without one write completing, the watchdog
-/// force-closes every pooled session so replacements reconnect. Zero
+/// When an operation class stays pending without completions, recycle the
+/// pool even if other classes are progressing. This includes reads and
+/// metadata operations such as staging cleanup, not just writes. Zero
 /// disables the watchdog; the production value comes from
 /// `[sftp] flush_stall_recycle_secs`.
 const SFTP_FLUSH_STALL_RECYCLE_DISABLED: u64 = 0;
@@ -555,14 +553,17 @@ impl FairAdmission {
         state.waiters.clear();
     }
 
-    /// Whether any write operation is admitted or queued right now.
-    fn write_work_pending(&self) -> bool {
+    fn work_pending(&self) -> [bool; 3] {
         let state = self.inner.state.lock().unwrap();
-        state.active_writes > 0
-            || state
-                .waiters
-                .iter()
-                .any(|waiter| waiter.kind == OperationKind::Write)
+        let mut pending = [
+            state.active_reads > 0,
+            state.active_writes > 0,
+            state.active_metadata > 0,
+        ];
+        for waiter in &state.waiters {
+            pending[waiter.kind as usize] = true;
+        }
+        pending
     }
 
     #[cfg(test)]
@@ -730,10 +731,8 @@ struct PoolInner {
     idle_warm_floor: AtomicUsize,
     // Millisecond window for the flush-stall watchdog; zero disables it.
     flush_stall_recycle_millis: AtomicU64,
-    // Completed (transport-answered) write operations, the watchdog's
-    // liveness signal.
-    write_completions: AtomicU64,
-    flush_stall: StdMutex<FlushStallTracker>,
+    operation_completions: [AtomicU64; 3],
+    flush_stall: StdMutex<[FlushStallTracker; 3]>,
     // Millisecond window for the auth-stall watchdog; zero disables it.
     auth_stall_recycle_millis: AtomicU64,
     auth_stall: StdMutex<AuthStallTracker>,
@@ -772,7 +771,7 @@ fn is_auth_rejection(error: &TransportError) -> bool {
     matches!(error, TransportError::AuthenticationRejected(_))
 }
 
-/// Watchdog state: the completion count last observed and how long write
+/// Watchdog state: the completion count last observed and how long
 /// work has been pending without that count advancing.
 #[derive(Debug, Default)]
 struct FlushStallTracker {
@@ -1057,49 +1056,57 @@ impl PoolInner {
         }
     }
 
-    /// Runs on every reaper tick. Write work continuously pending without a
-    /// single write completing means every carrying session may be stalled
-    /// on a backend that no longer answers (an established TCP session a
-    /// storage backend wedged without erroring it). Recycle the whole pool:
-    /// force-closing the sessions errors their pending operations, retries
-    /// re-checkout onto freshly dialed connections, and the log line makes a
-    /// stall visible instead of silent.
+    /// Track each operation class independently so healthy writes cannot
+    /// mask stalled reads or staging cleanup.
     fn check_flush_stall(self: &Arc<Self>) {
         let window = self.flush_stall_recycle_millis.load(Ordering::SeqCst);
         if window == SFTP_FLUSH_STALL_RECYCLE_DISABLED || self.closed.load(Ordering::SeqCst) {
             return;
         }
         let window = Duration::from_millis(window);
-        let completions = self.write_completions.load(Ordering::SeqCst);
+        let pending = self.admission.work_pending();
         let now = Instant::now();
-        let stalled_for = {
-            let mut stall = self.flush_stall.lock().unwrap();
-            if !self.admission.write_work_pending() {
-                stall.pending_since = None;
-                return;
-            }
-            if stall.pending_since.is_none() || completions != stall.last_completions {
+        let stalled = {
+            let mut stalls = self.flush_stall.lock().unwrap();
+            let mut stalled = None;
+            for kind in [
+                OperationKind::Read,
+                OperationKind::Write,
+                OperationKind::Metadata,
+            ] {
+                let index = kind as usize;
+                let stall = &mut stalls[index];
+                let completions = self.operation_completions[index].load(Ordering::SeqCst);
+                if !pending[index] {
+                    stall.pending_since = None;
+                } else if stall.pending_since.is_none() || completions != stall.last_completions {
+                    stall.pending_since = Some(now);
+                } else if let Some(since) = stall.pending_since {
+                    let elapsed = now.saturating_duration_since(since);
+                    if elapsed >= window && stalled.is_none() {
+                        stalled = Some((kind, elapsed));
+                    }
+                }
                 stall.last_completions = completions;
-                stall.pending_since = Some(now);
-                return;
             }
-            let pending_since = stall
-                .pending_since
-                .expect("pending_since was checked above");
-            let stalled_for = now.saturating_duration_since(pending_since);
-            if stalled_for < window {
-                return;
+            if stalled.is_some() {
+                for stall in stalls.iter_mut() {
+                    if stall.pending_since.is_some() {
+                        stall.pending_since = Some(now);
+                    }
+                }
             }
-            // Restart the window so a backend that stays wedged is recycled
-            // again rather than warned about exactly once.
-            stall.pending_since = Some(now);
-            stalled_for
+            stalled
+        };
+        let Some((kind, stalled_for)) = stalled else {
+            return;
         };
         let recycled = self.recycle_all_sessions();
         tracing::warn!(
+            operation_kind = ?kind,
             stalled_secs = stalled_for.as_secs(),
             sessions = recycled,
-            "SFTP write flushes made no progress while work was pending; \
+            "SFTP operations made no progress while work was pending; \
              force-closing every pooled session so replacements reconnect"
         );
         metrics::counter!("zerofs_sftp_pool_stall_recycles_total").increment(1);
@@ -1435,8 +1442,8 @@ impl SftpSessionPool {
                 session_cursor: AtomicUsize::new(0),
                 idle_warm_floor: AtomicUsize::new(SFTP_IDLE_WARM_FLOOR),
                 flush_stall_recycle_millis: AtomicU64::new(SFTP_FLUSH_STALL_RECYCLE_DISABLED),
-                write_completions: AtomicU64::new(0),
-                flush_stall: StdMutex::new(FlushStallTracker::default()),
+                operation_completions: std::array::from_fn(|_| AtomicU64::new(0)),
+                flush_stall: StdMutex::new(std::array::from_fn(|_| FlushStallTracker::default())),
                 auth_stall_recycle_millis: AtomicU64::new(SFTP_AUTH_STALL_RECYCLE_DISABLED),
                 auth_stall: StdMutex::new(AuthStallTracker::default()),
                 directories: DirectoryCache::default(),
@@ -2102,11 +2109,7 @@ impl SessionLease {
             .session
             .take()
             .expect("lease always owns a session until completion");
-        if self.kind == OperationKind::Write {
-            // The transport answered this write, so the flush path is alive;
-            // the stall watchdog keys off this count.
-            self.pool.write_completions.fetch_add(1, Ordering::SeqCst);
-        }
+        self.pool.operation_completions[self.kind as usize].fetch_add(1, Ordering::SeqCst);
         self.pool.release_session(&session, self.kind);
         drop(self.admission.take());
         drop(self.activity.take());
@@ -2115,8 +2118,8 @@ impl SessionLease {
 
     fn start_retirement(&mut self) -> Option<tokio::task::JoinHandle<Result<(), TransportError>>> {
         let session = self.session.take()?;
-        // Marking the session broken removes it from placement; the close
-        // itself happens once the last concurrent operation releases it.
+        // Let sibling operations finish briefly, but never let a stalled
+        // sibling retain a broken session outside the watchdog's roster.
         let pool = self.pool.clone();
         if self.kind == OperationKind::Write {
             session.active_writes.fetch_sub(1, Ordering::SeqCst);
@@ -2132,7 +2135,15 @@ impl SessionLease {
             let result = if remaining == 0 {
                 pool.close_shared_session(session).await
             } else {
-                session.wait_close_settled().await
+                match tokio::time::timeout(SFTP_SESSION_CLOSE_TIMEOUT, session.wait_close_settled())
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        pool.close_shared_session(session.clone()).await?;
+                        session.wait_close_settled().await
+                    }
+                }
             };
             pool.roster_changed.notify_waiters();
             drop(admission);
@@ -4494,6 +4505,174 @@ mod tests {
         // The stalled operation's owner finds its session already closed.
         lease.retire().await.unwrap();
         pool.shutdown().await.unwrap();
+    }
+
+    async fn assert_stalled_kind_reconnects(kind: OperationKind) {
+        let factory = RecordingFactory::fully_capable();
+        let pool = pool(factory.clone(), 2, 2, 2).await;
+        pool.inner
+            .flush_stall_recycle_millis
+            .store(30_000, Ordering::SeqCst);
+        let stuck = pool.checkout(kind).await.unwrap();
+        pool.inner.check_flush_stall();
+        tokio::time::advance(Duration::from_secs(31)).await;
+        pool.inner.check_flush_stall();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            factory.live(),
+            0,
+            "{kind:?} must trigger connection recovery"
+        );
+        stuck.retire().await.unwrap();
+
+        let dials = factory.dials();
+        let recovered = pool.checkout(kind).await.unwrap();
+        assert_eq!(factory.dials(), dials + 1);
+        recovered.complete().await.unwrap();
+        pool.shutdown().await.unwrap();
+        assert_eq!(factory.live(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_reads_reconnect_without_pending_writes() {
+        assert_stalled_kind_reconnects(OperationKind::Read).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_metadata_reconnects_without_pending_writes() {
+        assert_stalled_kind_reconnects(OperationKind::Metadata).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completing_writes_do_not_mask_stalled_reads() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = pool(factory.clone(), 1, 2, 2).await;
+        pool.inner
+            .flush_stall_recycle_millis
+            .store(30_000, Ordering::SeqCst);
+        let stuck = pool.checkout(OperationKind::Read).await.unwrap();
+        pool.inner.check_flush_stall();
+        for _ in 0..4 {
+            pool.checkout(OperationKind::Write)
+                .await
+                .unwrap()
+                .complete()
+                .await
+                .unwrap();
+            tokio::time::advance(Duration::from_secs(8)).await;
+            pool.inner.check_flush_stall();
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(factory.live(), 0);
+        stuck.retire().await.unwrap();
+        pool.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completing_reads_and_metadata_keep_the_stall_watchdog_quiet() {
+        for kind in [OperationKind::Read, OperationKind::Metadata] {
+            let factory = RecordingFactory::fully_capable();
+            let pool = pool(factory.clone(), 1, 2, 2).await;
+            pool.inner
+                .flush_stall_recycle_millis
+                .store(30_000, Ordering::SeqCst);
+            for _ in 0..6 {
+                let lease = pool.checkout(kind).await.unwrap();
+                pool.inner.check_flush_stall();
+                tokio::time::advance(Duration::from_secs(10)).await;
+                lease.complete().await.unwrap();
+                pool.inner.check_flush_stall();
+            }
+            assert_eq!(factory.dials(), 1);
+            assert_eq!(factory.live(), 1);
+            pool.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disabled_stall_watchdog_keeps_pending_sessions() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = pool(factory.clone(), 1, 2, 2).await;
+        let lease = pool.checkout(OperationKind::Read).await.unwrap();
+        pool.inner.check_flush_stall();
+        tokio::time::advance(Duration::from_secs(180)).await;
+        pool.inner.check_flush_stall();
+        assert_eq!(factory.live(), 1);
+        lease.complete().await.unwrap();
+        pool.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retirement_does_not_wait_forever_for_a_stalled_sibling() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = pool(factory.clone(), 1, 2, 2).await;
+        let abandoned = pool.checkout(OperationKind::Read).await.unwrap();
+        let sibling = pool.checkout(OperationKind::Read).await.unwrap();
+        drop(abandoned);
+        tokio::task::yield_now().await;
+        assert_eq!(factory.live(), 1);
+        assert!(pool.inner.roster.lock().unwrap().is_empty());
+
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            factory.live(),
+            0,
+            "retired sessions must close even with a stalled sibling"
+        );
+        let recovered = pool.checkout(OperationKind::Read).await.unwrap();
+        assert_eq!(factory.live(), 1);
+        assert_eq!(
+            factory.peak(),
+            1,
+            "reconnection must preserve the physical connection limit"
+        );
+        recovered.complete().await.unwrap();
+        sibling.retire().await.unwrap();
+        pool.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_retirement_deadlines_hold_admission_until_close_settles() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = pool(factory.clone(), 1, 3, 2).await;
+        factory.state.block_close.store(1, Ordering::SeqCst);
+        let first = pool.checkout(OperationKind::Read).await.unwrap();
+        let second = pool.checkout(OperationKind::Read).await.unwrap();
+        let sibling = pool.checkout(OperationKind::Read).await.unwrap();
+        drop(first);
+        drop(second);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(factory.state.close_started_count.load(Ordering::SeqCst), 1);
+        assert_eq!(factory.live(), 1);
+        assert_eq!(
+            pool.inner
+                .admission
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .active_reads,
+            3
+        );
+
+        factory.state.block_close.store(0, Ordering::SeqCst);
+        factory.state.allow_close.notify_waiters();
+        sibling.retire().await.unwrap();
+        pool.shutdown().await.unwrap();
+        assert_eq!(factory.live(), 0);
+        assert_eq!(
+            pool.inner
+                .admission
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .active_reads,
+            0
+        );
     }
 
     #[tokio::test(start_paused = true)]

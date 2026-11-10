@@ -10,6 +10,8 @@ Durability still depends on the configured journal disk and remote storage.
 | Failure | Recovery | Safety boundary |
 | --- | --- | --- |
 | Connection handshake exceeds 30 seconds | Cancel it, retain its connection slot until cleanup settles, then retry with dial backoff | An opener that cannot settle within the additional 5 seconds closes the pool |
+| Reads, writes, or metadata stay pending without a completion in that class | Recycle pooled sessions after `flush_stall_recycle_secs` (default 120 seconds); progress in another class does not reset the window | Existing physical-close ownership and connection limits still apply; 0 disables this watchdog |
+| An abandoned operation shares a connection with stalled siblings | Remove the connection from placement, allow siblings up to 10 seconds to settle, then run the owned close path | Retain admission and connection capacity until physical cleanup settles; no unbounded wait outside the pool roster |
 | Publication reply and staging removal both fail | Retain the exact staging owner, retry bounded removal with 1–30 second backoff, then replay the durable journal record | Never advance the remote sequence merely because cleanup succeeded |
 | Large multipart write fails and abort cannot remove staging | The same typed SFTP cleanup recovery; generic multipart backends retain their existing fail-closed contract | No new publication while the prior attempt's owned cleanup is unresolved |
 | Create already committed but its reply was lost | Cleanup, replay, and verify the existing object's exact bytes | Different bytes remain terminal; never overwrite a conflicting immutable object |
@@ -56,6 +58,13 @@ replays, shutdown during cleanup, caller cancellation and physical slot
 ownership. Assertions include unchanged remote watermarks during the outage,
 retained journal records, exact payload bytes after recovery, and no leftover
 owned staging paths.
+
+Pool regressions also hold read and metadata leases without completions, verify
+connection recycling and redial, and abandon one lease while another retains the
+same connection. The latter must release the physical connection within the
+retirement grace period without exceeding the connection limit on redial. These
+deterministic pool tests cover the recovery policy, not a reproduction of every
+provider outage or a production deployment receipt.
 
 `russh_pool_recovers_after_real_stalled_handshake_without_restart` additionally
 uses real loopback TCP/SSH/SFTP: write durable bytes, stall the next handshake
