@@ -80,6 +80,11 @@ the same close result, including failures. These deterministic pool tests cover
 the recovery policy and connection limit on redial, not a reproduction of every
 provider outage or a production deployment receipt.
 
+Connection open, retirement, and close tasks run on the runtime that created
+the pool. Dropping a lease outside a runtime, or shutting down a separate
+caller's runtime, does not abandon its cleanup or release connection capacity
+early. The pool's owning runtime must remain alive through pool shutdown.
+
 `russh_pool_recovers_after_real_stalled_handshake_without_restart` additionally
 uses real loopback TCP/SSH/SFTP: write durable bytes, stall the next handshake
 past the actual deadline, observe socket closure, reconnect through the same

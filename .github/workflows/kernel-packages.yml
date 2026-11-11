@@ -180,7 +180,7 @@ jobs:
 
   gate:
     name: Kernel package gate
-    if: always()
+    if: ${{ !cancelled() }}
     needs: [resolve, package, smoke]
     runs-on: ubuntu-26.04
     env:

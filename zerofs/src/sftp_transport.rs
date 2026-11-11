@@ -826,6 +826,17 @@ impl Drop for FailClosedOnOwnerDrop {
 }
 
 impl PoolInner {
+    /// Connection lifetime work belongs to the pool's runtime. A request can
+    /// be polled on another runtime, or its abandoned lease dropped outside
+    /// any runtime, without transferring ownership of physical cleanup.
+    fn spawn_owned<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.tasks.spawn_on(future, &self.runtime)
+    }
+
     fn fail_closed(self: &Arc<Self>) {
         let _gate = self.activity_gate.lock().unwrap();
         if self.closed.swap(true, Ordering::SeqCst) {
@@ -858,24 +869,11 @@ impl PoolInner {
     }
 
     fn close_departing_sessions(self: &Arc<Self>, departing: Vec<Arc<SharedSession>>) {
-        if departing.is_empty() {
-            return;
-        }
-        if tokio::runtime::Handle::try_current().is_ok() {
-            for session in departing {
-                let pool = self.clone();
-                self.tasks.spawn(async move {
-                    let _ = pool.close_shared_session(session).await;
-                });
-            }
-        } else {
-            // No runtime to run the graceful close; dropping the transport
-            // still tears the connection down via its Drop.
-            for session in departing {
-                if !session.closing.swap(true, Ordering::SeqCst) {
-                    drop(session.take_lifetime());
-                }
-            }
+        for session in departing {
+            let pool = self.clone();
+            self.spawn_owned(async move {
+                let _ = pool.close_shared_session(session).await;
+            });
         }
     }
 
@@ -913,16 +911,11 @@ impl PoolInner {
             *session.idle_since.lock().unwrap() = Instant::now();
             if broken || self.closed.load(Ordering::SeqCst) {
                 self.remove_from_roster(session);
-                if tokio::runtime::Handle::try_current().is_ok() {
-                    let pool = self.clone();
-                    let session = session.clone();
-                    self.tasks.spawn(async move {
-                        let _ = pool.close_shared_session(session).await;
-                    });
-                } else if !session.closing.swap(true, Ordering::SeqCst) {
-                    self.fail_closed();
-                    drop(session.take_lifetime());
-                }
+                let pool = self.clone();
+                let session = session.clone();
+                self.spawn_owned(async move {
+                    let _ = pool.close_shared_session(session).await;
+                });
                 return;
             }
         }
@@ -991,7 +984,7 @@ impl PoolInner {
     ) -> Result<(), TransportError> {
         let (sender, receiver) = oneshot::channel();
         let owner_pool = self.clone();
-        self.tasks.spawn(async move {
+        self.spawn_owned(async move {
             let lifetime = lifetime;
             let mut fail_closed_on_drop = FailClosedOnOwnerDrop::new(owner_pool.clone());
             let force = CancellationToken::new();
@@ -1133,7 +1126,7 @@ impl PoolInner {
         let recycled = departing.len();
         for session in departing {
             let pool = self.clone();
-            self.tasks.spawn(async move {
+            self.spawn_owned(async move {
                 let _ = pool.close_shared_session(session).await;
             });
         }
@@ -1251,7 +1244,7 @@ impl PoolInner {
 
         for session in expired {
             let inner = self.clone();
-            self.tasks.spawn(async move {
+            self.spawn_owned(async move {
                 let _ = inner.close_shared_session(session).await;
             });
         }
@@ -1492,7 +1485,7 @@ impl SftpSessionPool {
         let inner = Arc::downgrade(&self.inner);
         let shutdown = self.inner.reaper_shutdown.clone();
         let mut next_tick = Instant::now() + SFTP_IDLE_REAP_INTERVAL;
-        self.inner.tasks.spawn(async move {
+        self.inner.spawn_owned(async move {
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
@@ -1831,7 +1824,7 @@ impl SftpSessionPool {
         let writable = inner.writable;
         let owner_pool = inner.clone();
         let (sender, receiver) = oneshot::channel();
-        self.inner.tasks.spawn(async move {
+        self.inner.spawn_owned(async move {
             let mut permit = Some(permit);
             let mut fail_closed_on_drop = FailClosedOnOwnerDrop::new(owner_pool.clone());
             let force = owner_pool.session_shutdown.child_token();
@@ -2129,7 +2122,7 @@ impl SessionLease {
         // The close runs in an owned task so caller cancellation or an
         // implicit lease drop cannot abandon it half-way. Admission and pool
         // activity remain held until the physical session has settled.
-        Some(self.pool.tasks.spawn(async move {
+        Some(self.pool.spawn_owned(async move {
             let result = if remaining == 0 {
                 pool.close_shared_session(session.clone()).await?;
                 // A sibling's deadline or the watchdog may already own the
@@ -3033,6 +3026,169 @@ mod tests {
             while ran.load(Ordering::SeqCst) == 0 {
                 tokio::task::yield_now().await;
             }
+            pool.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn dropped_lease_outside_caller_runtime_retains_owned_cleanup() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let factory = RecordingFactory::fully_capable();
+        let (pool, lease) = runtime.block_on(async {
+            let pool = pool(factory.clone(), 1, 1, 1).await;
+            let lease = pool.checkout(OperationKind::Read).await.unwrap();
+            (pool, lease)
+        });
+        factory.state.block_close.store(1, Ordering::SeqCst);
+        let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(lease)));
+        assert!(
+            dropped.is_ok(),
+            "abandoned leases must schedule cleanup on the pool runtime"
+        );
+        runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                factory.state.close_started.notified(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(pool.inner.active.load(Ordering::SeqCst), 1);
+            assert_eq!(pool.inner.shared.available_permits(), 0);
+            assert_eq!(factory.live(), 1);
+            factory.state.block_close.store(0, Ordering::SeqCst);
+            factory.state.allow_close.notify_waiters();
+            tokio::time::timeout(Duration::from_secs(1), pool.inner.wait_for_activity_drain())
+                .await
+                .unwrap();
+            assert_eq!(factory.live(), 0);
+            pool.checkout(OperationKind::Read)
+                .await
+                .unwrap()
+                .complete()
+                .await
+                .unwrap();
+            assert_eq!(factory.dials(), 2);
+            assert_eq!(factory.peak(), 1);
+            pool.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn retirement_grace_outlives_the_caller_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let factory = RecordingFactory::fully_capable();
+        let (pool, first, last) = runtime.block_on(async {
+            let pool = pool(factory.clone(), 1, 2, 2).await;
+            let first = pool.checkout(OperationKind::Read).await.unwrap();
+            let last = pool.checkout(OperationKind::Read).await.unwrap();
+            (pool, first, last)
+        });
+        factory.state.block_close.store(1, Ordering::SeqCst);
+        let caller = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        caller.block_on(async {
+            drop(first);
+            tokio::task::yield_now().await;
+        });
+        drop(caller);
+        runtime.block_on(async {
+            assert_eq!(
+                pool.inner.active.load(Ordering::SeqCst),
+                2,
+                "caller runtime shutdown must not abandon retirement ownership"
+            );
+            assert!(!pool.inner.closed.load(Ordering::SeqCst));
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_secs(11)).await;
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                factory.state.close_started.notified(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(pool.inner.shared.available_permits(), 0);
+            assert_eq!(factory.live(), 1);
+            factory.state.block_close.store(0, Ordering::SeqCst);
+            factory.state.allow_close.notify_waiters();
+            last.retire().await.unwrap();
+            pool.inner.wait_for_activity_drain().await;
+            assert_eq!(factory.live(), 0);
+            pool.checkout(OperationKind::Read)
+                .await
+                .unwrap()
+                .complete()
+                .await
+                .unwrap();
+            assert_eq!(factory.dials(), 2);
+            assert_eq!(factory.peak(), 1);
+            pool.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn shared_close_outlives_the_finishing_siblings_caller_runtime() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let factory = RecordingFactory::fully_capable();
+        let (pool, first, last) = runtime.block_on(async {
+            let pool = pool(factory.clone(), 1, 2, 2).await;
+            let first = pool.checkout(OperationKind::Read).await.unwrap();
+            let last = pool.checkout(OperationKind::Read).await.unwrap();
+            (pool, first, last)
+        });
+        factory.state.block_close.store(1, Ordering::SeqCst);
+        runtime.block_on(async {
+            drop(first);
+            tokio::task::yield_now().await;
+        });
+        let caller = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        caller.block_on(async {
+            last.complete().await.unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                factory.state.close_started.notified(),
+            )
+            .await
+            .unwrap();
+        });
+        drop(caller);
+        runtime.block_on(async {
+            assert!(
+                !pool.inner.closed.load(Ordering::SeqCst),
+                "a finishing sibling's runtime must not own the physical close"
+            );
+            assert_eq!(pool.inner.active.load(Ordering::SeqCst), 1);
+            assert_eq!(pool.inner.shared.available_permits(), 0);
+            assert_eq!(factory.live(), 1);
+            factory.state.block_close.store(0, Ordering::SeqCst);
+            factory.state.allow_close.notify_waiters();
+            tokio::time::timeout(Duration::from_secs(1), pool.inner.wait_for_activity_drain())
+                .await
+                .unwrap();
+            assert_eq!(factory.live(), 0);
+            pool.checkout(OperationKind::Read)
+                .await
+                .unwrap()
+                .complete()
+                .await
+                .unwrap();
+            assert_eq!(factory.dials(), 2);
+            assert_eq!(factory.peak(), 1);
             pool.shutdown().await.unwrap();
         });
     }
