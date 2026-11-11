@@ -137,13 +137,21 @@ jobs:
             . $HOME/.cargo/env
             cd zerofs
             cargo build --profile ci --features webui
-            # FreeBSD's 12 GiB CI guest SIGKILLed rustc while compiling the
-            # lib-test target with 16 codegen units. Keep the same test,
-            # optimization profile and features; bound only compile parallelism.
-            CARGO_BUILD_JOBS=2 CARGO_PROFILE_CI_CODEGEN_UNITS=4 \
+            # The optimized binary builds in this guest, but optimizing the
+            # full lib-test harness was SIGKILLed even with four codegen units.
+            # Only this test build's zerofs package disables optimization;
+            # dependencies reuse the ci profile and the exact test is retained.
+            CARGO_BUILD_JOBS=1 /usr/bin/time -l \
               cargo test --locked --profile ci --features webui -p zerofs --lib \
+                --config profile.ci.package.zerofs.opt-level=0 \
                 writeback::anchored_dir::tests::descriptor_read_only_open_retains_identity_and_exact_writer_lock \
-                -- --exact
+                -- --exact || {
+                  test_status=$?
+                  swapinfo -h || true
+                  vmstat -s || true
+                  dmesg | tail -n 100 || true
+                  exit "$test_status"
+                }
             cp target/ci/zerofs ../zerofs-${{ matrix.platform }}-${{ matrix.arch }}
             rm -rf target/
 
