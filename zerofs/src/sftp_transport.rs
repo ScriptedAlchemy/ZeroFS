@@ -553,19 +553,6 @@ impl FairAdmission {
         state.waiters.clear();
     }
 
-    fn work_pending(&self) -> [bool; 3] {
-        let state = self.inner.state.lock().unwrap();
-        let mut pending = [
-            state.active_reads > 0,
-            state.active_writes > 0,
-            state.active_metadata > 0,
-        ];
-        for waiter in &state.waiters {
-            pending[waiter.kind as usize] = true;
-        }
-        pending
-    }
-
     #[cfg(test)]
     fn waiter_count(&self) -> usize {
         self.inner.state.lock().unwrap().waiters.len()
@@ -621,7 +608,7 @@ struct SharedSession {
     // race the remote server still counting the old session against its cap.
     lifetime: StdMutex<Option<OwnedSemaphorePermit>>,
     active_ops: AtomicUsize,
-    active_writes: AtomicUsize,
+    active_by_kind: [AtomicUsize; 3],
     broken: AtomicBool,
     // Whoever swaps this to true owns the close; releases and reapers race
     // for it once a session must go away.
@@ -638,7 +625,7 @@ impl SharedSession {
             transport,
             lifetime: StdMutex::new(Some(lifetime)),
             active_ops: AtomicUsize::new(0),
-            active_writes: AtomicUsize::new(0),
+            active_by_kind: std::array::from_fn(|_| AtomicUsize::new(0)),
             broken: AtomicBool::new(false),
             closing: AtomicBool::new(false),
             close_settled: AtomicBool::new(false),
@@ -653,10 +640,17 @@ impl SharedSession {
     }
 
     fn claim(&self, kind: OperationKind) {
-        if kind == OperationKind::Write {
-            self.active_writes.fetch_add(1, Ordering::SeqCst);
-        }
+        self.active_by_kind[kind as usize].fetch_add(1, Ordering::SeqCst);
         self.active_ops.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn release(&self, kind: OperationKind) -> usize {
+        self.active_by_kind[kind as usize].fetch_sub(1, Ordering::SeqCst);
+        self.active_ops.fetch_sub(1, Ordering::SeqCst) - 1
+    }
+
+    fn active_for(&self, kind: OperationKind) -> usize {
+        self.active_by_kind[kind as usize].load(Ordering::SeqCst)
     }
 
     async fn wait_close_settled(&self) -> Result<(), TransportError> {
@@ -910,10 +904,7 @@ impl PoolInner {
     /// the roster immediately so no new operation lands on them; the close
     /// itself waits for the last in-flight operation.
     fn release_session(self: &Arc<Self>, session: &Arc<SharedSession>, kind: OperationKind) {
-        if kind == OperationKind::Write {
-            session.active_writes.fetch_sub(1, Ordering::SeqCst);
-        }
-        let remaining = session.active_ops.fetch_sub(1, Ordering::SeqCst) - 1;
+        let remaining = session.release(kind);
         let broken = session.broken.load(Ordering::SeqCst);
         if broken {
             self.remove_from_roster(session);
@@ -1056,15 +1047,27 @@ impl PoolInner {
         }
     }
 
-    /// Track each operation class independently so healthy writes cannot
-    /// mask stalled reads or staging cleanup.
+    /// Only claimed work on live sessions can establish a transport stall.
+    /// Admission also includes queued work, dials, and retirement cleanup;
+    /// none of those should make healthy pooled sessions look unresponsive.
+    fn session_work_pending(&self) -> [bool; 3] {
+        let roster = self.roster.lock().unwrap();
+        std::array::from_fn(|index| {
+            roster
+                .iter()
+                .any(|session| session.active_by_kind[index].load(Ordering::SeqCst) > 0)
+        })
+    }
+
+    /// Track each active operation class independently so healthy writes
+    /// cannot mask stalled reads or staging cleanup on a live session.
     fn check_flush_stall(self: &Arc<Self>) {
         let window = self.flush_stall_recycle_millis.load(Ordering::SeqCst);
         if window == SFTP_FLUSH_STALL_RECYCLE_DISABLED || self.closed.load(Ordering::SeqCst) {
             return;
         }
         let window = Duration::from_millis(window);
-        let pending = self.admission.work_pending();
+        let pending = self.session_work_pending();
         let now = Instant::now();
         let stalled = {
             let mut stalls = self.flush_stall.lock().unwrap();
@@ -1667,9 +1670,7 @@ impl SftpSessionPool {
                     .min_by_key(|session| {
                         let ops = session.active_ops.load(Ordering::SeqCst);
                         match kind {
-                            OperationKind::Write => {
-                                (session.active_writes.load(Ordering::SeqCst), ops)
-                            }
+                            OperationKind::Write => (session.active_for(OperationKind::Write), ops),
                             OperationKind::Read | OperationKind::Metadata => (ops, 0),
                         }
                     })
@@ -2121,19 +2122,19 @@ impl SessionLease {
         // Let sibling operations finish briefly, but never let a stalled
         // sibling retain a broken session outside the watchdog's roster.
         let pool = self.pool.clone();
-        if self.kind == OperationKind::Write {
-            session.active_writes.fetch_sub(1, Ordering::SeqCst);
-        }
         pool.remove_from_roster(&session);
         let admission = self.admission.take();
         let activity = self.activity.take();
-        let remaining = session.active_ops.fetch_sub(1, Ordering::SeqCst) - 1;
+        let remaining = session.release(self.kind);
         // The close runs in an owned task so caller cancellation or an
         // implicit lease drop cannot abandon it half-way. Admission and pool
         // activity remain held until the physical session has settled.
         Some(self.pool.tasks.spawn(async move {
             let result = if remaining == 0 {
-                pool.close_shared_session(session).await
+                pool.close_shared_session(session.clone()).await?;
+                // A sibling's deadline or the watchdog may already own the
+                // close. A duplicate close is a no-op, not cleanup evidence.
+                session.wait_close_settled().await
             } else {
                 match tokio::time::timeout(SFTP_SESSION_CLOSE_TIMEOUT, session.wait_close_settled())
                     .await
@@ -3535,7 +3536,7 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .map(|session| session.active_writes.load(Ordering::SeqCst))
+            .map(|session| session.active_for(OperationKind::Write))
             .collect::<Vec<_>>();
         writes_per_session.sort_unstable();
         assert_eq!(writes_per_session, [2, 2, 2, 2]);
@@ -4569,6 +4570,119 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn queued_metadata_does_not_recycle_progressing_reads() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = pool(factory.clone(), 1, 16, 16).await;
+        pool.inner
+            .flush_stall_recycle_millis
+            .store(30_000, Ordering::SeqCst);
+        let mut reads = Vec::new();
+        for _ in 0..16 {
+            reads.push(pool.checkout(OperationKind::Read).await.unwrap());
+        }
+
+        // Older FIFO readers keep metadata waiting for admission while reads
+        // continue completing. Queueing has not started a transport request.
+        let mut queued_reads = Vec::new();
+        for expected_waiters in 1..=4 {
+            let queued_pool = pool.clone();
+            queued_reads.push(tokio::spawn(async move {
+                queued_pool.checkout(OperationKind::Read).await
+            }));
+            while pool.inner.admission.waiter_count() != expected_waiters {
+                tokio::task::yield_now().await;
+            }
+        }
+        let queued_pool = pool.clone();
+        let metadata =
+            tokio::spawn(async move { queued_pool.checkout(OperationKind::Metadata).await });
+        while pool.inner.admission.waiter_count() != 5 {
+            tokio::task::yield_now().await;
+        }
+        pool.inner.check_flush_stall();
+        for queued_read in queued_reads {
+            tokio::time::advance(Duration::from_secs(8)).await;
+            reads.pop().unwrap().complete().await.unwrap();
+            reads.push(queued_read.await.unwrap().unwrap());
+            pool.inner.check_flush_stall();
+        }
+        tokio::task::yield_now().await;
+        assert!(!metadata.is_finished());
+        assert_eq!(
+            factory.live(),
+            1,
+            "admission delay is not a transport stall"
+        );
+        assert_eq!(
+            factory.dials(),
+            1,
+            "healthy readers must not need to redial"
+        );
+
+        reads.pop().unwrap().complete().await.unwrap();
+        metadata.await.unwrap().unwrap().complete().await.unwrap();
+        for read in reads {
+            read.complete().await.unwrap();
+        }
+        pool.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dialing_reads_do_not_recycle_progressing_writes() {
+        let factory = RecordingFactory::fully_capable();
+        let pool = pool(factory.clone(), 2, 2, 2).await;
+        // Keep this policy test shorter than the independent 30s opener
+        // deadline, so the read remains admitted but has no leased session.
+        pool.inner
+            .flush_stall_recycle_millis
+            .store(5_000, Ordering::SeqCst);
+        factory.state.block_open_from.store(2, Ordering::SeqCst);
+        let mut write = pool.checkout(OperationKind::Write).await.unwrap();
+        let queued_pool = pool.clone();
+        let opening = tokio::spawn(async move { queued_pool.checkout(OperationKind::Read).await });
+        factory.state.open_started.notified().await;
+        assert_eq!(
+            pool.inner
+                .admission
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .active_reads,
+            1
+        );
+        pool.inner.check_flush_stall();
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(2)).await;
+            write.complete().await.unwrap();
+            write = pool.checkout(OperationKind::Write).await.unwrap();
+            pool.inner.check_flush_stall();
+        }
+        tokio::task::yield_now().await;
+        assert!(!opening.is_finished());
+        assert!(
+            !write
+                .session
+                .as_ref()
+                .unwrap()
+                .broken
+                .load(Ordering::SeqCst),
+            "a pending dial must not retire the healthy carrying session"
+        );
+        assert_eq!(
+            factory.live(),
+            2,
+            "the established session and dial stay owned"
+        );
+
+        factory.state.allow_open.notify_one();
+        opening.await.unwrap().unwrap().complete().await.unwrap();
+        write.complete().await.unwrap();
+        pool.shutdown().await.unwrap();
+        assert_eq!(factory.live(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn completing_reads_and_metadata_keep_the_stall_watchdog_quiet() {
         for kind in [OperationKind::Read, OperationKind::Metadata] {
             let factory = RecordingFactory::fully_capable();
@@ -4673,6 +4787,93 @@ mod tests {
                 .active_reads,
             0
         );
+    }
+
+    async fn assert_last_retirement_waits_for_deadline_close(fail_close: bool) {
+        let factory = RecordingFactory::fully_capable();
+        let pool = pool(factory.clone(), 1, 2, 2).await;
+        factory.state.block_close.store(1, Ordering::SeqCst);
+        factory
+            .state
+            .fail_close
+            .store(usize::from(fail_close), Ordering::SeqCst);
+        let first = pool.checkout(OperationKind::Read).await.unwrap();
+        let last = pool.checkout(OperationKind::Read).await.unwrap();
+        let first_retirement = tokio::spawn(async move { first.retire().await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(11)).await;
+        factory.state.close_started.notified().await;
+
+        // The deadline already owns a blocked physical close when the final
+        // sibling retires. It must join that close, including its failure.
+        let mut last_retirement = tokio::spawn(async move { last.retire().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), &mut last_retirement)
+                .await
+                .is_err(),
+            "the final retirement must await an already-running physical close"
+        );
+        assert_eq!(factory.state.close_started_count.load(Ordering::SeqCst), 1);
+        assert_eq!(factory.live(), 1);
+        assert_eq!(pool.inner.shared.available_permits(), 0);
+        assert_eq!(pool.inner.active.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            pool.inner
+                .admission
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .active_reads,
+            2,
+            "every retiring operation retains admission until the close result"
+        );
+
+        factory.state.block_close.store(0, Ordering::SeqCst);
+        factory.state.allow_close.notify_waiters();
+        let results = [
+            first_retirement.await.unwrap(),
+            last_retirement.await.unwrap(),
+        ];
+        for result in results {
+            if fail_close {
+                assert!(matches!(result, Err(TransportError::Close(ref message))
+                    if message.contains("forced close failure")));
+            } else {
+                result.unwrap();
+            }
+        }
+        assert_eq!(pool.inner.active.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            pool.inner
+                .admission
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .active_reads,
+            0
+        );
+        if fail_close {
+            assert!(matches!(
+                pool.checkout(OperationKind::Read).await,
+                Err(TransportError::PoolClosed)
+            ));
+            assert!(pool.shutdown().await.is_err());
+        } else {
+            pool.shutdown().await.unwrap();
+            assert_eq!(factory.live(), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn last_retirement_waits_for_in_progress_deadline_close() {
+        assert_last_retirement_waits_for_deadline_close(false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn last_retirement_propagates_in_progress_deadline_close_failure() {
+        assert_last_retirement_waits_for_deadline_close(true).await;
     }
 
     #[tokio::test(start_paused = true)]
