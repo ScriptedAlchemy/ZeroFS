@@ -59,7 +59,9 @@ jobs:
       - name: Build
         run: cargo build --verbose
       - name: Exercise local storage pooling over 9P
-        run: python3 ../scripts/test-local-storage-pool.py --binary target/debug/zerofs
+        run: |
+          set -o pipefail
+          python3 ../scripts/test-local-storage-pool.py --binary target/debug/zerofs --receipt target/local-storage-pool.json 2>&1 | tee target/local-storage-pool.log
       - name: Run tests
         run: cargo test --verbose
       - name: Run deterministic simulation tests
@@ -107,4 +109,17 @@ jobs:
         run: cargo build --locked --bin zerofs --features disk-health-test-hooks --verbose
       - name: Exercise disk-health recovery over 9P
         timeout-minutes: 20
-        run: python3 ../scripts/test-local-storage-pool.py --binary target/debug/zerofs --health-recovery
+        run: |
+          set -o pipefail
+          python3 ../scripts/test-local-storage-pool.py --binary target/debug/zerofs --health-recovery --receipt target/physical-disk-health.json 2>&1 | tee target/physical-disk-health.log
+      - name: Preserve local-pool acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-pool-acceptance
+          path: |
+            zerofs/target/local-storage-pool.json
+            zerofs/target/local-storage-pool.log
+            zerofs/target/physical-disk-health.json
+            zerofs/target/physical-disk-health.log
+          if-no-files-found: warn
