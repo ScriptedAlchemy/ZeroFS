@@ -182,6 +182,8 @@ pub(super) struct Snapshot {
 }
 
 pub(super) struct Catalog {
+    // Fields drop in declaration order: finish database shutdown before
+    // releasing the catalog's exclusive ownership below.
     database: Database,
     pub identity: Identity,
     /// Quarantine is sticky and forbids every new target reservation and
@@ -191,7 +193,21 @@ pub(super) struct Catalog {
     #[cfg(test)]
     empty_ownership_scans: std::sync::atomic::AtomicUsize,
     _root: AnchoredDir,
-    _lock: File,
+    _lock: CatalogLock,
+}
+
+struct CatalogLock(File);
+
+impl Drop for CatalogLock {
+    fn drop(&mut self) {
+        // CLOEXEC only closes a child's inherited descriptor at exec. Closing
+        // our descriptor alone can leave its flock held across that interval;
+        // explicitly unlock the shared open file description after the owner
+        // has finished all catalog work.
+        if let Err(error) = FileExt::unlock(&self.0) {
+            tracing::warn!(%error, "failed to release pool catalog lock");
+        }
+    }
 }
 
 impl std::fmt::Debug for Catalog {
@@ -235,6 +251,7 @@ impl Catalog {
         if !FileExt::try_lock_exclusive(&lock)? {
             bail!("pool catalog is already locked by another process");
         }
+        let lock = CatalogLock(lock);
         if !initialize {
             // Do not create a replacement database if the file disappeared
             // between the preliminary check and descriptor-anchored open.
@@ -1338,161 +1355,71 @@ fn ensure_eligible(tx: &redb::WriteTransaction, member: &str) -> Result<()> {
 }
 
 #[cfg(test)]
-mod empty_quarantine_tests {
+mod catalog_lock_tests {
     use super::*;
-    use std::sync::Arc;
-    use std::sync::atomic::Ordering;
 
-    fn fixture() -> (tempfile::TempDir, Catalog, Vec<PoolMember>) {
-        let root = tempfile::tempdir().unwrap();
-        let catalog = Catalog::open(&root.path().join("catalog"), "db", true, None).unwrap();
-        let members = ["old", "current", "target"]
-            .into_iter()
-            .map(|id| PoolMember {
-                id: id.into(),
-                identity: format!("memory://{id}"),
-                store: Arc::new(object_store::memory::InMemory::new()),
-                capacity_bytes: 1024,
-                local_path: None,
-                min_free_bytes: 0,
-                health_device: None,
-            })
-            .collect::<Vec<_>>();
-        catalog.configure_members(&members).unwrap();
-        catalog.finish_initialization().unwrap();
-        (root, catalog, members)
-    }
-
-    fn insert(
-        catalog: &Catalog,
-        members: &[PoolMember],
-        location: &str,
-        member: &str,
-        size: u64,
-    ) -> Entry {
-        let upload = catalog
-            .reserve(location, size, members, Some(member))
-            .unwrap();
-        let entry = Entry {
-            physical: Physical::Member {
-                member_id: member.into(),
-                key: upload.physical_key,
-                e_tag: None,
-                version: None,
-            },
-            size,
-            last_modified_secs: 0,
-            last_modified_nanos: 0,
-            e_tag: None,
-            version: None,
-            sha256: None,
-            attributes: Vec::new(),
+    #[test]
+    fn catalog_release_does_not_wait_for_inherited_descriptors() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("catalog");
+        let catalog = Catalog::open(&root, "db", true, None).unwrap();
+        let member = PoolMember {
+            id: "hdd-a".into(),
+            identity: "memory://hdd-a".into(),
+            store: std::sync::Arc::new(object_store::memory::InMemory::new()),
+            capacity_bytes: 1024,
+            local_path: None,
+            min_free_bytes: 0,
+            health_device: None,
         };
+        catalog.configure_members(&[member]).unwrap();
+        catalog.finish_initialization().unwrap();
         catalog
-            .publish_for_migration(&upload.id, &entry, None, false)
+            .kernel_observation("hdd-a", "available".into(), Some(("boot-a".into(), 42)))
             .unwrap();
-        entry
-    }
-
-    fn quarantine(catalog: &Catalog) {
-        for member in ["old", "current"] {
-            catalog
-                .observe_health(member, None, Some("media failure".into()), None)
-                .unwrap();
-        }
-    }
-
-    #[test]
-    fn empty_historical_quarantine_is_scanned_once_and_revalidated_after_reopen() {
-        let (root, catalog, members) = fixture();
-        insert(&catalog, &members, "current-data", "current", 8);
-        quarantine(&catalog);
-        catalog.require_automatic_evacuation().unwrap();
-        assert!(
-            catalog
-                .verified_empty_quarantined
-                .lock()
-                .unwrap()
-                .contains("old")
-        );
-        assert_eq!(catalog.empty_ownership_scans.load(Ordering::Relaxed), 1);
-        for _ in 0..32 {
-            catalog.require_automatic_evacuation().unwrap();
-        }
-        assert_eq!(catalog.empty_ownership_scans.load(Ordering::Relaxed), 1);
-        assert!(
-            catalog
-                .reserve("new-data", 0, &members, Some("old"))
-                .is_err()
-        );
         let marker = catalog.identity.marker().unwrap();
-        drop(catalog);
-        let reopened =
-            Catalog::open(&root.path().join("catalog"), "db", false, Some(&marker)).unwrap();
-        assert!(
-            reopened
-                .verified_empty_quarantined
-                .lock()
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(reopened.empty_ownership_scans.load(Ordering::Relaxed), 0);
-        reopened.require_automatic_evacuation().unwrap();
-        assert_eq!(reopened.empty_ownership_scans.load(Ordering::Relaxed), 1);
-        reopened.require_automatic_evacuation().unwrap();
-        assert_eq!(reopened.empty_ownership_scans.load(Ordering::Relaxed), 1);
-    }
+        let pool_id = catalog.identity.pool_id.clone();
 
-    #[test]
-    fn zero_byte_object_upload_and_cleanup_debt_each_prevent_caching_empty() {
-        let (_root, catalog, members) = fixture();
-        let zero = insert(&catalog, &members, "zero-data", "old", 0);
-        let upload = catalog
-            .reserve("zero-upload", 0, &members, Some("old"))
-            .unwrap();
-        insert(&catalog, &members, "current-data", "current", 8);
-        quarantine(&catalog);
-        assert!(catalog.require_automatic_evacuation().is_err());
-        assert!(
-            !catalog
-                .verified_empty_quarantined
-                .lock()
-                .unwrap()
-                .contains("old")
-        );
-        let garbage = catalog.retire("zero-data", &zero).unwrap();
-        // The upload is now the first remaining zero-byte owner encountered.
-        assert!(catalog.require_automatic_evacuation().is_err());
-        assert!(
-            !catalog
-                .verified_empty_quarantined
-                .lock()
-                .unwrap()
-                .contains("old")
-        );
-        catalog.forget_upload(&upload.id).unwrap();
-        // Only a cleanup debt remains; byte counters alone still say zero.
-        assert!(catalog.require_automatic_evacuation().is_err());
-        assert!(
-            !catalog
-                .verified_empty_quarantined
-                .lock()
-                .unwrap()
-                .contains("old")
-        );
-        catalog.forget_garbage(&garbage.id).unwrap();
-        catalog.require_automatic_evacuation().unwrap();
-        assert!(
-            catalog
-                .verified_empty_quarantined
-                .lock()
-                .unwrap()
-                .contains("old")
-        );
-        let scans = catalog.empty_ownership_scans.load(Ordering::Relaxed);
-        assert_eq!(scans, 4);
-        catalog.require_automatic_evacuation().unwrap();
-        assert_eq!(catalog.empty_ownership_scans.load(Ordering::Relaxed), scans);
+        // fork() duplicates the open file description before CLOEXEC can close
+        // it. A duplicated descriptor models that interval without forking a
+        // multithreaded test process or relying on scheduler timing.
+        let inherited_lock = catalog._lock.0.try_clone().unwrap();
+        let assert_locked = || {
+            assert!(
+                Catalog::open(&root, "db", false, Some(&marker))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("pool catalog is already locked by another process")
+            );
+        };
+        assert_locked();
+        drop(catalog);
+
+        let reopened = Catalog::open(&root, "db", false, Some(&marker))
+            .expect("closed catalog must release its lock while an inherited descriptor remains");
+        assert_eq!(reopened.identity.pool_id, pool_id);
+        assert!(reopened.identity.initialized);
+        assert_eq!(reopened.member("hdd-a").unwrap().identity, "memory://hdd-a");
+        let health: MemberHealth = {
+            let read = reopened.database.begin_read().unwrap();
+            bincode::deserialize(
+                read.open_table(HEALTH)
+                    .unwrap()
+                    .get("hdd-a")
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+            )
+            .unwrap()
+        };
+        assert_eq!(health.kernel_cursor, Some(("boot-a".into(), 42)));
+        assert_eq!(health.quarantine.as_deref(), Some("kernel block I/O error"));
+
+        assert_locked();
+        drop(inherited_lock);
+        // Closing the previous generation's descriptor cannot release the new
+        // owner's lock, which belongs to a separate open file description.
+        assert_locked();
     }
 }
 
@@ -1650,5 +1577,164 @@ mod legacy_health_compatibility {
                 .value(),
             entry
         );
+    }
+}
+
+#[cfg(test)]
+mod empty_quarantine_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    fn fixture() -> (tempfile::TempDir, Catalog, Vec<PoolMember>) {
+        let root = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(&root.path().join("catalog"), "db", true, None).unwrap();
+        let members = ["old", "current", "target"]
+            .into_iter()
+            .map(|id| PoolMember {
+                id: id.into(),
+                identity: format!("memory://{id}"),
+                store: Arc::new(object_store::memory::InMemory::new()),
+                capacity_bytes: 1024,
+                local_path: None,
+                min_free_bytes: 0,
+                health_device: None,
+            })
+            .collect::<Vec<_>>();
+        catalog.configure_members(&members).unwrap();
+        catalog.finish_initialization().unwrap();
+        (root, catalog, members)
+    }
+
+    fn insert(
+        catalog: &Catalog,
+        members: &[PoolMember],
+        location: &str,
+        member: &str,
+        size: u64,
+    ) -> Entry {
+        let upload = catalog
+            .reserve(location, size, members, Some(member))
+            .unwrap();
+        let entry = Entry {
+            physical: Physical::Member {
+                member_id: member.into(),
+                key: upload.physical_key,
+                e_tag: None,
+                version: None,
+            },
+            size,
+            last_modified_secs: 0,
+            last_modified_nanos: 0,
+            e_tag: None,
+            version: None,
+            sha256: None,
+            attributes: Vec::new(),
+        };
+        catalog
+            .publish_for_migration(&upload.id, &entry, None, false)
+            .unwrap();
+        entry
+    }
+
+    fn quarantine(catalog: &Catalog) {
+        for member in ["old", "current"] {
+            catalog
+                .observe_health(member, None, Some("media failure".into()), None)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn empty_historical_quarantine_is_scanned_once_and_revalidated_after_reopen() {
+        let (root, catalog, members) = fixture();
+        insert(&catalog, &members, "current-data", "current", 8);
+        quarantine(&catalog);
+        catalog.require_automatic_evacuation().unwrap();
+        assert!(
+            catalog
+                .verified_empty_quarantined
+                .lock()
+                .unwrap()
+                .contains("old")
+        );
+        assert_eq!(catalog.empty_ownership_scans.load(Ordering::Relaxed), 1);
+        for _ in 0..32 {
+            catalog.require_automatic_evacuation().unwrap();
+        }
+        assert_eq!(catalog.empty_ownership_scans.load(Ordering::Relaxed), 1);
+        assert!(
+            catalog
+                .reserve("new-data", 0, &members, Some("old"))
+                .is_err()
+        );
+        let marker = catalog.identity.marker().unwrap();
+        drop(catalog);
+        let reopened =
+            Catalog::open(&root.path().join("catalog"), "db", false, Some(&marker)).unwrap();
+        assert!(
+            reopened
+                .verified_empty_quarantined
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(reopened.empty_ownership_scans.load(Ordering::Relaxed), 0);
+        reopened.require_automatic_evacuation().unwrap();
+        assert_eq!(reopened.empty_ownership_scans.load(Ordering::Relaxed), 1);
+        reopened.require_automatic_evacuation().unwrap();
+        assert_eq!(reopened.empty_ownership_scans.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn zero_byte_object_upload_and_cleanup_debt_each_prevent_caching_empty() {
+        let (_root, catalog, members) = fixture();
+        let zero = insert(&catalog, &members, "zero-data", "old", 0);
+        let upload = catalog
+            .reserve("zero-upload", 0, &members, Some("old"))
+            .unwrap();
+        insert(&catalog, &members, "current-data", "current", 8);
+        quarantine(&catalog);
+        assert!(catalog.require_automatic_evacuation().is_err());
+        assert!(
+            !catalog
+                .verified_empty_quarantined
+                .lock()
+                .unwrap()
+                .contains("old")
+        );
+        let garbage = catalog.retire("zero-data", &zero).unwrap();
+        // The upload is now the first remaining zero-byte owner encountered.
+        assert!(catalog.require_automatic_evacuation().is_err());
+        assert!(
+            !catalog
+                .verified_empty_quarantined
+                .lock()
+                .unwrap()
+                .contains("old")
+        );
+        catalog.forget_upload(&upload.id).unwrap();
+        // Only a cleanup debt remains; byte counters alone still say zero.
+        assert!(catalog.require_automatic_evacuation().is_err());
+        assert!(
+            !catalog
+                .verified_empty_quarantined
+                .lock()
+                .unwrap()
+                .contains("old")
+        );
+        catalog.forget_garbage(&garbage.id).unwrap();
+        catalog.require_automatic_evacuation().unwrap();
+        assert!(
+            catalog
+                .verified_empty_quarantined
+                .lock()
+                .unwrap()
+                .contains("old")
+        );
+        let scans = catalog.empty_ownership_scans.load(Ordering::Relaxed);
+        assert_eq!(scans, 4);
+        catalog.require_automatic_evacuation().unwrap();
+        assert_eq!(catalog.empty_ownership_scans.load(Ordering::Relaxed), scans);
     }
 }
