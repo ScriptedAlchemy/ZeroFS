@@ -1077,7 +1077,11 @@ async fn disk_health_quarantine_fences_reserved_start_and_late_multipart() {
         .unwrap();
     pool.quarantine("hdd-a", "media fault").await.unwrap();
     let id = upload.id.clone();
-    assert!(pool.catalog(move |c| c.mark_started(&id)).await.is_err());
+    assert!(
+        pool.catalog(move |c| c.mark_started_for_migration(&id, false))
+            .await
+            .is_err()
+    );
     assert!(multipart.complete().await.is_err());
     assert!(pool.head(&segment(994)).await.is_err());
     pool.cleanup_upload(&upload).await.unwrap();
@@ -1126,6 +1130,11 @@ async fn disk_health_evacuation_no_capacity_never_claims_completion() {
     create(&pool, &segment(997), b"12345678").await;
     create(&pool, &segment(998), b"abcdefgh").await;
     pool.quarantine("hdd-a", "kernel I/O").await.unwrap();
+    let before = pool.status().await.unwrap();
+    assert_eq!(before.members[0].evacuation, "cannot_complete_capacity");
+    assert_eq!(before.members[0].evacuation_capacity.required_bytes, 8);
+    assert_eq!(before.members[0].evacuation_capacity.available_bytes, 0);
+    assert!(!before.members[0].evacuation_capacity.sufficient);
     pool.evacuate_pass(&tokio_util::sync::CancellationToken::new())
         .await
         .unwrap();
@@ -1133,7 +1142,128 @@ async fn disk_health_evacuation_no_capacity_never_claims_completion() {
     assert_eq!(status.members[0].objects, 1);
     assert!(!status.members[0].safe_to_remove);
     assert!(!status.members[0].readable_evacuated);
+    assert_eq!(status.members[0].evacuation, "cannot_complete_capacity");
+    assert!(!status.members[0].safe_to_pull_with_known_loss);
     assert!(status.unreadable.is_empty());
+}
+
+#[tokio::test]
+async fn physical_root_capacity_gate_observes_real_filesystem_reserve() {
+    let root = tempfile::tempdir().unwrap();
+    for name in ["authority", "hdd-a", "hdd-b"] {
+        std::fs::create_dir(root.path().join(name)).unwrap();
+    }
+    let pool = persistent_pool(root.path(), true).await;
+    let location = segment(1020);
+    create(&pool, &location, b"one-copy").await;
+    pool.quarantine("hdd-a", "media failure").await.unwrap();
+    let authority = pool.inner.authority.clone();
+    let mut members = pool.inner.members.clone();
+    members[1].min_free_bytes = 1 << 60;
+    drop(pool);
+    let pool = PoolObjectStore::open(
+        authority,
+        Path::from("db"),
+        root.path().join("catalog"),
+        members,
+    )
+    .await
+    .unwrap();
+    let before = pool.status().await.unwrap();
+    assert!(before.members[1].capacity_bytes > before.members[0].used_bytes);
+    assert_eq!(before.members[1].available_bytes, 0);
+    assert_eq!(before.members[0].evacuation, "cannot_complete_capacity");
+    assert!(!before.members[0].evacuation_capacity.sufficient);
+    pool.evacuate_pass(&tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(placement(&pool, &location).await, "hdd-a");
+    assert_eq!(read(&pool, &location).await.as_ref(), b"one-copy");
+    assert!(!pool.status().await.unwrap().members[0].safe_to_remove);
+}
+
+#[tokio::test]
+async fn two_through_five_physical_roots_preserve_exact_unique_placements() {
+    for count in 2..=5 {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("authority")).unwrap();
+        let authority: Arc<dyn ObjectStore> = Arc::new(
+            object_store::local::LocalFileSystem::new_with_prefix(root.path().join("authority"))
+                .unwrap(),
+        );
+        let mut members = Vec::new();
+        for index in 0..count {
+            let id = format!("disk-{index}");
+            let directory = root.path().join(&id);
+            std::fs::create_dir(&directory).unwrap();
+            members.push(PoolMember {
+                identity: format!("file:///{id}"),
+                id,
+                store: Arc::new(
+                    object_store::local::LocalFileSystem::new_with_prefix(&directory).unwrap(),
+                ),
+                capacity_bytes: 8,
+                local_path: Some(directory),
+                min_free_bytes: 0,
+                health_device: None,
+            });
+        }
+        let pool = PoolObjectStore::initialize(
+            authority.clone(),
+            Path::from("db"),
+            root.path().join("catalog"),
+            members.clone(),
+        )
+        .await
+        .unwrap();
+        for index in 0..count {
+            pool.put_opts(
+                &segment(2000 + index),
+                Bytes::from(vec![index as u8; 8]).into(),
+                create_options(),
+            )
+            .await
+            .unwrap();
+        }
+        let placements = pool.placements().await.unwrap();
+        assert_eq!(placements.len(), count as usize);
+        let before = serde_json::to_value(&placements).unwrap();
+        for (index, entry) in placements.iter().enumerate() {
+            assert_eq!(entry.member_id, format!("disk-{index}"));
+            let body = root.path().join(&entry.member_id).join(&entry.physical_key);
+            assert_eq!(std::fs::read(body).unwrap(), vec![index as u8; 8]);
+            for other in 0..count {
+                if entry.member_id != format!("disk-{other}") {
+                    assert!(
+                        !root
+                            .path()
+                            .join(format!("disk-{other}"))
+                            .join(&entry.physical_key)
+                            .exists()
+                    );
+                }
+            }
+        }
+        drop(pool);
+        let reopened = PoolObjectStore::open(
+            authority,
+            Path::from("db"),
+            root.path().join("catalog"),
+            members,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(reopened.placements().await.unwrap()).unwrap(),
+            before
+        );
+        for index in 0..count {
+            assert_eq!(
+                read(&reopened, &segment(2000 + index)).await.as_ref(),
+                &vec![index as u8; 8]
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -1638,7 +1768,9 @@ async fn disk_health_catalog_publication_is_fenced_after_upload_start() {
     let path = segment(2006);
     let upload = pool.reserve(&path, 4, Some("hdd-a".into())).await.unwrap();
     let id = upload.id.clone();
-    pool.catalog(move |c| c.mark_started(&id)).await.unwrap();
+    pool.catalog(move |c| c.mark_started_for_migration(&id, false))
+        .await
+        .unwrap();
     pool.quarantine("hdd-a", "media failure after start")
         .await
         .unwrap();
@@ -1659,7 +1791,7 @@ async fn disk_health_catalog_publication_is_fenced_after_upload_start() {
     };
     let id = upload.id.clone();
     assert!(
-        pool.catalog(move |c| c.publish(&id, &entry, None))
+        pool.catalog(move |c| c.publish_for_migration(&id, &entry, None, false))
             .await
             .is_err()
     );
@@ -1727,7 +1859,9 @@ async fn disk_health_zero_byte_debts_prevent_safe_removal_until_cleaned() {
         .await
         .unwrap();
     let id = upload.id.clone();
-    pool.catalog(move |c| c.mark_started(&id)).await.unwrap();
+    pool.catalog(move |c| c.mark_started_for_migration(&id, false))
+        .await
+        .unwrap();
     f.first
         .inner
         .put(

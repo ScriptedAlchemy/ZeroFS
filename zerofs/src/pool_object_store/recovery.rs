@@ -1,4 +1,4 @@
-use super::PoolObjectStore;
+use super::{PoolMemberStatus, PoolObjectStore, PoolStatus};
 use std::collections::BTreeSet;
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -8,6 +8,19 @@ use tokio_util::sync::CancellationToken;
 mod tests;
 
 const MAX_FAULT_VERIFICATIONS_PER_PASS: usize = 16;
+const MULTIPLE_SICK_MEMBERS: &str = "multiple_sick_members";
+
+/// Historical quarantine on an already emptied member must not turn a later
+/// single-device failure into a permanent multi-device stop. Count unfinished
+/// zero-byte operations too: their physical ownership still has to settle.
+fn active_failure(member: &PoolMemberStatus) -> bool {
+    member.health.quarantine.is_some()
+        && (member.objects != 0
+            || member.used_bytes != 0
+            || member.reserved_bytes != 0
+            || member.pending_uploads != 0
+            || member.cleanup_debts != 0)
+}
 
 pub(crate) struct PoolRecovery {
     stop: CancellationToken,
@@ -46,6 +59,30 @@ impl PoolRecovery {
 }
 
 impl PoolObjectStore {
+    /// This cut deliberately has no policy for evacuating two failed devices.
+    /// Leave their remaining placements in place, retain committed moves, and
+    /// publish a durable explanation while ordinary debt cleanup can continue.
+    async fn single_failure_status(&self) -> object_store::Result<Option<PoolStatus>> {
+        let status = self.status().await?;
+        let multiple = status.members.iter().filter(|m| active_failure(m)).count() > 1;
+        for member in status.members.iter().filter(|m| active_failure(m)) {
+            let previous = member.health.evacuation_error.as_deref();
+            let issue = if multiple {
+                Some(MULTIPLE_SICK_MEMBERS.to_owned())
+            } else if previous == Some(MULTIPLE_SICK_MEMBERS) {
+                None
+            } else {
+                continue;
+            };
+            if previous != issue.as_deref() {
+                let id = member.id.clone();
+                self.catalog(move |c| c.evacuation_error(&id, issue))
+                    .await?;
+            }
+        }
+        Ok((!multiple).then_some(status))
+    }
+
     async fn verify_due_faults(
         &self,
         stop: &CancellationToken,
@@ -109,7 +146,9 @@ impl PoolObjectStore {
     }
 
     pub(crate) async fn evacuate_pass(&self, stop: &CancellationToken) -> object_store::Result<()> {
-        let status = self.status().await?;
+        let Some(status) = self.single_failure_status().await? else {
+            return Ok(());
+        };
         let sick: BTreeSet<_> = status
             .members
             .iter()
@@ -150,16 +189,31 @@ impl PoolObjectStore {
                         break;
                     }
                     match self
-                        .migrate_from(
+                        .migrate_automatic(
                             &placement.location,
                             &target.id,
-                            Some(placement.member_id.clone()),
+                            placement.member_id.clone(),
                         )
                         .await
                     {
-                        Ok(()) => break,
+                        Ok(true) => {
+                            let member = placement.member_id.clone();
+                            self.catalog(move |c| c.evacuation_error(&member, None))
+                                .await?;
+                            break;
+                        }
+                        // A reader or another migration owns this object. Its
+                        // lock is independent of the target; keep walking so a
+                        // held read lease cannot starve later source segments.
+                        Ok(false) => break,
                         Err(super::MoveFailure::Control(error)) => return Err(error),
                         Err(error) => {
+                            // Admission/publication also check the policy in
+                            // the catalog, so a second failure during a copy
+                            // fences the remap and stops subsequent copies.
+                            if self.single_failure_status().await?.is_none() {
+                                return Ok(());
+                            }
                             let issue = match &error {
                                 super::MoveFailure::Admission(_) => {
                                     "capacity_or_allocation_blocked"

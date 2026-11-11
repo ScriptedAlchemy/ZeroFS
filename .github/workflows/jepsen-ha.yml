@@ -72,9 +72,13 @@ jobs:
 
       - name: Install guest JDK, Leiningen, and gnuplot
         if: matrix.mount-client == 'native'
+        timeout-minutes: 15
         run: |
-          sudo apt-get update
-          sudo apt-get install -y curl gnuplot openjdk-17-jdk-headless
+          # Retry package transport failures only; durability tests run once.
+          apt_options=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
+          # The headless renderer provides Jepsen's PNG plots without pulling Qt.
+          sudo apt-get "${apt_options[@]}" install -y curl gnuplot-nox openjdk-17-jdk-headless
           sudo curl -fsSL \
             https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein \
             -o /usr/local/bin/lein
@@ -298,9 +302,13 @@ jobs:
 
       - name: Install guest JDK, Leiningen, and gnuplot
         if: matrix.mount-client == 'native'
+        timeout-minutes: 15
         run: |
-          sudo apt-get update
-          sudo apt-get install -y curl gnuplot openjdk-17-jdk-headless
+          # Retry package transport failures only; durability tests run once.
+          apt_options=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
+          # The headless renderer provides Jepsen's PNG plots without pulling Qt.
+          sudo apt-get "${apt_options[@]}" install -y curl gnuplot-nox openjdk-17-jdk-headless
           sudo curl -fsSL \
             https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein \
             -o /usr/local/bin/lein

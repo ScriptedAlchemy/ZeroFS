@@ -5,7 +5,7 @@
 //! has been deleted. Superseded objects remain charged until cleanup succeeds.
 
 use super::health::{MemberHealth, SegmentFault, SmartSample};
-use super::{PoolMember, PoolMemberStatus, PoolPlacement, PoolStatus};
+use super::{EvacuationCapacity, PoolMember, PoolMemberStatus, PoolPlacement, PoolStatus};
 use anyhow::{Context, Result, bail};
 use fs4::fs_std::FileExt;
 use object_store::path::Path;
@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::path::Path as FilePath;
+use std::sync::Mutex;
 use uuid::Uuid;
 
 use crate::writeback::anchored_dir::AnchoredDir;
@@ -24,6 +25,10 @@ use crate::writeback::anchored_dir::AnchoredDir;
 #[derive(Debug, thiserror::Error)]
 #[error("no pool member has sufficient capacity and local free-space reserve")]
 pub(super) struct NoCapacity;
+
+#[derive(Debug, thiserror::Error)]
+#[error("automatic evacuation stopped: multiple devices have unfinished evacuation")]
+pub(super) struct AutomaticEvacuationBlocked;
 
 #[derive(Debug, thiserror::Error)]
 #[error("pool member {member} is allocation-blocked: {reason}")]
@@ -179,6 +184,12 @@ pub(super) struct Snapshot {
 pub(super) struct Catalog {
     database: Database,
     pub identity: Identity,
+    /// Quarantine is sticky and forbids every new target reservation and
+    /// publication. Once a writer transaction proves all ownership absent,
+    /// this member cannot regain data. Reopening discards and rechecks proof.
+    verified_empty_quarantined: Mutex<BTreeSet<String>>,
+    #[cfg(test)]
+    empty_ownership_scans: std::sync::atomic::AtomicUsize,
     _root: AnchoredDir,
     _lock: File,
 }
@@ -312,6 +323,9 @@ impl Catalog {
         Ok(Self {
             database,
             identity,
+            verified_empty_quarantined: Mutex::new(BTreeSet::new()),
+            #[cfg(test)]
+            empty_ownership_scans: std::sync::atomic::AtomicUsize::new(0),
             _root: anchored,
             _lock: lock,
         })
@@ -706,9 +720,17 @@ impl Catalog {
         Ok(upload)
     }
 
-    pub fn mark_started(&self, id: &str) -> Result<()> {
+    pub fn require_automatic_evacuation(&self) -> Result<()> {
+        let tx = self.database.begin_write()?;
+        self.ensure_single_active_failure(&tx)
+    }
+
+    pub fn mark_started_for_migration(&self, id: &str, automatic: bool) -> Result<()> {
         let mut tx = self.database.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
+        if automatic {
+            self.ensure_single_active_failure(&tx)?;
+        }
         {
             let mut table = tx.open_table(UPLOADS)?;
             let mut upload: Upload = bincode::deserialize(
@@ -725,14 +747,18 @@ impl Catalog {
         Ok(())
     }
 
-    pub fn publish(
+    pub fn publish_for_migration(
         &self,
         id: &str,
         entry: &Entry,
         previous: Option<&Entry>,
+        automatic: bool,
     ) -> Result<Option<Garbage>> {
         let mut tx = self.database.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
+        if automatic {
+            self.ensure_single_active_failure(&tx)?;
+        }
         let upload: Upload = {
             let table = tx.open_table(UPLOADS)?;
             bincode::deserialize(
@@ -919,6 +945,7 @@ impl Catalog {
             }
             let entry: Entry = bincode::deserialize(value.value())?;
             result.push(PoolPlacement {
+                physical_key: entry.physical.key().to_owned(),
                 location: Path::parse(key.value())?,
                 member_id: entry
                     .physical
@@ -972,6 +999,7 @@ impl Catalog {
             .into_iter()
             .map(|(key, entry)| {
                 Ok(PoolPlacement {
+                    physical_key: entry.physical.key().to_owned(),
                     location: Path::parse(key).context("invalid logical path in pool catalog")?,
                     size: entry.size,
                     member_id: entry
@@ -984,7 +1012,11 @@ impl Catalog {
             .collect()
     }
 
-    pub fn status(&self, order: &[PoolMember]) -> Result<PoolStatus> {
+    pub fn status(
+        &self,
+        order: &[PoolMember],
+        active: Option<&super::EvacuationProgress>,
+    ) -> Result<PoolStatus> {
         let tx = self.database.begin_read()?;
         let mut counts = BTreeMap::<String, u64>::new();
         let mut mapped_objects = 0_u64;
@@ -1004,6 +1036,7 @@ impl Catalog {
                 .unwrap_or_default();
             if health.quarantine.is_some() {
                 quarantined_leftovers.push(PoolPlacement {
+                    physical_key: entry.physical.key().to_owned(),
                     location: Path::parse(key.value())?,
                     member_id: id.into(),
                     size: entry.size,
@@ -1025,8 +1058,34 @@ impl Catalog {
             }
         }
         let mut upload_counts = BTreeMap::<String, u64>::new();
+        let mut evacuation_reservations = BTreeMap::<String, BTreeMap<String, u64>>::new();
         for row in tx.open_table(UPLOADS)?.iter()? {
             let upload: Upload = bincode::deserialize(row?.1.value())?;
+            let target_health: MemberHealth = health_table
+                .get(upload.member_id.as_str())?
+                .map(|v| bincode::deserialize(v.value()))
+                .transpose()?
+                .unwrap_or_default();
+            if active.is_some_and(|a| {
+                a.upload_id.as_deref() == Some(upload.id.as_str()) && a.location == upload.location
+            }) && target_health.quarantine.is_none()
+                && target_health.monitoring_error.is_none()
+                && let Some(value) = object_table.get(upload.location.as_str())?
+            {
+                let entry: Entry = bincode::deserialize(value.value())?;
+                if let Some(source) = entry.physical.member_id()
+                    && source != upload.member_id
+                    && active.is_some_and(|a| {
+                        a.member_id == source && a.source_key == entry.physical.key()
+                    })
+                {
+                    evacuation_reservations
+                        .entry(source.into())
+                        .or_default()
+                        .entry(upload.location.clone())
+                        .or_insert(entry.size.min(upload.size));
+                }
+            }
             *upload_counts.entry(upload.member_id).or_default() += 1;
         }
         let mut garbage_counts = BTreeMap::<String, u64>::new();
@@ -1101,12 +1160,30 @@ impl Catalog {
                 "incomplete"
             }
             .to_owned();
+            let reserved_destination_bytes = evacuation_reservations
+                .get(&record.id)
+                .map(|entries| {
+                    entries
+                        .values()
+                        .fold(0_u64, |sum, size| sum.saturating_add(*size))
+                })
+                .unwrap_or(0);
             members.push(PoolMemberStatus {
                 id: record.id.clone(),
                 capacity_bytes: record.capacity,
                 used_bytes: record.used,
                 reserved_bytes: record.reserved,
                 objects,
+                evacuation_capacity: EvacuationCapacity {
+                    required_bytes: if health.quarantine.is_some() {
+                        record.used.saturating_sub(reserved_destination_bytes)
+                    } else {
+                        0
+                    },
+                    reserved_destination_bytes,
+                    ..Default::default()
+                },
+                available_bytes: 0,
                 health,
                 safe_to_remove,
                 safe_to_pull_with_known_loss,
@@ -1116,6 +1193,35 @@ impl Catalog {
                 cleanup_debts,
                 evacuation,
             });
+        }
+        super::capacity::assess(order, &mut members);
+        let multiple_failures = members
+            .iter()
+            .filter(|member| {
+                member.health.quarantine.is_some()
+                    && (member.objects > 0
+                        || member.used_bytes > 0
+                        || member.reserved_bytes > 0
+                        || member.pending_uploads > 0
+                        || member.cleanup_debts > 0)
+            })
+            .count()
+            > 1;
+        for member in &mut members {
+            if member.health.quarantine.is_none() || member.safe_to_remove {
+                continue;
+            }
+            if multiple_failures {
+                member.evacuation = "failed_multiple_devices".into();
+                member.safe_to_pull_with_known_loss = false;
+            } else if member.objects > 0
+                && !member.readable_evacuated
+                && !member.evacuation_capacity.sufficient
+            {
+                member.evacuation = "cannot_complete_capacity".into();
+                member.safe_to_remove = false;
+                member.safe_to_pull_with_known_loss = false;
+            }
         }
         let pending_operations = usize::try_from(tx.open_table(UPLOADS)?.len()?)?
             .checked_add(usize::try_from(tx.open_table(GARBAGE)?.len()?)?)
@@ -1140,6 +1246,85 @@ fn health_in(tx: &redb::WriteTransaction, member: &str) -> Result<MemberHealth> 
         .unwrap_or_default())
 }
 
+impl Catalog {
+    /// Runs before any writes in the same transaction as automatic upload-start
+    /// or remap. Zero-byte operations count, while an empty historic quarantine
+    /// needs a full ownership scan only once per catalog open.
+    fn ensure_single_active_failure(&self, tx: &redb::WriteTransaction) -> Result<()> {
+        let mut known_empty = self
+            .verified_empty_quarantined
+            .lock()
+            .map_err(|_| anyhow::anyhow!("empty quarantined-member cache is poisoned"))?;
+        let mut active = BTreeSet::new();
+        let mut unchecked = BTreeSet::new();
+        for row in tx.open_table(MEMBERS)?.iter()? {
+            let member: MemberRecord = bincode::deserialize(row?.1.value())?;
+            if health_in(tx, &member.id)?.quarantine.is_none() {
+                known_empty.remove(&member.id);
+                continue;
+            }
+            if member.used > 0 || member.reserved > 0 {
+                // Keep a contradictory durable count authoritative even if a
+                // future caller violates the sticky-quarantine invariant.
+                known_empty.remove(&member.id);
+                active.insert(member.id);
+            } else if !known_empty.contains(&member.id) {
+                unchecked.insert(member.id);
+            }
+        }
+        if !unchecked.is_empty() {
+            #[cfg(test)]
+            self.empty_ownership_scans
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            for row in tx.open_table(OBJECTS)?.iter()? {
+                let entry: Entry = bincode::deserialize(row?.1.value())?;
+                if let Some(id) = entry.physical.member_id()
+                    && unchecked.remove(id)
+                {
+                    active.insert(id.to_owned());
+                }
+                if unchecked.is_empty() {
+                    break;
+                }
+            }
+            if !unchecked.is_empty() {
+                for row in tx.open_table(UPLOADS)?.iter()? {
+                    let upload: Upload = bincode::deserialize(row?.1.value())?;
+                    if unchecked.remove(&upload.member_id) {
+                        active.insert(upload.member_id);
+                    }
+                    if unchecked.is_empty() {
+                        break;
+                    }
+                }
+            }
+            if !unchecked.is_empty() {
+                for row in tx.open_table(GARBAGE)?.iter()? {
+                    let garbage: Garbage = bincode::deserialize(row?.1.value())?;
+                    if let Some(id) = garbage.entry.physical.member_id()
+                        && unchecked.remove(id)
+                    {
+                        active.insert(id.to_owned());
+                    }
+                    if unchecked.is_empty() {
+                        break;
+                    }
+                }
+            }
+            // Every remaining member is quarantined and has no object, upload,
+            // or garbage row. Existing ownership never disappears before its
+            // successor debt is recorded, and no new target is admitted after
+            // quarantine. Since this check precedes transaction mutations,
+            // aborting the caller cannot invalidate the observed emptiness.
+            known_empty.extend(unchecked);
+        }
+        if active.len() > 1 {
+            return Err(AutomaticEvacuationBlocked.into());
+        }
+        Ok(())
+    }
+}
+
 fn ensure_eligible(tx: &redb::WriteTransaction, member: &str) -> Result<()> {
     let health = health_in(tx, member)?;
     if let Some(reason) = health.quarantine.or(health.monitoring_error) {
@@ -1150,6 +1335,165 @@ fn ensure_eligible(tx: &redb::WriteTransaction, member: &str) -> Result<()> {
         .into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod empty_quarantine_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    fn fixture() -> (tempfile::TempDir, Catalog, Vec<PoolMember>) {
+        let root = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(&root.path().join("catalog"), "db", true, None).unwrap();
+        let members = ["old", "current", "target"]
+            .into_iter()
+            .map(|id| PoolMember {
+                id: id.into(),
+                identity: format!("memory://{id}"),
+                store: Arc::new(object_store::memory::InMemory::new()),
+                capacity_bytes: 1024,
+                local_path: None,
+                min_free_bytes: 0,
+                health_device: None,
+            })
+            .collect::<Vec<_>>();
+        catalog.configure_members(&members).unwrap();
+        catalog.finish_initialization().unwrap();
+        (root, catalog, members)
+    }
+
+    fn insert(
+        catalog: &Catalog,
+        members: &[PoolMember],
+        location: &str,
+        member: &str,
+        size: u64,
+    ) -> Entry {
+        let upload = catalog
+            .reserve(location, size, members, Some(member))
+            .unwrap();
+        let entry = Entry {
+            physical: Physical::Member {
+                member_id: member.into(),
+                key: upload.physical_key,
+                e_tag: None,
+                version: None,
+            },
+            size,
+            last_modified_secs: 0,
+            last_modified_nanos: 0,
+            e_tag: None,
+            version: None,
+            sha256: None,
+            attributes: Vec::new(),
+        };
+        catalog
+            .publish_for_migration(&upload.id, &entry, None, false)
+            .unwrap();
+        entry
+    }
+
+    fn quarantine(catalog: &Catalog) {
+        for member in ["old", "current"] {
+            catalog
+                .observe_health(member, None, Some("media failure".into()), None)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn empty_historical_quarantine_is_scanned_once_and_revalidated_after_reopen() {
+        let (root, catalog, members) = fixture();
+        insert(&catalog, &members, "current-data", "current", 8);
+        quarantine(&catalog);
+        catalog.require_automatic_evacuation().unwrap();
+        assert!(
+            catalog
+                .verified_empty_quarantined
+                .lock()
+                .unwrap()
+                .contains("old")
+        );
+        assert_eq!(catalog.empty_ownership_scans.load(Ordering::Relaxed), 1);
+        for _ in 0..32 {
+            catalog.require_automatic_evacuation().unwrap();
+        }
+        assert_eq!(catalog.empty_ownership_scans.load(Ordering::Relaxed), 1);
+        assert!(
+            catalog
+                .reserve("new-data", 0, &members, Some("old"))
+                .is_err()
+        );
+        let marker = catalog.identity.marker().unwrap();
+        drop(catalog);
+        let reopened =
+            Catalog::open(&root.path().join("catalog"), "db", false, Some(&marker)).unwrap();
+        assert!(
+            reopened
+                .verified_empty_quarantined
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(reopened.empty_ownership_scans.load(Ordering::Relaxed), 0);
+        reopened.require_automatic_evacuation().unwrap();
+        assert_eq!(reopened.empty_ownership_scans.load(Ordering::Relaxed), 1);
+        reopened.require_automatic_evacuation().unwrap();
+        assert_eq!(reopened.empty_ownership_scans.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn zero_byte_object_upload_and_cleanup_debt_each_prevent_caching_empty() {
+        let (_root, catalog, members) = fixture();
+        let zero = insert(&catalog, &members, "zero-data", "old", 0);
+        let upload = catalog
+            .reserve("zero-upload", 0, &members, Some("old"))
+            .unwrap();
+        insert(&catalog, &members, "current-data", "current", 8);
+        quarantine(&catalog);
+        assert!(catalog.require_automatic_evacuation().is_err());
+        assert!(
+            !catalog
+                .verified_empty_quarantined
+                .lock()
+                .unwrap()
+                .contains("old")
+        );
+        let garbage = catalog.retire("zero-data", &zero).unwrap();
+        // The upload is now the first remaining zero-byte owner encountered.
+        assert!(catalog.require_automatic_evacuation().is_err());
+        assert!(
+            !catalog
+                .verified_empty_quarantined
+                .lock()
+                .unwrap()
+                .contains("old")
+        );
+        catalog.forget_upload(&upload.id).unwrap();
+        // Only a cleanup debt remains; byte counters alone still say zero.
+        assert!(catalog.require_automatic_evacuation().is_err());
+        assert!(
+            !catalog
+                .verified_empty_quarantined
+                .lock()
+                .unwrap()
+                .contains("old")
+        );
+        catalog.forget_garbage(&garbage.id).unwrap();
+        catalog.require_automatic_evacuation().unwrap();
+        assert!(
+            catalog
+                .verified_empty_quarantined
+                .lock()
+                .unwrap()
+                .contains("old")
+        );
+        let scans = catalog.empty_ownership_scans.load(Ordering::Relaxed);
+        assert_eq!(scans, 4);
+        catalog.require_automatic_evacuation().unwrap();
+        assert_eq!(catalog.empty_ownership_scans.load(Ordering::Relaxed), scans);
+    }
 }
 
 #[cfg(test)]
@@ -1271,7 +1615,7 @@ mod legacy_health_compatibility {
             min_free_bytes: 0,
             health_device: None,
         };
-        let status = catalog.status(&[config]).unwrap();
+        let status = catalog.status(&[config], None).unwrap();
         assert_eq!(status.mapped_objects, 1);
         assert_eq!(status.members[0].used_bytes, 7);
         assert!(status.members[0].health.quarantine.is_none());

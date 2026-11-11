@@ -6,6 +6,7 @@
 //! Replacement and migration publish the new location before removing the old
 //! body, and failed cleanup remains charged and recoverable.
 
+mod capacity;
 mod catalog;
 mod health;
 mod recovery;
@@ -93,6 +94,20 @@ pub struct PoolMemberStatus {
     pub pending_uploads: u64,
     pub cleanup_debts: u64,
     pub evacuation: String,
+    /// Allocatable bytes after quota, reservations, and local free-space reserve.
+    pub available_bytes: u64,
+    pub evacuation_capacity: EvacuationCapacity,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct EvacuationCapacity {
+    /// Source bytes that do not already have a reserved healthy destination.
+    pub required_bytes: u64,
+    pub reserved_destination_bytes: u64,
+    /// Healthy capacity, counting each underlying filesystem only once.
+    pub available_bytes: u64,
+    pub sufficient: bool,
+    pub unavailable_members: Vec<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -111,6 +126,8 @@ pub struct PoolPlacement {
     pub location: Path,
     pub member_id: String,
     pub size: u64,
+    /// Object key relative to the selected member's configured root.
+    pub physical_key: String,
 }
 
 #[derive(Clone)]
@@ -127,6 +144,7 @@ struct PoolInner {
     member_checks: Vec<Mutex<bool>>,
     locks: Vec<Arc<RwLock<()>>>,
     migration: Mutex<()>,
+    evacuating: Arc<StdMutex<Option<EvacuationProgress>>>,
     tasks: tokio_util::task::TaskTracker,
     health_changed: tokio::sync::Notify,
     safety_failure: tokio_util::sync::CancellationToken,
@@ -162,6 +180,23 @@ struct ReservedPut {
     preserve: Option<Entry>,
     cancelled: Arc<AtomicBool>,
     verify: bool,
+    automatic: bool,
+}
+
+#[derive(Clone)]
+struct EvacuationProgress {
+    member_id: String,
+    location: String,
+    source_key: String,
+    upload_id: Option<String>,
+}
+
+struct ActiveEvacuation(Arc<StdMutex<Option<EvacuationProgress>>>);
+
+impl Drop for ActiveEvacuation {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap() = None;
+    }
 }
 
 impl PoolMember {
@@ -244,7 +279,9 @@ impl MoveFailure {
     fn destination(error: object_store::Error) -> Self {
         if has_cause::<SourceChecksumMismatch>(&error) {
             Self::Source(error)
-        } else if has_cause::<catalog::AllocationBlocked>(&error) {
+        } else if has_cause::<catalog::AllocationBlocked>(&error)
+            || has_cause::<catalog::AutomaticEvacuationBlocked>(&error)
+        {
             Self::Admission(error)
         } else if has_cause::<CatalogFailure>(&error) {
             Self::Control(error)
@@ -458,6 +495,7 @@ impl PoolObjectStore {
                 members,
                 member_indices,
                 migration: Mutex::new(()),
+                evacuating: Arc::new(StdMutex::new(None)),
                 tasks: tokio_util::task::TaskTracker::new(),
                 health_changed: tokio::sync::Notify::new(),
                 safety_failure: tokio_util::sync::CancellationToken::new(),
@@ -781,6 +819,7 @@ impl PoolObjectStore {
             preserve,
             cancelled,
             verify,
+            automatic,
         } = request;
         let outcome = async {
             if u64::try_from(payload.content_length()).ok() != Some(upload.size) {
@@ -806,7 +845,7 @@ impl PoolObjectStore {
                 return Err(permanent(SourceChecksumMismatch));
             }
             let id = upload.id.clone();
-            self.catalog(move |catalog| catalog.mark_started(&id)).await?;
+            self.catalog(move |catalog| catalog.mark_started_for_migration(&id, automatic)).await?;
             #[cfg(test)] crash_cutpoint("after_started");
             options.mode = PutMode::Create;
             let member = self.member(&upload.member_id)?;
@@ -856,7 +895,7 @@ impl PoolObjectStore {
             let member_id = upload.member_id.clone();
             self.catalog(move |c| c.require_eligible(&member_id)).await?;
             self.ensure_member(&upload.member_id, true).await?;
-            let garbage = self.catalog(move |catalog| catalog.publish(&id, &entry, previous.as_ref())).await?;
+            let garbage = self.catalog(move |catalog| catalog.publish_for_migration(&id, &entry, previous.as_ref(), automatic)).await?;
             #[cfg(test)] crash_cutpoint("after_remap");
             #[cfg(test)] if garbage.is_some() { crash_cutpoint("before_source_delete"); }
             if let Some(garbage) = garbage
@@ -898,6 +937,7 @@ impl PoolObjectStore {
             preserve: None,
             cancelled,
             verify: false,
+            automatic: false,
         })
         .await
     }
@@ -1345,9 +1385,24 @@ impl PoolObjectStore {
 
     pub async fn status(&self) -> object_store::Result<PoolStatus> {
         let members = self.inner.members.clone();
+        let evacuating = self.inner.evacuating.lock().unwrap().clone();
+        let snapshot = evacuating.clone();
         let mut status = self
-            .catalog(move |catalog| catalog.status(&members))
+            .catalog(move |catalog| catalog.status(&members, snapshot.as_ref()))
             .await?;
+        for member in &mut status.members {
+            if evacuating
+                .as_ref()
+                .is_some_and(|active| active.member_id == member.id)
+                && member.evacuation_capacity.sufficient
+                && matches!(
+                    member.evacuation.as_str(),
+                    "incomplete" | "blocked_destination" | "blocked_capacity_or_admission"
+                )
+            {
+                member.evacuation = "running".into();
+            }
+        }
         if !self.inner.tasks.is_empty() {
             for member in &mut status.members {
                 member.safe_to_remove = false;
@@ -1377,6 +1432,7 @@ impl PoolObjectStore {
                 && !snapshot.hidden.contains(meta.location.as_ref())
             {
                 placements.push(PoolPlacement {
+                    physical_key: meta.location.to_string(),
                     location: meta.location,
                     member_id: "authority".to_owned(),
                     size: meta.size,
@@ -1484,6 +1540,28 @@ impl PoolObjectStore {
         target_member_id: &str,
         expected_source: Option<String>,
     ) -> Result<(), MoveFailure> {
+        self.migrate_inner(location, target_member_id, expected_source, false)
+            .await
+            .map(|_| ())
+    }
+
+    async fn migrate_automatic(
+        &self,
+        location: &Path,
+        target_member_id: &str,
+        expected_source: String,
+    ) -> Result<bool, MoveFailure> {
+        self.migrate_inner(location, target_member_id, Some(expected_source), true)
+            .await
+    }
+
+    async fn migrate_inner(
+        &self,
+        location: &Path,
+        target_member_id: &str,
+        expected_source: Option<String>,
+        automatic: bool,
+    ) -> Result<bool, MoveFailure> {
         if !self.segment(location) {
             return Err(unsupported(
                 "only canonical segment objects can be migrated into the pool",
@@ -1499,22 +1577,50 @@ impl PoolObjectStore {
         self.inner
             .tasks
             .spawn(async move {
-                let _migration = pool.inner.migration.lock().await;
-                let _guard = pool.key_lock(&location).write_owned().await;
+                let _migration = if automatic {
+                    let Ok(guard) = pool.inner.migration.try_lock() else {
+                        return Ok(false);
+                    };
+                    guard
+                } else {
+                    pool.inner.migration.lock().await
+                };
+                let _guard = if automatic {
+                    let Ok(guard) = pool.key_lock(&location).try_write_owned() else {
+                        return Ok(false);
+                    };
+                    guard
+                } else {
+                    pool.key_lock(&location).write_owned().await
+                };
                 let previous = match pool.visible(&location).await? {
                     Some(previous) => previous,
-                    None if expected_source.is_some() => return Ok(()),
+                    None if expected_source.is_some() => return Ok(true),
                     None => return Err(missing(&location).into()),
                 };
                 if expected_source
                     .as_ref()
                     .is_some_and(|source| previous.physical.member_id() != Some(source.as_str()))
                 {
-                    return Ok(());
+                    return Ok(true);
                 }
                 if previous.physical.member_id() == Some(target.as_str()) {
-                    return Ok(());
+                    return Ok(true);
                 }
+                let _active = if automatic {
+                    pool.catalog(Catalog::require_automatic_evacuation)
+                        .await
+                        .map_err(MoveFailure::destination)?;
+                    *pool.inner.evacuating.lock().unwrap() = Some(EvacuationProgress {
+                        member_id: expected_source.clone().expect("automatic source"),
+                        location: location.to_string(),
+                        source_key: previous.physical.key().to_owned(),
+                        upload_id: None,
+                    });
+                    Some(ActiveEvacuation(pool.inner.evacuating.clone()))
+                } else {
+                    None
+                };
                 let upload = pool
                     .reserve(&location, previous.size, Some(target))
                     .await
@@ -1525,6 +1631,9 @@ impl PoolObjectStore {
                             MoveFailure::Control(e)
                         }
                     })?;
+                if automatic && let Some(active) = pool.inner.evacuating.lock().unwrap().as_mut() {
+                    active.upload_id = Some(upload.id.clone());
+                }
                 let (payload, attributes) = match pool.read_payload(&previous).await {
                     Ok(payload) => payload,
                     Err(error) => {
@@ -1545,10 +1654,11 @@ impl PoolObjectStore {
                     preserve: Some(previous),
                     cancelled,
                     verify: true,
+                    automatic,
                 })
                 .await
                 .map_err(MoveFailure::destination)?;
-                Ok(())
+                Ok(true)
             })
             .await
             .map_err(|e| MoveFailure::Control(error(format!("pool migration task failed: {e}"))))?
@@ -2016,6 +2126,7 @@ impl MultipartUpload for PoolMultipartUpload {
                     preserve: None,
                     cancelled,
                     verify: false,
+                    automatic: false,
                 })
                 .await
             })
