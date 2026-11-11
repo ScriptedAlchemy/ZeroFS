@@ -37,7 +37,9 @@ jobs:
           scripts.tests.test_gc_cadence
           scripts.tests.test_local_storage_pool_lifecycle
           scripts.tests.test_release_pgo_workflow
+          scripts.tests.test_jepsen_native_deps
           scripts.tests.test_lein_deps_retry
+          scripts.tests.test_local_storage_pool_diagnostics
 
   build:
     uses: ./.github/workflows/_build-ci-bin.yml

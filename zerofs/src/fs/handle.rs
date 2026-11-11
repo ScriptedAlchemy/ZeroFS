@@ -36,7 +36,7 @@ fn dec_open_handle(map: &DashMap<InodeId, u64>, id: InodeId) -> u64 {
     }
 }
 
-/// Pins an inode while an opened 9P fid or a walked directory fid retains it.
+/// Pins an inode while an opened 9P fid or an authorized directory fid retains it.
 /// Created (incrementing the count) under the inode lock, and stored in that
 /// fid's slot in the session table. Because it lives in the slot, every way a
 /// fid goes away (clunk, close_all, a walk that overwrites it, the session
