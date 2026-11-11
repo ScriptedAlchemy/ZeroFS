@@ -59,7 +59,9 @@ jobs:
       - name: Build
         run: cargo build --verbose
       - name: Exercise local storage pooling over 9P
-        run: python3 ../scripts/test-local-storage-pool.py --binary target/debug/zerofs --receipt target/local-storage-pool.json
+        run: |
+          set -euo pipefail
+          python3 ../scripts/test-local-storage-pool.py --binary target/debug/zerofs --receipt target/local-storage-pool.json 2>&1 | tee target/local-storage-pool.log
       - name: Run tests
         run: |
           set -euo pipefail
@@ -115,7 +117,9 @@ jobs:
         # Four SMART cases and two loss cases each have a 300-second budget.
         # Leave room for all six cases and their bounded server cleanup.
         timeout-minutes: 35
-        run: python3 ../scripts/test-local-storage-pool.py --binary target/debug/zerofs --health-recovery --receipt target/physical-disk-health.json
+        run: |
+          set -euo pipefail
+          python3 ../scripts/test-local-storage-pool.py --binary target/debug/zerofs --health-recovery --receipt target/physical-disk-health.json 2>&1 | tee target/physical-disk-health.log
       - name: Retain physical disk acceptance evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -123,7 +127,9 @@ jobs:
           name: physical-disk-acceptance
           path: |
             zerofs/target/local-storage-pool.json
+            zerofs/target/local-storage-pool.log
             zerofs/target/physical-disk-health.json
+            zerofs/target/physical-disk-health.log
             zerofs/target/pool-exports.log
             zerofs/target/unit-tests.log
           if-no-files-found: error

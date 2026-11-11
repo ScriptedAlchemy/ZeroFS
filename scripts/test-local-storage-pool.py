@@ -11,10 +11,7 @@ The script uses the ordinary CLI and never mounts a filesystem or needs root.
 from __future__ import annotations
 
 import argparse
-from collections import Counter
-from contextlib import contextmanager
-from datetime import datetime, timezone
-import fcntl
+import contextlib
 import hashlib
 import json
 import os
@@ -27,25 +24,83 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import Counter
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import fcntl
 
 
 PAYLOAD_BYTES = 768 * 1024
-FIRST_MEMBER_BYTES = 1024 * 1024
-OTHER_MEMBER_BYTES = 8 * 1024 * 1024
-TOTAL_TIMEOUT_SECONDS = 300
-COMMAND_TIMEOUT_SECONDS = 90
-START_TIMEOUT_SECONDS = 60
-SHUTDOWN_TIMEOUT_SECONDS = 30
 RUNNING_STATUS_TIMEOUT_SECONDS = 5
 RUNNING_STATUS_SAMPLES = 3
 NATIVE_MUTATION_LOCK_NAME = ".zerofs-local-mutations#0"
 # Version-one footer from zerofs/src/segment.rs; only identity and bounds are
 # parsed here. SHA-256 compares whole bodies; cold reads verify file bytes.
 SEGMENT_FOOTER = struct.Struct("<4sIIQIQQQQII")
+FIRST_MEMBER_BYTES = 1024 * 1024
+OTHER_MEMBER_BYTES = 8 * 1024 * 1024
+TOTAL_TIMEOUT_SECONDS = 300
+COMMAND_TIMEOUT_SECONDS = 90
+START_TIMEOUT_SECONDS = 60
+SHUTDOWN_TIMEOUT_SECONDS = 30
+CANCEL_SHUTDOWN_TIMEOUT_SECONDS = 2
 
 
 class SmokeFailure(RuntimeError):
     pass
+
+
+class SmokeCancelled(SmokeFailure):
+    def __init__(self, signum: int):
+        super().__init__(f"cancelled by {signal.Signals(signum).name}")
+
+
+_active_cancellation = None
+
+
+@contextlib.contextmanager
+def defer_cancellation():
+    """Finish transferring child ownership before unwinding a signal."""
+    state = _active_cancellation
+    if state is None:
+        yield
+        return
+    state["deferred"] += 1
+    try:
+        yield
+    finally:
+        state["deferred"] -= 1
+        if state["received"] and state["deferred"] == 0:
+            raise SmokeCancelled(state["received"][0])
+
+
+@contextlib.contextmanager
+def cancellation_signals():
+    """Let cancellation unwind owned servers before the runner exits."""
+    global _active_cancellation
+    previous_state = _active_cancellation
+    state = {"received": [], "deferred": 0}
+    _active_cancellation = state
+    previous = {signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)}
+
+    def cancel(signum, _frame):
+        # Ignore repeated soft cancellation while bounded reaping completes.
+        # Keep a caught handler rather than SIG_IGN, so an in-flight spawn does
+        # not inherit ignored signal dispositions into its new executable.
+        if state["received"]:
+            return
+        state["received"].append(signum)
+        if state["deferred"] == 0:
+            raise SmokeCancelled(signum)
+
+    try:
+        for signum in previous:
+            signal.signal(signum, cancel)
+        yield state["received"]
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+        _active_cancellation = previous_state
 
 
 def require(condition: bool, message: str) -> None:
@@ -119,18 +174,22 @@ class Server:
         self.socket_path.unlink(missing_ok=True)
         self.log = self.log_path.open("wb")
         environment = os.environ.copy()
+        # A cold restart must use persisted health state, even when this runner
+        # was launched from an environment that already enables test injection.
+        environment.pop("ZEROFS_TEST_DISK_HEALTH", None)
         if self.health_events is not None:
             environment["ZEROFS_TEST_DISK_HEALTH"] = str(self.health_events)
         environment.update(RUST_LOG="info", NO_COLOR="1", TERM="dumb")
         try:
-            self.process = subprocess.Popen(
-                [str(self.binary), "run", "--config", str(self.config)],
-                stdin=subprocess.DEVNULL,
-                stdout=self.log,
-                stderr=subprocess.STDOUT,
-                env=environment,
-                start_new_session=True,
-            )
+            with defer_cancellation():
+                self.process = subprocess.Popen(
+                    [str(self.binary), "run", "--config", str(self.config)],
+                    stdin=subprocess.DEVNULL,
+                    stdout=self.log,
+                    stderr=subprocess.STDOUT,
+                    env=environment,
+                    start_new_session=True,
+                )
             ready_deadline = time.monotonic() + time_left(self.deadline, START_TIMEOUT_SECONDS)
             while time.monotonic() < ready_deadline:
                 if self.process.poll() is not None:
@@ -147,11 +206,11 @@ class Server:
                         pass
                 time.sleep(0.05)
             raise SmokeFailure("server did not accept connections before the startup deadline")
-        except BaseException:
-            self.stop(strict=False)
+        except BaseException as error:
+            self.stop(strict=False, cancelled=isinstance(error, SmokeCancelled))
             raise
 
-    def stop(self, *, strict: bool) -> None:
+    def stop(self, *, strict: bool, cancelled: bool = False) -> None:
         failure = None
         try:
             if self.process is not None:
@@ -161,7 +220,8 @@ class Server:
                     except ProcessLookupError:
                         pass
                     try:
-                        self.process.wait(timeout=SHUTDOWN_TIMEOUT_SECONDS)
+                        self.process.wait(timeout=CANCEL_SHUTDOWN_TIMEOUT_SECONDS if cancelled
+                                          else SHUTDOWN_TIMEOUT_SECONDS)
                     except subprocess.TimeoutExpired:
                         try:
                             os.killpg(self.process.pid, signal.SIGKILL)
@@ -172,6 +232,18 @@ class Server:
                 expected_exit = self.expected_kill and self.process.returncode == -signal.SIGKILL
                 if self.process.returncode != 0 and not expected_exit and failure is None:
                     failure = f"server exited with status {self.process.returncode}"
+        except SmokeCancelled:
+            # The first signal can arrive while an otherwise normal __exit__
+            # is already waiting for TERM. Finish reaping before unwinding;
+            # merely closing the log would leave the detached server alive.
+            if self.process is not None:
+                if self.process.poll() is None:
+                    try:
+                        os.killpg(self.process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                self.process.wait(timeout=5)
+            raise
         finally:
             if self.log is not None:
                 self.log.close()
@@ -191,7 +263,8 @@ class Server:
         self.expected_kill = True
 
     def __exit__(self, exception_type, _exception, _traceback):
-        self.stop(strict=exception_type is None)
+        self.stop(strict=exception_type is None,
+                  cancelled=exception_type is not None and issubclass(exception_type, SmokeCancelled))
         return False
 
 
@@ -267,6 +340,22 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
         return digest.hexdigest()
+
+
+def write_receipt(path: Path, receipt: dict) -> None:
+    """Replace an earlier result atomically so a failed rerun cannot leave a pass."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=f".{path.name}.", delete=False) as output:
+            temporary = Path(output.name)
+            json.dump(receipt, output, indent=2, sort_keys=True)
+            output.write("\n")
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def fixture(fixture_id: str, **evidence) -> dict:
@@ -910,23 +999,7 @@ def loss_smoke(binary: Path, root: Path, no_space: bool = False) -> dict:
             "healthy_sha256": expected["second.bin"], "checkpoint_affected": True, "fixtures": evidence}
 
 
-def write_receipt(path: Path, receipt: dict) -> None:
-    """Replace an earlier result atomically so a failed rerun cannot leave a pass."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
-                                         prefix=f".{path.name}.", delete=False) as output:
-            temporary = Path(output.name)
-            json.dump(receipt, output, indent=2, sort_keys=True)
-            output.write("\n")
-        temporary.replace(path)
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-
-
-def main() -> int:
+def run_smoke() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path, help="built ZeroFS executable")
     parser.add_argument("--health-recovery", action="store_true", help="requires a disk-health-test-hooks build")
@@ -976,6 +1049,17 @@ def main() -> int:
                 print(f"could not write failure receipt: {receipt_error}", file=sys.stderr)
         print(f"local storage pool smoke test failed: {error}", file=sys.stderr)
         return 1
+
+
+def main() -> int:
+    with cancellation_signals() as received:
+        try:
+            result = run_smoke()
+        except SmokeCancelled as error:
+            # Argument parsing precedes run_smoke's ordinary failure handler.
+            print(f"local storage pool smoke test failed: {error}", file=sys.stderr)
+            result = 1
+    return 128 + received[0] if received else result
 
 
 if __name__ == "__main__":
