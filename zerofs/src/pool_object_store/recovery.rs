@@ -125,12 +125,28 @@ impl PoolObjectStore {
         let Some(expected) = entry.sha256 else {
             return Ok(false);
         };
+        // A successful verification can turn a known-loss leftover back into
+        // readable data. Keep its member busy until that catalog update commits.
+        let member_activity = self.track_member(&entry.physical);
         match self.hash_physical(&entry.physical, entry.size).await {
             Ok(actual) if actual == expected => {
+                #[cfg(test)]
+                {
+                    let pause = self.inner.verification_pause.lock().unwrap().take();
+                    if let Some((entered, resume)) = pause {
+                        entered.notify_one();
+                        resume.notified().await;
+                    }
+                }
                 let location = fault.location.clone();
                 let generation = fault.physical_key.clone();
-                self.catalog(move |c| c.clear_fault_if_current(&location, &generation))
-                    .await?;
+                self.catalog(move |c| {
+                    // A cancelled waiter cannot release the dependency while
+                    // the blocking catalog transaction is still clearing it.
+                    let _member_activity = member_activity;
+                    c.clear_fault_if_current(&location, &generation)
+                })
+                .await?;
             }
             failure => {
                 let reason = match failure {
@@ -138,8 +154,11 @@ impl PoolObjectStore {
                     Err(e) => e.to_string(),
                 };
                 let location = fault.location.clone();
-                self.catalog(move |c| c.record_source_fault(&location, &entry, reason))
-                    .await?;
+                self.catalog(move |c| {
+                    let _member_activity = member_activity;
+                    c.record_source_fault(&location, &entry, reason)
+                })
+                .await?;
             }
         }
         Ok(true)

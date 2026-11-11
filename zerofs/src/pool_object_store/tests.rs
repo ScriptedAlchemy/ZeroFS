@@ -1124,6 +1124,234 @@ async fn disk_health_evacuation_continues_after_unreadable_and_persists_loss() {
 }
 
 #[tokio::test]
+async fn pull_ready_empty_member_ignores_healthy_member_reads_and_multipart() {
+    let f = Fixture::new(1024);
+    let pool = f.initialize().await;
+    let path = segment(2400);
+    create(&pool, &path, b"source").await;
+    let source_read = pool.get(&path).await.unwrap();
+    pool.quarantine("hdd-a", "fixture media failure")
+        .await
+        .unwrap();
+    pool.evacuate_pass(&tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(placement(&pool, &path).await, "hdd-a");
+    assert!(!pool.status().await.unwrap().members[0].safe_to_remove);
+    drop(source_read);
+    pool.evacuate_pass(&tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(placement(&pool, &path).await, "hdd-b");
+
+    let mut healthy_upload = multipart(&pool, &segment(2401), 4).await;
+    let healthy_read = pool.get(&path).await.unwrap();
+    let status = pool.status().await.unwrap();
+    let empty = &status.members[0];
+    assert_eq!(
+        (empty.used_bytes, empty.objects, empty.reserved_bytes),
+        (0, 0, 0)
+    );
+    assert_eq!((empty.pending_uploads, empty.cleanup_debts), (0, 0));
+    assert!(
+        empty.safe_to_remove,
+        "unrelated healthy-member work must not block an empty disk"
+    );
+    assert_eq!(status.members[1].pending_uploads, 1);
+    assert!(
+        !pool.inner.tasks.is_empty(),
+        "shutdown still tracks healthy work"
+    );
+    drop(healthy_read);
+    healthy_upload.abort().await.unwrap();
+    drop(healthy_upload);
+}
+
+#[tokio::test]
+async fn pull_ready_known_loss_tracks_only_its_own_reads_and_debts() {
+    let f = Fixture::new(1024);
+    let pool = f.initialize().await;
+    let bad = segment(2402);
+    let good = segment(2403);
+    create(&pool, &bad, b"bad").await;
+    create(&pool, &good, b"healthy").await;
+    let mut source_upload = multipart(&pool, &segment(2404), 0).await;
+    f.first
+        .control
+        .corrupt_payload_len
+        .store(3, Ordering::SeqCst);
+    pool.quarantine("hdd-a", "fixture media failure")
+        .await
+        .unwrap();
+    pool.evacuate_pass(&tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(placement(&pool, &bad).await, "hdd-a");
+    assert_eq!(placement(&pool, &good).await, "hdd-b");
+    let status = pool.status().await.unwrap();
+    assert_eq!(status.members[0].pending_uploads, 1);
+    assert!(!status.members[0].safe_to_pull_with_known_loss);
+    source_upload.abort().await.unwrap();
+    drop(source_upload);
+
+    let mut healthy_upload = multipart(&pool, &segment(2405), 4).await;
+    let healthy_read = pool.get(&good).await.unwrap();
+    let status = pool.status().await.unwrap();
+    assert_eq!(status.members[0].unreadable_objects, 1);
+    assert_eq!(status.members[0].cleanup_debts, 0);
+    assert!(!status.members[0].safe_to_remove);
+    assert!(
+        status.members[0].safe_to_pull_with_known_loss,
+        "healthy traffic must not mask completed readable evacuation"
+    );
+
+    // HEAD is allowed for a recorded unreadable object. A returned response
+    // still owns a physical read lease until the caller drops its payload.
+    let source_read = pool
+        .get_opts(
+            &bad,
+            GetOptions {
+                head: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!pool.status().await.unwrap().members[0].safe_to_pull_with_known_loss);
+    drop(source_read);
+    assert!(pool.status().await.unwrap().members[0].safe_to_pull_with_known_loss);
+    drop(healthy_read);
+    healthy_upload.abort().await.unwrap();
+    drop(healthy_upload);
+}
+
+#[tokio::test]
+async fn pull_ready_known_loss_stays_blocked_until_verification_catalog_update() {
+    let f = Fixture::new(1024);
+    let pool = f.initialize().await;
+    let path = segment(2406);
+    create(&pool, &path, b"bad").await;
+    f.first
+        .control
+        .corrupt_payload_len
+        .store(3, Ordering::SeqCst);
+    pool.quarantine("hdd-a", "fixture media failure")
+        .await
+        .unwrap();
+    pool.evacuate_pass(&tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    let fault = pool.faults().await.unwrap().pop().unwrap();
+    assert!(pool.status().await.unwrap().members[0].safe_to_pull_with_known_loss);
+    f.first
+        .control
+        .corrupt_payload_len
+        .store(0, Ordering::SeqCst);
+    let entered = Arc::new(Notify::new());
+    let resume = Arc::new(Notify::new());
+    *pool.inner.verification_pause.lock().unwrap() = Some((entered.clone(), resume.clone()));
+    let verifying = pool.clone();
+    let verified = tokio::spawn(async move { verifying.verify_source_fault(&fault).await });
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    let status = pool.status().await.unwrap();
+    assert_eq!(
+        status.members[0].unreadable_objects, 1,
+        "fault is not cleared yet"
+    );
+    assert!(
+        !status.members[0].safe_to_pull_with_known_loss,
+        "verification owns the source through catalog settlement"
+    );
+    resume.notify_one();
+    assert!(verified.await.unwrap().unwrap());
+    assert!(pool.faults().await.unwrap().is_empty());
+    assert!(!pool.status().await.unwrap().members[0].safe_to_pull_with_known_loss);
+    pool.evacuate_pass(&tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(pool.status().await.unwrap().members[0].safe_to_remove);
+    assert_eq!(read(&pool, &path).await, "bad");
+}
+
+async fn assert_pull_ready_snapshot_tracks_verification(active_before_snapshot: bool) {
+    let f = Fixture::new(1024);
+    let pool = f.initialize().await;
+    let path = segment(2408);
+    create(&pool, &path, b"bad").await;
+    f.first
+        .control
+        .corrupt_payload_len
+        .store(3, Ordering::SeqCst);
+    pool.quarantine("hdd-a", "fixture media failure")
+        .await
+        .unwrap();
+    pool.evacuate_pass(&tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    let fault = pool.faults().await.unwrap().pop().unwrap();
+    assert!(pool.status().await.unwrap().members[0].safe_to_pull_with_known_loss);
+    f.first
+        .control
+        .corrupt_payload_len
+        .store(0, Ordering::SeqCst);
+
+    let verified_entered = Arc::new(Notify::new());
+    let verified_resume = Arc::new(Notify::new());
+    let verifying = if active_before_snapshot {
+        *pool.inner.verification_pause.lock().unwrap() =
+            Some((verified_entered.clone(), verified_resume.clone()));
+        let verifier = pool.clone();
+        let retry = fault.clone();
+        let task = tokio::spawn(async move { verifier.verify_source_fault(&retry).await });
+        tokio::time::timeout(Duration::from_secs(5), verified_entered.notified())
+            .await
+            .unwrap();
+        Some(task)
+    } else {
+        None
+    };
+
+    let status_entered = Arc::new(Notify::new());
+    let status_resume = Arc::new(Notify::new());
+    *pool.inner.status_pause.lock().unwrap() =
+        Some((status_entered.clone(), status_resume.clone()));
+    let reporter = pool.clone();
+    let reporting = tokio::spawn(async move { reporter.status().await });
+    tokio::time::timeout(Duration::from_secs(5), status_entered.notified())
+        .await
+        .unwrap();
+    if let Some(verifying) = verifying {
+        verified_resume.notify_one();
+        assert!(verifying.await.unwrap().unwrap());
+    } else {
+        assert!(pool.verify_source_fault(&fault).await.unwrap());
+    }
+    assert!(pool.faults().await.unwrap().is_empty());
+    status_resume.notify_one();
+    let snapshot = reporting.await.unwrap().unwrap();
+    assert_eq!(snapshot.members[0].unreadable_objects, 1);
+    assert!(
+        !snapshot.members[0].safe_to_pull_with_known_loss,
+        "a completed verifier must not make its earlier catalog snapshot pull-ready"
+    );
+    let current = pool.status().await.unwrap();
+    assert_eq!(current.members[0].unreadable_objects, 0);
+    assert!(!current.members[0].safe_to_pull_with_known_loss);
+}
+
+#[tokio::test]
+async fn pull_ready_snapshot_tracks_preexisting_verification_through_completion() {
+    assert_pull_ready_snapshot_tracks_verification(true).await;
+}
+
+#[tokio::test]
+async fn pull_ready_snapshot_tracks_verification_started_and_finished_during_read() {
+    assert_pull_ready_snapshot_tracks_verification(false).await;
+}
+
+#[tokio::test]
 async fn disk_health_evacuation_no_capacity_never_claims_completion() {
     let f = Fixture::new(8);
     let pool = f.initialize().await;
@@ -1709,6 +1937,108 @@ async fn native_recovery_timeout_keeps_cleanup_owned_until_catalog_settlement() 
 }
 
 #[tokio::test]
+#[cfg(target_os = "linux")]
+async fn pull_ready_cancelled_stale_native_cleanup_keeps_worker_and_shutdown_owned() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    for directory in ["authority", "hdd-a", "hdd-b"] {
+        std::fs::create_dir(root.join(directory)).unwrap();
+    }
+    let pool = persistent_pool(&root, true).await;
+    let path = segment(2407);
+    create(&pool, &path, b"source").await;
+    let previous = pool.visible(&path).await.unwrap().unwrap();
+    let lock_path = root
+        .join("hdd-a")
+        .join(previous.physical.key())
+        .parent()
+        .unwrap()
+        .join(".zerofs-local-mutations#0");
+    let key = path.to_string();
+    let garbage = pool
+        .catalog(move |catalog| catalog.retire(&key, &previous))
+        .await
+        .unwrap();
+    pool.cleanup_garbage(&garbage).await.unwrap();
+    for member in ["hdd-a", "hdd-b"] {
+        pool.quarantine(member, "empty fixture member")
+            .await
+            .unwrap();
+    }
+    assert!(
+        pool.status()
+            .await
+            .unwrap()
+            .members
+            .iter()
+            .all(|member| member.safe_to_remove)
+    );
+
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    fs4::fs_std::FileExt::lock_exclusive(&lock).unwrap();
+    let cleaner = pool.clone();
+    let cleaning = tokio::spawn(async move { cleaner.cleanup_garbage(&garbage).await });
+    // Observe the native worker's descriptor for this unique lock file, rather
+    // than sleeping and assuming the detached worker has actually started.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let descriptors = std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+                .filter(|path| *path == lock_path)
+                .count();
+            if descriptors >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    cleaning.abort();
+    assert!(cleaning.await.unwrap_err().is_cancelled());
+    let status = pool.status().await.unwrap();
+    assert_eq!(
+        status.pending_operations, 0,
+        "this is an already-retired stale snapshot"
+    );
+    assert!(
+        !status.members[0].safe_to_remove,
+        "native cleanup still owns disk A"
+    );
+    assert!(
+        status.members[1].safe_to_remove,
+        "disk B has no native work"
+    );
+    let draining = pool.clone();
+    let mut settlement = tokio::spawn(async move { draining.settle().await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut settlement)
+            .await
+            .is_err()
+    );
+    drop(lock);
+    tokio::time::timeout(Duration::from_secs(5), settlement)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        pool.status()
+            .await
+            .unwrap()
+            .members
+            .iter()
+            .all(|member| member.safe_to_remove)
+    );
+    assert!(!pool.inner.safety_failure.is_cancelled());
+}
+
+#[tokio::test]
 #[ignore = "child of disk_health_crash_reopen_preserves_one_verified_placement"]
 async fn disk_health_crash_child() {
     let Some(root) = std::env::var_os("ZEROFS_POOL_CRASH_ROOT") else {
@@ -1879,6 +2209,120 @@ async fn disk_health_empty_missing_object_cannot_clear_without_physical_verifica
     let fault = pool.faults().await.unwrap().pop().unwrap();
     pool.verify_source_fault(&fault).await.unwrap();
     assert_eq!(pool.faults().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn native_health_worker_reports_running_while_destination_mutation_is_blocked() {
+    use sha2::{Digest, Sha256};
+
+    const BODY: &[u8] = b"native automatic evacuation payload";
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    for directory in ["authority", "hdd-a", "hdd-b"] {
+        std::fs::create_dir(root.join(directory)).unwrap();
+    }
+    let pool = persistent_pool(&root, true).await;
+    let path = segment(2409);
+    create(&pool, &path, BODY).await;
+    let previous = pool.visible(&path).await.unwrap().unwrap();
+    assert_eq!(previous.physical.member_id(), Some("hdd-a"));
+    let source = root.join("hdd-a").join(previous.physical.key());
+    let destination_directory = root.join("hdd-b").join(
+        std::path::Path::new(previous.physical.key())
+            .parent()
+            .unwrap(),
+    );
+    std::fs::create_dir_all(&destination_directory).unwrap();
+    let lock_path = destination_directory.join(".zerofs-local-mutations#0");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    fs4::fs_std::FileExt::lock_exclusive(&lock).unwrap();
+    let failure = tokio_util::sync::CancellationToken::new();
+    let worker = super::PoolRecovery::start(pool.clone(), failure.clone());
+    pool.observe_health(
+        "hdd-a",
+        super::SmartSample {
+            device: "native-fixture-a".into(),
+            pending: Some(1),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    // Prove the production native PUT reached the OS lock; a reservation alone
+    // could otherwise be observed before the physical write actually started.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let descriptors = std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+                .filter(|path| *path == lock_path)
+                .count();
+            if descriptors >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let running = tokio::time::timeout(Duration::from_secs(1), pool.status())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(running.members[0].evacuation, "running");
+    assert!(running.members[0].health.quarantine.is_some());
+    assert_eq!(running.members[0].used_bytes, BODY.len() as u64);
+    assert_eq!(running.members[0].objects, 1);
+    assert!(!running.members[0].safe_to_remove);
+    assert!(!running.members[0].safe_to_pull_with_known_loss);
+    assert_eq!(running.members[1].reserved_bytes, BODY.len() as u64);
+    assert_eq!(running.members[1].pending_uploads, 1);
+    assert_eq!(running.members[1].objects, 0);
+    assert_eq!(running.pending_operations, 1);
+    let unchanged = pool.visible(&path).await.unwrap().unwrap();
+    assert_eq!(unchanged.physical.key(), previous.physical.key());
+    assert_eq!(unchanged.physical.member_id(), Some("hdd-a"));
+    assert!(source.is_file());
+
+    drop(lock);
+    let completed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = pool.status().await.unwrap();
+            if status.members[0].safe_to_remove {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(completed.pending_operations, 0);
+    assert_eq!(completed.members[0].used_bytes, 0);
+    assert_eq!(completed.members[0].objects, 0);
+    assert_eq!(completed.members[1].used_bytes, BODY.len() as u64);
+    assert_eq!(completed.members[1].reserved_bytes, 0);
+    assert_eq!(completed.members[1].objects, 1);
+    assert_eq!(placement(&pool, &path).await, "hdd-b");
+    assert!(!source.exists());
+    let restored = read(&pool, &path).await;
+    assert_eq!(restored.len(), BODY.len());
+    assert_eq!(Sha256::digest(&restored), Sha256::digest(BODY));
+    assert!(!failure.is_cancelled());
+    tokio::time::timeout(Duration::from_secs(5), worker.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    pool.settle().await;
+    assert!(!pool.inner.safety_failure.is_cancelled());
 }
 
 #[tokio::test]

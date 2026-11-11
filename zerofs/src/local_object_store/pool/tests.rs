@@ -67,7 +67,7 @@ async fn pool_create_rejects_preexisting_staging_and_invalid_namespace() {
     assert_eq!(std::fs::read(&staging).unwrap(), b"interrupted");
     assert!(!root.join(&key).exists());
     assert!(!root.join(format!("{key}#2")).exists());
-    remove(&root, &key, GenerationState::Unpublished)
+    remove(&root, &key, GenerationState::Unpublished, ())
         .await
         .unwrap();
     assert!(!staging.exists());
@@ -111,7 +111,7 @@ async fn pool_cleanup_removes_only_the_owned_generation_and_keeps_live_multipart
     let mut multipart = store.put_multipart(&ordinary).await.unwrap();
     multipart.put_part("live multipart".into()).await.unwrap();
 
-    remove(&root, &key, GenerationState::Unpublished)
+    remove(&root, &key, GenerationState::Unpublished, ())
         .await
         .unwrap();
     assert!(owned.iter().all(|path| !path.exists()));
@@ -124,7 +124,7 @@ async fn pool_cleanup_removes_only_the_owned_generation_and_keeps_live_multipart
         store.get(&ordinary).await.unwrap().bytes().await.unwrap(),
         "live multipart"
     );
-    remove(&root, &key, GenerationState::Unpublished)
+    remove(&root, &key, GenerationState::Unpublished, ())
         .await
         .unwrap();
 }
@@ -141,14 +141,14 @@ async fn pool_published_cleanup_removes_legacy_hardlink_remainder() {
     std::fs::write(&final_path, "published").unwrap();
     std::fs::write(&unrelated, "unrelated").unwrap();
     std::fs::hard_link(&final_path, &staging).unwrap();
-    remove(&root, &key, GenerationState::Published)
+    remove(&root, &key, GenerationState::Published, ())
         .await
         .unwrap();
     assert!(!final_path.exists());
     assert!(!staging.exists());
     assert_eq!(std::fs::read(unrelated).unwrap(), b"unrelated");
     assert!(final_path.parent().unwrap().join(LOCK_FILE).is_file());
-    remove(&root, &key, GenerationState::Published)
+    remove(&root, &key, GenerationState::Published, ())
         .await
         .unwrap();
 }
@@ -161,7 +161,13 @@ async fn pool_cleanup_waits_for_native_writer_before_removing_final_and_stage() 
     let cleaning_root = root.clone();
     let cleaning_key = key.clone();
     let mut cleaning = tokio::spawn(async move {
-        remove(&cleaning_root, &cleaning_key, GenerationState::Unpublished).await
+        remove(
+            &cleaning_root,
+            &cleaning_key,
+            GenerationState::Unpublished,
+            (),
+        )
+        .await
     });
     assert!(
         tokio::time::timeout(Duration::from_millis(100), &mut cleaning)
@@ -190,7 +196,7 @@ async fn pool_cleanup_rejects_symlinks_without_touching_their_targets() {
     let staged = root.join(format!("{key}#1"));
     std::os::unix::fs::symlink(&target, &staged).unwrap();
     assert!(
-        remove(&root, &key, GenerationState::Unpublished)
+        remove(&root, &key, GenerationState::Unpublished, ())
             .await
             .is_err()
     );
@@ -212,7 +218,7 @@ async fn pool_cleanup_rejects_symlinks_without_touching_their_targets() {
     ));
     std::fs::write(&outside_stage, "outside stage").unwrap();
     assert!(
-        remove(&root, &key, GenerationState::Unpublished)
+        remove(&root, &key, GenerationState::Unpublished, ())
             .await
             .is_err()
     );
@@ -230,14 +236,14 @@ async fn pool_cleanup_rejects_keys_outside_the_uuid_namespace() {
         key.replace("/objects/", "/../objects/"),
     ] {
         assert!(
-            remove(&root, &invalid, GenerationState::Unpublished)
+            remove(&root, &invalid, GenerationState::Unpublished, ())
                 .await
                 .is_err(),
             "accepted {invalid}"
         );
     }
     std::fs::write(root.join(&key), "owned").unwrap();
-    remove(&root, &key, GenerationState::Unpublished)
+    remove(&root, &key, GenerationState::Unpublished, ())
         .await
         .unwrap();
     assert!(!root.join(&key).exists());

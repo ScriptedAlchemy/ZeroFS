@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from contextlib import contextmanager
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import json
 import os
@@ -20,6 +22,7 @@ from pathlib import Path
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -33,6 +36,12 @@ TOTAL_TIMEOUT_SECONDS = 300
 COMMAND_TIMEOUT_SECONDS = 90
 START_TIMEOUT_SECONDS = 60
 SHUTDOWN_TIMEOUT_SECONDS = 30
+RUNNING_STATUS_TIMEOUT_SECONDS = 5
+RUNNING_STATUS_SAMPLES = 3
+NATIVE_MUTATION_LOCK_NAME = ".zerofs-local-mutations#0"
+# Version-one footer from zerofs/src/segment.rs; only identity and bounds are
+# parsed here. SHA-256 compares whole bodies; cold reads verify file bytes.
+SEGMENT_FOOTER = struct.Struct("<4sIIQIQQQQII")
 
 
 class SmokeFailure(RuntimeError):
@@ -264,19 +273,81 @@ def fixture(fixture_id: str, **evidence) -> dict:
     return {"fixture_id": fixture_id, "result": "passed", **evidence}
 
 
-def physical_snapshot(root: Path, status: dict) -> list[dict]:
-    """Read owned object bodies independently of the placement catalog."""
+def segment_location_identity(location: str) -> tuple[str, str]:
+    """Match Segid::from_object_key's fixed-width lowercase identity and shard."""
+    prefix, separator, suffix = location.rpartition("/segments/")
+    if not separator:
+        require(location.startswith("segments/"), f"noncanonical segment location: {location}")
+        prefix, suffix = "", location.removeprefix("segments/")
+    parts = suffix.split("/")
+    require(len(parts) == 3 and tuple(map(len, parts)) == (2, 16, 16)
+            and all(character in "0123456789abcdef" for part in parts for character in part),
+            f"noncanonical segment location: {location}")
+    counter = int(parts[2], 16)
+    require(int(parts[0], 16) == counter & 0xff,
+            f"segment path shard disagrees with its counter: {location}")
+    return prefix, f"segments/{suffix}"
+
+
+def segment_footer_identity(body: Path, size: int) -> str:
+    """Read identity and bounds using production parse_footer's v1 layout."""
+    require(size >= SEGMENT_FOOTER.size, f"segment body is smaller than its footer: {body}")
+    with body.open("rb") as source:
+        source.seek(-SEGMENT_FOOTER.size, os.SEEK_END)
+        footer = source.read(SEGMENT_FOOTER.size)
+    require(len(footer) == SEGMENT_FOOTER.size, f"truncated segment footer: {body}")
+    (magic, version, _frames, directory_offset, directory_length, epoch, counter,
+     _sealed_sequence, total_length, _crc, reserved) = SEGMENT_FOOTER.unpack(footer)
+    require(magic == b"ZSEG", f"bad segment footer magic: {body}")
+    require(version == 1, f"unsupported segment footer version {version}: {body}")
+    require(total_length == size, f"segment footer length disagrees with its body: {body}")
+    require(reserved == 0, f"nonzero reserved segment footer bytes: {body}")
+    require(directory_offset + directory_length + SEGMENT_FOOTER.size == total_length,
+            f"segment directory does not abut its footer: {body}")
+    return f"segments/{counter & 0xff:02x}/{epoch:016x}/{counter:016x}"
+
+
+def physical_snapshot(root: Path, status: dict, logical_prefix: str) -> list[dict]:
+    """Derive a live segment map from immutable bodies, without a catalog read."""
     bodies = []
+    identities = set()
     for member in status["members"]:
         member_root = root / member["id"]
         directory = member_root / ".zerofs-pool" / status["pool_id"] / "objects"
         if directory.exists():
             for body in directory.rglob("*"):
-                if body.is_file() and body.name != ".zerofs-local-mutations#0":
-                    bodies.append({"member_id": member["id"],
+                if body.is_file() and body.name != NATIVE_MUTATION_LOCK_NAME:
+                    size = body.stat().st_size
+                    segment_id = segment_footer_identity(body, size)
+                    require(segment_id not in identities,
+                            f"physical bodies repeat a logical segment identity: {segment_id}")
+                    identities.add(segment_id)
+                    location = f"{logical_prefix}/{segment_id}" if logical_prefix else segment_id
+                    bodies.append({"segment_id": segment_id, "location": location,
+                                   "member_id": member["id"],
                                    "physical_key": body.relative_to(member_root).as_posix(),
-                                   "size": body.stat().st_size, "sha256": file_sha256(body)})
-    return sorted(bodies, key=lambda body: (body["member_id"], body["physical_key"]))
+                                   "size": size, "sha256": file_sha256(body)})
+    return sorted(bodies, key=lambda body: body["segment_id"])
+
+
+def verify_physical_manifest(physical: list[dict], placements: list[dict], phase: str) -> list[dict]:
+    """Compare every body-derived identity and placement with pool-list API JSON."""
+    manifest = []
+    identities = set()
+    for entry in placements:
+        _, segment_id = segment_location_identity(entry["location"])
+        require(segment_id not in identities,
+                f"API map repeats a logical segment identity: {segment_id}")
+        identities.add(segment_id)
+        require(entry["physical_state"] == "present" and entry["sha256"] is not None,
+                f"API map has an unverified body during {phase}: {entry}")
+        manifest.append({"segment_id": segment_id,
+                         **{key: entry[key] for key in
+                            ("location", "member_id", "physical_key", "size", "sha256")}})
+    manifest.sort(key=lambda entry: entry["segment_id"])
+    require(manifest == physical,
+            f"{phase} changed the exact segment identity/device/key/size/SHA manifest")
+    return manifest
 
 
 def placement_snapshot(binary: Path, deadline: float, root: Path, config: Path,
@@ -322,7 +393,7 @@ def placement_snapshot(binary: Path, deadline: float, root: Path, config: Path,
         if directory.exists():
             for body in directory.rglob("*"):
                 # Native backend coordination locks are not segment bodies.
-                if body.is_file() and body.name != ".zerofs-local-mutations#0":
+                if body.is_file() and body.name != NATIVE_MUTATION_LOCK_NAME:
                     actual.add((member, body.relative_to(root / member).as_posix()))
     expected_present = {(entry["member_id"], entry["physical_key"])
                         for entry in verified if entry["physical_state"] == "present"}
@@ -369,6 +440,81 @@ def wait_status(binary: Path, deadline: float, endpoint: str, predicate,
         time.sleep(0.1)
 
 
+@contextmanager
+def hold_native_mutation_lock(root: Path, member_id: str, pool_id: str):
+    """Pause only this fixture's destination PUT, using the backend's OS lock."""
+    lock_path = root / member_id / ".zerofs-pool" / pool_id / "objects" / NATIVE_MUTATION_LOCK_NAME
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    # fs4 0.13.1's Unix FileExt::lock_exclusive uses rustix::fs::flock.
+    # Separate descriptors therefore contend with fcntl.flock on Linux.
+    with lock_path.open("a+b") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise SmokeFailure("destination native mutation lock was already held before health injection") from error
+        try:
+            yield lock_path
+        finally:
+            # This inner finally runs before health_case's Server cleanup,
+            # including when an admin request or assertion fails.
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def observe_automatic_evacuation(binary: Path, deadline: float, endpoint: str,
+                                 root: Path, before: dict, changes: dict) -> dict:
+    """Require responsive live status while an automatic copy is held in PUT."""
+    source_id, target_id = "disk1", "disk2"
+    original = {member["id"]: member for member in before["members"]}
+
+    def running(status):
+        members = {member["id"]: member for member in status["members"]}
+        source, target = members[source_id], members[target_id]
+        return (source["health"]["quarantine"] is not None and source["evacuation"] == "running"
+                and target["pending_uploads"] > 0 and target["reserved_bytes"] > 0
+                and status["pending_operations"] > 0)
+
+    def verify_paused(status):
+        require(running(status), "automatic evacuation stopped running while its destination PUT was paused")
+        require(status["mapped_objects"] == before["mapped_objects"],
+                "paused evacuation changed the mapped segment count")
+        for member in status["members"]:
+            require(member["objects"] == original[member["id"]]["objects"]
+                    and member["used_bytes"] == original[member["id"]]["used_bytes"],
+                    "evacuation published a remap while its destination PUT was paused")
+            if member["id"] == source_id:
+                require(not member["safe_to_remove"] and not member["safe_to_pull_with_known_loss"],
+                        "paused evacuation reported the source as pull-ready")
+
+    with hold_native_mutation_lock(root, target_id, before["pool_id"]) as lock_path:
+        started = time.monotonic()
+        injected = inject_smart(root / "health.json", **changes)
+        quarantined = wait_status(binary, deadline, endpoint,
+                                  lambda s: s["members"][0]["health"]["quarantine"] is not None,
+                                  "durable quarantine after the injected health signal")
+        active = wait_status(binary, deadline, endpoint, running,
+                             "automatic evacuation with a reserved destination PUT")
+        verify_paused(active)
+        running_after = time.monotonic() - started
+        samples = []
+        for index in range(RUNNING_STATUS_SAMPLES):
+            requested = time.monotonic()
+            status = command_json(binary, min(deadline, requested + RUNNING_STATUS_TIMEOUT_SECONDS),
+                                  "pool", "status", "--endpoint", endpoint)
+            received = time.monotonic()
+            verify_paused(status)
+            samples.append({"started_after_signal_seconds": requested - started,
+                            "request_seconds": received - requested, "status": status})
+            if index + 1 < RUNNING_STATUS_SAMPLES:
+                time.sleep(time_left(deadline, 0.1))
+        pause = {"reason": "destination native mutation lock", "member_id": target_id,
+                 "physical_key": lock_path.relative_to(root / target_id).as_posix(),
+                 "signal_to_running_seconds": running_after,
+                 "held_seconds": time.monotonic() - started,
+                 "status_request_timeout_seconds": RUNNING_STATUS_TIMEOUT_SECONDS,
+                 "status_samples": samples}
+    return {"observation": injected, "quarantined": quarantined, "running": active, "paused_copy": pause}
+
+
 def download_and_verify(binary: Path, deadline: float, server: Server, root: Path,
                         phase: str, expected: dict[str, str]) -> None:
     for name, digest in expected.items():
@@ -407,6 +553,12 @@ def smoke(binary: Path, root: Path) -> dict:
     require(before_members["disk1"]["objects"] > 0, "first local member received no segments")
     require(before_members["disk2"]["objects"] > 0, "quota did not spill segments to the second member")
     require(before["mapped_objects"] >= 2, "two separately synced uploads did not create pool placements")
+    logical_prefixes = {segment_location_identity(entry["location"])[0]
+                        for entry in original["placements"]}
+    require(len(logical_prefixes) == 1, "fixture placements do not share one database prefix")
+    logical_prefix = logical_prefixes.pop()
+    verify_physical_manifest(physical_snapshot(root, before, logical_prefix),
+                             original["placements"], "initial stopped-server snapshot")
 
     print("Upload a new file, SIGKILL its writer, and verify durable placement and cold reads", flush=True)
     with Server(binary, config, root, "server-before-crash", deadline) as server:
@@ -424,15 +576,16 @@ def smoke(binary: Path, root: Path) -> dict:
         status_members(before_kill)
         require(before_kill["mapped_objects"] > original["status"]["mapped_objects"],
                 "killed writer did not publish a new segment")
-        before_kill_bodies = physical_snapshot(root, before_kill)
+        before_kill_bodies = physical_snapshot(root, before_kill, logical_prefix)
         require(len(before_kill_bodies) == before_kill["mapped_objects"],
                 "live committed placements do not match the backing-body count")
         server.crash()
     crashed = placement_snapshot(binary, deadline, root, config)
     require(crashed["status"]["mapped_objects"] == before_kill["mapped_objects"],
             "SIGKILL lost a committed placement from the killed writer")
-    require(physical_snapshot(root, crashed["status"]) == before_kill_bodies,
+    require(physical_snapshot(root, crashed["status"], logical_prefix) == before_kill_bodies,
             "SIGKILL changed committed backing bodies or their bytes")
+    crashed_manifest = verify_physical_manifest(before_kill_bodies, crashed["placements"], "SIGKILL")
     crashed_map = {entry["location"]: entry for entry in crashed["placements"]}
     require(all(crashed_map.get(entry["location"]) == entry for entry in original["placements"]),
             "SIGKILL changed an existing placement or its bytes")
@@ -442,6 +595,8 @@ def smoke(binary: Path, root: Path) -> dict:
         download_and_verify(binary, deadline, server, root, "post-crash", expected)
     restarted = placement_snapshot(binary, deadline, root, config)
     require(restarted["placements"] == crashed["placements"], "cold restart changed committed placement or bytes")
+    restarted_manifest = verify_physical_manifest(before_kill_bodies, restarted["placements"],
+                                                 "cold restart")
     before = crashed["status"]
     before_members = status_members(before)
 
@@ -490,6 +645,9 @@ def smoke(binary: Path, root: Path) -> dict:
             fixture("fx-place-map-crash", signal="SIGKILL", roots=2,
                     crash_scope="committed writes in the killed process; no in-flight migration claim",
                     before=original, before_kill_status=before_kill, before_kill_bodies=before_kill_bodies,
+                    before_kill_manifest_source="physical ZSEG v1 footers and backing-file SHA-256; not live catalog API JSON",
+                    after_manifest_source="pool-list API JSON with independently verified backing-file SHA-256",
+                    after_kill_manifest=crashed_manifest, after_restart_manifest=restarted_manifest,
                     after_kill=crashed, after_restart=restarted,
                     application_sha256=expected),
             fixture("fx-evacuate-remap-sha", case="explicit_stopped_server_migration",
@@ -549,12 +707,11 @@ def health_case(binary: Path, root: Path, trigger: str) -> dict:
             require(stable["health"]["crc_increases"] == 1 and stable["health"]["quarantine"] is None,
                     "replaying an unchanged CRC counter triggered evacuation")
             require(stable["objects"] == before["mapped_objects"], "warning-only samples moved source segments")
-            injected = inject_smart(events, crc=2)
+            signal_changes = {"crc": 2}
         else:
-            injected = inject_smart(events, **{trigger: 1})
-        quarantined = wait_status(binary, deadline, endpoint,
-                                  lambda s: s["members"][0]["health"]["quarantine"] is not None,
-                                  "durable quarantine after the injected health signal")
+            signal_changes = {trigger: 1}
+        live = observe_automatic_evacuation(binary, deadline, endpoint, root, before, signal_changes)
+        injected, quarantined = live["observation"], live["quarantined"]
         completed = wait_status(binary, deadline, endpoint,
                                 lambda s: (s["members"][0]["safe_to_remove"]
                                            and s["members"][0]["evacuation"] == "complete"),
@@ -591,7 +748,8 @@ def health_case(binary: Path, root: Path, trigger: str) -> dict:
         fixture("fx-smart-quarantine", case=trigger, source="injected SMART sample",
                 observation=injected, quarantined=quarantined, after_new_write=after),
         fixture("fx-auto-evacuate", case=trigger, operator_migrate_commands=0,
-                observed=quarantined, completed=completed),
+                observed=quarantined, running=live["running"], paused_copy=live["paused_copy"],
+                completed=completed),
         fixture("fx-evacuate-remap-sha", case=trigger, before=original, after=final,
                 application_sha256=expected),
         fixture("fx-pull-ready", case=trigger, status=completed),
@@ -611,6 +769,66 @@ def health_smoke(binary: Path, root: Path) -> dict:
         "signal_scope": "SMART injection; native kernel attribution is covered by Rust tests",
         "fixtures": [evidence for case in cases for evidence in case["fixtures"]],
     }
+
+
+def verify_settled_loss_status(status: dict, original: dict, damaged: dict,
+                               *, no_space: bool, phase: str) -> None:
+    """Apply the same loss/capacity contract before and after cold reopening."""
+    members = status_members(status)
+    source, destination = members["disk1"], members["disk2"]
+    require(source["health"]["quarantine"] is not None, f"{phase}: source lost quarantine")
+    require(not source["safe_to_remove"], f"{phase}: loss was marked safe to remove")
+    require(source["safe_to_pull_with_known_loss"] == (not no_space),
+            f"{phase}: known-loss removal assessment does not match remaining readable data")
+    require(source["readable_evacuated"] == (not no_space),
+            f"{phase}: readable evacuation assessment does not match remaining source data")
+    expected_state = "cannot_complete_capacity" if no_space else "readable_evacuated_loss_blocked"
+    require(source["evacuation"] == expected_state,
+            f"{phase}: expected {expected_state}, got {source['evacuation']}")
+
+    identity = lambda entry: (entry["location"], entry["member_id"], entry["physical_key"])
+    require([identity(entry) for entry in status["unreadable"]] == [identity(damaged)],
+            f"{phase}: unreadable report does not identify exactly the planted source body")
+    require(source["unreadable_objects"] == 1,
+            f"{phase}: source unreadable count does not match the planted loss")
+    expected_leftovers = ([entry for entry in original["placements"] if entry["member_id"] == "disk1"]
+                          if no_space else [damaged])
+    actual_leftovers = sorted((*identity(entry), entry["size"]) for entry in status["quarantined_leftovers"])
+    expected_leftovers = sorted((*identity(entry), entry["size"]) for entry in expected_leftovers)
+    require(actual_leftovers == expected_leftovers,
+            f"{phase}: quarantined leftovers changed exact segment identity, device, key, or bytes")
+    require(source["objects"] == len(expected_leftovers)
+            and source["used_bytes"] == sum(entry[3] for entry in expected_leftovers),
+            f"{phase}: remaining source counts or bytes hide unexplained data")
+    require(status["mapped_objects"] == original["status"]["mapped_objects"],
+            f"{phase}: loss recovery changed the mapped segment count")
+    if no_space:
+        original_source = next(member for member in original["status"]["members"] if member["id"] == "disk1")
+        require(source["objects"] == original["status"]["mapped_objects"],
+                f"{phase}: no-space recovery lost source placements")
+        capacity = source["evacuation_capacity"]
+        require(not capacity["sufficient"] and capacity["available_bytes"] < capacity["required_bytes"],
+                f"{phase}: insufficient space was not reported as cannot-complete: {capacity}")
+        require(capacity["required_bytes"] == original_source["used_bytes"]
+                and capacity["reserved_destination_bytes"] == 0,
+                f"{phase}: capacity assessment does not account for the exact source bytes: {capacity}")
+        require(capacity["available_bytes"] == 8 and destination["available_bytes"] == 8,
+                f"{phase}: capacity assessment does not match the fixture's 8-byte destination quota: {capacity}")
+        require(destination["objects"] == 0 and destination["used_bytes"] == 0,
+                f"{phase}: no-space fixture unexpectedly remapped a segment or retained destination bytes")
+
+
+def wait_settled_loss_status(binary: Path, deadline: float, endpoint: str, original: dict,
+                             damaged: dict, *, no_space: bool, phase: str) -> dict:
+    def settled(status):
+        source = next(member for member in status["members"] if member["id"] == "disk1")
+        return (status["pending_operations"] == 0 and bool(status["unreadable"])
+                and (source["evacuation"] == "cannot_complete_capacity" if no_space
+                     else source["safe_to_pull_with_known_loss"]))
+
+    status = wait_status(binary, deadline, endpoint, settled, f"{phase} settled partial-loss recovery")
+    verify_settled_loss_status(status, original, damaged, no_space=no_space, phase=phase)
+    return status
 
 
 def loss_smoke(binary: Path, root: Path, no_space: bool = False) -> dict:
@@ -649,36 +867,8 @@ def loss_smoke(binary: Path, root: Path, no_space: bool = False) -> dict:
         if no_space:
             failed_read = subprocess.run([str(binary), "download", server.target, "/first.bin", str(root / "first-failed-read"), "--jobs", "1"], capture_output=True, timeout=time_left(deadline, COMMAND_TIMEOUT_SECONDS))
             require(failed_read.returncode != 0, "missing body unexpectedly readable")
-        while True:
-            status = command_json(binary, deadline, "pool", "status", "--endpoint", endpoint)
-            if no_space and status["unreadable"] and status["members"][0]["evacuation"] == "cannot_complete_capacity":
-                require(not status["members"][0]["readable_evacuated"], "no-space recovery claimed readable data evacuated")
-                require(status["members"][0]["objects"] == original["status"]["mapped_objects"],
-                        "no-space recovery lost source placements")
-                capacity = status["members"][0]["evacuation_capacity"]
-                require(not capacity["sufficient"] and capacity["available_bytes"] < capacity["required_bytes"],
-                        f"insufficient space was not reported as cannot-complete: {capacity}")
-                require(capacity["required_bytes"] == original["status"]["members"][0]["used_bytes"]
-                        and capacity["reserved_destination_bytes"] == 0,
-                        f"capacity assessment does not account for the exact source bytes: {capacity}")
-                require(capacity["available_bytes"] == 8 and status["members"][1]["available_bytes"] == 8,
-                        f"capacity assessment does not match the fixture's 8-byte destination quota: {capacity}")
-                require(status["members"][1]["objects"] == 0, "no-space fixture unexpectedly remapped a segment")
-                break
-            if not no_space and status["members"][0]["safe_to_pull_with_known_loss"]:
-                break
-            require(time.monotonic() < deadline, "partial-loss recovery timed out")
-            time.sleep(0.1)
-        require(not status["members"][0]["safe_to_remove"], "loss was marked safe to remove")
-        require(status["members"][0]["safe_to_pull_with_known_loss"] == (not no_space), "known-loss removal assessment does not match remaining readable data")
-        require(len(status["unreadable"]) >= 1, "missing body has no persistent evidence")
-        faults = {(entry["member_id"], entry["physical_key"]) for entry in status["unreadable"]}
-        require(("disk1", missing_key) in faults, "unreadable report does not identify the planted source body")
-        if not no_space:
-            leftovers = {(entry["member_id"], entry["physical_key"]) for entry in status["quarantined_leftovers"]}
-            require(leftovers == faults, "pull-ready status has leftovers that are not quarantined unreadable objects")
-            require(status["members"][0]["used_bytes"] == sum(entry["size"] for entry in status["quarantined_leftovers"]),
-                    "known-loss pull-ready status hides unexplained source bytes")
+        settled = wait_settled_loss_status(binary, deadline, endpoint, original, damaged[0],
+                                          no_space=no_space, phase="initial recovery")
         download_and_verify(binary, deadline, server, root, "loss-healthy", {"second.bin": expected["second.bin"]})
         report = command_json(binary, deadline, "pool", "affected", "--endpoint", endpoint, "--member", "disk1")
         require(report["complete"], f"loss report incomplete: {report}")
@@ -692,6 +882,8 @@ def loss_smoke(binary: Path, root: Path, no_space: bool = False) -> dict:
         failed_read = subprocess.run([str(binary), "download", server.target, "/first.bin", str(root / "damaged-download"), "--jobs", "1"], capture_output=True, timeout=time_left(deadline, COMMAND_TIMEOUT_SECONDS))
         require(failed_read.returncode != 0, "damaged file silently read successfully")
     recovered = placement_snapshot(binary, deadline, root, config, allow_unreadable=True)
+    verify_settled_loss_status(recovered["status"], original, damaged[0],
+                              no_space=no_space, phase="recovered snapshot")
     verify_remapped(original, recovered, "disk1", "disk1" if no_space else "disk2", allow_unreadable=True)
     if no_space:
         before_map = [(e["location"], e["member_id"], e["physical_key"]) for e in original["placements"]]
@@ -700,13 +892,16 @@ def loss_smoke(binary: Path, root: Path, no_space: bool = False) -> dict:
     shutil.rmtree(root / "cache")
     (root / "cache").mkdir(mode=0o700)
     with Server(binary, config, root, "server-loss-restart", deadline) as server:
-        status = command_json(binary, deadline, "pool", "status", "--endpoint", endpoint)
-        require(len(status["unreadable"]) >= 1 and not status["members"][0]["safe_to_remove"], "restart lost loss-blocked status")
+        restarted = wait_settled_loss_status(binary, deadline, endpoint, original, damaged[0],
+                                            no_space=no_space, phase="cold restart")
         download_and_verify(binary, deadline, server, root, "loss-restart-healthy", {"second.bin": expected["second.bin"]})
     final = placement_snapshot(binary, deadline, root, config, allow_unreadable=True)
+    verify_settled_loss_status(final["status"], original, damaged[0],
+                              no_space=no_space, phase="final snapshot")
     require(final["placements"] == recovered["placements"], "restart changed recovered placement or bytes")
     fixture_id = "fx-freespace-gate" if no_space else "fx-evacuate-unreadable"
     evidence = [fixture(fixture_id, before=original, after=final, affected=report,
+                        settled_status=settled, restart_status=restarted,
                         damaged_segment=damaged[0]["location"], damaged_inode_references=damaged_refs,
                         healthy_sha256=expected["second.bin"], damaged_download_exit=failed_read.returncode)]
     if not no_space:

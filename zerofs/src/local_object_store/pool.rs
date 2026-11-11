@@ -98,10 +98,11 @@ fn staging_name(name: &[u8], object: &[u8]) -> bool {
 /// if recovery's bounded async wait is cancelled. Local pool roots are canonical
 /// absolute paths; walking every component with NOFOLLOW prevents cleanup from
 /// escaping through a replaced pool subdirectory.
-pub(crate) async fn remove(
+pub(crate) async fn remove<Guard: Send + 'static>(
     root: &FsPath,
     physical_key: &str,
     state: GenerationState,
+    ownership: Guard,
 ) -> Result<()> {
     let components: Vec<_> = physical_key.split('/').collect();
     if components.len() != 4
@@ -122,6 +123,9 @@ pub(crate) async fn remove(
     let root = root.to_owned();
     let physical_key = physical_key.to_owned();
     run_local(move || {
+        // Status and shutdown ownership follow the actual native operation,
+        // including cancellation of the async receiver while this worker waits.
+        let _ownership = ownership;
         let mut directory =
             File::from(open("/", DIRECTORY_FLAGS, Mode::empty()).map_err(io_error)?);
         for component in root.components() {

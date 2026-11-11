@@ -34,7 +34,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock};
 use uuid::Uuid;
@@ -136,6 +136,11 @@ pub struct PoolObjectStore {
     inner: Arc<PoolInner>,
 }
 
+struct MemberActivity {
+    tasks: tokio_util::task::TaskTracker,
+    started: AtomicU64,
+}
+
 struct PoolInner {
     authority: Arc<dyn ObjectStore>,
     authority_prefix: Path,
@@ -143,6 +148,9 @@ struct PoolInner {
     members: Vec<PoolMember>,
     member_indices: HashMap<String, usize>,
     member_checks: Vec<Mutex<bool>>,
+    // Physical read/copy/cleanup dependencies for each member's pull status.
+    // Process shutdown still uses the global tracker below.
+    member_activity: Vec<MemberActivity>,
     locks: Vec<Arc<RwLock<()>>>,
     migration: Mutex<()>,
     evacuating: Arc<StdMutex<Option<EvacuationProgress>>>,
@@ -154,6 +162,10 @@ struct PoolInner {
     reserve_pause: StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     #[cfg(test)]
     recovery_pause: StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    #[cfg(test)]
+    verification_pause: StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    #[cfg(test)]
+    status_pause: StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 
 struct OwnedUpload {
@@ -493,6 +505,12 @@ impl PoolObjectStore {
                 authority_prefix,
                 catalog: Arc::new(catalog),
                 member_checks: (0..members.len()).map(|_| Mutex::new(false)).collect(),
+                member_activity: (0..members.len())
+                    .map(|_| MemberActivity {
+                        tasks: tokio_util::task::TaskTracker::new(),
+                        started: AtomicU64::new(0),
+                    })
+                    .collect(),
                 members,
                 member_indices,
                 migration: Mutex::new(()),
@@ -505,6 +523,10 @@ impl PoolObjectStore {
                 reserve_pause: StdMutex::new(None),
                 #[cfg(test)]
                 recovery_pause: StdMutex::new(None),
+                #[cfg(test)]
+                verification_pause: StdMutex::new(None),
+                #[cfg(test)]
+                status_pause: StdMutex::new(None),
                 locks: (0..KEY_LOCKS).map(|_| Arc::new(RwLock::new(()))).collect(),
             }),
         };
@@ -631,6 +653,23 @@ impl PoolObjectStore {
                 error(format!(
                     "pool member {id} is absent from this configuration"
                 ))
+            })
+    }
+
+    fn track_member(
+        &self,
+        physical: &Physical,
+    ) -> Option<tokio_util::task::task_tracker::TaskTrackerToken> {
+        physical
+            .member_id()
+            .and_then(|id| self.inner.member_indices.get(id))
+            .map(|&index| {
+                let activity = &self.inner.member_activity[index];
+                // Publish busy before the epoch, and both before any member
+                // work. Status uses that order to cover a whole catalog read.
+                let token = activity.tasks.token();
+                activity.started.fetch_add(1, Ordering::SeqCst);
+                token
             })
     }
 
@@ -1014,6 +1053,7 @@ impl PoolObjectStore {
         physical: &Physical,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
+        let activity = self.track_member(physical);
         match physical {
             Physical::Member { member_id, key, .. } => {
                 self.ensure_member(member_id, false).await?;
@@ -1037,19 +1077,20 @@ impl PoolObjectStore {
                         let extensions = result.extensions.clone();
                         let pool = self.clone();
                         let member = member_id.clone();
-                        let payload = result
-                            .into_stream()
-                            .then(move |chunk| {
-                                let pool = pool.clone();
-                                let member = member.clone();
-                                async move {
-                                    if let Err(failure) = &chunk {
-                                        pool.observe_io_error(&member, failure).await?;
-                                    }
-                                    chunk
+                        let payload = stream::unfold(
+                            (result.into_stream(), pool, member, activity),
+                            |(mut stream, pool, member, activity)| async move {
+                                let mut chunk = stream.next().await?;
+                                if let Err(failure) = &chunk
+                                    && let Err(observation) =
+                                        pool.observe_io_error(&member, failure).await
+                                {
+                                    chunk = Err(observation);
                                 }
-                            })
-                            .boxed();
+                                Some((chunk, (stream, pool, member, activity)))
+                            },
+                        )
+                        .boxed();
                         Ok(GetResult {
                             payload: GetResultPayload::Stream(payload),
                             meta,
@@ -1197,6 +1238,7 @@ impl PoolObjectStore {
         state: GenerationState,
     ) -> object_store::Result<()> {
         self.validate_physical(physical)?;
+        let activity = self.track_member(physical);
         let result = match physical {
             Physical::Member { member_id, key, .. } => {
                 self.ensure_member(member_id, true).await?;
@@ -1205,7 +1247,11 @@ impl PoolObjectStore {
                     // LocalFileSystem hides `UUID#N` native staging files from
                     // list/delete. Reclaim this catalog-owned generation under
                     // the native mutation lock before releasing its debt.
-                    crate::local_object_store::pool::remove(root, key, state).await
+                    // The native worker owns both tokens through unlink/fsync,
+                    // even if its async caller times out or is cancelled after
+                    // another cleanup already retired this generation's debt.
+                    let ownership = (activity, self.inner.tasks.token());
+                    crate::local_object_store::pool::remove(root, key, state, ownership).await
                 } else {
                     member.store.delete(&catalog_path(key)?).await
                 }
@@ -1441,12 +1487,31 @@ impl PoolObjectStore {
     }
 
     pub async fn status(&self) -> object_store::Result<PoolStatus> {
+        let activity_before: Vec<_> = self
+            .inner
+            .member_activity
+            .iter()
+            .map(|activity| {
+                // Read the epoch before busy here, and in reverse order below.
+                let started = activity.started.load(Ordering::SeqCst);
+                let busy = !activity.tasks.is_empty();
+                (started, busy)
+            })
+            .collect();
         let members = self.inner.members.clone();
         let evacuating = self.inner.evacuating.lock().unwrap().clone();
         let snapshot = evacuating.clone();
         let mut status = self
             .catalog(move |catalog| catalog.status(&members, snapshot.as_ref()))
             .await?;
+        #[cfg(test)]
+        {
+            let pause = self.inner.status_pause.lock().unwrap().take();
+            if let Some((entered, resume)) = pause {
+                entered.notify_one();
+                resume.notified().await;
+            }
+        }
         for member in &mut status.members {
             if evacuating
                 .as_ref()
@@ -1460,8 +1525,18 @@ impl PoolObjectStore {
                 member.evacuation = "running".into();
             }
         }
-        if !self.inner.tasks.is_empty() {
-            for member in &mut status.members {
+        for ((member, activity), (started_before, busy_before)) in status
+            .members
+            .iter_mut()
+            .zip(&self.inner.member_activity)
+            .zip(activity_before)
+        {
+            let busy_after = !activity.tasks.is_empty();
+            let started_after = activity.started.load(Ordering::SeqCst);
+            // A completed verifier can change a known-loss catalog snapshot.
+            // Busy endpoints catch preexisting work; the epoch also catches
+            // work that began and ended entirely during the snapshot read.
+            if busy_before || busy_after || started_before != started_after {
                 member.safe_to_remove = false;
                 member.safe_to_pull_with_known_loss = false;
             }
@@ -1664,6 +1739,9 @@ impl PoolObjectStore {
                 if previous.physical.member_id() == Some(target.as_str()) {
                     return Ok(true);
                 }
+                // Keep the source dependency across range reads, publication,
+                // and old-body cleanup, not only while a single GET is active.
+                let _source_activity = pool.track_member(&previous.physical);
                 let _active = if automatic {
                     pool.catalog(Catalog::require_automatic_evacuation)
                         .await

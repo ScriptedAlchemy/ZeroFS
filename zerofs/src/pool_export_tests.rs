@@ -78,11 +78,12 @@ fn settings(root: &Path) -> Settings {
 async fn open(settings: &Settings, initialize: bool) -> (Arc<ZeroFS>, PoolObjectStore) {
     let (opened, pool) = open_pool_storage(settings, initialize).await.unwrap();
     let store: Arc<dyn ObjectStore> = Arc::from(opened.store);
+    let db_path = opened.path;
     let key = [0x67; 32];
     let transformer: Arc<dyn BlockTransformer> =
         ZeroFsBlockTransformer::new_arc(&key, CompressionConfig::default());
     let db = Arc::new(
-        DbBuilder::new(opened.path, Arc::clone(&store))
+        DbBuilder::new(db_path.clone(), Arc::clone(&store))
             .with_block_transformer(transformer)
             .with_filter_policies(crate::fs::filter_policy::filter_policies())
             .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
@@ -95,17 +96,27 @@ async fn open(settings: &Settings, initialize: bool) -> (Arc<ZeroFS>, PoolObject
         crate::segment::SEGMENT_INFO,
         CompressionConfig::default(),
     );
-    let fs = ZeroFS::new_with_slatedb(
+    // Match production: SlateDB receives the raw store and database path,
+    // while relative segment keys are prefixed before reaching the pool.
+    let segment_store: Arc<dyn ObjectStore> =
+        Arc::new(object_store::prefix::PrefixStore::new(store, db_path));
+    let mut fs = ZeroFS::new_with_slatedb(
         SlateDbHandle::ReadWrite(db),
         u64::MAX,
         None,
         false,
-        store,
+        segment_store,
         codec,
     )
     .await
     .unwrap();
-    (Arc::new(fs), pool)
+    fs.write_ack = settings
+        .filesystem_write_ack_settings(crate::writeback::config::WritebackAccessMode::ReadWrite)
+        .unwrap();
+    let fs = Arc::new(fs);
+    fs.install_volatile_overlay();
+    fs.start_materializer();
+    (fs, pool)
 }
 
 async fn close(fs: Arc<ZeroFS>, pool: PoolObjectStore) {

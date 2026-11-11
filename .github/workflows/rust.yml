@@ -61,7 +61,9 @@ jobs:
       - name: Exercise local storage pooling over 9P
         run: python3 ../scripts/test-local-storage-pool.py --binary target/debug/zerofs --receipt target/local-storage-pool.json
       - name: Run tests
-        run: cargo test --verbose
+        run: |
+          set -euo pipefail
+          cargo test --verbose 2>&1 | tee target/unit-tests.log
       - name: Record pool-backed NFS and NBD acceptance evidence
         run: |
           set -euo pipefail
@@ -123,4 +125,5 @@ jobs:
             zerofs/target/local-storage-pool.json
             zerofs/target/physical-disk-health.json
             zerofs/target/pool-exports.log
+            zerofs/target/unit-tests.log
           if-no-files-found: error
