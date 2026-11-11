@@ -148,8 +148,10 @@ async fn nfs_roundtrip(client: &mut TcpStream, call: &[u8], xid: u32) -> Vec<u8>
         }
     }
     let header: Vec<_> = reply[..28]
-        .chunks_exact(4)
-        .map(|word| u32::from_be_bytes(word.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| u32::from_be_bytes(*word))
         .collect();
     assert_eq!(header, [xid, 1, 0, 0, 0, 0, 0], "NFS/RPC operation failed");
     reply

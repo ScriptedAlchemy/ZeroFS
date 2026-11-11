@@ -290,9 +290,24 @@ async fn second_failure_during_reserved_copy_fences_remap_and_keeps_committed_co
     let recovering = pool.clone();
     let task =
         tokio::spawn(async move { recovering.evacuate_pass(&CancellationToken::new()).await });
-    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+    if tokio::time::timeout(Duration::from_secs(5), entered.notified())
         .await
-        .unwrap();
+        .is_err()
+    {
+        let migration_busy = pool.inner.migration.try_lock().is_err();
+        let key_busy = pool.key_lock(&remaining).try_write_owned().is_err();
+        let status = pool.status().await;
+        let task_finished = task.is_finished();
+        let outcome = if task_finished {
+            format!("{:?}", task.await)
+        } else {
+            "still running".to_owned()
+        };
+        resume.notify_one();
+        panic!(
+            "reserved-copy pause not reached: migration_busy={migration_busy}, key_busy={key_busy}, task_finished={task_finished}, outcome={outcome}, status={status:?}"
+        );
+    }
     pool.quarantine("disk-1", "second media failure")
         .await
         .unwrap();

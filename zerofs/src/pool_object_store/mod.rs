@@ -39,6 +39,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock};
 use uuid::Uuid;
 
+use crate::local_object_store::pool::{GenerationState, PoolObjectCreate};
 use crate::segment::Segid;
 use crate::segment_store::ConditionalMultipartCreate;
 
@@ -858,6 +859,7 @@ impl PoolObjectStore {
                 // the authoritative catalog and expose the same logical view
                 // before and after moving this object to another member.
                 options.attributes = Attributes::default();
+                options.extensions.insert(PoolObjectCreate);
             }
             let path = Path::from(upload.physical_key.clone());
             let written = member.store.put_opts(&path, payload, options).await?;
@@ -1189,15 +1191,24 @@ impl PoolObjectStore {
         Ok(())
     }
 
-    async fn remove_physical(&self, physical: &Physical) -> object_store::Result<()> {
+    async fn remove_physical(
+        &self,
+        physical: &Physical,
+        state: GenerationState,
+    ) -> object_store::Result<()> {
         self.validate_physical(physical)?;
         let result = match physical {
             Physical::Member { member_id, key, .. } => {
                 self.ensure_member(member_id, true).await?;
-                self.member(member_id)?
-                    .store
-                    .delete(&catalog_path(key)?)
-                    .await
+                let member = self.member(member_id)?;
+                if let Some(root) = &member.local_path {
+                    // LocalFileSystem hides `UUID#N` native staging files from
+                    // list/delete. Reclaim this catalog-owned generation under
+                    // the native mutation lock before releasing its debt.
+                    crate::local_object_store::pool::remove(root, key, state).await
+                } else {
+                    member.store.delete(&catalog_path(key)?).await
+                }
             }
             Physical::Legacy {
                 key,
@@ -1250,12 +1261,15 @@ impl PoolObjectStore {
             return Ok(());
         };
         if current.started {
-            self.remove_physical(&Physical::Member {
-                member_id: current.member_id,
-                key: current.physical_key,
-                e_tag: None,
-                version: None,
-            })
+            self.remove_physical(
+                &Physical::Member {
+                    member_id: current.member_id,
+                    key: current.physical_key,
+                    e_tag: None,
+                    version: None,
+                },
+                GenerationState::Unpublished,
+            )
             .await?;
         }
         let id = current.id;
@@ -1264,7 +1278,8 @@ impl PoolObjectStore {
     }
 
     async fn cleanup_garbage(&self, garbage: &Garbage) -> object_store::Result<()> {
-        self.remove_physical(&garbage.entry.physical).await?;
+        self.remove_physical(&garbage.entry.physical, GenerationState::Published)
+            .await?;
         #[cfg(test)]
         crash_cutpoint("after_source_delete");
         let id = garbage.id.clone();
@@ -1275,8 +1290,9 @@ impl PoolObjectStore {
     async fn recover_pending(&self) -> object_store::Result<()> {
         let (mut uploads, mut garbage) = self.catalog(Catalog::recovery).await?;
         // Recover local debts first, and bound startup work even when a remote
-        // member has thousands of interrupted operations. A timeout leaves the
-        // durable debt intact; no detached cleanup worker can race later use.
+        // member has thousands of interrupted operations. Started native uploads
+        // keep an owned task through deletion and catalog settlement: a slow
+        // directory scan must not lose its result when the bounded wait expires.
         let is_local = |id: &str| {
             self.member(id)
                 .is_ok_and(|member| member.local_path.is_some())
@@ -1335,7 +1351,45 @@ impl PoolObjectStore {
             }
             let attempt_deadline =
                 deadline.min(tokio::time::Instant::now() + std::time::Duration::from_secs(1));
-            match tokio::time::timeout_at(attempt_deadline, self.cleanup_upload(&upload)).await {
+            let result = if upload.started && is_local(&upload.member_id) {
+                // The key guard plus active-owner recheck above excludes live
+                // publishers. Register this cleanup before moving both guards
+                // into the task, so later passes cannot start duplicate work.
+                self.inner
+                    .active_uploads
+                    .lock()
+                    .unwrap()
+                    .insert(upload.id.clone());
+                let owned = OwnedUpload {
+                    upload: upload.clone(),
+                    active: self.inner.active_uploads.clone(),
+                };
+                let pool = self.clone();
+                let cleaning = self.inner.tasks.spawn(async move {
+                    let guard = _guard;
+                    let interrupted = pool.inner.safety_failure.clone().drop_guard();
+                    let result = pool.cleanup_upload(&owned).await;
+                    if let Err(error) = &result {
+                        tracing::warn!(%error, upload = %owned.id, "owned native cleanup failed; upload and reservation remain recorded");
+                    }
+                    drop(owned);
+                    drop(guard);
+                    interrupted.disarm();
+                    if result.is_ok() {
+                        pool.inner.health_changed.notify_one();
+                    }
+                    result
+                });
+                tokio::time::timeout_at(attempt_deadline, async {
+                    cleaning.await.map_err(|issue| {
+                        error(format!("native pool cleanup task failed: {issue}"))
+                    })?
+                })
+                .await
+            } else {
+                tokio::time::timeout_at(attempt_deadline, self.cleanup_upload(&upload)).await
+            };
+            match result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     unavailable.insert(upload.member_id.clone());
