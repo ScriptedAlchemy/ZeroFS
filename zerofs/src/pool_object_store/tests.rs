@@ -2539,7 +2539,7 @@ async fn disk_health_zero_byte_debts_prevent_safe_removal_until_cleaned() {
 }
 
 #[tokio::test]
-async fn disk_health_missing_monitored_device_does_not_block_healthy_members_on_startup() {
+async fn disk_health_missing_monitored_device_startup() {
     let temp = tempfile::tempdir().unwrap();
     for directory in ["authority", "hdd-a", "hdd-b", "cache"] {
         std::fs::create_dir(temp.path().join(directory)).unwrap();
@@ -2590,9 +2590,18 @@ enabled = false
     let config_path = temp.path().join("settings.toml");
     std::fs::write(&config_path, config).unwrap();
     let settings = crate::config::Settings::from_file(&config_path).unwrap();
-    let prepared = crate::disk_health::PreparedDiskMonitor::prepare(pool.clone(), &settings)
-        .await
-        .unwrap();
+    let prepared = crate::disk_health::PreparedDiskMonitor::prepare(pool.clone(), &settings).await;
+    if !cfg!(target_os = "linux") {
+        assert_eq!(
+            prepared
+                .err()
+                .expect("configured device monitoring must reject unsupported platforms")
+                .to_string(),
+            "health_device monitoring requires Linux"
+        );
+        return;
+    }
+    let prepared = prepared.unwrap();
     let status = pool.status().await.unwrap();
     assert!(status.members[0].health.quarantine.is_some());
     assert!(status.members[0].health.monitoring_error.is_some());
