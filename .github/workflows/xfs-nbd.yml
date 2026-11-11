@@ -508,5 +508,7 @@ jobs:
             python3 scripts/tiered-writeback-e2e.py cleanup --ledger "$LEDGER" || CLEANUP_STATUS=$?
             python3 scripts/tiered-writeback-e2e.py assert-clean --ledger "$LEDGER" || CLEANUP_STATUS=$?
           fi
-          docker rm -f "$MINIO_CONTAINER" || CLEANUP_STATUS=$?
+          if [ -n "${MINIO_CONTAINER:-}" ]; then
+            docker rm -f "$MINIO_CONTAINER" || CLEANUP_STATUS=$?
+          fi
           exit "$CLEANUP_STATUS"
