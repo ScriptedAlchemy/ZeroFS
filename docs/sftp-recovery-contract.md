@@ -35,6 +35,16 @@ not correct them. The existing native client force-closes its socket and awaits
 the SSH connection task. Keep that ownership contract rather than introducing
 a second production transport.
 
+The November investigation also found that the pinned `russh 0.62.7` included
+the upstream channel-window accounting bug
+([russh #789](https://github.com/Eugeny/russh/issues/789)). Its application queue
+can stop advancing while the SSH connection still appears alive. ZeroFS now
+requires `russh 0.65.1`, which includes the upstream fix, alongside the pool
+recovery protections above. The incident's healthy fresh SFTP connections and
+stalled existing sessions are consistent with this bug; they do not by themselves
+prove that it triggered the production stall. Dependency validation uses the
+existing native loopback transfer and connection-lifecycle tests.
+
 The September authentication-stall incident was distinct: the existing auth
 watchdog refreshes the client factory for future dials without retiring healthy
 sessions. Disk-full incidents and genuine immutable-object conflicts are also

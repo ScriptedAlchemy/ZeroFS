@@ -78,14 +78,12 @@ impl client::Handler for StrictHostKey {
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &russh::keys::PublicKey,
+        server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        match russh::keys::check_known_hosts_path(
-            &self.host,
-            self.port,
-            server_public_key,
-            &self.known_hosts,
-        ) {
+        let russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } = server_public_key else {
+            return Ok(false);
+        };
+        match russh::keys::check_known_hosts_path(&self.host, self.port, key, &self.known_hosts) {
             Ok(true) => Ok(true),
             Ok(false) => {
                 tracing::error!(
@@ -1412,10 +1410,10 @@ SiHvLIjvZnsP6UHEZvepD9dSLx72qVi3Qb2/E=
                 async fn auth_publickey(
                     &mut self,
                     _user: &str,
-                    public_key: &russh::keys::PublicKey,
+                    public_key: russh::server::VerifiedPublicKey<'_>,
                 ) -> Result<Auth, Self::Error> {
                     // Compare key material only; comments and encoding wrappers differ.
-                    if public_key.key_data() == self.state.client_public.key_data() {
+                    if public_key.public_key.key_data() == self.state.client_public.key_data() {
                         Ok(Auth::Accept)
                     } else {
                         Ok(Auth::Reject {
