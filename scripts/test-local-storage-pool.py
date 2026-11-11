@@ -757,7 +757,13 @@ def main() -> int:
                     receipt = smoke(binary, root)
             except BaseException:
                 for log in sorted(root.rglob("server-*.log")):
-                    print(f"\n{log.relative_to(root)}:\n{tail(log.read_text(errors='replace'))}", file=sys.stderr)
+                    try:
+                        diagnostic = tail(log.read_text(errors="replace"))
+                    except OSError as error:
+                        # Keep the original failure and the remaining logs even
+                        # if one diagnostic is unreadable or has disappeared.
+                        diagnostic = f"<unable to read log: {error}>"
+                    print(f"\n{log.relative_to(root)}:\n{diagnostic}", file=sys.stderr)
                 raise
         require(file_sha256(binary) == provenance["binary_sha256"], "binary changed while the acceptance suite ran")
         receipt.update(provenance)

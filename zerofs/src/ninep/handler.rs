@@ -185,15 +185,15 @@ pub struct FidSlot {
     pub fid: Fid,
     /// Open-handle pin installed only after an open is authorized.
     pub handle: Option<OpenHandle>,
-    /// A directory walked by a client stays addressable until its last fid
-    /// retires, including when rmdir unlinks the current working directory.
+    /// A directory reached by walk or authorized rebind stays addressable until
+    /// its last fid retires, including when rmdir unlinks the working directory.
     /// This does not confer an open/read capability or authorize Trebind.
     pub directory_pin: Option<OpenHandle>,
     /// `Trebind(OPENED)` expects this unopened fid to be reopened next.
     ///
-    /// This is deliberately metadata rather than an `OpenHandle`: a
-    /// client-declared replay state must not pin storage before the server has
-    /// authorized an actual open.
+    /// This is deliberately metadata rather than an open-handle pin: a replay
+    /// marker grants no open capability. Directory liveness is independently
+    /// retained by `directory_pin` after namespace authorization.
     replay_reopen: bool,
     /// Present once the fid takes its first byte-range lock; releases the fid's
     /// locks on drop.
@@ -1226,13 +1226,18 @@ impl NinePHandler {
         let qid = inode_to_qid(&inode, tr.inode_id);
 
         // OPENED records only that reconnect expects an in-place reopen next.
-        // The client-supplied replay flag grants neither access nor an
-        // open-handle pin; the actual open performs DAC checks and installs
-        // the first resource-bearing handle.
+        // The client-supplied replay flag grants no access or opened-file pin;
+        // the actual open still performs DAC checks and installs that handle.
         let mut state = self.connected_session()?;
         if state.fids.contains_key(&tr.fid) {
             return Err(P9Error::FidInUse);
         }
+        // The native client also uses rebind for freshly created directories.
+        // Like a walked directory, this authorized fid must retain a removed
+        // cwd for getattr and ".." traversal. The existing inode lock orders
+        // this pin against rmdir; it is independent of the OPENED replay flag.
+        let directory_pin = (tr.inode_id != 0 && inode.is_directory())
+            .then(|| self.filesystem.new_open_handle(tr.inode_id));
         state.fids.insert(
             tr.fid,
             FidSlot {
@@ -1246,7 +1251,7 @@ impl NinePHandler {
                     creds,
                 },
                 handle: None,
-                directory_pin: None,
+                directory_pin,
                 replay_reopen,
                 lock_guard: None,
             },
@@ -5293,6 +5298,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rebound_directory_fids_keep_removed_cwd_and_parent_addressable() {
+        for flags in [0, P9_REBIND_REPLAY, P9_REBIND_REPLAY | P9_REBIND_OPENED] {
+            let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+            let creds = test_creds();
+            let auth = AuthContext::from(&creds);
+            let (parent_id, _) = fs
+                .mkdir(&creds, 0, b"cwd-parent", &SetAttributes::default())
+                .await
+                .unwrap();
+            let (child_id, _) = fs
+                .mkdir(&creds, parent_id, b"cwd-child", &SetAttributes::default())
+                .await
+                .unwrap();
+            let handler = zerofs_handler(&fs).await;
+            assert!(matches!(
+                rebind(&handler, 1, 1, parent_id, 0, flags).await,
+                Message::Rrebind(_)
+            ));
+            assert!(matches!(
+                rebind(&handler, 2, 2, child_id, 0, flags).await,
+                Message::Rrebind(_)
+            ));
+
+            fs.remove(&auth, parent_id, b"cwd-child").await.unwrap();
+            fs.remove(&auth, 0, b"cwd-parent").await.unwrap();
+
+            // The native client obtains freshly created directory fids by
+            // inode rebind, without opening or walking them. These capabilities
+            // must keep a removed cwd alive just like walked directory fids.
+            for (tag, fid, inode_id) in [(3, 1, parent_id), (4, 2, child_id)] {
+                let stat = request(
+                    &handler,
+                    tag,
+                    Message::Tgetattr(Tgetattr {
+                        fid,
+                        request_mask: GETATTR_ALL,
+                    }),
+                )
+                .await;
+                assert!(
+                    matches!(
+                        &stat.body,
+                        Message::Rgetattr(Rgetattr { stat, .. })
+                            if stat.qid.path == inode_id && stat.nlink == 0
+                    ),
+                    "removed directory fid {fid} with rebind flags {flags:#x}: {:?}",
+                    stat.body
+                );
+                assert_eq!(fs.open_handle_count(inode_id), 1);
+            }
+            expect_walk(&handler, 5, 2, 3, &[b".."]).await;
+            assert_eq!(handler.get_fid(3).unwrap().inode_id, parent_id);
+            assert_eq!(fs.open_handle_count(parent_id), 2);
+            expect_walk(&handler, 6, 3, 4, &[b".."]).await;
+            assert_eq!(handler.get_fid(4).unwrap().inode_id, 0);
+
+            // An existing capability survives unlink; new binds still reject
+            // detached inodes, including an attempted replay of an opened fid.
+            for (tag, denied_flags, expected_errno) in [
+                (7, 0, crate::linux_errno::EACCES),
+                (8, P9_REBIND_REPLAY, crate::linux_errno::ESTALE),
+                (
+                    9,
+                    P9_REBIND_REPLAY | P9_REBIND_OPENED,
+                    crate::linux_errno::ESTALE,
+                ),
+            ] {
+                assert!(matches!(
+                    rebind(&handler, tag, 5, child_id, 0, denied_flags).await,
+                    Message::Rlerror(Rlerror { ecode }) if ecode == expected_errno
+                ));
+                assert!(handler.get_fid(5).is_err());
+                assert_eq!(fs.open_handle_count(child_id), 1);
+            }
+
+            assert!(matches!(
+                request(&handler, 10, Message::Tclunk(Tclunk { fid: 2 }))
+                    .await
+                    .body,
+                Message::Rclunk(_)
+            ));
+            assert_eq!(fs.open_handle_count(child_id), 0);
+            assert!(matches!(
+                request(&handler, 11, Message::Tclunk(Tclunk { fid: 1 }))
+                    .await
+                    .body,
+                Message::Rclunk(_)
+            ));
+            assert_eq!(fs.open_handle_count(parent_id), 1);
+            handler.close_for_disconnect();
+            assert_eq!(fs.open_handle_count(parent_id), 0);
+            assert_eq!(fs.open_handle_count(0), 0);
+            handler.close_all_open_handles();
+            assert_eq!(fs.open_handle_count(child_id), 0);
+            assert_eq!(fs.open_handle_count(parent_id), 0);
+        }
+    }
+
+    #[tokio::test]
     async fn disconnect_releases_open_handle_immediately() {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
         let handler = zerofs_handler(&fs).await;
@@ -5512,6 +5616,11 @@ mod tests {
             Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::ESTALE
         ));
         assert!(replay.get_fid(1).is_err());
+        assert_eq!(
+            fs.open_handle_count(attach_root),
+            0,
+            "failed namespace authorization must not pin the directory"
+        );
     }
 
     #[tokio::test]

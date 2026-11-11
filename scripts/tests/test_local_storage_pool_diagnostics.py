@@ -123,6 +123,37 @@ class LocalStoragePoolDiagnosticsTests(unittest.TestCase):
             self.assertIn("binary changed", evidence["error"])
             self.assertIn("binary changed", stderr)
 
+    def test_unreadable_log_preserves_original_failure_and_remaining_logs(self):
+        read_text = Path.read_text
+        for read_error in (PermissionError("log unreadable"), FileNotFoundError("log disappeared")):
+            with self.subTest(error=type(read_error).__name__):
+                roots = []
+
+                def fail(_binary, root):
+                    roots.append(root)
+                    (root / "loss").mkdir()
+                    (root / "loss" / "server-loss-recovery.log").write_text(
+                        "unavailable diagnostic", encoding="utf-8"
+                    )
+                    (root / "server-health.log").write_text("remaining diagnostic", encoding="utf-8")
+                    raise SMOKE.SmokeFailure("original failure")
+
+                def read_log(path, *args, **kwargs):
+                    if path.name == "server-loss-recovery.log":
+                        raise read_error
+                    return read_text(path, *args, **kwargs)
+
+                with mock.patch.object(SMOKE, "smoke", side_effect=fail), \
+                        mock.patch.object(Path, "read_text", read_log):
+                    result, stdout, stderr = self.run_main()
+                self.assertEqual(result, 1)
+                self.assertEqual(stdout, "")
+                self.assertIn(f"{Path('loss') / 'server-loss-recovery.log'}:\n", stderr)
+                self.assertIn(f"unable to read log: {read_error}", stderr)
+                self.assertIn("server-health.log:\nremaining diagnostic", stderr)
+                self.assertIn("local storage pool smoke test failed: original failure", stderr)
+                self.assertFalse(roots[0].exists())
+
 
 if __name__ == "__main__":
     unittest.main()
