@@ -161,6 +161,86 @@ fn take_u32(bytes: &[u8], offset: &mut usize) -> u32 {
     value
 }
 
+fn skip_nfs_wcc(reply: &[u8], offset: &mut usize) {
+    for length in [24, 84] {
+        match take_u32(reply, offset) {
+            0 => {}
+            1 => *offset += length,
+            flag => panic!("invalid NFS WCC presence flag {flag}"),
+        }
+    }
+}
+
+fn take_nfs_verifier(reply: &[u8], offset: &mut usize) -> [u8; 8] {
+    let verifier = reply[*offset..*offset + 8].try_into().unwrap();
+    *offset += 8;
+    assert_eq!(*offset, reply.len(), "unparsed NFS reply bytes");
+    verifier
+}
+
+fn parse_nfs_write_reply(reply: &[u8], expected_count: u32) -> [u8; 8] {
+    let mut offset = 28;
+    skip_nfs_wcc(reply, &mut offset);
+    assert_eq!(take_u32(reply, &mut offset), expected_count);
+    assert_eq!(take_u32(reply, &mut offset), stable_how::FILE_SYNC as u32);
+    take_nfs_verifier(reply, &mut offset)
+}
+
+fn validate_nfs_commit_reply(reply: &[u8], expected_verifier: [u8; 8]) {
+    let mut offset = 28;
+    skip_nfs_wcc(reply, &mut offset);
+    assert_eq!(
+        take_nfs_verifier(reply, &mut offset),
+        expected_verifier,
+        "NFS WRITE and COMMIT must return the same service verifier"
+    );
+}
+
+#[test]
+fn nfs_write_and_commit_replies_require_complete_matching_verifiers() {
+    let verifier = [0x3a; 8];
+    for attributes in [false, true] {
+        let prefix = || {
+            // The roundtrip validates the RPC header and status separately.
+            let mut reply = vec![0; 28];
+            for length in [24, 84] {
+                reply.extend_from_slice(&u32::from(attributes).to_be_bytes());
+                if attributes {
+                    reply.resize(reply.len() + length, 0);
+                }
+            }
+            reply
+        };
+        let mut write = prefix();
+        write.extend_from_slice(&4096_u32.to_be_bytes());
+        write.extend_from_slice(&(stable_how::FILE_SYNC as u32).to_be_bytes());
+        write.extend_from_slice(&verifier);
+        assert_eq!(parse_nfs_write_reply(&write, 4096), verifier);
+        let mut commit = prefix();
+        commit.extend_from_slice(&verifier);
+        validate_nfs_commit_reply(&commit, verifier);
+
+        for length in [28, write.len() - 1] {
+            assert!(
+                std::panic::catch_unwind(|| parse_nfs_write_reply(&write[..length], 4096)).is_err()
+            );
+        }
+        for length in [28, commit.len() - 1] {
+            assert!(
+                std::panic::catch_unwind(|| validate_nfs_commit_reply(&commit[..length], verifier))
+                    .is_err()
+            );
+        }
+        assert!(
+            std::panic::catch_unwind(|| validate_nfs_commit_reply(&commit, [0x3b; 8])).is_err()
+        );
+        write.push(0);
+        commit.push(0);
+        assert!(std::panic::catch_unwind(|| parse_nfs_write_reply(&write, 4096)).is_err());
+        assert!(std::panic::catch_unwind(|| validate_nfs_commit_reply(&commit, verifier)).is_err());
+    }
+}
+
 async fn nfs_io(fs: Arc<ZeroFS>, inode: u64, payload: &[u8], write: bool) {
     let listener = NFSTcpListener::bind("127.0.0.1:0".parse().unwrap(), NFSAdapter::new(fs))
         .await
@@ -178,18 +258,11 @@ async fn nfs_io(fs: Arc<ZeroFS>, inode: u64, payload: &[u8], write: bool) {
         call.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         call.extend_from_slice(payload);
         let reply = nfs_roundtrip(&mut client, &call, 1).await;
-        let mut offset = 28;
-        if take_u32(&reply, &mut offset) != 0 {
-            offset += 24;
-        }
-        if take_u32(&reply, &mut offset) != 0 {
-            offset += 84;
-        }
-        assert_eq!(take_u32(&reply, &mut offset), payload.len() as u32);
-        assert_eq!(take_u32(&reply, &mut offset), stable_how::FILE_SYNC as u32);
+        let verifier = parse_nfs_write_reply(&reply, payload.len() as u32);
         let mut commit = nfs_call(2, 21, inode);
         commit.extend_from_slice(&0_u32.to_be_bytes());
-        nfs_roundtrip(&mut client, &commit, 2).await;
+        let reply = nfs_roundtrip(&mut client, &commit, 2).await;
+        validate_nfs_commit_reply(&reply, verifier);
     }
     let mut call = nfs_call(3, 6, inode);
     call.extend_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -407,18 +480,17 @@ async fn pool_exports_nfs_and_nbd_survive_locator_evacuation_and_cold_reopen() {
         nbd_io(Arc::clone(&fs), root.path(), &nbd_payload, false).await;
         let status = pool.status().await.unwrap();
         assert!(status.members[0].safe_to_remove);
-        println!(
-            "POOL_EXPORTS_ACCEPTANCE {}",
-            serde_json::json!({
-                "fixture_id": "fx-exports-unchanged", "result": "passed",
-                "protocols": ["nfs3_tcp", "nbd_unix"], "kernel_mount": false,
-                "locator_evacuation": true, "cold_reopen": true,
-                "nfs_sha256": format!("{:x}", Sha256::digest(&nfs_payload)),
-                "nbd_sha256": format!("{:x}", Sha256::digest(&nbd_payload)),
-                "placements_before": before, "placements_after": after, "status": status
-            })
-        );
+        let acceptance = serde_json::json!({
+            "fixture_id": "fx-exports-unchanged", "result": "passed",
+            "protocols": ["nfs3_tcp", "nbd_unix"], "kernel_mount": false,
+            "locator_evacuation": true, "cold_reopen": true,
+            "nfs_sha256": format!("{:x}", Sha256::digest(&nfs_payload)),
+            "nbd_sha256": format!("{:x}", Sha256::digest(&nbd_payload)),
+            "placements_before": before, "placements_after": after, "status": status
+        });
         close(fs, pool).await;
+        root.close().expect("remove pool export fixture");
+        println!("POOL_EXPORTS_ACCEPTANCE {acceptance}");
     })
     .await
     .expect("pool-backed NFS/NBD wire regression exceeded its deadline");
