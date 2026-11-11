@@ -123,10 +123,13 @@ async fn close(fs: Arc<ZeroFS>, pool: PoolObjectStore) {
     fs.stop_new_mutation_admission();
     fs.stop_mutation_workers().await.unwrap();
     fs.flush_coordinator.close().await.unwrap();
-    pool.settle().await;
+    let commit_worker = fs.write_coordinator.take_worker_for_tests();
     drop(fs);
+    commit_worker
+        .await
+        .expect("commit worker must release its pool handles before cold reopen");
+    pool.settle().await;
     drop(pool);
-    tokio::task::yield_now().await;
 }
 
 fn nfs_call(xid: u32, procedure: u32, inode: u64) -> Vec<u8> {
