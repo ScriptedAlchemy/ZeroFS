@@ -578,7 +578,10 @@ impl PoolObjectStore {
         {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(issue)) => {
-                if !issue.is::<catalog::NoCapacity>() && !issue.is::<catalog::AllocationBlocked>() {
+                if !issue.is::<catalog::NoCapacity>()
+                    && !issue.is::<catalog::AllocationBlocked>()
+                    && !issue.is::<catalog::AutomaticEvacuationBlocked>()
+                {
                     self.inner.safety_failure.cancel();
                 }
                 Err(permanent(CatalogFailure(issue)))

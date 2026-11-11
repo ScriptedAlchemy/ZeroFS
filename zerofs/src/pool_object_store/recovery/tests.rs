@@ -305,6 +305,10 @@ async fn second_failure_during_reserved_copy_fences_remap_and_keeps_committed_co
     assert_eq!(member_for(&pool, &committed).await, "disk-2");
     assert_eq!(member_for(&pool, &remaining).await, "disk-0");
     assert_eq!(member_for(&pool, &second).await, "disk-1");
+    assert!(
+        !pool.inner.safety_failure.is_cancelled(),
+        "an expected upload-start policy refusal must not stop the service"
+    );
     assert_eq!(
         pool.get(&committed).await.unwrap().bytes().await.unwrap(),
         Bytes::from_static(b"copied-a")
@@ -388,6 +392,10 @@ async fn running_copy_rechecks_two_disk_policy_at_publication() {
         .unwrap();
     assert_eq!(member_for(&pool, &first).await, "disk-0");
     assert_eq!(member_for(&pool, &second).await, "disk-1");
+    assert!(
+        !pool.inner.safety_failure.is_cancelled(),
+        "an expected publication policy refusal must not stop the service"
+    );
     let status = pool.status().await.unwrap();
     assert_eq!(status.pending_operations, 0);
     assert_eq!(status.members[2].objects, 0);
