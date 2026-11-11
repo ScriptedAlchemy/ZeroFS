@@ -4,6 +4,11 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+mod tests;
+
+const MAX_FAULT_VERIFICATIONS_PER_PASS: usize = 16;
+
 pub(crate) struct PoolRecovery {
     stop: CancellationToken,
     task: JoinHandle<object_store::Result<()>>,
@@ -21,18 +26,8 @@ impl PoolRecovery {
                 }
                 pool.evacuate_pass(&cancelled).await?;
                 pool.recover_pending().await?;
-                for fault in pool
-                    .faults()
-                    .await?
-                    .into_iter()
-                    .filter(|f| f.next_retry_ms <= chrono::Utc::now().timestamp_millis())
-                    .take(16)
-                {
-                    if cancelled.is_cancelled() {
-                        break;
-                    }
-                    pool.verify_source_fault(&fault).await?;
-                }
+                pool.verify_due_faults(&cancelled, chrono::Utc::now().timestamp_millis())
+                    .await?;
                 tokio::select! {
                     _ = cancelled.cancelled() => return Ok(()),
                     _ = tokio::time::sleep(Duration::from_secs(60)) => {},
@@ -51,24 +46,47 @@ impl PoolRecovery {
 }
 
 impl PoolObjectStore {
+    async fn verify_due_faults(
+        &self,
+        stop: &CancellationToken,
+        now_ms: i64,
+    ) -> object_store::Result<()> {
+        let mut attempted = 0;
+        for fault in self.faults().await? {
+            if stop.is_cancelled() || attempted == MAX_FAULT_VERIFICATIONS_PER_PASS {
+                break;
+            }
+            if fault.next_retry_ms > now_ms {
+                continue;
+            }
+            // A busy lock (including a colliding key's read lease) must not
+            // consume the budget and indefinitely starve later fault entries.
+            if self.verify_source_fault(&fault).await? {
+                attempted += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns whether physical verification was attempted, including failures.
     pub(super) async fn verify_source_fault(
         &self,
         fault: &super::SegmentFault,
-    ) -> object_store::Result<()> {
+    ) -> object_store::Result<bool> {
         let location = object_store::path::Path::parse(&fault.location)
             .map_err(|e| super::error(e.to_string()))?;
         let Ok(_guard) = self.key_lock(&location).try_write_owned() else {
-            return Ok(());
+            return Ok(false);
         };
         let _owner = self.inner.tasks.token();
         let Some(entry) = self.visible(&location).await? else {
-            return Ok(());
+            return Ok(false);
         };
         if entry.physical.key() != fault.physical_key {
-            return Ok(());
+            return Ok(false);
         }
         let Some(expected) = entry.sha256 else {
-            return Ok(());
+            return Ok(false);
         };
         match self.hash_physical(&entry.physical, entry.size).await {
             Ok(actual) if actual == expected => {
@@ -87,7 +105,7 @@ impl PoolObjectStore {
                     .await?;
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     pub(crate) async fn evacuate_pass(&self, stop: &CancellationToken) -> object_store::Result<()> {
