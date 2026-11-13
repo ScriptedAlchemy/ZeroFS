@@ -727,6 +727,17 @@ pub(super) struct CleanCacheOwner {
     _lock: File,
 }
 
+impl Drop for CleanCacheOwner {
+    fn drop(&mut self) {
+        // A child's inherited descriptor can outlive this owner until exec.
+        // Release the shared open file description when the last cache
+        // ownership guard is dropped, rather than waiting for that descriptor.
+        if let Err(error) = FileExt::unlock(&self._lock) {
+            tracing::warn!(%error, "failed to release clean cache ownership lock");
+        }
+    }
+}
+
 fn acquire_clean_cache_owner(root: &StdPath) -> Result<CleanCacheOwner> {
     std::fs::create_dir_all(root)
         .with_context(|| format!("creating clean cache root at {}", root.display()))?;
@@ -2908,6 +2919,34 @@ min_free_gb = 256.0
         assert!(error.to_string().contains("already in use"), "{error:#}");
         drop(first);
         acquire_clean_cache_owner(root.path()).unwrap();
+    }
+
+    #[test]
+    fn clean_cache_owner_release_does_not_wait_for_inherited_descriptors() {
+        let root = tempfile::tempdir().unwrap();
+        let first = Arc::new(acquire_clean_cache_owner(root.path()).unwrap());
+        let live_owner = Arc::clone(&first);
+        // A duplicate models the shared open file description inherited
+        // between fork and exec without starting a child or relying on timing.
+        let inherited_lock = first._lock.try_clone().unwrap();
+        let assert_locked = || {
+            let error = acquire_clean_cache_owner(root.path()).unwrap_err();
+            assert!(error.to_string().contains("already in use"), "{error:#}");
+        };
+        assert_locked();
+        drop(first);
+        assert_locked();
+        drop(live_owner);
+
+        let reopened = acquire_clean_cache_owner(root.path()).expect(
+            "closed cache owner must release its lock while an inherited descriptor remains",
+        );
+        assert_locked();
+        drop(inherited_lock);
+        // Closing the old descriptor cannot release the new owner's lock.
+        assert_locked();
+        drop(reopened);
+        acquire_clean_cache_owner(root.path()).expect("closed replacement owner releases its lock");
     }
 
     #[test]

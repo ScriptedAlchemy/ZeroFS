@@ -10,6 +10,8 @@ Durability still depends on the configured journal disk and remote storage.
 | Failure | Recovery | Safety boundary |
 | --- | --- | --- |
 | Connection handshake exceeds 30 seconds | Cancel it, retain its connection slot until cleanup settles, then retry with dial backoff | An opener that cannot settle within the additional 5 seconds closes the pool |
+| Reads, writes, or metadata hold a live pooled session without a completion in that class on that connection | Recycle pooled sessions after `flush_stall_recycle_secs` (default 180 seconds); progress on another connection or in another class does not reset the window | Admission queues, connection placement, dialing, and retired sessions are not evidence of a stalled operation; existing physical-close ownership and connection limits still apply; 0 disables this watchdog |
+| An abandoned operation shares a connection with stalled siblings | Remove the connection from placement, allow siblings up to 10 seconds to settle, then run the owned close path | Retain admission through the shared close result and connection capacity until physical cleanup settles; fail closed if cleanup cannot be proven |
 | Publication reply and staging removal both fail | Retain the exact staging owner, retry bounded removal with 1–30 second backoff, then replay the durable journal record | Never advance the remote sequence merely because cleanup succeeded |
 | Large multipart write fails and abort cannot remove staging | The same typed SFTP cleanup recovery; generic multipart backends retain their existing fail-closed contract | No new publication while the prior attempt's owned cleanup is unresolved |
 | Create already committed but its reply was lost | Cleanup, replay, and verify the existing object's exact bytes | Different bytes remain terminal; never overwrite a conflicting immutable object |
@@ -32,6 +34,16 @@ Those policies sit above the native `russh` client; replacing the client would
 not correct them. The existing native client force-closes its socket and awaits
 the SSH connection task. Keep that ownership contract rather than introducing
 a second production transport.
+
+The November investigation also found that the pinned `russh 0.62.7` included
+the upstream channel-window accounting bug
+([russh #789](https://github.com/Eugeny/russh/issues/789)). Its application queue
+can stop advancing while the SSH connection still appears alive. ZeroFS now
+requires `russh 0.65.1`, which includes the upstream fix, alongside the pool
+recovery protections above. The incident's healthy fresh SFTP connections and
+stalled existing sessions are consistent with this bug; they do not by themselves
+prove that it triggered the production stall. Dependency validation uses the
+existing native loopback transfer and connection-lifecycle tests.
 
 The September authentication-stall incident was distinct: the existing auth
 watchdog refreshes the client factory for future dials without retiring healthy
@@ -56,6 +68,28 @@ replays, shutdown during cleanup, caller cancellation and physical slot
 ownership. Assertions include unchanged remote watermarks during the outage,
 retained journal records, exact payload bytes after recovery, and no leftover
 owned staging paths.
+
+Pool regressions also hold read and metadata leases without completions, verify
+connection recycling and redial, and distinguish queued work from operations on
+live sessions. Separate read, write, and metadata regressions keep a second
+connection answering the same operation class and verify that its progress
+cannot hide the stalled connection. Progress in the same class on the same
+connection still resets its watchdog; this is a connection-liveness policy,
+not a deadline for each individual request. Pooled object-store calls have a
+separate 45-second deadline; a shorter configured watchdog window can recycle
+their connection earlier. Abandoning one lease while another retains the same
+connection starts the owned physical close after at most 10 seconds of sibling
+grace. That close has its own 10-second graceful window and 5-second
+forced-cleanup window; an unsettled forced cleanup closes the pool and retains
+the connection slot until cleanup finishes. A sibling retiring during an existing close waits for
+the same close result, including failures. These deterministic pool tests cover
+the recovery policy and connection limit on redial, not a reproduction of every
+provider outage or a production deployment receipt.
+
+Connection open, retirement, and close tasks run on the runtime that created
+the pool. Dropping a lease outside a runtime, or shutting down a separate
+caller's runtime, does not abandon its cleanup or release connection capacity
+early. The pool's owning runtime must remain alive through pool shutdown.
 
 `russh_pool_recovers_after_real_stalled_handshake_without_restart` additionally
 uses real loopback TCP/SSH/SFTP: write durable bytes, stall the next handshake
