@@ -233,9 +233,10 @@ pub struct SftpConfig {
     #[serde(default, skip_serializing_if = "SftpSshTransport::is_russh")]
     pub(crate) transport: SftpSshTransport,
     /// Stall watchdog: when reads, writes, or metadata hold live pooled sessions
-    /// this many seconds without a completion in that class, recycle pooled
-    /// sessions so replacements reconnect. Queued work and connection setup
-    /// do not arm the watchdog. The legacy option name is retained; 0 disables it.
+    /// this many seconds without a completion in that class on the same
+    /// connection, recycle pooled sessions so replacements reconnect. Queued
+    /// work and connection setup do not arm the watchdog. The legacy option
+    /// name is retained; 0 disables it.
     #[serde(default = "default_sftp_flush_stall_recycle_secs")]
     pub(crate) flush_stall_recycle_secs: u64,
     /// Auth-stall watchdog: when every SSH dial has been rejected at

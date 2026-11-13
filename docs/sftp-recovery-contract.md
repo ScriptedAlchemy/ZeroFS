@@ -10,7 +10,7 @@ Durability still depends on the configured journal disk and remote storage.
 | Failure | Recovery | Safety boundary |
 | --- | --- | --- |
 | Connection handshake exceeds 30 seconds | Cancel it, retain its connection slot until cleanup settles, then retry with dial backoff | An opener that cannot settle within the additional 5 seconds closes the pool |
-| Reads, writes, or metadata hold a live pooled session without a completion in that class | Recycle pooled sessions after `flush_stall_recycle_secs` (default 180 seconds); progress in another class does not reset the window | Admission queues, connection placement, dialing, and retired sessions are not evidence of a stalled operation; existing physical-close ownership and connection limits still apply; 0 disables this watchdog |
+| Reads, writes, or metadata hold a live pooled session without a completion in that class on that connection | Recycle pooled sessions after `flush_stall_recycle_secs` (default 180 seconds); progress on another connection or in another class does not reset the window | Admission queues, connection placement, dialing, and retired sessions are not evidence of a stalled operation; existing physical-close ownership and connection limits still apply; 0 disables this watchdog |
 | An abandoned operation shares a connection with stalled siblings | Remove the connection from placement, allow siblings up to 10 seconds to settle, then run the owned close path | Retain admission through the shared close result and connection capacity until physical cleanup settles; fail closed if cleanup cannot be proven |
 | Publication reply and staging removal both fail | Retain the exact staging owner, retry bounded removal with 1–30 second backoff, then replay the durable journal record | Never advance the remote sequence merely because cleanup succeeded |
 | Large multipart write fails and abort cannot remove staging | The same typed SFTP cleanup recovery; generic multipart backends retain their existing fail-closed contract | No new publication while the prior attempt's owned cleanup is unresolved |
@@ -71,11 +71,17 @@ owned staging paths.
 
 Pool regressions also hold read and metadata leases without completions, verify
 connection recycling and redial, and distinguish queued work from operations on
-live sessions. Abandoning one lease while another retains the same connection
-starts the owned physical close after at most 10 seconds of sibling grace. That
-close has its own 10-second graceful window and 5-second forced-cleanup window;
-an unsettled forced cleanup closes the pool and retains the connection slot
-until cleanup finishes. A sibling retiring during an existing close waits for
+live sessions. Separate read, write, and metadata regressions keep a second
+connection answering the same operation class and verify that its progress
+cannot hide the stalled connection. Progress in the same class on the same
+connection still resets its watchdog; this is a connection-liveness policy,
+not a deadline for each individual request. Pooled object-store calls have a
+separate 45-second deadline; a shorter configured watchdog window can recycle
+their connection earlier. Abandoning one lease while another retains the same
+connection starts the owned physical close after at most 10 seconds of sibling
+grace. That close has its own 10-second graceful window and 5-second
+forced-cleanup window; an unsettled forced cleanup closes the pool and retains
+the connection slot until cleanup finishes. A sibling retiring during an existing close waits for
 the same close result, including failures. These deterministic pool tests cover
 the recovery policy and connection limit on redial, not a reproduction of every
 provider outage or a production deployment receipt.

@@ -534,6 +534,9 @@ impl NinePHandler {
         };
         slot.replay_reopen = false;
         slot.handle = Some(self.filesystem.new_open_handle(inode_id));
+        // The opened handle now owns liveness. In-place create/open can replace
+        // a different directory identity, whose old pin must not survive here.
+        slot.directory_pin = None;
         Ok(())
     }
 
@@ -568,7 +571,7 @@ impl NinePHandler {
         directory_pin: Option<OpenHandle>,
     ) -> P9Result<()> {
         let replaced = {
-            let mut state = self.session_state();
+            let mut state = self.connected_session()?;
             if source != newfid && state.fids.contains_key(&newfid) {
                 return Err(P9Error::FidInUse);
             }
@@ -1489,6 +1492,7 @@ impl NinePHandler {
                     slot.fid = fid_entry;
                     slot.replay_reopen = false;
                     slot.handle = Some(self.filesystem.new_open_handle(inode_id));
+                    slot.directory_pin = None;
                 }
                 None => return Err(P9Error::BadFid),
             }
@@ -1818,6 +1822,7 @@ impl NinePHandler {
             slot.fid = opened_fid;
             slot.replay_reopen = false;
             slot.handle = Some(self.filesystem.new_open_handle(child_id));
+            slot.directory_pin = None;
         }
 
         Ok(Message::Rlcreate(Rlcreate {
@@ -3100,7 +3105,7 @@ mod tests {
     async fn lopen_never_attaches_snapshot_authority_to_a_racing_walk_replacement() {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
         let (replacement_id, _) = fs
-            .create(&test_creds(), 0, b"replacement", &SetAttributes::default())
+            .mkdir(&test_creds(), 0, b"replacement", &SetAttributes::default())
             .await
             .unwrap();
         let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
@@ -3121,6 +3126,7 @@ mod tests {
 
         expect_walk(&handler, 3, 1, 1, &[b"replacement"]).await;
         assert_eq!(handler.get_fid(1).unwrap().inode_id, replacement_id);
+        assert_eq!(fs.open_handle_count(replacement_id), 1);
 
         drop(inode_guard);
         assert!(matches!(opening.await.body, Message::Rlopen(_)));
@@ -5393,6 +5399,138 @@ mod tests {
             handler.close_all_open_handles();
             assert_eq!(fs.open_handle_count(child_id), 0);
             assert_eq!(fs.open_handle_count(parent_id), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn creating_on_directory_fid_releases_previous_directory_pin() {
+        for use_rebind in [false, true] {
+            for compound in [false, true] {
+                let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+                let creds = test_creds();
+                let auth = AuthContext::from(&creds);
+                let (parent_id, _) = fs
+                    .mkdir(&creds, 0, b"parent", &SetAttributes::default())
+                    .await
+                    .unwrap();
+                let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+                start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+                if use_rebind {
+                    assert!(matches!(
+                        rebind(&handler, 2, 2, parent_id, 0, 0).await,
+                        Message::Rrebind(_)
+                    ));
+                } else {
+                    expect_walk(&handler, 2, 1, 2, &[b"parent"]).await;
+                }
+                assert_eq!(fs.open_handle_count(parent_id), 1);
+
+                if compound {
+                    let created = request(
+                        &handler,
+                        3,
+                        Message::Tlcreateattr(Tlcreateattr {
+                            dfid: 2,
+                            newfid: 2,
+                            name: P9String::new(b"file".to_vec()),
+                            flags: O_RDWR as u32,
+                            mode: 0o644,
+                            gid: creds.gid,
+                        }),
+                    )
+                    .await;
+                    assert!(matches!(created.body, Message::Rlcreateattr(_)));
+                } else {
+                    create_file(&handler, 3, 2, b"file").await;
+                }
+                let file_id = handler.get_fid(2).unwrap().inode_id;
+                assert_eq!(fs.open_handle_count(file_id), 1);
+                assert_eq!(
+                    fs.open_handle_count(parent_id),
+                    0,
+                    "a created file fid must no longer retain its previous directory"
+                );
+
+                // Retaining an unlinked file must not retain its now-empty
+                // parent directory when no fid still refers to that parent.
+                fs.write(&auth, file_id, 0, &Bytes::from_static(b"retained"))
+                    .await
+                    .unwrap();
+                fs.remove(&auth, parent_id, b"file").await.unwrap();
+                fs.remove(&auth, 0, b"parent").await.unwrap();
+                assert!(matches!(
+                    fs.inode_store.get(parent_id).await,
+                    Err(FsError::NotFound)
+                ));
+                let read = request(
+                    &handler,
+                    4,
+                    Message::Tread(Tread {
+                        fid: 2,
+                        offset: 0,
+                        count: 8,
+                    }),
+                )
+                .await;
+                assert!(matches!(
+                    read.body,
+                    Message::Rread(Rread { ref data, .. }) if data.as_ref() == b"retained"
+                ));
+                request(&handler, 5, Message::Tclunk(Tclunk { fid: 2 })).await;
+                fs.reclaim_if_unreferenced(file_id).await;
+                assert!(matches!(
+                    fs.inode_store.get(file_id).await,
+                    Err(FsError::NotFound)
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnect_prevents_inflight_walk_from_repinning_directory() {
+        for compound in [false, true] {
+            let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+            let (directory_id, _) = fs
+                .mkdir(&test_creds(), 0, b"late-walk", &SetAttributes::default())
+                .await
+                .unwrap();
+            let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+            start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+
+            // Pause the received walk at its directory-liveness acquisition.
+            // Disconnect must remain authoritative after this task resumes,
+            // even while another received task keeps the handler alive.
+            let inode_guard = fs.lock_manager.acquire(directory_id).await;
+            let names = vec![P9String::new(b"late-walk".to_vec())];
+            let body = if compound {
+                Message::Twalkgetattr(Twalkgetattr {
+                    fid: 1,
+                    newfid: 2,
+                    nwname: 1,
+                    wnames: names,
+                })
+            } else {
+                Message::Twalk(Twalk {
+                    fid: 1,
+                    newfid: 2,
+                    nwname: 1,
+                    wnames: names,
+                })
+            };
+            let mut walking = Box::pin(request(&handler, 2, body));
+            assert!(futures::poll!(walking.as_mut()).is_pending());
+            handler.close_for_disconnect();
+            drop(inode_guard);
+
+            let response = walking.await;
+            assert!(matches!(
+                response.body,
+                Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::ESTALE
+            ));
+            assert!(handler.get_fid(2).is_err());
+            assert_eq!(fs.open_handle_count(directory_id), 0);
+            handler.close_for_disconnect();
+            assert_eq!(fs.open_handle_count(directory_id), 0);
         }
     }
 

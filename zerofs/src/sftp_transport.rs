@@ -114,9 +114,9 @@ const SFTP_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 const SFTP_SESSION_FORCE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const SFTP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const SFTP_IDLE_REAP_INTERVAL: Duration = Duration::from_secs(10);
-/// When an operation class stays pending without completions, recycle the
-/// pool even if other classes are progressing. This includes reads and
-/// metadata operations such as staging cleanup, not just writes. Zero
+/// When an operation class on a session stays pending without completions,
+/// recycle the pool even if other sessions or classes are progressing. This
+/// includes reads and metadata such as staging cleanup, not just writes. Zero
 /// disables the watchdog; the production value comes from
 /// `[sftp] flush_stall_recycle_secs`.
 const SFTP_FLUSH_STALL_RECYCLE_DISABLED: u64 = 0;
@@ -609,6 +609,8 @@ struct SharedSession {
     lifetime: StdMutex<Option<OwnedSemaphorePermit>>,
     active_ops: AtomicUsize,
     active_by_kind: [AtomicUsize; 3],
+    operation_completions: [AtomicU64; 3],
+    flush_stall: StdMutex<[FlushStallTracker; 3]>,
     broken: AtomicBool,
     // Whoever swaps this to true owns the close; releases and reapers race
     // for it once a session must go away.
@@ -626,6 +628,8 @@ impl SharedSession {
             lifetime: StdMutex::new(Some(lifetime)),
             active_ops: AtomicUsize::new(0),
             active_by_kind: std::array::from_fn(|_| AtomicUsize::new(0)),
+            operation_completions: std::array::from_fn(|_| AtomicU64::new(0)),
+            flush_stall: StdMutex::new(std::array::from_fn(|_| FlushStallTracker::default())),
             broken: AtomicBool::new(false),
             closing: AtomicBool::new(false),
             close_settled: AtomicBool::new(false),
@@ -725,8 +729,6 @@ struct PoolInner {
     idle_warm_floor: AtomicUsize,
     // Millisecond window for the flush-stall watchdog; zero disables it.
     flush_stall_recycle_millis: AtomicU64,
-    operation_completions: [AtomicU64; 3],
-    flush_stall: StdMutex<[FlushStallTracker; 3]>,
     // Millisecond window for the auth-stall watchdog; zero disables it.
     auth_stall_recycle_millis: AtomicU64,
     auth_stall: StdMutex<AuthStallTracker>,
@@ -1040,56 +1042,42 @@ impl PoolInner {
         }
     }
 
-    /// Only claimed work on live sessions can establish a transport stall.
-    /// Admission also includes queued work, dials, and retirement cleanup;
-    /// none of those should make healthy pooled sessions look unresponsive.
-    fn session_work_pending(&self) -> [bool; 3] {
-        let roster = self.roster.lock().unwrap();
-        std::array::from_fn(|index| {
-            roster
-                .iter()
-                .any(|session| session.active_by_kind[index].load(Ordering::SeqCst) > 0)
-        })
-    }
-
-    /// Track each active operation class independently so healthy writes
-    /// cannot mask stalled reads or staging cleanup on a live session.
+    /// Track each active operation class on each live session independently.
+    /// Completions on another connection cannot establish that this one is
+    /// progressing. Only claimed work arms a tracker: queued work, dials, and
+    /// retirement cleanup must not make healthy sessions look unresponsive.
     fn check_flush_stall(self: &Arc<Self>) {
         let window = self.flush_stall_recycle_millis.load(Ordering::SeqCst);
         if window == SFTP_FLUSH_STALL_RECYCLE_DISABLED || self.closed.load(Ordering::SeqCst) {
             return;
         }
         let window = Duration::from_millis(window);
-        let pending = self.session_work_pending();
         let now = Instant::now();
         let stalled = {
-            let mut stalls = self.flush_stall.lock().unwrap();
+            let roster = self.roster.lock().unwrap();
             let mut stalled = None;
-            for kind in [
-                OperationKind::Read,
-                OperationKind::Write,
-                OperationKind::Metadata,
-            ] {
-                let index = kind as usize;
-                let stall = &mut stalls[index];
-                let completions = self.operation_completions[index].load(Ordering::SeqCst);
-                if !pending[index] {
-                    stall.pending_since = None;
-                } else if stall.pending_since.is_none() || completions != stall.last_completions {
-                    stall.pending_since = Some(now);
-                } else if let Some(since) = stall.pending_since {
-                    let elapsed = now.saturating_duration_since(since);
-                    if elapsed >= window && stalled.is_none() {
-                        stalled = Some((kind, elapsed));
-                    }
-                }
-                stall.last_completions = completions;
-            }
-            if stalled.is_some() {
-                for stall in stalls.iter_mut() {
-                    if stall.pending_since.is_some() {
+            for session in roster.iter() {
+                let mut stalls = session.flush_stall.lock().unwrap();
+                for kind in [
+                    OperationKind::Read,
+                    OperationKind::Write,
+                    OperationKind::Metadata,
+                ] {
+                    let index = kind as usize;
+                    let stall = &mut stalls[index];
+                    let completions = session.operation_completions[index].load(Ordering::SeqCst);
+                    if session.active_for(kind) == 0 {
+                        stall.pending_since = None;
+                    } else if stall.pending_since.is_none() || completions != stall.last_completions
+                    {
                         stall.pending_since = Some(now);
+                    } else if let Some(since) = stall.pending_since {
+                        let elapsed = now.saturating_duration_since(since);
+                        if elapsed >= window && stalled.is_none() {
+                            stalled = Some((kind, elapsed));
+                        }
                     }
+                    stall.last_completions = completions;
                 }
             }
             stalled
@@ -1438,8 +1426,6 @@ impl SftpSessionPool {
                 session_cursor: AtomicUsize::new(0),
                 idle_warm_floor: AtomicUsize::new(SFTP_IDLE_WARM_FLOOR),
                 flush_stall_recycle_millis: AtomicU64::new(SFTP_FLUSH_STALL_RECYCLE_DISABLED),
-                operation_completions: std::array::from_fn(|_| AtomicU64::new(0)),
-                flush_stall: StdMutex::new(std::array::from_fn(|_| FlushStallTracker::default())),
                 auth_stall_recycle_millis: AtomicU64::new(SFTP_AUTH_STALL_RECYCLE_DISABLED),
                 auth_stall: StdMutex::new(AuthStallTracker::default()),
                 directories: DirectoryCache::default(),
@@ -2103,7 +2089,7 @@ impl SessionLease {
             .session
             .take()
             .expect("lease always owns a session until completion");
-        self.pool.operation_completions[self.kind as usize].fetch_add(1, Ordering::SeqCst);
+        session.operation_completions[self.kind as usize].fetch_add(1, Ordering::SeqCst);
         self.pool.release_session(&session, self.kind);
         drop(self.admission.take());
         drop(self.activity.take());
@@ -4725,6 +4711,83 @@ mod tests {
         pool.shutdown().await.unwrap();
     }
 
+    async fn assert_other_session_completions_do_not_mask_stall(kind: OperationKind) {
+        let factory = RecordingFactory::fully_capable();
+        let pool = pool(factory.clone(), 2, 2, 2).await;
+        pool.inner
+            .flush_stall_recycle_millis
+            .store(30_000, Ordering::SeqCst);
+        let stuck = pool.checkout(kind).await.unwrap();
+        let first = pool.checkout(kind).await.unwrap();
+        let peer = first.session.as_ref().unwrap().clone();
+        assert!(!Arc::ptr_eq(stuck.session.as_ref().unwrap(), &peer));
+        first.complete().await.unwrap();
+        pool.inner.check_flush_stall();
+
+        // The second connection keeps answering the same operation class.
+        // Those answers say nothing about the first connection's liveness.
+        for tick in 0..4 {
+            let completing = pool.checkout(kind).await.unwrap();
+            assert!(!Arc::ptr_eq(
+                stuck.session.as_ref().unwrap(),
+                completing.session.as_ref().unwrap()
+            ));
+            completing.complete().await.unwrap();
+            tokio::time::advance(Duration::from_secs(8)).await;
+            pool.inner.check_flush_stall();
+            if tick < 3 {
+                assert!(
+                    !stuck
+                        .session
+                        .as_ref()
+                        .unwrap()
+                        .broken
+                        .load(Ordering::SeqCst),
+                    "a new tracker must allow the full stall window"
+                );
+            }
+        }
+        assert!(
+            stuck
+                .session
+                .as_ref()
+                .unwrap()
+                .broken
+                .load(Ordering::SeqCst),
+            "{kind:?} completions on a peer must not hide a stalled connection"
+        );
+        stuck.retire().await.unwrap();
+        peer.wait_close_settled().await.unwrap();
+        assert_eq!(
+            factory.live(),
+            0,
+            "both connections must finish closing before their slots are reused"
+        );
+        assert_eq!(pool.inner.shared.available_permits(), 2);
+
+        let recovered = pool.checkout(kind).await.unwrap();
+        assert_eq!(factory.dials(), 3);
+        assert_eq!(factory.peak(), 2);
+        recovered.complete().await.unwrap();
+        pool.shutdown().await.unwrap();
+        assert_eq!(factory.live(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reads_on_another_session_do_not_mask_stalled_reads() {
+        assert_other_session_completions_do_not_mask_stall(OperationKind::Read).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn writes_on_another_session_do_not_mask_stalled_writes() {
+        assert_other_session_completions_do_not_mask_stall(OperationKind::Write).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn metadata_on_another_session_does_not_mask_stalled_metadata() {
+        assert_other_session_completions_do_not_mask_stall(OperationKind::Metadata).await;
+    }
+
     #[tokio::test(start_paused = true)]
     async fn queued_metadata_does_not_recycle_progressing_reads() {
         let factory = RecordingFactory::fully_capable();
@@ -5035,17 +5098,20 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn completing_writes_keep_the_stall_watchdog_quiet() {
         let factory = RecordingFactory::fully_capable();
-        let pool = pool(factory.clone(), 2, 2, 2).await;
+        let pool = pool(factory.clone(), 1, 2, 2).await;
         pool.inner
             .flush_stall_recycle_millis
             .store(30_000, Ordering::SeqCst);
 
         // One write pends forever, so write work is always pending; another
-        // write completes between every tick, which is real flush progress.
+        // write on the same connection completes between every tick, which
+        // is real progress on that connection.
         let stuck = pool.checkout(OperationKind::Write).await.unwrap();
-        // The first completing write may dial a second session; settle the
-        // roster before measuring so the assertion sees recycles only.
         let first = pool.checkout(OperationKind::Write).await.unwrap();
+        assert!(Arc::ptr_eq(
+            stuck.session.as_ref().unwrap(),
+            first.session.as_ref().unwrap()
+        ));
         first.complete().await.unwrap();
         let live_before = factory.live();
         for _ in 0..6 {
