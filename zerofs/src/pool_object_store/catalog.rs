@@ -177,10 +177,26 @@ pub(super) struct Snapshot {
 }
 
 pub(super) struct Catalog {
+    // Fields drop in declaration order: finish database shutdown before
+    // releasing the catalog's exclusive ownership below.
     database: Database,
     pub identity: Identity,
     _root: AnchoredDir,
-    _lock: File,
+    _lock: CatalogLock,
+}
+
+struct CatalogLock(File);
+
+impl Drop for CatalogLock {
+    fn drop(&mut self) {
+        // CLOEXEC only closes a child's inherited descriptor at exec. Closing
+        // our descriptor alone can leave its flock held across that interval;
+        // explicitly unlock the shared open file description after the owner
+        // has finished all catalog work.
+        if let Err(error) = FileExt::unlock(&self.0) {
+            tracing::warn!(%error, "failed to release pool catalog lock");
+        }
+    }
 }
 
 impl std::fmt::Debug for Catalog {
@@ -224,6 +240,7 @@ impl Catalog {
         if !FileExt::try_lock_exclusive(&lock)? {
             bail!("pool catalog is already locked by another process");
         }
+        let lock = CatalogLock(lock);
         if !initialize {
             // Do not create a replacement database if the file disappeared
             // between the preliminary check and descriptor-anchored open.
@@ -1150,6 +1167,75 @@ fn ensure_eligible(tx: &redb::WriteTransaction, member: &str) -> Result<()> {
         .into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod catalog_lock_tests {
+    use super::*;
+
+    #[test]
+    fn catalog_release_does_not_wait_for_inherited_descriptors() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("catalog");
+        let catalog = Catalog::open(&root, "db", true, None).unwrap();
+        let member = PoolMember {
+            id: "hdd-a".into(),
+            identity: "memory://hdd-a".into(),
+            store: std::sync::Arc::new(object_store::memory::InMemory::new()),
+            capacity_bytes: 1024,
+            local_path: None,
+            min_free_bytes: 0,
+            health_device: None,
+        };
+        catalog.configure_members(&[member]).unwrap();
+        catalog.finish_initialization().unwrap();
+        catalog
+            .kernel_observation("hdd-a", "available".into(), Some(("boot-a".into(), 42)))
+            .unwrap();
+        let marker = catalog.identity.marker().unwrap();
+        let pool_id = catalog.identity.pool_id.clone();
+
+        // fork() duplicates the open file description before CLOEXEC can close
+        // it. A duplicated descriptor models that interval without forking a
+        // multithreaded test process or relying on scheduler timing.
+        let inherited_lock = catalog._lock.0.try_clone().unwrap();
+        let assert_locked = || {
+            assert!(
+                Catalog::open(&root, "db", false, Some(&marker))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("pool catalog is already locked by another process")
+            );
+        };
+        assert_locked();
+        drop(catalog);
+
+        let reopened = Catalog::open(&root, "db", false, Some(&marker))
+            .expect("closed catalog must release its lock while an inherited descriptor remains");
+        assert_eq!(reopened.identity.pool_id, pool_id);
+        assert!(reopened.identity.initialized);
+        assert_eq!(reopened.member("hdd-a").unwrap().identity, "memory://hdd-a");
+        let health: MemberHealth = {
+            let read = reopened.database.begin_read().unwrap();
+            bincode::deserialize(
+                read.open_table(HEALTH)
+                    .unwrap()
+                    .get("hdd-a")
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+            )
+            .unwrap()
+        };
+        assert_eq!(health.kernel_cursor, Some(("boot-a".into(), 42)));
+        assert_eq!(health.quarantine.as_deref(), Some("kernel block I/O error"));
+
+        assert_locked();
+        drop(inherited_lock);
+        // Closing the previous generation's descriptor cannot release the new
+        // owner's lock, which belongs to a separate open file description.
+        assert_locked();
+    }
 }
 
 #[cfg(test)]
