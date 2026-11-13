@@ -1376,6 +1376,86 @@ async fn disk_health_evacuation_no_capacity_never_claims_completion() {
 }
 
 #[tokio::test]
+async fn evacuation_capacity_requires_whole_segments_to_fit_destinations() {
+    for (payloads, capacities, sufficient) in [
+        (vec![b"12345678".as_slice()], [4, 4], false),
+        (
+            vec![b"123456".as_slice(), b"abcdef".as_slice()],
+            [8, 4],
+            false,
+        ),
+        (vec![b"1234".as_slice(), b"abcd".as_slice()], [4, 4], true),
+    ] {
+        let size = payloads.iter().map(|payload| payload.len() as u64).sum();
+        let f = Fixture::new(size);
+        let mut members = f.members();
+        members[1].capacity_bytes = capacities[0];
+        let mut third = members[1].clone();
+        third.id = "hdd-c".into();
+        third.identity = "memory://hdd-c".into();
+        third.store = Arc::new(InMemory::new());
+        third.capacity_bytes = capacities[1];
+        members.push(third);
+        let pool = PoolObjectStore::initialize(
+            f.authority.clone(),
+            Path::from("db"),
+            f.catalog.path().canonicalize().unwrap().join("catalog"),
+            members,
+        )
+        .await
+        .unwrap();
+        for (index, payload) in payloads.into_iter().enumerate() {
+            create(&pool, &segment(3000 + index as u64), payload).await;
+        }
+        pool.quarantine("hdd-a", "media failure").await.unwrap();
+        let before = pool.status().await.unwrap();
+        assert!(before.members[0].evacuation_capacity.available_bytes >= size);
+        assert_eq!(before.members[0].evacuation_capacity.sufficient, sufficient);
+        if !sufficient {
+            assert_eq!(before.members[0].evacuation, "cannot_complete_capacity");
+        }
+        pool.evacuate_pass(&tokio_util::sync::CancellationToken::new())
+            .await
+            .unwrap();
+        let after = pool.status().await.unwrap();
+        assert_eq!(after.mapped_objects, before.mapped_objects);
+        assert_eq!(after.members[0].safe_to_remove, sufficient);
+        assert!(!after.members[0].safe_to_pull_with_known_loss);
+        if !sufficient {
+            assert!(!after.members[0].evacuation_capacity.sufficient);
+            assert_eq!(after.members[0].evacuation, "cannot_complete_capacity");
+        }
+    }
+}
+
+#[tokio::test]
+async fn evacuation_capacity_does_not_place_an_active_reserved_segment_twice() {
+    let f = Fixture::new(8);
+    let pool = f.initialize().await;
+    create(&pool, &segment(3010), b"12345678").await;
+    pool.quarantine("hdd-a", "media failure").await.unwrap();
+    f.second.control.gate_payload_len.store(8, Ordering::SeqCst);
+    let evacuating = pool.clone();
+    let task = tokio::spawn(async move {
+        evacuating
+            .evacuate_pass(&tokio_util::sync::CancellationToken::new())
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), f.second.control.entered.notified())
+        .await
+        .unwrap();
+    let running = pool.status().await.unwrap();
+    f.second.control.release.notify_one();
+    task.await.unwrap().unwrap();
+    let source = &running.members[0];
+    assert_eq!(source.evacuation, "running");
+    assert_eq!(source.evacuation_capacity.required_bytes, 0);
+    assert_eq!(source.evacuation_capacity.reserved_destination_bytes, 8);
+    assert_eq!(source.evacuation_capacity.available_bytes, 0);
+    assert!(source.evacuation_capacity.sufficient);
+}
+
+#[tokio::test]
 async fn physical_root_capacity_gate_observes_real_filesystem_reserve() {
     let root = tempfile::tempdir().unwrap();
     for name in ["authority", "hdd-a", "hdd-b"] {

@@ -107,6 +107,7 @@ pub struct EvacuationCapacity {
     pub reserved_destination_bytes: u64,
     /// Healthy capacity, counting each underlying filesystem only once.
     pub available_bytes: u64,
+    /// The byte budget and recovery's whole-segment placement plan both fit.
     pub sufficient: bool,
     pub unavailable_members: Vec<String>,
 }

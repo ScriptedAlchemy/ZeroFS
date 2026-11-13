@@ -1211,7 +1211,19 @@ impl Catalog {
                 evacuation,
             });
         }
-        super::capacity::assess(order, &mut members);
+        let mut evacuation_segments = BTreeMap::<String, Vec<u64>>::new();
+        for placement in &quarantined_leftovers {
+            if !evacuation_reservations
+                .get(&placement.member_id)
+                .is_some_and(|reserved| reserved.contains_key(placement.location.as_ref()))
+            {
+                evacuation_segments
+                    .entry(placement.member_id.clone())
+                    .or_default()
+                    .push(placement.size);
+            }
+        }
+        super::capacity::assess(order, &mut members, &evacuation_segments);
         let multiple_failures = members
             .iter()
             .filter(|member| {
