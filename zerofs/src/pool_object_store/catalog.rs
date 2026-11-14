@@ -1112,6 +1112,18 @@ impl Catalog {
                 *garbage_counts.entry(member.into()).or_default() += 1;
             }
         }
+        let mut evacuation_segments = BTreeMap::<String, Vec<u64>>::new();
+        for placement in &quarantined_leftovers {
+            if !evacuation_reservations
+                .get(&placement.member_id)
+                .is_some_and(|reserved| reserved.contains_key(placement.location.as_ref()))
+            {
+                evacuation_segments
+                    .entry(placement.member_id.clone())
+                    .or_default()
+                    .push(placement.size);
+            }
+        }
         let table = tx.open_table(MEMBERS)?;
         let mut members = Vec::new();
         for member in order {
@@ -1193,7 +1205,10 @@ impl Catalog {
                 objects,
                 evacuation_capacity: EvacuationCapacity {
                     required_bytes: if health.quarantine.is_some() {
-                        record.used.saturating_sub(reserved_destination_bytes)
+                        evacuation_segments
+                            .get(&record.id)
+                            .map(|sizes| sizes.iter().fold(0_u64, |sum, s| sum.saturating_add(*s)))
+                            .unwrap_or(0)
                     } else {
                         0
                     },
@@ -1210,18 +1225,6 @@ impl Catalog {
                 cleanup_debts,
                 evacuation,
             });
-        }
-        let mut evacuation_segments = BTreeMap::<String, Vec<u64>>::new();
-        for placement in &quarantined_leftovers {
-            if !evacuation_reservations
-                .get(&placement.member_id)
-                .is_some_and(|reserved| reserved.contains_key(placement.location.as_ref()))
-            {
-                evacuation_segments
-                    .entry(placement.member_id.clone())
-                    .or_default()
-                    .push(placement.size);
-            }
         }
         super::capacity::assess(order, &mut members, &evacuation_segments);
         let multiple_failures = members
