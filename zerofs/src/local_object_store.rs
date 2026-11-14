@@ -20,6 +20,8 @@
 //! pool starvation. File publication and ETag generation remain the upstream
 //! implementation, preserving the existing on-disk layout and read semantics.
 
+pub(crate) mod pool;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use fs4::fs_std::FileExt;
@@ -166,8 +168,18 @@ impl ObjectStore for LocalConditionalStore {
         let location = location.clone();
         let inner = self.inner.clone();
         run_local(move || {
-            let _locks = lock_parents(&[path])?;
-            if let PutMode::Update(expected) = &opts.mode {
+            let _locks = lock_parents(std::slice::from_ref(&path))?;
+            if opts.extensions.get::<pool::PoolObjectCreate>().is_some() {
+                if !matches!(opts.mode, PutMode::Create) {
+                    return Err(generic("pool native writes must be create-only"));
+                }
+                // Pool generations are fresh UUID keys with one native PUT.
+                // Check under the shared mutation lock, then use upstream's
+                // fsynced rename. Its Create hard-link path ignores staging
+                // unlink errors and does not sync that unlink before returning.
+                pool::ensure_fresh(&path, &location)?;
+                opts.mode = PutMode::Overwrite;
+            } else if let PutMode::Update(expected) = &opts.mode {
                 let actual = match futures::executor::block_on(inner.head(&location)) {
                     Ok(meta) => meta,
                     Err(Error::NotFound { .. }) => {

@@ -59,9 +59,17 @@ jobs:
       - name: Build
         run: cargo build --verbose
       - name: Exercise local storage pooling over 9P
-        run: python3 ../scripts/test-local-storage-pool.py --binary target/debug/zerofs
+        run: |
+          set -euo pipefail
+          python3 ../scripts/test-local-storage-pool.py --binary target/debug/zerofs --receipt target/local-storage-pool.json 2>&1 | tee target/local-storage-pool.log
       - name: Run tests
-        run: cargo test --verbose
+        run: |
+          set -euo pipefail
+          cargo test --verbose 2>&1 | tee target/unit-tests.log
+      - name: Record pool-backed NFS and NBD acceptance evidence
+        run: |
+          set -euo pipefail
+          cargo test --locked --lib pool_export_tests::pool_exports_nfs_and_nbd_survive_locator_evacuation_and_cold_reopen -- --exact --nocapture | tee target/pool-exports.log
       - name: Run deterministic simulation tests
         run: RUSTFLAGS="$DST_RUSTFLAGS" cargo test --test dst --verbose
       - name: Run zerofs-client crate tests (incl. doctests, all features)
@@ -101,3 +109,27 @@ jobs:
         run: |
           cargo test --features failpoints --test failpoints --verbose
           RUSTFLAGS="$DST_RUSTFLAGS" cargo test --features failpoints --test dst crash_points --verbose
+      # Keep fault injection in this test-only job, after the ordinary binary
+      # checks. Shared CI artifacts and release builds never enable these hooks.
+      - name: Build disk-health acceptance test binary
+        run: cargo build --locked --bin zerofs --features disk-health-test-hooks --verbose
+      - name: Exercise disk-health recovery over 9P
+        # Four SMART cases and two loss cases each have a 300-second budget.
+        # Leave room for all six cases and their bounded server cleanup.
+        timeout-minutes: 35
+        run: |
+          set -euo pipefail
+          python3 ../scripts/test-local-storage-pool.py --binary target/debug/zerofs --health-recovery --receipt target/physical-disk-health.json 2>&1 | tee target/physical-disk-health.log
+      - name: Retain physical disk acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: physical-disk-acceptance
+          path: |
+            zerofs/target/local-storage-pool.json
+            zerofs/target/local-storage-pool.log
+            zerofs/target/physical-disk-health.json
+            zerofs/target/physical-disk-health.log
+            zerofs/target/pool-exports.log
+            zerofs/target/unit-tests.log
+          if-no-files-found: error

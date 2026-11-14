@@ -153,6 +153,8 @@ pub struct WriteCoordinator {
     /// pre-write value while the batch is still in flight.
     inode_store: InodeStore,
     #[cfg(test)]
+    worker: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    #[cfg(test)]
     apply_probe: Arc<std::sync::Mutex<Option<oneshot::Sender<()>>>>,
     /// Size of every drained commit batch, in apply order.
     #[cfg(test)]
@@ -240,10 +242,14 @@ impl WriteCoordinator {
             #[cfg(test)]
             stage_nanos: Arc::clone(&stage_nanos),
         };
-        spawn_named("commit-worker", worker_loop(ctx, receiver, initial_counter));
+        let worker = spawn_named("commit-worker", worker_loop(ctx, receiver, initial_counter));
+        #[cfg(not(test))]
+        drop(worker);
         Self {
             sender,
             inode_store: submit_inode_store,
+            #[cfg(test)]
+            worker: Arc::new(std::sync::Mutex::new(Some(worker))),
             #[cfg(test)]
             apply_probe,
             #[cfg(test)]
@@ -329,6 +335,17 @@ impl WriteCoordinator {
             .send(Request::Barrier(reply_tx))
             .map_err(|_| FsError::IoError)?;
         reply_rx.await.map_err(|_| FsError::IoError)?
+    }
+
+    /// Capture completion without retaining a sender or database handle, so a
+    /// cold-reopen test can drop all coordinators before joining the worker.
+    #[cfg(test)]
+    pub(crate) fn take_worker_for_tests(&self) -> tokio::task::JoinHandle<()> {
+        self.worker
+            .lock()
+            .expect("write coordinator worker handle poisoned")
+            .take()
+            .expect("write coordinator worker join handle already taken")
     }
 
     /// Notify a test immediately before the next non-empty batch waits for its

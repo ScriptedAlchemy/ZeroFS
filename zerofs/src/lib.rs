@@ -29,6 +29,8 @@ mod ninep;
 pub mod object_store_prefetch;
 pub mod object_trace;
 mod parse_object_store;
+#[cfg(test)]
+mod pool_export_tests;
 mod pool_object_store;
 mod prometheus;
 mod redis_conditional_store;
