@@ -2779,3 +2779,31 @@ async fn disk_health_debt_retry_rechecks_owner_after_key_lock() {
     assert_eq!(usage(&pool, "hdd-a").await.1, 0);
     assert!(!pool.inner.safety_failure.is_cancelled());
 }
+
+#[tokio::test]
+async fn evacuation_capacity_ignores_already_moved_bodies_awaiting_source_cleanup() {
+    let f = Fixture::new(16);
+    let pool = f.initialize().await;
+    let (moved, remaining) = (segment(3101), segment(3102));
+    create(&pool, &moved, b"12345678").await;
+    create(&pool, &remaining, b"abcdefgh").await;
+    pool.quarantine("hdd-a", "media failure").await.unwrap();
+    f.first.control.fail_deletes.store(true, Ordering::SeqCst);
+    pool.migrate(&moved, "hdd-b").await.unwrap();
+
+    let status = pool.status().await.unwrap();
+    assert_eq!(status.members[0].objects, 1);
+    assert_eq!(status.members[0].cleanup_debts, 1);
+    assert_eq!(status.members[0].used_bytes, 16);
+    assert_eq!(status.members[1].available_bytes, 8);
+    assert_eq!(status.members[0].evacuation_capacity.required_bytes, 8);
+    assert!(status.members[0].evacuation_capacity.sufficient);
+    assert_ne!(status.members[0].evacuation, "cannot_complete_capacity");
+
+    pool.evacuate_pass(&tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    let status = pool.status().await.unwrap();
+    assert_eq!(status.members[0].objects, 0);
+    assert_eq!(status.members[1].objects, 2);
+}
