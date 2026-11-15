@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -99,6 +100,14 @@ def require(condition: bool, message: str) -> None:
 
 def tail(text: str, limit: int = 6000) -> str:
     return text[-limit:]
+
+
+def file_sha256(path: Path) -> str:
+    with path.open("rb") as source:
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def time_left(deadline: float, maximum: float) -> float:
@@ -435,7 +444,70 @@ def health_smoke(binary: Path, root: Path) -> dict:
         require(status["members"][0]["health"]["quarantine"] is not None, "restart lost quarantine")
         report = command_json(binary, deadline, "pool", "affected", "--endpoint", endpoint, "--member", "disk1")
         require(report["complete"], f"affected report incomplete: {report}")
-    return {"result": "passed", "sha256": expected, "automatic_evacuation": True, "cold_restart": True}
+    return {"result": "passed", "sha256": expected, "automatic_evacuation": True, "cold_restart": True,
+            "signal_scope": "injected pending-sector SMART sample; no hardware qualification"}
+
+
+def verify_loss_status(status: dict, original: dict, missing_key: str, missing_size: int,
+                       *, no_space: bool, phase: str, expected_fault=None) -> tuple:
+    """Recheck loss readiness with the status fields available on this branch."""
+    members = status_members(status)
+    source, target = members["disk1"], members["disk2"]
+    require(source["health"]["quarantine"] is not None, f"{phase}: restart lost quarantine")
+    require(not source["safe_to_remove"], f"{phase}: loss was marked safe to remove")
+    require(source["safe_to_pull_with_known_loss"] == (not no_space),
+            f"{phase}: known-loss readiness does not match remaining readable data")
+    require(source["readable_evacuated"] == (not no_space),
+            f"{phase}: readable evacuation does not match remaining source data")
+    expected_state = "blocked_capacity_or_admission" if no_space else "readable_evacuated_loss_blocked"
+    require(source["evacuation"] == expected_state,
+            f"{phase}: expected {expected_state}, got {source['evacuation']}")
+    require(len(status["unreadable"]) == 1 and source["unreadable_objects"] == 1,
+            f"{phase}: loss report does not contain exactly one unreadable body")
+    fault = status["unreadable"][0]
+    identity = (fault["location"], fault["member_id"], fault["physical_key"])
+    require(identity[1:] == ("disk1", missing_key), f"{phase}: unreadable report names another body")
+    if expected_fault is not None:
+        require(identity == expected_fault, f"{phase}: restart changed the unreadable segment identity")
+    damaged = [entry for entry in original["placements"]
+               if entry["location"] == fault["location"] and entry["member_id"] == "disk1"]
+    require(len(damaged) == 1 and damaged[0]["size"] == missing_size,
+            f"{phase}: unreadable body does not match its original placement and size")
+    expected_leftovers = ([entry for entry in original["placements"] if entry["member_id"] == "disk1"]
+                          if no_space else damaged)
+    signature = lambda entries: sorted((entry["location"], entry["member_id"], entry["size"])
+                                       for entry in entries)
+    require(signature(status["quarantined_leftovers"]) == signature(expected_leftovers),
+            f"{phase}: remaining quarantined segment identities or bytes changed")
+    require(source["objects"] == len(expected_leftovers)
+            and source["used_bytes"] == sum(entry["size"] for entry in expected_leftovers),
+            f"{phase}: remaining source counts or bytes hide unexplained data")
+    require(status["mapped_objects"] == original["status"]["mapped_objects"],
+            f"{phase}: loss recovery changed the mapped object count")
+    if no_space:
+        before = next(member for member in original["status"]["members"] if member["id"] == "disk1")
+        require(source["objects"] == before["objects"] and source["used_bytes"] == before["used_bytes"],
+                f"{phase}: no-space recovery lost source placements or bytes")
+        require(target["capacity_bytes"] == 8 and target["objects"] == 0 and target["used_bytes"] == 0,
+                f"{phase}: no-space destination changed quota or retained copied data")
+    return identity
+
+
+def wait_loss_status(binary: Path, deadline: float, endpoint: str, original: dict,
+                     missing_key: str, missing_size: int, *, no_space: bool, phase: str,
+                     expected_fault=None) -> dict:
+    while True:
+        status = command_json(binary, deadline, "pool", "status", "--endpoint", endpoint)
+        source = next(member for member in status["members"] if member["id"] == "disk1")
+        settled = (status["pending_operations"] == 0 and bool(status["unreadable"])
+                   and (source["evacuation"] == "blocked_capacity_or_admission" if no_space
+                        else source["safe_to_pull_with_known_loss"]))
+        if settled:
+            verify_loss_status(status, original, missing_key, missing_size, no_space=no_space,
+                               phase=phase, expected_fault=expected_fault)
+            return status
+        require(time.monotonic() < deadline, f"{phase}: partial-loss recovery timed out: {status}")
+        time.sleep(0.1)
 
 
 def loss_smoke(binary: Path, root: Path, no_space: bool = False) -> dict:
@@ -461,6 +533,11 @@ def loss_smoke(binary: Path, root: Path, no_space: bool = False) -> dict:
                 missing_body = max(bodies, key=lambda p: p.stat().st_size)
         command(binary, deadline, "checkpoint", "create", "--config", config, "before-loss")
     require(missing_body is not None, "missing source fixture")
+    original = {"status": command_json(binary, deadline, "pool", "status", "--config", config),
+                "placements": command_json(binary, deadline, "pool", "list", "--config", config)}
+    status_members(original["status"])
+    missing_key = missing_body.relative_to(root / "disk1").as_posix()
+    missing_size = missing_body.stat().st_size
     missing_body.unlink()
     events.write_text(json.dumps({"disk1": {"device": "fixture", "pending": 1, "reallocated": 0, "uncorrectable": 0, "crc": 0, "failed": False}}))
     shutil.rmtree(root / "cache")
@@ -470,44 +547,70 @@ def loss_smoke(binary: Path, root: Path, no_space: bool = False) -> dict:
         if no_space:
             failed_read = subprocess.run([str(binary), "download", server.target, "/first.bin", str(root / "first-failed-read"), "--jobs", "1"], capture_output=True, timeout=time_left(deadline, COMMAND_TIMEOUT_SECONDS))
             require(failed_read.returncode != 0, "missing body unexpectedly readable")
-        while True:
-            status = command_json(binary, deadline, "pool", "status", "--endpoint", endpoint)
-            if no_space and status["unreadable"]:
-                require(not status["members"][0]["readable_evacuated"], "no-space recovery claimed readable data evacuated")
-                require(status["members"][0]["objects"] >= 2, "no-space recovery lost source placements")
-                break
-            if not no_space and status["members"][0]["safe_to_pull_with_known_loss"]:
-                break
-            require(time.monotonic() < deadline, "partial-loss recovery timed out")
-            time.sleep(0.1)
-        require(not status["members"][0]["safe_to_remove"], "loss was marked safe to remove")
-        require(status["members"][0]["safe_to_pull_with_known_loss"] == (not no_space), "known-loss removal assessment does not match remaining readable data")
-        require(len(status["unreadable"]) >= 1, "missing body has no persistent evidence")
+        settled = wait_loss_status(binary, deadline, endpoint, original, missing_key, missing_size,
+                                   no_space=no_space, phase="initial recovery")
+        fault = settled["unreadable"][0]
+        fault_identity = (fault["location"], fault["member_id"], fault["physical_key"])
         download_and_verify(binary, deadline, server, root, "loss-healthy", {"second.bin": expected["second.bin"]})
         report = command_json(binary, deadline, "pool", "affected", "--endpoint", endpoint, "--member", "disk1")
         require(report["complete"], f"loss report incomplete: {report}")
         refs = [r for v in report["views"] for r in v["references"]]
-        require(any(list(b"/first.bin") in r["paths"] for r in refs), "affected report omitted damaged pathname")
+        require(any(list(b"/first.bin") in r["paths"] and r["inode"] > 0
+                    and fault["location"].endswith("/" + r["segment"]) for r in refs),
+                "affected report omitted the damaged pathname, inode, or segment association")
         require(any("before-loss" in v["view"] and v["references"] for v in report["views"]), "affected report omitted retained checkpoint")
         failed_read = subprocess.run([str(binary), "download", server.target, "/first.bin", str(root / "damaged-download"), "--jobs", "1"], capture_output=True, timeout=time_left(deadline, COMMAND_TIMEOUT_SECONDS))
         require(failed_read.returncode != 0, "damaged file silently read successfully")
+    recovered = command_json(binary, deadline, "pool", "list", "--config", config)
+    if no_space:
+        require(recovered == original["placements"], "insufficient space changed the placement map")
     shutil.rmtree(root / "cache")
     (root / "cache").mkdir(mode=0o700)
     with Server(binary, config, root, "server-loss-restart", deadline) as server:
-        status = command_json(binary, deadline, "pool", "status", "--endpoint", endpoint)
-        require(len(status["unreadable"]) >= 1 and not status["members"][0]["safe_to_remove"], "restart lost loss-blocked status")
+        restarted = wait_loss_status(binary, deadline, endpoint, original, missing_key, missing_size,
+                                     no_space=no_space, phase="cold restart", expected_fault=fault_identity)
         download_and_verify(binary, deadline, server, root, "loss-restart-healthy", {"second.bin": expected["second.bin"]})
-    return {"partial_loss_no_space" if no_space else "partial_loss": True, "healthy_sha256": expected["second.bin"], "checkpoint_affected": True}
+    final = command_json(binary, deadline, "pool", "status", "--config", config)
+    verify_loss_status(final, original, missing_key, missing_size, no_space=no_space,
+                       phase="final snapshot", expected_fault=fault_identity)
+    final_map = command_json(binary, deadline, "pool", "list", "--config", config)
+    require(final_map == recovered, "restart changed recovered placements or sizes")
+    case = "partial_loss_no_space" if no_space else "partial_loss"
+    return {case: True, "healthy_sha256": expected["second.bin"], "checkpoint_affected": True,
+            case + "_evidence": {"before": original, "settled_status": settled, "restart_status": restarted,
+                                 "final_status": final, "final_placements": final_map, "affected": report}}
+
+
+def write_receipt(path: Path, receipt: dict) -> None:
+    """Replace prior results atomically, including on a failed rerun."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=f".{path.name}.", delete=False) as output:
+            temporary = Path(output.name)
+            json.dump(receipt, output, indent=2, sort_keys=True)
+            output.write("\n")
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def run_smoke() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path, help="built ZeroFS executable")
     parser.add_argument("--health-recovery", action="store_true", help="requires a disk-health-test-hooks build")
+    parser.add_argument("--receipt", type=Path, help="write machine-readable evidence to this JSON file")
     arguments = parser.parse_args()
+    provenance = {"started_at": datetime.now(timezone.utc).isoformat(),
+                  "mode": "health_recovery" if arguments.health_recovery else "local_pool"}
     try:
+        if arguments.receipt:
+            write_receipt(arguments.receipt, {"result": "running", **provenance})
         binary = arguments.binary.resolve(strict=True)
         require(binary.is_file() and os.access(binary, os.X_OK), f"binary is not executable: {binary}")
+        provenance["binary_sha256"] = file_sha256(binary)
         with tempfile.TemporaryDirectory(prefix="zpool-") as temporary:
             root = Path(temporary).resolve()
             try:
@@ -527,9 +630,20 @@ def run_smoke() -> int:
                         diagnostic = f"<unable to read log: {error}>"
                     print(f"\n{log.relative_to(root)}:\n{diagnostic}", file=sys.stderr)
                 raise
+        require(file_sha256(binary) == provenance["binary_sha256"], "binary changed while the acceptance suite ran")
+        receipt.update(provenance)
+        receipt["completed_at"] = datetime.now(timezone.utc).isoformat()
+        if arguments.receipt:
+            write_receipt(arguments.receipt, receipt)
         print("LOCAL_STORAGE_POOL_SMOKE " + json.dumps(receipt, sort_keys=True), flush=True)
         return 0
-    except (SmokeFailure, OSError, subprocess.SubprocessError) as error:
+    except (SmokeFailure, OSError, subprocess.SubprocessError, KeyError, TypeError) as error:
+        if arguments.receipt:
+            try:
+                write_receipt(arguments.receipt, {"result": "failed", "error": str(error), **provenance,
+                                                  "completed_at": datetime.now(timezone.utc).isoformat()})
+            except OSError as receipt_error:
+                print(f"could not write failure receipt: {receipt_error}", file=sys.stderr)
         print(f"local storage pool smoke test failed: {error}", file=sys.stderr)
         return 1
 
