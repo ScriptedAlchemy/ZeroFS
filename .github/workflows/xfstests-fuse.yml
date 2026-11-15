@@ -22,6 +22,9 @@ jobs:
       - run: df -h
       - uses: actions/checkout@v4
 
+      - name: Initialize retained evidence
+        run: mkdir -p "$RUNNER_TEMP/zerofs-xfstests-fuse"
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -139,7 +142,7 @@ jobs:
           enabled = false
           EOF
 
-          ./target/ci/zerofs run -c zerofs-test.toml &
+          ./target/ci/zerofs run -c zerofs-test.toml > "$RUNNER_TEMP/zerofs-xfstests-fuse/zerofs-test.log" 2>&1 &
           echo $! > /tmp/zerofs-test.pid
 
           echo "Waiting for ZeroFS TEST instance to start..."
@@ -153,6 +156,7 @@ jobs:
 
           if [ ! -S /tmp/zerofs-test.9p.sock ]; then
             echo "ZeroFS TEST instance failed to start"
+            tail -n 200 "$RUNNER_TEMP/zerofs-xfstests-fuse/zerofs-test.log" || true
             exit 1
           fi
 
@@ -186,7 +190,7 @@ jobs:
           enabled = false
           EOF
 
-          ./target/ci/zerofs run -c zerofs-scratch.toml &
+          ./target/ci/zerofs run -c zerofs-scratch.toml > "$RUNNER_TEMP/zerofs-xfstests-fuse/zerofs-scratch.log" 2>&1 &
           echo $! > /tmp/zerofs-scratch.pid
 
           echo "Waiting for ZeroFS SCRATCH instance to start..."
@@ -200,6 +204,7 @@ jobs:
 
           if [ ! -S /tmp/zerofs-scratch.9p.sock ]; then
             echo "ZeroFS SCRATCH instance failed to start"
+            tail -n 200 "$RUNNER_TEMP/zerofs-xfstests-fuse/zerofs-scratch.log" || true
             exit 1
           fi
 
@@ -293,7 +298,8 @@ jobs:
       - name: Run xfstests
         working-directory: /tmp/xfstests
         run: |
-          sudo ./check -g quick -E excludes
+          set -euo pipefail
+          sudo ./check -g quick -E excludes 2>&1 | tee "$RUNNER_TEMP/zerofs-xfstests-fuse/xfstests.log"
 
       - name: Cleanup
         if: always()
@@ -310,3 +316,72 @@ jobs:
           fi
           pkill -f "zerofs-test.toml" || true
           pkill -f "zerofs-scratch.toml" || true
+
+      - name: Collect xfstests evidence
+        if: always()
+        env:
+          EVIDENCE_JOB_STATUS: ${{ job.status }}
+          EVIDENCE_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/zerofs-xfstests-fuse"
+          mkdir -p "$evidence"
+          checkout_sha=$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD 2>/dev/null || printf unavailable)
+          xfstests_sha=$(git -C /tmp/xfstests rev-parse HEAD 2>/dev/null || printf unavailable)
+          fsverity_path=$(sudo sh -c 'command -v fsverity' 2>/dev/null || printf unavailable)
+          binary_sha256=unavailable
+          binary="$GITHUB_WORKSPACE/zerofs/target/ci/zerofs"
+          if [[ -f "$binary" ]]; then
+            binary_sha256=$(sha256sum "$binary")
+            binary_sha256=${binary_sha256%% *}
+          fi
+          mount_binary_sha256=unavailable
+          if [[ -f /usr/local/bin/zerofs ]]; then
+            mount_binary_sha256=$(sha256sum /usr/local/bin/zerofs)
+            mount_binary_sha256=${mount_binary_sha256%% *}
+          fi
+          {
+            printf 'fixture=xfstests-fuse\nstorage_backend=s3\n'
+            printf 'recorded_at_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            printf 'repository=%s\nworkflow=%s\njob=%s\n' "$GITHUB_REPOSITORY" "$GITHUB_WORKFLOW" "$GITHUB_JOB"
+            printf 'run_url=%s/%s/actions/runs/%s\nrun_attempt=%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'event=%s\nref=%s\ntrigger_sha=%s\n' "$GITHUB_EVENT_NAME" "$GITHUB_REF" "$GITHUB_SHA"
+            printf 'source_head_sha=%s\ncheckout_sha=%s\n' "$EVIDENCE_HEAD_SHA" "$checkout_sha"
+            printf 'binary_artifact=zerofs-ci-bin\nbinary_artifact_run_id=%s\n' "$GITHUB_RUN_ID"
+            printf 'binary_relative_path=zerofs/target/ci/zerofs\nbinary_sha256=%s\n' "$binary_sha256"
+            printf 'mount_binary_path=/usr/local/bin/zerofs\nmount_binary_sha256=%s\n' "$mount_binary_sha256"
+            printf 'xfstests_repository=https://github.com/Barre/xfstests.git\nxfstests_checkout_sha=%s\n' "$xfstests_sha"
+            printf 'fsverity_path=%s\njob_status_before_collection=%s\n' "$fsverity_path" "$EVIDENCE_JOB_STATUS"
+          } > "$evidence/provenance.txt"
+          if [[ -f /tmp/zerofs-mount.log ]]; then
+            sudo cp -a /tmp/zerofs-mount.log "$evidence/"
+            sudo chown "$(id -u):$(id -g)" "$evidence/zerofs-mount.log"
+          fi
+          if [[ -d /tmp/xfstests/results ]]; then
+            sudo cp -a /tmp/xfstests/results "$evidence/"
+            sudo chown -R "$(id -u):$(id -g)" "$evidence/results"
+          elif [[ "$EVIDENCE_JOB_STATUS" == success ]]; then
+            echo "Successful xfstests run is missing /tmp/xfstests/results" >&2
+            exit 1
+          fi
+          if [[ "$EVIDENCE_JOB_STATUS" != success ]]; then
+            if [[ -d "$evidence/results" ]]; then
+              while IFS= read -r -d '' result; do
+                printf '\nFirst 200 lines from %s:\n' "${result#"$evidence/"}"
+                head -n 200 "$result" || true
+              done < <(find "$evidence/results" -type f -name '*.out.bad' -print0 | sort -z)
+            fi
+            for log in "$evidence"/zerofs-*.log; do
+              [[ -f "$log" ]] || continue
+              printf '\nLast server messages from %s:\n' "$(basename "$log")"
+              tail -n 200 "$log" || true
+            done
+          fi
+
+      - name: Upload xfstests evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zerofs-xfstests-fuse
+          path: ${{ runner.temp }}/zerofs-xfstests-fuse
+          if-no-files-found: error

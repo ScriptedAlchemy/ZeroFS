@@ -53,7 +53,7 @@ jobs:
 
       - name: Assert the runner owns a disposable NBD device
         run: |
-          # This is a local CI fixture, not a production block device.
+          # This is a local CI fixture, not a shared block device.
           sudo modprobe nbd
           test -b "$ZEROFS_CI_NBD_DEVICE"
           if sudo nbd-client -c "$ZEROFS_CI_NBD_DEVICE" >/dev/null 2>&1; then

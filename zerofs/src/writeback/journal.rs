@@ -169,9 +169,11 @@ const FENCE_CLASSIFICATION_VERSION: u32 = 2;
 pub struct Journal {
     root: PathBuf,
     root_dir: AnchoredDir,
+    // Fields drop in declaration order: close the database before releasing
+    // the journal's exclusive ownership below.
     database: Database,
     write_gate: JournalWriteGate,
-    _lock_file: File,
+    _lock: JournalLock,
     format_version: u32,
     #[cfg(test)]
     snapshot_calls: AtomicU64,
@@ -181,6 +183,19 @@ pub struct Journal {
     local_commit_error_after_durable: AtomicBool,
     #[cfg(test)]
     remote_mark_pause: Mutex<Option<std::sync::Arc<RemoteMarkPauseInner>>>,
+}
+
+struct JournalLock(File);
+
+impl Drop for JournalLock {
+    fn drop(&mut self) {
+        // CLOEXEC only closes a child's inherited descriptor at exec. Closing
+        // our descriptor alone can leave its flock held across that interval;
+        // explicitly unlock after the owner has finished all journal work.
+        if let Err(error) = FileExt::unlock(&self.0) {
+            tracing::warn!(%error, "failed to release writeback journal lock");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -547,6 +562,7 @@ impl Journal {
         if !FileExt::try_lock_exclusive(&lock_file).context("failed to acquire journal lock")? {
             bail!("writeback journal is already locked by another process");
         }
+        let lock = JournalLock(lock_file);
 
         root_dir.open_or_create_child("blobs".as_ref(), 0o700)?;
         root_dir.open_or_create_child("tmp".as_ref(), 0o700)?;
@@ -571,7 +587,7 @@ impl Journal {
             root_dir,
             database,
             write_gate: JournalWriteGate::default(),
-            _lock_file: lock_file,
+            _lock: lock,
             format_version: expected_identity.format_version,
             #[cfg(test)]
             snapshot_calls: AtomicU64::new(0),
@@ -3887,6 +3903,53 @@ mod tests {
     }
 
     #[test]
+    fn journal_release_does_not_wait_for_inherited_descriptors() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let predecessor = "gc/manifest.boundary";
+        journal
+            .commit_put(put_record(1, predecessor, b"remote"), b"remote")
+            .unwrap();
+        journal.mark_remote(1, None).unwrap();
+        journal
+            .seed_remote_object_etag(predecessor, 1, "reseeded-etag")
+            .unwrap();
+        journal
+            .commit_put(put_record(2, "segments/2", b"pending"), b"pending")
+            .unwrap();
+
+        // A duplicate shares the same open file description as a descriptor
+        // inherited between fork and exec, without timing or child processes.
+        let inherited_lock = journal._lock.0.try_clone().unwrap();
+        let assert_locked = || {
+            let error = Journal::open(&root, identity("bucket-a")).unwrap_err();
+            assert!(format!("{error:#}").contains("already locked"));
+        };
+        assert_locked();
+        drop(journal);
+
+        let reopened = Journal::open_existing(&root)
+            .expect("closed journal must release its lock while an inherited descriptor remains");
+        let snapshot = reopened.snapshot().unwrap();
+        assert_eq!(snapshot.identity, identity("bucket-a"));
+        assert_eq!(snapshot.local_seq, 2);
+        assert_eq!(snapshot.remote_seq, 1);
+        assert_eq!(reopened.read_blob(2).unwrap(), b"pending");
+        assert_eq!(
+            reopened
+                .remote_object_etag(predecessor, 1)
+                .unwrap()
+                .as_deref(),
+            Some("reseeded-etag")
+        );
+        assert_locked();
+        drop(inherited_lock);
+        // The previous generation's descriptor cannot unlock the new owner.
+        assert_locked();
+    }
+
+    #[test]
     fn reopening_with_a_different_identity_fails_closed() {
         let temp = tempfile::tempdir().unwrap();
         drop(open_temp_journal(&temp, "bucket-a"));
@@ -3894,6 +3957,8 @@ mod tests {
         let error = Journal::open(temp.path().join("writeback"), identity("bucket-b")).unwrap_err();
 
         assert!(format!("{error:#}").contains("identity mismatch"));
+        let reopened = open_temp_journal(&temp, "bucket-a");
+        assert_eq!(reopened.snapshot().unwrap().identity, identity("bucket-a"));
     }
 
     #[test]

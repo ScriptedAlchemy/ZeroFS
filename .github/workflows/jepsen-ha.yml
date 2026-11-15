@@ -72,9 +72,9 @@ jobs:
 
       - name: Install guest JDK, Leiningen, and gnuplot
         if: matrix.mount-client == 'native'
+        timeout-minutes: 10
         run: |
-          sudo apt-get update
-          sudo apt-get install -y curl gnuplot openjdk-17-jdk-headless
+          bash "$GITHUB_WORKSPACE/scripts/ci/install-jepsen-native-deps.sh"
           sudo curl -fsSL \
             https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein \
             -o /usr/local/bin/lein
@@ -298,9 +298,9 @@ jobs:
 
       - name: Install guest JDK, Leiningen, and gnuplot
         if: matrix.mount-client == 'native'
+        timeout-minutes: 10
         run: |
-          sudo apt-get update
-          sudo apt-get install -y curl gnuplot openjdk-17-jdk-headless
+          bash "$GITHUB_WORKSPACE/scripts/ci/install-jepsen-native-deps.sh"
           sudo curl -fsSL \
             https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein \
             -o /usr/local/bin/lein
