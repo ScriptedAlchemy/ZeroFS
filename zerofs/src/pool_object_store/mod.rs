@@ -6,6 +6,7 @@
 //! Replacement and migration publish the new location before removing the old
 //! body, and failed cleanup remains charged and recoverable.
 
+mod capacity;
 mod catalog;
 mod health;
 mod recovery;
@@ -33,11 +34,12 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock};
 use uuid::Uuid;
 
+use crate::local_object_store::pool::{GenerationState, PoolObjectCreate};
 use crate::segment::Segid;
 use crate::segment_store::ConditionalMultipartCreate;
 
@@ -93,6 +95,21 @@ pub struct PoolMemberStatus {
     pub pending_uploads: u64,
     pub cleanup_debts: u64,
     pub evacuation: String,
+    /// Allocatable bytes after quota, reservations, and local free-space reserve.
+    pub available_bytes: u64,
+    pub evacuation_capacity: EvacuationCapacity,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct EvacuationCapacity {
+    /// Source bytes that do not already have a reserved healthy destination.
+    pub required_bytes: u64,
+    pub reserved_destination_bytes: u64,
+    /// Healthy capacity, counting each underlying filesystem only once.
+    pub available_bytes: u64,
+    /// The byte budget and recovery's whole-segment placement plan both fit.
+    pub sufficient: bool,
+    pub unavailable_members: Vec<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -111,11 +128,18 @@ pub struct PoolPlacement {
     pub location: Path,
     pub member_id: String,
     pub size: u64,
+    /// Object key relative to the selected member's configured root.
+    pub physical_key: String,
 }
 
 #[derive(Clone)]
 pub struct PoolObjectStore {
     inner: Arc<PoolInner>,
+}
+
+struct MemberActivity {
+    tasks: tokio_util::task::TaskTracker,
+    started: AtomicU64,
 }
 
 struct PoolInner {
@@ -125,8 +149,12 @@ struct PoolInner {
     members: Vec<PoolMember>,
     member_indices: HashMap<String, usize>,
     member_checks: Vec<Mutex<bool>>,
+    // Physical read/copy/cleanup dependencies for each member's pull status.
+    // Process shutdown still uses the global tracker below.
+    member_activity: Vec<MemberActivity>,
     locks: Vec<Arc<RwLock<()>>>,
     migration: Mutex<()>,
+    evacuating: Arc<StdMutex<Option<EvacuationProgress>>>,
     tasks: tokio_util::task::TaskTracker,
     health_changed: tokio::sync::Notify,
     safety_failure: tokio_util::sync::CancellationToken,
@@ -135,6 +163,10 @@ struct PoolInner {
     reserve_pause: StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     #[cfg(test)]
     recovery_pause: StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    #[cfg(test)]
+    verification_pause: StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    #[cfg(test)]
+    status_pause: StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 
 struct OwnedUpload {
@@ -162,6 +194,23 @@ struct ReservedPut {
     preserve: Option<Entry>,
     cancelled: Arc<AtomicBool>,
     verify: bool,
+    automatic: bool,
+}
+
+#[derive(Clone)]
+struct EvacuationProgress {
+    member_id: String,
+    location: String,
+    source_key: String,
+    upload_id: Option<String>,
+}
+
+struct ActiveEvacuation(Arc<StdMutex<Option<EvacuationProgress>>>);
+
+impl Drop for ActiveEvacuation {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap() = None;
+    }
 }
 
 impl PoolMember {
@@ -244,7 +293,9 @@ impl MoveFailure {
     fn destination(error: object_store::Error) -> Self {
         if has_cause::<SourceChecksumMismatch>(&error) {
             Self::Source(error)
-        } else if has_cause::<catalog::AllocationBlocked>(&error) {
+        } else if has_cause::<catalog::AllocationBlocked>(&error)
+            || has_cause::<catalog::AutomaticEvacuationBlocked>(&error)
+        {
             Self::Admission(error)
         } else if has_cause::<CatalogFailure>(&error) {
             Self::Control(error)
@@ -455,9 +506,16 @@ impl PoolObjectStore {
                 authority_prefix,
                 catalog: Arc::new(catalog),
                 member_checks: (0..members.len()).map(|_| Mutex::new(false)).collect(),
+                member_activity: (0..members.len())
+                    .map(|_| MemberActivity {
+                        tasks: tokio_util::task::TaskTracker::new(),
+                        started: AtomicU64::new(0),
+                    })
+                    .collect(),
                 members,
                 member_indices,
                 migration: Mutex::new(()),
+                evacuating: Arc::new(StdMutex::new(None)),
                 tasks: tokio_util::task::TaskTracker::new(),
                 health_changed: tokio::sync::Notify::new(),
                 safety_failure: tokio_util::sync::CancellationToken::new(),
@@ -466,6 +524,10 @@ impl PoolObjectStore {
                 reserve_pause: StdMutex::new(None),
                 #[cfg(test)]
                 recovery_pause: StdMutex::new(None),
+                #[cfg(test)]
+                verification_pause: StdMutex::new(None),
+                #[cfg(test)]
+                status_pause: StdMutex::new(None),
                 locks: (0..KEY_LOCKS).map(|_| Arc::new(RwLock::new(()))).collect(),
             }),
         };
@@ -540,7 +602,10 @@ impl PoolObjectStore {
         {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(issue)) => {
-                if !issue.is::<catalog::NoCapacity>() && !issue.is::<catalog::AllocationBlocked>() {
+                if !issue.is::<catalog::NoCapacity>()
+                    && !issue.is::<catalog::AllocationBlocked>()
+                    && !issue.is::<catalog::AutomaticEvacuationBlocked>()
+                {
                     self.inner.safety_failure.cancel();
                 }
                 Err(permanent(CatalogFailure(issue)))
@@ -589,6 +654,23 @@ impl PoolObjectStore {
                 error(format!(
                     "pool member {id} is absent from this configuration"
                 ))
+            })
+    }
+
+    fn track_member(
+        &self,
+        physical: &Physical,
+    ) -> Option<tokio_util::task::task_tracker::TaskTrackerToken> {
+        physical
+            .member_id()
+            .and_then(|id| self.inner.member_indices.get(id))
+            .map(|&index| {
+                let activity = &self.inner.member_activity[index];
+                // Publish busy before the epoch, and both before any member
+                // work. Status uses that order to cover a whole catalog read.
+                let token = activity.tasks.token();
+                activity.started.fetch_add(1, Ordering::SeqCst);
+                token
             })
     }
 
@@ -781,6 +863,7 @@ impl PoolObjectStore {
             preserve,
             cancelled,
             verify,
+            automatic,
         } = request;
         let outcome = async {
             if u64::try_from(payload.content_length()).ok() != Some(upload.size) {
@@ -806,7 +889,7 @@ impl PoolObjectStore {
                 return Err(permanent(SourceChecksumMismatch));
             }
             let id = upload.id.clone();
-            self.catalog(move |catalog| catalog.mark_started(&id)).await?;
+            self.catalog(move |catalog| catalog.mark_started_for_migration(&id, automatic)).await?;
             #[cfg(test)] crash_cutpoint("after_started");
             options.mode = PutMode::Create;
             let member = self.member(&upload.member_id)?;
@@ -816,6 +899,7 @@ impl PoolObjectStore {
                 // the authoritative catalog and expose the same logical view
                 // before and after moving this object to another member.
                 options.attributes = Attributes::default();
+                options.extensions.insert(PoolObjectCreate);
             }
             let path = Path::from(upload.physical_key.clone());
             let written = member.store.put_opts(&path, payload, options).await?;
@@ -856,7 +940,7 @@ impl PoolObjectStore {
             let member_id = upload.member_id.clone();
             self.catalog(move |c| c.require_eligible(&member_id)).await?;
             self.ensure_member(&upload.member_id, true).await?;
-            let garbage = self.catalog(move |catalog| catalog.publish(&id, &entry, previous.as_ref())).await?;
+            let garbage = self.catalog(move |catalog| catalog.publish_for_migration(&id, &entry, previous.as_ref(), automatic)).await?;
             #[cfg(test)] crash_cutpoint("after_remap");
             #[cfg(test)] if garbage.is_some() { crash_cutpoint("before_source_delete"); }
             if let Some(garbage) = garbage
@@ -898,6 +982,7 @@ impl PoolObjectStore {
             preserve: None,
             cancelled,
             verify: false,
+            automatic: false,
         })
         .await
     }
@@ -969,6 +1054,7 @@ impl PoolObjectStore {
         physical: &Physical,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
+        let activity = self.track_member(physical);
         match physical {
             Physical::Member { member_id, key, .. } => {
                 self.ensure_member(member_id, false).await?;
@@ -992,19 +1078,20 @@ impl PoolObjectStore {
                         let extensions = result.extensions.clone();
                         let pool = self.clone();
                         let member = member_id.clone();
-                        let payload = result
-                            .into_stream()
-                            .then(move |chunk| {
-                                let pool = pool.clone();
-                                let member = member.clone();
-                                async move {
-                                    if let Err(failure) = &chunk {
-                                        pool.observe_io_error(&member, failure).await?;
-                                    }
-                                    chunk
+                        let payload = stream::unfold(
+                            (result.into_stream(), pool, member, activity),
+                            |(mut stream, pool, member, activity)| async move {
+                                let mut chunk = stream.next().await?;
+                                if let Err(failure) = &chunk
+                                    && let Err(observation) =
+                                        pool.observe_io_error(&member, failure).await
+                                {
+                                    chunk = Err(observation);
                                 }
-                            })
-                            .boxed();
+                                Some((chunk, (stream, pool, member, activity)))
+                            },
+                        )
+                        .boxed();
                         Ok(GetResult {
                             payload: GetResultPayload::Stream(payload),
                             meta,
@@ -1146,15 +1233,29 @@ impl PoolObjectStore {
         Ok(())
     }
 
-    async fn remove_physical(&self, physical: &Physical) -> object_store::Result<()> {
+    async fn remove_physical(
+        &self,
+        physical: &Physical,
+        state: GenerationState,
+    ) -> object_store::Result<()> {
         self.validate_physical(physical)?;
+        let activity = self.track_member(physical);
         let result = match physical {
             Physical::Member { member_id, key, .. } => {
                 self.ensure_member(member_id, true).await?;
-                self.member(member_id)?
-                    .store
-                    .delete(&catalog_path(key)?)
-                    .await
+                let member = self.member(member_id)?;
+                if let Some(root) = &member.local_path {
+                    // LocalFileSystem hides `UUID#N` native staging files from
+                    // list/delete. Reclaim this catalog-owned generation under
+                    // the native mutation lock before releasing its debt.
+                    // The native worker owns both tokens through unlink/fsync,
+                    // even if its async caller times out or is cancelled after
+                    // another cleanup already retired this generation's debt.
+                    let ownership = (activity, self.inner.tasks.token());
+                    crate::local_object_store::pool::remove(root, key, state, ownership).await
+                } else {
+                    member.store.delete(&catalog_path(key)?).await
+                }
             }
             Physical::Legacy {
                 key,
@@ -1207,12 +1308,15 @@ impl PoolObjectStore {
             return Ok(());
         };
         if current.started {
-            self.remove_physical(&Physical::Member {
-                member_id: current.member_id,
-                key: current.physical_key,
-                e_tag: None,
-                version: None,
-            })
+            self.remove_physical(
+                &Physical::Member {
+                    member_id: current.member_id,
+                    key: current.physical_key,
+                    e_tag: None,
+                    version: None,
+                },
+                GenerationState::Unpublished,
+            )
             .await?;
         }
         let id = current.id;
@@ -1221,7 +1325,8 @@ impl PoolObjectStore {
     }
 
     async fn cleanup_garbage(&self, garbage: &Garbage) -> object_store::Result<()> {
-        self.remove_physical(&garbage.entry.physical).await?;
+        self.remove_physical(&garbage.entry.physical, GenerationState::Published)
+            .await?;
         #[cfg(test)]
         crash_cutpoint("after_source_delete");
         let id = garbage.id.clone();
@@ -1232,8 +1337,9 @@ impl PoolObjectStore {
     async fn recover_pending(&self) -> object_store::Result<()> {
         let (mut uploads, mut garbage) = self.catalog(Catalog::recovery).await?;
         // Recover local debts first, and bound startup work even when a remote
-        // member has thousands of interrupted operations. A timeout leaves the
-        // durable debt intact; no detached cleanup worker can race later use.
+        // member has thousands of interrupted operations. Started native uploads
+        // keep an owned task through deletion and catalog settlement: a slow
+        // directory scan must not lose its result when the bounded wait expires.
         let is_local = |id: &str| {
             self.member(id)
                 .is_ok_and(|member| member.local_path.is_some())
@@ -1292,7 +1398,45 @@ impl PoolObjectStore {
             }
             let attempt_deadline =
                 deadline.min(tokio::time::Instant::now() + std::time::Duration::from_secs(1));
-            match tokio::time::timeout_at(attempt_deadline, self.cleanup_upload(&upload)).await {
+            let result = if upload.started && is_local(&upload.member_id) {
+                // The key guard plus active-owner recheck above excludes live
+                // publishers. Register this cleanup before moving both guards
+                // into the task, so later passes cannot start duplicate work.
+                self.inner
+                    .active_uploads
+                    .lock()
+                    .unwrap()
+                    .insert(upload.id.clone());
+                let owned = OwnedUpload {
+                    upload: upload.clone(),
+                    active: self.inner.active_uploads.clone(),
+                };
+                let pool = self.clone();
+                let cleaning = self.inner.tasks.spawn(async move {
+                    let guard = _guard;
+                    let interrupted = pool.inner.safety_failure.clone().drop_guard();
+                    let result = pool.cleanup_upload(&owned).await;
+                    if let Err(error) = &result {
+                        tracing::warn!(%error, upload = %owned.id, "owned native cleanup failed; upload and reservation remain recorded");
+                    }
+                    drop(owned);
+                    drop(guard);
+                    interrupted.disarm();
+                    if result.is_ok() {
+                        pool.inner.health_changed.notify_one();
+                    }
+                    result
+                });
+                tokio::time::timeout_at(attempt_deadline, async {
+                    cleaning.await.map_err(|issue| {
+                        error(format!("native pool cleanup task failed: {issue}"))
+                    })?
+                })
+                .await
+            } else {
+                tokio::time::timeout_at(attempt_deadline, self.cleanup_upload(&upload)).await
+            };
+            match result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     unavailable.insert(upload.member_id.clone());
@@ -1344,12 +1488,56 @@ impl PoolObjectStore {
     }
 
     pub async fn status(&self) -> object_store::Result<PoolStatus> {
+        let activity_before: Vec<_> = self
+            .inner
+            .member_activity
+            .iter()
+            .map(|activity| {
+                // Read the epoch before busy here, and in reverse order below.
+                let started = activity.started.load(Ordering::SeqCst);
+                let busy = !activity.tasks.is_empty();
+                (started, busy)
+            })
+            .collect();
         let members = self.inner.members.clone();
+        let evacuating = self.inner.evacuating.lock().unwrap().clone();
+        let snapshot = evacuating.clone();
         let mut status = self
-            .catalog(move |catalog| catalog.status(&members))
+            .catalog(move |catalog| catalog.status(&members, snapshot.as_ref()))
             .await?;
-        if !self.inner.tasks.is_empty() {
-            for member in &mut status.members {
+        #[cfg(test)]
+        {
+            let pause = self.inner.status_pause.lock().unwrap().take();
+            if let Some((entered, resume)) = pause {
+                entered.notify_one();
+                resume.notified().await;
+            }
+        }
+        for member in &mut status.members {
+            if evacuating
+                .as_ref()
+                .is_some_and(|active| active.member_id == member.id)
+                && member.evacuation_capacity.sufficient
+                && matches!(
+                    member.evacuation.as_str(),
+                    "incomplete" | "blocked_destination" | "blocked_capacity_or_admission"
+                )
+            {
+                member.evacuation = "running".into();
+            }
+        }
+        for ((member, activity), (started_before, busy_before)) in status
+            .members
+            .iter_mut()
+            .zip(&self.inner.member_activity)
+            .zip(activity_before)
+        {
+            let busy_after = !activity.tasks.is_empty();
+            let started_after = activity.started.load(Ordering::SeqCst);
+            // A completed verifier can change a known-loss catalog snapshot.
+            // Busy endpoints catch preexisting work; the epoch also catches
+            // work that began and ended entirely during the snapshot read.
+            if busy_before || busy_after || started_before != started_after {
                 member.safe_to_remove = false;
                 member.safe_to_pull_with_known_loss = false;
             }
@@ -1377,6 +1565,7 @@ impl PoolObjectStore {
                 && !snapshot.hidden.contains(meta.location.as_ref())
             {
                 placements.push(PoolPlacement {
+                    physical_key: meta.location.to_string(),
                     location: meta.location,
                     member_id: "authority".to_owned(),
                     size: meta.size,
@@ -1484,6 +1673,28 @@ impl PoolObjectStore {
         target_member_id: &str,
         expected_source: Option<String>,
     ) -> Result<(), MoveFailure> {
+        self.migrate_inner(location, target_member_id, expected_source, false)
+            .await
+            .map(|_| ())
+    }
+
+    async fn migrate_automatic(
+        &self,
+        location: &Path,
+        target_member_id: &str,
+        expected_source: String,
+    ) -> Result<bool, MoveFailure> {
+        self.migrate_inner(location, target_member_id, Some(expected_source), true)
+            .await
+    }
+
+    async fn migrate_inner(
+        &self,
+        location: &Path,
+        target_member_id: &str,
+        expected_source: Option<String>,
+        automatic: bool,
+    ) -> Result<bool, MoveFailure> {
         if !self.segment(location) {
             return Err(unsupported(
                 "only canonical segment objects can be migrated into the pool",
@@ -1499,22 +1710,53 @@ impl PoolObjectStore {
         self.inner
             .tasks
             .spawn(async move {
-                let _migration = pool.inner.migration.lock().await;
-                let _guard = pool.key_lock(&location).write_owned().await;
+                let _migration = if automatic {
+                    let Ok(guard) = pool.inner.migration.try_lock() else {
+                        return Ok(false);
+                    };
+                    guard
+                } else {
+                    pool.inner.migration.lock().await
+                };
+                let _guard = if automatic {
+                    let Ok(guard) = pool.key_lock(&location).try_write_owned() else {
+                        return Ok(false);
+                    };
+                    guard
+                } else {
+                    pool.key_lock(&location).write_owned().await
+                };
                 let previous = match pool.visible(&location).await? {
                     Some(previous) => previous,
-                    None if expected_source.is_some() => return Ok(()),
+                    None if expected_source.is_some() => return Ok(true),
                     None => return Err(missing(&location).into()),
                 };
                 if expected_source
                     .as_ref()
                     .is_some_and(|source| previous.physical.member_id() != Some(source.as_str()))
                 {
-                    return Ok(());
+                    return Ok(true);
                 }
                 if previous.physical.member_id() == Some(target.as_str()) {
-                    return Ok(());
+                    return Ok(true);
                 }
+                // Keep the source dependency across range reads, publication,
+                // and old-body cleanup, not only while a single GET is active.
+                let _source_activity = pool.track_member(&previous.physical);
+                let _active = if automatic {
+                    pool.catalog(Catalog::require_automatic_evacuation)
+                        .await
+                        .map_err(MoveFailure::destination)?;
+                    *pool.inner.evacuating.lock().unwrap() = Some(EvacuationProgress {
+                        member_id: expected_source.clone().expect("automatic source"),
+                        location: location.to_string(),
+                        source_key: previous.physical.key().to_owned(),
+                        upload_id: None,
+                    });
+                    Some(ActiveEvacuation(pool.inner.evacuating.clone()))
+                } else {
+                    None
+                };
                 let upload = pool
                     .reserve(&location, previous.size, Some(target))
                     .await
@@ -1525,6 +1767,9 @@ impl PoolObjectStore {
                             MoveFailure::Control(e)
                         }
                     })?;
+                if automatic && let Some(active) = pool.inner.evacuating.lock().unwrap().as_mut() {
+                    active.upload_id = Some(upload.id.clone());
+                }
                 let (payload, attributes) = match pool.read_payload(&previous).await {
                     Ok(payload) => payload,
                     Err(error) => {
@@ -1545,10 +1790,11 @@ impl PoolObjectStore {
                     preserve: Some(previous),
                     cancelled,
                     verify: true,
+                    automatic,
                 })
                 .await
                 .map_err(MoveFailure::destination)?;
-                Ok(())
+                Ok(true)
             })
             .await
             .map_err(|e| MoveFailure::Control(error(format!("pool migration task failed: {e}"))))?
@@ -2016,6 +2262,7 @@ impl MultipartUpload for PoolMultipartUpload {
                     preserve: None,
                     cancelled,
                     verify: false,
+                    automatic: false,
                 })
                 .await
             })
