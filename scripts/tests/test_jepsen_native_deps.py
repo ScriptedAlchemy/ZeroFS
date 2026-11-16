@@ -105,6 +105,8 @@ if name == "apt-get":
         # Strict refresh must turn that warning into a failure before install.
         if phase == "install" or "APT::Update::Error-Mode=any" in args:
             sys.exit(100)
+if name == "curl" and os.environ.get("FAIL_PHASE") == "download":
+    sys.exit(22)
 ''')
                 tool.chmod(0o755)
             environment = dict(
@@ -142,6 +144,12 @@ if name == "apt-get":
                     self.assertIn(package, packages)
                 self.assertNotIn("gnuplot", packages)
                 self.assertIn("--no-install-recommends", packages)
+                download = commands[2][1]
+                for option in ("--fail", "--retry-all-errors"):
+                    self.assertIn(option, download)
+                for option, value in (("--connect-timeout", "15"), ("--max-time", "60"),
+                                      ("--retry-max-time", "180"), ("--retry", "3")):
+                    self.assertEqual(download[download.index(option) + 1], value)
 
     def test_failed_index_refresh_stops_before_installing_or_downloading_lein(self):
         for step in self.setup_steps():
@@ -156,6 +164,13 @@ if name == "apt-get":
                 result, commands = self.run_setup(step, fail_phase="install")
                 self.assertEqual(result.returncode, 100, result.stderr)
                 self.assertEqual([name for name, _, _ in commands], ["apt-get", "apt-get"])
+
+    def test_failed_launcher_download_stops_before_bootstrap(self):
+        for step in self.setup_steps():
+            with self.subTest(step=step):
+                result, commands = self.run_setup(step, fail_phase="download")
+                self.assertEqual(result.returncode, 22, result.stderr)
+                self.assertEqual([name for name, _, _ in commands], ["apt-get", "apt-get", "curl"])
 
 
 if __name__ == "__main__":
