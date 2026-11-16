@@ -63,6 +63,28 @@ fn linux_plain_tree_is_complete() {
     let visible = platform::trusted_xattr_namespace().visible == Some(true);
     assert_eq!(complete, visible, "{records:#?}");
     assert_eq!(summary(&records)["complete"], visible);
+    let reasons = summary(&records)["unavailable_by_reason"]
+        .as_object()
+        .unwrap();
+    for reason in reasons.keys() {
+        assert!(
+            matches!(
+                reason.as_str(),
+                "not_collected_for_kind"
+                    | "not_requested"
+                    | "not_decoded"
+                    | "not_applicable_on_platform"
+                    | "format_not_supported_by_filesystem"
+            ) || (!visible && reason == "trusted_namespace_not_visible"),
+            "unexpected incomplete field: {reason}; {records:#?}"
+        );
+    }
+    if visible {
+        assert!(!reasons.contains_key("trusted_namespace_not_visible"));
+    } else {
+        // Root, file, directory and symlink each record the missing visibility.
+        assert_eq!(reasons["trusted_namespace_not_visible"], 4);
+    }
     for path in ["", "file", "directory"] {
         assert_eq!(
             entry(&records, path)["platform_flags"]["status"],
@@ -681,14 +703,14 @@ fn review_special_node_metadata() {
 
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires ZEROFS_INVENTORY_BIND_MOUNT_TEST=1 and CAP_SYS_ADMIN in a private mount namespace"]
 fn review_same_device_bind_mount_is_not_traversed() {
     let _guard = FIXTURE_LOCK.lock().unwrap();
-    if std::env::var("ZEROFS_INVENTORY_BIND_MOUNT_TEST").as_deref() != Ok("1") {
-        eprintln!(
-            "SKIP real bind mount fixture; set ZEROFS_INVENTORY_BIND_MOUNT_TEST=1 with CAP_SYS_ADMIN"
-        );
-        return;
-    }
+    assert_eq!(
+        std::env::var("ZEROFS_INVENTORY_BIND_MOUNT_TEST").as_deref(),
+        Ok("1"),
+        "run this fixture with explicit opt-in and CAP_SYS_ADMIN in a private mount namespace"
+    );
     struct Unmount(std::path::PathBuf);
     impl Drop for Unmount {
         fn drop(&mut self) {
@@ -807,7 +829,7 @@ fn collisions_are_emitted_before_directory_entries() {
         .position(|r| r["record"] == "entry" && r["path"]["display"] == "FILE")
         .unwrap();
     assert!(collision < first_child);
-    assert_eq!(records[0]["schema"], 2);
+    assert_eq!(records[0]["schema"], 3);
 }
 
 #[test]

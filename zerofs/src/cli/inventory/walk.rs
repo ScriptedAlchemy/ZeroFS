@@ -78,7 +78,7 @@ pub(super) fn inventory(
         trusted_namespace.scope(),
     );
     output.emit(&Record::Header(Header {
-        schema: 2,
+        schema: 3,
         tool_version: env!("CARGO_PKG_VERSION"),
         collector: std::env::consts::OS,
         root: RawBytes::new(raw),
@@ -206,10 +206,11 @@ impl<W: Write> Walker<'_, W> {
                 DIRECTORY_FLAGS,
                 &mut self.noatime_fallback,
             )),
-            EntryKind::File => Some(openat(
+            EntryKind::File => Some(open_regular_file(
                 parent,
                 name,
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                &before,
+                &entry,
                 &mut self.noatime_fallback,
             )),
             #[cfg(target_os = "macos")]
@@ -240,6 +241,12 @@ impl<W: Write> Walker<'_, W> {
                     None
                 }
             },
+            Some(Err(Errno::STALE)) => {
+                self.changed(&path)?;
+                invalidate_reads(&mut entry, Reason::EntryChanged);
+                self.output.emit(&Record::Entry(Box::new(entry)))?;
+                return Ok(());
+            }
             Some(Err(error)) => {
                 self.open_failed(&mut entry, entry_kind, &path, error)?;
                 None
@@ -436,6 +443,70 @@ fn openat(
     #[cfg(target_os = "macos")]
     let _ = noatime_fallback;
     fs::openat(parent, name, flags, Mode::empty())
+}
+
+fn open_regular_file(
+    parent: BorrowedFd<'_>,
+    name: &OsStr,
+    before: &Stat,
+    entry: &Entry,
+    noatime_fallback: &mut bool,
+) -> Result<OwnedFd, Errno> {
+    #[cfg(target_os = "linux")]
+    {
+        let pinned = pin_regular_file(parent, name, before, entry)?;
+        read_pinned_file(pinned.as_fd(), noatime_fallback)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (before, entry);
+        openat(
+            parent,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            noatime_fallback,
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pin_regular_file(
+    parent: BorrowedFd<'_>,
+    name: &OsStr,
+    before: &Stat,
+    entry: &Entry,
+) -> Result<OwnedFd, Errno> {
+    // O_NONBLOCK does not make opening a device harmless. O_PATH pins the
+    // entry without opening it for I/O, so a swap after stat cannot cause the
+    // collector to open a FIFO or device before discovering its new type.
+    let pinned = fs::openat(
+        parent,
+        name,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let stat = fs::fstat(&pinned)?;
+    if kind(&stat) != EntryKind::File
+        || !same_version(before, &stat)
+        || !same_mount(entry, pinned.as_fd(), OsStr::new(""), &stat)
+    {
+        return Err(Errno::STALE);
+    }
+    Ok(pinned)
+}
+
+#[cfg(target_os = "linux")]
+fn read_pinned_file(pinned: BorrowedFd<'_>, noatime_fallback: &mut bool) -> Result<OwnedFd, Errno> {
+    use rustix::fd::AsRawFd;
+    let path = format!("/proc/self/fd/{}", pinned.as_raw_fd());
+    // Follow only this process's descriptor link, not the mutable source name.
+    // The O_PATH descriptor remains live until the data descriptor is opened.
+    openat(
+        fs::CWD,
+        OsStr::new(&path),
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        noatime_fallback,
+    )
 }
 
 fn names(fd: BorrowedFd<'_>, noatime_fallback: &mut bool) -> Result<Vec<Vec<u8>>, Errno> {
@@ -656,5 +727,69 @@ fn content_hash(fd: BorrowedFd<'_>) -> Field<String> {
         Err(error) => Field::error(Errno::from_raw_os_error(
             error.raw_os_error().unwrap_or(libc::EIO),
         )),
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    fn observed_file(root: &Path) -> (OwnedFd, Stat, Entry) {
+        std::fs::write(root.join("file"), b"original contents").unwrap();
+        let parent = fs::open(root, DIRECTORY_FLAGS, Mode::empty()).unwrap();
+        let before = fs::statat(&parent, "file", AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        let entry = stat_entry(
+            b"file".to_vec(),
+            &before,
+            parent.as_fd(),
+            OsStr::new("file"),
+            Field::Observed(()),
+        );
+        (parent, before, entry)
+    }
+
+    fn replace_with_fifo(root: &Path) {
+        std::fs::rename(root.join("file"), root.join("retained")).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(root.join("file"))
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[test]
+    fn regular_file_replaced_before_pin_is_not_opened_for_io() {
+        let root = tempfile::tempdir().unwrap();
+        let (parent, before, entry) = observed_file(root.path());
+        replace_with_fifo(root.path());
+        let mut noatime_fallback = false;
+        assert_eq!(
+            open_regular_file(
+                parent.as_fd(),
+                OsStr::new("file"),
+                &before,
+                &entry,
+                &mut noatime_fallback,
+            )
+            .unwrap_err(),
+            Errno::STALE
+        );
+    }
+
+    #[test]
+    fn regular_file_replaced_after_pin_opens_the_retained_inode() {
+        let root = tempfile::tempdir().unwrap();
+        let (parent, before, entry) = observed_file(root.path());
+        let pinned = pin_regular_file(parent.as_fd(), OsStr::new("file"), &before, &entry).unwrap();
+        replace_with_fifo(root.path());
+        let mut noatime_fallback = false;
+        let read = read_pinned_file(pinned.as_fd(), &mut noatime_fallback).unwrap();
+        let mut file = std::fs::File::from(read);
+        assert!(file.metadata().unwrap().is_file());
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "original contents");
     }
 }

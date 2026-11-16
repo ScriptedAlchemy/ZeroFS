@@ -4,7 +4,6 @@ on:
   push:
     branches: ["main", "develop"]
   pull_request:
-    branches: ["main", "develop"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -66,6 +65,26 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --verbose 2>&1 | tee target/unit-tests.log
+      - name: Verify inventory mount boundaries and device metadata
+        run: |
+          set -euo pipefail
+          cargo test --locked --lib --no-run --message-format=json > target/inventory-test-build.json
+          test_binary="$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+          artifacts = [json.loads(line) for line in Path("target/inventory-test-build.json").read_text().splitlines()]
+          binaries = [item["executable"] for item in artifacts if item.get("reason") == "compiler-artifact" and item.get("target", {}).get("name") == "zerofs" and item.get("profile", {}).get("test") and item.get("executable")]
+          if len(binaries) != 1:
+              raise SystemExit(f"expected one zerofs library test binary, found {len(binaries)}")
+          print(binaries[0])
+          PY
+          )"
+          # Only the compiled fixture runs with mount privileges. Its private
+          # mount namespace also releases mounts if the test process crashes.
+          sudo env ZEROFS_INVENTORY_BIND_MOUNT_TEST=1 \
+            unshare --mount --propagation private "$test_binary" \
+            --exact cli::inventory::tests::review_same_device_bind_mount_is_not_traversed \
+            --ignored --nocapture 2>&1 | tee target/inventory-mounts.log
       - name: Record pool-backed NFS and NBD acceptance evidence
         run: |
           set -euo pipefail
@@ -132,4 +151,5 @@ jobs:
             zerofs/target/physical-disk-health.log
             zerofs/target/pool-exports.log
             zerofs/target/unit-tests.log
+            zerofs/target/inventory-mounts.log
           if-no-files-found: error

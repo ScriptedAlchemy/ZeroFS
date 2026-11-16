@@ -14,6 +14,7 @@ use crate::fs::tracing::FileOperation;
 use crate::fs::types::AuthContext;
 use crate::fs::{
     EXTENT_SIZE, SMALL_FILE_TOMBSTONE_THRESHOLD, ZeroFS, get_current_time, validate_filename,
+    validate_filename_length,
 };
 use ::tracing::debug;
 use std::sync::atomic::Ordering;
@@ -50,7 +51,71 @@ struct VerifiedRenamePause {
 static VERIFIED_RENAME_PAUSE: std::sync::OnceLock<std::sync::Mutex<Option<VerifiedRenamePause>>> =
     std::sync::OnceLock::new();
 
+fn set_rename_backpointer(inode: &mut Inode, parent: InodeId, name: &[u8]) {
+    match inode {
+        Inode::Directory(d) => {
+            d.parent = parent;
+            d.name = Some(name.to_vec());
+        }
+        Inode::File(f) => {
+            if f.nlink == 1 {
+                f.parent = Some(parent);
+                f.name = Some(name.to_vec());
+            }
+        }
+        Inode::Symlink(s) => {
+            if s.nlink == 1 {
+                s.parent = Some(parent);
+                s.name = Some(name.to_vec());
+            }
+        }
+        Inode::Fifo(s) | Inode::Socket(s) | Inode::CharDevice(s) | Inode::BlockDevice(s) => {
+            if s.nlink == 1 {
+                s.parent = Some(parent);
+                s.name = Some(name.to_vec());
+            }
+        }
+    }
+}
+
 impl ZeroFS {
+    fn record_rename(
+        &self,
+        source_inode: &Inode,
+        trace_old_path: Option<String>,
+        to_dirid: InodeId,
+        to_name: &[u8],
+    ) {
+        match source_inode {
+            Inode::File(_) => {
+                self.stats.files_renamed.fetch_add(1, Ordering::Relaxed);
+            }
+            Inode::Directory(_) => {
+                self.stats
+                    .directories_renamed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Inode::Symlink(_) => {
+                self.stats.links_renamed.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
+        self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+
+        // Emit the rename event with the old and new paths.
+        if let Some(old_path) = trace_old_path {
+            let inode_store = self.inode_store.clone();
+            let tracer = self.tracer.clone();
+            let to_name = String::from_utf8_lossy(to_name).to_string();
+            tokio::spawn(async move {
+                let to_dir_path = inode_store.resolve_path_lossy(to_dirid).await;
+                let new_path = format!("{}/{}", to_dir_path.trim_end_matches('/'), to_name);
+                tracer.emit_with_path(old_path, FileOperation::Rename { new_path });
+            });
+        }
+    }
+
     #[cfg(test)]
     fn pause_verified_rename_after_hash_for_test(
         &self,
@@ -267,7 +332,11 @@ impl ZeroFS {
             return Err(FsError::InvalidArgument);
         }
 
-        validate_filename(from_name)?;
+        validate_filename_length(from_name)?;
+        validate_filename_length(to_name)?;
+        if to_name == b"." || to_name == b".." {
+            return Err(FsError::Exists);
+        }
         validate_filename(to_name)?;
 
         // Replay a completed rename before resolving source and target names.
@@ -281,10 +350,6 @@ impl ZeroFS {
         if from_name == b"." || from_name == b".." {
             return Err(FsError::InvalidArgument);
         }
-        if to_name == b"." || to_name == b".." {
-            return Err(FsError::Exists);
-        }
-
         if verification.is_none() && from_dirid == to_dirid && from_name == to_name {
             // No-op renames still publish a durable replay result.
             if crate::dedup::has_op_id(&op_id) {
@@ -396,7 +461,9 @@ impl ZeroFS {
             Err(FsError::NotFound) => None,
             Err(e) => return Err(e),
         };
-        if !replace_existing && verified_target_entry.is_some() {
+        let same_entry = from_dirid == to_dirid
+            && verified_target_entry == Some((source_inode_id, source_cookie));
+        if !replace_existing && verified_target_entry.is_some() && !same_entry {
             return Err(FsError::Exists);
         }
         if verified_target_entry.map(|(id, _)| id) != target_inode_id {
@@ -446,6 +513,76 @@ impl ZeroFS {
             if creds.uid != 0 && creds.uid != source_uid {
                 return Err(FsError::PermissionDenied);
             }
+        }
+
+        if same_entry && from_name != to_name {
+            let verified_content = if let Some(expected) = verification {
+                let actual = self
+                    .hash_file_canonical_locked(auth, source_inode_id)
+                    .await?;
+                #[cfg(test)]
+                self.pause_verified_rename_after_hash_if_requested(source_inode_id)
+                    .await;
+                if actual.size != expected.size || expected.sha256 != Some(actual.sha256) {
+                    return Ok(Some(VerifiedRenameOutcome::Mismatch(actual)));
+                }
+                Some(actual)
+            } else {
+                None
+            };
+            let old_path = if self.tracer.has_subscribers() {
+                Some(self.inode_store.resolve_path_lossy(source_inode_id).await)
+            } else {
+                None
+            };
+            let (now_sec, now_nsec) = get_current_time();
+            set_rename_backpointer(&mut source_inode, to_dirid, to_name);
+            let (ctime, ctime_nsec) = match &mut source_inode {
+                Inode::Directory(i) => (&mut i.ctime, &mut i.ctime_nsec),
+                Inode::File(i) => (&mut i.ctime, &mut i.ctime_nsec),
+                Inode::Symlink(i) => (&mut i.ctime, &mut i.ctime_nsec),
+                Inode::Fifo(i)
+                | Inode::Socket(i)
+                | Inode::CharDevice(i)
+                | Inode::BlockDevice(i) => (&mut i.ctime, &mut i.ctime_nsec),
+            };
+            *ctime = now_sec;
+            *ctime_nsec = now_nsec;
+            let mut txn = self.db.new_transaction()?;
+            txn.set_dedup_result(op_id, DedupResult::Rename);
+            self.inode_store
+                .save(&mut txn, source_inode_id, &source_inode)?;
+            let embedded =
+                (source_inode.is_directory() || source_inode.nlink() == 1).then_some(&source_inode);
+            self.directory_store.add(
+                &mut txn,
+                to_dirid,
+                to_name,
+                source_inode_id,
+                source_cookie,
+                embedded,
+            );
+            if let Inode::Directory(d) = &mut from_dir {
+                d.mtime = now_sec;
+                d.mtime_nsec = now_nsec;
+                d.ctime = now_sec;
+                d.ctime_nsec = now_nsec;
+            }
+            self.inode_store.save(&mut txn, from_dirid, &from_dir)?;
+            if let Inode::Directory(d) = &from_dir
+                && let Some(name) = &d.name
+            {
+                self.directory_store
+                    .update_inode_in_entry(&mut txn, d.parent, name, from_dirid, &from_dir)
+                    .await?;
+            }
+            #[cfg(feature = "failpoints")]
+            fail_point!(fp::RENAME_AFTER_NEW_ENTRY);
+            self.write_coordinator.commit(txn).await?;
+            #[cfg(feature = "failpoints")]
+            fail_point!(fp::RENAME_AFTER_COMMIT);
+            self.record_rename(&source_inode, old_path, to_dirid, to_name);
+            return Ok(verified_content.map(VerifiedRenameOutcome::Published));
         }
 
         // POSIX specifies that renaming one hard link over another link to the
@@ -722,38 +859,8 @@ impl ZeroFS {
         #[cfg(feature = "failpoints")]
         fail_point!(fp::RENAME_AFTER_SOURCE_UNLINK);
 
-        let dir_changed = from_dirid != to_dirid;
         let (now_sec, now_nsec) = get_current_time();
-        match &mut source_inode {
-            Inode::Directory(d) => {
-                if dir_changed {
-                    d.parent = to_dirid;
-                }
-                d.name = Some(to_name.to_vec());
-            }
-            Inode::File(f) => {
-                if f.nlink == 1 {
-                    f.parent = Some(to_dirid);
-                    f.name = Some(to_name.to_vec());
-                }
-            }
-            Inode::Symlink(s) => {
-                if s.nlink == 1 {
-                    // A symlink that fell from two links to one can still be
-                    // parentless with a reference entry. Renaming that final
-                    // alias embeds it again, even within the same directory,
-                    // so restore both halves of its namespace identity.
-                    s.parent = Some(to_dirid);
-                    s.name = Some(to_name.to_vec());
-                }
-            }
-            Inode::Fifo(s) | Inode::Socket(s) | Inode::CharDevice(s) | Inode::BlockDevice(s) => {
-                if s.nlink == 1 {
-                    s.parent = Some(to_dirid);
-                    s.name = Some(to_name.to_vec());
-                }
-            }
-        }
+        set_rename_backpointer(&mut source_inode, to_dirid, to_name);
 
         let new_cookie = if from_dirid == to_dirid {
             source_cookie
@@ -873,34 +980,7 @@ impl ZeroFS {
         #[cfg(feature = "failpoints")]
         fail_point!(fp::RENAME_AFTER_COMMIT);
 
-        match source_inode {
-            Inode::File(_) => {
-                self.stats.files_renamed.fetch_add(1, Ordering::Relaxed);
-            }
-            Inode::Directory(_) => {
-                self.stats
-                    .directories_renamed
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            Inode::Symlink(_) => {
-                self.stats.links_renamed.fetch_add(1, Ordering::Relaxed);
-            }
-            _ => {}
-        }
-        self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
-        self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
-
-        // Emit rename event with old path and new path
-        if let Some(old_path) = trace_old_path {
-            let inode_store = self.inode_store.clone();
-            let tracer = self.tracer.clone();
-            let to_name = String::from_utf8_lossy(to_name).to_string();
-            tokio::spawn(async move {
-                let to_dir_path = inode_store.resolve_path_lossy(to_dirid).await;
-                let new_path = format!("{}/{}", to_dir_path.trim_end_matches('/'), to_name);
-                tracer.emit_with_path(old_path, FileOperation::Rename { new_path });
-            });
-        }
+        self.record_rename(&source_inode, trace_old_path, to_dirid, to_name);
 
         Ok(verified_content.map(VerifiedRenameOutcome::Published))
     }
@@ -2097,6 +2177,55 @@ mod tests {
         assert_eq!(
             fs.lookup(&test_creds(), 0, b"published").await.unwrap(),
             file
+        );
+    }
+    #[tokio::test]
+    async fn recase_without_replace_and_verified_rename_keep_their_contracts() {
+        use crate::fs::name_mode::NameMode;
+        use crate::fs::name_mode_tests::assert_preserved;
+        use sha2::{Digest, Sha256};
+        let fs = ZeroFS::new_in_memory_with_name_mode(NameMode::Insensitive)
+            .await
+            .unwrap();
+        let creds = test_creds();
+        let auth = AuthContext::from(&creds);
+        let (id, _) = fs
+            .create(&creds, 0, b"Foo", &SetAttributes::default())
+            .await
+            .unwrap();
+        let (_, cookie) = fs.entry_identity(0, b"foo").await.unwrap();
+        let expected = VerifiedFileExpectation {
+            inode: id,
+            entry_cookie: cookie,
+            size: 0,
+            sha256: Some(Sha256::digest([]).into()),
+        };
+        let wrong = VerifiedFileExpectation {
+            size: 1,
+            ..expected
+        };
+        assert!(matches!(
+            fs.rename_verified(&auth, 0, b"Foo", 0, b"foo", wrong)
+                .await
+                .unwrap(),
+            VerifiedRenameOutcome::Mismatch(_)
+        ));
+        assert_preserved(&fs, 0, b"Foo", id).await;
+        fs.rename_noreplace_idempotent(&auth, 0, b"Foo", 0, b"foo", [1; 16])
+            .await
+            .unwrap();
+        assert_preserved(&fs, 0, b"foo", id).await;
+        fs.rename_verified(&auth, 0, b"foo", 0, b"Foo", expected)
+            .await
+            .unwrap();
+        assert_preserved(&fs, 0, b"Foo", id).await;
+        let before = bincode::serialize(&fs.inode_store.get(id).await.unwrap()).unwrap();
+        fs.rename_verified(&auth, 0, b"Foo", 0, b"Foo", expected)
+            .await
+            .unwrap();
+        assert_eq!(
+            bincode::serialize(&fs.inode_store.get(id).await.unwrap()).unwrap(),
+            before
         );
     }
 }

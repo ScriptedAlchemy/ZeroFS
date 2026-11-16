@@ -154,15 +154,23 @@ pub enum ParsedKey {
     Unknown,
 }
 
-/// Per-volume key encoder/decoder. Stateless: every volume uses the segmented
-/// layout, a `b"meta"`/`b"extent"` domain prefix that the slatedb segment
-/// extractor routes on.
+/// Each volume uses segmented keys and its fixed filename lookup rule.
 #[derive(Debug, Clone, Default)]
-pub struct KeyCodec;
+pub struct KeyCodec {
+    name_mode: super::name_mode::NameMode,
+}
 
 impl KeyCodec {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    pub fn with_name_mode(name_mode: super::name_mode::NameMode) -> Self {
+        Self { name_mode }
+    }
+
+    pub(crate) fn name_key<'a>(&self, name: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        self.name_mode.key(name)
     }
 
     /// Number of bytes the domain prefix contributes for `prefix`.
@@ -291,11 +299,12 @@ impl KeyCodec {
     }
 
     pub fn dir_entry_key(&self, dir_id: InodeId, name: &[u8]) -> Bytes {
+        let name = self.name_key(name);
         let mut key =
             Vec::with_capacity(self.id_offset(KeyPrefix::DirEntry) + U64_SIZE + name.len());
         self.push_prefix(&mut key, KeyPrefix::DirEntry);
         key.extend_from_slice(&dir_id.to_be_bytes());
-        key.extend_from_slice(name);
+        key.extend_from_slice(&name);
         Bytes::from(key)
     }
 

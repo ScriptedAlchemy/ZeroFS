@@ -49,6 +49,7 @@ impl ZeroFS {
             segment_codec,
             None,
             crate::config::StoreProfile::default(),
+            crate::fs::name_mode::NameMode::Sensitive,
         )
         .await
     }
@@ -73,11 +74,12 @@ impl ZeroFS {
         segment_warm: Option<crate::segment_store::SegmentWarmHook>,
         // Backend data-plane tuning; `Default` keeps every crate default.
         store_profile: crate::config::StoreProfile,
+        name_mode: crate::fs::name_mode::NameMode,
     ) -> anyhow::Result<Self> {
         // The expiry reaper may already be running from CLI setup.
         dedup.start_expiry_reaper();
         let lock_manager = Arc::new(KeyedLockManager::new());
-        let key_codec = Arc::new(KeyCodec::new());
+        let key_codec = Arc::new(KeyCodec::with_name_mode(name_mode));
         let ha_writer = lease.is_some();
 
         // The data-db `writer_epoch` (monotonic object-store CAS, bumped on every
@@ -239,6 +241,7 @@ impl ZeroFS {
 
         let committed = global_stats.get_totals().0;
         let fs = Self {
+            name_mode,
             db: db.clone(),
             extent_store,
             directory_store,
@@ -434,6 +437,22 @@ impl ZeroFS {
 
     #[cfg(test)]
     pub(crate) async fn new_in_memory_with_sync_writes(sync_writes: bool) -> anyhow::Result<Self> {
+        Self::new_in_memory_with_options(sync_writes, crate::fs::name_mode::NameMode::Sensitive)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn new_in_memory_with_name_mode(
+        mode: crate::fs::name_mode::NameMode,
+    ) -> anyhow::Result<Self> {
+        Self::new_in_memory_with_options(false, mode).await
+    }
+
+    #[cfg(test)]
+    async fn new_in_memory_with_options(
+        sync_writes: bool,
+        mode: crate::fs::name_mode::NameMode,
+    ) -> anyhow::Result<Self> {
         use crate::block_transformer::ZeroFsBlockTransformer;
         use crate::config::CompressionConfig;
         use slatedb::BlockTransformer;
@@ -462,13 +481,22 @@ impl ZeroFS {
             crate::segment::SEGMENT_INFO,
             CompressionConfig::default(),
         );
-        Self::new_with_slatedb(
+        Self::new_with_slatedb_and_lease(
             SlateDbHandle::ReadWrite(slatedb),
             u64::MAX,
             None,
             sync_writes,
+            false,
+            None,
+            None,
+            Arc::new(crate::dedup::DedupCache::new()),
+            None,
+            ObjectTracer::new(),
             object_store,
             segment_codec,
+            None,
+            crate::config::StoreProfile::default(),
+            mode,
         )
         .await
     }

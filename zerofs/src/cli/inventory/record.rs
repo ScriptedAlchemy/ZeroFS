@@ -249,7 +249,7 @@ pub(crate) struct Header {
     pub trusted_xattr_namespace: TrustedXattrNamespace,
     pub mount_boundary_detection: &'static str,
     pub hashing: &'static str,
-    pub collision_rules: [&'static str; 2],
+    pub collision_rules: [&'static str; 3],
     pub atime_notice: &'static str,
     pub noatime_requested: bool,
     pub noatime_fallback: bool,

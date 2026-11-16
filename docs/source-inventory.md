@@ -21,6 +21,16 @@ incomplete and the collector skips its reads and descendants. macOS detects
 different-device mounts through `st_dev`. It cannot identify a mount that keeps
 the same device number. The command is available only on Linux and macOS.
 
+Linux pins a candidate regular file with `O_PATH` before opening it for I/O,
+checks the pinned type, identity, metadata version and mount ID, then opens the
+retained inode through `/proc/self/fd`. A FIFO, symlink or device swapped in
+after the initial stat cannot be opened for data; a swap after pinning cannot
+redirect the descriptor reopen. Missing proc descriptor access makes collection
+incomplete. macOS has no corresponding pin in this collector: it uses a
+no-follow nonblocking open and rejects changed metadata afterward. That detects
+a replacement, but does not guarantee that a concurrently substituted device
+was never opened. Use a stable source or read-only snapshot for macOS collection.
+
 The command does not change modes, ownership, timestamps, ACLs, or xattrs, and it
 does not create files under the source. Reading directory entries or hashing
 contents can update atime under the mount's policy. Linux opens files and
@@ -89,8 +99,8 @@ namespace, which the header states explicitly.
 Linux reads symlink, FIFO, socket, and device xattrs with `llistxattr` and
 `lgetxattr` through `/proc/self/fd/<parent fd>/<name>`. The path stays anchored to the opened parent
 and the calls do not follow the final symlink. The collector checks the entry
-before and after these reads, including its mount ID. It never opens FIFO,
-socket, or device nodes to collect their metadata. A missing or inaccessible
+before and after these reads, including its mount ID. On Linux it never opens
+FIFO, socket, or device nodes for I/O to collect their metadata. A missing or inaccessible
 proc fd anchor produces `proc_fd_unavailable` and makes the inventory incomplete. POSIX ACLs are
 inapplicable to Linux symlinks. The collector still probes their NFSv4 XDR ACLs.
 Other special nodes receive all three Linux ACL probes. macOS FIFO, socket,
@@ -105,21 +115,32 @@ after reading it. A mismatch produces an `entry_changed` record and invalidates
 the fields read through the descriptor. The original stat fields remain the
 pre-open observations.
 
-Schema 2 emits mount boundaries, changed entries, unreadable directories, and
+Schema 3 includes the shared OpenZFS name rule. Like schema 2, it emits mount
+boundaries, changed entries, unreadable directories, and
 name collisions during traversal. A directory's collision records precede its
 children. Hardlink groups follow traversal and precede the final header update,
 summary, and digest. Hardlink groups contain the paths found in the tree and the observed link count. Links outside the tree equal that
 count minus the paths found only when the traversal completed and the link
 observations agree. Otherwise, the outside count remains unavailable.
 
-Collision rules operate on UTF-8 names within each directory. `unicode-canonical`
+The `openzfs-insensitive-unicode-5.0.0` collision rule uses
+`fs::name_mode::fold_name`, the same function as ZeroFS insensitive name lookup.
+It matches the declared source rule (`casesensitivity=insensitive`,
+`normalization=none`, `utf8only=off`): Unicode 5.0.0 simple uppercase with no
+normalization, preserving invalid multi-byte spans exactly as the shared fold
+does. It keeps `ß` distinct from `SS` and composed accents distinct from their
+decomposed forms, but detects `ı`/`I` and collisions containing invalid UTF-8.
+This is source-code equivalence, not evidence from a running OpenZFS dataset.
+
+Two additional diagnostic rules operate on UTF-8 names. `unicode-canonical`
 compares NFC forms with `icu_normalizer`. `unicode-case-fold` compares the full
 Unicode case fold of the NFC forms with `unicase` 2.10 or later. Version 2.9
 reordered three-character folds and failed the ligature regression test.
-These rules do not claim equivalence to Samba or ZFS. They do not include the
-OpenZFS insensitive rule. That rule will use the shared fold function when the
-case-insensitive naming work in PR 78 lands. Non-UTF-8 names retain their exact
-bytes, do not participate in Unicode rules, and increment `non_utf8_names`.
+Those two Unicode rules are advisory and do not establish a collision under the
+source dataset's rule or Samba's matching behavior. Non-UTF-8 names retain their
+exact bytes, participate in the OpenZFS rule only, and increment
+`non_utf8_names`. Use the rule field, not the presence of any collision record,
+when assessing a transfer to an insensitive ZeroFS filesystem.
 
 The summary counts unavailable fields and diagnostic reasons. Intentional
 omissions for an entry kind, fields inapplicable on the platform, an unrequested
@@ -155,6 +176,13 @@ whose atime changes between runs can produce different output.
 
 The macOS collector's tests were last run on macOS before this serialization
 change and are not rerun on the host.
+
+The Linux bind-mount and special-device fixture is explicitly ignored by normal
+unit-test runs. The Rust workflow runs it separately with `--ignored --exact`,
+the opt-in environment variable, and mount privileges in a private mount
+namespace. The step builds as the normal user and elevates only the fixture
+binary, retaining `inventory-mounts.log`. Omitting the opt-in when explicitly
+running the test is an error, not a successful no-op.
 
 - Not verified: TrueNAS and ZFS collection and ACL exposure require runs on those
   platforms. Local fixtures do not establish which ACLs or xattrs a NAS carries,

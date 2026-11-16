@@ -206,6 +206,7 @@ impl Storage {
                     seal_threshold: Some(scale.seal_threshold),
                     ..Default::default()
                 },
+                zerofs::fs::name_mode::NameMode::Sensitive,
             )
             .await
             .expect("zerofs open"),

@@ -225,6 +225,7 @@ struct Fuse9P {
     prefetch: Arc<DashMap<u64, OpenPrefetch>>,
     /// Attribute/entry cache lifetime returned to the kernel.
     ttl: Duration,
+    negative_ttl: Duration,
     /// When true, request the FUSE writeback cache so the kernel buffers writes
     /// and flushes them asynchronously (instead of synchronous write-through).
     writeback: bool,
@@ -510,7 +511,7 @@ async fn resolve_child(
     name: &[u8],
 ) -> Result<(FileAttr, Option<u32>), ClientError> {
     let nf = client.alloc_fid();
-    let stat = match client.walk_getattr(parent_fid, nf, &[name]).await {
+    let stat = match client.walk_getattr_exact(parent_fid, nf, &[name]).await {
         Ok((_qids, stat)) => stat,
         Err(e) => {
             client.free_fid(nf);
@@ -606,6 +607,7 @@ impl Filesystem for Fuse9P {
         let client = Arc::clone(&self.client);
         let inodes = Arc::clone(&self.inodes);
         let ttl = self.ttl;
+        let negative_ttl = self.negative_ttl;
         let identity = UserIdentity::from_request(req);
         let name = name.as_bytes().to_vec();
         let parent = parent.0;
@@ -628,9 +630,9 @@ impl Filesystem for Fuse9P {
                         client.free_fid(fid);
                     }
                 }
-                // Cache misses only in relaxed mode.
-                Err(e) if !ttl.is_zero() && e.to_errno() == libc::ENOENT => {
-                    reply.entry(&ttl, &negative_attr(), Generation(0));
+                // Cache misses only when the negotiated name mode permits it.
+                Err(e) if !negative_ttl.is_zero() && e.to_errno() == libc::ENOENT => {
+                    reply.entry(&negative_ttl, &negative_attr(), Generation(0));
                 }
                 Err(e) => {
                     reply.error(errno(&e));
@@ -1969,6 +1971,11 @@ pub async fn run(target: String, mountpoint: PathBuf, opts: MountOptions) -> Res
     // also forces write-through (the writeback cache delays write visibility) and
     // a zero attribute-cache TTL (every lookup/getattr revalidates).
     let strict = !opts.relaxed_consistency;
+    let negative_ttl = if strict || client.case_insensitive() {
+        Duration::ZERO
+    } else {
+        ATTR_TTL
+    };
     let fs = Fuse9P {
         client,
         rt: Handle::current(),
@@ -1979,6 +1986,7 @@ pub async fn run(target: String, mountpoint: PathBuf, opts: MountOptions) -> Res
         dir_reads_plus: Arc::new(DashMap::new()),
         prefetch: Arc::new(DashMap::new()),
         ttl: if strict { Duration::ZERO } else { ATTR_TTL },
+        negative_ttl,
         writeback: opts.writeback && !strict,
         strict,
     };
