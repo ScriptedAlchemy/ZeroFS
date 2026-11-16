@@ -12,6 +12,28 @@ retention, profile-specific I/O tuning, and metadata survival are not implemente
 here. `[placement]` and `placement_enabled` are rejected as unknown fields.
 Existing first-fit segment placement retains its existing semantics.
 
+## Hardware declarations do not activate a route
+
+Declaring `nvme` neither enables writeback nor establishes that a device is
+suitable for it. The existing `[writeback] enabled` setting selects one global
+journal path. Every enabled acknowledgement mode uses that journal, including
+`remote`. Selective per-workload bypass is unavailable. Future route selection
+must be durable before acknowledgement and remain valid through recovery.
+
+The hardware-aware follow-up must distinguish declared ratings, configured
+workload expectations, measured activity, and unavailable observations. S2 does
+not yet verify device serials, boot-device exclusion, endurance, power-loss
+protection, sustained throughput, or write budgets. Filesystem identity alone
+does not establish those facts. No declaration in this change activates the
+installed Crucial P3. Its proposed role is optional clean read retention, pending
+resolution of the old/untouched-region read anomaly and measured workload benefit.
+Cache fills, promotions, and rebuilds write bytes even though cache hits do not.
+
+Budget pressure must refuse new work before acceptance. It must preserve and
+drain already accepted dirty data under its original durability contract.
+Direct-to-HDD routing is a deliberate policy choice, with backend publication
+semantics. It is not a fallback from an unsatisfied journal policy.
+
 ## Declarations and role bindings
 
 Declare each filesystem once with an ID, its canonical mountpoint, its stable
@@ -96,3 +118,25 @@ do not establish Linux mount, block-device, or OpenZFS runtime behavior. No
 TrueNAS app/container mount visibility, encrypted dataset lifecycle, ACL, SMB,
 hardware durability, or performance acceptance is claimed. Colocating control
 metadata on HDD does not satisfy the separate one-device-loss survival gate.
+
+## Runtime and migration preconditions remain separate
+
+The current startup memory admission adds fixed reserves of 32 GiB and 8 GiB
+before the configured cache and dirty-write budgets. A local run with an explicit
+8 GiB application limit was rejected before storage creation. This is a
+reproduction budget, not a NAS sizing recommendation. The existing unit test
+`small_envelope_does_not_shrink_policy_reserves_into_acceptance` also exercises
+that floor. A passing filesystem preflight cannot make this runtime model fit
+the N5 Air's reported 29.16 GiB of OS-visible RAM.
+
+A future bounded runtime must leave headroom for TrueNAS, ZFS ARC, Plex, and
+other apps, and pass real cgroup-limit, backpressure, OOM-recovery, and dirty-data
+tests. An unlimited local run does not establish deployment readiness. Disposable
+build scratch is a separate volatile use; it changes no persistent fsync promise.
+
+Independent full-copy capacity is currently insufficient. A proposed external
+18 TB drive is not empty or installed and contributes no available capacity.
+Recalculate after the operations-owned transfer finishes, using final inventory,
+engine overhead, other datasets, and reserves. Drive labels use decimal TB;
+`zpool list` and `zfs list` values with a `T` suffix use TiB. Capacity verification
+and all migration safety gates remain required.
