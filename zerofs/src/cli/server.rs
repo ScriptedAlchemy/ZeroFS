@@ -914,7 +914,7 @@ fn parts_engine_knobs(disk_bytes: usize) -> PartsEngineKnobs {
     }
 }
 
-async fn build_parts_hybrid(
+pub(crate) async fn build_parts_hybrid(
     cache_root: &std::path::Path,
     memory_bytes: usize,
     disk_bytes: usize,
