@@ -7656,6 +7656,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "walkdir",
  "zerofs-client",
  "zerofs_nfsserve",
  "zstd",

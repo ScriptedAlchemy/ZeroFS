@@ -50,6 +50,7 @@ pub mod sftp_transport;
 mod storage_backend;
 pub mod storage_class_object_store;
 mod storage_compatibility;
+mod storage_readiness;
 pub(crate) mod task;
 mod telemetry;
 #[cfg(feature = "webui")]

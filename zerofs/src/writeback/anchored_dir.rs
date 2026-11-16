@@ -16,6 +16,11 @@ const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static DIRECTORY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct AnchoredDir {
     fd: Arc<OwnedFd>,
@@ -32,6 +37,12 @@ impl AnchoredDir {
     }
 
     fn walk_absolute(path: &Path, create: bool, mode: u32) -> Result<Self> {
+        let directory = Self::walk_absolute_components(path, create, mode)?;
+        directory.validate_owner_mode(mode)?;
+        Ok(directory)
+    }
+
+    fn walk_absolute_components(path: &Path, create: bool, mode: u32) -> Result<Self> {
         if !path.is_absolute() {
             bail!("anchored directory path must be absolute");
         }
@@ -58,7 +69,6 @@ impl AnchoredDir {
                 }
             }
         }
-        current.validate_owner_mode(mode)?;
         Ok(current)
     }
 
@@ -368,6 +378,8 @@ impl AnchoredDir {
     }
 
     pub(crate) fn for_each_entry(&self, mut visit: impl FnMut(&OsStr) -> Result<()>) -> Result<()> {
+        #[cfg(test)]
+        DIRECTORY_READS.with(|reads| reads.set(reads.get() + 1));
         let scan = openat(self.fd.as_ref(), ".", DIRECTORY_FLAGS, Mode::empty())
             .map_err(anyhow::Error::new)
             .context("open independent anchored directory scan")?;

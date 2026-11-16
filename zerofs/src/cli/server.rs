@@ -790,9 +790,12 @@ fn prune_foyer_partitions(root: &StdPath, capacity: usize) -> Result<FoyerPruneR
     }
 
     let mut partitions = Vec::new();
+    let mut progress =
+        crate::storage_readiness::paths::ScanProgress::new("inspecting cache partitions", root);
     for entry in std::fs::read_dir(root)
         .with_context(|| format!("reading foyer cache directory {}", root.display()))?
     {
+        progress.entry();
         let entry = entry?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
