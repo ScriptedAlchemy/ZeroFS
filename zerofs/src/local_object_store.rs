@@ -317,7 +317,7 @@ impl ObjectStore for LocalConditionalStore {
         let prefix = prefix.cloned();
         futures::stream::once(async move {
             store.check_tree().await?;
-            Ok(store.inner.list(prefix.as_ref()))
+            Ok::<_, Error>(store.inner.list(prefix.as_ref()))
         })
         .try_flatten()
         .boxed()
@@ -336,7 +336,7 @@ impl ObjectStore for LocalConditionalStore {
         let offset = offset.clone();
         futures::stream::once(async move {
             store.check_tree().await?;
-            Ok(store.inner.list_with_offset(prefix.as_ref(), &offset))
+            Ok::<_, Error>(store.inner.list_with_offset(prefix.as_ref(), &offset))
         })
         .try_flatten()
         .boxed()
@@ -585,11 +585,11 @@ mod tests {
         let (directory, store, prefix) = fixture();
         let store = store.with_readiness_root(directory.path().canonicalize().unwrap());
         store
-            .put(&prefix.join("object"), "payload".into())
+            .put(&prefix.clone().join("object"), "payload".into())
             .await
             .unwrap();
         let listing = store.list(Some(&prefix));
-        let offset_listing = store.list_with_offset(Some(&prefix), &prefix.join("a"));
+        let offset_listing = store.list_with_offset(Some(&prefix), &prefix.clone().join("a"));
 
         // Stream construction is lazy. Validate on the worker before any
         // object metadata is emitted, including changes made before polling.
