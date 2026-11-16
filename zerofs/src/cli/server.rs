@@ -2247,6 +2247,40 @@ addresses = ["127.0.0.1:20490"]
     }
 
     #[test]
+    fn startup_memory_admission_charges_shared_only_volatile_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = temp.path().join("backend-must-not-exist");
+        let config = temp.path().join("zerofs.toml");
+        std::fs::write(&config, format!(r#"
+[cache]
+dir = {cache:?}
+disk_size_gb = 1.0
+[runtime]
+memory_limit_gb = 0.25
+[storage]
+url = {storage:?}
+encryption_password = "test"
+[servers.nfs]
+addresses = ["127.0.0.1:20490"]
+[filesystem]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 2.0
+[writeback]
+enabled = true
+dir = {journal:?}
+memory_size_gb = 1.0
+disk_size_gb = 8.0
+min_free_gb = 1.0
+"#, cache = temp.path().join("cache"), journal = temp.path().join("journal"),
+            storage = format!("file://{}", backend.display()))).unwrap();
+        let error = load_and_validate_server_settings(&config).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("2.00 GB volatile writes"), "{message}");
+        assert!(!backend.exists());
+        assert!(!temp.path().join("journal").exists());
+    }
+
+    #[test]
     fn volatile_nbd_ack_rejects_read_only_database_modes() {
         let config = NbdConfig {
             addresses: Some(std::collections::HashSet::new()),
