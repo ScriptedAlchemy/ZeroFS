@@ -37,6 +37,23 @@ pub(crate) struct Checkpoint {
     pub tree_complete: bool,
     pub noatime_fallback: bool,
     pub prefix_sha256: String,
+    pub state_sha256: String,
+}
+
+impl Checkpoint {
+    pub(super) fn state_digest(&self) -> Result<String> {
+        // The prefix digest cannot protect the final checkpoint itself. Cover
+        // every cursor and traversal field before trusting it to skip entries.
+        // The tuple order is part of manifest schema 5.
+        let state = serde_json::to_vec(&(
+            &self.path,
+            &self.ancestors,
+            self.tree_complete,
+            self.noatime_fallback,
+            &self.prefix_sha256,
+        ))?;
+        Ok(super::record::hex(&Sha256::digest(state)))
+    }
 }
 
 pub(super) struct Resume {
@@ -70,6 +87,10 @@ impl Resume {
                 ensure!(
                     checkpoint.prefix_sha256 == super::record::hex(&hash.clone().finalize()),
                     "resume checkpoint digest mismatch"
+                );
+                ensure!(
+                    checkpoint.state_sha256 == checkpoint.state_digest()?,
+                    "resume checkpoint state digest mismatch"
                 );
                 ensure!(
                     checkpoint.ancestors.len() <= 128,

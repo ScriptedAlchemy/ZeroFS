@@ -116,7 +116,7 @@ after reading it. A mismatch produces an `entry_changed` record and invalidates
 the fields read through the descriptor. The original stat fields remain the
 pre-open observations.
 
-Schema 4 emits mount boundaries, changed entries, unreadable directories, and
+Schema 5 emits mount boundaries, changed entries, unreadable directories, and
 name collisions during traversal. A directory's collision records precede its
 children. Each `hardlink_observation` records one non-directory path with more
 than one link, its identity, observed link count, and whether its metadata stayed
@@ -202,14 +202,20 @@ capability visibility, hash request, and pacing option. The scratch location and
 internal sorting cap may change because neither affects output order.
 
 A flushed `directory_complete` record follows each finished directory collection
-attempt, including an attempt that reported an unreadable directory. It contains the SHA-256 of the preceding bytes, active ancestor identities and
-metadata versions, each ancestor's last child cursor, and traversal state. Resume
-validates checkpoint digests, copies the original bytes through the last complete
+attempt, including an attempt that reported an unreadable directory. It contains
+the SHA-256 of the preceding bytes, active ancestor identities and metadata
+versions, each ancestor's last child cursor, and traversal state. Its separate
+`state_sha256` protects the checkpoint state itself, including the prefix digest;
+a prefix-only digest cannot detect a corrupted final cursor that skips remaining
+entries. Resume validates both digests before copying any output, copies the
+original bytes through the last complete
 checkpoint, rebuilds summary counts and the hardlink sorter, and reopens active
 ancestors without following symlinks. A changed ancestor or mount ID stops resume.
 The collector continues after the saved child cursors without recollecting
 completed subtrees. Records after that checkpoint, including a torn final line,
 are discarded. A manifest with no complete directory checkpoint cannot resume.
+Schema 4 manifests lack the checkpoint-state digest and are refused by the header
+version check; collect a new schema 5 manifest instead of resuming them.
 
 The source must remain stable across the interruption. Resume retains earlier
 observations and does not rescan completed subtrees to detect later changes.

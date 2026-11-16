@@ -309,3 +309,50 @@ fn resume_after_interruption_is_byte_exact_and_rejects_mismatches() {
     );
     assert_eq!(fs::read_dir(&work).unwrap().count(), 0);
 }
+
+#[test]
+fn resume_rejects_corrupted_checkpoint_cursor() {
+    let _guard = super::tests::FIXTURE_LOCK.lock().unwrap();
+    let temp = fixture();
+    let root = temp.path().join("root");
+    fs::create_dir(&root).unwrap();
+    for name in ["a", "b", "c"] {
+        fs::create_dir(root.join(name)).unwrap();
+        fs::write(root.join(name).join("file"), b"data").unwrap();
+    }
+    let original = scan(&root, None, None, 1024 * 1024).unwrap();
+    let mut partial = Vec::new();
+    for line in original.split_inclusive(|byte| *byte == b'\n') {
+        let mut record: Value = serde_json::from_slice(line).unwrap();
+        if record["record"] == "directory_complete" {
+            assert_eq!(record["path"]["display"], "a");
+            // Leave the preceding manifest bytes and their digest untouched.
+            // A corrupted cursor must not silently skip the remaining b/c trees.
+            record["ancestors"][0]["last_child"]["hex"] = Value::String("63".into());
+            record["ancestors"][0]["last_child"]["display"] = Value::String("c".into());
+            partial.extend(serde_json::to_vec(&record).unwrap());
+            partial.push(b'\n');
+            break;
+        }
+        partial.extend_from_slice(line);
+    }
+    let resume = temp.path().join("partial.jsonl");
+    fs::write(&resume, partial).unwrap();
+    let mut output = Vec::new();
+    let result = walk::inventory_with_options(
+        &root,
+        false,
+        None,
+        walk::Options {
+            resume_from: Some(&resume),
+            ..Default::default()
+        },
+        &mut output,
+    );
+    let error = result.expect_err("corrupted checkpoint cursor silently skipped remaining entries");
+    assert!(
+        error.to_string().contains("checkpoint state digest"),
+        "{error:#}"
+    );
+    assert!(output.is_empty());
+}

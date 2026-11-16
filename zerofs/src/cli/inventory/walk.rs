@@ -110,7 +110,7 @@ pub(super) fn inventory_with_options(
         trusted_namespace.scope(),
     );
     let header = Record::Header(Header {
-        schema: 4,
+        schema: 5,
         tool_version: env!("CARGO_PKG_VERSION"),
         collector: std::env::consts::OS,
         root: RawBytes::new(raw),
@@ -275,13 +275,15 @@ impl<W: Write> Walker<'_, W> {
         if !matches!(fs::fstat(fd), Ok(after) if version(&after) == frame.version) {
             self.changed(&path)?;
         }
-        let checkpoint = Checkpoint {
+        let mut checkpoint = Checkpoint {
             path: frame.path,
             ancestors: self.frames.clone(),
             tree_complete: self.tree_complete,
             noatime_fallback: self.noatime_fallback,
             prefix_sha256: hex(&self.output.hash.clone().finalize()),
+            state_sha256: String::new(),
         };
+        checkpoint.state_sha256 = checkpoint.state_digest()?;
         self.output.emit(&Record::DirectoryComplete(checkpoint))?;
         // A flushed checkpoint is usable even when the next output write fails.
         self.output.writer.flush()?;

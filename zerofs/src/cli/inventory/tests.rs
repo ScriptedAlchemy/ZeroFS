@@ -846,7 +846,7 @@ fn collisions_are_emitted_before_directory_entries() {
         .position(|r| r["record"] == "entry" && r["path"]["display"] == "FILE")
         .unwrap();
     assert!(collision < first_child);
-    assert_eq!(records[0]["schema"], 4);
+    assert_eq!(records[0]["schema"], 5);
 }
 
 #[test]
