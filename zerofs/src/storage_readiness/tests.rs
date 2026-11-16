@@ -28,6 +28,8 @@ impl Fixture {
         ];
         for path in &paths {
             std::fs::create_dir_all(path).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         let document = json!({
             "cache": { "dir": paths[3], "disk_size_gb": 0.001 },
@@ -587,3 +589,134 @@ fn a_real_open_path_cannot_escape_its_declared_role_or_filesystem() {
 }
 #[path = "device_tests.rs"]
 mod device_tests;
+
+
+#[tokio::test]
+async fn readiness_symlinks_refuse_pool_init_and_server_backend_open_before_writes() {
+    use std::os::unix::fs::symlink;
+    for initialize in [true, false] {
+        for (role, relative) in [
+            ("authority", ".zerofs-pool"),
+            ("member data", ".zerofs-pool"),
+            ("member data", ".zerofs-pool/00000000-0000-0000-0000-000000000001/objects"),
+            ("catalog", "pool.lock"),
+            ("cache", "bucket_fixture/hybrid_cache"),
+            ("cache", "bucket_fixture/parts_cache/foyer-storage-direct-fs-00000000"),
+            ("journal", "bucket_fixture/blobs/00"),
+            ("journal", "bucket_fixture/tmp"),
+        ] {
+            let mut fixture = Fixture::new();
+            fixture.document["storage"]["readiness"]["strict"] = json!(false);
+            let settings = fixture.parse().unwrap();
+            if !initialize {
+                drop(crate::storage_backend::open_pool_storage(&settings, true).await.unwrap());
+            }
+            let child = fixture.path(role).join(relative);
+            if child.is_dir() {
+                std::fs::remove_dir_all(&child).unwrap();
+            } else if child.exists() {
+                std::fs::remove_file(&child).unwrap();
+            }
+            std::fs::create_dir_all(child.parent().unwrap()).unwrap();
+            let outside = fixture._temp.path().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            std::fs::write(outside.join("sentinel"), b"unchanged").unwrap();
+            symlink(&outside, &child).unwrap();
+            let result = if initialize {
+                crate::storage_backend::open_pool_storage(&settings, true).await.map(|_| ())
+            } else {
+                crate::storage_backend::open_storage(&settings).await.map(|_| ())
+            };
+            assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1, "wrote through {role}/{relative}");
+            assert_eq!(std::fs::read(outside.join("sentinel")).unwrap(), b"unchanged");
+            error_contains(result, "symlink");
+            let mut strict_settings = settings.clone();
+            strict_settings.storage.readiness.as_mut().unwrap().strict = true;
+            error_contains(verify_with(&strict_settings, &fixture), "symlink");
+        }
+    }
+}
+
+#[tokio::test]
+async fn readiness_member_payload_write_refuses_a_symlink_added_after_open() {
+    use object_store::{ObjectStoreExt, PutMode, PutOptions};
+    for replace_marker in [true, false] {
+        let mut fixture = Fixture::new();
+        fixture.document["storage"]["readiness"]["strict"] = json!(false);
+        let settings = fixture.parse().unwrap();
+        let (opened, pool) = crate::storage_backend::open_pool_storage(&settings, true).await.unwrap();
+        let pool_id = pool.status().await.unwrap().pool_id;
+        let member = fixture.path("member data");
+        let child = if replace_marker {
+            member.join(".zerofs-pool")
+        } else {
+            member.join(format!(".zerofs-pool/{pool_id}/objects"))
+        };
+        let outside = fixture._temp.path().join("outside");
+        if replace_marker {
+            std::fs::rename(&child, &outside).unwrap();
+        } else {
+            std::fs::create_dir(&outside).unwrap();
+        }
+        std::os::unix::fs::symlink(&outside, &child).unwrap();
+        let mut options = PutOptions::from(PutMode::Create);
+        options.extensions.insert(crate::segment_store::GeneratedSegmentCreate);
+        let key = opened.path.join(crate::segment::Segid::new(97, 1).object_key());
+        let result = opened.store.put_opts(&key, "must stay local".into(), options).await;
+        let objects = if replace_marker { outside.join(format!("{pool_id}/objects")) } else { outside.clone() };
+        assert!(!objects.exists() || std::fs::read_dir(objects).unwrap().count() == 0, "payload reached symlink target");
+        assert!(format!("{:#}", result.unwrap_err()).contains("symlink"));
+    }
+}
+
+#[test]
+fn reserve_above_configured_member_capacity_is_rejected_in_both_strict_modes() {
+    for strict in [true, false] {
+        let mut fixture = Fixture::new();
+        fixture.document["storage"]["readiness"]["strict"] = json!(strict);
+        fixture.document["storage"]["readiness"]["reserves"][0]["bytes"] = json!(10_000_000);
+        fixture.parse().unwrap();
+        fixture.document["storage"]["readiness"]["reserves"][0]["bytes"] = json!(10_000_001);
+        error_contains(fixture.parse().map(|_| ()), "configured member capacity");
+    }
+}
+
+#[test]
+fn reserve_above_observed_size_or_unavailable_size_refuses_strict_open() {
+    struct SizeProvider<'a> { fixture: &'a Fixture, size: Option<u64> }
+    impl IdentityProvider for SizeProvider<'_> {
+        fn observe(&self, path: &Path) -> Result<MountedFilesystem> {
+            self.fixture.observe(path)
+        }
+        fn filesystem_size(&self, _path: &Path) -> Result<u64> {
+            self.size.context("synthetic filesystem size unavailable")
+        }
+
+    }
+    let fixture = Fixture::new();
+    let settings = fixture.parse().unwrap();
+    verify_with(&settings, &SizeProvider { fixture: &fixture, size: Some(1_000_000) }).unwrap();
+    error_contains(verify_with(&settings, &SizeProvider { fixture: &fixture, size: Some(999_999) }), "observed filesystem size");
+    error_contains(verify_with(&settings, &SizeProvider { fixture: &fixture, size: None }), "filesystem size unavailable");
+}
+
+
+#[test]
+fn readiness_refuses_internal_and_dangling_symlinks_below_every_role() {
+    for role in ["authority", "catalog", "member data", "cache", "journal"] {
+        for dangling in [true, false] {
+            let mut fixture = Fixture::new();
+            let root = fixture.path(role);
+            let target = root.join("target");
+            if !dangling {
+                std::fs::create_dir(&target).unwrap();
+            }
+            let link = root.join("child");
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            for strict in [true, false] {
+                fixture.document["storage"]["readiness"]["strict"] = json!(strict);
+                error_contains(fixture.verify(), "symlink");
+            }
+        }
+    }
+}

@@ -19,6 +19,10 @@ use identity::{DeviceObservation, MountedFilesystem, Serial};
 pub(super) trait IdentityProvider {
     fn observe(&self, root: &Path) -> Result<MountedFilesystem>;
 
+    fn filesystem_size(&self, _root: &Path) -> Result<u64> {
+        bail!("filesystem size unavailable from this adapter")
+    }
+
     fn observe_device(&self, _by_id: &Path) -> Result<DeviceObservation> {
         bail!("device identity unavailable from this adapter")
     }
