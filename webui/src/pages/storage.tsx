@@ -146,18 +146,27 @@ function Capacity({ member }: { member: MemberStatus }) {
 
 function HealthSummary({ member }: { member: MemberStatus }) {
   const health = memberHealth(member);
-  // Only a completed observation with nothing in it supports a green "no issues".
+  // Green needs a completed observation, every field reported, and every monitor running.
   const observed = member.observedMs.state === "known";
+  const limited = health.limits.length > 0;
   const unknown = health.unavailable.length > 0 || !observed;
-  const tone = health.issues.length ? "text-destructive" : unknown ? "text-muted" : "text-success";
-  const Icon = health.issues.length ? CircleAlert : unknown ? CircleHelp : CircleCheck;
+  const tone = health.issues.length
+    ? "text-destructive"
+    : limited
+      ? "text-warning"
+      : unknown
+        ? "text-muted"
+        : "text-success";
+  const Icon = health.issues.length || limited ? CircleAlert : unknown ? CircleHelp : CircleCheck;
   const headline = health.issues.length
     ? `${health.issues.length} health ${health.issues.length === 1 ? "issue" : "issues"} reported`
-    : health.unavailable.length
-      ? "Health not fully reported"
-      : observed
-        ? "No health issues reported"
-        : "Health not observed yet";
+    : limited
+      ? "Monitoring is limited"
+      : health.unavailable.length
+        ? "Health not fully reported"
+        : observed
+          ? "No health issues reported"
+          : "Health not observed yet";
   return (
     <div className="space-y-2 text-sm">
       <p className={`flex items-center gap-2 ${tone}`}>
@@ -169,6 +178,14 @@ function HealthSummary({ member }: { member: MemberStatus }) {
           <span className="text-muted">{issue.label}:</span> {issue.text}
         </p>
       ))}
+      {health.limits.map((limit) => (
+        <p key={limit.label} className="pl-6 text-warning">
+          <span className="text-muted">{limit.label}:</span> {limit.text}
+        </p>
+      ))}
+      {member.kernelCoverage.state === "known" && member.kernelCoverage.value !== null && !limited && (
+        <p className="pl-6 text-xs text-muted-foreground">Kernel error coverage: {member.kernelCoverage.value}</p>
+      )}
       {health.unavailable.map((item) => (
         <p key={item.label} className="pl-6 text-xs text-muted-foreground">
           {item.label} unavailable · {item.reason}
@@ -230,6 +247,9 @@ function Member({ member, onScan }: { member: MemberStatus; onScan: (id: string)
             {words}
           </Row>
           <Row label="Readable data evacuated" value={member.readableEvacuated}>
+            {yesNo}
+          </Row>
+          <Row label="Evacuation capacity sufficient" value={member.evacuationCapacitySufficient}>
             {yesNo}
           </Row>
           <Row label="Safe to remove" value={member.safeToRemove}>

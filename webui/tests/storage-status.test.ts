@@ -275,13 +275,17 @@ test("member health separates reported problems from observations the server omi
   const disk = value(value(parsePoolStatus(JSON.stringify(pool))).members)[0];
   assert.deepEqual(memberHealth(disk), {
     issues: [{ label: "Monitoring error", text: "SMART unavailable" }],
-    unavailable: [],
+    limits: [],
+    unavailable: [
+      { label: "Kernel error monitoring", reason: "kernel_coverage was not reported by the server" },
+      { label: "SMART sample", reason: "last_sample was not reported by the server" },
+    ],
   });
   const silent = value(
     value(parsePoolStatus(JSON.stringify({ ...pool, members: [{ ...member, health: undefined }] }))).members,
   )[0];
   assert.equal(memberHealth(silent).issues.length, 0);
-  assert.equal(memberHealth(silent).unavailable.length, 4);
+  assert.equal(memberHealth(silent).unavailable.length, 6);
 });
 
 test("view summary reports one row per pathname with its extent count", async () => {

@@ -55,6 +55,11 @@ export interface MemberStatus {
   monitoringError: Value<string | null>;
   warning: Value<string | null>;
   evacuationError: Value<string | null>;
+  /** Free text from the server's kernel error watcher. Null means it has never reported. */
+  kernelCoverage: Value<string | null>;
+  /** Whether the server holds a SMART sample for this member. */
+  smartSampled: Value<boolean>;
+  evacuationCapacitySufficient: Value<boolean>;
   observedMs: Value<number>;
 }
 
@@ -82,6 +87,17 @@ function member(raw: unknown): Value<MemberStatus> {
     monitoringError: healthText("monitoring_error"),
     warning: healthText("warning"),
     evacuationError: healthText("evacuation_error"),
+    kernelCoverage: healthText("kernel_coverage"),
+    smartSampled: !health
+      ? unavailable("health was not reported")
+      : !("last_sample" in health)
+        ? unavailable("last_sample was not reported by the server")
+        : health.last_sample === null || object(health.last_sample)
+          ? known(health.last_sample !== null)
+          : unavailable("last_sample has an unsupported value"),
+    evacuationCapacitySufficient: object(row.evacuation_capacity)
+      ? field(object(row.evacuation_capacity)!, "sufficient", flag)
+      : unavailable("evacuation_capacity was not reported by the server"),
     observedMs:
       health?.observed_ms === null
         ? unavailable("No health observation has been reported")
@@ -290,14 +306,21 @@ export function capacityBreakdown(member: MemberStatus): Value<CapacityBreakdown
   });
 }
 
+// The kernel watcher reports this text while it is reading the current boot's kernel ring.
+// Any other text means the watcher is missing, behind or broken.
+const KERNEL_WATCHER_RUNNING = "current boot kernel ring";
+
 export interface MemberHealth {
+  /** Problems the server reported. */
   issues: { label: string; text: string }[];
+  /** Monitoring that is not running or has not reported, so "no issues" would overstate what is known. */
+  limits: { label: string; text: string }[];
   unavailable: { label: string; reason: string }[];
 }
 
-/** Sorts the four health observations into reported problems and observations the server did not supply. */
+/** Sorts health observations into reported problems, monitoring limits and fields the server did not supply. */
 export function memberHealth(member: MemberStatus): MemberHealth {
-  const health: MemberHealth = { issues: [], unavailable: [] };
+  const health: MemberHealth = { issues: [], limits: [], unavailable: [] };
   for (const [label, value] of [
     ["Quarantine", member.quarantine],
     ["Monitoring error", member.monitoringError],
@@ -307,6 +330,20 @@ export function memberHealth(member: MemberStatus): MemberHealth {
     if (value.state === "unavailable") health.unavailable.push({ label, reason: value.reason });
     else if (value.value !== null) health.issues.push({ label, text: value.value });
   }
+  const unreadable = member.unreadableObjects;
+  if (unreadable.state === "unavailable")
+    health.unavailable.push({ label: "Unreadable objects", reason: unreadable.reason });
+  else if (unreadable.value > 0)
+    health.issues.push({ label: "Unreadable objects", text: unreadable.value.toLocaleString("en-US") });
+  const kernel = member.kernelCoverage;
+  if (kernel.state === "unavailable")
+    health.unavailable.push({ label: "Kernel error monitoring", reason: kernel.reason });
+  else if (kernel.value === null) health.limits.push({ label: "Kernel error monitoring", text: "has not reported" });
+  else if (!kernel.value.startsWith(KERNEL_WATCHER_RUNNING))
+    health.limits.push({ label: "Kernel error monitoring", text: kernel.value });
+  const smart = member.smartSampled;
+  if (smart.state === "unavailable") health.unavailable.push({ label: "SMART sample", reason: smart.reason });
+  else if (!smart.value) health.limits.push({ label: "SMART", text: "no sample recorded" });
   return health;
 }
 

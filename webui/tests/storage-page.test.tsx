@@ -26,7 +26,16 @@ const member = {
   safe_to_remove: false,
   safe_to_pull_with_known_loss: false,
   readable_evacuated: false,
-  health: { quarantine: null, monitoring_error: null, warning: null, evacuation_error: null, observed_ms: null },
+  health: {
+    quarantine: null,
+    monitoring_error: null,
+    warning: null,
+    evacuation_error: null,
+    kernel_coverage: "current boot kernel ring; unrecognized device/error forms are not attributed",
+    last_sample: { device: "synthetic", failed: false },
+    observed_ms: null,
+  },
+  evacuation_capacity: { sufficient: true },
 };
 const pool = (members: unknown[]) =>
   JSON.stringify({
@@ -271,5 +280,42 @@ describe("Storage page affected-path display", () => {
     await inspect();
     expect(await screen.findByText(/too large to display/)).toBeTruthy();
     expect(screen.queryByText("Scan complete")).toBeNull();
+  });
+});
+
+describe("Storage page monitoring limits", () => {
+  const observed = { ...member.health, observed_ms: 1_800_000_000_000 };
+  async function show(health: Record<string, unknown>, extra: Record<string, unknown> = {}) {
+    cleanup();
+    client.getPoolStatus.mockResolvedValue({ json: pool([{ ...member, ...extra, health }]) });
+    render(<StoragePage />);
+    await screen.findByText("hdd-a");
+  }
+
+  it("never shows the healthy state while a monitor is degraded, silent or unreported", async () => {
+    await show(observed);
+    expect(screen.getByText("No health issues reported")).toBeTruthy();
+    expect(screen.getByText(/^Kernel error coverage: current boot kernel ring/)).toBeTruthy();
+
+    await show({ ...observed, kernel_coverage: "kernel watcher unavailable: Permission denied" });
+    expect(screen.getByText("Monitoring is limited")).toBeTruthy();
+    expect(screen.getByText("kernel watcher unavailable: Permission denied")).toBeTruthy();
+    expect(screen.queryByText("No health issues reported")).toBeNull();
+
+    await show({ ...observed, kernel_coverage: null });
+    expect(screen.getByText("Monitoring is limited")).toBeTruthy();
+    expect(screen.queryByText("No health issues reported")).toBeNull();
+
+    await show(without(observed, "kernel_coverage"));
+    expect(screen.getByText("Health not fully reported")).toBeTruthy();
+    expect(screen.queryByText("No health issues reported")).toBeNull();
+
+    await show({ ...observed, last_sample: null });
+    expect(screen.getByText("Monitoring is limited")).toBeTruthy();
+    expect(screen.getByText("no sample recorded")).toBeTruthy();
+
+    await show(observed, { unreadable_objects: 3 });
+    expect(screen.getByText("1 health issue reported")).toBeTruthy();
+    expect(screen.queryByText("No health issues reported")).toBeNull();
   });
 });
