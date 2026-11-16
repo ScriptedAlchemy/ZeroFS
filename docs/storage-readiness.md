@@ -68,7 +68,8 @@ structural paths, including `.zerofs-pool`, the active pool directory, member
 markers, object directory roots, catalog files, and the active bucket's cache
 and journal directories. It also checks existing cache partitions before the
 cache engine opens them. Their count is bounded by cache configuration.
-Startup does not enumerate authority objects, member payloads, or journal blobs.
+Readiness preflight does not enumerate authority objects, member payloads, or
+journal blobs. Normal storage engine recovery still reads the data it needs.
 Object operations check each existing path component when they use it. Listings
 reject symlinks while walking the requested subtree. Journal blob opens use
 descriptor-anchored no-follow handles. The checks reject symlinks even when
@@ -226,7 +227,7 @@ evidence unavailable in strict mode.
 
 Strict readiness guards against storage that is absent, unmounted, locked,
 read-only, misidentified, or declared wrongly when a command starts. Both strict
-modes reject symlinks present when they check a path. Startup checks fixed
+modes reject symlinks present when they check a path. Startup preflight checks fixed
 structural paths and sets bounded by configuration, such as the active cache
 namespace's partition leaves. It never enumerates a set that grows with stored
 data, such as object files or journal blobs. Per-object operations check
