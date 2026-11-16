@@ -457,6 +457,15 @@ pub(super) struct SealingGeneration {
     _residency: tokio::sync::OwnedSemaphorePermit,
 }
 
+/// What the old-debit lookup in `stage_edits` found for one edited extent.
+struct OldExtent {
+    extent: u64,
+    /// The extent has a key, even if its value does not decode.
+    exists: bool,
+    /// The superseded frame to debit, when the value decodes.
+    debit: Option<(Segid, u32)>,
+}
+
 impl ExtentStore {
     #[inline]
     pub(super) fn open_lane(&self, id: InodeId) -> &OpenLane {
@@ -695,6 +704,13 @@ impl ExtentStore {
         #[cfg(test)]
         let t_old_debit = std::time::Instant::now();
         let mut old_debits: Vec<(Segid, u32)> = Vec::new();
+        // Edited extents below `looked_up_end` that currently have a key. A
+        // hole edit stages a delete only for these, so zeroing a sparse range
+        // writes no deletion markers for extents that were never written.
+        // Edits at or past `looked_up_end` were not looked up and keep their
+        // unconditional delete.
+        let mut existing: HashSet<u64> = HashSet::new();
+        let mut looked_up_end = 0;
         if let (Some(min), Some(max)) = (
             edits.iter().map(|(e, _)| *e).min(),
             edits.iter().map(|(e, _)| *e).max(),
@@ -704,6 +720,7 @@ impl ExtentStore {
             // supersede an old FrameLoc. Keep the unaligned old tail in range,
             // but do not make append-only metadata reads for newer extents.
             let scan_end = max.saturating_add(1).min(old_extent_end);
+            looked_up_end = scan_end;
             #[cfg(test)]
             self.old_extent_scan_ranges
                 .lock()
@@ -720,7 +737,7 @@ impl ExtentStore {
                 // pre-sized sparse file (the NBD stripe-member shape) needs no
                 // metadata I/O, while a range scan pays iterator setup plus
                 // read-ahead in every sorted run even when the range is empty.
-                let found: Vec<Option<(Segid, u32)>> = stream::iter(edited)
+                let found: Vec<OldExtent> = stream::iter(edited)
                     .map(|extent| async move {
                         // Warm path: this store's own committed writes publish
                         // every extent's location, so overwrites of extents it
@@ -734,8 +751,16 @@ impl ExtentStore {
                             .map_err(|_| FsError::IoError)?
                         {
                             return Ok(match cached {
-                                CachedExtentLocation::Hole => None,
-                                CachedExtentLocation::Frame(loc) => Some((loc.segid, loc.byte_len)),
+                                CachedExtentLocation::Hole => OldExtent {
+                                    extent,
+                                    exists: false,
+                                    debit: None,
+                                },
+                                CachedExtentLocation::Frame(loc) => OldExtent {
+                                    extent,
+                                    exists: true,
+                                    debit: Some((loc.segid, loc.byte_len)),
+                                },
                             });
                         }
                         #[cfg(test)]
@@ -747,16 +772,23 @@ impl ExtentStore {
                             .get_bytes(&key)
                             .await
                             .map_err(|_| FsError::IoError)?;
-                        Ok::<_, FsError>(
-                            value
+                        Ok::<_, FsError>(OldExtent {
+                            extent,
+                            exists: value.is_some(),
+                            debit: value
                                 .and_then(|v| FrameLoc::decode(&v))
                                 .map(|loc| (loc.segid, loc.byte_len)),
-                        )
+                        })
                     })
                     .buffer_unordered(PARALLEL_EXTENT_OPS)
                     .try_collect()
                     .await?;
-                old_debits.extend(found.into_iter().flatten());
+                for old in found {
+                    if old.exists {
+                        existing.insert(old.extent);
+                    }
+                    old_debits.extend(old.debit);
+                }
             } else {
                 // Wide candidate sets (bulk hole punches, range deletes) keep
                 // the single range scan: one iterator beats thousands of gets
@@ -774,9 +806,11 @@ impl ExtentStore {
                     let (key, value) = result.map_err(|_| FsError::IoError)?;
                     if let Some(extent_idx) = self.key_codec.parse_extent_key(&key)
                         && edited.contains(&extent_idx)
-                        && let Some(loc) = FrameLoc::decode(&value)
                     {
-                        old_debits.push((loc.segid, loc.byte_len));
+                        existing.insert(extent_idx);
+                        if let Some(loc) = FrameLoc::decode(&value) {
+                            old_debits.push((loc.segid, loc.byte_len));
+                        }
                     }
                 }
             }
@@ -949,7 +983,11 @@ impl ExtentStore {
                     // Credit the frame just appended: both live and total.
                     self.seg_delta(txn, loc.segid, loc.byte_len as i64, loc.byte_len as i64);
                 }
-                None => self.delete(txn, id, *extent),
+                None => {
+                    if *extent >= looked_up_end || existing.contains(extent) {
+                        self.delete(txn, id, *extent);
+                    }
+                }
             }
         }
         debug_assert!(locs.next().is_none());
@@ -2331,6 +2369,66 @@ mod tests {
         let end = (100 + EXTENT_SIZE).min(model.len());
         model[100..end].fill(0);
         assert_read_matches(&store, &model).await;
+    }
+
+    #[tokio::test]
+    async fn zero_range_tombstones_only_existing_extents() {
+        let (store, db) = make().await;
+        let mut model = Vec::new();
+        write_and_check(&store, &db, &mut model, 0, &vec![8u8; 2 * EXTENT_SIZE]).await;
+        let file_size = 1u64 << 40; // a sparse 1 TiB volume
+
+        // Far past the written data, no extent key exists in the range.
+        let mut txn = db.new_transaction().unwrap();
+        store
+            .zero_range(&mut txn, 1, 1 << 30, 1 << 30, file_size)
+            .await
+            .unwrap();
+        let (delete_keys, cache_deletes) = staged_deletes(txn);
+        assert!(
+            delete_keys.is_empty() && cache_deletes.is_empty(),
+            "zeroing unwritten extents staged {} deletes",
+            delete_keys.len()
+        );
+
+        // Covering the two written extents plus a large unwritten tail stages
+        // one delete per existing extent and nothing for the rest.
+        let mut txn = db.new_transaction().unwrap();
+        store
+            .zero_range(&mut txn, 1, 0, 1 << 30, file_size)
+            .await
+            .unwrap();
+        let mut probe = db.new_transaction().unwrap();
+        store
+            .zero_range(&mut probe, 1, 0, 1 << 30, file_size)
+            .await
+            .unwrap();
+        let (delete_keys, _) = staged_deletes(probe);
+        assert_eq!(
+            delete_keys,
+            [0_u64, 1].map(|extent| store.key_codec.extent_key(1, extent)),
+        );
+        commit(&store, txn).await;
+        model.fill(0);
+        assert_read_matches(&store, &model).await;
+    }
+
+    // Few edits take the point-lookup path rather than the range scan. A hole
+    // over an absent extent must not stage a delete on that path either.
+    #[tokio::test]
+    async fn zero_range_point_lookup_path_skips_absent_extents() {
+        let (store, db) = make().await;
+        let mut model = Vec::new();
+        write_and_check(&store, &db, &mut model, 0, &vec![8u8; EXTENT_SIZE]).await;
+        let file_size = 8 * EXTENT_SIZE as u64;
+
+        let mut txn = db.new_transaction().unwrap();
+        store
+            .zero_range(&mut txn, 1, 0, 4 * EXTENT_SIZE as u64, file_size)
+            .await
+            .unwrap();
+        let (delete_keys, _) = staged_deletes(txn);
+        assert_eq!(delete_keys, [store.key_codec.extent_key(1, 0)]);
     }
 
     #[tokio::test]
