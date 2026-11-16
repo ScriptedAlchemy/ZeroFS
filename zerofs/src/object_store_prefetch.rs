@@ -3208,6 +3208,56 @@ mod tests {
         .unwrap()
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parts_cache_written_without_a_tombstone_log_opens_with_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Path::from("segments/upgrade");
+        let generation = CacheGeneration::Versioned {
+            e_tag: Some("upgrade".into()),
+            version: None,
+        };
+        let value = |part: usize| Bytes::from(vec![part as u8; 4096]);
+        // The previous server configuration: the same device and block size,
+        // with no tombstone log partition.
+        let previous = HybridCacheBuilder::new()
+            .with_name("test-previous-parts")
+            .memory(MEM)
+            .with_weighter(|_: &PartKey, v: &Bytes| v.len())
+            .storage()
+            .with_io_engine_config(PsyncIoEngineConfig::new())
+            .with_engine_config(
+                BlockEngineConfig::new(
+                    foyer::DeviceBuilder::build(
+                        FsDeviceBuilder::new(dir.path().join("parts_cache"))
+                            .with_capacity(256 * 1024 * 1024),
+                    )
+                    .unwrap(),
+                )
+                .with_block_size(64 * 1024 * 1024),
+            )
+            .build()
+            .await
+            .unwrap();
+        for part in 0..64 {
+            previous.insert(PartKey::new(&path, 4096, &generation, part), value(part));
+        }
+        previous.close().await.unwrap();
+        drop(previous);
+
+        let upgraded = open_production_parts_cache(dir.path()).await;
+        for part in 0..64 {
+            let key = PartKey::new(&path, 4096, &generation, part);
+            if let Some(entry) = upgraded.get(&key).await.unwrap() {
+                assert_eq!(
+                    entry.value(),
+                    &value(part),
+                    "part {part} recovered wrong bytes"
+                );
+            }
+        }
+        upgraded.close().await.unwrap();
+    }
+
     /// Put a corrupt run on the disk tier only, repair it, then reopen the
     /// cache. Returns the integrity refetches the read after reopening needed.
     async fn repair_a_corrupt_disk_tier_part() -> u64 {
