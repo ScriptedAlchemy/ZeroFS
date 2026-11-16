@@ -1,6 +1,6 @@
 use super::errors::FsError;
-use super::inode::{Inode, InodeAttrs};
-use super::types::AuthContext;
+use super::inode::{DirectoryInode, Inode, InodeAttrs};
+use super::types::{AuthContext, SetGid};
 
 const S_IRUSR: u32 = 0o400;
 const S_IWUSR: u32 = 0o200;
@@ -57,6 +57,30 @@ impl Credentials {
             return true;
         }
         self.groups[..self.groups_count].contains(&gid)
+    }
+}
+
+/// Group for a new entry. An explicit group wins. Otherwise a setgid parent
+/// directory passes on its group, and any other parent leaves the caller's.
+pub(crate) fn new_entry_gid(
+    parent: &DirectoryInode,
+    requested: &SetGid,
+    creds: &Credentials,
+) -> u32 {
+    match requested {
+        SetGid::Set(gid) => *gid,
+        SetGid::NoChange if parent.mode & 0o2000 != 0 => parent.gid,
+        SetGid::NoChange => creds.gid,
+    }
+}
+
+/// Clears the setgid bit on a new non-directory entry unless the caller is
+/// root or a member of the entry's group, as Linux does at creation.
+pub(crate) fn strip_sgid_unless_member(mode: u32, gid: u32, creds: &Credentials) -> u32 {
+    if creds.uid != 0 && !creds.is_member_of_group(gid) {
+        mode & !0o2000
+    } else {
+        mode
     }
 }
 
