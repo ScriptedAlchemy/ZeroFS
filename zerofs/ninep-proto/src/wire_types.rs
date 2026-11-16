@@ -235,6 +235,8 @@ pub mod message_type {
     pub const RWRITE: u8 = 119;
     pub const TCLUNK: u8 = 120;
     pub const RCLUNK: u8 = 121;
+    /// Exact-spelling compound walk. Its reply uses RWALKGETATTR.
+    pub const TWALKGETATTREXACT: u8 = 226;
     pub const TFALLOCATE: u8 = 228;
     pub const RFALLOCATE: u8 = 229;
     pub const TLOPENATREAD: u8 = 230;

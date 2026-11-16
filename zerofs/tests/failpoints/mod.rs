@@ -3805,7 +3805,13 @@ async fn insensitive_names_and_collisions_survive_reopen() {
     let (x, _) = fs.create(&creds, 0, b"x", &attrs).await.unwrap();
     fs.link(&auth, x, 0, b"y").await.unwrap();
     fs.rename(&auth, 0, b"x", 0, b"Y").await.unwrap();
-    for name in [b"a\xffb".as_slice(), b"\xc3a", b"\xc3A", "é".as_bytes(), "e\u{301}".as_bytes()] {
+    for name in [
+        b"a\xffb".as_slice(),
+        b"\xc3a",
+        b"\xc3A",
+        "é".as_bytes(),
+        "e\u{301}".as_bytes(),
+    ] {
         fs.create(&creds, 0, name, &attrs).await.unwrap();
     }
     let mut recased = Vec::new();

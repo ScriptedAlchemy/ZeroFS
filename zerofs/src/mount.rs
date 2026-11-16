@@ -511,7 +511,7 @@ async fn resolve_child(
     name: &[u8],
 ) -> Result<(FileAttr, Option<u32>), ClientError> {
     let nf = client.alloc_fid();
-    let stat = match client.walk_getattr(parent_fid, nf, &[name]).await {
+    let stat = match client.walk_getattr_exact(parent_fid, nf, &[name]).await {
         Ok((_qids, stat)) => stat,
         Err(e) => {
             client.free_fid(nf);

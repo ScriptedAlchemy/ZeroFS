@@ -5,32 +5,35 @@ Omission or `name_mode = "sensitive"` keeps byte-exact names.
 Set `name_mode = "insensitive"` only when creating a filesystem.
 The mode cannot be changed on an existing filesystem.
 
-The shared object store holds `zerofs.namemode` beside `zerofs.key` under
-the database path. Every node checks this record during startup, before
+The shared object store holds the name mode inside `zerofs.key` under the
+database path. Every node checks it while loading the encryption key, before
 it starts a replication receiver or opens the database. A fresh writable
-store creates the mode record with a conditional create before it initializes
-the encryption key. Concurrent initializers read the winning record and
-refuse a different configured mode.
+store creates the key with a conditional create. Concurrent initializers read
+the winning key and refuse a different configured mode. Read-only opens never
+create a key. Password changes preserve the envelope version and mode.
 
-The record contains two bytes. The first byte is the format version, currently
-1. The second byte is 0 for sensitive mode or 1 for Unicode 5.0.0 simple
-uppercase without normalization. Unknown versions, unknown modes and malformed
-records prevent startup. A record without a key retains the selected mode
-when initialization resumes. Read-only opens never create the mode record.
-A key without a record identifies a legacy sensitive filesystem. It accepts
-sensitive opens without writing a record and refuses insensitive opens.
+Sensitive filesystems keep the legacy bincode `WrappedDataKey` bytes. A legacy
+envelope always means sensitive mode. Insensitive filesystems use a version 2
+envelope. Its first eight bytes are `ff ff ff ff ff ff ff ff`, followed by the
+version byte `02`, mode byte `01`, and the legacy wrapped key fields. The mode
+byte `00` means sensitive. Unknown versions, unknown modes, and malformed keys
+prevent startup. Older binaries read the magic as an impossible string length
+and refuse to open the filesystem. Their key loader propagates that parse
+error and never initializes a replacement key.
 
-Old binaries ignore this record. An insensitive filesystem must never be
-served by a binary that lacks this feature. The new binary cannot enforce
-that restriction on an old binary. Backups and metadata recovery must preserve
-`zerofs.namemode` along with `zerofs.key`.
+Insensitive lookup uses Unicode 5.0.0 simple uppercase without normalization.
+The byte-span rules match OpenZFS 2.3.4 `u8_textprep_str` with
+`U8_TEXTPREP_IGNORE_INVALID`. A recognized UTF-8 lead byte consumes its full
+2, 3, or 4-byte span, even when later bytes are invalid. A truncated span copies
+through the end of the name. Other invalid bytes consume one byte. Invalid
+spans retain every byte, so `c3 61` and `c3 41` remain distinct. Valid spans fold
+with the pinned uppercase table. The exported `fs::name_mode::fold_name`
+function supplies this rule for lookup and inventory.
 
-- Not verified: Linux FUSE, the native kernel client and Samba acceptance have not run on this Mac. Equivalence with a running ZFS filesystem remains unverified.
-
-Insensitive lookup uses Unicode 5.0.0 simple uppercase. It leaves invalid UTF-8
-bytes unchanged and folds valid characters around them. It does not normalize
-names, so NFC and NFD spellings can coexist. The 255-byte filename limit applies
-to the supplied name, even when its lookup key grows after folding.
+NFC and NFD spellings can coexist. The 255-byte filename limit applies to the
+supplied name, even when its lookup key grows after folding. The offline
+reference generator reads the OpenZFS tables as data and compares every one-
+and two-byte string plus 200,000 seeded strings of three to eight bytes.
 
 Creating a file, directory, symlink, hardlink or special node at a fold-equal
 name returns `EEXIST`. A rename onto a different entry replaces that entry.
@@ -47,8 +50,14 @@ candidate with a different mode before replaying requests. The native kernel
 client accepts only the sensitive dialect and refuses an insensitive mount.
 Older userspace clients also refuse the new dialect.
 
-The FUSE bridge uses the negotiated mode to disable negative-entry caching
-for insensitive exports, including relaxed mounts. Plain `9P2000.L` still
-passes names as bytes. Its client cache behavior, Linux v9fs and Samba over
-FUSE require separate acceptance tests before this option leaves experimental
-status. This change does not alter the HA replication protocol.
+Local programs on an insensitive FUSE mount use exact-spelling lookup.
+For example, a stored `Foo` is visible as `Foo`, while looking up `foo` returns
+`ENOENT`. Creating `foo` still returns `EEXIST` because the store excludes
+fold-equal collisions. This lets Linux call the filesystem for a case-only
+rename instead of treating two spellings of the same inode as a no-op.
+The bridge uses a private exact-spelling walk and disables negative-entry
+caching, including on relaxed mounts. Ordinary 9P walks retain folded lookup.
+Plain `9P2000.L` still passes names as bytes. This change does not alter the
+HA replication protocol.
+
+- Not verified: Samba end to end, Linux v9fs client caching, native kernel mount refusal, and equivalence with a running ZFS filesystem require separate acceptance tests.

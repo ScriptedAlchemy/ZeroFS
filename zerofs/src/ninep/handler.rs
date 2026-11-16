@@ -888,6 +888,7 @@ impl NinePHandler {
             Message::Tgetlock(tg) => self.getlock(tg).await,
             Message::Trebind(tr) => self.rebind(tr).await,
             Message::Twalkgetattr(tw) => self.walk_getattr(tw).await,
+            Message::Twalkgetattrexact(tw) => self.walk_getattr_inner(tw, true).await,
             Message::Treaddirattr(tr) => self.readdir_attr(tr).await,
             Message::Tlopenat(tl) => self.lopenat(tl).await,
             Message::Tlopenatread(tl) => self.lopenatread(tl).await,
@@ -1410,6 +1411,10 @@ impl NinePHandler {
     // the client's lookup costs one round trip instead of walk + getattr. Unlike
     // Twalk there is no partial result. Any miss is a hard error.
     async fn walk_getattr(&self, tw: Twalkgetattr) -> P9Result<Message> {
+        self.walk_getattr_inner(tw, false).await
+    }
+
+    async fn walk_getattr_inner(&self, tw: Twalkgetattr, exact: bool) -> P9Result<Message> {
         let src_fid = self.get_fid(tw.fid)?;
 
         let mut current_path = src_fid.path;
@@ -1422,6 +1427,18 @@ impl NinePHandler {
             let child_id = self
                 .walk_component(&src_fid.creds, src_fid.root, current_id, &name_bytes)
                 .await?;
+            if exact
+                && self.filesystem.name_mode() == crate::fs::name_mode::NameMode::Insensitive
+                && !matches!(name_bytes.as_ref(), b"." | b"..")
+                && self
+                    .filesystem
+                    .directory_store
+                    .get_exact(current_id, &name_bytes)
+                    .await?
+                    != child_id
+            {
+                return Err(FsError::NotFound.into());
+            }
             let child_inode = self.filesystem.inode_store.get(child_id).await?;
             Self::step_path(&mut current_path, name_bytes, current_id, src_fid.root);
             wqids.push(inode_to_qid(&child_inode, child_id));
@@ -3848,6 +3865,74 @@ mod tests {
             response.body,
             Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EOVERFLOW
         ));
+    }
+
+    #[tokio::test]
+    async fn exact_walk_preserves_folded_walks_and_execute_only_directories() {
+        use crate::fs::name_mode::NameMode;
+        use crate::fs::types::SetMode;
+        let fs = Arc::new(
+            ZeroFS::new_in_memory_with_name_mode(NameMode::Insensitive)
+                .await
+                .unwrap(),
+        );
+        let creds = test_creds();
+        let (directory, _) = fs
+            .mkdir(&creds, 0, b"Dir", &SetAttributes::default())
+            .await
+            .unwrap();
+        let (inode, _) = fs
+            .create(&creds, directory, b"Foo", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.link(&AuthContext::from(&creds), inode, directory, b"Other")
+            .await
+            .unwrap();
+        fs.setattr(
+            &creds,
+            directory,
+            &SetAttributes {
+                mode: SetMode::Set(0o111),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let handler = NinePHandler::new(fs.clone(), Arc::new(FileLockManager::new()));
+        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+        for (name, exact, found) in [
+            (b"Foo".as_slice(), true, true),
+            (b"foo", true, false),
+            (b"foo", false, true),
+            (b"Other", true, true),
+            (b"other", true, false),
+        ] {
+            let walk = Twalkgetattr {
+                fid: 1,
+                newfid: 2,
+                nwname: 2,
+                wnames: vec![P9String::new(b"Dir".to_vec()), P9String::new(name.to_vec())],
+            };
+            let body = if exact {
+                Message::Twalkgetattrexact(walk)
+            } else {
+                Message::Twalkgetattr(walk)
+            };
+            let response = request(&handler, 2, body).await;
+            if found {
+                assert!(
+                    matches!(response.body, Message::Rwalkgetattr(ref reply) if reply.stat.qid.path == inode),
+                    "{name:?}: {:?}",
+                    response.body
+                );
+                request(&handler, 3, Message::Tclunk(Tclunk { fid: 2 })).await;
+            } else {
+                assert!(
+                    matches!(response.body, Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::ENOENT)
+                );
+                assert!(handler.get_fid(2).is_err());
+            }
+        }
     }
 
     #[tokio::test]

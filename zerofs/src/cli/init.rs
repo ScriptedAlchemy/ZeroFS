@@ -1587,8 +1587,14 @@ mod role_decision_tests {
                 .await
                 .err()
                 .unwrap();
-            assert!(format!("{error:#}").contains("name mode mismatch"), "{error:#}");
-            assert_eq!(std::fs::read(metadata.join("zerofs.key")).unwrap(), key_bytes);
+            assert!(
+                format!("{error:#}").contains("name mode mismatch"),
+                "{error:#}"
+            );
+            assert_eq!(
+                std::fs::read(metadata.join("zerofs.key")).unwrap(),
+                key_bytes
+            );
         }
         settings.filesystem = Some(toml::from_str("name_mode = 'insensitive'").unwrap());
         let error = super::initialize_filesystem(&settings, DatabaseMode::ReadWrite)

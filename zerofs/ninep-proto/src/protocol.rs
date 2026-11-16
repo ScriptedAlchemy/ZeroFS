@@ -887,6 +887,8 @@ pub enum Message {
     Rrebind(Rrebind),
     #[deku(id = "message_type::TWALKGETATTR")]
     Twalkgetattr(Twalkgetattr),
+    #[deku(id = "message_type::TWALKGETATTREXACT")]
+    Twalkgetattrexact(Twalkgetattr),
     #[deku(id = "message_type::RWALKGETATTR")]
     Rwalkgetattr(Rwalkgetattr),
     #[deku(id = "message_type::TREADDIRATTR")]
@@ -913,6 +915,7 @@ impl Message {
             | Message::Trenamenoreplace(_)
             | Message::Trebind(_)
             | Message::Twalkgetattr(_)
+            | Message::Twalkgetattrexact(_)
             | Message::Treaddirattr(_) => true,
             Message::Tversion(_)
             | Message::Rversion(_)
@@ -1016,7 +1019,9 @@ impl Message {
             Message::Tlopenatread(m) => [Some(m.fid), Some(m.newfid)],
             Message::Tlcreateattr(m) => [Some(m.dfid), Some(m.newfid)],
             Message::Trebind(m) => [Some(m.fid), None],
-            Message::Twalkgetattr(m) => [Some(m.fid), Some(m.newfid)],
+            Message::Twalkgetattr(m) | Message::Twalkgetattrexact(m) => {
+                [Some(m.fid), Some(m.newfid)]
+            }
             Message::Treaddirattr(m) => [Some(m.fid), None],
             Message::Tversion(_)
             | Message::Rversion(_)
@@ -1354,6 +1359,28 @@ mod tests {
         let size = bytes.len() as u32;
         bytes[..P9_SIZE_FIELD_LEN].copy_from_slice(&size.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn exact_walk_has_a_private_opcode_and_the_normal_fid_footprint() {
+        let message = P9Message::new(
+            7,
+            Message::Twalkgetattrexact(Twalkgetattr {
+                fid: 1,
+                newfid: 2,
+                nwname: 1,
+                wnames: vec![P9String::new(b"Foo".to_vec())],
+            }),
+        );
+        assert!(message.body.is_zerofs_private_request());
+        assert_eq!(message.body.request_fids().collect::<Vec<_>>(), vec![1, 2]);
+        assert!(!message.body.is_mutation());
+        let bytes = message.to_bytes_ctx(true).unwrap();
+        assert_eq!(bytes[4], message_type::TWALKGETATTREXACT);
+        let decoded = P9Message::from_bytes_ctx(&bytes, true).unwrap();
+        assert!(
+            matches!(decoded.body, Message::Twalkgetattrexact(ref walk) if walk.fid == 1 && walk.newfid == 2 && walk.wnames[0].data == b"Foo")
+        );
     }
 
     #[test]

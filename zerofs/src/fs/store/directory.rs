@@ -125,6 +125,22 @@ impl DirectoryStore {
             .map(|(inode_id, _)| inode_id)
     }
 
+    /// Check the stored spelling with a point read, without directory read access.
+    pub(crate) async fn get_exact(&self, dir_id: InodeId, name: &[u8]) -> Result<InodeId, FsError> {
+        let (inode_id, cookie) = self.get_entry_with_cookie(dir_id, name).await?;
+        let scan = self
+            .db
+            .get_bytes(&self.key_codec.dir_scan_key(dir_id, cookie))
+            .await
+            .map_err(|error| FsError::from_db_error(&error))?
+            .ok_or(FsError::NotFound)?;
+        let (stored, value) = decode_dir_scan_value(&scan)?;
+        if stored != name || value.inode_id() != inode_id {
+            return Err(FsError::NotFound);
+        }
+        Ok(inode_id)
+    }
+
     async fn load_entry(&self, dir_id: InodeId, name: &[u8]) -> Result<EntryCacheValue, FsError> {
         let entry_key = self.key_codec.dir_entry_key(dir_id, name);
 

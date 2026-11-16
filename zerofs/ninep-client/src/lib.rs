@@ -2069,18 +2069,44 @@ impl NinePClient {
         newfid: u32,
         names: &[&[u8]],
     ) -> ClientResult<(Vec<Qid>, Stat)> {
+        self.walk_getattr_inner(fid, newfid, names, false).await
+    }
+
+    /// Walk by stored spelling for the FUSE bridge. Ordinary walks still fold.
+    /// Insensitive exports negotiate the private CI dialect before using this request.
+    pub async fn walk_getattr_exact(
+        &self,
+        fid: u32,
+        newfid: u32,
+        names: &[&[u8]],
+    ) -> ClientResult<(Vec<Qid>, Stat)> {
+        self.walk_getattr_inner(fid, newfid, names, self.case_insensitive())
+            .await
+    }
+
+    async fn walk_getattr_inner(
+        &self,
+        fid: u32,
+        newfid: u32,
+        names: &[&[u8]],
+        exact: bool,
+    ) -> ClientResult<(Vec<Qid>, Stat)> {
         let wnames = names
             .iter()
             .map(|n| P9String::new(n.to_vec()))
             .collect::<Vec<_>>();
-        let (resp, _transition) = self
-            .rpc_stateful(Message::Twalkgetattr(Twalkgetattr {
-                fid,
-                newfid,
-                nwname: wnames.len() as u16,
-                wnames,
-            }))
-            .await?;
+        let walk = Twalkgetattr {
+            fid,
+            newfid,
+            nwname: wnames.len() as u16,
+            wnames,
+        };
+        let request = if exact {
+            Message::Twalkgetattrexact(walk)
+        } else {
+            Message::Twalkgetattr(walk)
+        };
+        let (resp, _transition) = self.rpc_stateful(request).await?;
         match resp {
             Message::Rwalkgetattr(r) => {
                 {
@@ -3674,6 +3700,58 @@ mod session_transition_tests {
         let result = client.replay(conn).await;
         responder.await.unwrap();
         result
+    }
+
+    #[tokio::test]
+    async fn exact_walk_selects_the_ci_opcode_and_records_successful_fids() {
+        for insensitive in [false, true] {
+            let (conn, mut requests) = test_conn_with_receiver();
+            conn.case_insensitive.store(insensitive, Ordering::Release);
+            let client = test_client(conn.clone());
+            client.state.lock().unwrap().fids.insert(
+                1,
+                FidRecord {
+                    inode_id: 0,
+                    root_inode: 0,
+                    n_uname: 1000,
+                    uname: b"test".to_vec(),
+                    opened: None,
+                },
+            );
+            let responder = tokio::spawn(async move {
+                let request = recv_request(&mut requests, "exact walk").await;
+                let walk = match request.body {
+                    Message::Twalkgetattrexact(walk) if insensitive => walk,
+                    Message::Twalkgetattr(walk) if !insensitive => walk,
+                    other => panic!("unexpected walk {other:?}"),
+                };
+                assert_eq!((walk.fid, walk.newfid), (1, 2));
+                assert_eq!(walk.wnames[0].data, b"Foo");
+                let qid = Qid {
+                    path: 42,
+                    ..Default::default()
+                };
+                reply(
+                    &conn,
+                    request.tag,
+                    Message::Rwalkgetattr(Rwalkgetattr {
+                        nwqid: 1,
+                        wqids: vec![qid],
+                        stat: Stat {
+                            qid,
+                            ..Default::default()
+                        },
+                    }),
+                );
+            });
+            let (_, stat) = client.walk_getattr_exact(1, 2, &[b"Foo"]).await.unwrap();
+            responder.await.unwrap();
+            assert_eq!(stat.qid.path, 42);
+            assert_eq!(
+                client.state.lock().unwrap().fids.get(&2).unwrap().inode_id,
+                42
+            );
+        }
     }
 
     #[tokio::test]
