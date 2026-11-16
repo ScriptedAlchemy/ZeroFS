@@ -15,6 +15,61 @@ WORKFLOW = ROOT / ".github/workflows/jepsen-ha.yml"
 
 
 class NativeJepsenDepsTests(unittest.TestCase):
+    def test_fuse_bootstraps_lein_in_the_runtime_home(self):
+        workflow = WORKFLOW.read_text()
+        setup = re.findall(
+            r"      - name: Install Leiningen \+ FUSE \+ gnuplot\n"
+            r"(?:        [^\n]*\n)*?        run: \|\n((?:          [^\n]*\n|\n)+)",
+            workflow,
+        )
+        resolve = re.findall(
+            r"      - name: Resolve Jepsen dependencies with bounded retries\n"
+            r"(?:        [^\n]*\n)*?        run: \|\n((?:          [^\n]*\n|\n)+)",
+            workflow,
+        )
+        self.assertEqual(len(setup), 2)
+        self.assertEqual(len(resolve), 2)
+        for install, dependencies in zip(setup, resolve):
+            with self.subTest(install=install), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                log = root / "commands.jsonl"
+                for name in ("sudo", "apt-get", "curl", "chmod", "lein"):
+                    tool = root / name
+                    tool.write_text('''#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import sys
+
+name = Path(sys.argv[0]).name
+if name == "sudo":
+    args = ["lein" if arg == "/usr/local/bin/lein" else arg for arg in sys.argv[1:]]
+    os.execvp(args[0], args)
+if name == "lein":
+    with open(os.environ["COMMAND_LOG"], "a") as log:
+        log.write(json.dumps([sys.argv[1:], os.environ["HOME"],
+                              os.environ.get("LEIN_ROOT"), os.environ["JAVA_HOME"]]) + "\\n")
+''')
+                    tool.chmod(0o755)
+                environment = dict(
+                    os.environ, PATH=f"{root}:{os.environ['PATH']}",
+                    HOME="/home/runner", JAVA_HOME="/test/jdk17",
+                    GITHUB_WORKSPACE=str(ROOT), COMMAND_LOG=str(log),
+                )
+                script = textwrap.dedent(install) + textwrap.dedent(dependencies)
+                script = script.replace("${{ matrix.mount-client }}", "fuse")
+                result = subprocess.run(
+                    ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script],
+                    env=environment, capture_output=True, text=True, timeout=10,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                commands = [json.loads(line) for line in log.read_text().splitlines()]
+                self.assertEqual(commands, [
+                    [["version"], "/root", "1", "/test/jdk17"],
+                    [["deps"], "/root", "1", "/test/jdk17"],
+                ])
+
     def setup_steps(self):
         blocks = re.findall(
             r"      - name: Install guest JDK, Leiningen, and gnuplot\n"
