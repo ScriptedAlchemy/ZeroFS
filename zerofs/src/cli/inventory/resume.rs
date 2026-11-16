@@ -148,7 +148,9 @@ pub(super) fn decode_hex(hex: &str) -> Result<Vec<u8>> {
         "invalid manifest byte encoding"
     );
     hex.as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| Ok(u8::from_str_radix(std::str::from_utf8(pair)?, 16)?))
         .collect()
 }
