@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use fs4::fs_std::FileExt;
 use futures::stream::BoxStream;
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
 use object_store::{
@@ -73,9 +73,13 @@ impl LocalConditionalStore {
         )
     }
 
-    fn check_tree(&self) -> Result<()> {
-        if let Some(root) = &self.readiness_root {
-            crate::storage_readiness::paths::verify_tree(root).map_err(generic)?;
+    async fn check_tree(&self) -> Result<()> {
+        if let Some(root) = self.readiness_root.clone() {
+            // A tree scan can perform millions of metadata operations. Use the
+            // same bounded native workers as mutations instead of blocking a
+            // Tokio executor while constructing or polling a listing.
+            run_local(move || crate::storage_readiness::paths::verify_tree(&root).map_err(generic))
+                .await?;
         }
         Ok(())
     }
@@ -306,10 +310,17 @@ impl ObjectStore for LocalConditionalStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
-        if let Err(error) = self.check_tree() {
-            return futures::stream::once(async { Err(error) }).boxed();
+        if self.readiness_root.is_none() {
+            return self.inner.list(prefix);
         }
-        self.inner.list(prefix)
+        let store = self.clone();
+        let prefix = prefix.cloned();
+        futures::stream::once(async move {
+            store.check_tree().await?;
+            Ok(store.inner.list(prefix.as_ref()))
+        })
+        .try_flatten()
+        .boxed()
     }
 
     fn list_with_offset(
@@ -317,14 +328,22 @@ impl ObjectStore for LocalConditionalStore {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, Result<ObjectMeta>> {
-        if let Err(error) = self.check_tree() {
-            return futures::stream::once(async { Err(error) }).boxed();
+        if self.readiness_root.is_none() {
+            return self.inner.list_with_offset(prefix, offset);
         }
-        self.inner.list_with_offset(prefix, offset)
+        let store = self.clone();
+        let prefix = prefix.cloned();
+        let offset = offset.clone();
+        futures::stream::once(async move {
+            store.check_tree().await?;
+            Ok(store.inner.list_with_offset(prefix.as_ref(), &offset))
+        })
+        .try_flatten()
+        .boxed()
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
-        self.check_tree()?;
+        self.check_tree().await?;
         self.inner.list_with_delimiter(prefix).await
     }
 
@@ -559,6 +578,53 @@ mod tests {
         let listing = store.list_with_delimiter(Some(&prefix)).await.unwrap();
         assert_eq!(listing.objects.len(), 1);
         assert!(listing.common_prefixes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn readiness_listings_check_the_tree_when_polled() {
+        let (directory, store, prefix) = fixture();
+        let store = store.with_readiness_root(directory.path().canonicalize().unwrap());
+        store
+            .put(&prefix.join("object"), "payload".into())
+            .await
+            .unwrap();
+        let listing = store.list(Some(&prefix));
+        let offset_listing = store.list_with_offset(Some(&prefix), &prefix.join("a"));
+
+        // Stream construction is lazy. Validate on the worker before any
+        // object metadata is emitted, including changes made before polling.
+        let outside = TempDir::new().unwrap();
+        let link = directory.path().join("foreign");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        for result in [
+            listing.try_collect::<Vec<_>>().await,
+            offset_listing.try_collect::<Vec<_>>().await,
+        ] {
+            let error = result.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("readiness path contains a symlink")
+            );
+        }
+        assert!(
+            store
+                .list_with_delimiter(Some(&prefix))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("readiness path contains a symlink")
+        );
+        std::fs::remove_file(link).unwrap();
+        assert_eq!(
+            store
+                .list(Some(&prefix))
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

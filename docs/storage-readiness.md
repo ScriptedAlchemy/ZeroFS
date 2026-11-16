@@ -219,6 +219,53 @@ evidence unavailable in strict mode.
 
 ## Scope of evidence
 
+### Threat model and remaining path-based I/O
+
+Readiness guards against wrong, missing, unmounted, locked, or misidentified
+storage at startup. Storage roots must be owned and controlled by the operator
+and service. It does not defend against another process with write access to a
+storage root while the server runs. Such a process can replace directories after
+a successful check or remove the pool's data directly.
+
+The authority object store, member object stores, and Foyer cache partitions
+still open by path. A replacement symlink between validation and a subsequent
+open can redirect a write, truncate a cache partition outside the root, or
+redirect multipart staging-file cleanup. The checks reject already-present
+symlinks; they do not make those operations atomic with validation. The catalog
+and journal use descriptor-anchored no-follow handles. The remaining conversion
+is tracked in [the anchored I/O follow-up](storage-readiness-anchored-io.md),
+including the required replacement-race and cleanup tests.
+
+### Tree-scan work
+
+Each preflight scans every existing entry below every declared role root. Let
+`N` be the number of entries, `D` the number of directories including the root,
+and `S` the sum of directory depths relative to the root. One scan performs
+`N` no-follow metadata queries and `D` directory enumerations. Because the
+walker reopens each pending directory from its root, it also performs `S`
+directory-component opens, plus one enumeration open per directory. Its work
+is therefore `O(N + S)`, not constant time or just one probe per device. For a
+tree with maximum depth `h`, `S <= (D - 1) * h`. Pending relative directory paths
+consume `O(D * h)` path components in the worst case; open descriptors remain
+bounded independently of the number of entries. No file payloads are read.
+
+Every invocation repeats this work: backend opening and bucket cache/journal
+verification each invoke a full preflight. Object `list`, `list_with_offset`,
+and `list_with_delimiter` also scan the whole corresponding root, even for a
+narrow listing prefix. A million-entry root needs a million metadata queries
+per scan. This can add minutes on an HDD with cold metadata; there is no measured
+HDD latency or wall-clock upper bound. Plan startup budgets from the actual tree
+and device, not the number of configured members.
+
+Runtime listing scans run on the existing bounded native-worker pool (at most
+32 local operations in flight across mutations and scans), so the scan does not
+block the Tokio executor. A listing emits no objects before its scan succeeds.
+Cancelling the caller does not terminate a scan already running in a worker.
+Descriptor-anchored object enumeration in the follow-up should remove this
+duplicate whole-tree scan without weakening the symlink refusal.
+
+### Startup and recovery contract
+
 This is a startup preflight, including explicit `pool init` and maintenance opens.
 Both `debug reseed-writeback-predecessor` and
 `debug accept-remote-writeback-branch` refuse to run whenever readiness is
