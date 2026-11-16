@@ -53,9 +53,10 @@ enabled = false
             mount = None
             try:
                 wait_for(socket.exists, server, "9P server")
-                command = [binary, "mount", "--writeback", "false"]
-                if relaxed:
-                    command.append("--relaxed-consistency")
+                command = [
+                    binary, "mount", "--writeback", "false",
+                    "--relaxed-consistency", str(relaxed).lower(),
+                ]
                 command.extend([f"unix:{socket}", str(mountpoint)])
                 mount = subprocess.Popen(command, stdout=mount_log, stderr=mount_log)
                 wait_for(lambda: os.path.ismount(mountpoint), mount, "FUSE mount")
