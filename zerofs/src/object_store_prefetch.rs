@@ -36,14 +36,17 @@ pub(crate) struct CacheRangeOnly;
 /// bytes failed frame authentication or decoding. The store drops the cached
 /// parts covering the range, fences fetches already in flight for the object,
 /// and reads the part-aligned range from the backend without caching it. The
-/// response carries an [`AuthenticatedRefetch`] that the caller admits only
-/// after the new bytes authenticate.
+/// response carries an [`AuthenticatedRefetch`] that the caller admits after
+/// the requested range authenticates. Admission caches only the parts that lie
+/// wholly inside the requested range. A part that also holds bytes outside it
+/// stays uncached, because the caller's check did not cover those bytes.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RefetchCorruptRange;
 
 /// Response extension of a [`RefetchCorruptRange`] GET. [`Self::admit`] caches
-/// the refetched parts; dropping it caches nothing. Admission is skipped if
-/// the object was invalidated after the refetch began.
+/// each refetched part whose every byte lies inside the requested range;
+/// dropping it caches nothing. Admission is skipped if the object was
+/// invalidated after the refetch began.
 #[derive(Clone)]
 pub(crate) struct AuthenticatedRefetch(Arc<RefetchAdmission>);
 
@@ -56,7 +59,11 @@ struct RefetchAdmission {
     generation: CacheGeneration,
     read: ReadLease,
     start_part: PartId,
+    /// Part-aligned bytes, starting at `start_part`.
     bytes: Bytes,
+    /// The requested range, the only bytes the caller authenticated.
+    verified: Range<u64>,
+    object_size: u64,
 }
 
 impl AuthenticatedRefetch {
@@ -68,12 +75,19 @@ impl AuthenticatedRefetch {
             admission_cap_bytes: admission.admission_cap_bytes,
             part_size_bytes: admission.part_size_bytes,
         };
+        let part_size = admission.part_size_bytes as u64;
         admission.read.publish(|| {
             for (i, part) in admission
                 .bytes
                 .chunks(admission.part_size_bytes)
                 .enumerate()
             {
+                let start = (admission.start_part + i) as u64 * part_size;
+                let end = start + part.len() as u64;
+                let whole = part.len() == admission.part_size_bytes || end == admission.object_size;
+                if !whole || start < admission.verified.start || end > admission.verified.end {
+                    continue;
+                }
                 // Owned copy, so a cached part never pins the whole response.
                 ctx.admit_part(
                     &admission.location,
@@ -1078,8 +1092,9 @@ impl PrefetchingObjectStore {
     /// the object revision makes every fetch already in flight refuse to
     /// publish, because such a fetch may carry the same corrupt response.
     /// Removing the registry slots keeps later reads from joining one. The
-    /// backend bytes are returned uncached; the caller admits them through
-    /// [`AuthenticatedRefetch`] once they authenticate.
+    /// backend bytes are returned uncached. Once the requested range
+    /// authenticates, the caller admits the parts that lie wholly inside it
+    /// through [`AuthenticatedRefetch`].
     async fn refetch_corrupt_range(
         &self,
         location: &Path,
@@ -1157,26 +1172,25 @@ impl PrefetchingObjectStore {
         }
         let end = ((requested.end.min(fetched.end)) - aligned.start) as usize;
         let payload = bytes.slice(start..end);
-        // Only whole parts, or the object's final short part, are cacheable.
-        let admissible = fetched.end.is_multiple_of(part_size) || fetched.end == meta.size;
+        let verified = requested.start..requested.start + (end - start) as u64;
         let mut extensions = object_store::Extensions::default();
-        if admissible {
-            extensions.insert(AuthenticatedRefetch(Arc::new(RefetchAdmission {
-                parts: self.parts.clone(),
-                part_counts: self.part_counts.clone(),
-                admission_cap_bytes: self.admission_cap_bytes,
-                part_size_bytes: self.part_size_bytes,
-                location: location.clone(),
-                generation,
-                read,
-                start_part,
-                bytes,
-            })));
-        }
+        extensions.insert(AuthenticatedRefetch(Arc::new(RefetchAdmission {
+            parts: self.parts.clone(),
+            part_counts: self.part_counts.clone(),
+            admission_cap_bytes: self.admission_cap_bytes,
+            part_size_bytes: self.part_size_bytes,
+            location: location.clone(),
+            generation,
+            read,
+            start_part,
+            bytes,
+            verified: verified.clone(),
+            object_size: meta.size,
+        })));
         Ok(GetResult {
             payload: GetResultPayload::Stream(stream::once(async move { Ok(payload) }).boxed()),
             meta,
-            range: requested.start..requested.start + (end - start) as u64,
+            range: verified,
             attributes,
             extensions,
         })
@@ -3161,19 +3175,30 @@ mod tests {
             2,
             "one cold GET and exactly one retry"
         );
+        assert_eq!(fixture.reader.integrity_refetches(), 1);
         assert!(
             fixture.assert_cache_holds_only_true_bytes().await > 0,
-            "the authenticated retry bytes should be cached"
+            "the parts inside the authenticated run should be cached"
         );
 
+        // Parts the run shares with the segment's other bytes were left
+        // uncached, so the first later read may fetch them once, normally.
+        fixture.assert_frames(&fixture.read().await.unwrap());
+        let gets = fixture.controls.get_count();
         for _ in 0..3 {
             fixture.assert_frames(&fixture.read().await.unwrap());
         }
         assert_eq!(
-            fixture.controls.get_count(),
-            2,
-            "later reads are served from the repaired cache without another retry"
+            fixture.reader.integrity_refetches(),
+            1,
+            "later reads need no further integrity refetch"
         );
+        assert_eq!(
+            fixture.controls.get_count(),
+            gets,
+            "later reads are served from the cache"
+        );
+        fixture.assert_cache_holds_only_true_bytes().await;
     }
 
     #[tokio::test]

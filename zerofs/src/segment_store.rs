@@ -474,9 +474,11 @@ impl SegmentStore {
     /// same-length corrupt response stays cached and fails every later read of
     /// its frames. After such a failure, evict those parts and read the run
     /// once more from the backend. The retry must have the run's exact length
-    /// and pass the same frame parsing and AEAD checks. Its parts are cached
-    /// only after they pass. A second failure returns the integrity error;
-    /// there is no further retry.
+    /// and pass the same frame parsing and AEAD checks. After it passes, the
+    /// cache admits only the parts that lie wholly inside the run. A part that
+    /// also holds a neighbouring frame's bytes stays uncached, because this
+    /// decode did not authenticate them. A second failure returns the
+    /// integrity error; there is no further retry.
     async fn refetch_run_after_integrity_failure<T>(
         &self,
         segid: Segid,
