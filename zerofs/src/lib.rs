@@ -20,6 +20,8 @@ pub mod length_checked_object_store;
 mod linux_errno;
 mod local_object_store;
 pub(crate) mod metadata_digest;
+#[cfg(test)]
+mod metadata_survival_tests;
 #[cfg(target_os = "linux")]
 mod mount;
 mod nbd;
