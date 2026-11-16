@@ -77,6 +77,7 @@ pub(crate) async fn open_storage(settings: &Settings) -> Result<OpenedStorage> {
             .await
             .map(|(opened, _)| opened);
     }
+    crate::storage_readiness::verify(settings)?;
     let url: url::Url = settings.storage.url.parse()?;
     let ParsedStore {
         store,
@@ -118,6 +119,7 @@ pub(crate) async fn open_pool_storage(
         .as_ref()
         .context("[storage.pool] is not configured")?;
     settings.validate()?;
+    crate::storage_readiness::verify(settings)?;
     validate_directories(settings)?;
     if !initialize && !config.catalog_dir.join(CATALOG_FILE_NAME).is_file() {
         anyhow::bail!(

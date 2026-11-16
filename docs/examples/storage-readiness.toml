@@ -1,0 +1,54 @@
+# Synthetic parser fixture only. No values here identify real storage.
+[cache]
+dir = "/fixture/fast/cache"
+disk_size_gb = 1.0
+memory_size_gb = 0.125
+
+[storage]
+url = "file:///fixture/durable/authority"
+encryption_password = "synthetic-example-password"
+
+[storage.pool]
+catalog_dir = "/fixture/durable/catalog"
+
+[[storage.pool.members]]
+id = "data"
+url = "file:///fixture/durable/data"
+capacity_gb = 8.0
+reserve_free_gb = 1.0
+
+[storage.readiness]
+strict = true
+authority = "durable"
+catalog = "durable"
+cache = "fast"
+journal = "fast"
+
+[storage.readiness.members]
+data = "durable"
+
+[[storage.readiness.filesystems]]
+id = "durable"
+profile = "hdd-smr"
+mountpoint = "/fixture/durable"
+# Values intentionally exercise unsigned GUIDs beyond TOML's integer range.
+identity = { kind = "zfs", pool_guid = "18446744073709551614", dataset_guid = "18446744073709551615" }
+
+[[storage.readiness.filesystems]]
+id = "fast"
+profile = "nvme"
+mountpoint = "/fixture/fast"
+identity = { kind = "uuid", uuid = "47166772-65c1-4ecf-8066-935452891add" }
+
+[writeback]
+enabled = true
+dir = "/fixture/fast/journal"
+ack_mode = "ssd"
+memory_size_gb = 0.125
+disk_size_gb = 2.0
+min_free_gb = 1.0
+
+[servers]
+
+[telemetry]
+enabled = false
