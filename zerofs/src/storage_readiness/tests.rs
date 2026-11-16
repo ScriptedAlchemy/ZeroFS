@@ -594,6 +594,9 @@ fn a_real_open_path_cannot_escape_its_declared_role_or_filesystem() {
 #[path = "device_tests.rs"]
 mod device_tests;
 
+#[path = "scan_tests.rs"]
+mod scan_tests;
+
 #[tokio::test]
 async fn readiness_symlinks_refuse_pool_init_and_server_backend_open_before_writes() {
     use std::os::unix::fs::symlink;
