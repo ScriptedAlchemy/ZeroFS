@@ -41,7 +41,7 @@ use admission::{
     CONNECTION_INFLIGHT_MEMORY, CONNECTION_INFLIGHT_REQUESTS, GLOBAL_INFLIGHT_MEMORY,
     GLOBAL_INFLIGHT_REQUESTS, GLOBAL_TRANSPORT_SESSIONS, P9ConnectionAdmission,
 };
-pub(crate) use admission::{P9AcceptedWorkTracker, P9GlobalAdmission};
+pub(crate) use admission::{P9AcceptedWorkTracker, P9GlobalAdmission, P9XattrPermit};
 #[cfg(test)]
 use frame_codec::{
     FidFootprint, P9_RWRITE_MAX_SIZE, ShallowFrameMetadata, inspect_frame_metadata,
@@ -326,6 +326,51 @@ mod tests {
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(1);
     const QUIET_TIMEOUT: Duration = Duration::from_millis(20);
+
+    #[test]
+    fn xattr_frames_declare_their_fids_for_clunk_barriers() {
+        for (body, expected) in [
+            (
+                Message::Txattrwalk(ninep_proto::Txattrwalk {
+                    fid: 7,
+                    newfid: 8,
+                    name: ninep_proto::P9String::new(vec![]),
+                }),
+                FidFootprint::Two(7, 8),
+            ),
+            (
+                Message::Txattrcreate(ninep_proto::Txattrcreate {
+                    fid: 8,
+                    name: ninep_proto::P9String::new(b"user.key".to_vec()),
+                    size: 0,
+                    flags: 2,
+                }),
+                FidFootprint::One(8),
+            ),
+        ] {
+            let frame = P9Message::new(1, body).to_bytes().unwrap();
+            for private in [false, true] {
+                let metadata = inspect_frame_metadata(&frame, private);
+                assert_eq!(metadata.fids, expected);
+                assert!(metadata.received_op.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn retained_xattrs_keep_credit_and_leave_room_for_clunk() {
+        let global = P9GlobalAdmission::for_test(1024, 4);
+        let retained = global.try_admit_xattr(256).unwrap();
+        assert_eq!(global.snapshot().reserved_bytes, 256);
+        assert!(matches!(
+            global.try_admit_xattr(1),
+            Err(crate::fs::errors::FsError::RetryLater)
+        ));
+        assert_eq!(global.snapshot().reserved_bytes, 256);
+        drop(retained);
+        assert_eq!(global.snapshot().reserved_bytes, 0);
+        assert!(global.try_admit_xattr(256).is_ok());
+    }
 
     #[tokio::test]
     async fn transport_receive_envelope_bounds_reconnect_frames() {

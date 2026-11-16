@@ -1,3 +1,6 @@
+mod xattr;
+use xattr::XattrFid;
+
 use super::errors::{P9Error, P9Result};
 use super::lock_manager::{FileLock, FileLockManager, LockGuard};
 #[cfg(feature = "failpoints")]
@@ -198,6 +201,7 @@ pub struct FidSlot {
     /// Present once the fid takes its first byte-range lock; releases the fid's
     /// locks on drop.
     pub lock_guard: Option<LockGuard>,
+    xattr: Option<XattrFid>,
 }
 
 impl FidSlot {
@@ -208,6 +212,7 @@ impl FidSlot {
             directory_pin: None,
             replay_reopen: false,
             lock_guard: None,
+            xattr: None,
         }
     }
 }
@@ -496,6 +501,7 @@ impl NinePHandler {
         self.session_state()
             .fids
             .get(&fid)
+            .filter(|slot| slot.xattr.is_none())
             .ok_or(P9Error::BadFid)
             .map(|slot| OpenFidContext {
                 fid: slot.fid.clone(),
@@ -660,6 +666,7 @@ impl NinePHandler {
         self.session_state()
             .fids
             .get(&fid)
+            .filter(|slot| slot.xattr.is_none())
             .ok_or(P9Error::BadFid)
             .map(|s| s.fid.clone())
     }
@@ -670,6 +677,7 @@ impl NinePHandler {
         self.session_state()
             .fids
             .get(&fid)
+            .filter(|slot| slot.xattr.is_none())
             .ok_or(P9Error::BadFid)
             .map(|slot| {
                 let state = if !slot.fid.opened {
@@ -864,7 +872,7 @@ impl NinePHandler {
             Message::Tlcreate(tc) => self.lcreate(tc, op_id).await,
             Message::Tread(tr) => self.read(tr).await,
             Message::Twrite(tw) => self.write(tw, op_id, op_origin_epoch).await,
-            Message::Tclunk(tc) => Ok(self.clunk(tc).await),
+            Message::Tclunk(tc) => self.clunk(tc).await,
             Message::Treaddir(tr) => self.readdir(tr).await,
             Message::Tgetattr(tg) => self.getattr(tg).await,
             Message::Tsetattr(ts) => self.setattr(ts, op_id).await,
@@ -882,12 +890,14 @@ impl NinePHandler {
             Message::Tfsyncdur(tf) => self.fsyncdur(tf).await,
             Message::Tgetlineage(_) => self.getlineage().await,
             Message::Tflush(_) => Ok(Message::Rflush(Rflush)),
-            Message::Txattrwalk(_) => Err(P9Error::NotSupported),
+            Message::Txattrwalk(tx) => self.xattrwalk(tx).await,
+            Message::Txattrcreate(tx) => self.xattrcreate(tx).await,
             Message::Tstatfs(ts) => self.statfs(ts).await,
             Message::Tlock(tl) => self.lock(tl).await,
             Message::Tgetlock(tg) => self.getlock(tg).await,
             Message::Trebind(tr) => self.rebind(tr).await,
             Message::Twalkgetattr(tw) => self.walk_getattr(tw).await,
+            Message::Twalkgetattrexact(tw) => self.walk_getattr_inner(tw, true).await,
             Message::Treaddirattr(tr) => self.readdir_attr(tr).await,
             Message::Tlopenat(tl) => self.lopenat(tl).await,
             Message::Tlopenatread(tl) => self.lopenatread(tl).await,
@@ -974,7 +984,10 @@ impl NinePHandler {
         self.lock_manager.release_session_locks(self.handler_id);
 
         let requested = version_str.as_bytes();
-        if requested != VERSION_9P2000L && requested != VERSION_9P2000L_ZEROFS {
+        if requested != VERSION_9P2000L
+            && requested != VERSION_9P2000L_ZEROFS
+            && requested != VERSION_9P2000L_ZEROFS_CI
+        {
             debug!("Client requested an unsupported 9P dialect, returning unknown");
             return Ok(Message::Rversion(Rversion {
                 msize: tv.msize,
@@ -983,14 +996,22 @@ impl NinePHandler {
         }
 
         let msize = tv.msize.min(P9_MAX_MSIZE);
-        let zerofs_protocol = requested == VERSION_9P2000L_ZEROFS;
+        let zerofs_protocol = requested != VERSION_9P2000L;
         let mut state = self.session_state();
         state.msize = msize;
         state.zerofs_protocol = zerofs_protocol;
 
+        let advertised = if zerofs_protocol {
+            match self.filesystem.name_mode() {
+                crate::fs::name_mode::NameMode::Sensitive => VERSION_9P2000L_ZEROFS,
+                crate::fs::name_mode::NameMode::Insensitive => VERSION_9P2000L_ZEROFS_CI,
+            }
+        } else {
+            VERSION_9P2000L
+        };
         Ok(Message::Rversion(Rversion {
             msize,
-            version: P9String::new(requested.to_vec()),
+            version: P9String::new(advertised.to_vec()),
         }))
     }
 
@@ -1257,6 +1278,7 @@ impl NinePHandler {
                 directory_pin,
                 replay_reopen,
                 lock_guard: None,
+                xattr: None,
             },
         );
         Ok(Message::Rrebind(Rrebind { qid }))
@@ -1399,6 +1421,10 @@ impl NinePHandler {
     // the client's lookup costs one round trip instead of walk + getattr. Unlike
     // Twalk there is no partial result. Any miss is a hard error.
     async fn walk_getattr(&self, tw: Twalkgetattr) -> P9Result<Message> {
+        self.walk_getattr_inner(tw, false).await
+    }
+
+    async fn walk_getattr_inner(&self, tw: Twalkgetattr, exact: bool) -> P9Result<Message> {
         let src_fid = self.get_fid(tw.fid)?;
 
         let mut current_path = src_fid.path;
@@ -1411,6 +1437,18 @@ impl NinePHandler {
             let child_id = self
                 .walk_component(&src_fid.creds, src_fid.root, current_id, &name_bytes)
                 .await?;
+            if exact
+                && self.filesystem.name_mode() == crate::fs::name_mode::NameMode::Insensitive
+                && !matches!(name_bytes.as_ref(), b"." | b"..")
+                && self
+                    .filesystem
+                    .directory_store
+                    .get_exact(current_id, &name_bytes)
+                    .await?
+                    != child_id
+            {
+                return Err(FsError::NotFound.into());
+            }
             let child_inode = self.filesystem.inode_store.get(child_id).await?;
             Self::step_path(&mut current_path, name_bytes, current_id, src_fid.root);
             wqids.push(inode_to_qid(&child_inode, child_id));
@@ -1599,11 +1637,12 @@ impl NinePHandler {
         }))
     }
 
-    async fn clunk(&self, tc: Tclunk) -> Message {
+    async fn clunk(&self, tc: Tclunk) -> P9Result<Message> {
         let slot = self.session_state().fids.remove(&tc.fid);
-        // Release resources outside the session lock.
-        drop(slot);
-        Message::Rclunk(Rclunk)
+        if let Some(slot) = slot {
+            self.commit_xattr(slot).await?;
+        }
+        Ok(Message::Rclunk(Rclunk))
     }
 
     /// Implicitly clunk every fid, as required by Tversion.
@@ -1630,6 +1669,9 @@ impl NinePHandler {
                         slot.handle.take(),
                         slot.directory_pin.take(),
                         slot.lock_guard.take(),
+                        slot.xattr
+                            .as_mut()
+                            .map(|xattr| std::mem::replace(xattr, XattrFid::Closed)),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1875,6 +1917,9 @@ impl NinePHandler {
     }
 
     async fn read(&self, tr: Tread) -> P9Result<Message> {
+        if let Some(result) = self.read_xattr(&tr) {
+            return result;
+        }
         let fid_entry = self.get_fid(tr.fid)?;
 
         if !fid_allows_read(&fid_entry) {
@@ -1903,6 +1948,9 @@ impl NinePHandler {
         op_id: crate::dedup::OpId,
         op_origin_epoch: u64,
     ) -> P9Result<Message> {
+        if let Some(result) = self.write_xattr(&tw) {
+            return result;
+        }
         let fid_entry = self.get_fid(tw.fid)?;
 
         if !fid_allows_write(&fid_entry) {
@@ -2800,6 +2848,39 @@ mod tests {
             attach(handler, 1, 1, b"test", aname, 1000).await.body,
             Message::Rattach(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn name_mode_selects_a_dialect_the_kernel_can_refuse() {
+        for mode in [
+            crate::fs::name_mode::NameMode::Sensitive,
+            crate::fs::name_mode::NameMode::Insensitive,
+        ] {
+            let fs = Arc::new(ZeroFS::new_in_memory_with_name_mode(mode).await.unwrap());
+            let handler = NinePHandler::new(fs, Arc::new(FileLockManager::new()));
+            let response = negotiate(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS).await;
+            let Message::Rversion(version) = response.body else {
+                panic!("expected version reply")
+            };
+            assert_eq!(
+                ninep_proto::kernel_dialect_supported(&version.version.data),
+                mode == crate::fs::name_mode::NameMode::Sensitive
+            );
+            assert_eq!(
+                version.version.data,
+                if mode == crate::fs::name_mode::NameMode::Sensitive {
+                    VERSION_9P2000L_ZEROFS
+                } else {
+                    VERSION_9P2000L_ZEROFS_CI
+                }
+            );
+            assert!(handler.zerofs_protocol_enabled());
+            let response = negotiate(&handler, DEFAULT_MSIZE, VERSION_9P2000L).await;
+            let Message::Rversion(version) = response.body else {
+                panic!("expected version reply")
+            };
+            assert_eq!(version.version.data, VERSION_9P2000L);
+        }
     }
 
     async fn start_plain_session(handler: &NinePHandler) {
@@ -3804,6 +3885,74 @@ mod tests {
             response.body,
             Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EOVERFLOW
         ));
+    }
+
+    #[tokio::test]
+    async fn exact_walk_preserves_folded_walks_and_execute_only_directories() {
+        use crate::fs::name_mode::NameMode;
+        use crate::fs::types::SetMode;
+        let fs = Arc::new(
+            ZeroFS::new_in_memory_with_name_mode(NameMode::Insensitive)
+                .await
+                .unwrap(),
+        );
+        let creds = test_creds();
+        let (directory, _) = fs
+            .mkdir(&creds, 0, b"Dir", &SetAttributes::default())
+            .await
+            .unwrap();
+        let (inode, _) = fs
+            .create(&creds, directory, b"Foo", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.link(&AuthContext::from(&creds), inode, directory, b"Other")
+            .await
+            .unwrap();
+        fs.setattr(
+            &creds,
+            directory,
+            &SetAttributes {
+                mode: SetMode::Set(0o111),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let handler = NinePHandler::new(fs.clone(), Arc::new(FileLockManager::new()));
+        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+        for (name, exact, found) in [
+            (b"Foo".as_slice(), true, true),
+            (b"foo", true, false),
+            (b"foo", false, true),
+            (b"Other", true, true),
+            (b"other", true, false),
+        ] {
+            let walk = Twalkgetattr {
+                fid: 1,
+                newfid: 2,
+                nwname: 2,
+                wnames: vec![P9String::new(b"Dir".to_vec()), P9String::new(name.to_vec())],
+            };
+            let body = if exact {
+                Message::Twalkgetattrexact(walk)
+            } else {
+                Message::Twalkgetattr(walk)
+            };
+            let response = request(&handler, 2, body).await;
+            if found {
+                assert!(
+                    matches!(response.body, Message::Rwalkgetattr(ref reply) if reply.stat.qid.path == inode),
+                    "{name:?}: {:?}",
+                    response.body
+                );
+                request(&handler, 3, Message::Tclunk(Tclunk { fid: 2 })).await;
+            } else {
+                assert!(
+                    matches!(response.body, Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::ENOENT)
+                );
+                assert!(handler.get_fid(2).is_err());
+            }
+        }
     }
 
     #[tokio::test]
@@ -5564,6 +5713,7 @@ mod tests {
                 directory_pin: None,
                 replay_reopen: false,
                 lock_guard: None,
+                xattr: None,
             },
         );
         assert_eq!(fs.open_handle_count(file_id), 1);

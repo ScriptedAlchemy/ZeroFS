@@ -139,9 +139,14 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("Password validation failed: {}", e))?;
 
         let db_path = Path::from(actual_db_path.clone());
-        let encryption_key =
-            key_management::load_or_init_encryption_key(&object_store, &db_path, &password, false)
-                .await?;
+        let encryption_key = key_management::load_or_init_encryption_key(
+            &object_store,
+            &db_path,
+            &password,
+            settings.name_mode(),
+            false,
+        )
+        .await?;
 
         let block_transformer: Arc<dyn BlockTransformer> =
             ZeroFsBlockTransformer::new_arc(&encryption_key, settings.compression());
@@ -720,6 +725,7 @@ mod tests {
             &remote,
             &Path::from(prefix.clone()),
             password,
+            settings.name_mode(),
             false,
         )
         .await

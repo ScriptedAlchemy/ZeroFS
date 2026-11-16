@@ -521,10 +521,12 @@ async fn upload_writeback_preflight(
 
 fn upload_fs_error(error: FsError) -> axum::response::Response {
     let status = match error {
-        FsError::NotFound | FsError::StaleHandle => StatusCode::NOT_FOUND,
+        FsError::NotFound | FsError::StaleHandle | FsError::NoData => StatusCode::NOT_FOUND,
         FsError::PermissionDenied
         | FsError::OperationNotPermitted
         | FsError::ReadOnlyFilesystem => StatusCode::FORBIDDEN,
+        FsError::TooBig => StatusCode::PAYLOAD_TOO_LARGE,
+        FsError::Range | FsError::NotSupported => StatusCode::BAD_REQUEST,
         FsError::Exists => StatusCode::CONFLICT,
         FsError::IsDirectory
         | FsError::NotDirectory

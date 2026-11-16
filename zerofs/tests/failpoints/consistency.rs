@@ -409,7 +409,7 @@ impl<'a> ConsistencyChecker<'a> {
         // (see `tests/failpoints/mod.rs`).
         Self {
             fs,
-            codec: KeyCodec::new(),
+            codec: KeyCodec::with_name_mode(fs.name_mode()),
             report: ConsistencyReport::default(),
             inode_refs: BTreeMap::new(),
             valid_inodes: BTreeSet::new(),
@@ -934,7 +934,7 @@ impl<'a> ConsistencyChecker<'a> {
                             cookie: *cookie,
                         });
                 } else if let Some(scan_name) = dir_scans.get(cookie)
-                    && scan_name != name
+                    && self.fs.name_mode().key(scan_name).as_ref() != name.as_slice()
                 {
                     self.report
                         .errors
@@ -948,8 +948,10 @@ impl<'a> ConsistencyChecker<'a> {
             }
 
             for (cookie, name) in &dir_scans {
-                let has_matching_entry =
-                    dir_entries.get(name).map(|c| c == cookie).unwrap_or(false);
+                let has_matching_entry = dir_entries
+                    .get(self.fs.name_mode().key(name).as_ref())
+                    .map(|c| c == cookie)
+                    .unwrap_or(false);
                 if !has_matching_entry {
                     self.report
                         .errors

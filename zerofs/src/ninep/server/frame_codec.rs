@@ -82,7 +82,7 @@ fn request_fid_footprint(type_byte: u8, body: &[u8]) -> FidFootprint {
             })
         }
 
-        8 | 12 | 14 | 16 | 18 | 22 | 24 | 26 | 40 | 50 | 52 | 54 | 72 | 76 | 116 | 118
+        8 | 12 | 14 | 16 | 18 | 22 | 24 | 26 | 32 | 40 | 50 | 52 | 54 | 72 | 76 | 116 | 118
         | TCLUNK_TYPE | 228 | 232 | 240 | 242 | 244 | 248 | 250 | 254 => fixed_one_fid(body),
         _ => FidFootprint::None,
     }

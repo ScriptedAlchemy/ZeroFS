@@ -30,6 +30,7 @@ use bytes::Bytes;
 //   0x07 TOMBSTONE     deferred-deletion entries, scanned only by GC
 //   0x08 ORPHAN        open-unlinked inodes pending reclaim, drained at startup
 //   0x09 SEGCOUNT      per-segment (live, total) byte counters, segid-keyed; drives segment GC reclaim
+//   0x0A XATTR         raw attribute bytes, keyed by inode and byte-exact name
 //   0xFE EXTENT        bulk file data — the only kind in the extent segment
 
 const PREFIX_INODE: u8 = 0x01;
@@ -41,6 +42,7 @@ const PREFIX_SYSTEM: u8 = 0x06;
 const PREFIX_TOMBSTONE: u8 = 0x07;
 const PREFIX_ORPHAN: u8 = 0x08;
 const PREFIX_SEGCOUNT: u8 = 0x09;
+const PREFIX_XATTR: u8 = 0x0A;
 const PREFIX_EXTENT: u8 = 0xFE;
 
 const SYSTEM_COUNTER_SUBTYPE: u8 = 0x01;
@@ -83,6 +85,7 @@ pub enum KeyPrefix {
     System,
     DirCookie,
     SegCount,
+    Xattr,
 }
 
 impl TryFrom<u8> for KeyPrefix {
@@ -100,6 +103,7 @@ impl TryFrom<u8> for KeyPrefix {
             PREFIX_SYSTEM => Ok(Self::System),
             PREFIX_DIR_COOKIE => Ok(Self::DirCookie),
             PREFIX_SEGCOUNT => Ok(Self::SegCount),
+            PREFIX_XATTR => Ok(Self::Xattr),
             _ => Err(()),
         }
     }
@@ -118,6 +122,7 @@ impl From<KeyPrefix> for u8 {
             KeyPrefix::System => PREFIX_SYSTEM,
             KeyPrefix::DirCookie => PREFIX_DIR_COOKIE,
             KeyPrefix::SegCount => PREFIX_SEGCOUNT,
+            KeyPrefix::Xattr => PREFIX_XATTR,
         }
     }
 }
@@ -135,6 +140,7 @@ impl KeyPrefix {
             Self::System => "SYSTEM",
             Self::DirCookie => "DIR_COOKIE",
             Self::SegCount => "SEGCOUNT",
+            Self::Xattr => "XATTR",
         }
     }
 
@@ -151,18 +157,27 @@ pub enum ParsedKey {
     DirScan { cookie: u64 },
     Tombstone { inode_id: InodeId },
     Orphan { inode_id: InodeId },
+    Xattr { inode_id: InodeId, name: Bytes },
     Unknown,
 }
 
-/// Per-volume key encoder/decoder. Stateless: every volume uses the segmented
-/// layout, a `b"meta"`/`b"extent"` domain prefix that the slatedb segment
-/// extractor routes on.
+/// Each volume uses segmented keys and its fixed filename lookup rule.
 #[derive(Debug, Clone, Default)]
-pub struct KeyCodec;
+pub struct KeyCodec {
+    name_mode: super::name_mode::NameMode,
+}
 
 impl KeyCodec {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    pub fn with_name_mode(name_mode: super::name_mode::NameMode) -> Self {
+        Self { name_mode }
+    }
+
+    pub(crate) fn name_key<'a>(&self, name: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        self.name_mode.key(name)
     }
 
     /// Number of bytes the domain prefix contributes for `prefix`.
@@ -290,12 +305,26 @@ impl KeyCodec {
         self.prefix_range(KeyPrefix::SegCount)
     }
 
+    pub fn xattr_prefix(&self, inode_id: InodeId) -> Bytes {
+        let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::Xattr) + U64_SIZE);
+        self.push_prefix(&mut key, KeyPrefix::Xattr);
+        key.extend_from_slice(&inode_id.to_be_bytes());
+        Bytes::from(key)
+    }
+
+    pub fn xattr_key(&self, inode_id: InodeId, name: &[u8]) -> Bytes {
+        let mut key = self.xattr_prefix(inode_id).to_vec();
+        key.extend_from_slice(name);
+        Bytes::from(key)
+    }
+
     pub fn dir_entry_key(&self, dir_id: InodeId, name: &[u8]) -> Bytes {
+        let name = self.name_key(name);
         let mut key =
             Vec::with_capacity(self.id_offset(KeyPrefix::DirEntry) + U64_SIZE + name.len());
         self.push_prefix(&mut key, KeyPrefix::DirEntry);
         key.extend_from_slice(&dir_id.to_be_bytes());
-        key.extend_from_slice(name);
+        key.extend_from_slice(&name);
         Bytes::from(key)
     }
 
@@ -505,6 +534,16 @@ impl KeyCodec {
         let id_off = self.id_offset(kind);
 
         match kind {
+            KeyPrefix::Xattr => {
+                let name_off = id_off + U64_SIZE;
+                if key.len() <= name_off || key.len() > name_off + 255 {
+                    return ParsedKey::Unknown;
+                }
+                ParsedKey::Xattr {
+                    inode_id: u64::from_be_bytes(key[id_off..name_off].try_into().unwrap()),
+                    name: Bytes::copy_from_slice(&key[name_off..]),
+                }
+            }
             KeyPrefix::DirScan => {
                 let expected = id_off + U64_SIZE * 2;
                 if key.len() != expected {

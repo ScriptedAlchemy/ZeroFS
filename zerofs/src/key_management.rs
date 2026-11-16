@@ -1,5 +1,6 @@
+use crate::fs::name_mode::NameMode;
 use crate::task::spawn_blocking_named;
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use argon2::{
     Algorithm, Argon2, Params, Version,
     password_hash::{PasswordHasher, SaltString},
@@ -32,6 +33,80 @@ pub struct WrappedDataKey {
     pub wrapped_dek: Vec<u8>,
     /// Version for future compatibility
     pub version: u32,
+}
+
+// The legacy decoder reads these bytes as a u64 string length and fails.
+const KEY_ENVELOPE_MAGIC: [u8; 8] = [0xff; 8];
+
+#[derive(Debug)]
+pub struct KeyEnvelope {
+    wrapped_key: WrappedDataKey,
+    version: u8,
+    name_mode: NameMode,
+}
+
+impl KeyEnvelope {
+    fn new(wrapped_key: WrappedDataKey, name_mode: NameMode) -> Self {
+        Self {
+            wrapped_key,
+            version: if name_mode == NameMode::Sensitive {
+                1
+            } else {
+                2
+            },
+            name_mode,
+        }
+    }
+
+    fn encode(&self) -> Result<Vec<u8>> {
+        let key = bincode::serialize(&self.wrapped_key)?;
+        if self.version == 1 {
+            return Ok(key);
+        }
+        let mut data = KEY_ENVELOPE_MAGIC.to_vec();
+        data.push(self.version);
+        data.push(match self.name_mode {
+            NameMode::Sensitive => 0,
+            NameMode::Insensitive => 1,
+        });
+        data.extend_from_slice(&key);
+        Ok(data)
+    }
+
+    fn decode(data: &[u8]) -> Result<Self> {
+        if !data.starts_with(&KEY_ENVELOPE_MAGIC) {
+            return Ok(Self::new(bincode::deserialize(data)?, NameMode::Sensitive));
+        }
+        let (&version, rest) = data[8..]
+            .split_first()
+            .context("missing key envelope version")?;
+        if version != 2 {
+            bail!("unknown key envelope version {version}");
+        }
+        let (&mode, key) = rest
+            .split_first()
+            .context("missing key envelope name mode")?;
+        let name_mode = match mode {
+            0 => NameMode::Sensitive,
+            1 => NameMode::Insensitive,
+            _ => bail!("unknown filesystem name mode {mode} in key envelope"),
+        };
+        Ok(Self {
+            wrapped_key: bincode::deserialize(key)?,
+            version,
+            name_mode,
+        })
+    }
+
+    fn check_mode(&self, configured: NameMode) -> Result<()> {
+        if self.name_mode != configured {
+            bail!(
+                "filesystem name mode mismatch: stored {:?}, configured {configured:?}; converting an existing filesystem is not supported",
+                self.name_mode
+            );
+        }
+        Ok(())
+    }
 }
 
 pub struct KeyManager {
@@ -172,13 +247,13 @@ fn wrapped_key_path(db_path: &Path) -> Path {
 pub async fn load_wrapped_key_from_object_store(
     object_store: &Arc<dyn ObjectStore>,
     db_path: &Path,
-) -> Result<Option<WrappedDataKey>> {
+) -> Result<Option<KeyEnvelope>> {
     let key_path = wrapped_key_path(db_path);
 
     match object_store.get(&key_path).await {
         Ok(result) => {
             let data = result.bytes().await?;
-            let wrapped_key: WrappedDataKey = bincode::deserialize(&data)
+            let wrapped_key = KeyEnvelope::decode(&data)
                 .map_err(|e| anyhow::anyhow!("Failed to deserialize wrapped key: {}", e))?;
             Ok(Some(wrapped_key))
         }
@@ -191,12 +266,13 @@ pub async fn load_wrapped_key_from_object_store(
 pub async fn save_wrapped_key_to_object_store(
     object_store: &Arc<dyn ObjectStore>,
     db_path: &Path,
-    wrapped_key: &WrappedDataKey,
+    wrapped_key: &KeyEnvelope,
 ) -> Result<()> {
     let key_path = wrapped_key_path(db_path);
 
-    let serialized = bincode::serialize(wrapped_key)
-        .map_err(|e| anyhow::anyhow!("Failed to serialize wrapped key: {}", e))?;
+    let serialized = wrapped_key
+        .encode()
+        .context("Failed to serialize wrapped key")?;
 
     object_store
         .put(&key_path, PutPayload::from(Bytes::from(serialized)))
@@ -211,11 +287,13 @@ pub(crate) async fn load_existing_encryption_key(
     object_store: &Arc<dyn ObjectStore>,
     db_path: &Path,
     password: &str,
+    name_mode: NameMode,
 ) -> Result<[u8; 32]> {
     let wrapped_key = load_wrapped_key_from_object_store(object_store, db_path)
         .await?
         .ok_or_else(|| anyhow::anyhow!("missing existing encryption key at {db_path}"))?;
-    unwrap_key_blocking(password, wrapped_key).await
+    wrapped_key.check_mode(name_mode)?;
+    unwrap_key_blocking(password, wrapped_key.wrapped_key).await
 }
 
 /// Load or initialize encryption key from object store.
@@ -227,10 +305,12 @@ pub async fn load_or_init_encryption_key(
     object_store: &Arc<dyn ObjectStore>,
     db_path: &Path,
     password: &str,
+    name_mode: NameMode,
     read_only: bool,
 ) -> Result<[u8; 32]> {
     if let Some(wrapped_key) = load_wrapped_key_from_object_store(object_store, db_path).await? {
-        return unwrap_key_blocking(password, wrapped_key).await;
+        wrapped_key.check_mode(name_mode)?;
+        return unwrap_key_blocking(password, wrapped_key.wrapped_key).await;
     }
 
     if read_only {
@@ -251,6 +331,7 @@ pub async fn load_or_init_encryption_key(
     .await
     .map_err(|e| anyhow::anyhow!("Task join error: {}", e))??;
 
+    let wrapped_key = KeyEnvelope::new(wrapped_key, name_mode);
     if save_wrapped_key_if_absent(object_store, db_path, &wrapped_key).await? {
         return Ok(dek);
     }
@@ -260,7 +341,8 @@ pub async fn load_or_init_encryption_key(
     let wrapped_key = load_wrapped_key_from_object_store(object_store, db_path)
         .await?
         .ok_or_else(|| anyhow::anyhow!("wrapped key disappeared right after a concurrent init"))?;
-    unwrap_key_blocking(password, wrapped_key).await
+    wrapped_key.check_mode(name_mode)?;
+    unwrap_key_blocking(password, wrapped_key.wrapped_key).await
 }
 
 /// Unwrap a wrapped DEK off the runtime (argon2 is CPU-heavy).
@@ -279,11 +361,12 @@ async fn unwrap_key_blocking(password: &str, wrapped_key: WrappedDataKey) -> Res
 async fn save_wrapped_key_if_absent(
     object_store: &Arc<dyn ObjectStore>,
     db_path: &Path,
-    wrapped_key: &WrappedDataKey,
+    wrapped_key: &KeyEnvelope,
 ) -> Result<bool> {
     let key_path = wrapped_key_path(db_path);
-    let serialized = bincode::serialize(wrapped_key)
-        .map_err(|e| anyhow::anyhow!("Failed to serialize wrapped key: {}", e))?;
+    let serialized = wrapped_key
+        .encode()
+        .context("Failed to serialize wrapped key")?;
     match object_store
         .put_opts(
             &key_path,
@@ -314,7 +397,10 @@ pub async fn change_encryption_password(
     let old_password = old_password.to_string();
     let new_password = new_password.to_string();
     let new_wrapped_key = spawn_blocking_named("argon2-rewrap", move || {
-        key_manager.rewrap_key(&old_password, &new_password, &wrapped_key)
+        let mut envelope = wrapped_key;
+        envelope.wrapped_key =
+            key_manager.rewrap_key(&old_password, &new_password, &envelope.wrapped_key)?;
+        Ok::<_, anyhow::Error>(envelope)
     })
     .map_err(|e| anyhow::anyhow!("Failed to spawn task: {}", e))?
     .await
@@ -328,6 +414,214 @@ pub async fn change_encryption_password(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn example_key() -> WrappedDataKey {
+        WrappedDataKey {
+            salt: "salt".into(),
+            nonce: [7; 24],
+            wrapped_dek: vec![9; 48],
+            version: 1,
+        }
+    }
+
+    #[test]
+    fn key_envelopes_fence_insensitive_and_preserve_legacy_bytes() {
+        let legacy = bincode::serialize(&example_key()).unwrap();
+        let sensitive = KeyEnvelope::new(example_key(), NameMode::Sensitive)
+            .encode()
+            .unwrap();
+        assert_eq!(legacy, sensitive);
+        assert_eq!(
+            KeyEnvelope::decode(&legacy).unwrap().name_mode,
+            NameMode::Sensitive
+        );
+        let insensitive = KeyEnvelope::new(example_key(), NameMode::Insensitive)
+            .encode()
+            .unwrap();
+        assert_eq!(
+            &insensitive[..10],
+            &[255, 255, 255, 255, 255, 255, 255, 255, 2, 1]
+        );
+        assert!(bincode::deserialize::<WrappedDataKey>(&insensitive).is_err());
+        let decoded = KeyEnvelope::decode(&insensitive).unwrap();
+        assert_eq!(decoded.version, 2);
+        assert_eq!(decoded.name_mode, NameMode::Insensitive);
+        assert_eq!(decoded.encode().unwrap(), insensitive);
+    }
+
+    #[tokio::test]
+    async fn invalid_envelopes_never_initialize_a_replacement() {
+        use crate::fault_store::FaultStore;
+        let (fault, controls) = FaultStore::new(store());
+        let store: Arc<dyn ObjectStore> = fault;
+        let path = Path::from("invalid");
+        let valid = KeyEnvelope::new(example_key(), NameMode::Insensitive)
+            .encode()
+            .unwrap();
+        let mut unknown_version = valid.clone();
+        unknown_version[8] = 3;
+        let mut unknown_mode = valid.clone();
+        unknown_mode[9] = 2;
+        for bytes in [
+            valid[..8].to_vec(),
+            valid[..9].to_vec(),
+            valid[..10].to_vec(),
+            unknown_version,
+            unknown_mode,
+            b"corrupt".to_vec(),
+        ] {
+            store
+                .put(&wrapped_key_path(&path), bytes.clone().into())
+                .await
+                .unwrap();
+            let puts = controls.put_count();
+            for read_only in [false, true] {
+                for mode in [NameMode::Sensitive, NameMode::Insensitive] {
+                    assert!(
+                        load_or_init_encryption_key(&store, &path, "pw", mode, read_only)
+                            .await
+                            .is_err()
+                    );
+                }
+            }
+            assert_eq!(controls.put_count(), puts);
+            assert_eq!(
+                store
+                    .get(&wrapped_key_path(&path))
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                bytes
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_different_modes_refuse_the_loser() {
+        use crate::fault_store::FaultStore;
+        let (fault, controls) = FaultStore::new(store());
+        let store: Arc<dyn ObjectStore> = fault;
+        controls.block_puts();
+        let mut tasks = Vec::new();
+        for mode in [NameMode::Sensitive, NameMode::Insensitive] {
+            let store = store.clone();
+            tasks.push(tokio::spawn(async move {
+                load_or_init_encryption_key(&store, &Path::from("race"), "pw", mode, false).await
+            }));
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while controls.put_count() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        controls.release_puts();
+        let a = tasks.remove(0).await.unwrap();
+        let b = tasks.remove(0).await.unwrap();
+        assert_ne!(a.is_ok(), b.is_ok());
+        let winner = load_wrapped_key_from_object_store(&store, &Path::from("race"))
+            .await
+            .unwrap()
+            .unwrap();
+        for (mode, result) in [(NameMode::Sensitive, a), (NameMode::Insensitive, b)] {
+            if mode == winner.name_mode {
+                let dek = result.unwrap();
+                assert_eq!(
+                    load_or_init_encryption_key(&store, &Path::from("race"), "pw", mode, true)
+                        .await
+                        .unwrap(),
+                    dek
+                );
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("name mode mismatch")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn password_rotation_preserves_each_envelope_format_and_mode() {
+        for (version, mode) in [
+            (1, NameMode::Sensitive),
+            (2, NameMode::Insensitive),
+            (2, NameMode::Sensitive),
+        ] {
+            let store = store();
+            let path = Path::from("rotation");
+            let (wrapped_key, dek) = KeyManager::new().generate_and_wrap_key("old").unwrap();
+            let envelope = KeyEnvelope {
+                wrapped_key,
+                version,
+                name_mode: mode,
+            };
+            save_wrapped_key_to_object_store(&store, &path, &envelope)
+                .await
+                .unwrap();
+            change_encryption_password(&store, &path, "old", "new")
+                .await
+                .unwrap();
+            let rotated = load_wrapped_key_from_object_store(&store, &path)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(rotated.version, version);
+            assert_eq!(rotated.name_mode, mode);
+            assert_eq!(
+                KeyManager::new()
+                    .unwrap_key("new", &rotated.wrapped_key)
+                    .unwrap(),
+                dek
+            );
+            assert!(
+                KeyManager::new()
+                    .unwrap_key("old", &rotated.wrapped_key)
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_and_mode_mismatch_never_write() {
+        use crate::fault_store::FaultStore;
+        let (fault, controls) = FaultStore::new(store());
+        let store: Arc<dyn ObjectStore> = fault;
+        let path = Path::from("modes");
+        for mode in [NameMode::Sensitive, NameMode::Insensitive] {
+            assert!(
+                load_or_init_encryption_key(&store, &path, "pw", mode, true)
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(controls.put_count(), 0);
+        for stored in [NameMode::Sensitive, NameMode::Insensitive] {
+            let envelope = KeyEnvelope::new(example_key(), stored);
+            save_wrapped_key_to_object_store(&store, &path, &envelope)
+                .await
+                .unwrap();
+            let puts = controls.put_count();
+            let wrong = if stored == NameMode::Sensitive {
+                NameMode::Insensitive
+            } else {
+                NameMode::Sensitive
+            };
+            for read_only in [false, true] {
+                let error = load_or_init_encryption_key(&store, &path, "pw", wrong, read_only)
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("name mode mismatch"));
+            }
+            assert_eq!(controls.put_count(), puts);
+        }
+    }
 
     #[test]
     fn test_key_wrap_unwrap() {
@@ -405,15 +699,15 @@ mod tests {
         let pw = "shared-cluster-password";
 
         let (ka, kb) = tokio::join!(
-            load_or_init_encryption_key(&store, &db_path, pw, false),
-            load_or_init_encryption_key(&store, &db_path, pw, false),
+            load_or_init_encryption_key(&store, &db_path, pw, NameMode::Sensitive, false),
+            load_or_init_encryption_key(&store, &db_path, pw, NameMode::Sensitive, false),
         );
         let ka = ka.expect("node A init");
         let kb = kb.expect("node B init");
         assert_eq!(ka, kb, "concurrent initializers must converge on one key");
 
         // A later loader gets that same committed key.
-        let kc = load_or_init_encryption_key(&store, &db_path, pw, false)
+        let kc = load_or_init_encryption_key(&store, &db_path, pw, NameMode::Sensitive, false)
             .await
             .expect("later load");
         assert_eq!(ka, kc, "a later load must return the committed key");
@@ -431,7 +725,7 @@ mod tests {
         let db_path = Path::from("data");
         let (old_pw, new_pw) = ("old-pw-123", "new-pw-456");
 
-        let dek = load_or_init_encryption_key(&store, &db_path, old_pw, false)
+        let dek = load_or_init_encryption_key(&store, &db_path, old_pw, NameMode::Sensitive, false)
             .await
             .unwrap();
 
@@ -440,14 +734,15 @@ mod tests {
             .unwrap();
 
         assert!(
-            load_or_init_encryption_key(&store, &db_path, old_pw, false)
+            load_or_init_encryption_key(&store, &db_path, old_pw, NameMode::Sensitive, false)
                 .await
                 .is_err(),
             "the old password must stop unwrapping the key"
         );
-        let dek2 = load_or_init_encryption_key(&store, &db_path, new_pw, false)
-            .await
-            .unwrap();
+        let dek2 =
+            load_or_init_encryption_key(&store, &db_path, new_pw, NameMode::Sensitive, false)
+                .await
+                .unwrap();
         assert_eq!(dek, dek2, "rotation must preserve the data key");
     }
 
@@ -464,9 +759,15 @@ mod tests {
     #[tokio::test]
     async fn read_only_init_without_a_key_errors() {
         let store = store();
-        let err = load_or_init_encryption_key(&store, &Path::from("data"), "pw", true)
-            .await
-            .unwrap_err();
+        let err = load_or_init_encryption_key(
+            &store,
+            &Path::from("data"),
+            "pw",
+            NameMode::Sensitive,
+            true,
+        )
+        .await
+        .unwrap_err();
         assert!(format!("{err:#}").contains("read-only"), "got: {err:#}");
     }
 
@@ -474,11 +775,11 @@ mod tests {
     async fn reload_with_wrong_password_errors() {
         let store = store();
         let db_path = Path::from("data");
-        load_or_init_encryption_key(&store, &db_path, "right", false)
+        load_or_init_encryption_key(&store, &db_path, "right", NameMode::Sensitive, false)
             .await
             .unwrap();
         assert!(
-            load_or_init_encryption_key(&store, &db_path, "wrong", false)
+            load_or_init_encryption_key(&store, &db_path, "wrong", NameMode::Sensitive, false)
                 .await
                 .is_err()
         );

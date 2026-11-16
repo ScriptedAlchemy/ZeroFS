@@ -165,9 +165,21 @@ All 9P clients send numeric identities to a server that trusts them. Keep UID an
 
 ZeroFS supports advisory POSIX byte-range locks from the native client, `zerofs mount`, and stock v9fs. Locks live in server memory and disappear when the server restarts or an HA takeover begins. ZeroFS clients attempt to reacquire recorded locks during reconnect, but another session can acquire a lock during the gap. These locks are not a distributed fencing mechanism.
 
+## Extended attributes
+
+ZeroFS supports extended attributes through standard 9P2000.L `Txattrwalk` and `Txattrcreate`, and through the `getxattr`, `listxattr`, `setxattr`, and `removexattr` callbacks in `zerofs mount`. Names are byte-exact even on a volume with case-insensitive filenames. Hardlinks share attributes.
+
+The core and 9P server accept names up to 255 bytes and values up to 2,097,152 bytes. Linux's own xattr limits apply to v9fs and FUSE mounts. Oversized values return `E2BIG`, missing attributes return `ENODATA`, and a nonzero read buffer that is too small returns `ERANGE`. A zero-size FUSE read returns the required size.
+
+The `user.*` namespace requires inode read permission for reads and write permission for changes, and is limited to regular files and directories. Only uid 0 may access `trusted.*` attributes. Anyone may read `security.*` attributes, but only uid 0 may change them. ZeroFS rejects `system.*` and unknown namespaces with `EOPNOTSUPP`.
+
+Attribute writes commit at clunk, which can return an error. A disconnect discards staged bytes that have not reached the clunk commit. A submitted commit may finish after disconnect. Linux uses a zero-size `Txattrcreate` with `XATTR_REPLACE` to remove an attribute, so that combination removes rather than stores an empty value. Flags zero or `XATTR_CREATE` can store an empty value.
+
+Attribute changes are not deduplicated across HA failover because clunk has no operation id. Retrying a successful create-only set can return `EEXIST`; retrying a removal can return `ENODATA`. If the clunk response is lost, read the attribute to determine whether the change committed. A later fsync covers completed attribute changes under the configured durability contract.
+
 ## Limitations
 
-- ZeroFS does not support extended attributes or POSIX ACLs over 9P.
+- ZeroFS does not enforce POSIX ACLs over 9P. The `system.*` attribute namespace is reserved.
 - Stock v9fs has no ZeroFS reconnect or compound-operation extensions and cannot send supplementary groups.
 - `zerofs mount` sends the caller's primary GID but not supplementary groups.
 - `zerofs mount` supports plain allocation, hole punching, and zero range through `fallocate`. Other allocation modes return `EOPNOTSUPP`.
