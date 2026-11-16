@@ -19,6 +19,29 @@ fn storage_readiness_startup_does_not_enumerate_object_entries() {
     assert_eq!(DIRECTORY_READS.with(Cell::get) - before, 0);
 }
 
+#[test]
+fn storage_readiness_startup_leaves_data_entry_symlinks_for_their_open_checks() {
+    let mut fixture = Fixture::new();
+    let pool_id = "00000000-0000-0000-0000-000000000001";
+    for directory in [
+        fixture.path("authority").join("manifest/nested"),
+        fixture
+            .path("member data")
+            .join(format!(".zerofs-pool/{pool_id}/objects/nested")),
+        fixture.path("journal").join("bucket_fixture/blobs/00"),
+    ] {
+        std::fs::create_dir_all(&directory).unwrap();
+        std::os::unix::fs::symlink(directory.join("missing"), directory.join("unchecked"))
+            .unwrap();
+    }
+    for strict in [true, false] {
+        fixture.document["storage"]["readiness"]["strict"] = json!(strict);
+        fixture.verify().unwrap();
+        verify_pool_paths(&fixture.parse().unwrap(), pool_id).unwrap();
+    }
+    verify_bucket_paths(&fixture.parse().unwrap(), "bucket_fixture").unwrap();
+}
+
 #[tokio::test]
 async fn storage_readiness_listing_inspects_only_the_requested_subtree() {
     let fixture = Fixture::new();
