@@ -223,18 +223,12 @@ impl StartupContext {
 
             info!("Loading or initializing encryption key from object store");
             let db_path = Path::from(actual_db_path.clone());
-            let name_mode = crate::name_mode_record::load_or_init(
-                &object_store,
-                &db_path,
-                settings.name_mode(),
-                db_mode.is_read_only(),
-            )
-            .await
-            .context("Failed to check filesystem name mode")?;
+            let name_mode = settings.name_mode();
             let encryption_key = key_management::load_or_init_encryption_key(
                 &object_store,
                 &db_path,
                 &password,
+                name_mode,
                 db_mode.is_read_only(),
             )
             .await
@@ -1334,6 +1328,7 @@ pub(crate) async fn load_existing_writeback_identity(
         object_store,
         &Path::from(database_prefix),
         &settings.storage.encryption_password,
+        settings.name_mode(),
     )
     .await
     .context("failed to load existing encryption key for writeback recovery")?;
@@ -1529,22 +1524,33 @@ mod role_decision_tests {
         let metadata = temp.path().join("metadata");
         std::fs::create_dir(&metadata).unwrap();
         let mut settings = crate::config::Settings::generate_default();
-        settings.storage.url = url::Url::from_directory_path(&metadata).unwrap().to_string();
+        settings.storage.url = url::Url::from_directory_path(&metadata)
+            .unwrap()
+            .to_string();
         settings.storage.encryption_password = "name-mode-startup-test".into();
         settings.cache.dir = temp.path().join("cache");
         settings.aws = None;
         settings.filesystem = Some(toml::from_str("name_mode = 'insensitive'").unwrap());
-        let startup = StartupContext::prepare(&settings, DatabaseMode::ReadWrite).await.unwrap();
+        let startup = StartupContext::prepare(&settings, DatabaseMode::ReadWrite)
+            .await
+            .unwrap();
         let bytes = std::fs::read(metadata.join("zerofs.key")).unwrap();
         assert!(bincode::deserialize::<crate::key_management::WrappedDataKey>(&bytes).is_err());
         crate::key_management::change_encryption_password(
-            &startup.object_store, &Path::from(""), &settings.storage.encryption_password, "new-name-mode-password"
-        ).await.unwrap();
+            &startup.object_store,
+            &Path::from(startup.actual_db_path.clone()),
+            &settings.storage.encryption_password,
+            "new-name-mode-password",
+        )
+        .await
+        .unwrap();
         let bytes = std::fs::read(metadata.join("zerofs.key")).unwrap();
         assert!(bincode::deserialize::<crate::key_management::WrappedDataKey>(&bytes).is_err());
         drop(startup);
         settings.storage.encryption_password = "new-name-mode-password".into();
-        let startup = StartupContext::prepare(&settings, DatabaseMode::ReadWrite).await.unwrap();
+        let startup = StartupContext::prepare(&settings, DatabaseMode::ReadWrite)
+            .await
+            .unwrap();
         drop(startup);
     }
 
@@ -1554,7 +1560,6 @@ mod role_decision_tests {
         let root = temp.path().canonicalize().unwrap();
         let metadata = root.join("metadata");
         std::fs::create_dir(&metadata).unwrap();
-        std::fs::write(metadata.join("zerofs.namemode"), [1, 1]).unwrap();
         let mut settings = crate::config::Settings::generate_default();
         settings.storage.url = url::Url::from_directory_path(&metadata)
             .unwrap()
@@ -1562,6 +1567,14 @@ mod role_decision_tests {
         settings.storage.encryption_password = "name-mode-startup-test".into();
         settings.cache.dir = root.join("cache");
         settings.aws = None;
+        settings.filesystem = Some(toml::from_str("name_mode = 'insensitive'").unwrap());
+        drop(
+            StartupContext::prepare(&settings, DatabaseMode::ReadWrite)
+                .await
+                .unwrap(),
+        );
+        let key_bytes = std::fs::read(metadata.join("zerofs.key")).unwrap();
+        settings.filesystem = None;
         settings.replication = Some(crate::config::ReplicationConfig {
             node_id: "mode-test-standby".into(),
             role: ReplicationRole::Standby,
@@ -1569,15 +1582,14 @@ mod role_decision_tests {
             replication_listen: Some("invalid-receiver-address".into()),
             force_recovery: false,
         });
-        let error = super::initialize_filesystem(&settings, DatabaseMode::ReadWrite)
-            .await
-            .err()
-            .unwrap();
-        assert!(
-            format!("{error:#}").contains("name mode mismatch"),
-            "{error:#}"
-        );
-        assert!(!metadata.join("zerofs.key").exists());
+        for mode in [DatabaseMode::ReadWrite, DatabaseMode::ReadOnly] {
+            let error = super::initialize_filesystem(&settings, mode)
+                .await
+                .err()
+                .unwrap();
+            assert!(format!("{error:#}").contains("name mode mismatch"), "{error:#}");
+            assert_eq!(std::fs::read(metadata.join("zerofs.key")).unwrap(), key_bytes);
+        }
         settings.filesystem = Some(toml::from_str("name_mode = 'insensitive'").unwrap());
         let error = super::initialize_filesystem(&settings, DatabaseMode::ReadWrite)
             .await
