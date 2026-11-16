@@ -1,9 +1,66 @@
 use super::collect::{self, xattr};
-use super::record::{Field, Filesystem, RawAcl, RawBytes, Reason, Timestamp, Xattr};
+use super::record::{
+    EntryKind, Field, Filesystem, RawAcl, RawBytes, Reason, Timestamp, TrustedXattrNamespace, Xattr,
+};
 use rustix::fd::{AsRawFd, BorrowedFd};
 use rustix::fs::{AtFlags, Stat, StatFs, StatxFlags, statx};
 use std::ffi::OsStr;
 use std::path::Path;
+
+pub(super) fn trusted_xattr_namespace() -> TrustedXattrNamespace {
+    let status = std::fs::read_to_string("/proc/self/status").ok();
+    let namespace = std::fs::read_link("/proc/self/ns/user").ok();
+    TrustedXattrNamespace {
+        visible: Some(trusted_visible(status.as_deref(), namespace.as_deref())),
+        probe: "Effective CAP_SYS_ADMIN, bit 21 of /proc/self/status CapEff, in the initial user namespace.",
+        user_namespace_policy: "Only Linux's reserved initial user namespace ID 4026531837 is accepted. Child or unrecognized namespaces and failed proc reads count as not visible.",
+    }
+}
+
+fn trusted_visible(status: Option<&str>, namespace: Option<&Path>) -> bool {
+    // Linux reserves PROC_USER_INIT_INO for the initial user namespace.
+    if namespace != Some(Path::new("user:[4026531837]")) {
+        return false;
+    }
+    status
+        .and_then(|s| s.lines().find_map(|line| line.strip_prefix("CapEff:")))
+        .and_then(|bits| u64::from_str_radix(bits.trim(), 16).ok())
+        .is_some_and(|bits| bits & (1 << 21) != 0)
+}
+
+pub(super) fn mount_id(parent: BorrowedFd<'_>, name: &OsStr, stat: &Stat) -> Field<u64> {
+    mount_id_result(
+        statx(
+            parent,
+            name,
+            AtFlags::SYMLINK_NOFOLLOW | AtFlags::NO_AUTOMOUNT | AtFlags::EMPTY_PATH,
+            StatxFlags::MNT_ID | StatxFlags::INO,
+        ),
+        stat,
+    )
+}
+
+fn mount_id_result(
+    result: Result<rustix::fs::Statx, rustix::io::Errno>,
+    stat: &Stat,
+) -> Field<u64> {
+    match result {
+        Ok(s) if s.stx_mask & StatxFlags::MNT_ID.bits() == 0 => {
+            Field::unavailable(Reason::MountIdUnavailable)
+        }
+        Ok(s)
+            if s.stx_ino != stat.st_ino
+                || rustix::fs::makedev(s.stx_dev_major, s.stx_dev_minor) != stat.st_dev =>
+        {
+            Field::unavailable(Reason::EntryChanged)
+        }
+        Ok(s) => Field::Observed(s.stx_mnt_id),
+        Err(error) => Field::Unavailable {
+            reason: Reason::MountIdUnavailable,
+            errno: Some(error.raw_os_error()),
+        },
+    }
+}
 
 pub(super) fn acl(fd: BorrowedFd<'_>) -> Field<Vec<RawAcl>> {
     acl_probes(|name| xattr(fd, OsStr::new(name)))
@@ -26,16 +83,18 @@ fn acl_probes(mut probe: impl FnMut(&str) -> Field<Option<RawBytes>>) -> Field<V
     )
 }
 
-pub(super) fn symlink_metadata(
+pub(super) fn path_metadata(
     parent: BorrowedFd<'_>,
     name: &OsStr,
+    kind: EntryKind,
 ) -> (Field<Vec<Xattr>>, Field<Vec<RawAcl>>) {
-    symlink_metadata_at(parent, name, Path::new("/proc/self/fd"))
+    path_metadata_at(parent, name, kind, Path::new("/proc/self/fd"))
 }
 
-fn symlink_metadata_at(
+fn path_metadata_at(
     parent: BorrowedFd<'_>,
     name: &OsStr,
+    kind: EntryKind,
     proc_fds: &Path,
 ) -> (Field<Vec<Xattr>>, Field<Vec<RawAcl>>) {
     let proc_parent = proc_fds.join(parent.as_raw_fd().to_string());
@@ -71,7 +130,7 @@ fn symlink_metadata_at(
         get,
     );
     let acl = acl_probes(|name| {
-        if name == "system.nfs4_acl_xdr" {
+        if kind != EntryKind::Symlink || name == "system.nfs4_acl_xdr" {
             get(OsStr::new(name))
         } else {
             Field::unavailable(Reason::NotApplicableOnPlatform)
@@ -151,6 +210,54 @@ mod tests {
     use rustix::fd::AsFd;
 
     #[test]
+    fn trusted_visibility_requires_initial_namespace_and_effective_capability() {
+        let initial = Some(Path::new("user:[4026531837]"));
+        assert!(trusted_visible(
+            Some("CapEff:\t0000000000200000\n"),
+            initial
+        ));
+        assert!(!trusted_visible(
+            Some("CapEff:\t0000000000000000\n"),
+            initial
+        ));
+        assert!(!trusted_visible(
+            Some("CapEff:\t0000000000200000\n"),
+            Some(Path::new("user:[1234]"))
+        ));
+        assert!(!trusted_visible(None, initial));
+        assert!(!trusted_visible(Some("CapEff:\tbad input\n"), initial));
+        assert!(!trusted_visible(Some("CapEff:\t0000000000200000\n"), None));
+    }
+
+    #[test]
+    fn missing_mount_id_is_incomplete() {
+        let fd = rustix::fs::open(
+            "/tmp",
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        let stat = rustix::fs::fstat(&fd).unwrap();
+        let mut observed = statx(
+            &fd,
+            "",
+            AtFlags::EMPTY_PATH,
+            StatxFlags::INO | StatxFlags::MNT_ID,
+        )
+        .unwrap();
+        observed.stx_mask &= !StatxFlags::MNT_ID.bits();
+        let missing = mount_id_result(Ok(observed), &stat);
+        assert_eq!(missing, Field::unavailable(Reason::MountIdUnavailable));
+        assert!(!missing.is_complete());
+        let unsupported = mount_id_result(Err(rustix::io::Errno::NOSYS), &stat);
+        assert!(!unsupported.is_complete());
+        assert_eq!(
+            serde_json::to_value(unsupported).unwrap()["errno"],
+            libc::ENOSYS
+        );
+    }
+
+    #[test]
     fn unsupported_inode_flags_are_complete() {
         let (socket, _) = std::os::unix::net::UnixStream::pair().unwrap();
         let flags = fd_flags(socket.as_fd());
@@ -172,9 +279,10 @@ mod tests {
             rustix::fs::Mode::empty(),
         )
         .unwrap();
-        let (xattrs, acl) = symlink_metadata_at(
+        let (xattrs, acl) = path_metadata_at(
             parent.as_fd(),
             OsStr::new("link"),
+            EntryKind::Symlink,
             Path::new("/proc/self/missing-fd-directory"),
         );
         assert!(matches!(

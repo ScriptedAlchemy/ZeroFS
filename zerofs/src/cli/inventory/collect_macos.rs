@@ -1,10 +1,20 @@
-use super::record::{Field, Filesystem, RawAcl, RawBytes, Reason, Timestamp};
+use super::record::{
+    Field, Filesystem, RawAcl, RawBytes, Reason, Timestamp, TrustedXattrNamespace,
+};
 use rustix::fd::{AsRawFd, BorrowedFd};
 use rustix::fs::{Stat, StatFs};
 use rustix::io::Errno;
 use std::ffi::{CStr, OsStr, c_char, c_int, c_void};
 
 const ACL_TYPE_EXTENDED: c_int = 0x100;
+
+pub(super) fn trusted_xattr_namespace() -> TrustedXattrNamespace {
+    TrustedXattrNamespace {
+        visible: None,
+        probe: "macOS has no trusted.* xattr namespace.",
+        user_namespace_policy: "not_applicable",
+    }
+}
 
 unsafe extern "C" {
     fn acl_get_fd_np(fd: c_int, acl_type: c_int) -> *mut c_void;

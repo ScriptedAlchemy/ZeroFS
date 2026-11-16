@@ -22,9 +22,18 @@ pub(crate) enum HashAlgorithm {
     Sha256,
 }
 
-pub(crate) fn run(root: &Path, hash: Option<HashAlgorithm>) -> Result<()> {
+pub(crate) fn run(
+    root: &Path,
+    hash: Option<HashAlgorithm>,
+    max_entries_per_second: Option<std::num::NonZeroU32>,
+) -> Result<()> {
     let stdout = std::io::stdout();
-    let complete = walk::inventory(root, hash.is_some(), std::io::BufWriter::new(stdout.lock()))?;
+    let complete = walk::inventory(
+        root,
+        hash.is_some(),
+        max_entries_per_second,
+        std::io::BufWriter::new(stdout.lock()),
+    )?;
     if !complete {
         std::process::exit(3);
     }

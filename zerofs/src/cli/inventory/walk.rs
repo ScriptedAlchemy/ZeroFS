@@ -10,8 +10,10 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io::{Read, Write};
+use std::num::NonZeroU32;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
@@ -27,13 +29,22 @@ struct Links {
 struct Walker<'a, W> {
     output: &'a mut Manifest<W>,
     root_dev: u64,
+    #[cfg(target_os = "linux")]
+    root_mount_id: Field<u64>,
+    trusted_namespace: Field<()>,
     hash: bool,
     tree_complete: bool,
     links: BTreeMap<(u64, u64), Links>,
-    derived: Vec<Record>,
+    noatime_fallback: bool,
+    pacer: Pacer,
 }
 
-pub(super) fn inventory(root: &Path, hash: bool, writer: impl Write) -> Result<bool> {
+pub(super) fn inventory(
+    root: &Path,
+    hash: bool,
+    max_entries_per_second: Option<NonZeroU32>,
+    writer: impl Write,
+) -> Result<bool> {
     // A trailing slash must not bypass O_NOFOLLOW on the final component.
     let raw = root.as_os_str().as_bytes();
     let end = raw
@@ -46,7 +57,8 @@ pub(super) fn inventory(root: &Path, hash: bool, writer: impl Write) -> Result<b
     if kind(&before) != EntryKind::Directory {
         bail!("inventory root must be a directory, not a symlink or file");
     }
-    let root_fd = fs::open(path, DIRECTORY_FLAGS, Mode::empty())
+    let mut noatime_fallback = false;
+    let root_fd = openat(fs::CWD, path, DIRECTORY_FLAGS, &mut noatime_fallback)
         .context("open inventory root without following symlinks")?;
     let opened = fs::fstat(&root_fd).context("stat opened inventory root")?;
     if !same_version(&before, &opened) {
@@ -57,40 +69,93 @@ pub(super) fn inventory(root: &Path, hash: bool, writer: impl Write) -> Result<b
         Ok(stats) => Field::Observed(platform::filesystem(&stats)),
         Err(error) => Field::error(error),
     };
+    let trusted_namespace = platform::trusted_xattr_namespace();
+    let mut entry = stat_entry(
+        Vec::new(),
+        &before,
+        root_fd.as_fd(),
+        OsStr::new("."),
+        trusted_namespace.scope(),
+    );
     output.emit(&Record::Header(Header {
-        schema: 1,
+        schema: 2,
         tool_version: env!("CARGO_PKG_VERSION"),
         collector: std::env::consts::OS,
         root: RawBytes::new(raw),
         root_identity: Field::Observed(identity(&before)),
         filesystem,
+        trusted_xattr_namespace: trusted_namespace,
+        mount_boundary_detection: if cfg!(target_os = "linux") {
+            "Device number and STATX_MNT_ID. Missing mount IDs prevent reads and descent."
+        } else {
+            "Device number only. Mounts retaining the same device number cannot be identified."
+        },
         hashing: if hash { "sha256" } else { "not_requested" },
         collision_rules: super::collision::RULES,
-        atime_notice: "Times are sampled before opening entries. Reads may update atime; only a read-only mount prevents this. This is not a filesystem snapshot.",
+        atime_notice: "Times are sampled before opening entries. Linux requests O_NOATIME and retries on EPERM. Symlink reads and fallback opens may update atime. macOS reads may update atime. Only a read-only mount prevents updates. This is not a filesystem snapshot.",
+        noatime_requested: cfg!(target_os = "linux"),
+        noatime_fallback,
     }))?;
     let mut walker = Walker {
         output: &mut output,
         root_dev: identity(&before).dev,
+        #[cfg(target_os = "linux")]
+        root_mount_id: entry.mount_id.clone(),
+        trusted_namespace: entry.xattrs.trusted_namespace.clone(),
         hash,
         tree_complete: true,
         links: BTreeMap::new(),
-        derived: Vec::new(),
+        noatime_fallback,
+        pacer: Pacer::new(max_entries_per_second),
     };
-    let mut entry = stat_entry(Vec::new(), &before, root_fd.as_fd(), OsStr::new("."));
-    walker.collect_fd(&mut entry, root_fd.as_fd(), EntryKind::Directory);
-    walker.output.emit(&Record::Entry(Box::new(entry)))?;
-    walker.directory(root_fd.as_fd(), &[])?;
-    walker.check_directory(root_fd.as_fd(), &[], &before);
+    walker.pacer.wait();
+    if let Some(reason) = walker.boundary_reason(&entry) {
+        walker.skip_boundary(entry, reason)?;
+    } else {
+        walker.collect_fd(&mut entry, root_fd.as_fd(), EntryKind::Directory);
+        walker.output.emit(&Record::Entry(Box::new(entry)))?;
+        walker.directory(root_fd.as_fd(), &[])?;
+        walker.check_directory(root_fd.as_fd(), &[], &before)?;
+    }
     walker.finish()?;
     output.finish()
 }
 
 impl<W: Write> Walker<'_, W> {
+    fn boundary_reason(&self, entry: &Entry) -> Option<Reason> {
+        if matches!(entry.identity, Field::Observed(id) if id.dev != self.root_dev) {
+            return Some(Reason::MountBoundary);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            match (&self.root_mount_id, &entry.mount_id) {
+                (Field::Observed(root), Field::Observed(child)) if root == child => None,
+                (Field::Observed(_), Field::Observed(_)) => Some(Reason::MountBoundary),
+                _ => Some(Reason::MountIdUnavailable),
+            }
+        }
+        #[cfg(target_os = "macos")]
+        None
+    }
+
+    fn skip_boundary(&mut self, mut entry: Entry, reason: Reason) -> Result<()> {
+        self.tree_complete = false;
+        let path = entry.path.clone();
+        let identity = entry.identity.clone();
+        invalidate_reads(&mut entry, reason);
+        self.output.emit(&Record::Entry(Box::new(entry)))?;
+        self.output.emit(&Record::MountBoundary {
+            path,
+            identity,
+            error: Field::unavailable(reason),
+        })
+    }
+
     fn directory(&mut self, fd: BorrowedFd<'_>, path: &[u8]) -> Result<()> {
-        let names = match names(fd) {
+        let names = match names(fd, &mut self.noatime_fallback) {
             Ok(names) => names,
             Err(error) => {
-                self.unreadable(path, error);
+                self.unreadable(path, error)?;
                 return Ok(());
             }
         };
@@ -99,11 +164,11 @@ impl<W: Write> Walker<'_, W> {
             .filter(|n| std::str::from_utf8(n).is_err())
             .count() as u64;
         for (rule, group) in super::collision::collisions(&names) {
-            self.derived.push(Record::NameCollision(NameCollision {
+            self.output.emit(&Record::NameCollision(NameCollision {
                 dir: RawBytes::new(path),
                 rule,
                 names: group.iter().map(|n| RawBytes::new(n)).collect(),
-            }));
+            }))?;
         }
         for name in names {
             let child = join(path, &name);
@@ -113,41 +178,39 @@ impl<W: Write> Walker<'_, W> {
     }
 
     fn entry(&mut self, parent: BorrowedFd<'_>, name: &OsStr, path: Vec<u8>) -> Result<()> {
+        self.pacer.wait();
         let before = match fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(stat) => stat,
             Err(error) => {
-                let entry = failed_entry(&path, error);
+                let entry = failed_entry(&path, error, self.trusted_namespace.clone());
                 self.tree_complete &= entry.kind.is_complete();
                 self.output.emit(&Record::Entry(Box::new(entry)))?;
                 return Ok(());
             }
         };
         let entry_kind = kind(&before);
-        let mut entry = stat_entry(path.clone(), &before, parent, name);
-        if identity(&before).dev != self.root_dev {
-            self.tree_complete &= Reason::MountBoundary.counts_as_complete();
-            entry.xattrs = Field::unavailable(Reason::MountBoundary);
-            entry.acl = Field::unavailable(Reason::MountBoundary);
-            entry.data_extents = Field::unavailable(Reason::MountBoundary);
-            #[cfg(target_os = "linux")]
-            if matches!(entry_kind, EntryKind::File | EntryKind::Directory) {
-                entry.platform_flags = Field::unavailable(Reason::MountBoundary);
-            }
-            self.output.emit(&Record::Entry(Box::new(entry)))?;
-            self.derived.push(Record::MountBoundary {
-                path: RawBytes::new(&path),
-                identity: Field::Observed(identity(&before)),
-                error: Field::unavailable(Reason::MountBoundary),
-            });
-            return Ok(());
+        let mut entry = stat_entry(
+            path.clone(),
+            &before,
+            parent,
+            name,
+            self.trusted_namespace.clone(),
+        );
+        if let Some(reason) = self.boundary_reason(&entry) {
+            return self.skip_boundary(entry, reason);
         }
         let fd = match entry_kind {
-            EntryKind::Directory => Some(fs::openat(parent, name, DIRECTORY_FLAGS, Mode::empty())),
-            EntryKind::File => Some(fs::openat(
+            EntryKind::Directory => Some(openat(
+                parent,
+                name,
+                DIRECTORY_FLAGS,
+                &mut self.noatime_fallback,
+            )),
+            EntryKind::File => Some(openat(
                 parent,
                 name,
                 OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-                Mode::empty(),
+                &mut self.noatime_fallback,
             )),
             #[cfg(target_os = "macos")]
             EntryKind::Symlink => Some(fs::openat(
@@ -160,20 +223,25 @@ impl<W: Write> Walker<'_, W> {
         };
         let fd = match fd {
             Some(Ok(fd)) => match fs::fstat(&fd) {
-                Ok(opened) if same_version(&before, &opened) => Some(fd),
+                Ok(opened)
+                    if same_version(&before, &opened)
+                        && same_mount(&entry, fd.as_fd(), OsStr::new(""), &opened) =>
+                {
+                    Some(fd)
+                }
                 Ok(_) => {
-                    self.changed(&path);
+                    self.changed(&path)?;
                     invalidate_reads(&mut entry, Reason::EntryChanged);
                     self.output.emit(&Record::Entry(Box::new(entry)))?;
                     return Ok(());
                 }
                 Err(error) => {
-                    self.open_failed(&mut entry, entry_kind, &path, error);
+                    self.open_failed(&mut entry, entry_kind, &path, error)?;
                     None
                 }
             },
             Some(Err(error)) => {
-                self.open_failed(&mut entry, entry_kind, &path, error);
+                self.open_failed(&mut entry, entry_kind, &path, error)?;
                 None
             }
             None => None,
@@ -181,11 +249,19 @@ impl<W: Write> Walker<'_, W> {
         if let Some(fd) = &fd {
             self.collect_fd(&mut entry, fd.as_fd(), entry_kind);
         }
-        if entry_kind == EntryKind::Symlink {
+        if !matches!(entry_kind, EntryKind::Directory | EntryKind::File) {
             #[cfg(target_os = "linux")]
             {
-                (entry.xattrs, entry.acl) = platform::symlink_metadata(parent, name);
+                (entry.xattrs.listing, entry.acl) =
+                    platform::path_metadata(parent, name, entry_kind);
             }
+            #[cfg(target_os = "macos")]
+            if entry_kind != EntryKind::Symlink {
+                entry.xattrs.listing = Field::unavailable(Reason::NotImplementedOnPlatform);
+                entry.acl = Field::unavailable(Reason::NotImplementedOnPlatform);
+            }
+        }
+        if entry_kind == EntryKind::Symlink {
             entry.symlink_target = match fs::readlinkat(parent, name, Vec::new()) {
                 Ok(target) => Field::Observed(RawBytes::new(target.to_bytes())),
                 Err(error) => Field::error(error),
@@ -196,11 +272,15 @@ impl<W: Write> Walker<'_, W> {
         } else {
             fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
         };
-        let stable = matches!(&after, Ok(after) if same_version(&before, after))
-            && (entry_kind != EntryKind::Symlink
-                || matches!(fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW), Ok(after) if same_version(&before, &after)));
+        let stable = matches!(&after, Ok(after) if same_version(&before, after)
+        && if let Some(fd) = &fd {
+            same_mount(&entry, fd.as_fd(), OsStr::new(""), after)
+        } else {
+            same_mount(&entry, parent, name, after)
+        }) && (entry_kind != EntryKind::Symlink
+            || matches!(fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW), Ok(after) if same_version(&before, &after)));
         if !stable {
-            self.changed(&path);
+            self.changed(&path)?;
             invalidate_reads(&mut entry, Reason::EntryChanged);
         }
         if entry_kind != EntryKind::Directory && before.st_nlink > 1 {
@@ -219,13 +299,13 @@ impl<W: Write> Walker<'_, W> {
             && let Some(fd) = fd
         {
             self.directory(fd.as_fd(), &path)?;
-            self.check_directory(fd.as_fd(), &path, &before);
+            self.check_directory(fd.as_fd(), &path, &before)?;
         }
         Ok(())
     }
 
     fn collect_fd(&self, entry: &mut Entry, fd: BorrowedFd<'_>, kind: EntryKind) {
-        entry.xattrs = collect::xattrs(fd);
+        entry.xattrs.listing = collect::xattrs(fd);
         entry.acl = platform::acl(fd);
         #[cfg(target_os = "linux")]
         {
@@ -241,8 +321,14 @@ impl<W: Write> Walker<'_, W> {
         }
     }
 
-    fn open_failed(&mut self, entry: &mut Entry, kind: EntryKind, path: &[u8], error: Errno) {
-        entry.xattrs = Field::error(error);
+    fn open_failed(
+        &mut self,
+        entry: &mut Entry,
+        kind: EntryKind,
+        path: &[u8],
+        error: Errno,
+    ) -> Result<()> {
+        entry.xattrs.listing = Field::error(error);
         entry.acl = Field::error(error);
         #[cfg(target_os = "linux")]
         {
@@ -255,31 +341,33 @@ impl<W: Write> Walker<'_, W> {
             }
         }
         if kind == EntryKind::Directory {
-            self.unreadable(path, error);
+            self.unreadable(path, error)?;
         }
+        Ok(())
     }
 
-    fn unreadable(&mut self, path: &[u8], error: Errno) {
+    fn unreadable(&mut self, path: &[u8], error: Errno) -> Result<()> {
         let error = Field::error(error);
         self.tree_complete &= error.is_complete();
-        self.derived.push(Record::DirectoryUnreadable {
+        self.output.emit(&Record::DirectoryUnreadable {
             path: RawBytes::new(path),
             error,
-        });
+        })
     }
 
-    fn changed(&mut self, path: &[u8]) {
+    fn changed(&mut self, path: &[u8]) -> Result<()> {
         self.tree_complete &= Reason::EntryChanged.counts_as_complete();
-        self.derived.push(Record::EntryChanged {
+        self.output.emit(&Record::EntryChanged {
             path: RawBytes::new(path),
             error: Field::unavailable(Reason::EntryChanged),
-        });
+        })
     }
 
-    fn check_directory(&mut self, fd: BorrowedFd<'_>, path: &[u8], before: &Stat) {
+    fn check_directory(&mut self, fd: BorrowedFd<'_>, path: &[u8], before: &Stat) -> Result<()> {
         if !matches!(fs::fstat(fd), Ok(after) if same_version(before, &after)) {
-            self.changed(path);
+            self.changed(path)?;
         }
+        Ok(())
     }
 
     fn finish(self) -> Result<()> {
@@ -304,15 +392,54 @@ impl<W: Write> Walker<'_, W> {
                 links_outside_tree: outside,
             }))?;
         }
-        for record in self.derived {
-            self.output.emit(&record)?;
-        }
-        Ok(())
+        self.output.emit(&Record::HeaderUpdate {
+            noatime_fallback: self.noatime_fallback,
+        })
     }
 }
 
-fn names(fd: BorrowedFd<'_>) -> Result<Vec<Vec<u8>>, Errno> {
-    let scan = fs::openat(fd, ".", DIRECTORY_FLAGS, Mode::empty())?;
+struct Pacer {
+    interval: Option<Duration>,
+    previous: Option<Instant>,
+}
+
+impl Pacer {
+    fn new(rate: Option<NonZeroU32>) -> Self {
+        Self {
+            interval: rate
+                .map(|n| Duration::from_nanos(1_000_000_000_u64.div_ceil(n.get().into()))),
+            previous: None,
+        }
+    }
+
+    fn wait(&mut self) {
+        if let Some(interval) = self.interval {
+            if let Some(previous) = self.previous {
+                std::thread::sleep(interval.saturating_sub(previous.elapsed()));
+            }
+            self.previous = Some(Instant::now());
+        }
+    }
+}
+
+fn openat(
+    parent: BorrowedFd<'_>,
+    name: &OsStr,
+    flags: OFlags,
+    noatime_fallback: &mut bool,
+) -> Result<OwnedFd, Errno> {
+    #[cfg(target_os = "linux")]
+    match fs::openat(parent, name, flags | OFlags::NOATIME, Mode::empty()) {
+        Err(Errno::PERM) => *noatime_fallback = true,
+        result => return result,
+    }
+    #[cfg(target_os = "macos")]
+    let _ = noatime_fallback;
+    fs::openat(parent, name, flags, Mode::empty())
+}
+
+fn names(fd: BorrowedFd<'_>, noatime_fallback: &mut bool) -> Result<Vec<Vec<u8>>, Errno> {
+    let scan = openat(fd, OsStr::new("."), DIRECTORY_FLAGS, noatime_fallback)?;
     let directory = Dir::new(scan)?;
     let mut names = Vec::new();
     for entry in directory {
@@ -357,11 +484,19 @@ fn identity(stat: &Stat) -> Identity {
 }
 
 #[allow(clippy::unnecessary_cast)]
-fn stat_entry(path: Vec<u8>, stat: &Stat, parent: BorrowedFd<'_>, name: &OsStr) -> Entry {
+fn stat_entry(
+    path: Vec<u8>,
+    stat: &Stat,
+    parent: BorrowedFd<'_>,
+    name: &OsStr,
+    trusted_namespace: Field<()>,
+) -> Entry {
     Entry {
         path: RawBytes::new(&path),
         kind: Field::Observed(kind(stat)),
         identity: Field::Observed(identity(stat)),
+        #[cfg(target_os = "linux")]
+        mount_id: platform::mount_id(parent, name, stat),
         nlink: Field::Observed(stat.st_nlink as u64),
         owner: Field::Observed(Owner {
             uid: stat.st_uid,
@@ -389,7 +524,10 @@ fn stat_entry(path: Vec<u8>, stat: &Stat, parent: BorrowedFd<'_>, name: &OsStr) 
         platform_flags: platform::flags(stat),
         data_extents: Field::unavailable(Reason::NotCollectedForKind),
         symlink_target: Field::unavailable(Reason::NotCollectedForKind),
-        xattrs: Field::unavailable(Reason::NotCollectedForKind),
+        xattrs: Xattrs {
+            listing: Field::unavailable(Reason::NotCollectedForKind),
+            trusted_namespace,
+        },
         acl: Field::unavailable(Reason::NotCollectedForKind),
         content_sha256: Field::unavailable(if kind(stat) == EntryKind::File {
             Reason::NotRequested
@@ -399,11 +537,13 @@ fn stat_entry(path: Vec<u8>, stat: &Stat, parent: BorrowedFd<'_>, name: &OsStr) 
     }
 }
 
-fn failed_entry(path: &[u8], error: Errno) -> Entry {
+fn failed_entry(path: &[u8], error: Errno, trusted_namespace: Field<()>) -> Entry {
     Entry {
         path: RawBytes::new(path),
         kind: Field::error(error),
         identity: Field::error(error),
+        #[cfg(target_os = "linux")]
+        mount_id: Field::error(error),
         nlink: Field::error(error),
         owner: Field::error(error),
         mode: Field::error(error),
@@ -415,7 +555,10 @@ fn failed_entry(path: &[u8], error: Errno) -> Entry {
         symlink_target: Field::error(error),
         rdev: Field::error(error),
         platform_flags: Field::error(error),
-        xattrs: Field::error(error),
+        xattrs: Xattrs {
+            listing: Field::error(error),
+            trusted_namespace,
+        },
         acl: Field::error(error),
         content_sha256: Field::error(error),
     }
@@ -429,11 +572,21 @@ fn invalidate_reads(entry: &mut Entry, reason: Reason) {
     ) {
         entry.platform_flags = Field::unavailable(reason);
     }
-    entry.xattrs = Field::unavailable(reason);
+    entry.xattrs.listing = Field::unavailable(reason);
     entry.acl = Field::unavailable(reason);
     entry.data_extents = Field::unavailable(reason);
     entry.symlink_target = Field::unavailable(reason);
     entry.content_sha256 = Field::unavailable(reason);
+}
+
+#[cfg(target_os = "linux")]
+fn same_mount(entry: &Entry, parent: BorrowedFd<'_>, name: &OsStr, stat: &Stat) -> bool {
+    platform::mount_id(parent, name, stat) == entry.mount_id
+}
+
+#[cfg(target_os = "macos")]
+fn same_mount(_entry: &Entry, _parent: BorrowedFd<'_>, _name: &OsStr, _stat: &Stat) -> bool {
+    true
 }
 
 // Reading the source may update its access time, so the comparison excludes it.

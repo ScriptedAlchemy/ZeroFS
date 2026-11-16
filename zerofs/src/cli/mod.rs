@@ -41,6 +41,9 @@ pub enum Commands {
         /// Read regular file contents to compute SHA-256 (disabled by default)
         #[arg(long, value_enum)]
         hash: Option<inventory::HashAlgorithm>,
+        /// Limit entry starts per second (unlimited by default)
+        #[arg(long)]
+        max_entries_per_second: Option<std::num::NonZeroU32>,
     },
     /// Upload a file or directory directly over ZeroFS 9P
     Upload {

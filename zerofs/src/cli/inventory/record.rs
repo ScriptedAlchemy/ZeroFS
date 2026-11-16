@@ -34,8 +34,10 @@ pub(crate) enum Reason {
     NotSupportedByFilesystem,
     FormatNotSupportedByFilesystem,
     NotImplementedOnPlatform,
-    #[cfg(target_os = "linux")]
     NotApplicableOnPlatform,
+    TrustedNamespaceNotVisible,
+    #[cfg(target_os = "linux")]
+    MountIdUnavailable,
     #[cfg(target_os = "linux")]
     ProcFdUnavailable,
     NotCollectedForKind,
@@ -49,15 +51,14 @@ pub(crate) enum Reason {
 
 impl Reason {
     pub(super) fn counts_as_complete(self) -> bool {
-        match self {
+        matches!(
+            self,
             Self::NotCollectedForKind
-            | Self::NotRequested
-            | Self::NotDecoded
-            | Self::FormatNotSupportedByFilesystem => true,
-            #[cfg(target_os = "linux")]
-            Self::NotApplicableOnPlatform => true,
-            _ => false,
-        }
+                | Self::NotRequested
+                | Self::NotDecoded
+                | Self::FormatNotSupportedByFilesystem
+                | Self::NotApplicableOnPlatform
+        )
     }
 }
 
@@ -176,6 +177,30 @@ pub(crate) struct Xattr {
     pub value: Field<RawBytes>,
 }
 
+#[derive(Debug, Serialize)]
+pub(crate) struct Xattrs {
+    #[serde(flatten)]
+    pub listing: Field<Vec<Xattr>>,
+    pub trusted_namespace: Field<()>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct TrustedXattrNamespace {
+    pub visible: Option<bool>,
+    pub probe: &'static str,
+    pub user_namespace_policy: &'static str,
+}
+
+impl TrustedXattrNamespace {
+    pub(super) fn scope(&self) -> Field<()> {
+        match self.visible {
+            Some(true) => Field::Observed(()),
+            Some(false) => Field::unavailable(Reason::TrustedNamespaceNotVisible),
+            None => Field::unavailable(Reason::NotApplicableOnPlatform),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct RawAcl {
     pub format: &'static str,
@@ -188,6 +213,8 @@ pub(crate) struct Entry {
     pub path: RawBytes,
     pub kind: Field<EntryKind>,
     pub identity: Field<Identity>,
+    #[cfg(target_os = "linux")]
+    pub mount_id: Field<u64>,
     pub nlink: Field<u64>,
     pub owner: Field<Owner>,
     pub mode: Field<u32>,
@@ -199,7 +226,7 @@ pub(crate) struct Entry {
     pub symlink_target: Field<RawBytes>,
     pub rdev: Field<u64>,
     pub platform_flags: Field<u32>,
-    pub xattrs: Field<Vec<Xattr>>,
+    pub xattrs: Xattrs,
     pub acl: Field<Vec<RawAcl>>,
     pub content_sha256: Field<String>,
 }
@@ -219,9 +246,13 @@ pub(crate) struct Header {
     pub root: RawBytes,
     pub root_identity: Field<Identity>,
     pub filesystem: Field<Filesystem>,
+    pub trusted_xattr_namespace: TrustedXattrNamespace,
+    pub mount_boundary_detection: &'static str,
     pub hashing: &'static str,
     pub collision_rules: [&'static str; 2],
     pub atime_notice: &'static str,
+    pub noatime_requested: bool,
+    pub noatime_fallback: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -252,6 +283,9 @@ pub(crate) struct Summary {
 #[serde(tag = "record", rename_all = "snake_case")]
 pub(crate) enum Record {
     Header(Header),
+    HeaderUpdate {
+        noatime_fallback: bool,
+    },
     Entry(Box<Entry>),
     HardlinkGroup(HardlinkGroup),
     NameCollision(NameCollision),
