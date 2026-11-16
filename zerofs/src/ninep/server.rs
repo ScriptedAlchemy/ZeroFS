@@ -2655,7 +2655,9 @@ mod tests {
             );
             let directory = filesystem
                 .mkdir(
-                    &crate::fs::test_util::test_creds(),
+                    &Credentials::from_auth_context(
+                        &(&crate::test_helpers::test_helpers_mod::test_auth()).into(),
+                    ),
                     0,
                     b"Dir",
                     &crate::fs::types::SetAttributes::default(),
