@@ -257,7 +257,7 @@ pinned `object_store` 0.14.1 and `foyer-storage` 0.22.3 sources.
 | --- | --- |
 | Authority and member writes and reads | `zerofs/src/local_object_store.rs:189`, `:263`, and `:268`. Native file opens are at `object_store/src/local.rs:1069`, `:1363`, and `:506`. |
 | Authority and member deletion, copying, and renaming | `zerofs/src/local_object_store.rs:273`, `:327`, and `:345`. Native unlink, link, and rename calls are at `object_store/src/local.rs:780`, `:652`, `:971`, and `:955`. |
-| Object listing directory walks and metadata reads | `zerofs/src/local_object_store/listing.rs:126`, `:30`, and `:68`. |
+| Object listing directory walks and metadata reads | `zerofs/src/local_object_store/listing.rs:127`, `:34`, and `:72`. |
 | Native directory creation, mutation locks, and directory sync opens | `zerofs/src/local_object_store.rs:125`, `:150`, and `:108`. The native backend also creates parents and syncs directories at `object_store/src/local.rs:924` and `:1051`. |
 | Multipart staging, publication, abort, and destructor cleanup | `zerofs/src/local_object_store.rs:239`, `:433`, and `:455`; `object_store/src/local.rs:1069`, `:1161`, `:1175`, `:1188`, and `:1189`. Part writes retain the opened staging file. |
 | Cache namespace creation and ownership lock | `zerofs/src/cli/server.rs:742` and `:756`. The lock leaf uses `O_NOFOLLOW`, but its parents use path resolution. |

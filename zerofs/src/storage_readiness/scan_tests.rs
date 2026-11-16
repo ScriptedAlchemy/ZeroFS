@@ -58,6 +58,40 @@ async fn storage_readiness_listing_inspects_only_the_requested_subtree() {
 }
 
 #[tokio::test]
+async fn storage_readiness_listing_checks_prefix_components_when_polled() {
+    let fixture = Fixture::new();
+    let root = fixture.path("member data");
+    let directory = root.join("listed");
+    std::fs::create_dir(&directory).unwrap();
+    let prefix = object_store::path::Path::from_absolute_path(&directory).unwrap();
+    let store = LocalConditionalStore::new().with_readiness_root(root.clone());
+    let listing = store.list(Some(&prefix));
+    let offset_listing = store.list_with_offset(Some(&prefix), &prefix);
+    std::fs::rename(&directory, root.join("saved")).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("object"), b"outside").unwrap();
+    std::os::unix::fs::symlink(outside.path(), &directory).unwrap();
+    for result in [
+        listing.try_collect::<Vec<_>>().await,
+        offset_listing.try_collect::<Vec<_>>().await,
+    ] {
+        assert!(result.unwrap_err().to_string().contains("symlink"));
+    }
+    assert!(
+        store
+            .list_with_delimiter(Some(&prefix))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("symlink")
+    );
+    assert_eq!(
+        std::fs::read(outside.path().join("object")).unwrap(),
+        b"outside"
+    );
+}
+
+#[tokio::test]
 async fn storage_readiness_object_directories_are_checked_on_operations_and_listings() {
     let fixture = Fixture::new();
     let root = fixture.path("member data");
