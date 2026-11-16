@@ -478,19 +478,9 @@ async fn baseline_metadata_loss_is_not_recoverable() {
     .expect("metadata-loss reproduction exceeded deadline");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Authority-device recovery is missing. See docs/metadata-survival-design.md."]
-async fn authority_device_loss_preserves_committed_namespace() {
-    tokio::time::timeout(Duration::from_secs(60), observe_loss(Loss::AuthorityDevice))
-        .await
-        .expect("authority-loss acceptance exceeded deadline")
-        .expect("Committed namespace must survive authority-device loss");
-}
-
 // These are controls for the existing writeback durability contract, not
 // metadata-survival acceptance tests. No replica is configured and a backend
-// receipt is not a survival receipt. Keep the unimplemented recovery matrix in
-// the design document rather than letting configuration parsing stand in for it.
+// receipt is not a survival receipt. The strict survival contracts live in the acceptance module below.
 struct DurablePrefixFixture {
     fixture: Fixture,
     expected: ExpectedNamespace,
@@ -638,3 +628,5 @@ async fn journal_loss_after_backend_cutoff_preserves_the_drained_suffix() {
         .expect("journal-loss control exceeded deadline")
         .expect("The remotely durable suffix must remain readable after journal loss");
 }
+
+pub(crate) mod acceptance;
