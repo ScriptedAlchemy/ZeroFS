@@ -197,6 +197,10 @@ impl StartupContext {
                 .await
                 .context("Failed to resolve bucket identity")?;
 
+            crate::storage_readiness::verify_bucket_paths(
+                settings,
+                &bucket.cache_directory_name(),
+            )?;
             let cache_config = CacheConfig {
                 root_folder: cache_config.root_folder.join(bucket.cache_directory_name()),
                 ..cache_config
@@ -1592,5 +1596,78 @@ mod role_decision_tests {
         assert!(recovering_handoff);
         assert!(elected_leader);
         assert!(faults.get_count() >= 3);
+    }
+}
+
+#[cfg(test)]
+mod storage_readiness_tests {
+    use super::*;
+    use crate::storage_readiness::tests::Fixture;
+
+    #[tokio::test]
+    async fn storage_readiness_refuses_symlinked_children_during_server_startup() {
+        for mode in [
+            DatabaseMode::ReadWrite,
+            DatabaseMode::ReadOnly,
+            DatabaseMode::Checkpoint(uuid::Uuid::nil()),
+        ] {
+            for (role, relative) in [
+                ("authority", ".zerofs-pool"),
+                ("member data", ".zerofs-pool"),
+                (
+                    "member data",
+                    ".zerofs-pool/00000000-0000-0000-0000-000000000001/objects",
+                ),
+                ("cache", "bucket_fixture/hybrid_cache"),
+                ("journal", "bucket_fixture/blobs/00"),
+            ] {
+                let mut fixture = Fixture::new();
+                fixture.document["storage"]["readiness"]["strict"] = serde_json::json!(false);
+                let settings = fixture.parse().unwrap();
+                let initialized = crate::storage_backend::open_pool_storage(&settings, true)
+                    .await
+                    .unwrap();
+                let store: Arc<dyn object_store::ObjectStore> = Arc::new(initialized.1.clone());
+                let namespace = bucket_identity::BucketIdentity::get_or_create(
+                    &store,
+                    initialized.0.path.as_ref(),
+                )
+                .await
+                .unwrap()
+                .cache_directory_name();
+                let pool_id = initialized.1.status().await.unwrap().pool_id;
+                drop(store);
+                drop(initialized);
+                let relative = relative
+                    .replace("bucket_fixture", &namespace)
+                    .replace("00000000-0000-0000-0000-000000000001", &pool_id);
+                let child = fixture.path(role).join(&relative);
+                std::fs::create_dir_all(child.parent().unwrap()).unwrap();
+                let outside = tempfile::tempdir().unwrap();
+                let target = outside.path().join("target");
+                if child.exists() {
+                    std::fs::rename(&child, &target).unwrap();
+                } else {
+                    std::fs::create_dir(&target).unwrap();
+                }
+                std::fs::write(target.join("sentinel"), b"unchanged").unwrap();
+                let target_entries = std::fs::read_dir(&target).unwrap().count();
+                std::os::unix::fs::symlink(&target, child).unwrap();
+                let error = StartupContext::prepare(&settings, mode)
+                    .await
+                    .err()
+                    .expect("server startup must refuse the symlink");
+                assert_eq!(
+                    std::fs::read_dir(&target).unwrap().count(),
+                    target_entries,
+                    "wrote through {role}/{relative}"
+                );
+                assert_eq!(
+                    std::fs::read(target.join("sentinel")).unwrap(),
+                    b"unchanged"
+                );
+                assert!(format!("{error:#}").contains("symlink"), "{error:#}");
+            }
+        }
     }
 }

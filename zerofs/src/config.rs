@@ -663,6 +663,8 @@ pub struct StorageConfig {
     /// Permanent segment placement across local disks and remote stores.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pool: Option<StoragePoolConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) readiness: Option<crate::storage_readiness::ReadinessConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -887,6 +889,7 @@ impl fmt::Debug for StorageConfig {
             .field("encryption_password", &"[REDACTED]")
             .field("storage_class", &self.storage_class)
             .field("pool", &self.pool)
+            .field("readiness", &self.readiness)
             .finish()
     }
 }
@@ -898,7 +901,9 @@ impl Serialize for StorageConfig {
     {
         let mut state = serializer.serialize_struct(
             "StorageConfig",
-            2 + usize::from(self.storage_class.is_some()) + usize::from(self.pool.is_some()),
+            2 + usize::from(self.storage_class.is_some())
+                + usize::from(self.pool.is_some())
+                + usize::from(self.readiness.is_some()),
         )?;
         state.serialize_field("url", &redacted_storage_url(&self.url))?;
         state.serialize_field("encryption_password", &self.encryption_password)?;
@@ -907,6 +912,9 @@ impl Serialize for StorageConfig {
         }
         if let Some(pool) = &self.pool {
             state.serialize_field("pool", pool)?;
+        }
+        if let Some(readiness) = &self.readiness {
+            state.serialize_field("readiness", readiness)?;
         }
         state.end()
     }
@@ -1979,6 +1987,9 @@ impl Settings {
         if let Some(pool) = &self.storage.pool {
             pool.validate(self)?;
         }
+        if let Some(readiness) = &self.storage.readiness {
+            readiness.validate(self)?;
+        }
         if let Some(prometheus) = &self.prometheus
             && let Some(authority) = &prometheus.benchmark_authority
         {
@@ -2247,6 +2258,7 @@ impl Settings {
                 encryption_password: "${ZEROFS_PASSWORD}".to_string(),
                 storage_class: None,
                 pool: None,
+                readiness: None,
             },
             servers: ServerConfig {
                 nfs: Some(NfsConfig {
@@ -3519,6 +3531,7 @@ known_hosts = "${ZEROFS_TEST_KNOWN_HOSTS}""#,
             encryption_password: "volume-encryption-secret".to_owned(),
             storage_class: None,
             pool: None,
+            readiness: None,
         };
 
         let debug = format!("{storage:?}");
