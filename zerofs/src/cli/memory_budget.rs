@@ -11,6 +11,10 @@ const GIB: u64 = 1024 * 1024 * 1024;
 const UNMODELED_RESIDENCY_RESERVE_BYTES: u64 = 32 * GIB;
 const COMPANION_PROCESS_RESERVE_BYTES: u64 = 8 * GIB;
 
+#[cfg(test)]
+#[path = "memory_admission_tests.rs"]
+mod admission_tests;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct StartupMemoryTiers {
     clean_cache_bytes: u64,
