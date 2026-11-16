@@ -34,7 +34,7 @@ pub enum Commands {
     /// Inventory source metadata as JSON Lines without a server or configuration
     ///
     /// Reads may update atime; only a read-only mount prevents this. Exit 3 means
-    /// the inventory is incomplete. Collision rules do not model Samba or ZFS.
+    /// the inventory is incomplete. The name rule uses the OpenZFS insensitive fold.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     Inventory {
         root: PathBuf,
@@ -44,6 +44,12 @@ pub enum Commands {
         /// Limit entry starts per second (unlimited by default)
         #[arg(long)]
         max_entries_per_second: Option<std::num::NonZeroU32>,
+        /// Existing scratch parent outside the source root, required when memory caps are exceeded
+        #[arg(long)]
+        work_dir: Option<PathBuf>,
+        /// Continue a partial manifest after its last complete directory, writing a new manifest
+        #[arg(long)]
+        resume_from: Option<PathBuf>,
     },
     /// Upload a file or directory directly over ZeroFS 9P
     Upload {

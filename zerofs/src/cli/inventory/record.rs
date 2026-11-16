@@ -103,7 +103,7 @@ impl<T> Field<T> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub(crate) struct RawBytes {
     pub hex: String,
     pub display: String,
@@ -250,6 +250,7 @@ pub(crate) struct Header {
     pub mount_boundary_detection: &'static str,
     pub hashing: &'static str,
     pub collision_rules: [&'static str; 3],
+    pub max_entries_per_second: Option<u32>,
     pub atime_notice: &'static str,
     pub noatime_requested: bool,
     pub noatime_fallback: bool,
@@ -262,6 +263,8 @@ pub(crate) struct HardlinkGroup {
     pub nlink: Field<u64>,
     pub paths_in_tree: Vec<RawBytes>,
     pub links_outside_tree: Field<u64>,
+    pub chunk: u64,
+    pub last_chunk: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -269,6 +272,17 @@ pub(crate) struct NameCollision {
     pub dir: RawBytes,
     pub rule: &'static str,
     pub names: Vec<RawBytes>,
+    pub chunk: u64,
+    pub last_chunk: bool,
+}
+
+#[derive(Debug, Serialize, serde::Deserialize)]
+pub(crate) struct LinkObservation {
+    pub path: RawBytes,
+    pub dev: u64,
+    pub ino: u64,
+    pub nlink: u64,
+    pub stable: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -288,6 +302,8 @@ pub(crate) enum Record {
     },
     Entry(Box<Entry>),
     HardlinkGroup(HardlinkGroup),
+    HardlinkObservation(LinkObservation),
+    DirectoryComplete(super::resume::Checkpoint),
     NameCollision(NameCollision),
     DirectoryUnreadable {
         path: RawBytes,

@@ -40,14 +40,18 @@ fn summary(records: &[Value]) -> &Value {
 #[test]
 fn unsupported_metadata_formats_are_complete_but_extent_failures_are_not() {
     let mut output = Manifest::new(Vec::new());
-    output.count_unavailable(&serde_json::json!({
-        "status": "unavailable", "reason": "format_not_supported_by_filesystem", "errno": 95
-    }));
+    output
+        .count_unavailable(&serde_json::json!({
+            "status": "unavailable", "reason": "format_not_supported_by_filesystem", "errno": 95
+        }))
+        .unwrap();
     assert!(output.complete);
     assert_eq!(output.reasons["format_not_supported_by_filesystem"], 1);
-    output.count_unavailable(&serde_json::json!({
-        "status": "unavailable", "reason": "not_supported_by_filesystem", "errno": 22
-    }));
+    output
+        .count_unavailable(&serde_json::json!({
+            "status": "unavailable", "reason": "not_supported_by_filesystem", "errno": 22
+        }))
+        .unwrap();
     assert!(!output.complete);
 }
 
@@ -806,7 +810,20 @@ fn pacing_limits_entry_starts_and_preserves_output() {
     )
     .unwrap();
     assert!(start.elapsed() >= std::time::Duration::from_millis(150));
-    assert_eq!(paced, unlimited);
+    let observations = |bytes: &[u8]| -> Vec<Value> {
+        bytes
+            .split(|b| *b == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice::<Value>(line).unwrap())
+            .filter(|value| {
+                !matches!(
+                    value["record"].as_str(),
+                    Some("header" | "directory_complete" | "digest")
+                )
+            })
+            .collect()
+    };
+    assert_eq!(observations(&paced), observations(&unlimited));
 }
 
 #[test]
@@ -829,7 +846,7 @@ fn collisions_are_emitted_before_directory_entries() {
         .position(|r| r["record"] == "entry" && r["path"]["display"] == "FILE")
         .unwrap();
     assert!(collision < first_child);
-    assert_eq!(records[0]["schema"], 3);
+    assert_eq!(records[0]["schema"], 4);
 }
 
 #[test]

@@ -7,6 +7,8 @@ mod platform;
 #[path = "collect_macos.rs"]
 mod platform;
 pub(crate) mod record;
+mod resume;
+mod spill;
 mod walk;
 
 use anyhow::Result;
@@ -26,12 +28,19 @@ pub(crate) fn run(
     root: &Path,
     hash: Option<HashAlgorithm>,
     max_entries_per_second: Option<std::num::NonZeroU32>,
+    work_dir: Option<&Path>,
+    resume_from: Option<&Path>,
 ) -> Result<()> {
     let stdout = std::io::stdout();
-    let complete = walk::inventory(
+    let complete = walk::inventory_with_options(
         root,
         hash.is_some(),
         max_entries_per_second,
+        walk::Options {
+            work_dir,
+            resume_from,
+            ..Default::default()
+        },
         std::io::BufWriter::new(stdout.lock()),
     )?;
     if !complete {
@@ -62,42 +71,54 @@ impl<W: Write> Manifest<W> {
     }
 
     fn emit(&mut self, record: &Record) -> Result<()> {
-        if matches!(record, Record::Entry(_)) {
-            self.entries += 1;
-        }
         let value = serde_json::to_value(record)?;
-        self.count_unavailable(&value);
         let mut bytes = serde_json::to_vec(record)?;
         bytes.push(b'\n');
-        self.writer.write_all(&bytes)?;
+        self.replay(&value, &bytes)
+    }
+
+    fn replay(&mut self, value: &Value, bytes: &[u8]) -> Result<()> {
+        if value["record"] == "entry" {
+            self.entries += 1;
+            let path = resume::decode_hex(
+                value["path"]["hex"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("entry has no raw path"))?,
+            )?;
+            if std::str::from_utf8(path.rsplit(|b| *b == b'/').next().unwrap()).is_err() {
+                self.non_utf8_names += 1;
+            }
+        }
+        self.count_unavailable(value)?;
+        self.writer.write_all(bytes)?;
         self.hash.update(bytes);
         Ok(())
     }
 
-    fn count_unavailable(&mut self, value: &Value) {
+    fn count_unavailable(&mut self, value: &Value) -> Result<()> {
         match value {
             Value::Object(object) => {
                 if object.get("status").and_then(Value::as_str) == Some("unavailable")
                     && let Some(reason) = object.get("reason").and_then(Value::as_str)
                 {
                     *self.reasons.entry(reason.to_owned()).or_default() += 1;
-                    let reason: Reason = serde_json::from_value(Value::String(reason.to_owned()))
-                        .expect("the manifest serializes inventory reasons");
+                    let reason: Reason = serde_json::from_value(Value::String(reason.to_owned()))?;
                     if !reason.counts_as_complete() {
                         self.complete = false;
                     }
                 }
                 for value in object.values() {
-                    self.count_unavailable(value);
+                    self.count_unavailable(value)?;
                 }
             }
             Value::Array(values) => {
                 for value in values {
-                    self.count_unavailable(value);
+                    self.count_unavailable(value)?;
                 }
             }
             _ => {}
         }
+        Ok(())
     }
 
     fn finish(mut self) -> Result<bool> {

@@ -2,17 +2,19 @@ use super::Manifest;
 use super::collect;
 use super::platform;
 use super::record::*;
+use super::resume::{self, Checkpoint, Frame, Version};
+use super::spill::{GROUP_ROWS, Rows, Sorter, Workspace};
 use anyhow::{Context, Result, bail};
 use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
 use rustix::fs::{self, AtFlags, Dir, Mode, OFlags, SeekFrom, Stat};
 use rustix::io::Errno;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::num::NonZeroU32;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
@@ -20,10 +22,20 @@ const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
 
-struct Links {
-    nlink: u64,
-    consistent: bool,
-    paths: Vec<Vec<u8>>,
+pub(super) struct Options<'a> {
+    pub work_dir: Option<&'a Path>,
+    pub resume_from: Option<&'a Path>,
+    pub memory_bytes: usize,
+}
+
+impl Default for Options<'_> {
+    fn default() -> Self {
+        Self {
+            work_dir: None,
+            resume_from: None,
+            memory_bytes: super::spill::MEMORY_BYTES,
+        }
+    }
 }
 
 struct Walker<'a, W> {
@@ -34,28 +46,37 @@ struct Walker<'a, W> {
     trusted_namespace: Field<()>,
     hash: bool,
     tree_complete: bool,
-    links: BTreeMap<(u64, u64), Links>,
+    links: Sorter,
+    work: Rc<Workspace>,
+    frames: Vec<Frame>,
     noatime_fallback: bool,
     pacer: Pacer,
 }
 
-pub(super) struct Options<'a> {
-    pub work_dir: Option<&'a Path>,
-    pub resume_from: Option<&'a Path>,
-    pub memory_bytes: usize,
-}
-
-pub(super) fn inventory_with_options(root: &Path, hash: bool, rate: Option<NonZeroU32>, options: Options<'_>, writer: impl Write) -> Result<bool> {
-    let _ = (options.work_dir, options.resume_from, options.memory_bytes);
-    inventory(root, hash, rate, writer)
-}
-
+#[cfg(test)]
 pub(super) fn inventory(
     root: &Path,
     hash: bool,
     max_entries_per_second: Option<NonZeroU32>,
     writer: impl Write,
 ) -> Result<bool> {
+    inventory_with_options(
+        root,
+        hash,
+        max_entries_per_second,
+        Options::default(),
+        writer,
+    )
+}
+
+pub(super) fn inventory_with_options(
+    root: &Path,
+    hash: bool,
+    max_entries_per_second: Option<NonZeroU32>,
+    options: Options<'_>,
+    writer: impl Write,
+) -> Result<bool> {
+    let work = Workspace::new(root, options.work_dir, options.memory_bytes)?;
     // A trailing slash must not bypass O_NOFOLLOW on the final component.
     let raw = root.as_os_str().as_bytes();
     let end = raw
@@ -88,8 +109,8 @@ pub(super) fn inventory(
         OsStr::new("."),
         trusted_namespace.scope(),
     );
-    output.emit(&Record::Header(Header {
-        schema: 3,
+    let header = Record::Header(Header {
+        schema: 4,
         tool_version: env!("CARGO_PKG_VERSION"),
         collector: std::env::consts::OS,
         root: RawBytes::new(raw),
@@ -103,10 +124,18 @@ pub(super) fn inventory(
         },
         hashing: if hash { "sha256" } else { "not_requested" },
         collision_rules: super::collision::RULES,
+        max_entries_per_second: max_entries_per_second.map(NonZeroU32::get),
         atime_notice: "Times are sampled before opening entries. Linux requests O_NOATIME and retries on EPERM. Symlink reads and fallback opens may update atime. macOS reads may update atime. Only a read-only mount prevents updates. This is not a filesystem snapshot.",
         noatime_requested: cfg!(target_os = "linux"),
         noatime_fallback,
-    }))?;
+    });
+    let resume = options
+        .resume_from
+        .map(|path| resume::Resume::open(path, &serde_json::to_value(&header)?))
+        .transpose()?;
+    if resume.is_none() {
+        output.emit(&header)?;
+    }
     let mut walker = Walker {
         output: &mut output,
         root_dev: identity(&before).dev,
@@ -115,18 +144,49 @@ pub(super) fn inventory(
         trusted_namespace: entry.xattrs.trusted_namespace.clone(),
         hash,
         tree_complete: true,
-        links: BTreeMap::new(),
+        links: Sorter::new(work.clone()),
+        work,
+        frames: Vec::new(),
         noatime_fallback,
         pacer: Pacer::new(max_entries_per_second),
     };
-    walker.pacer.wait();
-    if let Some(reason) = walker.boundary_reason(&entry) {
-        walker.skip_boundary(entry, reason)?;
+    if let Some(mut resume) = resume {
+        let mut copied = 0;
+        let mut line = Vec::new();
+        while copied < resume.end {
+            line.clear();
+            let count = resume.reader.read_until(b'\n', &mut line)?;
+            anyhow::ensure!(count > 0, "resume manifest changed while replaying");
+            copied += count as u64;
+            anyhow::ensure!(
+                copied <= resume.end,
+                "resume manifest changed while replaying"
+            );
+            let value: serde_json::Value = serde_json::from_slice(&line)?;
+            if value["record"] == "hardlink_observation" {
+                let link: LinkObservation = serde_json::from_value(value.clone())?;
+                walker.links.push(link_row(&link)?)?;
+            }
+            walker.output.replay(&value, &line)?;
+        }
+        anyhow::ensure!(
+            hex(&walker.output.hash.clone().finalize()) == resume.digest,
+            "resume manifest changed while replaying"
+        );
+        walker.tree_complete = resume.checkpoint.tree_complete;
+        walker.noatime_fallback |= resume.checkpoint.noatime_fallback;
+        if !resume.checkpoint.ancestors.is_empty() {
+            walker.resume_directory(root_fd.as_fd(), &resume.checkpoint.ancestors)?;
+        }
     } else {
-        walker.collect_fd(&mut entry, root_fd.as_fd(), EntryKind::Directory);
-        walker.output.emit(&Record::Entry(Box::new(entry)))?;
-        walker.directory(root_fd.as_fd(), &[])?;
-        walker.check_directory(root_fd.as_fd(), &[], &before)?;
+        walker.pacer.wait();
+        if let Some(reason) = walker.boundary_reason(&entry) {
+            walker.skip_boundary(entry, reason)?;
+        } else {
+            walker.collect_fd(&mut entry, root_fd.as_fd(), EntryKind::Directory);
+            walker.output.emit(&Record::Entry(Box::new(entry)))?;
+            walker.directory(root_fd.as_fd(), &[], &before)?;
+        }
     }
     walker.finish()?;
     output.finish()
@@ -162,30 +222,100 @@ impl<W: Write> Walker<'_, W> {
         })
     }
 
-    fn directory(&mut self, fd: BorrowedFd<'_>, path: &[u8]) -> Result<()> {
-        let names = match names(fd, &mut self.noatime_fallback) {
+    fn directory(&mut self, fd: BorrowedFd<'_>, path: &[u8], before: &Stat) -> Result<()> {
+        anyhow::ensure!(
+            self.frames.len() < 128,
+            "inventory directory depth exceeds 128"
+        );
+        self.frames.push(Frame {
+            path: RawBytes::new(path),
+            version: version(before),
+            mount_id: mount_number(fd, before),
+            last_child: None,
+        });
+        self.directory_contents(fd, path, None)?;
+        self.complete_directory(fd)
+    }
+
+    fn directory_contents(
+        &mut self,
+        fd: BorrowedFd<'_>,
+        path: &[u8],
+        after: Option<&[u8]>,
+    ) -> Result<()> {
+        let (names, folded) = match names(fd, &mut self.noatime_fallback, self.work.clone()) {
             Ok(names) => names,
             Err(error) => {
-                self.unreadable(path, error)?;
-                return Ok(());
+                if let Some(error) = error.downcast_ref::<Errno>() {
+                    self.unreadable(path, *error)?;
+                    return Ok(());
+                }
+                return Err(error);
             }
         };
-        self.output.non_utf8_names += names
-            .iter()
-            .filter(|n| std::str::from_utf8(n).is_err())
-            .count() as u64;
-        for (rule, group) in super::collision::collisions(&names) {
-            self.output.emit(&Record::NameCollision(NameCollision {
-                dir: RawBytes::new(path),
-                rule,
-                names: group.iter().map(|n| RawBytes::new(n)).collect(),
-            }))?;
+        if after.is_none() {
+            super::collision::emit(&folded, path, self.output)?;
         }
-        for name in names {
+        drop(folded);
+        for name in names.iter()? {
+            let name = name?;
+            if after.is_some_and(|after| name.as_slice() <= after) {
+                continue;
+            }
+            self.frames.last_mut().unwrap().last_child = Some(RawBytes::new(&name));
             let child = join(path, &name);
             self.entry(fd, OsStr::from_bytes(&name), child)?;
         }
         Ok(())
+    }
+
+    fn complete_directory(&mut self, fd: BorrowedFd<'_>) -> Result<()> {
+        let frame = self.frames.pop().unwrap();
+        let path = resume::bytes(&frame.path)?;
+        if !matches!(fs::fstat(fd), Ok(after) if version(&after) == frame.version) {
+            self.changed(&path)?;
+        }
+        let checkpoint = Checkpoint {
+            path: frame.path,
+            ancestors: self.frames.clone(),
+            tree_complete: self.tree_complete,
+            noatime_fallback: self.noatime_fallback,
+            prefix_sha256: hex(&self.output.hash.clone().finalize()),
+        };
+        self.output.emit(&Record::DirectoryComplete(checkpoint))?;
+        // A flushed checkpoint is usable even when the next output write fails.
+        self.output.writer.flush()?;
+        Ok(())
+    }
+
+    fn resume_directory(&mut self, fd: BorrowedFd<'_>, frames: &[Frame]) -> Result<()> {
+        let frame = &frames[0];
+        let stat = fs::fstat(fd)?;
+        anyhow::ensure!(
+            version(&stat) == frame.version && mount_number(fd, &stat) == frame.mount_id,
+            "resume ancestor directory changed"
+        );
+        let path = resume::bytes(&frame.path)?;
+        self.frames.push(frame.clone());
+        let last = frame.last_child.as_ref().map(resume::bytes).transpose()?;
+        if frames.len() > 1 {
+            let name = last
+                .as_deref()
+                .context("resume ancestor has no child cursor")?;
+            anyhow::ensure!(
+                join(&path, name) == resume::bytes(&frames[1].path)?,
+                "invalid resume ancestor chain"
+            );
+            let child = openat(
+                fd,
+                OsStr::from_bytes(name),
+                DIRECTORY_FLAGS,
+                &mut self.noatime_fallback,
+            )?;
+            self.resume_directory(child.as_fd(), &frames[1..])?;
+        }
+        self.directory_contents(fd, &path, last.as_deref())?;
+        self.complete_directory(fd)
     }
 
     fn entry(&mut self, parent: BorrowedFd<'_>, name: &OsStr, path: Vec<u8>) -> Result<()> {
@@ -303,21 +433,22 @@ impl<W: Write> Walker<'_, W> {
         }
         if entry_kind != EntryKind::Directory && before.st_nlink > 1 {
             let id = identity(&before);
-            let group = self.links.entry((id.dev, id.ino)).or_insert_with(|| Links {
+            let link = LinkObservation {
+                dev: id.dev,
+                ino: id.ino,
                 nlink: before.st_nlink as u64,
-                consistent: true,
-                paths: Vec::new(),
-            });
-            group.consistent &= stable && group.nlink == before.st_nlink as u64;
-            group.paths.push(path.clone());
+                stable,
+                path: RawBytes::new(&path),
+            };
+            self.links.push(link_row(&link)?)?;
+            self.output.emit(&Record::HardlinkObservation(link))?;
         }
         self.output.emit(&Record::Entry(Box::new(entry)))?;
         if stable
             && entry_kind == EntryKind::Directory
             && let Some(fd) = fd
         {
-            self.directory(fd.as_fd(), &path)?;
-            self.check_directory(fd.as_fd(), &path, &before)?;
+            self.directory(fd.as_fd(), &path, &before)?;
         }
         Ok(())
     }
@@ -381,34 +512,65 @@ impl<W: Write> Walker<'_, W> {
         })
     }
 
-    fn check_directory(&mut self, fd: BorrowedFd<'_>, path: &[u8], before: &Stat) -> Result<()> {
-        if !matches!(fs::fstat(fd), Ok(after) if same_version(before, &after)) {
-            self.changed(path)?;
-        }
-        Ok(())
-    }
-
     fn finish(self) -> Result<()> {
-        for ((dev, ino), mut links) in self.links {
-            links.paths.sort_unstable();
-            let count = links.paths.len() as u64;
-            let nlink = if links.consistent && links.nlink >= count {
-                Field::Observed(links.nlink)
+        let rows = self.links.finish()?;
+        let mut metadata = rows.iter()?.peekable();
+        let mut paths = rows.iter()?;
+        while let Some(first) = metadata.next() {
+            let first = first?;
+            let dev = u64::from_be_bytes(first[..8].try_into()?);
+            let ino = u64::from_be_bytes(first[8..16].try_into()?);
+            let (nlink, stable) = link_metadata(&first);
+            let mut consistent = stable;
+            let mut count = 1_u64;
+            loop {
+                let same = match metadata.peek() {
+                    Some(Ok(row)) => row[..16] == first[..16],
+                    Some(Err(_)) => {
+                        metadata.next().unwrap()?;
+                        unreachable!()
+                    }
+                    None => false,
+                };
+                if !same {
+                    break;
+                }
+                let row = metadata.next().unwrap()?;
+                let (other_nlink, stable) = link_metadata(&row);
+                consistent &= stable && other_nlink == nlink;
+                count += 1;
+            }
+            let observed_nlink = if consistent && nlink >= count {
+                Field::Observed(nlink)
             } else {
                 Field::unavailable(Reason::EntryChanged)
             };
-            let outside = if self.tree_complete && links.consistent && links.nlink >= count {
-                Field::Observed(links.nlink - count)
+            let outside = if self.tree_complete && consistent && nlink >= count {
+                Field::Observed(nlink - count)
             } else {
                 Field::unavailable(Reason::IncompleteTraversal)
             };
-            self.output.emit(&Record::HardlinkGroup(HardlinkGroup {
-                dev,
-                ino,
-                nlink,
-                paths_in_tree: links.paths.iter().map(|p| RawBytes::new(p)).collect(),
-                links_outside_tree: outside,
-            }))?;
+            let mut remaining = count;
+            let mut chunk = 0;
+            while remaining > 0 {
+                let take = remaining.min(GROUP_ROWS as u64);
+                let mut group = Vec::new();
+                for _ in 0..take {
+                    let row = paths.next().unwrap()?;
+                    group.push(RawBytes::new(&row[16..row.len() - 10]));
+                }
+                remaining -= take;
+                self.output.emit(&Record::HardlinkGroup(HardlinkGroup {
+                    dev,
+                    ino,
+                    nlink: observed_nlink.clone(),
+                    paths_in_tree: group,
+                    links_outside_tree: outside.clone(),
+                    chunk,
+                    last_chunk: remaining == 0,
+                }))?;
+                chunk += 1;
+            }
         }
         self.output.emit(&Record::HeaderUpdate {
             noatime_fallback: self.noatime_fallback,
@@ -520,19 +682,68 @@ fn read_pinned_file(pinned: BorrowedFd<'_>, noatime_fallback: &mut bool) -> Resu
     )
 }
 
-fn names(fd: BorrowedFd<'_>, noatime_fallback: &mut bool) -> Result<Vec<Vec<u8>>, Errno> {
+fn names(
+    fd: BorrowedFd<'_>,
+    noatime_fallback: &mut bool,
+    work: Rc<Workspace>,
+) -> Result<(Rows, Rows)> {
     let scan = openat(fd, OsStr::new("."), DIRECTORY_FLAGS, noatime_fallback)?;
     let directory = Dir::new(scan)?;
-    let mut names = Vec::new();
+    let mut names = Sorter::new(work.clone());
+    let mut folded = Sorter::new(work);
     for entry in directory {
         let entry = entry?;
         let name = entry.file_name().to_bytes();
         if name != b"." && name != b".." {
-            names.push(name.to_vec());
+            names.push(name.to_vec())?;
+            super::collision::push(&mut folded, name)?;
         }
     }
-    names.sort_unstable();
-    Ok(names)
+    Ok((names.finish()?, folded.finish()?))
+}
+
+fn link_row(link: &LinkObservation) -> Result<Vec<u8>> {
+    let mut row = link.dev.to_be_bytes().to_vec();
+    row.extend_from_slice(&link.ino.to_be_bytes());
+    row.extend_from_slice(&resume::bytes(&link.path)?);
+    row.push(0);
+    row.extend_from_slice(&link.nlink.to_be_bytes());
+    row.push(u8::from(link.stable));
+    Ok(row)
+}
+
+fn link_metadata(row: &[u8]) -> (u64, bool) {
+    (
+        u64::from_be_bytes(row[row.len() - 9..row.len() - 1].try_into().unwrap()),
+        row[row.len() - 1] != 0,
+    )
+}
+
+#[allow(clippy::unnecessary_cast)]
+fn version(stat: &Stat) -> Version {
+    Version {
+        dev: stat.st_dev as u64,
+        ino: stat.st_ino as u64,
+        mode: stat.st_mode as u32,
+        nlink: stat.st_nlink as u64,
+        uid: stat.st_uid,
+        gid: stat.st_gid,
+        size: stat.st_size as u64,
+        blocks: stat.st_blocks as u64,
+        rdev: stat.st_rdev as u64,
+        mtime: (stat.st_mtime as i64, stat.st_mtime_nsec as i64),
+        ctime: (stat.st_ctime as i64, stat.st_ctime_nsec as i64),
+    }
+}
+
+fn mount_number(fd: BorrowedFd<'_>, stat: &Stat) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    if let Field::Observed(id) = platform::mount_id(fd, OsStr::new(""), stat) {
+        return Some(id);
+    }
+    #[cfg(target_os = "macos")]
+    let _ = (fd, stat);
+    None
 }
 
 fn join(parent: &[u8], name: &[u8]) -> Vec<u8> {
@@ -772,6 +983,7 @@ mod tests {
 
     #[test]
     fn regular_file_replaced_before_pin_is_not_opened_for_io() {
+        let _guard = super::super::tests::FIXTURE_LOCK.lock().unwrap();
         let root = tempfile::tempdir().unwrap();
         let (parent, before, entry) = observed_file(root.path());
         replace_with_fifo(root.path());
@@ -791,6 +1003,7 @@ mod tests {
 
     #[test]
     fn regular_file_replaced_after_pin_opens_the_retained_inode() {
+        let _guard = super::super::tests::FIXTURE_LOCK.lock().unwrap();
         let root = tempfile::tempdir().unwrap();
         let (parent, before, entry) = observed_file(root.path());
         let pinned = pin_regular_file(parent.as_fd(), OsStr::new("file"), &before, &entry).unwrap();

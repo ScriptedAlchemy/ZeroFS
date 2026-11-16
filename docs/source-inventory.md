@@ -7,7 +7,8 @@ tree. The command has no output-file option.
 ```sh
 zerofs inventory /path/to/owned/source > /path/outside/source/inventory.jsonl
 zerofs inventory /path/to/owned/source --hash sha256 > /path/outside/source/hashed.jsonl
-zerofs inventory /path/to/owned/source --max-entries-per-second 100 > /path/outside/source/paced.jsonl
+zerofs inventory /path/to/owned/source --work-dir /path/to/scratch --max-entries-per-second 100 > /path/outside/source/paced.jsonl
+zerofs inventory /path/to/owned/source --work-dir /path/to/scratch --resume-from /path/outside/source/partial.jsonl > /path/outside/source/resumed.jsonl
 ```
 
 The collector opens the root and child directories without following their final
@@ -46,7 +47,7 @@ or a filesystem snapshot when concurrent changes matter.
 ## Records and completeness
 
 The header records the platform, tool version, root identity, filesystem type,
-known network filesystem status, collision rules, and hash request. A network
+known network filesystem status, collision rules, hash request, and pacing option. A network
 mount exposes the client's metadata mapping. Its inventory does not establish
 the server's native ownership or ACLs. Linux reports the filesystem magic even
 when the collector has no name for it. The network flag recognizes known network
@@ -115,22 +116,23 @@ after reading it. A mismatch produces an `entry_changed` record and invalidates
 the fields read through the descriptor. The original stat fields remain the
 pre-open observations.
 
-Schema 3 includes the shared OpenZFS name rule. Like schema 2, it emits mount
-boundaries, changed entries, unreadable directories, and
+Schema 4 emits mount boundaries, changed entries, unreadable directories, and
 name collisions during traversal. A directory's collision records precede its
-children. Hardlink groups follow traversal and precede the final header update,
-summary, and digest. Hardlink groups contain the paths found in the tree and the observed link count. Links outside the tree equal that
-count minus the paths found only when the traversal completed and the link
-observations agree. Otherwise, the outside count remains unavailable.
+children. Each `hardlink_observation` records one non-directory path with more
+than one link, its identity, observed link count, and whether its metadata stayed
+stable. These records let resume rebuild the bounded hardlink sorter.
+Hardlink groups follow traversal and precede the final header update, summary,
+and digest. Links outside the tree equal the observed link count minus the paths
+found only when traversal completed and all link observations agree. Otherwise,
+the outside count remains unavailable.
 
-The `openzfs-insensitive-unicode-5.0.0` collision rule uses
-`fs::name_mode::fold_name`, the same function as ZeroFS insensitive name lookup.
-It matches the declared source rule (`casesensitivity=insensitive`,
-`normalization=none`, `utf8only=off`): Unicode 5.0.0 simple uppercase with no
-normalization, preserving invalid multi-byte spans exactly as the shared fold
-does. It keeps `ß` distinct from `SS` and composed accents distinct from their
-decomposed forms, but detects `ı`/`I` and collisions containing invalid UTF-8.
-This is source-code equivalence, not evidence from a running OpenZFS dataset.
+The `openzfs-insensitive-unicode-5.0.0` collision rule uses the same `fold_name`
+function as filesystem lookup. It applies the OpenZFS Unicode 5.0.0 simple
+uppercase table without normalization. It keeps `ß` distinct from `SS` and
+composed accents distinct from decomposed accents. It matches `ı` with `I`.
+Invalid UTF-8 spans follow the shared OpenZFS byte rule. They participate in
+collision detection, and each non-UTF-8 basename increments `non_utf8_names`.
+This rule does not establish Samba's matching behavior.
 
 Two additional diagnostic rules operate on UTF-8 names. `unicode-canonical`
 compares NFC forms with `icu_normalizer`. `unicode-case-fold` compares the full
@@ -141,6 +143,12 @@ source dataset's rule or Samba's matching behavior. Non-UTF-8 names retain their
 exact bytes, participate in the OpenZFS rule only, and increment
 `non_utf8_names`. Use the rule field, not the presence of any collision record,
 when assessing a transfer to an insensitive ZeroFS filesystem.
+
+Collision groups and hardlink groups contain at most 256 names or paths per
+record. The zero-based `chunk` and `last_chunk` fields identify consecutive parts
+of one group. Collision chunks share their directory, rule, and folded name key.
+Hardlink chunks share their device and inode, and repeat the same link counts.
+Consumers must combine those chunks before treating the path list as complete.
 
 The summary counts unavailable fields and diagnostic reasons. Intentional
 omissions for an entry kind, fields inapplicable on the platform, an unrequested
@@ -155,19 +163,59 @@ inventory, and another nonzero code for usage, root, or output errors.
 `--max-entries-per-second <n>` accepts a positive integer and defaults to
 unlimited. The collector sleeps between entry starts when the previous entry
 took less than the requested interval. It does not limit hashing bytes or pace
-the directory listing calls. There is no resume support. An interrupted run
-requires a new traversal.
+the directory listing calls.
 
-The collector holds a directory's raw names in memory while it sorts them and
-visits its children. Active ancestor directories retain their remaining names.
-Collision detection also needs per-directory Unicode grouping storage. Ordinary
-single-link files do not enter the hardlink map. Each distinct non-directory
-inode with `nlink > 1` needs a 16-byte identity key and a 40-byte group value on a
-64-bit target, plus B-tree and allocator overhead. Each stored path needs a
-24-byte vector descriptor plus its raw path bytes and spare capacity. The path
-list itself can have spare capacity. Memory therefore grows with the number of
-hardlinked inodes and the total bytes of their paths. Diagnostic records do not
-accumulate for the whole tree.
+Each sorter holds at most 4,096 rows and a 1 MiB byte budget. The budget includes
+reserved raw byte capacity and the actual capacity of the row-vector allocation.
+Each vector descriptor uses 24 bytes on a 64-bit target. One oversized row can
+temporarily exceed the budget before it spills. Directory listing creates a raw-name sorter and a folded-key sorter.
+The folded sorter holds keys for all three rules and is released before visiting
+children. The hardlink sorter uses the same caps and stores observations instead of an inode-to-path map.
+Large groups stream in chunks of 256 rows, so one inode cannot retain all its
+paths in memory.
+
+`--work-dir` names an existing scratch parent. It must resolve outside the source
+root, including through symlinks. The collector creates a private temporary child
+there only when a sorter exceeds a cap. Without this option, exceeding either
+cap stops the walk with an error. Sorted runs merge two at a time in binary
+levels, with at most one run per level. This limits merge buffers to two input
+rows and three 8 KiB I/O buffers, plus file descriptors for logarithmically many
+runs. Scratch files disappear on success and returned errors. A killed process
+can leave its private scratch child for the operator to remove.
+
+An active ancestor can retain up to 1 MiB of sorted raw names. Traversal stops
+with an error beyond 128 active directory levels. Retained ancestor names
+therefore use at most 128 MiB, plus the current sorters, the hardlink sorter,
+path and checkpoint state, and temporary JSON serialization copies. With 255-byte
+components, a path can reach about 32 KiB at that depth. A 256-path output chunk
+can therefore hold about 8 MiB of raw paths before hex, display, and JSON copies.
+These caps bound directory and hardlink storage. They do not cap an individual
+entry's ACLs, xattrs, or extent list.
+
+## Resume
+
+`--resume-from <manifest>` reads an earlier partial manifest and writes a new
+whole manifest to standard output. Redirect to a different file outside the
+source. Never truncate the input manifest with shell redirection. The collector
+checks the full header, including root identity, raw root path, collector platform and version,
+capability visibility, hash request, and pacing option. The scratch location and
+internal sorting cap may change because neither affects output order.
+
+A flushed `directory_complete` record follows each finished directory collection
+attempt, including an attempt that reported an unreadable directory. It contains the SHA-256 of the preceding bytes, active ancestor identities and
+metadata versions, each ancestor's last child cursor, and traversal state. Resume
+validates checkpoint digests, copies the original bytes through the last complete
+checkpoint, rebuilds summary counts and the hardlink sorter, and reopens active
+ancestors without following symlinks. A changed ancestor or mount ID stops resume.
+The collector continues after the saved child cursors without recollecting
+completed subtrees. Records after that checkpoint, including a torn final line,
+are discarded. A manifest with no complete directory checkpoint cannot resume.
+
+The source must remain stable across the interruption. Resume retains earlier
+observations and does not rescan completed subtrees to detect later changes.
+It does not turn the walk into a snapshot. With the same metadata observations
+and collector build, resumed output is byte for byte identical to uninterrupted
+output. Its final digest includes the copied prefix and all new records.
 
 The last line contains the SHA-256 of every preceding output byte, including
 each newline. It excludes its own line. Output order and serialization are
@@ -183,6 +231,9 @@ the opt-in environment variable, and mount privileges in a private mount
 namespace. The step builds as the normal user and elevates only the fixture
 binary, retaining `inventory-mounts.log`. Omitting the opt-in when explicitly
 running the test is an error, not a successful no-op.
+
+The dedicated source-inventory workflow also runs the ordinary inventory suite
+and this exact ignored fixture in a private mount namespace.
 
 - Not verified: TrueNAS and ZFS collection and ACL exposure require runs on those
   platforms. Local fixtures do not establish which ACLs or xattrs a NAS carries,

@@ -1,39 +1,102 @@
+use super::Manifest;
+use super::record::{NameCollision, RawBytes, Record};
+use super::spill::{GROUP_ROWS, Rows, Sorter};
 use icu_normalizer::ComposingNormalizer;
-use std::collections::{BTreeMap, BTreeSet};
+use anyhow::Result;
+use std::io::Write;
 
 const OPENZFS_RULE: &str = "openzfs-insensitive-unicode-5.0.0";
 pub(super) const RULES: [&str; 3] = [OPENZFS_RULE, "unicode-canonical", "unicode-case-fold"];
 
-pub(super) fn collisions(names: &[Vec<u8>]) -> Vec<(&'static str, Vec<Vec<u8>>)> {
+fn key(rule: usize, name: &[u8]) -> Option<Vec<u8>> {
+    if rule == 0 {
+        return Some(crate::fs::name_mode::fold_name(name).into_owned());
+    }
+    let text = std::str::from_utf8(name).ok()?;
     let nfc = ComposingNormalizer::new_nfc();
+    let canonical = nfc.normalize(text);
+    Some(if rule == 2 {
+        unicase::UniCase::unicode(canonical.as_ref()).to_folded_case().into_bytes()
+    } else {
+        canonical.into_owned().into_bytes()
+    })
+}
+
+pub(super) fn push(sorter: &mut Sorter, name: &[u8]) -> Result<()> {
+    for rule in 0..RULES.len() {
+        if let Some(key) = key(rule, name) {
+            let mut row = Vec::with_capacity(1 + key.len() + 1 + name.len());
+            row.push(rule as u8);
+            row.extend_from_slice(&key);
+            row.push(0);
+            row.extend_from_slice(name);
+            sorter.push(row)?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn emit<W: Write>(rows: &Rows, path: &[u8], output: &mut Manifest<W>) -> Result<()> {
+    let mut rows = rows.iter()?.peekable();
+    while let Some(first) = rows.next() {
+        let first = first?;
+        let rule = RULES[first[0] as usize];
+        let separator = 1 + first[1..].iter().position(|b| *b == 0).unwrap();
+        let key = &first[..=separator];
+        let mut names = vec![RawBytes::new(&first[separator + 1..])];
+        let mut chunk = 0;
+        loop {
+            let same = match rows.peek() {
+                Some(Ok(row)) => row.starts_with(key),
+                Some(Err(_)) => {
+                    rows.next().unwrap()?;
+                    unreachable!()
+                }
+                None => false,
+            };
+            if !same {
+                if names.len() > 1 || chunk > 0 {
+                    output.emit(&Record::NameCollision(NameCollision {
+                        dir: RawBytes::new(path),
+                        rule,
+                        names,
+                        chunk,
+                        last_chunk: true,
+                    }))?;
+                }
+                break;
+            }
+            if names.len() == GROUP_ROWS {
+                output.emit(&Record::NameCollision(NameCollision {
+                    dir: RawBytes::new(path),
+                    rule,
+                    names,
+                    chunk,
+                    last_chunk: false,
+                }))?;
+                names = Vec::new();
+                chunk += 1;
+            }
+            let row = rows.next().unwrap()?;
+            names.push(RawBytes::new(&row[separator + 1..]));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn collisions(names: &[Vec<u8>]) -> Vec<(&'static str, Vec<Vec<u8>>)> {
+    use std::collections::{BTreeMap, BTreeSet};
     let mut result = Vec::new();
-    for rule in RULES {
+    for (rule, label) in RULES.iter().enumerate() {
         let mut groups = BTreeMap::<Vec<u8>, BTreeSet<Vec<u8>>>::new();
         for name in names {
-            if rule == OPENZFS_RULE {
-                // Use precisely the filesystem's byte rule, including invalid
-                // UTF-8 spans. NFC/full folding would produce a different set
-                // of collisions from the source ZFS dataset and destination.
-                let key = crate::fs::name_mode::fold_name(name).into_owned();
+            if let Some(key) = key(rule, name) {
                 groups.entry(key).or_default().insert(name.clone());
-                continue;
             }
-            let Ok(text) = std::str::from_utf8(name) else {
-                continue;
-            };
-            let canonical = nfc.normalize(text);
-            let key = if rule == "unicode-case-fold" {
-                unicase::UniCase::unicode(canonical.as_ref()).to_folded_case()
-            } else {
-                canonical.into_owned()
-            };
-            groups
-                .entry(key.into_bytes())
-                .or_default()
-                .insert(name.clone());
         }
-        for group in groups.into_values().filter(|g| g.len() > 1) {
-            result.push((rule, group.into_iter().collect()));
+        for group in groups.into_values().filter(|group| group.len() > 1) {
+            result.push((*label, group.into_iter().collect()));
         }
     }
     result
