@@ -43,7 +43,8 @@ list means that the API reported no values. A failed listing produces a
 Entries include the kind, device and inode, link count, uid and gid, full mode,
 nanosecond access, modification and change times, birth time when available,
 logical and allocated sizes, device number, symlink target, xattrs and ACLs.
-macOS also provides `st_flags`. Allocated bytes come from `st_blocks * 512`.
+macOS provides `st_flags`. Linux reads inode flags with `FS_IOC_GETFLAGS` on
+opened files and directories. Allocated bytes come from `st_blocks * 512`.
 Data extents come only from `SEEK_DATA` and `SEEK_HOLE`. Allocation below logical
 size does not establish sparseness, since compression can also reduce allocation.
 An unsupported extent query remains unavailable.
@@ -53,9 +54,20 @@ when the descriptor ACL API reports an absent ACL or no entries. Linux probes
 `system.posix_acl_access`,
 `system.posix_acl_default`, and `system.nfs4_acl_xdr` explicitly, including when
 the name does not appear in the xattr listing. Each raw ACL probe retains its
-own status. Linux `ENODATA` means no ACL was reported. `ENOTSUP` means that the
-filesystem does not support the probe. Linux symlink xattrs and ACLs remain
-unavailable because this collector has no descriptor-based API for them.
+own status. Linux `ENODATA` means no ACL was reported. `EOPNOTSUPP` means that
+the filesystem cannot contain that ACL format. This is a definite answer and
+does not make the inventory incomplete. The same rule applies when the xattr
+listing API reports that the filesystem does not support xattrs. Unsupported
+inode flag queries also count as complete when they return `ENOTTY` or
+`EOPNOTSUPP`. These answers use `format_not_supported_by_filesystem` and retain
+the errno.
+
+Linux reads symlink xattrs with `llistxattr` and `lgetxattr` through
+`/proc/self/fd/<parent fd>/<name>`. The path stays anchored to the opened parent
+and the calls do not follow the final symlink. The collector checks the entry
+before and after these reads. A missing or inaccessible proc fd anchor produces
+`proc_fd_unavailable` and makes the inventory incomplete. POSIX ACLs are
+inapplicable to Linux symlinks. The collector still probes their NFSv4 XDR ACLs.
 The collector does not decode ACLs. The decoded field remains unavailable with
 the reason `not_decoded`.
 
@@ -74,14 +86,16 @@ Collision rules operate on UTF-8 names within each directory. `unicode-canonical
 compares NFC forms with `icu_normalizer`. `unicode-case-fold` compares the full
 Unicode case fold of the NFC forms with `unicase` 2.10 or later. Version 2.9
 reordered three-character folds and failed the ligature regression test.
-These rules do not claim equivalence to Samba or ZFS. Non-UTF-8 names retain their exact bytes, do not
-participate in Unicode rules, and increment `non_utf8_names`.
+These rules do not claim equivalence to Samba or ZFS. They do not include the
+OpenZFS insensitive rule. That rule will use the shared fold function when the
+case-insensitive naming work adds it. Non-UTF-8 names retain their exact bytes,
+do not participate in Unicode rules, and increment `non_utf8_names`.
 
 The summary counts unavailable fields and diagnostic reasons. Intentional
 omissions for an entry kind, fields inapplicable on the platform, an unrequested
-hash, and undecoded ACLs do not make the inventory incomplete. Collection
-failures, unsupported applicable APIs, changed entries, unreadable directories,
-and skipped device boundaries do.
+hash, undecoded ACLs, and definite unsupported metadata formats do not make the
+inventory incomplete. Collection failures, unsupported applicable APIs, changed
+entries, unreadable directories, and skipped device boundaries do.
 The command exits with code 0 for a complete inventory, code 3 for an incomplete
 inventory, and another nonzero code for usage, root, or output errors.
 
@@ -90,6 +104,6 @@ each newline. It excludes its own line. Output order and serialization are
 deterministic for the same metadata observations and collector build. A source
 whose atime changes between runs can produce different output.
 
-- Not verified: Linux collection and TrueNAS or ZFS ACL exposure require runs on
-  those platforms. A local macOS fixture does not establish which ACLs or xattrs
-  a NAS carries, its space usage, or Samba's name matching behavior.
+- Not verified: TrueNAS and ZFS collection and ACL exposure require runs on those
+  platforms. Local fixtures do not establish which ACLs or xattrs a NAS carries,
+  its space usage, or Samba's name matching behavior.
