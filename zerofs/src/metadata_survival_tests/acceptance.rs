@@ -11,6 +11,7 @@ use std::path::{Component, Path};
 use tokio::sync::oneshot;
 
 const REPLICA_TIMEOUT: Duration = Duration::from_secs(30);
+const REPLACEMENT_DEVICE_ID: &str = "fixture-replacement-device";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Row {
@@ -18,6 +19,7 @@ enum Row {
     JournalBeforeBackend,
     JournalAfterBackend,
     DataAndReplicaLoss,
+    PayloadRetention,
     AdmittedWriteLoss,
     InterruptedCommit,
     ExactRecovery,
@@ -30,11 +32,12 @@ enum Row {
 }
 
 impl Row {
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 14] = [
         Self::AuthorityLoss,
         Self::JournalBeforeBackend,
         Self::JournalAfterBackend,
         Self::DataAndReplicaLoss,
+        Self::PayloadRetention,
         Self::AdmittedWriteLoss,
         Self::InterruptedCommit,
         Self::ExactRecovery,
@@ -171,7 +174,9 @@ struct CutEvent {
 
 fn valid_object_path(path: &Path) -> bool {
     !path.as_os_str().is_empty()
-        && path.components().all(|part| matches!(part, Component::Normal(_)))
+        && path
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
 }
 
 // A test build of the future commit owner calls this at each actual boundary.
@@ -210,7 +215,10 @@ impl CommitCutHook {
             return;
         }
         if let Some(entered) = self.entered.take() {
-            let _ = entered.send(CutEvent { cut: self.cut, object: object.to_owned() });
+            let _ = entered.send(CutEvent {
+                cut: self.cut,
+                object: object.to_owned(),
+            });
             if let Some(release) = self.release.take() {
                 let _ = release.await;
             }
@@ -574,6 +582,17 @@ struct FaultObservation {
     replacement_root: Option<PathBuf>,
 }
 
+struct PayloadRetentionObservation {
+    range: ReadRange,
+    old_object: PathBuf,
+    old_object_digest: [u8; 32],
+    successor_hash: [u8; 32],
+    old_live_bytes: u64,
+    old_total_bytes: u64,
+    reclaim_passes: u64,
+    reclaim_completed: bool,
+}
+
 #[derive(Default)]
 struct Observation {
     receipt: Option<SurvivalReceipt>,
@@ -591,6 +610,7 @@ struct Observation {
     expected_local_only_suffix: Option<(u64, u64)>,
     reported_local_only_suffix: Option<JournalLossReport>,
     read_only: bool,
+    payload_retention: Option<PayloadRetentionObservation>,
     fault: FaultObservation,
 }
 
@@ -736,7 +756,8 @@ fn fault_oracle(row: Row, live: &Live, observed: &Observation) -> Result<()> {
                 actual.online_catch_up_refused && actual.offline_verified,
                 "replacement catch-up must be refused online and verified offline"
             );
-            let expected = tree_hashes(&live.replica_roots()[0].join(".zerofs-survival/v1"))?;
+            let source = live.replica_roots()[0].join(".zerofs-survival/v1");
+            let mut expected = tree_hashes(&source)?;
             let destination = actual
                 .replacement_root
                 .as_ref()
@@ -746,9 +767,36 @@ fn fault_oracle(row: Row, live: &Live, observed: &Observation) -> Result<()> {
                     && !destination.starts_with(&live.replica_roots()[0]),
                 "replacement must use its owned replica directory"
             );
+            let mut replacement = tree_hashes(destination)?;
+            // Replica bindings differ. The retained generations must not.
+            for path in ["identity.json", "writer.lock"] {
+                expected.remove(Path::new(path));
+                replacement.remove(Path::new(path));
+            }
             ensure!(
-                !expected.is_empty() && expected == tree_hashes(destination)?,
+                !expected.is_empty() && expected == replacement,
                 "replacement must contain the exact verified generation bytes"
+            );
+            let source_identity: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(source.join("identity.json"))?)?;
+            let replacement_identity: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(destination.join("identity.json"))?)?;
+            for field in [
+                "format_version",
+                "pool_id",
+                "membership_digest",
+                "membership_epoch",
+            ] {
+                ensure!(
+                    source_identity.get(field).is_some()
+                        && source_identity.get(field) == replacement_identity.get(field),
+                    "replacement identity changed {field}"
+                );
+            }
+            ensure!(
+                replacement_identity["replica_id"] == "disk-a-metadata"
+                    && replacement_identity["device_id"] == REPLACEMENT_DEVICE_ID,
+                "replacement identity has the wrong replica or device binding"
             );
         }
     }
@@ -776,14 +824,29 @@ fn oracle(row: Row, live: &Live, observed: &Observation) -> Result<()> {
         return fault_oracle(row, live, observed);
     }
     match row {
+        Row::PayloadRetention => payload_retention_oracle(
+            live,
+            observed
+                .payload_retention
+                .as_ref()
+                .context("no overwrite and reclaim evidence")?,
+        )?,
         Row::AdmittedWriteLoss => ensure!(
             observed.admitted_pending_at_loss,
             "no admitted write was blocked mid-commit at device loss"
         ),
         Row::InterruptedCommit => {
-            ensure!(observed.cut.is_some(), "the production commit cut hook is absent");
-            ensure!(observed.cut_object.as_deref().is_some_and(valid_object_path),
-                "the production cut did not identify its affected object");
+            ensure!(
+                observed.cut.is_some(),
+                "the production commit cut hook is absent"
+            );
+            ensure!(
+                observed
+                    .cut_object
+                    .as_deref()
+                    .is_some_and(valid_object_path),
+                "the production cut did not identify its affected object"
+            );
         }
         Row::JournalBeforeBackend | Row::JournalAfterBackend => {
             ensure!(observed.journal_absent, "the journal device was not lost");
@@ -842,6 +905,118 @@ fn oracle(row: Row, live: &Live, observed: &Observation) -> Result<()> {
         row == Row::ExactRecovery,
     )?;
     read_oracle(row, live, observed)
+}
+
+fn payload_retention_oracle(live: &Live, observed: &PayloadRetentionObservation) -> Result<()> {
+    ensure!(
+        live.reads.contains(&observed.range) && observed.successor_hash != observed.range.sha256,
+        "the receipt's file must have a different live successor"
+    );
+    ensure!(
+        observed.old_live_bytes == 0 && observed.old_total_bytes > 0,
+        "the receipt's old segment must be reclaimable by the live namespace"
+    );
+    ensure!(
+        observed.reclaim_completed && observed.reclaim_passes > 0,
+        "a completed reclaim pass must actually run after the overwrite"
+    );
+    let bytes = std::fs::read(&observed.old_object)
+        .context("reclaim deleted payload still needed by the survival receipt")?;
+    ensure!(
+        <[u8; 32]>::from(Sha256::digest(bytes)) == observed.old_object_digest,
+        "the retained physical payload generation changed"
+    );
+    Ok(())
+}
+
+async fn overwrite_and_reclaim(live: &Live) -> Result<PayloadRetentionObservation> {
+    let range = live
+        .reads
+        .iter()
+        .find(|range| range.names.iter().any(|name| name == "/lost.bin"))
+        .context("the isolated payload-retention file")?
+        .clone();
+    let key = KeyCodec.extent_key(range.inode, 0);
+    let old = live.fs().db.get_bytes(&key).await?.context("old extent")?;
+    let old = FrameLoc::decode(&old).context("old frame location")?;
+    let placement = live
+        .pool()
+        .placements()
+        .await?
+        .into_iter()
+        .find(|p| {
+            p.location
+                .as_ref()
+                .ends_with(old.segid.object_key().as_str())
+        })
+        .context("old physical generation")?;
+    let old_object = live
+        .fixture
+        .root
+        .path()
+        .join(format!("{}-device", placement.member_id))
+        .join("data")
+        .join(placement.physical_key);
+    let old_object_digest = Sha256::digest(std::fs::read(&old_object)?).into();
+    let successor = payload(101).slice(..range.length as usize);
+    live.fs()
+        .write(&AuthContext::default(), range.inode, 0, &successor)
+        .await?;
+    let _ = live.fs().administrative_remote_durability().await?;
+    let current = live
+        .fs()
+        .db
+        .get_bytes(&key)
+        .await?
+        .context("successor extent")?;
+    let current = FrameLoc::decode(&current).context("successor frame location")?;
+    ensure!(
+        current.segid != old.segid,
+        "the overwrite reused the old segment"
+    );
+    let (bytes, _) = live
+        .fs()
+        .read_file(&AuthContext::default(), range.inode, 0, range.length)
+        .await?;
+    ensure!(bytes == successor, "the live successor did not publish");
+    let counter = live
+        .fs()
+        .db
+        .get_bytes(&KeyCodec.segcount_key(old.segid.epoch, old.segid.counter))
+        .await?
+        .context("the old segment counter")?;
+    let (old_live_bytes, old_total_bytes) =
+        KeyCodec::decode_segcount(&counter).context("the old segment byte counts")?;
+    ensure!(
+        old_live_bytes == 0 && old_total_bytes > 0,
+        "the fixture must make the receipt's segment fully reclaimable"
+    );
+    let stats = live.fs().extent_store.segment_gc_stats();
+    let before = stats.passes.load(std::sync::atomic::Ordering::Relaxed);
+    // The live export pin must already have transferred to the ledger. Run a
+    // full pass so a permanent-checkpoint skip cannot satisfy this contract.
+    let pass = live
+        .fs()
+        .extent_store
+        .reclaim_segments_gated(
+            || std::future::ready(Ok(Some((chrono::Utc::now(), None)))),
+            None,
+            Duration::ZERO,
+            |_| false,
+            64 * 1024 * 1024,
+        )
+        .await?;
+    let after = stats.passes.load(std::sync::atomic::Ordering::Relaxed);
+    Ok(PayloadRetentionObservation {
+        range,
+        old_object,
+        old_object_digest,
+        successor_hash: Sha256::digest(successor).into(),
+        old_live_bytes,
+        old_total_bytes,
+        reclaim_passes: after.saturating_sub(before),
+        reclaim_completed: matches!(pass.status, crate::fs::store::PassStatus::Completed { .. }),
+    })
 }
 
 fn read_oracle(row: Row, live: &Live, observed: &Observation) -> Result<()> {
@@ -1156,6 +1331,26 @@ async fn one_case(row: Row, live: &mut Live, driver: &dyn Survival) -> Result<()
     if matches!(row, Row::JournalBeforeBackend | Row::JournalAfterBackend) {
         return journal_case(row, live, driver).await;
     }
+    if row == Row::PayloadRetention {
+        let receipt = driver.commit(live).await?;
+        verify_replica_record(live, &receipt)?;
+        live.expected = State::capture(live.fs(), live.pool(), &live.replica_roots()[0]).await?;
+        let retained = overwrite_and_reclaim(live).await?;
+        payload_retention_oracle(live, &retained)?;
+        live.close_writer().await;
+        return lose_and_recover(
+            row,
+            live,
+            driver,
+            receipt,
+            Device::Authority,
+            Observation {
+                payload_retention: Some(retained),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
     if row == Row::AdmittedWriteLoss {
         let pause = driver
             .pause_write(live)
@@ -1164,6 +1359,8 @@ async fn one_case(row: Row, live: &mut Live, driver: &dyn Survival) -> Result<()
         let result = async {
             let receipt = driver.commit(live).await?;
             verify_replica_record(live, &receipt)?;
+            live.expected =
+                State::capture(live.fs(), live.pool(), &live.replica_roots()[0]).await?;
             pause
                 .start
                 .send(())
@@ -1276,6 +1473,16 @@ async fn interrupted_case(
         ensure!(
             reached.cut == cut && valid_object_path(&reached.object) && !pause.task.is_finished(),
             "the requested cut did not block the real commit task"
+        );
+        println!(
+            "METADATA_SURVIVAL_OBSERVED_CUT {}",
+            serde_json::json!({
+                "point": format!("{:?}", reached.cut.point),
+                "side": format!("{:?}", reached.cut.side),
+                "replica": reached.cut.replica,
+                "object": reached.object,
+                "lost": format!("{:?}", reached.cut.lost),
+            })
         );
         lose_device(live, cut.lost)?;
         Ok((reached, prior, prior_state, prior_reads))
@@ -1410,6 +1617,11 @@ acceptance_row!(
     data_member_with_metadata_replica_loss_preserves_namespace_and_reports_ranges,
     DataAndReplicaLoss,
     "Metadata replica recovery and exact sole-copy range reporting are missing"
+);
+acceptance_row!(
+    reclaim_preserves_payload_referenced_by_the_last_survival_commit,
+    PayloadRetention,
+    "Survival receipts and payload-retention enforcement are missing"
 );
 acceptance_row!(
     writes_in_flight_during_loss_preserve_last_survival_commit,
@@ -1630,6 +1842,31 @@ async fn exact_state_oracle_rejects_catalog_and_envelope_mutations() -> Result<(
     finish(live, Row::ExactRecovery, Ok(())).await
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unretained_superseded_payload_is_reclaimed() -> Result<()> {
+    let live = Live::new(false).await?;
+    let result = async {
+        let observed = overwrite_and_reclaim(&live).await?;
+        ensure!(observed.reclaim_completed && observed.reclaim_passes > 0);
+        ensure!(
+            !observed.old_object.exists(),
+            "the control must delete the old payload"
+        );
+        let error = payload_retention_oracle(&live, &observed)
+            .expect_err("the retention oracle accepted actual missing payload");
+        println!(
+            "METADATA_SURVIVAL_RETENTION_CONTROL {}",
+            serde_json::json!({
+                "survival_gate": "failed", "old_payload_reclaimed": true,
+                "reclaim_passes": observed.reclaim_passes, "error": format!("{error:#}"),
+            })
+        );
+        Ok(())
+    }
+    .await;
+    finish(live, Row::PayloadRetention, result).await
+}
+
 #[tokio::test]
 async fn commit_cut_hook_blocks_each_requested_boundary() -> Result<()> {
     ensure!(cuts().len() == 288);
@@ -1638,17 +1875,26 @@ async fn commit_cut_hook_blocks_each_requested_boundary() -> Result<()> {
         // A different replica must not trigger this boundary.
         tokio::time::timeout(
             Duration::from_secs(1),
-            hook.reach(cut.point, cut.side, "unrelated-replica", Path::new("objects/expected")),
+            hook.reach(
+                cut.point,
+                cut.side,
+                "unrelated-replica",
+                Path::new("objects/expected"),
+            ),
         )
         .await?;
         for invalid in ["", "/absolute", "../outside"] {
             tokio::time::timeout(
                 Duration::from_secs(1),
                 hook.reach(cut.point, cut.side, cut.replica, Path::new(invalid)),
-            ).await?;
+            )
+            .await?;
         }
         let object = PathBuf::from("objects/expected");
-        let expected = CutEvent { cut, object: object.clone() };
+        let expected = CutEvent {
+            cut,
+            object: object.clone(),
+        };
         let task = tokio::spawn(async move {
             hook.reach(cut.point, cut.side, cut.replica, &object).await;
         });

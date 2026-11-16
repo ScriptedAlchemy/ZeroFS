@@ -4,7 +4,7 @@ This is the first design stage of the metadata survival implementation. It is
 verified against ZeroFS commit `9b67f82eddedb30d268ac31fccaa0e3d49d9f2c3`.
 The survival gate still fails. This change adds no replication, recovery command,
 survival acknowledgement or placement capability. The proposed mechanism is
-promising on source inspection only. Thirteen ignored acceptance contracts fail
+promising on source inspection only. Fourteen ignored acceptance contracts fail
 at missing production prerequisites. Two ordinary journal-loss controls exercise
 today's backend durability. No production recovery or interrupted-commit coverage
 is claimed. The coordinator accepted the first mechanism
@@ -171,8 +171,8 @@ outside a requested commit do not gain a survival guarantee. They can still
 wait behind the commit's closed admission gate.
 
 Deployment must supply a finite commit deadline, an admission byte/request
-budget and a metadata-retention byte budget; activation must refuse absent or
-zero budgets. These are requirements for the implementation, not configuration
+budget and a generation-retention byte budget covering metadata and pinned
+payload. Activation must refuse absent or zero budgets. These are requirements for the implementation, not configuration
 fields supported today. Exhausting any budget closes mutation admission and
 reports which budget failed. A timeout never authorizes dropping a replica,
 forgetting an acknowledged generation or silently switching acknowledgement
@@ -222,9 +222,17 @@ The metadata replica set must not depend on a single capacity HDD alone.
 
 Ordinary write acknowledgements and fsync acknowledgements do not require a
 survival receipt. They can wait for admission during a survival commit, and
-replicated allocation intents can increase their cost. They keep today's configured meaning, with RAM acceptance,
+replicated allocation intents can increase their cost. They keep today's
+configured meaning, with RAM acceptance,
 local NVMe journal durability and remote drain to the assigned HDD as separate
 cutoffs. A backend receipt does not become a survival receipt.
+
+Status must report the last successful survival sequence, its completion time,
+the current lag since that completion, and each failed replica with its error.
+Before the first success it reports that no survival recovery point exists.
+A failed or stuck attempt does not advance the sequence or completion time.
+Lag keeps growing while attempts stall. The configured interval schedules
+attempts and must never appear as the achieved recovery point.
 
 The owner runs survival commits on a configurable interval and on explicit
 request. The proposed initial interval is 60 seconds. After the authority device
@@ -242,14 +250,15 @@ the checkpoint and exports the catalog. With replicas on HDDs it then waits for
 each metadata dependency's file fsync and parent-directory fsync, the catalog
 export and dependency list fsyncs, and the commit record fsyncs on every replica.
 It verifies the stored bytes before returning the named receipt. Admission
-stays closed through that all-replica record publication. A slow replica can
+stays closed through that all-replica record publication and durable release
+of the live export pin. A slow replica can
 therefore pause new writes for the duration of its timeout.
 
 The publication count is variable and must appear in commit diagnostics. With
 pre-created, durably synced directories, each newly published file needs one
 file fsync and one parent-directory fsync. Let D be the number of new immutable
-metadata dependency copies, L the number of live authority files published by
-seal, flush and checkpoint creation, and K be 1 when the versioned key record is
+metadata dependency copies, L the number of live authority file publications
+from seal, flush, checkpoint creation and export-pin release, and K be 1 when the versioned key record is
 new and 0 when it is already durable. The catalog export, dependency list and
 commit record add three files. The generation therefore waits for
 `2 * (L + D + K + 3)` fsyncs on each replica. A commit that writes a new key record
@@ -258,9 +267,9 @@ zero new publication fsyncs. Let A count additional directory fsyncs, including
 new ancestry and the native conditional store's repeated syncs of existing
 parent ancestry. The total before retirement is `2 * (L + D + K + 3) + A` per
 replica. Directory depth therefore affects the count too. Retirement adds
-two fsyncs for its batched retirement record on each replica, plus the live
-checkpoint-release manifest writes and one parent sync for each subsequent
-delete. Allocation and deletion intents have their own file and parent syncs;
+two fsyncs for its batched retirement record on each replica and one parent
+sync for each subsequent delete. The ordinary export-pin release is already
+counted in L, even when no older generation retires. Allocation and deletion intents have their own file and parent syncs;
 the diagnostic must report those separately rather than hide them in D.
 HDD fsync latency and the resulting admission pause have not been measured.
 
@@ -356,7 +365,8 @@ Atomic rename without a parent sync is not a completed durable publication.
    It syncs each file and affected parent directory, then verifies lengths and
    hashes from that replica. It installs retention for the candidate and both
    selectable predecessors, when present. No commit record is written until
-   every replica has every metadata dependency. Payload remains on its one assigned member.
+   every replica has every metadata dependency. Payload remains on its one
+   assigned member.
 6. For each replica in the same order, the owner conditionally creates and syncs
    the identical authenticated commit record. The record names the previous
    committed chain, never independently selected latest files. A same-name,
@@ -389,12 +399,37 @@ once its complete immutable dependency bundle is protected on every replica.
 Read-only recovery opens that verified bundle in scratch and does not depend
 on the continued existence of its checkpoint in the live authority.
 
+A generation pins the full recovery state. This includes its metadata SSTs,
+manifest state, catalog export, exact key envelope and every physical payload
+object its catalog and captured namespace reference. For example, commit M0 can
+name segment S0 while a later overwrite or repack publishes S1. Reclaiming S0
+before M0 retires would leave valid M0 metadata pointing at missing payload on a
+healthy member. The ledger must preserve S0 even when the live namespace has no
+remaining reference to it. The replicas still copy metadata only. These payload
+pins retain existing single-copy objects; they add no payload redundancy.
+
+Reclaim, repack, tombstone cleanup and relocation must consult this same ledger
+before deleting an object or its old physical generation. A live remap to S1
+never grants permission to delete S0 while any selectable generation or reader
+references S0. Relocation retains its exact source key and generation until those
+references retire. All payload deletion paths, including pool garbage cleanup
+and orphan sweep, must honor this permission under the serialization owner.
+
+A member is removable only after a survival generation that no longer requires
+it is durable on every replica. Every older selectable generation and reader
+that still references the member must retire before physical removal. Keeping
+the two newest generations can therefore require another successful commit
+before removal is safe. A live relocation count of zero alone cannot authorize
+member removal. The first version still refuses online membership changes;
+offline removal must validate this ledger and its durable membership transition.
+
 Replacing the pin requires an explicit retention ledger consulted by **all**
 metadata and payload deletion/remap paths. It records references by generation
 and by recovery reader. The ledger keeps the two newest selectable survival
-generations. An older generation may be retired only after a newer generation is durable on every
-replica and all readers of the older generation close. Reader pin acquisition
-and retirement share the owner, so a new reader cannot race the no-reader check.
+generations. An older generation may be retired only after a newer generation
+is durable on every replica and all readers of the older generation close.
+Reader pin acquisition and retirement share the owner, so a new reader cannot
+race the no-reader check.
 Retirement is itself an authenticated, durable record on every replica. Recovery
 must reject retired generations, while retaining their small chain records if
 the selected generation still needs them for authentication. Only after this
@@ -423,14 +458,30 @@ retirement records when selecting generations and never runs their deletes.
 Without readers or an incomplete commit, this policy bounds retained survival
 metadata to the union of two generations' dependency bundles, catalog exports,
 dependency lists and key records. It bounds survival-only payload retention to
-the physical generations referenced by those two catalogs. Shared bytes occupy
-space once. One candidate can temporarily add a third generation. Readers can
+the physical generations referenced by those two catalogs. A physical object
+shared by both generations is charged once per capacity domain. Relocation
+copies retain separate charges. One candidate can temporarily add a third generation. Readers can
 retain older generations until they close, so admission must account for those
 references too and stop before consuming the configured reserve. Failed cleanup
 and orphan uploads remain separately charged. Historical authenticated chain
 and retirement records also consume space. This policy does not bound those
 small records or total pool usage. Discarding chain evidence requires a separate
 compaction format contract.
+
+The mandatory retention byte budget covers the union of pinned metadata and
+payload physical generations on each capacity domain, including retained
+relocation sources, the candidate and active readers. It also reserves space
+for durable intents and cleanup debts without spending the configured free
+reserve. Overwrites can increase these retained bytes while survival commits
+stall. Admission must check the added charge before accepting a mutation or
+maintenance allocation. At exhaustion it closes mutation admission with an
+explicit storage error, rejects unadmitted queued work and reports the budget
+and any failed replica. It preserves every selectable generation and reader pin.
+It cannot reclaim their bytes, evict the oldest recovery point, drop a replica
+or keep acknowledging new writes to make space. Read-only service follows the
+failure rules above until an operator resolves the budget or failed replica
+and safe publication and retirement can resume. The byte limit needs workload
+measurement before deployment; no safe numeric default is established here.
 
 The wrapper must serialize conditional operations as one logical decision under
 the fenced owner. It uses the primary's create or compare-and-swap decision and
@@ -532,6 +583,7 @@ independent hardware devices. Every owned directory must be absent after cleanup
 | Journal loss before backend cutoff | Commit the base prefix, create a real SSD-durable suffix with remote replay paused, lose the journal and the original authority, and recover the state captured at the base receipt. Report the local-only suffix as lost. Named survival receipts are absent. |
 | Journal loss after backend cutoff | Drain the real suffix to the pool, commit and capture that suffix, then lose the journal and original authority. Recover the exact receipt-covered suffix and report the local-only loss boundary. Named survival receipts are absent. |
 | A data member with a metadata replica is lost. | Capture each current file extent's member, exact file names including hardlinks, byte offset, length and expected hash. Require at least one current sole-copy range on the lost member and one on a survivor. Lose its whole device, recover the surviving authority replica in scratch, compare the exact lost-range report, require EIO for every lost range and hash every other range and empty file. Replica recovery and current-range reporting are absent. |
+| A retained payload becomes dead in the live namespace. | Obtain a survival receipt, overwrite a file into a different segment, prove its old segment has zero live references, and run a completed reclaim pass. Require the old physical generation and its hash to remain. Lose the authority device and recover the receipt's version of every file by hash. Survival receipts and payload-retention enforcement are missing. |
 | An admitted write is interrupted by device loss. | Install the mid-commit hook, commit the prior prefix, start a real admitted write and wait for its entered barrier while its task is still pending. Remove the device before releasing that task. Recover the prior receipt. The admitted-write mid-commit hook is absent. |
 | A survival commit is interrupted. | Use the typed `CommitPoint` enum, before and after each point, for each replica and each logical device loss. Require the real task to enter and block at that exact hook before removing the device. Compare recovery with a complete allowed generation. The production commit cut hook is absent. |
 | Exact catalog, debts and key epoch recovery | Compare all captured bytes and require nonzero upload and garbage debts, capacity charges, envelope digest, format version, name mode and committed epoch. Replica configuration and complete generation export are absent. |
@@ -540,7 +592,13 @@ independent hardware devices. Every owned directory must be absent after cleanup
 | A replica is stale. | Supply the preceding generation as the configured replica, require refusal and a read-only share. The stale-replica hook is absent. |
 | A replica returns an I/O error. | Inject EIO during publication or sync, require refusal and a read-only share. The I/O-fault hook is absent. |
 | A competing writer opens. | Keep the first writer's per-replica locks, attempt a second writer and require refusal while the first still owns every lock. The replica-lock hook is absent. |
-| A replaced replica catches up. | Refuse catch-up online. Stop the writer, perform offline catch-up and compare every retained generation file's hash before permitting writable startup. The replacement hook is absent. |
+| A replaced replica catches up. | Refuse catch-up online. Stop the writer, perform offline catch-up, compare every retained generation file's hash and independently verify the new replica/device identity with the same pool and membership before permitting writable startup. The replacement hook is absent. |
+
+The ordinary `unretained_superseded_payload_is_reclaimed` control uses the same
+overwrite and reclaim fixture without a survival receipt. It verifies a zero-live
+old segment and a completed collector pass, then requires the old object to be
+gone and the payload-retention oracle to reject that loss. This is a real
+counterexample to payload survival today, not a passing survival row.
 
 The typed cut matrix currently names 18 points, two sides, two replicas and four
 logical devices, for 288 hook requests. Dependency publication and sync points
@@ -553,8 +611,8 @@ no unconditional failure after a newly working implementation.
 `CommitCutHook::reach` is the test-only boundary that the future commit owner
 must call with the exact affected object path. The event preserves that path.
 Its normal test checks that every requested boundary blocks until released and
-that an unrelated replica or an invalid object path cannot trigger it. This tests the hook,
-not production interruption safety.
+that an unrelated replica or an invalid object path cannot trigger it. This
+tests the hook, not production interruption safety.
 
 `every_acceptance_oracle_rejects_success_without_survival` is the mutation check.
 Its test-only `StubSurvival` accepts the proposed configuration and returns a
@@ -564,24 +622,32 @@ replica, a cold recovered namespace, exact nonempty debt tables, failed-range
 reads, a blocked admitted task, an entered commit hook, a held writer lock or a
 verified replacement. The mutation test also supplies optimistic success
 reports and still requires physical replica evidence. A separate comparison
-test rejects removal or mutation of catalog rows, envelope fields and exact range outcomes. Both run in
-the ordinary module suite.
+test rejects removal or mutation of catalog rows, envelope fields and exact
+range outcomes. Both run in the ordinary module suite.
 
-The ordinary module run skips the 13 acceptance rows and passes the three
-durability controls, the two mutation checks and the test of the 288 requested
+The ordinary module run skips the 14 acceptance rows and passes the four
+durability and retention controls, the two mutation checks and the test of the 288 requested
 test-channel boundaries. Those channel events are not production commit cuts.
 Each ignored row must also be run explicitly,
 with its specific missing-dependency line retained. These intentional failures
 are design evidence, not survival evidence. The external report records exact
 commands, counts, cleanup and the per-row stub result.
 
+The future bindings must also enforce the wider required matrix from the
+remote design review. Replica faults must occur separately before and during
+publication, ENOSPC must preserve the configured reserve, and corrupt or stale
+content must be detected from bytes and identities. Competing writers must run
+in distinct processes. Cut requests must expand to every actual object and sync
+operation, and only observed production events count as executed cases. These
+requirements remain unverified while the hooks are absent.
+
 Repeated-commit retirement tests remain required before implementation can pass
 its gate. They must overwrite and remove data, hold and release an older reader,
 cut before and after retirement and export-pin release, verify that owned live
 pins reach zero, and prove safe reclamation of old dependencies and debts. These
 are future mechanism tests, not additional executed rows in this design stage.
-The wider comparison matrix still includes key-only and catalog-only loss, corruption, metadata-only
-workloads and refusal of password changes. Credential transitions remain
+The wider comparison matrix still includes key-only and catalog-only loss,
+corruption, metadata-only workloads and refusal of password changes. Credential transitions remain
 disabled until their own interrupted-change matrix passes.
 
 ## Unverified assumptions
@@ -615,7 +681,8 @@ disabled until their own interrupted-change matrix passes.
   directory fixtures cannot prove those deployment conditions.
 
 The coordinator has selected the initial mechanism. The operating contract
-above still awaits operator confirmation. The first version uses a quiescent commit, a fixed replica set, lifetime exclusive locks
+above still awaits operator confirmation. The first version uses a quiescent
+commit, a fixed replica set, lifetime exclusive locks
 on every replica and all-replica acknowledgement on one host. HA and password
 changes are refused. No external freshness service is part of this contract,
 and recovery reports the stale self-copy limit. The remaining work is to test

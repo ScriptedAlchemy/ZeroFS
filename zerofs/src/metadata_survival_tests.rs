@@ -480,7 +480,8 @@ async fn baseline_metadata_loss_is_not_recoverable() {
 
 // These are controls for the existing writeback durability contract, not
 // metadata-survival acceptance tests. No replica is configured and a backend
-// receipt is not a survival receipt. The strict survival contracts live in the acceptance module below.
+// receipt is not a survival receipt. The strict survival contracts live in the
+// acceptance module below.
 struct DurablePrefixFixture {
     fixture: Fixture,
     expected: ExpectedNamespace,
