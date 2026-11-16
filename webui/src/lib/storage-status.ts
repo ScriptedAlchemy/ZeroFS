@@ -82,7 +82,9 @@ function member(raw: unknown): Value<MemberStatus> {
     monitoringError: healthText("monitoring_error"),
     warning: healthText("warning"),
     evacuationError: healthText("evacuation_error"),
-    observedMs: health ? field(health, "observed_ms", count) : unavailable("health was not reported"),
+    observedMs: health?.observed_ms === null
+      ? unavailable("No health observation has been reported")
+      : health ? field(health, "observed_ms", count) : unavailable("health was not reported"),
   });
 }
 
@@ -222,10 +224,9 @@ function affectedCount(status: Omit<AffectedStatus, "pathCount">): Value<number>
     if (
       item.name.state !== "known" ||
       item.references.state !== "known" ||
-      item.unresolvedSegments.state !== "known" ||
-      item.unresolvedSegments.value.length
+      item.unresolvedSegments.state !== "known"
     )
-      return unavailable("A metadata view is incomplete or has unresolved segments");
+      return unavailable("A metadata view is incomplete");
     const paths = new Set<string>();
     for (const ref of item.references.value) {
       if (

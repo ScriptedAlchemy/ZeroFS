@@ -71,6 +71,7 @@ test("populated pool preserves configured, charged, reserved, and allocatable by
   assert.equal(value(disk.monitoringError), "SMART unavailable");
   assert.equal(value(disk.quarantine), null);
   assert.equal(disk.observedMs.state, "unavailable");
+  assert.deepEqual(disk.observedMs, { state: "unavailable", reason: "No health observation has been reported" });
 });
 
 test("only the explicit no-pool server result means no pool", async () => {
@@ -185,11 +186,27 @@ test("incomplete scans never report zero paths, even if the returned views are e
     { ...affected, errors: undefined },
     { ...affected, errors: ["checkpoint metadata incomplete"] },
     { ...affected, views: [] },
-    { ...affected, views: [{ view: "live", references: [], unresolved_segments: ["segments/lost"] }] },
   ]) {
     const parsed = value(parseAffectedStatus(JSON.stringify(partial), "hdd-a"));
     assert.equal(parsed.pathCount.state, "unavailable");
   }
+});
+
+test("segments absent from one coherent view do not hide reported paths in another view", () => {
+  const raw = {
+    ...affected,
+    views: [
+      { view: "live", references: [], unresolved_segments: ["segments/checkpoint-only"] },
+      {
+        view: "checkpoint/archive",
+        unresolved_segments: ["segments/waiting-for-gc"],
+        references: [{ inode: 4, extent: 0, segment: "segments/checkpoint-only", paths: [[47, 97]] }],
+      },
+    ],
+  };
+  const parsed = value(parseAffectedStatus(JSON.stringify(raw), "hdd-a"));
+  assert.equal(value(parsed.pathCount), 1);
+  assert.deepEqual(value(value(parsed.views)[0].unresolvedSegments), ["segments/checkpoint-only"]);
 });
 
 test("non-UTF-8 and control-containing paths have reversible escaped displays and raw bytes", () => {
