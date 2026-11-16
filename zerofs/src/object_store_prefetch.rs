@@ -2703,6 +2703,212 @@ mod tests {
         );
     }
 
+    /// A sealed segment behind a fault store and the parts cache, read through
+    /// a `SegmentStore` the way `ExtentStore` reads file data.
+    struct CorruptionFixture {
+        cache: Arc<PrefetchingObjectStore>,
+        controls: Arc<crate::fault_store::FaultControls>,
+        reader: crate::segment_store::SegmentStore,
+        frames: Vec<(u64, u64, Bytes)>,
+        locations: Vec<(u64, u64, crate::segment::FrameLoc)>,
+        object: Bytes,
+        _dir: TempDir,
+    }
+
+    const CORRUPTION_PART: usize = 4 * 1024;
+
+    impl CorruptionFixture {
+        async fn new() -> Self {
+            use crate::config::CompressionConfig;
+            use crate::frame_codec::FrameCodec;
+            use crate::segment::SEGMENT_INFO;
+            use crate::segment_store::SegmentStore;
+
+            let codec = || FrameCodec::new(&[7; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+            let mem = Arc::new(InMemory::new());
+            // Seal straight into the backend so the parts cache starts cold;
+            // sealing through the cache would warm it with the good bytes.
+            let writer = SegmentStore::new(mem.clone(), codec(), 5, None);
+            let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+            let frames: Vec<(u64, u64, Bytes)> = (0..4u64)
+                .map(|extent| {
+                    let bytes: Vec<u8> = (0..6000)
+                        .map(|_| {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 7;
+                            seed ^= seed << 17;
+                            seed as u8
+                        })
+                        .collect();
+                    (1, extent, Bytes::from(bytes))
+                })
+                .collect();
+            let locations = writer.seal(&frames).await.unwrap();
+            let path = Path::from(locations[0].2.segid.object_key());
+            let object = mem.get(&path).await.unwrap().bytes().await.unwrap();
+            let (faulty, controls) = crate::fault_store::FaultStore::new(mem);
+            let (cache, dir) = store_over(faulty, CORRUPTION_PART).await;
+            let cache = Arc::new(cache);
+            let reader = SegmentStore::new(cache.clone(), codec(), 6, None);
+            Self {
+                cache,
+                controls,
+                reader,
+                frames,
+                locations,
+                object,
+                _dir: dir,
+            }
+        }
+
+        fn path(&self) -> Path {
+            Path::from(self.locations[0].2.segid.object_key())
+        }
+
+        fn run_bounds(&self) -> (u64, u32) {
+            let first = self.locations[0].2;
+            let last = self.locations.last().unwrap().2;
+            let end = last.byte_offset + u64::from(last.byte_len);
+            (first.byte_offset, (end - first.byte_offset) as u32)
+        }
+
+        fn slots(&self) -> Vec<(u64, u64)> {
+            self.locations.iter().map(|(i, e, _)| (*i, *e)).collect()
+        }
+
+        async fn read(&self) -> Result<Vec<Bytes>, crate::segment_store::SegmentStoreError> {
+            let (offset, len) = self.run_bounds();
+            let first = self.locations[0].2;
+            self.reader
+                .read_run(first.segid, offset, len, first.frame_index, &self.slots())
+                .await
+        }
+
+        fn assert_frames(&self, got: &[Bytes]) {
+            assert_eq!(got.len(), self.frames.len());
+            for (got, (_, _, want)) in got.iter().zip(&self.frames) {
+                assert_eq!(got, want);
+            }
+        }
+
+        /// Every part covering the run is either absent or holds the object's
+        /// true bytes; returns how many were cached.
+        async fn assert_cache_holds_only_true_bytes(&self) -> usize {
+            let (offset, len) = self.run_bounds();
+            let first = offset as usize / CORRUPTION_PART;
+            let last = (offset as usize + len as usize).div_ceil(CORRUPTION_PART);
+            let mut cached = 0;
+            for part in first..last {
+                if let Some(bytes) = self.cache.cached_part(&self.path(), part).await {
+                    let start = part * CORRUPTION_PART;
+                    let end = (start + CORRUPTION_PART).min(self.object.len());
+                    assert_eq!(
+                        bytes.as_ref(),
+                        &self.object[start..end],
+                        "cache part {part} differs from the stored object"
+                    );
+                    cached += 1;
+                }
+            }
+            cached
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupted_cached_segment_part_is_refetched_once_and_replaced() {
+        let fixture = CorruptionFixture::new().await;
+        fixture.controls.corrupt_gets(1);
+
+        let got = fixture
+            .read()
+            .await
+            .expect("one uncached retry must recover a corrupted cached part");
+        fixture.assert_frames(&got);
+        assert_eq!(
+            fixture.controls.get_count(),
+            2,
+            "one cold GET and exactly one retry"
+        );
+        assert!(
+            fixture.assert_cache_holds_only_true_bytes().await > 0,
+            "the authenticated retry bytes should be cached"
+        );
+
+        for _ in 0..3 {
+            fixture.assert_frames(&fixture.read().await.unwrap());
+        }
+        assert_eq!(
+            fixture.controls.get_count(),
+            2,
+            "later reads are served from the repaired cache without another retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_retry_returns_the_integrity_error_without_looping() {
+        let fixture = CorruptionFixture::new().await;
+        fixture.controls.corrupt_gets(2);
+
+        let error = fixture
+            .read()
+            .await
+            .expect_err("a corrupt retry must not be accepted");
+        assert!(
+            matches!(error, crate::segment_store::SegmentStoreError::Segment(_)),
+            "expected a frame integrity error, got {error:?}"
+        );
+        assert_eq!(
+            fixture.controls.get_count(),
+            2,
+            "one cold GET and exactly one retry"
+        );
+        fixture.assert_cache_holds_only_true_bytes().await;
+
+        fixture.assert_frames(&fixture.read().await.unwrap());
+        assert_eq!(fixture.controls.get_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn uncached_segment_reads_are_unchanged() {
+        let fixture = CorruptionFixture::new().await;
+        let (offset, len) = fixture.run_bounds();
+        let first = fixture.locations[0].2;
+        let slots = fixture.slots();
+
+        fixture.controls.corrupt_gets(1);
+        let result = fixture
+            .reader
+            .read_compressed_run(first.segid, offset, len, first.frame_index, &slots)
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(crate::segment_store::SegmentStoreError::Segment(_))
+            ),
+            "compaction reads authenticate the bytes they fetched"
+        );
+        assert_eq!(
+            fixture.controls.get_count(),
+            1,
+            "no retry for uncached reads"
+        );
+        assert_eq!(fixture.assert_cache_holds_only_true_bytes().await, 0);
+
+        fixture
+            .reader
+            .read_compressed_run(first.segid, offset, len, first.frame_index, &slots)
+            .await
+            .unwrap();
+        assert_eq!(fixture.controls.get_count(), 2);
+
+        fixture.assert_frames(&fixture.read().await.unwrap());
+        assert_eq!(
+            fixture.controls.get_count(),
+            3,
+            "a clean cached read does not retry"
+        );
+    }
+
     #[tokio::test]
     async fn late_cold_reader_waits_for_discovery_payload() {
         const MIB: usize = 1024 * 1024;
