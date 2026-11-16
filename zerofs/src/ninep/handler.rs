@@ -1,3 +1,6 @@
+mod xattr;
+use xattr::XattrFid;
+
 use super::errors::{P9Error, P9Result};
 use super::lock_manager::{FileLock, FileLockManager, LockGuard};
 #[cfg(feature = "failpoints")]
@@ -198,6 +201,7 @@ pub struct FidSlot {
     /// Present once the fid takes its first byte-range lock; releases the fid's
     /// locks on drop.
     pub lock_guard: Option<LockGuard>,
+    xattr: Option<XattrFid>,
 }
 
 impl FidSlot {
@@ -208,6 +212,7 @@ impl FidSlot {
             directory_pin: None,
             replay_reopen: false,
             lock_guard: None,
+            xattr: None,
         }
     }
 }
@@ -496,6 +501,7 @@ impl NinePHandler {
         self.session_state()
             .fids
             .get(&fid)
+            .filter(|slot| slot.xattr.is_none())
             .ok_or(P9Error::BadFid)
             .map(|slot| OpenFidContext {
                 fid: slot.fid.clone(),
@@ -660,6 +666,7 @@ impl NinePHandler {
         self.session_state()
             .fids
             .get(&fid)
+            .filter(|slot| slot.xattr.is_none())
             .ok_or(P9Error::BadFid)
             .map(|s| s.fid.clone())
     }
@@ -670,6 +677,7 @@ impl NinePHandler {
         self.session_state()
             .fids
             .get(&fid)
+            .filter(|slot| slot.xattr.is_none())
             .ok_or(P9Error::BadFid)
             .map(|slot| {
                 let state = if !slot.fid.opened {
@@ -864,7 +872,7 @@ impl NinePHandler {
             Message::Tlcreate(tc) => self.lcreate(tc, op_id).await,
             Message::Tread(tr) => self.read(tr).await,
             Message::Twrite(tw) => self.write(tw, op_id, op_origin_epoch).await,
-            Message::Tclunk(tc) => Ok(self.clunk(tc).await),
+            Message::Tclunk(tc) => self.clunk(tc).await,
             Message::Treaddir(tr) => self.readdir(tr).await,
             Message::Tgetattr(tg) => self.getattr(tg).await,
             Message::Tsetattr(ts) => self.setattr(ts, op_id).await,
@@ -882,7 +890,8 @@ impl NinePHandler {
             Message::Tfsyncdur(tf) => self.fsyncdur(tf).await,
             Message::Tgetlineage(_) => self.getlineage().await,
             Message::Tflush(_) => Ok(Message::Rflush(Rflush)),
-            Message::Txattrwalk(_) => Err(P9Error::NotSupported),
+            Message::Txattrwalk(tx) => self.xattrwalk(tx).await,
+            Message::Txattrcreate(tx) => self.xattrcreate(tx).await,
             Message::Tstatfs(ts) => self.statfs(ts).await,
             Message::Tlock(tl) => self.lock(tl).await,
             Message::Tgetlock(tg) => self.getlock(tg).await,
@@ -1269,6 +1278,7 @@ impl NinePHandler {
                 directory_pin,
                 replay_reopen,
                 lock_guard: None,
+                xattr: None,
             },
         );
         Ok(Message::Rrebind(Rrebind { qid }))
@@ -1627,11 +1637,12 @@ impl NinePHandler {
         }))
     }
 
-    async fn clunk(&self, tc: Tclunk) -> Message {
+    async fn clunk(&self, tc: Tclunk) -> P9Result<Message> {
         let slot = self.session_state().fids.remove(&tc.fid);
-        // Release resources outside the session lock.
-        drop(slot);
-        Message::Rclunk(Rclunk)
+        if let Some(slot) = slot {
+            self.commit_xattr(slot).await?;
+        }
+        Ok(Message::Rclunk(Rclunk))
     }
 
     /// Implicitly clunk every fid, as required by Tversion.
@@ -1658,6 +1669,9 @@ impl NinePHandler {
                         slot.handle.take(),
                         slot.directory_pin.take(),
                         slot.lock_guard.take(),
+                        slot.xattr
+                            .as_mut()
+                            .map(|xattr| std::mem::replace(xattr, XattrFid::Closed)),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1903,6 +1917,9 @@ impl NinePHandler {
     }
 
     async fn read(&self, tr: Tread) -> P9Result<Message> {
+        if let Some(result) = self.read_xattr(&tr) {
+            return result;
+        }
         let fid_entry = self.get_fid(tr.fid)?;
 
         if !fid_allows_read(&fid_entry) {
@@ -1931,6 +1948,9 @@ impl NinePHandler {
         op_id: crate::dedup::OpId,
         op_origin_epoch: u64,
     ) -> P9Result<Message> {
+        if let Some(result) = self.write_xattr(&tw) {
+            return result;
+        }
         let fid_entry = self.get_fid(tw.fid)?;
 
         if !fid_allows_write(&fid_entry) {
@@ -5693,6 +5713,7 @@ mod tests {
                 directory_pin: None,
                 replay_reopen: false,
                 lock_guard: None,
+                xattr: None,
             },
         );
         assert_eq!(fs.open_handle_count(file_id), 1);

@@ -26,6 +26,8 @@ macro_rules! for_each_request {
     ($emit:ident) => {
         $emit! {
             Tversion, TVERSION, notag, { msize: u32, version: str };
+            Txattrwalk, TXATTRWALK, tag, { fid: u32, newfid: u32, name: str };
+            Txattrcreate, TXATTRCREATE, tag, { fid: u32, name: str, size: u64, flags: u32 };
             Tgetlineage, TGETLINEAGE, tag, { };
             Trebind, TREBIND, tag, {
                 fid: u32,

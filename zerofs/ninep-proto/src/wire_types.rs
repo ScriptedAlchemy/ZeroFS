@@ -205,6 +205,8 @@ pub mod message_type {
     pub const RSETATTR: u8 = 27;
     pub const TXATTRWALK: u8 = 30;
     pub const RXATTRWALK: u8 = 31;
+    pub const TXATTRCREATE: u8 = 32;
+    pub const RXATTRCREATE: u8 = 33;
     pub const TREADDIR: u8 = 40;
     pub const RREADDIR: u8 = 41;
     pub const TFSYNC: u8 = 50;

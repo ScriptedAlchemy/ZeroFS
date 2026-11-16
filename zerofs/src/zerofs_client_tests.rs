@@ -12,6 +12,7 @@ use zerofs_client::{
 };
 
 mod replay;
+mod xattr;
 
 fn start_server(fs: Arc<ZeroFS>, sock: std::path::PathBuf) -> CancellationToken {
     let server = NinePServer::new_unix(fs, sock);

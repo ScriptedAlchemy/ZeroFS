@@ -41,7 +41,12 @@ impl XattrName {
         }
     }
 
-    pub(crate) fn check(&self, inode: &Inode, creds: &Credentials, write: bool) -> Result<(), FsError> {
+    pub(crate) fn check(
+        &self,
+        inode: &Inode,
+        creds: &Credentials,
+        write: bool,
+    ) -> Result<(), FsError> {
         match self.namespace()? {
             b"user" => {
                 if !matches!(inode, Inode::File(_) | Inode::Directory(_)) {
