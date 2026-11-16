@@ -213,3 +213,17 @@ fn mount_readonly_and_subdirectory_roots_are_preserved() {
         assert_eq!(facts.filesystem_root, Path::new("/subdirectory"));
     }
 }
+
+#[test]
+fn descendant_mounts_below_every_storage_role_are_rejected() {
+    for role in ["authority", "catalog", "member", "cache", "journal"] {
+        let root = format!("/fixture/{role}");
+        for descendant in ["bucket_12345678", "nested/other", "pool.redb"] {
+            let input = format!(
+                "1 0 8:1 / /fixture rw - ext4 /dev/sda1 rw\n2 1 0:35 / {root}/{descendant} rw - tmpfs tmpfs rw\n"
+            );
+            let error = containing_mount(&input, Path::new(&root)).unwrap_err();
+            assert!(format!("{error:#}").contains("descendant mount"));
+        }
+    }
+}

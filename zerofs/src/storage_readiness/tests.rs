@@ -534,3 +534,49 @@ async fn unsupported_host_stops_normal_open_and_explicit_init_before_any_storage
         );
     }
 }
+
+#[test]
+fn real_open_paths_are_verified_without_creating_missing_children() {
+    let fixture = Fixture::new();
+    let settings = fixture.parse().unwrap();
+    let paths = ["authority", "catalog", "member data", "cache", "journal"]
+        .into_iter()
+        .map(|role| (role, fixture.path(role).join("actual-child")))
+        .collect::<Vec<_>>();
+    verify_open_paths_with(&settings, &fixture, &paths).unwrap();
+    for (_, path) in paths {
+        assert!(!path.exists());
+    }
+}
+
+#[test]
+fn a_real_open_path_cannot_escape_its_declared_role_or_filesystem() {
+    use std::os::unix::fs::symlink;
+    for role in ["authority", "catalog", "member data", "cache", "journal"] {
+        let mut fixture = Fixture::new();
+        let root = fixture.path(role);
+        let child = root.join("actual-child");
+        std::fs::create_dir(&child).unwrap();
+        let mut facts = fixture.facts[&root].clone();
+        facts.identity = FilesystemIdentity::Uuid {
+            uuid: "202a7f25-f539-4b30-8bb1-0b36331fde71".into(),
+        };
+        fixture.facts.insert(child.clone(), facts);
+        error_contains(
+            verify_open_paths_with(
+                &fixture.parse().unwrap(),
+                &fixture,
+                &[(role, child.clone())],
+            ),
+            "identity changed",
+        );
+        std::fs::remove_dir(&child).unwrap();
+        let outside = fixture._temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, &child).unwrap();
+        error_contains(
+            verify_open_paths_with(&fixture.parse().unwrap(), &fixture, &[(role, child)]),
+            "escapes its declared role",
+        );
+    }
+}

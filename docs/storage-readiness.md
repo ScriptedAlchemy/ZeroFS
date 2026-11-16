@@ -58,8 +58,12 @@ storage role unchecked.
 All active role directories must already exist, including catalog, cache, and
 journal directories. Readiness creates nothing. A role may be a dedicated child
 directory on its declared mounted filesystem. Role directories must be disjoint,
-including after resolving symlinks. Nested mounts cannot substitute for the
-declared mountpoint. Declared mountpoints must themselves be canonical paths.
+including after resolving symlinks. The Linux adapter rejects every mount
+strictly below a declared role root. It also checks the containing filesystem
+against the declaration. Before opening storage, preflight checks the catalog
+files and the cache and journal namespace children, including existing symlink
+targets. Missing children use their closest existing ancestor without creating
+anything. Nested mounts cannot substitute for the declared mountpoint. Declared mountpoints must themselves be canonical paths.
 
 Authority, catalog, and one member may share a filesystem through disjoint
 directories. Journal and cache may likewise share the NVMe filesystem. Multiple
@@ -121,8 +125,18 @@ Local tests cover injected missing/wrong/locked/read-only/unknown identities for
 every role, ordinary fallback directories, aliases, shared ZFS capacity,
 independent members, config round-trips, and Mac rejection before mutation.
 Mount-table and command-output tests verify parsing and rejection behavior. They
-do not establish Linux mount, block-device, or OpenZFS runtime behavior. No
-TrueNAS app/container mount visibility, encrypted dataset lifecycle, ACL, SMB,
+do not establish OpenZFS runtime behavior. An ignored Linux integration test
+checks tmpfs and bind descendants for all five roles in an isolated Docker
+container. A separate privileged test checks a loop-mounted ext4 UUID through
+real `blkid -p`. It also demonstrates that a mount change after a completed
+check reaches the replacement filesystem during a later path-based write.
+A fresh check rejects that mount.
+
+- Not verified: OpenZFS lifecycle and same-name dataset recreation, XFS block
+  devices, and host bind mounts outside the container were not exercised. The
+  completed preflight holds no handle and cannot detect later mount changes.
+
+No TrueNAS app/container mount visibility, encrypted dataset lifecycle, ACL, SMB,
 hardware durability, or performance acceptance is claimed. Colocating control
 metadata on HDD does not satisfy the separate one-device-loss survival gate.
 

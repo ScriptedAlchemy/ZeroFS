@@ -48,6 +48,13 @@ pub(super) fn containing_mount(input: &str, path: &Path) -> Result<Mount> {
         if !mountpoint.is_absolute() {
             bail!("mountinfo mountpoint must be absolute")
         }
+        if mountpoint != path && mountpoint.starts_with(path) {
+            bail!(
+                "descendant mount below storage root {} at {}",
+                path.display(),
+                mountpoint.display()
+            );
+        }
         if !path.starts_with(&mountpoint) {
             continue;
         }

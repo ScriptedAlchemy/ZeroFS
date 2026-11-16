@@ -197,6 +197,10 @@ impl StartupContext {
                 .await
                 .context("Failed to resolve bucket identity")?;
 
+            crate::storage_readiness::verify_bucket_paths(
+                settings,
+                &bucket.cache_directory_name(),
+            )?;
             let cache_config = CacheConfig {
                 root_folder: cache_config.root_folder.join(bucket.cache_directory_name()),
                 ..cache_config

@@ -119,7 +119,13 @@ pub(crate) async fn open_pool_storage(
         .as_ref()
         .context("[storage.pool] is not configured")?;
     settings.validate()?;
-    crate::storage_readiness::verify(settings)?;
+    crate::storage_readiness::verify_open_paths(
+        settings,
+        &[
+            ("catalog", config.catalog_dir.join(CATALOG_FILE_NAME)),
+            ("catalog", config.catalog_dir.join("pool.lock")),
+        ],
+    )?;
     validate_directories(settings)?;
     if !initialize && !config.catalog_dir.join(CATALOG_FILE_NAME).is_file() {
         anyhow::bail!(

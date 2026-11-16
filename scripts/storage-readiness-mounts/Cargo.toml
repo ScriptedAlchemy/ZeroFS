@@ -1,0 +1,13 @@
+[package]
+name = "zerofs-storage-readiness-mounts"
+version = "0.0.0"
+edition = "2024"
+publish = false
+autotests = false
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["serde"] }
+tempfile = "3"
