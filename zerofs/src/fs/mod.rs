@@ -114,6 +114,10 @@ pub struct ZeroFS {
     /// start the drainer just let sends buffer). `Arc<Mutex<..>>` keeps the
     /// vestigial `ZeroFS: Clone` derive working.
     reclaim_rx: Arc<Mutex<Option<UnboundedReceiver<InodeId>>>>,
+    /// Tells the reclaim drainer to close its queue and finish queued work.
+    reclaim_shutdown: tokio_util::sync::CancellationToken,
+    /// The drainer's join handle, so shutdown can wait for its final drain.
+    reclaim_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     pub lock_manager: Arc<KeyedLockManager<InodeId>>,
     pub stats: Arc<FileSystemStats>,
     pub global_stats: Arc<FileSystemGlobalStats>,

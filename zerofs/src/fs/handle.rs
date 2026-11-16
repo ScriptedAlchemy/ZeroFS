@@ -137,14 +137,51 @@ impl ZeroFS {
             None => return, // already started
         };
         let weak = Arc::downgrade(self);
-        tokio::spawn(async move {
+        let shutdown = self.reclaim_shutdown.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => {
+                        // Refuse new notifications, then finish everything
+                        // queued before shutdown.
+                        rx.close();
+                        break;
+                    }
+                    id = rx.recv() => {
+                        let Some(id) = id else {
+                            return;
+                        };
+                        match weak.upgrade() {
+                            Some(fs) => fs.reclaim_if_unreferenced(id).await,
+                            None => return,
+                        }
+                    }
+                }
+            }
             while let Some(id) = rx.recv().await {
                 match weak.upgrade() {
                     Some(fs) => fs.reclaim_if_unreferenced(id).await,
-                    None => break,
+                    None => return,
                 }
             }
         });
+        *self.reclaim_task.lock().unwrap() = Some(handle);
+    }
+
+    /// Finishes queued orphan reclaims and stops the drainer.
+    ///
+    /// Join the serving tasks first, so that dropping their last open handles
+    /// queues those inodes before the queue closes. Once this returns, no
+    /// reclaim can mutate metadata after the final database close.
+    pub(crate) async fn shutdown_reclaim_drainer(&self) {
+        self.reclaim_shutdown.cancel();
+        let handle = self.reclaim_task.lock().unwrap().take();
+        if let Some(handle) = handle {
+            // A join error means the drainer already exited, which also rules
+            // out a race with the database close.
+            let _ = handle.await;
+        }
     }
 
     /// Synchronous decrement-then-reclaim. Production drives this through the
@@ -380,6 +417,63 @@ mod tests {
         })
         .await
         .expect("orphan reclaim did not finish");
+    }
+
+    // Shutdown must finish the reclaims already queued and then refuse new
+    // ones, so no reclaim can mutate metadata after the final database close.
+    #[tokio::test]
+    async fn reclaim_drainer_shutdown_waits_for_queued_work_and_closes_queue() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        fs.start_reclaim_drainer();
+        let file_id = make_file(&fs, b"shutdown-orphan", b"data").await;
+
+        let open = {
+            let _guard = fs.lock_manager.acquire(file_id).await;
+            fs.new_open_handle(file_id)
+        };
+        fs.remove(&(&test_auth()).into(), 0, b"shutdown-orphan")
+            .await
+            .unwrap();
+
+        // Hold the inode lock so the queued reclaim cannot finish until the
+        // test releases it.
+        let inode_guard = fs.lock_manager.acquire(file_id).await;
+        drop(open);
+        let shutdown_fs = Arc::clone(&fs);
+        let shutdown = tokio::spawn(async move {
+            shutdown_fs.shutdown_reclaim_drainer().await;
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !fs.reclaim_shutdown.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reclaim drainer was not asked to stop");
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown returned before the queued reclaim finished"
+        );
+
+        drop(inode_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(3), shutdown)
+            .await
+            .expect("reclaim drainer shutdown timed out")
+            .unwrap();
+
+        assert!(matches!(
+            fs.inode_store.get(file_id).await,
+            Err(FsError::NotFound)
+        ));
+        assert!(orphan_ids(&fs).await.is_empty());
+        assert!(
+            fs.reclaim_tx.send(file_id).is_err(),
+            "shutdown must refuse reclaim work that could race the database close"
+        );
     }
 
     /// The deterministic repro: open a fid, unlink the name, the open fid must
