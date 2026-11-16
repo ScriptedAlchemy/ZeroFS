@@ -266,4 +266,4 @@ pub(crate) fn verify_bucket_paths(settings: &Settings, namespace: &str) -> Resul
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

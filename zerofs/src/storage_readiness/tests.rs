@@ -6,15 +6,15 @@ use std::collections::BTreeMap;
 
 const FAST_UUID: &str = "47166772-65c1-4ecf-8066-935452891add";
 
-struct Fixture {
+pub(crate) struct Fixture {
     _temp: tempfile::TempDir,
-    document: Value,
+    pub(crate) document: Value,
     facts: BTreeMap<PathBuf, MountedFilesystem>,
     calls: Cell<usize>,
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
         let base = temp.path().canonicalize().unwrap();
         let durable = base.join("durable");
@@ -92,13 +92,13 @@ impl Fixture {
         }
     }
 
-    fn parse(&self) -> Result<Settings> {
+    pub(crate) fn parse(&self) -> Result<Settings> {
         let settings: Settings = toml::from_str(&toml::to_string(&self.document)?)?;
         settings.validate()?;
         Ok(settings)
     }
 
-    fn path(&self, role: &str) -> PathBuf {
+    pub(crate) fn path(&self, role: &str) -> PathBuf {
         let settings = self.parse().unwrap();
         let roots = settings
             .storage
@@ -623,7 +623,9 @@ async fn readiness_symlinks_refuse_pool_init_and_server_backend_open_before_writ
             std::fs::write(outside.join("sentinel"), b"unchanged").unwrap();
             symlink(&outside, &child).unwrap();
             let result = if initialize {
-                crate::storage_backend::open_pool_storage(&settings, true).await.map(|_| ())
+                let config = fixture._temp.path().join("config.toml");
+                std::fs::write(&config, toml::to_string(&settings).unwrap()).unwrap();
+                crate::cli::pool::run(crate::cli::PoolCommands::Init { config }).await
             } else {
                 crate::storage_backend::open_storage(&settings).await.map(|_| ())
             };
@@ -674,6 +676,7 @@ fn reserve_above_configured_member_capacity_is_rejected_in_both_strict_modes() {
     for strict in [true, false] {
         let mut fixture = Fixture::new();
         fixture.document["storage"]["readiness"]["strict"] = json!(strict);
+        fixture.document["storage"]["readiness"]["reserves"][1]["bytes"] = json!(10_000_001);
         fixture.document["storage"]["readiness"]["reserves"][0]["bytes"] = json!(10_000_000);
         fixture.parse().unwrap();
         fixture.document["storage"]["readiness"]["reserves"][0]["bytes"] = json!(10_000_001);
@@ -683,23 +686,31 @@ fn reserve_above_configured_member_capacity_is_rejected_in_both_strict_modes() {
 
 #[test]
 fn reserve_above_observed_size_or_unavailable_size_refuses_strict_open() {
-    struct SizeProvider<'a> { fixture: &'a Fixture, size: Option<u64> }
+    struct SizeProvider<'a> { fixture: &'a Fixture, root: PathBuf, size: Option<u64> }
     impl IdentityProvider for SizeProvider<'_> {
         fn observe(&self, path: &Path) -> Result<MountedFilesystem> {
             self.fixture.observe(path)
         }
-        fn filesystem_size(&self, _path: &Path) -> Result<u64> {
-            self.size.context("synthetic filesystem size unavailable")
+        fn filesystem_size(&self, path: &Path) -> Result<u64> {
+            if path == self.root {
+                self.size.context("synthetic filesystem size unavailable")
+            } else {
+                Ok(100_000_000)
+            }
         }
-
     }
     let fixture = Fixture::new();
     let settings = fixture.parse().unwrap();
-    verify_with(&settings, &SizeProvider { fixture: &fixture, size: Some(1_000_000) }).unwrap();
-    error_contains(verify_with(&settings, &SizeProvider { fixture: &fixture, size: Some(999_999) }), "observed filesystem size");
-    error_contains(verify_with(&settings, &SizeProvider { fixture: &fixture, size: None }), "filesystem size unavailable");
+    for role in ["authority", "catalog", "member data", "cache", "journal"] {
+        let root = fixture.path(role);
+        verify_with(&settings, &SizeProvider { fixture: &fixture, root: root.clone(), size: Some(1_000_000) }).unwrap();
+        for (size, expected) in [(Some(999_999), "observed filesystem size"), (Some(0), "filesystem size unavailable"), (None, "filesystem size unavailable")] {
+            let error = verify_with(&settings, &SizeProvider { fixture: &fixture, root: root.clone(), size }).unwrap_err();
+            let error = format!("{error:#}");
+            assert!(error.contains(role) && error.contains(expected), "{error}");
+        }
+    }
 }
-
 
 #[test]
 fn readiness_refuses_internal_and_dangling_symlinks_below_every_role() {
