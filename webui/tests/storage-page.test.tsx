@@ -60,8 +60,8 @@ function without(record: Record<string, unknown>, ...keys: string[]) {
 }
 
 function rowValue(label: string): string {
-  const term = screen.getByText(label, { selector: "dt" });
-  return term.nextElementSibling?.textContent ?? "";
+  const term = screen.getByText(label).closest("dt");
+  return term?.nextElementSibling?.textContent ?? "";
 }
 
 beforeEach(() => {
@@ -90,7 +90,7 @@ describe("Storage page pool section", () => {
     render(<StoragePage />);
     await screen.findByText("hdd-a");
     for (const label of ["Configured capacity", "Charged usage"]) {
-      expect(rowValue(label)).toMatch(/^unavailable\./);
+      expect(rowValue(label)).toMatch(/^Unavailable/);
       expect(rowValue(label)).not.toMatch(/\b0\b/);
     }
   });
@@ -186,8 +186,8 @@ describe("Storage page affected-path scan", () => {
     });
     await inspect();
     await screen.findByText("Scan complete");
-    expect(rowValue("Scan complete")).toBe("no");
-    expect(rowValue("Reported path total across views")).toMatch(/^unavailable\./);
+    expect(rowValue("Scan complete")).toBe("No");
+    expect(rowValue("Reported path total across views")).toMatch(/^Unavailable/);
     expect(rowValue("Reported path total across views")).not.toMatch(/\b0\b/);
   });
 
@@ -196,5 +196,80 @@ describe("Storage page affected-path scan", () => {
     await inspect();
     expect(await screen.findByText(/scan timed out/)).toBeTruthy();
     expect(screen.queryByText("Reported path total across views")).toBeNull();
+  });
+});
+
+describe("Storage page capacity and health summary", () => {
+  it("draws the capacity bar only when all four byte counts are known and consistent", async () => {
+    render(<StoragePage />);
+    await screen.findByText("hdd-a");
+    expect(screen.getByRole("img", { name: /Share of configured capacity/ })).toBeTruthy();
+    expect(rowValue("Held back")).toBe("931.3 GiB (999,999,998,976 bytes)");
+    cleanup();
+    client.getPoolStatus.mockResolvedValue({ json: pool([without(member, "used_bytes")]) });
+    render(<StoragePage />);
+    await screen.findByText("hdd-a");
+    expect(screen.queryByRole("img", { name: /Share of configured capacity/ })).toBeNull();
+    expect(screen.getByText(/^Capacity bar unavailable/)).toBeTruthy();
+  });
+
+  it("says no issues only when every health observation was reported empty", async () => {
+    render(<StoragePage />);
+    await screen.findByText("hdd-a");
+    expect(screen.getByText("Health not observed yet")).toBeTruthy();
+    expect(screen.queryByText("No health issues reported")).toBeNull();
+    cleanup();
+    client.getPoolStatus.mockResolvedValue({
+      json: pool([{ ...member, health: { ...member.health, observed_ms: 1_800_000_000_000 } }]),
+    });
+    render(<StoragePage />);
+    expect(await screen.findByText("No health issues reported")).toBeTruthy();
+    cleanup();
+    client.getPoolStatus.mockResolvedValue({
+      json: pool([{ ...member, health: { ...member.health, warning: "reallocated sectors" } }]),
+    });
+    render(<StoragePage />);
+    expect(await screen.findByText("1 health issue reported")).toBeTruthy();
+    expect(screen.getByText("reallocated sectors")).toBeTruthy();
+    cleanup();
+    client.getPoolStatus.mockResolvedValue({ json: pool([without(member, "health")]) });
+    render(<StoragePage />);
+    expect(await screen.findByText("Health not fully reported")).toBeTruthy();
+    expect(screen.queryByText("No health issues reported")).toBeNull();
+  });
+});
+
+describe("Storage page affected-path display", () => {
+  const scan = (views: unknown[]) =>
+    JSON.stringify({ member: "hdd-a", complete: true, errors: [], coverage: "snapshots", views });
+  const movie = [47, 77, 111, 118, 105, 101];
+  async function inspect() {
+    render(<StoragePage />);
+    fireEvent.click(await screen.findByRole("button", { name: "Inspect affected paths" }));
+  }
+
+  it("shows one row per path with its extent count and folds views that report nothing", async () => {
+    client.getPoolAffected.mockResolvedValue({
+      json: scan([
+        {
+          view: "live",
+          unresolved_segments: [],
+          references: [0, 1, 2].map((extent) => ({ inode: 4, extent, segment: "segments/1", paths: [movie] })),
+        },
+        { view: "checkpoint one", unresolved_segments: [], references: [] },
+        { view: "checkpoint two", unresolved_segments: [], references: [] },
+      ]),
+    });
+    await inspect();
+    expect(await screen.findByText("3 extents")).toBeTruthy();
+    expect(screen.getAllByText("/Movie")).toHaveLength(1);
+    expect(screen.getByText("2 views report no affected paths")).toBeTruthy();
+  });
+
+  it("refuses to draw an answer too large for the browser and says why", async () => {
+    client.getPoolAffected.mockResolvedValue({ json: " ".repeat(8 * 1024 * 1024 + 1) });
+    await inspect();
+    expect(await screen.findByText(/too large to display/)).toBeTruthy();
+    expect(screen.queryByText("Scan complete")).toBeNull();
   });
 });

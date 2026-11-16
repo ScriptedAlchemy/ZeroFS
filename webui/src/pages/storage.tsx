@@ -1,80 +1,245 @@
 import { useEffect, useState } from "react";
-import { HardDrive, RefreshCw } from "lucide-react";
+import type { ReactNode } from "react";
+import { CircleAlert, CircleCheck, CircleHelp, HardDrive, Lock, RefreshCw, Search } from "lucide-react";
 import { useTitle } from "../hooks/use-title";
 import { useStorageActivity, useStoragePool } from "../hooks/use-storage";
 import { adminClient } from "../lib/grpc/client";
-import { formatBinaryBytes } from "../lib/format";
-import { known, parseAffectedStatus, rpcFailure, unavailable } from "../lib/storage-status";
+import { binaryBytesParts } from "../lib/format";
+import {
+  capacityBreakdown,
+  known,
+  memberHealth,
+  parseAffectedStatus,
+  rpcFailure,
+  summarizeView,
+  unavailable,
+} from "../lib/storage-status";
 import type { AffectedStatus, AffectedView, MemberStatus, Value } from "../lib/storage-status";
 import { Button } from "../components/ui/Button";
 
-function Fact<T>({ value, format = String }: { value: Value<T>; format?: (value: T) => string }) {
-  return value.state === "known" ? (
-    <span className="break-all">{format(value.value)}</span>
-  ) : (
-    <span className="text-muted-foreground" title={value.reason}>
-      unavailable. <span className="text-xs">{value.reason}</span>
+// A larger response cannot be parsed and drawn without freezing the tab. The server sends one
+// reference per extent today, so real pools exceed this until the admin API pages its answer.
+const MAX_AFFECTED_JSON_CHARS = 8 * 1024 * 1024;
+const MAX_PATHS_SHOWN = 200;
+
+const sectionTitle = "text-xs font-medium uppercase tracking-wider text-muted-foreground";
+const count = (value: number | bigint) => value.toLocaleString("en-US");
+const yesNo = (value: boolean) => (value ? "Yes" : "No");
+const words = (value: string) => value.replaceAll("_", " ");
+
+function Bytes({ value }: { value: number | bigint }) {
+  const { short, exact } = binaryBytesParts(value);
+  return (
+    <>
+      <span className="whitespace-nowrap">{short}</span>
+      {exact !== null && (
+        <>
+          {" "}
+          <span className="whitespace-nowrap text-xs text-muted-foreground">({exact})</span>
+        </>
+      )}
+    </>
+  );
+}
+
+function Fact<T>({ value, children }: { value: Value<T>; children?: (value: T) => ReactNode }) {
+  if (value.state === "known") return <>{children ? children(value.value) : String(value.value)}</>;
+  return (
+    <span className="font-sans text-muted-foreground">
+      <span className="text-muted">Unavailable</span>
+      <span className="text-xs"> · {value.reason}</span>
     </span>
   );
 }
 
-function Row<T>({ label, value, format }: { label: string; value: Value<T>; format?: (value: T) => string }) {
+function Row<T>(props: { label: ReactNode; value: Value<T>; children?: (value: T) => ReactNode }) {
   return (
-    <div className="flex flex-wrap justify-between gap-x-5 gap-y-1">
-      <dt className="text-muted-foreground">{label}</dt>
-      <dd className="font-mono tabular-nums text-right">
-        <Fact value={value} format={format} />
+    <div className="flex flex-col gap-0.5 py-1.5 sm:flex-row sm:items-baseline sm:justify-between sm:gap-6">
+      <dt className="text-muted">{props.label}</dt>
+      <dd className="font-mono tabular-nums sm:text-right">
+        <Fact value={props.value}>{props.children}</Fact>
       </dd>
     </div>
   );
 }
 
-const yesNo = (value: boolean) => (value ? "yes" : "no");
-const observation = (value: string | null) => (value === null ? "none reported" : value);
+function Stat<T>(props: { label: string; value: Value<T>; children?: (value: T) => ReactNode }) {
+  return (
+    <div className="card-surface min-w-0 rounded-lg p-4">
+      <dt className="mb-1.5 text-[11px] font-medium uppercase leading-tight tracking-wider text-muted-foreground">
+        {props.label}
+      </dt>
+      <dd
+        className={`font-mono tabular-nums tracking-tight ${props.value.state === "known" ? "text-xl font-semibold" : "text-sm"}`}
+      >
+        <Fact value={props.value}>{props.children}</Fact>
+      </dd>
+    </div>
+  );
+}
+
+const capacityParts = [
+  { key: "used", label: "Charged usage", color: "bg-primary" },
+  { key: "reserved", label: "Reserved uploads", color: "bg-warning" },
+  { key: "available", label: "Allocatable", color: "bg-border-bright" },
+] as const;
+
+function Capacity({ member }: { member: MemberStatus }) {
+  const breakdown = capacityBreakdown(member);
+  return (
+    <div className="space-y-3">
+      {breakdown.state === "known" ? (
+        <div
+          className="flex h-2.5 overflow-hidden rounded-full bg-background ring-1 ring-border"
+          role="img"
+          aria-label="Share of configured capacity that is charged, reserved, allocatable and held back"
+        >
+          {capacityParts.map(
+            (part) =>
+              breakdown.value[part.key] > 0 && (
+                <div
+                  key={part.key}
+                  className={`${part.color} min-w-[3px]`}
+                  style={{ width: `${(breakdown.value[part.key] / breakdown.value.capacity) * 100}%` }}
+                />
+              ),
+          )}
+        </div>
+      ) : (
+        <p className="text-xs text-muted-foreground">Capacity bar unavailable · {breakdown.reason}</p>
+      )}
+      <dl className="text-sm">
+        <Row label="Configured capacity" value={member.capacity}>
+          {(bytes) => <Bytes value={bytes} />}
+        </Row>
+        {capacityParts.map((part) => (
+          <Row
+            key={part.key}
+            label={
+              <span className="flex items-center gap-2">
+                <span className={`h-2 w-2 rounded-sm ${part.color}`} />
+                {part.label}
+              </span>
+            }
+            value={member[part.key]}
+          >
+            {(bytes) => <Bytes value={bytes} />}
+          </Row>
+        ))}
+        {breakdown.state === "known" && breakdown.value.held > 0 && (
+          <Row
+            label={
+              <span className="flex items-center gap-2">
+                <span className="h-2 w-2 rounded-sm bg-background ring-1 ring-border" />
+                Held back
+              </span>
+            }
+            value={known(breakdown.value.held)}
+          >
+            {(bytes) => <Bytes value={bytes} />}
+          </Row>
+        )}
+      </dl>
+    </div>
+  );
+}
+
+function HealthSummary({ member }: { member: MemberStatus }) {
+  const health = memberHealth(member);
+  // Only a completed observation with nothing in it supports a green "no issues".
+  const observed = member.observedMs.state === "known";
+  const unknown = health.unavailable.length > 0 || !observed;
+  const tone = health.issues.length ? "text-destructive" : unknown ? "text-muted" : "text-success";
+  const Icon = health.issues.length ? CircleAlert : unknown ? CircleHelp : CircleCheck;
+  const headline = health.issues.length
+    ? `${health.issues.length} health ${health.issues.length === 1 ? "issue" : "issues"} reported`
+    : health.unavailable.length
+      ? "Health not fully reported"
+      : observed
+        ? "No health issues reported"
+        : "Health not observed yet";
+  return (
+    <div className="space-y-2 text-sm">
+      <p className={`flex items-center gap-2 ${tone}`}>
+        <Icon size={15} />
+        {headline}
+      </p>
+      {health.issues.map((issue) => (
+        <p key={issue.label} className="pl-6 text-destructive">
+          <span className="text-muted">{issue.label}:</span> {issue.text}
+        </p>
+      ))}
+      {health.unavailable.map((item) => (
+        <p key={item.label} className="pl-6 text-xs text-muted-foreground">
+          {item.label} unavailable · {item.reason}
+        </p>
+      ))}
+      {member.observedMs.state === "known" && (
+        <p className="pl-6 text-xs text-muted-foreground">
+          Last health observation {new Date(member.observedMs.value).toLocaleString()}
+        </p>
+      )}
+    </div>
+  );
+}
 
 function Member({ member, onScan }: { member: MemberStatus; onScan: (id: string) => void }) {
   const id = member.id;
   return (
-    <section className="card-surface rounded-lg p-5 space-y-4">
-      <div className="flex items-center justify-between gap-3">
-        <h3 className="font-medium flex items-center gap-2">
-          <HardDrive size={17} />
-          <Fact value={id} />
+    <section className="card-surface space-y-5 rounded-lg p-5">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <h3 className="flex min-w-0 items-center gap-2 font-medium">
+          <HardDrive size={17} className="shrink-0 text-muted" />
+          <span className="truncate">
+            <Fact value={id} />
+          </span>
         </h3>
         <Button
-          variant="primary"
+          variant="outline"
           disabled={id.state !== "known"}
           onClick={() => {
             if (id.state === "known") onScan(id.value);
           }}
         >
-          Inspect affected paths
+          <span className="flex items-center gap-2 whitespace-nowrap">
+            <Search size={14} />
+            Inspect affected paths
+          </span>
         </Button>
       </div>
-      <dl className="space-y-2 text-sm">
-        <Row label="Configured capacity" value={member.capacity} format={formatBinaryBytes} />
-        <Row label="Charged usage" value={member.used} format={formatBinaryBytes} />
-        <Row label="Reserved uploads" value={member.reserved} format={formatBinaryBytes} />
-        <Row label="Allocatable" value={member.available} format={formatBinaryBytes} />
-        <Row label="Objects" value={member.objects} />
-        <Row label="Pending uploads" value={member.pendingUploads} />
-        <Row label="Cleanup debts" value={member.cleanupDebts} />
-        <Row label="Unreadable objects" value={member.unreadableObjects} />
-        <Row label="Evacuation" value={member.evacuation} />
-        <Row label="Quarantine" value={member.quarantine} format={observation} />
-        <Row label="Monitoring error" value={member.monitoringError} format={observation} />
-        <Row label="Warning" value={member.warning} format={observation} />
-        <Row label="Evacuation error" value={member.evacuationError} format={observation} />
-        <Row label="Health observation" value={member.observedMs} format={(ms) => new Date(ms).toLocaleString()} />
+      <Capacity member={member} />
+      <HealthSummary member={member} />
+      <dl className="grid grid-cols-2 gap-x-6 border-t border-border pt-3 text-sm">
+        <Row label="Objects" value={member.objects}>
+          {count}
+        </Row>
+        <Row label="Pending uploads" value={member.pendingUploads}>
+          {count}
+        </Row>
+        <Row label="Cleanup debts" value={member.cleanupDebts}>
+          {count}
+        </Row>
+        <Row label="Unreadable objects" value={member.unreadableObjects}>
+          {count}
+        </Row>
       </dl>
       <details className="text-sm">
-        <summary className="cursor-pointer text-muted-foreground">Backend removal observations</summary>
-        <dl className="space-y-2 pt-3">
-          <Row label="Safe to remove" value={member.safeToRemove} format={yesNo} />
-          <Row label="Safe to pull with known loss" value={member.safeToPullWithKnownLoss} format={yesNo} />
-          <Row label="Readable data evacuated" value={member.readableEvacuated} format={yesNo} />
+        <summary className="cursor-pointer text-muted hover:text-foreground">Evacuation and removal</summary>
+        <dl className="pt-2">
+          <Row label="Evacuation state" value={member.evacuation}>
+            {words}
+          </Row>
+          <Row label="Readable data evacuated" value={member.readableEvacuated}>
+            {yesNo}
+          </Row>
+          <Row label="Safe to remove" value={member.safeToRemove}>
+            {yesNo}
+          </Row>
+          <Row label="Safe to pull with known loss" value={member.safeToPullWithKnownLoss}>
+            {yesNo}
+          </Row>
         </dl>
-        <p className="text-xs text-muted-foreground mt-3">
+        <p className="mt-2 text-xs text-muted-foreground">
           These are existing pool observations. They do not establish whole-file relocation or metadata survival after
           device loss.
         </p>
@@ -83,44 +248,69 @@ function Member({ member, onScan }: { member: MemberStatus; onScan: (id: string)
   );
 }
 
-function AffectedViewDetails({ view }: { view: AffectedView }) {
+function ViewDetails({ view }: { view: AffectedView }) {
+  const summary = summarizeView(view);
   return (
     <div className="space-y-2 border-t border-border pt-3">
       <h4 className="font-medium">
         <Fact value={view.name} />
       </h4>
-      <p className="text-xs text-muted-foreground">
-        Unresolved segments:{" "}
-        <Fact value={view.unresolvedSegments} format={(items) => (items.length ? items.join(", ") : "none reported")} />
-      </p>
-      {view.references.state === "unavailable" ? (
-        <Fact value={view.references} />
+      {view.unresolvedSegments.state === "unavailable" ? (
+        <p className="text-xs">
+          Unresolved segments: <Fact value={view.unresolvedSegments} />
+        </p>
       ) : (
-        view.references.value.map((reference, index) => (
-          <div key={index} className="text-sm space-y-1">
+        view.unresolvedSegments.value.length > 0 && (
+          <p className="break-words text-xs text-warning">
+            Unresolved segments: {view.unresolvedSegments.value.join(", ")}
+          </p>
+        )
+      )}
+      {summary.state === "unavailable" ? (
+        <Fact value={summary} />
+      ) : (
+        <>
+          {summary.value.unreachableReferences > 0 && (
             <p className="text-xs text-muted-foreground">
-              Inode <Fact value={reference.inode} />, extent <Fact value={reference.extent} />, segment{" "}
-              <Fact value={reference.segment} />
+              {count(summary.value.unreachableReferences)} references have no reachable pathname.
             </p>
-            {reference.paths.state === "unavailable" ? (
-              <Fact value={reference.paths} />
-            ) : reference.paths.value.length === 0 ? (
-              <p className="text-muted-foreground">No reachable pathname reported for this reference.</p>
-            ) : (
-              reference.paths.value.map((path) => (
-                <details key={path.hex} className="font-mono break-all">
-                  <summary className="cursor-pointer">
-                    {path.display}
-                    {!path.utf8 && <span className="text-xs text-muted-foreground ml-2">non-UTF-8; escaped bytes</span>}
-                  </summary>
-                  <p className="text-xs text-muted-foreground pl-4">Path bytes (hex): {path.hex}</p>
-                </details>
-              ))
-            )}
-          </div>
-        ))
+          )}
+          <ul className="divide-y divide-border/50 text-sm">
+            {summary.value.paths.slice(0, MAX_PATHS_SHOWN).map(({ path, extents }) => (
+              <li key={path.hex} className="flex items-baseline justify-between gap-4 py-1.5">
+                <span className="break-all font-mono" title={`Path bytes (hex): ${path.hex}`}>
+                  {path.display}
+                  {!path.utf8 && (
+                    <span className="ml-2 font-sans text-xs text-muted-foreground">non-UTF-8; escaped bytes</span>
+                  )}
+                </span>
+                <span className="shrink-0 whitespace-nowrap text-xs tabular-nums text-muted-foreground">
+                  {count(extents)} {extents === 1 ? "extent" : "extents"}
+                </span>
+              </li>
+            ))}
+          </ul>
+          {summary.value.paths.length > MAX_PATHS_SHOWN && (
+            <p className="text-xs text-muted-foreground">
+              Showing the first {MAX_PATHS_SHOWN} of {count(summary.value.paths.length)} paths in this view.
+            </p>
+          )}
+        </>
       )}
     </div>
+  );
+}
+
+// A view that reports nothing needs no section of its own.
+function isQuiet(view: AffectedView): boolean {
+  const summary = summarizeView(view);
+  return (
+    view.name.state === "known" &&
+    view.unresolvedSegments.state === "known" &&
+    view.unresolvedSegments.value.length === 0 &&
+    summary.state === "known" &&
+    summary.value.paths.length === 0 &&
+    summary.value.unreachableReferences === 0
   );
 }
 
@@ -132,6 +322,14 @@ function Affected({ member }: { member: string }) {
     void adminClient.getPoolAffected({ member }, { signal: abort.signal, timeoutMs: 60_000 }).then(
       (response) => {
         if (abort.signal.aborted) return;
+        if (response.json.length > MAX_AFFECTED_JSON_CHARS) {
+          setResult(
+            unavailable(
+              `The scan answer is ${count(response.json.length)} characters, which is too large to display. Use a smaller scope once the admin API supports paging.`,
+            ),
+          );
+          return;
+        }
         const parsed = parseAffectedStatus(response.json, member);
         setResult(parsed);
         if (parsed.state === "known") setLastSuccess(new Date());
@@ -143,22 +341,31 @@ function Affected({ member }: { member: string }) {
     return () => abort.abort();
   }, [member]);
 
+  const views = result.state === "known" && result.value.views.state === "known" ? result.value.views.value : [];
+  const quiet = views.filter(isQuiet);
   return (
-    <section className="card-surface rounded-lg p-5 space-y-3" aria-live="polite">
-      <h2 className="font-medium">Affected paths · {member}</h2>
-      {lastSuccess && <p className="text-xs text-muted-foreground">Scan received {lastSuccess.toLocaleString()}</p>}
+    <section className="card-surface space-y-3 rounded-lg p-5" aria-live="polite">
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <h2 className="font-medium">Affected paths on {member}</h2>
+        {lastSuccess && <p className="text-xs text-muted-foreground">Scan received {lastSuccess.toLocaleString()}</p>}
+      </div>
       {result.state === "unavailable" ? (
-        <Fact value={result} />
+        <p className="text-sm">
+          <Fact value={result} />
+        </p>
       ) : (
         <>
-          <dl className="text-sm space-y-2">
-            <Row label="Scan complete" value={result.value.complete} format={yesNo} />
-            <Row label="Reported path total across views" value={result.value.pathCount} />
-            <Row label="Coverage" value={result.value.coverage} />
+          <dl className="text-sm">
+            <Row label="Scan complete" value={result.value.complete}>
+              {yesNo}
+            </Row>
+            <Row label="Reported path total across views" value={result.value.pathCount}>
+              {count}
+            </Row>
           </dl>
           <p className="text-xs text-muted-foreground">
-            Paths are counted once per metadata view; a live path and its checkpoint path count separately. Unlinked or
-            unreachable inodes have no paths.
+            Paths are counted once per metadata view, so a live path and its checkpoint path count separately. Unlinked
+            or unreachable inodes have no paths.
           </p>
           {result.value.errors.state === "unavailable" ? (
             <Fact value={result.value.errors} />
@@ -172,7 +379,21 @@ function Affected({ member }: { member: string }) {
           {result.value.views.state === "unavailable" ? (
             <Fact value={result.value.views} />
           ) : (
-            result.value.views.value.map((view, i) => <AffectedViewDetails key={i} view={view} />)
+            views.filter((view) => !isQuiet(view)).map((view, i) => <ViewDetails key={i} view={view} />)
+          )}
+          {quiet.length > 0 && (
+            <details className="border-t border-border pt-3 text-sm">
+              <summary className="cursor-pointer text-muted hover:text-foreground">
+                {quiet.length} {quiet.length === 1 ? "view reports" : "views report"} no affected paths
+              </summary>
+              <ul className="space-y-1 pt-2 font-mono text-xs text-muted-foreground">
+                {quiet.map((view, i) => (
+                  <li key={i} className="break-all">
+                    <Fact value={view.name} />
+                  </li>
+                ))}
+              </ul>
+            </details>
           )}
         </>
       )}
@@ -187,7 +408,7 @@ const capabilities = [
     "Declared profiles and verified readiness are not exposed by the current admin API.",
   ],
   [
-    "Buffered / locally durable / HDD-published bytes",
+    "Buffered, locally durable and HDD-published bytes",
     "The current admin API does not expose durability receipts or writeback watermarks.",
   ],
   ["NVMe backlog and reserve", "Journal occupancy and reserve are not exposed by the current admin API."],
@@ -202,62 +423,63 @@ export function StoragePage() {
   const [scan, setScan] = useState<{ member: string; sequence: number } | null>(null);
   const pool = result.state === "pool" ? result.pool : null;
   return (
-    <div className="p-6 space-y-5 max-w-[1400px]">
+    <div className="max-w-[1400px] space-y-6 p-6">
       <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
+        <div className="min-w-0">
           <h1 className="text-lg font-semibold">Storage</h1>
-          <p className="text-sm text-muted-foreground mt-1">Read-only observations from the existing admin service.</p>
+          <p className="mt-1 text-sm text-muted-foreground" aria-live="polite">
+            {lastSuccess ? `Pool read ${lastSuccess.toLocaleString()}` : "No successful pool response yet"}. Read-only;
+            refreshes on request.
+          </p>
+          {pool && (
+            <p className="mt-1 break-all font-mono text-xs text-muted-foreground">
+              Pool <Fact value={pool.id} />
+            </p>
+          )}
         </div>
-        <Button
-          variant="primary"
-          disabled={loading}
-          onClick={() => {
-            setScan(null);
-            refresh();
-          }}
-        >
+        <Button variant="outline" disabled={loading} onClick={() => (setScan(null), refresh())}>
           <span className="flex items-center gap-2">
             <RefreshCw size={14} className={loading ? "animate-spin" : ""} />
             Refresh pool
           </span>
         </Button>
       </div>
-      <section className="card-surface rounded-lg p-5 space-y-3" aria-live="polite">
-        <h2 className="font-medium">Pool</h2>
-        <p className="text-xs text-muted-foreground">
-          {lastSuccess
-            ? `Last successful response: ${lastSuccess.toLocaleString()}`
-            : "No successful pool response yet"}
-          . Pool observations refresh on request.
-        </p>
-        {result.state === "no-pool" ? (
-          <p>No permanent pool configured. The admin service explicitly reported this state.</p>
-        ) : result.state === "unavailable" ? (
+
+      {result.state === "no-pool" ? (
+        <section className="card-surface rounded-lg p-5 text-sm">
+          No permanent pool configured. The admin service explicitly reported this state.
+        </section>
+      ) : result.state === "unavailable" ? (
+        <section className="card-surface rounded-lg p-5 text-sm" aria-live="polite">
           <Fact value={result} />
-        ) : (
-          <dl className="space-y-2 text-sm">
-            <Row label="Pool ID" value={result.pool.id} />
-            <Row label="Mapped objects" value={result.pool.mappedObjects} />
-            <Row label="Pending operations" value={result.pool.pendingOperations} />
-            <Row label="Unreadable segment records" value={result.pool.unreadableObjects} />
-            <Row label="Quarantined leftovers" value={result.pool.quarantinedLeftovers} />
-          </dl>
-        )}
-      </section>
+        </section>
+      ) : (
+        <dl className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+          <Stat label="Mapped objects" value={result.pool.mappedObjects}>
+            {count}
+          </Stat>
+          <Stat label="Pending operations" value={result.pool.pendingOperations}>
+            {count}
+          </Stat>
+          <Stat label="Unreadable segment records" value={result.pool.unreadableObjects}>
+            {count}
+          </Stat>
+          <Stat label="Quarantined leftovers" value={result.pool.quarantinedLeftovers}>
+            {count}
+          </Stat>
+        </dl>
+      )}
+
       {pool && (
         <>
-          <div>
-            <h2 className="font-medium mb-3">Members</h2>
-            <p className="text-xs text-muted-foreground mb-3">
-              Charged usage includes superseded bodies awaiting cleanup; reserved bytes include unpublished uploads.
-              Allocatable bytes account for configured quota, reservations, and the local free-space reserve.
-            </p>
+          <div className="space-y-3">
+            <h2 className={sectionTitle}>Members</h2>
             {pool.members.state === "unavailable" ? (
               <Fact value={pool.members} />
             ) : pool.members.value.length === 0 ? (
               <p className="text-sm">The server reported no pool members.</p>
             ) : (
-              <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+              <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
                 {pool.members.value.map((member, i) => (
                   <Member
                     key={i}
@@ -267,72 +489,79 @@ export function StoragePage() {
                 ))}
               </div>
             )}
+            <p className="text-xs text-muted-foreground">
+              Charged usage includes superseded bodies awaiting cleanup. Reserved uploads are not yet published.
+              Allocatable accounts for the configured quota, reservations and the local free-space reserve.
+            </p>
           </div>
           {scan && <Affected key={scan.sequence} member={scan.member} />}
         </>
       )}
-      <section className="card-surface rounded-lg p-5 space-y-3">
-        <h2 className="font-medium">Filesystem activity</h2>
+
+      <div className="space-y-3">
+        <h2 className={sectionTitle}>Filesystem activity</h2>
+        {activity.state === "unavailable" ? (
+          <section className="card-surface rounded-lg p-5 text-sm">
+            <Fact value={activity} />
+          </section>
+        ) : (
+          <dl className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+            <Stat label="Logical bytes written" value={known(activity.value.logicalBytesWritten)}>
+              {(bytes) => <Bytes value={bytes} />}
+            </Stat>
+            <Stat label="Logical bytes read" value={known(activity.value.logicalBytesRead)}>
+              {(bytes) => <Bytes value={bytes} />}
+            </Stat>
+            <Stat label="Logical storage used" value={known(activity.value.logicalUsedBytes)}>
+              {(bytes) => <Bytes value={bytes} />}
+            </Stat>
+            <Stat label="Inodes used" value={known(activity.value.usedInodes)}>
+              {count}
+            </Stat>
+          </dl>
+        )}
         <p className="text-xs text-muted-foreground">
           Cumulative logical filesystem counters from StreamStats. These are not per-device writes or durability
-          receipts. {statsReceived && `Last sample received ${statsReceived.toLocaleString()}.`}
+          receipts.{" "}
+          {activity.state === "known" &&
+            "StreamStats sends these counters as plain protobuf numbers, so a counter the server omits arrives as 0. A 0 here can mean zero or not reported. "}
+          {statsReceived && `Last sample received ${statsReceived.toLocaleString()}.`}
         </p>
-        {activity.state === "unavailable" ? (
-          <Fact value={activity} />
-        ) : (
-          <>
-            <p className="text-xs text-muted-foreground">
-              StreamStats sends these counters as plain protobuf numbers, so a counter the server omits arrives as 0. A
-              0 here can mean zero or not reported.
-            </p>
-            <dl className="text-sm space-y-2">
-              <Row
-                label="Logical bytes written"
-                value={known(activity.value.logicalBytesWritten)}
-                format={formatBinaryBytes}
-              />
-              <Row
-                label="Logical bytes read"
-                value={known(activity.value.logicalBytesRead)}
-                format={formatBinaryBytes}
-              />
-              <Row
-                label="Logical storage used"
-                value={known(activity.value.logicalUsedBytes)}
-                format={formatBinaryBytes}
-              />
-              <Row label="Inodes used" value={known(activity.value.usedInodes)} />
-            </dl>
-          </>
-        )}
-      </section>
-      <section className="card-surface rounded-lg p-5 space-y-4">
-        <h2 className="font-medium">Placement capabilities</h2>
-        <dl className="space-y-3 text-sm">
+      </div>
+
+      <section className="card-surface space-y-4 rounded-lg p-5">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <h2 className={sectionTitle}>Placement</h2>
+          <span className="flex items-center gap-1.5 rounded-full bg-accent px-2 py-0.5 text-xs text-muted">
+            <Lock size={12} />
+            Strict placement is disabled
+          </span>
+        </div>
+        <p className="text-sm text-muted">
+          Buffered writes are accepted without durability. Locally durable writes are held in the NVMe journal.
+          Published writes require HDD payload and catalog publication. This page cannot assert those states from the
+          available APIs.
+        </p>
+        <dl className="grid grid-cols-1 gap-x-8 gap-y-3 text-sm md:grid-cols-2">
           {capabilities.map(([label, reason]) => (
             <div key={label}>
               <dt className="font-medium">{label}</dt>
-              <dd className="text-muted-foreground">unavailable. {reason}</dd>
+              <dd className="text-xs text-muted-foreground">Unavailable · {reason}</dd>
             </div>
           ))}
         </dl>
-        <p className="text-sm text-muted-foreground">
-          Strict placement is disabled. Buffered writes are accepted without durability; locally durable writes are held
-          in the NVMe journal; published writes require HDD payload and catalog publication. This page cannot assert
-          those states from the available APIs.
-        </p>
-        <div className="flex flex-wrap gap-3">
-          <Button variant="primary" disabled aria-describedby="storage-edit-reason">
+        <div className="flex flex-wrap items-center gap-3 border-t border-border pt-4">
+          <Button variant="outline" disabled aria-describedby="storage-edit-reason">
             Configure placement
           </Button>
-          <Button variant="primary" disabled aria-describedby="storage-edit-reason">
+          <Button variant="outline" disabled aria-describedby="storage-edit-reason">
             Move or evacuate files
           </Button>
+          <p id="storage-edit-reason" className="text-xs text-muted-foreground">
+            Disabled: validated policy edits and placement-safe whole-file movement are not available in the current
+            backend.
+          </p>
         </div>
-        <p id="storage-edit-reason" className="text-xs text-muted-foreground">
-          Disabled: validated policy edits and placement-safe whole-file movement are not available in the current
-          backend.
-        </p>
       </section>
     </div>
   );

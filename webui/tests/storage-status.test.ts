@@ -250,3 +250,46 @@ test("affected scans reject mismatched members, malformed payloads, and missing 
   for (const field of [parsed.complete, parsed.errors, parsed.views, parsed.pathCount, parsed.coverage])
     assert.equal(field.state, "unavailable");
 });
+
+test("capacity breakdown needs all four byte counts and never invents a remainder", async () => {
+  const { capacityBreakdown } = await import("../src/lib/storage-status.ts");
+  const disk = value(value(parsePoolStatus(JSON.stringify(pool))).members)[0];
+  assert.deepEqual(value(capacityBreakdown(disk)), {
+    capacity: 10000,
+    used: 3000,
+    reserved: 100,
+    available: 6900,
+    held: 0,
+  });
+  const noUsage = { ...member, used_bytes: undefined };
+  const partial = value(value(parsePoolStatus(JSON.stringify({ ...pool, members: [noUsage] }))).members)[0];
+  assert.equal(capacityBreakdown(partial).state, "unavailable");
+  const over = value(
+    value(parsePoolStatus(JSON.stringify({ ...pool, members: [{ ...member, used_bytes: 9000 }] }))).members,
+  )[0];
+  assert.equal(capacityBreakdown(over).state, "unavailable");
+});
+
+test("member health separates reported problems from observations the server omitted", async () => {
+  const { memberHealth } = await import("../src/lib/storage-status.ts");
+  const disk = value(value(parsePoolStatus(JSON.stringify(pool))).members)[0];
+  assert.deepEqual(memberHealth(disk), {
+    issues: [{ label: "Monitoring error", text: "SMART unavailable" }],
+    unavailable: [],
+  });
+  const silent = value(
+    value(parsePoolStatus(JSON.stringify({ ...pool, members: [{ ...member, health: undefined }] }))).members,
+  )[0];
+  assert.equal(memberHealth(silent).issues.length, 0);
+  assert.equal(memberHealth(silent).unavailable.length, 4);
+});
+
+test("view summary reports one row per pathname with its extent count", async () => {
+  const { summarizeView } = await import("../src/lib/storage-status.ts");
+  const parsed = value(parseAffectedStatus(JSON.stringify(affected), "hdd-a"));
+  const summary = value(summarizeView(value(parsed.views)[0]));
+  assert.equal(summary.paths.length, 1);
+  assert.equal(summary.paths[0].path.display, "/Movie");
+  assert.equal(summary.paths[0].extents, 2);
+  assert.equal(summary.unreachableReferences, 0);
+});

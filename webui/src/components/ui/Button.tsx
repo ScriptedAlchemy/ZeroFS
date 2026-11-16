@@ -4,6 +4,7 @@ const base = "transition-all duration-150 active:scale-[0.95] active:duration-75
 
 const variants = {
   primary: `${base} px-4 py-1.5 text-sm rounded bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-40 disabled:cursor-not-allowed disabled:active:scale-100 glow-primary`,
+  outline: `${base} px-3 py-1.5 text-sm rounded border border-border text-foreground hover:bg-accent hover:border-border-bright disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:active:scale-100`,
   ghost: `${base} px-3 py-1.5 text-sm rounded text-muted hover:bg-accent hover:text-foreground`,
   destructive: `${base} px-2.5 py-1.5 text-sm rounded text-destructive hover:bg-destructive/10`,
   "destructive-filled": `${base} px-4 py-1.5 text-sm rounded bg-destructive text-white hover:bg-destructive/90`,

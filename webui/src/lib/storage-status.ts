@@ -82,9 +82,12 @@ function member(raw: unknown): Value<MemberStatus> {
     monitoringError: healthText("monitoring_error"),
     warning: healthText("warning"),
     evacuationError: healthText("evacuation_error"),
-    observedMs: health?.observed_ms === null
-      ? unavailable("No health observation has been reported")
-      : health ? field(health, "observed_ms", count) : unavailable("health was not reported"),
+    observedMs:
+      health?.observed_ms === null
+        ? unavailable("No health observation has been reported")
+        : health
+          ? field(health, "observed_ms", count)
+          : unavailable("health was not reported"),
   });
 }
 
@@ -221,11 +224,7 @@ function affectedCount(status: Omit<AffectedStatus, "pathCount">): Value<number>
     return unavailable("No coherent metadata views were reported");
   let total = 0;
   for (const item of status.views.value) {
-    if (
-      item.name.state !== "known" ||
-      item.references.state !== "known" ||
-      item.unresolvedSegments.state !== "known"
-    )
+    if (item.name.state !== "known" || item.references.state !== "known" || item.unresolvedSegments.state !== "known")
       return unavailable("A metadata view is incomplete");
     const paths = new Set<string>();
     for (const ref of item.references.value) {
@@ -263,4 +262,78 @@ export function parseAffectedStatus(json: string, expectedMember: string): Value
     views: list(row, "views", view),
   };
   return known({ ...status, pathCount: affectedCount(status) });
+}
+
+export interface CapacityBreakdown {
+  capacity: number;
+  used: number;
+  reserved: number;
+  available: number;
+  /** Capacity that is neither charged, reserved nor allocatable, such as the free-space reserve. */
+  held: number;
+}
+
+export function capacityBreakdown(member: MemberStatus): Value<CapacityBreakdown> {
+  const { capacity, used, reserved, available } = member;
+  for (const part of [capacity, used, reserved, available]) if (part.state === "unavailable") return part;
+  if (capacity.state !== "known" || used.state !== "known" || reserved.state !== "known" || available.state !== "known")
+    return unavailable("capacity was not reported");
+  if (capacity.value === 0) return unavailable("configured capacity is zero");
+  const held = capacity.value - used.value - reserved.value - available.value;
+  if (held < 0) return unavailable("reported usage exceeds the configured capacity");
+  return known({
+    capacity: capacity.value,
+    used: used.value,
+    reserved: reserved.value,
+    available: available.value,
+    held,
+  });
+}
+
+export interface MemberHealth {
+  issues: { label: string; text: string }[];
+  unavailable: { label: string; reason: string }[];
+}
+
+/** Sorts the four health observations into reported problems and observations the server did not supply. */
+export function memberHealth(member: MemberStatus): MemberHealth {
+  const health: MemberHealth = { issues: [], unavailable: [] };
+  for (const [label, value] of [
+    ["Quarantine", member.quarantine],
+    ["Monitoring error", member.monitoringError],
+    ["Warning", member.warning],
+    ["Evacuation error", member.evacuationError],
+  ] as const) {
+    if (value.state === "unavailable") health.unavailable.push({ label, reason: value.reason });
+    else if (value.value !== null) health.issues.push({ label, text: value.value });
+  }
+  return health;
+}
+
+export interface AffectedPath {
+  path: BytePath;
+  extents: number;
+}
+
+export interface ViewSummary {
+  paths: AffectedPath[];
+  /** References whose inode has no reachable pathname in this view. */
+  unreachableReferences: number;
+}
+
+/** Collapses a view's per-extent references into one row per pathname. */
+export function summarizeView(view: AffectedView): Value<ViewSummary> {
+  if (view.references.state === "unavailable") return view.references;
+  const paths = new Map<string, AffectedPath>();
+  let unreachableReferences = 0;
+  for (const ref of view.references.value) {
+    if (ref.paths.state === "unavailable") return ref.paths;
+    if (ref.paths.value.length === 0) unreachableReferences += 1;
+    for (const path of ref.paths.value) {
+      const seen = paths.get(path.hex);
+      if (seen) seen.extents += 1;
+      else paths.set(path.hex, { path, extents: 1 });
+    }
+  }
+  return known({ paths: [...paths.values()], unreachableReferences });
 }

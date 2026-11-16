@@ -14,18 +14,23 @@ export function formatSize(bytes: bigint | number): string {
 const binaryUnits = ["KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
 
 // Capacity reporting needs unambiguous units: a binary prefix plus the exact byte count,
-// so 18,000,000,000,000 bytes reads "16.4 TiB (18,000,000,000,000 bytes)".
-export function formatBinaryBytes(bytes: bigint | number): string {
+// so 18,000,000,000,000 bytes reads "16.4 TiB" with "18,000,000,000,000 bytes" beside it.
+export function binaryBytesParts(bytes: bigint | number): { short: string; exact: string | null } {
   const exact = BigInt(bytes);
   const grouped = `${exact.toLocaleString("en-US")} bytes`;
-  if (exact < 1024n) return grouped;
+  if (exact < 1024n) return { short: grouped, exact: null };
   let value = Number(exact) / 1024;
   let unit = 0;
   while (value >= 1024 && unit < binaryUnits.length - 1) {
     value /= 1024;
     unit += 1;
   }
-  return `${value.toFixed(1)} ${binaryUnits[unit]} (${grouped})`;
+  return { short: `${value.toFixed(1)} ${binaryUnits[unit]}`, exact: grouped };
+}
+
+export function formatBinaryBytes(bytes: bigint | number): string {
+  const { short, exact } = binaryBytesParts(bytes);
+  return exact === null ? short : `${short} (${exact})`;
 }
 
 export function formatSizeFixed(bytes: number): string {
