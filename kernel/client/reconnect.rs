@@ -703,7 +703,7 @@ fn negotiate_candidate(
     let requested = endpoint.requested_msize;
     let negotiated = match transact_version(transport, io, requested)?.body {
         Response::Rversion(version)
-            if version.version.as_ref() == VERSION_9P2000L_ZEROFS
+            if protocol::kernel_dialect_supported(version.version.as_ref())
                 && version.msize >= MIN_MSIZE
                 && version.msize <= requested =>
         {

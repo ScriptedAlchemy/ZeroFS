@@ -76,6 +76,18 @@ impl DeferredOrphanReclaim {
 }
 
 impl ZeroFS {
+    /// Stage deletion of an inode. The caller holds its inode lock and owns
+    /// the transaction that removes its namespace and data references.
+    pub(crate) async fn delete_inode(
+        &self,
+        txn: &mut crate::db::Transaction,
+        id: InodeId,
+    ) -> Result<(), FsError> {
+        self.xattr_store.delete_all(txn, id).await?;
+        self.inode_store.delete(txn, id);
+        Ok(())
+    }
+
     pub(crate) fn deferred_orphan_reclaim(&self, inode_id: InodeId) -> DeferredOrphanReclaim {
         DeferredOrphanReclaim {
             inode_id,
@@ -83,10 +95,10 @@ impl ZeroFS {
         }
     }
 
-    /// Increment the open-handle count for `id`. MUST be invoked under
-    /// `lock_manager.acquire(id)` together with the inode-liveness `get`, so
-    /// that the increment and the "is the inode alive" check are serialized
-    /// against `remove`/`rename`'s defer-vs-delete decision on the same id.
+    /// Increment the open-handle count for `id`. Hold the inode lock alongside
+    /// the liveness read to order the increment against last unlink. A linked
+    /// directory can also be pinned under its parent's lock after validating
+    /// the entry, since directory removal and replacement take that lock too.
     // Public for library integration and DST harnesses.
     #[allow(dead_code)]
     pub fn open_handle_inc(&self, id: InodeId) {
@@ -113,9 +125,8 @@ impl ZeroFS {
     }
 
     /// Increment the open-handle count and return a guard that releases it on
-    /// drop; the caller stores it in the fid slot. Like `open_handle_inc`, must
-    /// be called under `lock_manager.acquire(id)` alongside the liveness `get`,
-    /// so the increment is ordered against `remove`/`rename`'s defer decision.
+    /// drop. The caller must order the increment against last unlink as
+    /// described by `open_handle_inc`, then store the guard in the fid slot.
     // Called by external library harnesses.
     #[allow(dead_code)]
     pub fn new_open_handle(&self, id: InodeId) -> OpenHandle {
@@ -212,7 +223,7 @@ impl ZeroFS {
                         .tombstones_created
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                self.inode_store.delete(&mut txn, id);
+                self.delete_inode(&mut txn, id).await?;
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::CLUNK_AFTER_RECLAIM_INODE_DELETE);
@@ -234,7 +245,7 @@ impl ZeroFS {
             Ok(Inode::Symlink(s)) if s.nlink == 0 => {
                 // Dataless orphan
                 let mut txn = self.db.new_transaction()?;
-                self.inode_store.delete(&mut txn, id);
+                self.delete_inode(&mut txn, id).await?;
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::CLUNK_AFTER_RECLAIM_INODE_DELETE);
@@ -256,7 +267,7 @@ impl ZeroFS {
                     return Ok(());
                 }
                 let mut txn = self.db.new_transaction()?;
-                self.inode_store.delete(&mut txn, id);
+                self.delete_inode(&mut txn, id).await?;
                 self.directory_store.delete_directory(&mut txn, id);
 
                 #[cfg(feature = "failpoints")]
@@ -278,7 +289,7 @@ impl ZeroFS {
             {
                 // Dataless orphan
                 let mut txn = self.db.new_transaction()?;
-                self.inode_store.delete(&mut txn, id);
+                self.delete_inode(&mut txn, id).await?;
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::CLUNK_AFTER_RECLAIM_INODE_DELETE);

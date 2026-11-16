@@ -14,7 +14,6 @@ on:
   push:
     branches: ["main", "develop"]
   pull_request:
-    branches: ["main", "develop"]
   workflow_dispatch:
 
 permissions:
@@ -41,6 +40,7 @@ jobs:
           scripts.tests.test_lein_deps_retry
           scripts.tests.test_linux_source_download
           scripts.tests.test_local_storage_pool_diagnostics
+          scripts.tests.test_case_insensitive_fuse_cleanup
       - name: Run Proxmox deployment regressions
         run: python3 -m unittest discover -s proxmox/tests -p 'test_*.py'
 

@@ -222,6 +222,17 @@ pub fn max_lopenatread_payload(msize: u32) -> u32 {
 /// One request supported by the native client.
 #[derive(Clone, Copy)]
 pub enum Request<'a> {
+    Txattrwalk {
+        fid: u32,
+        newfid: u32,
+        name: &'a [u8],
+    },
+    Txattrcreate {
+        fid: u32,
+        name: &'a [u8],
+        size: u64,
+        flags: u32,
+    },
     /// Negotiate `9P2000.L.Z`. This request must use [`NOTAG`].
     Tversion { msize: u32, version: &'a [u8] },
     /// Query durability lineage and the active writer epoch.
@@ -1347,7 +1358,7 @@ mod tests {
 
     /// Every request, with values chosen so each field kind is exercised.
     #[cfg(all(not(MODULE), feature = "owned"))]
-    fn request_corpus() -> [(u16, Request<'static>); 26] {
+    fn request_corpus() -> [(u16, Request<'static>); 28] {
         const ENVELOPE: MutationEnvelope = MutationEnvelope {
             op_id: [
                 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
@@ -1367,6 +1378,23 @@ mod tests {
                 },
             ),
             (1, Request::Tgetlineage),
+            (
+                27,
+                Request::Txattrwalk {
+                    fid: 4,
+                    newfid: 5,
+                    name: b"user.A",
+                },
+            ),
+            (
+                28,
+                Request::Txattrcreate {
+                    fid: 5,
+                    name: b"user.A",
+                    size: 2_097_152,
+                    flags: 1,
+                },
+            ),
             (
                 2,
                 Request::Trebind {

@@ -22,3 +22,6 @@ pub(crate) const ENOTEMPTY: u32 = 39;
 pub(crate) const EOVERFLOW: u32 = 75;
 pub(crate) const EOPNOTSUPP: u32 = 95;
 pub(crate) const ESTALE: u32 = 116;
+pub(crate) const E2BIG: u32 = 7;
+pub(crate) const ERANGE: u32 = 34;
+pub(crate) const ENODATA: u32 = 61;

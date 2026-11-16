@@ -13,6 +13,8 @@ mod lookup;
 mod remove;
 mod rename;
 mod setattr;
+mod xattr;
+pub use xattr::{XATTR_VALUE_MAX, XattrName, XattrSetMode, XattrValue};
 pub(crate) mod write;
 
 #[cfg(feature = "webui")]

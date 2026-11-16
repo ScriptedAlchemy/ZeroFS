@@ -353,6 +353,18 @@ pub struct Txattrwalk {
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
 #[deku(endian = "little")]
+pub struct Txattrcreate {
+    pub fid: u32,
+    pub name: P9String,
+    pub size: u64,
+    pub flags: u32,
+}
+
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Rxattrcreate;
+
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Tlock {
     pub fid: u32,
     pub lock_type: LockType,
@@ -842,6 +854,10 @@ pub enum Message {
     Txattrwalk(Txattrwalk),
     #[deku(id = "message_type::RXATTRWALK")]
     Rxattrwalk(Rxattrwalk),
+    #[deku(id = "message_type::TXATTRCREATE")]
+    Txattrcreate(Txattrcreate),
+    #[deku(id = "message_type::RXATTRCREATE")]
+    Rxattrcreate(Rxattrcreate),
     #[deku(id = "message_type::TSTATFS")]
     Tstatfs(Tstatfs),
     #[deku(id = "message_type::RSTATFS")]
@@ -887,6 +903,8 @@ pub enum Message {
     Rrebind(Rrebind),
     #[deku(id = "message_type::TWALKGETATTR")]
     Twalkgetattr(Twalkgetattr),
+    #[deku(id = "message_type::TWALKGETATTREXACT")]
+    Twalkgetattrexact(Twalkgetattr),
     #[deku(id = "message_type::RWALKGETATTR")]
     Rwalkgetattr(Rwalkgetattr),
     #[deku(id = "message_type::TREADDIRATTR")]
@@ -913,6 +931,7 @@ impl Message {
             | Message::Trenamenoreplace(_)
             | Message::Trebind(_)
             | Message::Twalkgetattr(_)
+            | Message::Twalkgetattrexact(_)
             | Message::Treaddirattr(_) => true,
             Message::Tversion(_)
             | Message::Rversion(_)
@@ -963,6 +982,8 @@ impl Message {
             | Message::Rlerror(_)
             | Message::Tflush(_)
             | Message::Rflush(_)
+            | Message::Txattrcreate(_)
+            | Message::Rxattrcreate(_)
             | Message::Txattrwalk(_)
             | Message::Rxattrwalk(_)
             | Message::Tstatfs(_)
@@ -1011,12 +1032,15 @@ impl Message {
             Message::Tlock(m) => [Some(m.fid), None],
             Message::Tgetlock(m) => [Some(m.fid), None],
             Message::Txattrwalk(m) => [Some(m.fid), Some(m.newfid)],
+            Message::Txattrcreate(m) => [Some(m.fid), None],
             Message::Tstatfs(m) => [Some(m.fid), None],
             Message::Tlopenat(m) => [Some(m.fid), Some(m.newfid)],
             Message::Tlopenatread(m) => [Some(m.fid), Some(m.newfid)],
             Message::Tlcreateattr(m) => [Some(m.dfid), Some(m.newfid)],
             Message::Trebind(m) => [Some(m.fid), None],
-            Message::Twalkgetattr(m) => [Some(m.fid), Some(m.newfid)],
+            Message::Twalkgetattr(m) | Message::Twalkgetattrexact(m) => {
+                [Some(m.fid), Some(m.newfid)]
+            }
             Message::Treaddirattr(m) => [Some(m.fid), None],
             Message::Tversion(_)
             | Message::Rversion(_)
@@ -1047,6 +1071,7 @@ impl Message {
             | Message::Rlerror(_)
             | Message::Tflush(_)
             | Message::Rflush(_)
+            | Message::Rxattrcreate(_)
             | Message::Rxattrwalk(_)
             | Message::Rstatfs(_)
             | Message::Rlopenat(_)
@@ -1354,6 +1379,58 @@ mod tests {
         let size = bytes.len() as u32;
         bytes[..P9_SIZE_FIELD_LEN].copy_from_slice(&size.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn exact_walk_has_a_private_opcode_and_the_normal_fid_footprint() {
+        let message = P9Message::new(
+            7,
+            Message::Twalkgetattrexact(Twalkgetattr {
+                fid: 1,
+                newfid: 2,
+                nwname: 1,
+                wnames: vec![P9String::new(b"Foo".to_vec())],
+            }),
+        );
+        assert!(message.body.is_zerofs_private_request());
+        assert_eq!(message.body.request_fids().collect::<Vec<_>>(), vec![1, 2]);
+        assert!(!message.body.is_mutation());
+        let bytes = message.to_bytes_ctx(true).unwrap();
+        assert_eq!(bytes[4], message_type::TWALKGETATTREXACT);
+        let decoded = P9Message::from_bytes_ctx(&bytes, true).unwrap();
+        assert!(
+            matches!(decoded.body, Message::Twalkgetattrexact(ref walk) if walk.fid == 1 && walk.newfid == 2 && walk.wnames[0].data == b"Foo")
+        );
+    }
+
+    #[test]
+    fn xattr_frames_use_standard_ids_and_no_mutation_envelope() {
+        let body = Message::Txattrcreate(Txattrcreate {
+            fid: 9,
+            name: P9String::new(b"user.bytes".to_vec()),
+            size: 2_097_152,
+            flags: 1,
+        });
+        assert_eq!(body.request_fids().collect::<Vec<_>>(), vec![9]);
+        assert!(!body.is_zerofs_private_request());
+        assert!(!P9Message::carries_op_id(message_type::TXATTRCREATE));
+        let message = P9Message::new(7, body);
+        let standard = message.to_bytes().unwrap();
+        assert_eq!(standard[4], 32);
+        assert_eq!(standard.len(), P9_HEADER_SIZE + 4 + 2 + 10 + 8 + 4);
+        assert_eq!(message.to_bytes_ctx(true).unwrap(), standard);
+        match P9Message::from_bytes_ctx(&standard, false).unwrap().body {
+            Message::Txattrcreate(tx) => {
+                assert_eq!(tx.size, 2_097_152);
+                assert_eq!(tx.flags, 1);
+            }
+            _ => panic!("wrong xattr request"),
+        }
+        let response = P9Message::new(7, Message::Rxattrcreate(Rxattrcreate))
+            .to_bytes()
+            .unwrap();
+        assert_eq!(response.len(), P9_HEADER_SIZE);
+        assert_eq!(response[4], 33);
     }
 
     #[test]

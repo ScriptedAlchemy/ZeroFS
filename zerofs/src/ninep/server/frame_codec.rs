@@ -62,7 +62,7 @@ fn request_fid_footprint(type_byte: u8, body: &[u8]) -> FidFootprint {
     match type_byte {
         TVERSION_TYPE => FidFootprint::All,
 
-        20 | 30 | 70 | 104 | 110 | 230 | 236 | 238 | 246 | 252 => fixed_two_fids(body),
+        20 | 30 | 70 | 104 | 110 | 226 | 230 | 236 | 238 | 246 | 252 => fixed_two_fids(body),
 
         // `Trenameat.newdirfid` follows the variable-length old name.
         74 | 235 => {
@@ -82,7 +82,7 @@ fn request_fid_footprint(type_byte: u8, body: &[u8]) -> FidFootprint {
             })
         }
 
-        8 | 12 | 14 | 16 | 18 | 22 | 24 | 26 | 40 | 50 | 52 | 54 | 72 | 76 | 116 | 118
+        8 | 12 | 14 | 16 | 18 | 22 | 24 | 26 | 32 | 40 | 50 | 52 | 54 | 72 | 76 | 116 | 118
         | TCLUNK_TYPE | 228 | 232 | 240 | 242 | 244 | 248 | 250 | 254 => fixed_one_fid(body),
         _ => FidFootprint::None,
     }

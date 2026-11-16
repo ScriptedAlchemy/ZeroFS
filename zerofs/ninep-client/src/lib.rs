@@ -63,6 +63,7 @@ mod runtime;
 mod web_transport;
 #[cfg(not(target_arch = "wasm32"))]
 mod write_progress;
+mod xattr;
 
 /// The 9P "no tag" sentinel. We never allocate it for a normal request.
 const NOTAG: u16 = 0xFFFF;
@@ -450,6 +451,7 @@ struct Conn {
     lineage_token: AtomicU64,
     /// Writer epoch returned by `Tgetlineage`; zero for standalone servers.
     writer_epoch: AtomicU64,
+    case_insensitive: AtomicBool,
     /// Set by whichever of the reader/writer tasks first sees the socket fail.
     dead: AtomicBool,
     /// Monotonic base for [`Conn::last_alive`].
@@ -659,6 +661,7 @@ pub struct NinePClient {
     /// Negotiated once for the logical session. Reconnects must match it so an
     /// ambiguous mutation can be resent byte-for-byte.
     msize: u32,
+    case_insensitive: bool,
     /// Suppresses repeated message-size mismatch warnings for this logical session.
     msize_mismatch_warned: Arc<AtomicBool>,
     fid_ctr: AtomicU32,
@@ -767,6 +770,7 @@ impl NinePClient {
 
         let client = Arc::new(Self {
             targets,
+            case_insensitive: conn.case_insensitive.load(Ordering::Acquire),
             conn: ArcSwap::new(conn),
             live: AtomicBool::new(true),
             terminal_errno: AtomicU32::new(0),
@@ -803,6 +807,7 @@ impl NinePClient {
             tag_ctr: AtomicU16::new(0),
             lineage_token: AtomicU64::new(0),
             writer_epoch: AtomicU64::new(0),
+            case_insensitive: AtomicBool::new(false),
             dead: AtomicBool::new(false),
             base: runtime::Clock::now(),
             last_alive: AtomicU64::new(0),
@@ -985,6 +990,7 @@ impl NinePClient {
         )
         .await?;
 
+        self.check_name_mode(&conn)?;
         // Settlement and snapshot/replay/install are mutually exclusive.
         let _transition = self.session_transition.lock().await;
         debug_assert_eq!(msize, self.msize);
@@ -997,6 +1003,19 @@ impl NinePClient {
         old.writer_shutdown.notify_one();
 
         Ok(())
+    }
+
+    fn check_name_mode(&self, conn: &Conn) -> ClientResult<()> {
+        if conn.case_insensitive.load(Ordering::Acquire) != self.case_insensitive {
+            conn.shutdown();
+            return Err(ClientError::Unexpected("filesystem name mode"));
+        }
+        Ok(())
+    }
+
+    /// Report the fixed directory lookup rule negotiated for this session.
+    pub fn case_insensitive(&self) -> bool {
+        self.case_insensitive
     }
 
     /// Resets a failed candidate before close. The ordered `Tversion` reply
@@ -1752,6 +1771,15 @@ impl NinePClient {
         exact_tag: Option<u16>,
         body: Message,
     ) -> ClientResult<Message> {
+        Self::send_raw_at_tag_ctx(conn, exact_tag, body, false).await
+    }
+
+    async fn send_raw_at_tag_ctx(
+        conn: &Conn,
+        exact_tag: Option<u16>,
+        body: Message,
+        op_id_enabled: bool,
+    ) -> ClientResult<Message> {
         let permit = conn
             .writer_tx
             .reserve()
@@ -1783,7 +1811,7 @@ impl NinePClient {
             drop(permit);
             return Err(ClientError::Disconnected);
         }
-        let bytes = match P9Message::new(tag, body).to_bytes() {
+        let bytes = match P9Message::new(tag, body).to_bytes_ctx(op_id_enabled) {
             Ok(b) => b,
             Err(e) => return Err(ClientError::Codec(e)),
         };
@@ -2051,18 +2079,44 @@ impl NinePClient {
         newfid: u32,
         names: &[&[u8]],
     ) -> ClientResult<(Vec<Qid>, Stat)> {
+        self.walk_getattr_inner(fid, newfid, names, false).await
+    }
+
+    /// Walk by stored spelling for the FUSE bridge. Ordinary walks still fold.
+    /// Insensitive exports negotiate the private CI dialect before using this request.
+    pub async fn walk_getattr_exact(
+        &self,
+        fid: u32,
+        newfid: u32,
+        names: &[&[u8]],
+    ) -> ClientResult<(Vec<Qid>, Stat)> {
+        self.walk_getattr_inner(fid, newfid, names, self.case_insensitive())
+            .await
+    }
+
+    async fn walk_getattr_inner(
+        &self,
+        fid: u32,
+        newfid: u32,
+        names: &[&[u8]],
+        exact: bool,
+    ) -> ClientResult<(Vec<Qid>, Stat)> {
         let wnames = names
             .iter()
             .map(|n| P9String::new(n.to_vec()))
             .collect::<Vec<_>>();
-        let (resp, _transition) = self
-            .rpc_stateful(Message::Twalkgetattr(Twalkgetattr {
-                fid,
-                newfid,
-                nwname: wnames.len() as u16,
-                wnames,
-            }))
-            .await?;
+        let walk = Twalkgetattr {
+            fid,
+            newfid,
+            nwname: wnames.len() as u16,
+            wnames,
+        };
+        let request = if exact {
+            Message::Twalkgetattrexact(walk)
+        } else {
+            Message::Twalkgetattr(walk)
+        };
+        let (resp, _transition) = self.rpc_stateful(request).await?;
         match resp {
             Message::Rwalkgetattr(r) => {
                 {
@@ -3188,13 +3242,19 @@ async fn version_on(conn: &Conn, requested: u32) -> ClientResult<u32> {
     {
         Message::Rlerror(e) => Err(ClientError::Errno(e.ecode)),
         Message::Rversion(rv) => {
-            if rv.version.data != VERSION_9P2000L_ZEROFS {
-                warn!(
-                    "server did not accept the required ZeroFS dialect: {:?}",
-                    rv.version.as_str().unwrap_or("<non-UTF-8>")
-                );
-                return Err(ClientError::Unexpected("version"));
-            }
+            let case_insensitive = match rv.version.data.as_slice() {
+                VERSION_9P2000L_ZEROFS => false,
+                VERSION_9P2000L_ZEROFS_CI => true,
+                _ => {
+                    warn!(
+                        "server did not accept the required ZeroFS dialect: {:?}",
+                        rv.version.as_str().unwrap_or("<non-UTF-8>")
+                    );
+                    return Err(ClientError::Unexpected("version"));
+                }
+            };
+            conn.case_insensitive
+                .store(case_insensitive, Ordering::Release);
             // Linux v9fs requires msize >= 4096.
             let negotiated = rv.msize.min(requested);
             if negotiated < 4096 {
@@ -3502,6 +3562,7 @@ fn test_conn_with_receiver_at(base: runtime::Clock) -> (Arc<Conn>, mpsc::Receive
         tag_ctr: AtomicU16::new(0),
         lineage_token: AtomicU64::new(0),
         writer_epoch: AtomicU64::new(0),
+        case_insensitive: AtomicBool::new(false),
         dead: AtomicBool::new(false),
         base,
         last_alive: AtomicU64::new(0),
@@ -3529,6 +3590,7 @@ mod session_transition_tests {
     fn test_client(conn: Arc<Conn>) -> Arc<NinePClient> {
         Arc::new(NinePClient {
             targets: Vec::new(),
+            case_insensitive: conn.case_insensitive.load(Ordering::Acquire),
             conn: ArcSwap::new(conn),
             live: AtomicBool::new(true),
             terminal_errno: AtomicU32::new(0),
@@ -3648,6 +3710,96 @@ mod session_transition_tests {
         let result = client.replay(conn).await;
         responder.await.unwrap();
         result
+    }
+
+    #[tokio::test]
+    async fn exact_walk_selects_the_ci_opcode_and_records_successful_fids() {
+        for insensitive in [false, true] {
+            let (conn, mut requests) = test_conn_with_receiver();
+            conn.case_insensitive.store(insensitive, Ordering::Release);
+            let client = test_client(conn.clone());
+            client.state.lock().unwrap().fids.insert(
+                1,
+                FidRecord {
+                    inode_id: 0,
+                    root_inode: 0,
+                    n_uname: 1000,
+                    uname: b"test".to_vec(),
+                    opened: None,
+                },
+            );
+            let responder = tokio::spawn(async move {
+                let request = recv_request(&mut requests, "exact walk").await;
+                let walk = match request.body {
+                    Message::Twalkgetattrexact(walk) if insensitive => walk,
+                    Message::Twalkgetattr(walk) if !insensitive => walk,
+                    other => panic!("unexpected walk {other:?}"),
+                };
+                assert_eq!((walk.fid, walk.newfid), (1, 2));
+                assert_eq!(walk.wnames[0].data, b"Foo");
+                let qid = Qid {
+                    path: 42,
+                    ..Default::default()
+                };
+                reply(
+                    &conn,
+                    request.tag,
+                    Message::Rwalkgetattr(Rwalkgetattr {
+                        nwqid: 1,
+                        wqids: vec![qid],
+                        stat: Stat {
+                            qid,
+                            ..Default::default()
+                        },
+                    }),
+                );
+            });
+            let (_, stat) = client.walk_getattr_exact(1, 2, &[b"Foo"]).await.unwrap();
+            responder.await.unwrap();
+            assert_eq!(stat.qid.path, 42);
+            assert_eq!(
+                client.state.lock().unwrap().fids.get(&2).unwrap().inode_id,
+                42
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn name_mode_negotiation_accepts_both_modes_and_rejects_a_changed_reconnect() {
+        for (version, insensitive) in [
+            (VERSION_9P2000L_ZEROFS, false),
+            (VERSION_9P2000L_ZEROFS_CI, true),
+        ] {
+            let (conn, mut requests) = test_conn_with_receiver();
+            let responder_conn = Arc::clone(&conn);
+            let responder = tokio::spawn(async move {
+                let request = recv_request(&mut requests, "version request").await;
+                assert!(matches!(request.body, Message::Tversion(_)));
+                reply(
+                    &responder_conn,
+                    request.tag,
+                    Message::Rversion(Rversion {
+                        msize: 8192,
+                        version: P9String::new(version.to_vec()),
+                    }),
+                );
+            });
+            assert_eq!(version_on(&conn, 8192).await.unwrap(), 8192);
+            responder.await.unwrap();
+            let client = test_client(conn);
+            assert_eq!(client.case_insensitive(), insensitive);
+            let candidate = test_conn();
+            candidate
+                .case_insensitive
+                .store(insensitive, Ordering::Release);
+            client.check_name_mode(&candidate).unwrap();
+            candidate
+                .case_insensitive
+                .store(!insensitive, Ordering::Release);
+            assert!(client.check_name_mode(&candidate).is_err());
+            assert!(candidate.dead.load(Ordering::Acquire));
+            assert!(candidate.pending.is_empty());
+        }
     }
 
     #[tokio::test]
