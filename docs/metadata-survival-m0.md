@@ -140,7 +140,10 @@ directories as logical devices on one host filesystem. It initializes the real
 pool/catalog, creates a real encrypted SlateDB namespace, writes and overwrites
 real segments, truncates, renames, links, removes a file, and closes all workers.
 Cold lookup/read verifies the control before fault injection. It checks physical
-member hashes after loss. Generated fixture state is removed; it never opens a
+member hashes after loss. The fixture uses `ObjectCoverage::DirectRemote`; its
+materialized mutation cutoff is zero. The completed flush and cold control prove
+the serialized fixture prefix, not NVMe journal coverage or a survival receipt.
+Generated fixture state is removed; it never opens a
 real disk, mount, NAS, or source tree. Directory removal models permanent state
 loss, not physical power failure or independent hardware failure domains.
 
@@ -164,3 +167,46 @@ fail at the real missing dependency. M1 still owes the complete matrix, the
 multi-device commit mechanism and crash proofs, encryption survival, integrity
 and cleanup evidence, and hardware power-loss validation. No strict placement
 capability is enabled by M0.
+
+## Local execution evidence
+
+On macOS arm64 with Rust/Cargo 1.100.0, the reproduction command above passed
+(`1 passed; 0 failed; 1 ignored`). Each of its four cases first passed cold
+namespace/catalog verification and retained three unchanged physical segments
+across both members. Authority-only loss failed at the identity marker; catalog
+and combined device loss failed at the missing catalog; key-only loss failed
+at the existing-key loader. Each reported successful fixture cleanup.
+
+The explicitly ignored acceptance command exited **101**, after the control and
+cleanup passed, with this intended failure (not a setup error):
+
+```text
+M0 gate failed: committed namespace must survive authority-device loss: open original pool
+Caused by:
+    pool catalog is missing: initialize a new pool with `zerofs pool init`, or restore an existing pool's catalog; normal startup never recreates it
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2213 filtered out
+```
+
+The fixture canonicalizes temporary paths because macOS may expose `/var` as a
+symlink; descriptor-anchored catalog opening rejects such aliases. An initial
+setup failure on that alias was corrected before collecting the evidence above.
+
+The normal library suite passed: **2,194 passed, 0 failed, 20 ignored**, in
+183.73 seconds. The ignored set includes the M0 acceptance and existing ignored
+tests; no ignored benchmarks were run. Run from `zerofs/`:
+
+```sh
+m0_tmp_parent=$(mktemp -d /private/tmp/zfsm0.XXXXXX)
+TMPDIR="$m0_tmp_parent" CARGO_TARGET_DIR="$PWD/target/m0-metadata-survival" \
+  /Users/zackjackson/.cargo/bin/cargo +1.100.0 test --locked -p zerofs --lib \
+  -- --test-threads=4
+rmdir "$m0_tmp_parent"
+```
+
+The short canonical scratch parent was removed successfully. An earlier broad
+run used a long checkout-local `TMPDIR` and was stopped after existing Unix
+socket fixtures failed with `path must be shorter than SUN_LEN`; the short-path
+rerun above resolved those setup failures. Its abandoned fixtures were removed.
+`cargo +1.100.0 fmt --all -- --check` and `git diff --check` also passed. All
+builds/tests used the native Mac toolchain directly, with no remote cargo,
+toolchain-default changes, Linux-only benchmarks, NAS access, or deployment.
