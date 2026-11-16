@@ -121,6 +121,10 @@ impl Fixture {
 }
 
 impl IdentityProvider for Fixture {
+    fn filesystem_size(&self, _root: &Path) -> Result<u64> {
+        Ok(100_000_000)
+    }
+
     fn observe(&self, root: &Path) -> Result<MountedFilesystem> {
         self.calls.set(self.calls.get() + 1);
         self.facts
@@ -583,13 +587,12 @@ fn a_real_open_path_cannot_escape_its_declared_role_or_filesystem() {
         symlink(&outside, &child).unwrap();
         error_contains(
             verify_open_paths_with(&fixture.parse().unwrap(), &fixture, &[(role, child)]),
-            "escapes its declared role",
+            "symlink",
         );
     }
 }
 #[path = "device_tests.rs"]
 mod device_tests;
-
 
 #[tokio::test]
 async fn readiness_symlinks_refuse_pool_init_and_server_backend_open_before_writes() {
@@ -598,10 +601,16 @@ async fn readiness_symlinks_refuse_pool_init_and_server_backend_open_before_writ
         for (role, relative) in [
             ("authority", ".zerofs-pool"),
             ("member data", ".zerofs-pool"),
-            ("member data", ".zerofs-pool/00000000-0000-0000-0000-000000000001/objects"),
+            (
+                "member data",
+                ".zerofs-pool/00000000-0000-0000-0000-000000000001/objects",
+            ),
             ("catalog", "pool.lock"),
             ("cache", "bucket_fixture/hybrid_cache"),
-            ("cache", "bucket_fixture/parts_cache/foyer-storage-direct-fs-00000000"),
+            (
+                "cache",
+                "bucket_fixture/parts_cache/foyer-storage-direct-fs-00000000",
+            ),
             ("journal", "bucket_fixture/blobs/00"),
             ("journal", "bucket_fixture/tmp"),
         ] {
@@ -609,7 +618,11 @@ async fn readiness_symlinks_refuse_pool_init_and_server_backend_open_before_writ
             fixture.document["storage"]["readiness"]["strict"] = json!(false);
             let settings = fixture.parse().unwrap();
             if !initialize {
-                drop(crate::storage_backend::open_pool_storage(&settings, true).await.unwrap());
+                drop(
+                    crate::storage_backend::open_pool_storage(&settings, true)
+                        .await
+                        .unwrap(),
+                );
             }
             let child = fixture.path(role).join(relative);
             if child.is_dir() {
@@ -627,10 +640,19 @@ async fn readiness_symlinks_refuse_pool_init_and_server_backend_open_before_writ
                 std::fs::write(&config, toml::to_string(&settings).unwrap()).unwrap();
                 crate::cli::pool::run(crate::cli::PoolCommands::Init { config }).await
             } else {
-                crate::storage_backend::open_storage(&settings).await.map(|_| ())
+                crate::storage_backend::open_storage(&settings)
+                    .await
+                    .map(|_| ())
             };
-            assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1, "wrote through {role}/{relative}");
-            assert_eq!(std::fs::read(outside.join("sentinel")).unwrap(), b"unchanged");
+            assert_eq!(
+                std::fs::read_dir(&outside).unwrap().count(),
+                1,
+                "wrote through {role}/{relative}"
+            );
+            assert_eq!(
+                std::fs::read(outside.join("sentinel")).unwrap(),
+                b"unchanged"
+            );
             error_contains(result, "symlink");
             let mut strict_settings = settings.clone();
             strict_settings.storage.readiness.as_mut().unwrap().strict = true;
@@ -641,12 +663,14 @@ async fn readiness_symlinks_refuse_pool_init_and_server_backend_open_before_writ
 
 #[tokio::test]
 async fn readiness_member_payload_write_refuses_a_symlink_added_after_open() {
-    use object_store::{ObjectStoreExt, PutMode, PutOptions};
+    use object_store::{PutMode, PutOptions};
     for replace_marker in [true, false] {
         let mut fixture = Fixture::new();
         fixture.document["storage"]["readiness"]["strict"] = json!(false);
         let settings = fixture.parse().unwrap();
-        let (opened, pool) = crate::storage_backend::open_pool_storage(&settings, true).await.unwrap();
+        let (opened, pool) = crate::storage_backend::open_pool_storage(&settings, true)
+            .await
+            .unwrap();
         let pool_id = pool.status().await.unwrap().pool_id;
         let member = fixture.path("member data");
         let child = if replace_marker {
@@ -662,11 +686,27 @@ async fn readiness_member_payload_write_refuses_a_symlink_added_after_open() {
         }
         std::os::unix::fs::symlink(&outside, &child).unwrap();
         let mut options = PutOptions::from(PutMode::Create);
-        options.extensions.insert(crate::segment_store::GeneratedSegmentCreate);
-        let key = opened.path.join(crate::segment::Segid::new(97, 1).object_key());
-        let result = opened.store.put_opts(&key, "must stay local".into(), options).await;
-        let objects = if replace_marker { outside.join(format!("{pool_id}/objects")) } else { outside.clone() };
-        assert!(!objects.exists() || std::fs::read_dir(objects).unwrap().count() == 0, "payload reached symlink target");
+        options
+            .extensions
+            .insert(crate::segment_store::GeneratedSegmentCreate);
+        let key = object_store::path::Path::from(format!(
+            "{}/{}",
+            opened.path,
+            crate::segment::Segid::new(97, 1).object_key()
+        ));
+        let result = opened
+            .store
+            .put_opts(&key, "must stay local".into(), options)
+            .await;
+        let objects = if replace_marker {
+            outside.join(format!("{pool_id}/objects"))
+        } else {
+            outside.clone()
+        };
+        assert!(
+            !objects.exists() || std::fs::read_dir(objects).unwrap().count() == 0,
+            "payload reached symlink target"
+        );
         assert!(format!("{:#}", result.unwrap_err()).contains("symlink"));
     }
 }
@@ -686,7 +726,11 @@ fn reserve_above_configured_member_capacity_is_rejected_in_both_strict_modes() {
 
 #[test]
 fn reserve_above_observed_size_or_unavailable_size_refuses_strict_open() {
-    struct SizeProvider<'a> { fixture: &'a Fixture, root: PathBuf, size: Option<u64> }
+    struct SizeProvider<'a> {
+        fixture: &'a Fixture,
+        root: PathBuf,
+        size: Option<u64>,
+    }
     impl IdentityProvider for SizeProvider<'_> {
         fn observe(&self, path: &Path) -> Result<MountedFilesystem> {
             self.fixture.observe(path)
@@ -703,9 +747,29 @@ fn reserve_above_observed_size_or_unavailable_size_refuses_strict_open() {
     let settings = fixture.parse().unwrap();
     for role in ["authority", "catalog", "member data", "cache", "journal"] {
         let root = fixture.path(role);
-        verify_with(&settings, &SizeProvider { fixture: &fixture, root: root.clone(), size: Some(1_000_000) }).unwrap();
-        for (size, expected) in [(Some(999_999), "observed filesystem size"), (Some(0), "filesystem size unavailable"), (None, "filesystem size unavailable")] {
-            let error = verify_with(&settings, &SizeProvider { fixture: &fixture, root: root.clone(), size }).unwrap_err();
+        verify_with(
+            &settings,
+            &SizeProvider {
+                fixture: &fixture,
+                root: root.clone(),
+                size: Some(1_000_000),
+            },
+        )
+        .unwrap();
+        for (size, expected) in [
+            (Some(999_999), "observed filesystem size"),
+            (Some(0), "filesystem size unavailable"),
+            (None, "filesystem size unavailable"),
+        ] {
+            let error = verify_with(
+                &settings,
+                &SizeProvider {
+                    fixture: &fixture,
+                    root: root.clone(),
+                    size,
+                },
+            )
+            .unwrap_err();
             let error = format!("{error:#}");
             assert!(error.contains(role) && error.contains(expected), "{error}");
         }
@@ -730,4 +794,28 @@ fn readiness_refuses_internal_and_dangling_symlinks_below_every_role() {
             }
         }
     }
+}
+
+#[test]
+fn statvfs_size_requires_nonzero_representable_bytes() {
+    assert_eq!(checked_filesystem_size(2, 4096).unwrap(), 8192);
+    for (blocks, fragment_size) in [(0, 4096), (1, 0), (u64::MAX, 2)] {
+        error_contains(
+            checked_filesystem_size(blocks, fragment_size).map(|_| ()),
+            "unavailable",
+        );
+    }
+    let fixture = Fixture::new();
+    assert!(
+        HostIdentityProvider
+            .filesystem_size(fixture._temp.path())
+            .unwrap()
+            > 0
+    );
+    error_contains(
+        HostIdentityProvider
+            .filesystem_size(&fixture._temp.path().join("missing"))
+            .map(|_| ()),
+        "unavailable",
+    );
 }

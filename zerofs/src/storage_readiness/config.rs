@@ -244,6 +244,20 @@ impl ReadinessConfig {
         Ok(())
     }
 
+    pub(super) fn reserve_bytes(&self, filesystem: &FilesystemDeclaration) -> Result<u64> {
+        self.reserves
+            .iter()
+            .find(|reserve| {
+                self.filesystems.iter().any(|candidate| {
+                    candidate.id == reserve.filesystem
+                        && candidate.identity.capacity_domain()
+                            == filesystem.identity.capacity_domain()
+                })
+            })
+            .map(|reserve| reserve.bytes)
+            .context("missing reserve for readiness capacity domain")
+    }
+
     fn validate_reserves(&self, settings: &Settings, roots: &[StorageRoot<'_>]) -> Result<()> {
         let mut reserves = BTreeMap::new();
         for reserve in &self.reserves {
@@ -276,12 +290,28 @@ impl ReadinessConfig {
             .pool
             .as_ref()
             .context("missing readiness pool")?;
+        let mut capacities = BTreeMap::<String, u128>::new();
         for member in &pool.members {
+            let root = roots
+                .iter()
+                .find(|root| root.role == RoleName::Member(member.id.clone()))
+                .context("missing reserve member binding")?;
+            let capacity = capacities
+                .entry(root.filesystem.identity.capacity_domain())
+                .or_default();
+            *capacity = capacity
+                .checked_add(u128::from(member.capacity_bytes()?))
+                .context("configured member capacity sum overflow")?;
             if declared_for(&RoleName::Member(member.id.clone()))? < member.reserve_free_bytes()? {
                 bail!(
                     "declared domain reserve is below enforced reserve_free_gb for member {}",
                     member.id
                 );
+            }
+        }
+        for (domain, capacity) in capacities {
+            if u128::from(reserves[&domain]) > capacity {
+                bail!("declared domain reserve exceeds summed configured member capacity");
             }
         }
         if let Some(writeback) =

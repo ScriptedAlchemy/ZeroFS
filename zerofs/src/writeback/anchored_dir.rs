@@ -32,6 +32,12 @@ impl AnchoredDir {
     }
 
     fn walk_absolute(path: &Path, create: bool, mode: u32) -> Result<Self> {
+        let directory = Self::walk_absolute_components(path, create, mode)?;
+        directory.validate_owner_mode(mode)?;
+        Ok(directory)
+    }
+
+    fn walk_absolute_components(path: &Path, create: bool, mode: u32) -> Result<Self> {
         if !path.is_absolute() {
             bail!("anchored directory path must be absolute");
         }
@@ -58,8 +64,44 @@ impl AnchoredDir {
                 }
             }
         }
-        current.validate_owner_mode(mode)?;
         Ok(current)
+    }
+
+    /// Inspect an existing storage tree without following child symlinks or
+    /// changing ownership or modes. No descriptor survives the preflight.
+    pub(crate) fn reject_symlinks_below(root: &Path) -> Result<()> {
+        let root = match root.canonicalize() {
+            Ok(root) => root,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error).context("resolve storage inspection root"),
+        };
+        let root = Self::walk_absolute_components(&root, false, 0)?;
+        let mut pending = vec![PathBuf::new()];
+        while let Some(relative) = pending.pop() {
+            let mut directory = root.clone();
+            for name in relative.iter() {
+                directory = directory
+                    .open_child_raw(name, false, 0)?
+                    .context("storage directory disappeared during inspection")?;
+            }
+            directory.for_each_entry(|name| {
+                let metadata = statat(directory.fd.as_ref(), name, AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(anyhow::Error::new)
+                    .context("inspect anchored storage entry")?;
+                let kind = FileType::from_raw_mode(metadata.st_mode);
+                if kind.is_symlink() {
+                    bail!(
+                        "readiness path contains a symlink: {}",
+                        directory.display.join(name).display()
+                    );
+                }
+                if kind.is_dir() {
+                    pending.push(relative.join(name));
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 
     pub(crate) fn open_or_create_child(&self, name: &OsStr, mode: u32) -> Result<Self> {

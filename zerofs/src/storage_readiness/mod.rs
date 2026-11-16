@@ -3,6 +3,7 @@ mod devices;
 mod identity;
 #[cfg(any(target_os = "linux", test))]
 mod linux;
+pub(crate) mod paths;
 
 use crate::config::Settings;
 use anyhow::{Context, Result, bail};
@@ -35,6 +36,11 @@ pub(super) trait IdentityProvider {
 struct HostIdentityProvider;
 
 impl IdentityProvider for HostIdentityProvider {
+    fn filesystem_size(&self, root: &Path) -> Result<u64> {
+        let stat = rustix::fs::statvfs(root).context("statvfs filesystem size unavailable")?;
+        checked_filesystem_size(stat.f_blocks, stat.f_frsize)
+    }
+
     #[cfg(target_os = "linux")]
     fn observe_device(&self, by_id: &Path) -> Result<DeviceObservation> {
         linux::devices::observe_device(by_id)
@@ -58,6 +64,13 @@ impl IdentityProvider for HostIdentityProvider {
     }
 }
 
+fn checked_filesystem_size(blocks: u64, fragment_size: u64) -> Result<u64> {
+    blocks
+        .checked_mul(fragment_size)
+        .filter(|size| *size > 0)
+        .context("statvfs filesystem size unavailable or overflowing")
+}
+
 pub(crate) fn verify(settings: &Settings) -> Result<()> {
     verify_with(settings, &HostIdentityProvider)
 }
@@ -66,10 +79,14 @@ pub(super) fn verify_with(settings: &Settings, provider: &dyn IdentityProvider) 
     let Some(config) = &settings.storage.readiness else {
         return Ok(());
     };
+    let roots = config.validated_roots(settings)?;
     if !config.strict {
+        for root in &roots {
+            paths::verify_tree(&root.path)
+                .with_context(|| format!("storage readiness failed for {}", root.role))?;
+        }
         return Ok(());
     }
-    let roots = config.validated_roots(settings)?;
     for device in &config.devices {
         let observation = provider.observe_device(&device.by_id).with_context(|| {
             format!(
@@ -103,6 +120,8 @@ pub(super) fn verify_with(settings: &Settings, provider: &dyn IdentityProvider) 
             bail!("readiness {} root is not a directory", root.role)
         }
         verify_identity(config, root, &path, provider)?;
+        paths::verify_tree(&root.path)
+            .with_context(|| format!("storage readiness failed for {}", root.role))?;
         verified.push((root, path));
     }
     for (index, (left, left_path)) in verified.iter().enumerate() {
@@ -154,6 +173,21 @@ fn verify_identity(
     if !facts.writable || !facts.unlocked {
         bail!(
             "readiness {} filesystem must be writable, mounted and unlocked",
+            root.role
+        );
+    }
+    let size = provider
+        .filesystem_size(path)
+        .with_context(|| format!("readiness {} filesystem size unavailable", root.role))?;
+    if size == 0 {
+        bail!(
+            "readiness {} filesystem size unavailable: zero size",
+            root.role
+        );
+    }
+    if config.reserve_bytes(root.filesystem)? > size {
+        bail!(
+            "readiness {} reserve exceeds observed filesystem size",
             root.role
         );
     }
@@ -219,19 +253,7 @@ fn verify_open_paths_with(
         if !path.starts_with(&root.path) {
             bail!("readiness {role} open path escapes its declared role");
         }
-        let mut existing = path.as_path();
-        loop {
-            match existing.symlink_metadata() {
-                Ok(_) => break,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    existing = existing
-                        .parent()
-                        .context("readiness open path has no existing ancestor")?;
-                }
-                Err(error) => return Err(error).context("cannot inspect readiness open path"),
-            }
-        }
-        let existing = existing.canonicalize()?;
+        let existing = paths::existing_ancestor(&root.path, path)?.canonicalize()?;
         if !existing.starts_with(root.path.canonicalize()?) {
             bail!("readiness {role} open path escapes its declared role");
         }

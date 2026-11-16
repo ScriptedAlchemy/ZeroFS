@@ -273,6 +273,7 @@ fn declared_reserve_compares_against_the_existing_pool_default() {
             .remove("reserve_free_gb");
         error_contains(fixture.parse().map(|_| ()), "reserve_free_gb");
         fixture.document["storage"]["readiness"]["reserves"][0]["bytes"] = json!(1_000_000_000);
+        fixture.document["storage"]["pool"]["members"][0]["capacity_gb"] = json!(2.0);
         let settings = fixture.parse().unwrap();
         assert_eq!(
             settings.storage.pool.as_ref().unwrap().members[0].reserve_free_gb,
@@ -329,6 +330,10 @@ impl<'a> HardwareProvider<'a> {
 }
 
 impl IdentityProvider for HardwareProvider<'_> {
+    fn filesystem_size(&self, root: &Path) -> Result<u64> {
+        self.fixture.filesystem_size(root)
+    }
+
     fn observe(&self, root: &Path) -> Result<MountedFilesystem> {
         self.fixture.observe(root)
     }

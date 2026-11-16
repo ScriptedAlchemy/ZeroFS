@@ -2,9 +2,10 @@
 
 `[storage.readiness]` adds opt-in identity verification before a local pool is
 opened. Omitting the section preserves ordinary local and cloud deployments.
-Setting `strict = false` retains the ordinary open behavior while config loading
-still checks the declarations. No identity probes run in either case. `strict`
-must be written explicitly when this section is present.
+Setting `strict = false` skips host identity and filesystem-size observations.
+Config loading still checks the declarations. Both strict modes reject existing
+symlinks below declared role roots before storage opens. `strict` must be written
+explicitly when this section is present.
 
 This completes the declarations and startup preflight for storage readiness.
 The schema binds storage paths to filesystems and declares device roles, lifetime
@@ -62,10 +63,14 @@ journal directories. Readiness creates nothing. A role may be a dedicated child
 directory on its declared mounted filesystem. Role directories must be disjoint,
 including after resolving symlinks. The Linux adapter rejects every mount
 strictly below a declared role root. It also checks the containing filesystem
-against the declaration. Before opening storage, preflight checks the catalog
-files and the cache and journal namespace children, including existing symlink
-targets. Missing children use their closest existing ancestor without creating
-anything. Nested mounts cannot substitute for the declared mountpoint. Declared mountpoints must themselves be canonical paths.
+against the declaration. Before opening storage, preflight inspects every
+existing child in the authority, catalog, member, cache, and journal trees
+without following symlinks. This includes
+`.zerofs-pool`, object directories, cache partitions, and journal blob shards.
+It rejects symlinks even when their targets stay inside the declared root.
+Missing children use their closest existing ancestor without creating anything.
+Nested mounts cannot substitute for the declared mountpoint. Declared
+mountpoints must themselves be canonical paths.
 
 Authority, catalog, and one member may share a filesystem through disjoint
 directories. Journal and cache may likewise share the NVMe filesystem. Multiple
@@ -73,9 +78,10 @@ data members cannot use the same capacity domain. For ext4/XFS, that domain is
 the filesystem UUID; for ZFS, it is the pool GUID, even across distinct dataset
 GUIDs. This conservatively rejects shared-pool member quotas that could
 otherwise count pool free space twice. Aliased declarations and conflicting
-profiles in one capacity domain are rejected. Storage readiness performs no
-capacity summation or new admission accounting. Shared control/data space still
-needs the existing reserves.
+profiles in one capacity domain are rejected. Config loading sums configured
+member capacities per domain to reject impossible reserves. Storage readiness
+adds no new admission accounting. Shared control/data space still needs the
+existing reserves.
 
 ZFS GUIDs are canonical nonzero decimal strings, preserving the full unsigned
 64-bit range through TOML. UUIDs are nonzero lowercase hyphenated UUID strings.
@@ -113,8 +119,13 @@ names a declared `filesystem` ID and a `bytes` quantity parsed as `u64`. There i
 no default. Multiple datasets in one ZFS pool require one entry for that pool,
 referencing any one of its filesystem IDs. A second entry for the same domain is
 invalid. Config loading rejects a quantity below any enforced `reserve_free_gb`
-on that domain or below the journal's enforced `min_free_gb`. The existing pool
-reserve default remains 1.0 GB. These existing settings remain the enforced
+on that domain or below the journal's enforced `min_free_gb`. It also rejects a
+reserve larger than the summed configured member capacity on that domain. Domains
+without members have no configured capacity bound. Strict Linux verification
+compares the domain reserve with the observed `statvfs` size at each role root,
+including each bound ZFS dataset. A missing, zero, or overflowing size is
+unavailable and refuses the open. The existing pool reserve default remains
+1.0 GB. These existing settings remain the enforced
 values. The new quantity is a declaration and does not reserve additional space.
 
 Every declaration rule runs at config load in both strict modes. Unknown fields,
@@ -168,6 +179,44 @@ before storage mutation there; ordinary deployments continue to use their
 existing behavior. Injected identity and command-output providers exercise the
 readiness contract on Mac without mounting anything or accessing a NAS.
 
+## Calls that perform no preflight
+
+Client commands that only contact a running server do no storage preflight on
+that client. These include upload, download, rm, mount, checkpoint management,
+flush, monitor, fatrace, otrace, NBD provisioning, `pool affected`, and
+`pool status --endpoint`. A configuration file used to locate an RPC endpoint
+still receives config validation. The running server owns its startup preflight.
+Generating a config with `init` also performs no storage preflight.
+
+Lower-level constructors do not run readiness verification. The exported
+`ZeroFS::new_with_slatedb_and_lease` constructor accepts an already-open database
+and object store. Exported store wrappers such as `RetryingObjectStore::new`
+also accept a supplied store without checking its filesystem. Deserializing the
+exported `Settings` type with Serde also performs no host probes. These calls
+do not acquire the CLI's readiness contract.
+
+The internal `Settings::from_file` parser validates declarations without host
+probes. The internal `parse_url_opts` helper builds stores without preflight.
+Internal `Journal::open`, writeback store constructors, and `build_slatedb` accept
+paths or stores directly without readiness settings. Callers that bypass the
+CLI must supply their own readiness checks.
+
+Direct RAM/SSD and SFTP/writeback benchmarks construct their stores, journals,
+and workers directly. They do no readiness preflight. In-process tier and extent
+benchmarks also bypass it. Config parsing in a benchmark does not establish host
+identity or capacity evidence.
+
+With `strict = false`, no host identity or size probes run. The skipped checks
+are required role-root existence, canonical mountpoints, resolved root overlap,
+containing mounts and mounted filesystem roots, descendant mounts, filesystem
+UUIDs or ZFS GUIDs, writable and unlocked state, observed filesystem size versus
+the reserve, device serial and whole-block-device identity, backing device sets,
+and declared boot-device exclusion. The open-path identity recheck is also
+skipped. Config validation and the symlink checks still run. Existing backend
+checks can independently reject missing, overlapping, or unsafe paths. Omitting
+device declarations also leaves serial, backing-device, and boot exclusion
+evidence unavailable in strict mode.
+
 ## Scope of evidence
 
 This is a startup preflight, including explicit `pool init` and maintenance opens.
@@ -187,8 +236,13 @@ formats.
 
 Startup readiness does not pin mounts or directory descriptors through the
 server lifetime. It does not guard every publication or resumed write against
-later mount loss. There remains a race between preflight and later path-based
-storage opens. The placement track must provide its continuing
+later mount loss. Authority and member object I/O and the Foyer cache still use
+path-based opens.
+The object store checks each requested path and its mutation lock before I/O.
+Catalog and journal opens retain their existing descriptor-anchored no-follow
+walkers. A symlink created after a check can still redirect a later path-based
+open, including an object-store operation or a cache open. The preflight does not
+close that window. The placement track must provide its continuing
 mutation/publication readiness contract before strict placement can be enabled.
 Passing this startup check is not a runtime loss-of-mount guarantee, a
 durability receipt, or a migration gate.
