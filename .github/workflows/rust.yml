@@ -3,8 +3,8 @@ name: Rust
 on:
   push:
     branches: ["main", "develop"]
+  # Stacked pull requests need the same build, lint and test gates as main.
   pull_request:
-    branches: ["main", "develop"]
 
 env:
   CARGO_TERM_COLOR: always

@@ -1,5 +1,8 @@
 # SFTP read throughput
 
+For the separate client upload path, including SSD writeback admission and the
+macOS/Linux tunnel comparison, see [WAN upload throughput](wan-upload-throughput.md).
+
 ## What the latency does and does not imply
 
 A 95 ms round trip does not impose a 1 MB/s limit on an SSH connection. The
@@ -649,7 +652,9 @@ prefix and encryption configuration intact.
 1. Record the running binary's exact Git revision, selected port, SFTP pool and
    read-concurrency settings, mount/client protocol, and cache state. An open
    PR is not evidence that the service runs its changes.
-2. On CT198, download the same existing large remote object with one stock
+2. Budget a spare account connection before a direct control: a production
+   pool configured for all ten connections leaves none for another client.
+   On CT198, download the same existing large remote object with one stock
    OpenSSH SFTP connection. Compare `-B 32768 -R 128` (4 MiB requested) with
    `-B 261120 -R 64` (about 15.9 MiB requested), subject to server support.
    Keep strict host-key verification and use an owned local scratch file.
@@ -658,7 +663,8 @@ prefix and encryption configuration intact.
    [OpenSSH SFTP manual](https://man.openbsd.org/sftp.1).
 3. Run the production native-russh direct benchmark described in `AGENTS.md`
    on the isolated Linux test environment. Account for production connections:
-   an eight-connection production pool leaves at most two benchmark slots.
+   an eight-connection production pool leaves at most two benchmark slots;
+   a ten-connection production pool leaves none.
    Use its integrity and teardown gates, and record both object size and
    effective concurrency. It creates its own UUID-scoped remote objects.
 4. Compare the same cold and warm user-visible copy paths. A raw encrypted
