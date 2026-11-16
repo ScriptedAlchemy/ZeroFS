@@ -17,37 +17,39 @@ pub enum NameMode {
 }
 
 impl NameMode {
-    /// Fold valid characters with Unicode 5.0.0 simple uppercase, without normalization.
-    /// Invalid UTF-8 bytes retain their original values.
     pub fn key<'a>(self, name: &'a [u8]) -> Cow<'a, [u8]> {
-        if self == Self::Sensitive {
-            return Cow::Borrowed(name);
+        match self {
+            Self::Sensitive => Cow::Borrowed(name),
+            Self::Insensitive => fold_name(name),
         }
-        let mut folded = Vec::with_capacity(name.len());
-        let mut rest = name;
-        while !rest.is_empty() {
-            match std::str::from_utf8(rest) {
-                Ok(valid) => {
-                    fold_valid(valid, &mut folded);
-                    break;
-                }
-                Err(error) => {
-                    let (valid, tail) = rest.split_at(error.valid_up_to());
-                    fold_valid(
-                        std::str::from_utf8(valid).expect("valid UTF-8 prefix"),
-                        &mut folded,
-                    );
-                    let invalid_len = error.error_len().unwrap_or(tail.len());
-                    folded.extend_from_slice(&tail[..invalid_len]);
-                    rest = &tail[invalid_len..];
-                }
-            }
+    }
+}
+
+/// Apply OpenZFS Unicode 5.0.0 simple uppercase without normalization.
+/// Invalid spans consume the lead byte's full width, including any ASCII tail.
+/// Illegal lead bytes consume one byte. Truncated spans consume the remainder.
+/// Inventory and filesystem lookup must use this same byte rule.
+pub fn fold_name(name: &[u8]) -> Cow<'_, [u8]> {
+    let mut folded = Vec::with_capacity(name.len());
+    let mut rest = name;
+    while let Some(&lead) = rest.first() {
+        let width = match lead {
+            0xc2..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf4 => 4,
+            _ => 1,
+        };
+        let (span, tail) = rest.split_at(width.min(rest.len()));
+        match std::str::from_utf8(span) {
+            Ok(valid) => fold_valid(valid, &mut folded),
+            Err(_) => folded.extend_from_slice(span),
         }
-        if folded == name {
-            Cow::Borrowed(name)
-        } else {
-            Cow::Owned(folded)
-        }
+        rest = tail;
+    }
+    if folded == name {
+        Cow::Borrowed(name)
+    } else {
+        Cow::Owned(folded)
     }
 }
 
@@ -72,7 +74,11 @@ mod tests {
     #[test]
     fn openzfs_byte_vectors() {
         for &(name, expected) in vectors::OPENZFS_VECTORS {
-            assert_eq!(NameMode::Insensitive.key(name).as_ref(), expected, "{name:02x?}");
+            assert_eq!(
+                NameMode::Insensitive.key(name).as_ref(),
+                expected,
+                "{name:02x?}"
+            );
         }
     }
 
@@ -88,7 +94,11 @@ mod tests {
             let expected_len = rest[1] as usize;
             let name = &rest[2..2 + name_len];
             let expected = &rest[2 + name_len..2 + name_len + expected_len];
-            assert_eq!(NameMode::Insensitive.key(name).as_ref(), expected, "{name:02x?}");
+            assert_eq!(
+                NameMode::Insensitive.key(name).as_ref(),
+                expected,
+                "{name:02x?}"
+            );
             counts[name_len] += 1;
             rest = &rest[2 + name_len + expected_len..];
         }
@@ -101,7 +111,10 @@ mod tests {
     #[test]
     fn malformed_multibyte_sequence_keeps_its_ascii_tail() {
         assert_eq!(NameMode::Insensitive.key(b"\xc3a"), b"\xc3a".as_slice());
-        assert_ne!(NameMode::Insensitive.key(b"\xc3a"), NameMode::Insensitive.key(b"\xc3A"));
+        assert_ne!(
+            NameMode::Insensitive.key(b"\xc3a"),
+            NameMode::Insensitive.key(b"\xc3A")
+        );
     }
 
     #[test]
