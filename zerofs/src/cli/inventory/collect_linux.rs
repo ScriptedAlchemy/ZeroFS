@@ -1,10 +1,15 @@
-use super::collect::xattr;
-use super::record::{Field, Filesystem, RawAcl, Reason, Timestamp};
-use rustix::fd::BorrowedFd;
+use super::collect::{self, xattr};
+use super::record::{Field, Filesystem, RawAcl, RawBytes, Reason, Timestamp, Xattr};
+use rustix::fd::{AsRawFd, BorrowedFd};
 use rustix::fs::{AtFlags, Stat, StatFs, StatxFlags, statx};
 use std::ffi::OsStr;
+use std::path::Path;
 
 pub(super) fn acl(fd: BorrowedFd<'_>) -> Field<Vec<RawAcl>> {
+    acl_probes(|name| xattr(fd, OsStr::new(name)))
+}
+
+fn acl_probes(mut probe: impl FnMut(&str) -> Field<Option<RawBytes>>) -> Field<Vec<RawAcl>> {
     Field::Observed(
         [
             ("linux-posix-access-xattr", "system.posix_acl_access"),
@@ -14,11 +19,65 @@ pub(super) fn acl(fd: BorrowedFd<'_>) -> Field<Vec<RawAcl>> {
         .into_iter()
         .map(|(format, name)| RawAcl {
             format,
-            raw: xattr(fd, OsStr::new(name)).format_probe(),
+            raw: probe(name).format_probe(),
             decoded: Field::unavailable(Reason::NotDecoded),
         })
         .collect(),
     )
+}
+
+pub(super) fn symlink_metadata(
+    parent: BorrowedFd<'_>,
+    name: &OsStr,
+) -> (Field<Vec<Xattr>>, Field<Vec<RawAcl>>) {
+    symlink_metadata_at(parent, name, Path::new("/proc/self/fd"))
+}
+
+fn symlink_metadata_at(
+    parent: BorrowedFd<'_>,
+    name: &OsStr,
+    proc_fds: &Path,
+) -> (Field<Vec<Xattr>>, Field<Vec<RawAcl>>) {
+    let proc_parent = proc_fds.join(parent.as_raw_fd().to_string());
+    let error = match (rustix::fs::fstat(parent), rustix::fs::stat(&proc_parent)) {
+        (Ok(expected), Ok(actual))
+            if expected.st_dev == actual.st_dev && expected.st_ino == actual.st_ino =>
+        {
+            None
+        }
+        (Err(error), _) | (_, Err(error)) => Some(Some(error.raw_os_error())),
+        _ => Some(None),
+    };
+    if let Some(errno) = error {
+        return (
+            Field::Unavailable {
+                reason: Reason::ProcFdUnavailable,
+                errno,
+            },
+            Field::Unavailable {
+                reason: Reason::ProcFdUnavailable,
+                errno,
+            },
+        );
+    }
+    let path = proc_parent.join(name);
+    let get = |name: &OsStr| {
+        collect::xattr_result(collect::variable_bytes(|buf| {
+            rustix::fs::lgetxattr(&path, name, buf)
+        }))
+    };
+    let xattrs = collect::xattrs_result(
+        collect::variable_bytes(|buf| rustix::fs::llistxattr(&path, buf)),
+        get,
+    );
+    let acl = acl_probes(|name| {
+        if name == "system.nfs4_acl_xdr" {
+            get(OsStr::new(name))
+        } else {
+            Field::unavailable(Reason::NotApplicableOnPlatform)
+        }
+    });
+    (xattrs, acl)
 }
 
 pub(super) fn birth(parent: BorrowedFd<'_>, name: &OsStr, stat: &Stat) -> Field<Timestamp> {
@@ -70,5 +129,35 @@ pub(super) fn filesystem(stat: &StatFs) -> Filesystem {
             magic,
             0x6969 | 0xff534d42 | 0xfe534d42 | 0x73757245 | 0x5346414f | 0x01021997
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustix::fd::AsFd;
+
+    #[test]
+    fn unavailable_proc_anchor_is_incomplete() {
+        let parent = rustix::fs::open(
+            "/tmp",
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        let (xattrs, acl) = symlink_metadata_at(
+            parent.as_fd(),
+            OsStr::new("link"),
+            Path::new("/proc/self/missing-fd-directory"),
+        );
+        assert!(matches!(
+            xattrs,
+            Field::Unavailable {
+                reason: Reason::ProcFdUnavailable,
+                ..
+            }
+        ));
+        assert!(!xattrs.is_complete());
+        assert!(!acl.is_complete());
     }
 }

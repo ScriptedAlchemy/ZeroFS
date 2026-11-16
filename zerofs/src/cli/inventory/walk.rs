@@ -124,11 +124,6 @@ impl<W: Write> Walker<'_, W> {
         };
         let entry_kind = kind(&before);
         let mut entry = stat_entry(path.clone(), &before, parent, name);
-        #[cfg(target_os = "linux")]
-        if entry_kind == EntryKind::Symlink {
-            entry.xattrs = Field::unavailable(Reason::NotImplementedOnPlatform);
-            entry.acl = Field::unavailable(Reason::NotImplementedOnPlatform);
-        }
         if identity(&before).dev != self.root_dev {
             self.tree_complete &= Reason::MountBoundary.counts_as_complete();
             entry.xattrs = Field::unavailable(Reason::MountBoundary);
@@ -183,6 +178,10 @@ impl<W: Write> Walker<'_, W> {
             self.collect_fd(&mut entry, fd.as_fd(), entry_kind);
         }
         if entry_kind == EntryKind::Symlink {
+            #[cfg(target_os = "linux")]
+            {
+                (entry.xattrs, entry.acl) = platform::symlink_metadata(parent, name);
+            }
             entry.symlink_target = match fs::readlinkat(parent, name, Vec::new()) {
                 Ok(target) => Field::Observed(RawBytes::new(target.to_bytes())),
                 Err(error) => Field::error(error),

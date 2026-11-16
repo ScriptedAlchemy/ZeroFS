@@ -25,7 +25,11 @@ pub(super) fn variable_bytes(
 }
 
 pub(super) fn xattr(fd: BorrowedFd<'_>, name: &OsStr) -> Field<Option<RawBytes>> {
-    match variable_bytes(|buf| fgetxattr(fd, name, buf)) {
+    xattr_result(variable_bytes(|buf| fgetxattr(fd, name, buf)))
+}
+
+pub(super) fn xattr_result(result: Result<Vec<u8>, Errno>) -> Field<Option<RawBytes>> {
+    match result {
         Ok(bytes) => Field::Observed(Some(RawBytes::new(&bytes))),
         #[cfg(target_os = "linux")]
         Err(Errno::NODATA) => Field::Observed(None),
@@ -37,7 +41,16 @@ pub(super) fn xattr(fd: BorrowedFd<'_>, name: &OsStr) -> Field<Option<RawBytes>>
 }
 
 pub(super) fn xattrs(fd: BorrowedFd<'_>) -> Field<Vec<Xattr>> {
-    let bytes = match variable_bytes(|buf| flistxattr(fd, buf)) {
+    xattrs_result(variable_bytes(|buf| flistxattr(fd, buf)), |name| {
+        xattr(fd, name)
+    })
+}
+
+pub(super) fn xattrs_result(
+    result: Result<Vec<u8>, Errno>,
+    mut get: impl FnMut(&OsStr) -> Field<Option<RawBytes>>,
+) -> Field<Vec<Xattr>> {
+    let bytes = match result {
         Ok(bytes) => bytes,
         Err(Errno::RANGE) => return Field::unavailable(Reason::EntryChanged),
         Err(error) => return Field::error(error).format_probe(),
@@ -51,7 +64,7 @@ pub(super) fn xattrs(fd: BorrowedFd<'_>) -> Field<Vec<Xattr>> {
         names
             .into_iter()
             .map(|name| {
-                let value = match xattr(fd, OsStr::from_bytes(name)) {
+                let value = match get(OsStr::from_bytes(name)) {
                     Field::Observed(Some(value)) => Field::Observed(value),
                     Field::Observed(None) => Field::unavailable(Reason::EntryChanged),
                     Field::Unavailable { reason, errno } => Field::Unavailable { reason, errno },

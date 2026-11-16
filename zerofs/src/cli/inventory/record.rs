@@ -36,6 +36,8 @@ pub(crate) enum Reason {
     NotImplementedOnPlatform,
     #[cfg(target_os = "linux")]
     NotApplicableOnPlatform,
+    #[cfg(target_os = "linux")]
+    ProcFdUnavailable,
     NotCollectedForKind,
     NotRequested,
     NotDecoded,
