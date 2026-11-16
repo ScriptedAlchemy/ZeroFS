@@ -218,10 +218,10 @@ async fn storage_readiness_listing_preserves_native_metadata_and_hidden_files() 
     );
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "Linux-only local diagnostic with one million files"]
 async fn measure_storage_readiness_scan() {
-    assert!(cfg!(target_os = "linux"));
     assert_eq!(std::env::var("ZEROFS_READINESS_SCAN_MEASURE").unwrap(), "1");
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let mut fixture = Fixture::new();
