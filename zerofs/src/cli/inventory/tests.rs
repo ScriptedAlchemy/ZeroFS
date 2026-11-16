@@ -59,7 +59,10 @@ fn linux_plain_tree_is_complete() {
     assert!(complete, "{records:#?}");
     assert_eq!(summary(&records)["complete"], true);
     for path in ["", "file", "directory"] {
-        assert_eq!(entry(&records, path)["platform_flags"]["status"], "observed");
+        assert_eq!(
+            entry(&records, path)["platform_flags"]["status"],
+            "observed"
+        );
     }
 }
 
@@ -413,18 +416,64 @@ fn macos_extended_acl_and_symlink_metadata() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn linux_non_utf8_names_and_symlink_unavailable() {
+fn linux_non_utf8_names_and_symlink_metadata() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
     let temp = fixture();
     fs::write(temp.path().join(OsStr::from_bytes(b"\xff")), b"data").unwrap();
-    symlink(OsStr::from_bytes(b"\xff"), temp.path().join("link")).unwrap();
+    let link_path = temp.path().join(OsStr::from_bytes(b"link-\xfe"));
+    symlink(OsStr::from_bytes(b"\xff"), &link_path).unwrap();
+    rustix::fs::setxattr(
+        temp.path().join(OsStr::from_bytes(b"\xff")),
+        "user.target-only",
+        b"must not follow",
+        rustix::fs::XattrFlags::empty(),
+    )
+    .unwrap();
+    let attr_name = "trusted.zerofs-inventory";
+    let attr_value = b"link value";
+    let set = rustix::fs::lsetxattr(
+        &link_path,
+        attr_name,
+        attr_value,
+        rustix::fs::XattrFlags::empty(),
+    );
+    let has_attr = match set {
+        Ok(()) => true,
+        Err(rustix::io::Errno::PERM | rustix::io::Errno::ACCESS | rustix::io::Errno::OPNOTSUPP) => {
+            false
+        }
+        Err(error) => panic!("set owned symlink xattr: {error}"),
+    };
     let (_, _, records) = scan(temp.path(), false);
     assert!(records.iter().any(|r| r["path"]["hex"] == "ff"));
-    assert_eq!(summary(&records)["non_utf8_names"], 1);
-    let link = entry(&records, "link");
+    assert_eq!(summary(&records)["non_utf8_names"], 2);
+    let link = records
+        .iter()
+        .find(|r| r["path"]["hex"] == "6c696e6b2dfe")
+        .unwrap();
     assert_eq!(link["symlink_target"]["value"]["hex"], "ff");
-    assert_eq!(link["xattrs"]["reason"], "not_implemented_on_platform");
+    assert_eq!(link["xattrs"]["status"], "observed");
+    let attrs = link["xattrs"]["value"].as_array().unwrap();
+    if has_attr {
+        assert!(
+            attrs.iter().any(|a| a["name"]["display"] == attr_name
+                && a["value"]["value"]["hex"] == hex(attr_value))
+        );
+    } else {
+        assert!(attrs.is_empty(), "{attrs:#?}");
+    }
+    let probes = link["acl"]["value"].as_array().unwrap();
+    for probe in &probes[..2] {
+        assert_eq!(probe["raw"]["reason"], "not_applicable_on_platform");
+    }
+    assert_eq!(
+        probes[2]["raw"],
+        serde_json::json!({
+            "status": "unavailable", "reason": "format_not_supported_by_filesystem",
+            "errno": rustix::io::Errno::OPNOTSUPP.raw_os_error()
+        })
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -463,5 +512,32 @@ fn linux_raw_acl_probes() {
     assert_eq!(probes[1]["raw"]["status"], "observed");
     assert_eq!(probes[1]["raw"]["value"], Value::Null);
     assert_eq!(probes[2]["format"], "nfs4-xdr-xattr");
+    assert_eq!(
+        probes[2]["raw"],
+        serde_json::to_value(record::Field::<Option<record::RawBytes>>::Unavailable {
+            reason: record::Reason::FormatNotSupportedByFilesystem,
+            errno: Some(rustix::io::Errno::OPNOTSUPP.raw_os_error()),
+        })
+        .unwrap()
+    );
     assert_eq!(probes[2]["decoded"]["reason"], "not_decoded");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_inode_flags_include_nodump() {
+    let temp = fixture();
+    let path = temp.path().join("file");
+    let file = fs::File::create(&path).unwrap();
+    let original = rustix::fs::ioctl_getflags(&file).unwrap();
+    let expected = original | rustix::fs::IFlags::NODUMP;
+    rustix::fs::ioctl_setflags(&file, expected).unwrap();
+    let (_, _, records) = scan(temp.path(), false);
+    assert_eq!(
+        entry(&records, "file")["platform_flags"],
+        serde_json::json!({
+            "status": "observed", "value": expected.bits()
+        })
+    );
+    rustix::fs::ioctl_setflags(&file, original).unwrap();
 }
