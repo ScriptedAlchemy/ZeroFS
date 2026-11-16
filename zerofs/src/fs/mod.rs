@@ -86,10 +86,18 @@ const NAME_MAX: usize = 255;
 /// count as a negative signed value and miscompute inode usage on the mount.
 pub(crate) const TOTAL_INODES: u64 = 1 << 48;
 
-/// Names are opaque bytes to the fs; only the [`NAME_MAX`] length is enforced.
+/// Names are opaque bytes, excluding path separators, NUL and dot components.
+/// [`NAME_MAX`] applies to the preserved name's byte length.
 pub(crate) fn validate_filename(filename: &[u8]) -> Result<(), FsError> {
     if filename.len() > NAME_MAX {
         Err(FsError::NameTooLong)
+    } else if filename.is_empty()
+        || filename == b"."
+        || filename == b".."
+        || filename.contains(&b'/')
+        || filename.contains(&0)
+    {
+        Err(FsError::InvalidArgument)
     } else {
         Ok(())
     }
@@ -178,6 +186,65 @@ mod tests {
     use crate::fs::inode::FileInode;
 
     use crate::fs::inode::Inode;
+
+    #[test]
+    fn filename_validation_preserves_opaque_bytes_and_length_limit() {
+        assert_eq!(validate_filename(b"\xffname"), Ok(()));
+        assert_eq!(validate_filename(&[b'a'; NAME_MAX]), Ok(()));
+        assert_eq!(
+            validate_filename(&[b'a'; NAME_MAX + 1]),
+            Err(FsError::NameTooLong)
+        );
+        for name in [b"".as_slice(), b".", b"..", b"a/b", b"a\0b"] {
+            assert_eq!(validate_filename(name), Err(FsError::InvalidArgument));
+        }
+    }
+
+    #[tokio::test]
+    async fn namespace_mutations_reject_invalid_names() {
+        use super::test_util::{test_auth, test_creds};
+        use super::types::{FileType, SetAttributes};
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let attrs = SetAttributes::default();
+        let creds = test_creds();
+        let auth = test_auth();
+        let (file, _) = fs.create(&creds, 0, b"valid", &attrs).await.unwrap();
+        for name in [b"".as_slice(), b".", b"..", b"a/b", b"a\0b"] {
+            assert_eq!(
+                fs.create(&creds, 0, name, &attrs).await.unwrap_err(),
+                FsError::InvalidArgument
+            );
+            assert_eq!(
+                fs.mkdir(&creds, 0, name, &attrs).await.unwrap_err(),
+                FsError::InvalidArgument
+            );
+            assert_eq!(
+                fs.mknod(&creds, 0, name, FileType::Fifo, &attrs, None)
+                    .await
+                    .unwrap_err(),
+                FsError::InvalidArgument
+            );
+            assert_eq!(
+                fs.symlink(&creds, 0, name, b"target", &attrs)
+                    .await
+                    .unwrap_err(),
+                FsError::InvalidArgument
+            );
+            assert_eq!(
+                fs.link(&auth, file, 0, name).await,
+                Err(FsError::InvalidArgument)
+            );
+            assert_eq!(
+                fs.rename(&auth, 0, name, 0, b"other").await,
+                Err(FsError::InvalidArgument)
+            );
+            assert_eq!(
+                fs.rename(&auth, 0, b"valid", 0, name).await,
+                Err(FsError::InvalidArgument)
+            );
+        }
+        assert_eq!(fs.lookup(&creds, 0, b"valid").await.unwrap(), file);
+    }
 
     #[tokio::test]
     async fn test_allocate_inode() {
