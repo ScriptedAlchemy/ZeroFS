@@ -799,7 +799,12 @@ fn prune_foyer_partitions(root: &StdPath, capacity: usize) -> Result<FoyerPruneR
         let Some(id) = name.strip_prefix(FOYER_PARTITION_PREFIX) else {
             continue;
         };
-        if id.len() != 8 || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+        let Ok(partition_id) = id.parse::<u32>() else {
+            continue;
+        };
+        // Foyer pads its u32 ID to a minimum width of eight digits. Reclaim
+        // wider native IDs too, but never delete similarly named foreign files.
+        if id != format!("{partition_id:08}") {
             continue;
         }
         let metadata = std::fs::symlink_metadata(entry.path())?;
@@ -811,7 +816,7 @@ fn prune_foyer_partitions(root: &StdPath, capacity: usize) -> Result<FoyerPruneR
         }
         let file = File::open(entry.path())?;
         partitions.push((
-            id.parse::<u32>()?,
+            partition_id,
             entry.path(),
             metadata.len(),
             file.allocated_size()?,
@@ -3001,24 +3006,68 @@ min_free_gb = 256.0
     }
 
     #[test]
+    fn foyer_prune_handles_wide_native_partition_ids() {
+        let root = tempfile::tempdir().unwrap();
+        for id in [0, 100_000_000, u32::MAX] {
+            let path = root.path().join(format!("{FOYER_PARTITION_PREFIX}{id:08}"));
+            std::fs::write(path, vec![0; 4096]).unwrap();
+        }
+        // Only Foyer's canonical u32 names belong to the cache. Similar names
+        // must remain untouched, including overflowing and overpadded IDs.
+        let foreign_ids = ["000000000", "0100000000", "4294967296", "1", "0000000x"];
+        for id in foreign_ids {
+            std::fs::write(
+                root.path().join(format!("{FOYER_PARTITION_PREFIX}{id}")),
+                b"keep",
+            )
+            .unwrap();
+        }
+
+        let result = prune_foyer_partitions(root.path(), 4096).unwrap();
+
+        assert_eq!(result.removed_files, 2);
+        assert!(
+            root.path()
+                .join("foyer-storage-direct-fs-00000000")
+                .exists()
+        );
+        for id in [100_000_000, u32::MAX] {
+            assert!(
+                !root
+                    .path()
+                    .join(format!("{FOYER_PARTITION_PREFIX}{id:08}"))
+                    .exists()
+            );
+        }
+        for id in foreign_ids {
+            assert_eq!(
+                std::fs::read(root.path().join(format!("{FOYER_PARTITION_PREFIX}{id}"))).unwrap(),
+                b"keep"
+            );
+        }
+    }
+
+    #[test]
     fn foyer_prune_rejects_symlinked_owned_partition() {
         #[cfg(unix)]
         {
             use std::os::unix::fs::symlink;
-            let root = tempfile::tempdir().unwrap();
-            let outside = tempfile::NamedTempFile::new().unwrap();
-            symlink(
-                outside.path(),
-                root.path().join("foyer-storage-direct-fs-00000000"),
-            )
-            .unwrap();
+            for id in [0, 100_000_000, u32::MAX] {
+                let root = tempfile::tempdir().unwrap();
+                let outside = tempfile::NamedTempFile::new().unwrap();
+                symlink(
+                    outside.path(),
+                    root.path().join(format!("{FOYER_PARTITION_PREFIX}{id:08}")),
+                )
+                .unwrap();
 
-            let error = prune_foyer_partitions(root.path(), 0).unwrap_err();
-            assert!(
-                error.to_string().contains("not a regular file"),
-                "{error:#}"
-            );
-            assert!(outside.path().exists());
+                let error = prune_foyer_partitions(root.path(), 0).unwrap_err();
+                assert!(
+                    error.to_string().contains("not a regular file"),
+                    "{error:#}"
+                );
+                assert!(outside.path().exists());
+            }
         }
     }
 

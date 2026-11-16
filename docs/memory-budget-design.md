@@ -330,4 +330,3 @@ A dependency change may require its own upstream review, but its API should be s
 - The production cgroup hierarchy, effective `memory.max` and `memory.high`, per-container limits, Plex peaks, and ARC reclaim behavior remain unknown. The single snapshot does not resolve them.
 - Not verified: Source inspection and step 1 unit fixtures do not prove that any proposed envelope starts, stays within its resident allowance, avoids OOM, meets throughput requirements, or recovers dirty data. The tests under real cgroup limits and the integrity checks remain proposed qualification work.
 - Not verified: The historical approximately 28.6 GiB excess residency was read from a source comment. This task did not reproduce that OOM or establish which present allocation paths account for those bytes.
-
