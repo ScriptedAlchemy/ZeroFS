@@ -550,7 +550,9 @@ impl AdminService for AdminRpcServer {
         // Anything under /.zerofs_trash would be deleted by the next sweep
         // with no error returned to anyone; refuse upfront, mirroring the
         // RemoveDirectory guard.
-        if components.first() == Some(&TRASH_DIR_NAME) {
+        if components.first().is_some_and(|name| {
+            self.fs.name_mode().key(name) == self.fs.name_mode().key(TRASH_DIR_NAME)
+        }) {
             return Err(Status::invalid_argument(format!(
                 "refusing to create {:?}: /{} is reserved",
                 req.path,
@@ -639,13 +641,15 @@ impl AdminService for AdminRpcServer {
                 "refusing to remove the filesystem root",
             ));
         };
-        if components[0] == TRASH_DIR_NAME {
+        if self.fs.name_mode().key(components[0]) == self.fs.name_mode().key(TRASH_DIR_NAME) {
             return Err(Status::invalid_argument(format!(
                 "refusing to remove {path:?}: /{} is reserved",
                 String::from_utf8_lossy(TRASH_DIR_NAME)
             )));
         }
-        if self.protect_nbd_exports && components[0] == NBD_DIR_NAME {
+        if self.protect_nbd_exports
+            && self.fs.name_mode().key(components[0]) == self.fs.name_mode().key(NBD_DIR_NAME)
+        {
             return Err(Status::invalid_argument(format!(
                 "refusing to remove {path:?}: /.nbd is reserved while volatile NBD acknowledgement is active"
             )));
@@ -814,6 +818,14 @@ mod tests {
         lease: Option<Arc<crate::replication::Lease>>,
         write_ack: Option<crate::fs::mutation::config::FilesystemWriteAckSettings>,
     ) -> (Arc<ZeroFS>, Arc<CheckpointManager>) {
+        make_fs_with_options(lease, write_ack, crate::fs::name_mode::NameMode::Sensitive).await
+    }
+
+    async fn make_fs_with_options(
+        lease: Option<Arc<crate::replication::Lease>>,
+        write_ack: Option<crate::fs::mutation::config::FilesystemWriteAckSettings>,
+        name_mode: crate::fs::name_mode::NameMode,
+    ) -> (Arc<ZeroFS>, Arc<CheckpointManager>) {
         let test_key = [0u8; 32];
         let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
             Arc::new(slatedb::object_store::memory::InMemory::new());
@@ -849,6 +861,7 @@ mod tests {
             ),
             None,
             crate::config::StoreProfile::default(),
+            name_mode,
         )
         .await
         .unwrap();
@@ -1266,6 +1279,32 @@ mod tests {
             error.to_string().contains("reserved"),
             "unexpected error: {error}"
         );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn insensitive_reserved_name_aliases_are_refused() {
+        let (fs, checkpoints) =
+            make_fs_with_options(None, None, crate::fs::name_mode::NameMode::Insensitive).await;
+        let (client, shutdown, _dir) = setup_fs(Arc::clone(&fs), checkpoints, true).await;
+        for path in ["/.ZEROFS_TRASH", "/.ZeroFS_Trash/child"] {
+            let error = client
+                .create_directory(path, 0o700, 0, 0)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("reserved"), "{error}");
+            let error = client.remove_directory(path).await.unwrap_err();
+            assert!(error.to_string().contains("reserved"), "{error}");
+        }
+        client
+            .create_directory("/.nbd/export", 0o700, 0, 0)
+            .await
+            .unwrap();
+        for path in ["/.NBD", "/.NbD/export"] {
+            let error = client.remove_directory(path).await.unwrap_err();
+            assert!(error.to_string().contains("reserved"), "{error}");
+        }
+        assert!(resolve_path(&fs, "/.nbd/export").await.is_ok());
         shutdown.cancel();
     }
 

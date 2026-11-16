@@ -983,6 +983,9 @@ fn backend_capabilities(url: &str) -> BackendCapabilities {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct FilesystemConfig {
+    /// Experimental lookup mode, fixed at creation. Omission keeps byte-exact names.
+    #[serde(default)]
+    pub(crate) name_mode: crate::fs::name_mode::NameMode,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     max_size_gb: Option<f64>,
     /// Compression algorithm for extent data: "zstd-{level}" (default: "zstd-3", level 1-22) or "lz4"
@@ -1931,6 +1934,13 @@ where
 }
 
 impl Settings {
+    pub(crate) fn name_mode(&self) -> crate::fs::name_mode::NameMode {
+        self.filesystem
+            .as_ref()
+            .map(|fs| fs.name_mode)
+            .unwrap_or_default()
+    }
+
     pub(crate) fn max_bytes(&self) -> u64 {
         self.filesystem
             .as_ref()
@@ -4113,6 +4123,16 @@ sync_writes = true"#,
                 "expected {bad} to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn filesystem_name_mode_is_opt_in_and_rejects_unknown_values() {
+        use crate::fs::name_mode::NameMode;
+        let config: FilesystemConfig = toml::from_str("").unwrap();
+        assert_eq!(config.name_mode, NameMode::Sensitive);
+        let config: FilesystemConfig = toml::from_str("name_mode = 'insensitive'").unwrap();
+        assert_eq!(config.name_mode, NameMode::Insensitive);
+        assert!(toml::from_str::<FilesystemConfig>("name_mode = 'fold'").is_err());
     }
 
     #[test]

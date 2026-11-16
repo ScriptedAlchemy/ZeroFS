@@ -2063,6 +2063,7 @@ mod tests {
             segment_codec,
             None,
             crate::config::StoreProfile::default(),
+            crate::fs::name_mode::NameMode::Sensitive,
         )
         .await
         .unwrap();

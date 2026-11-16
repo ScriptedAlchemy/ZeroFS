@@ -21,11 +21,18 @@ const DOCUMENTED_P9_MEMORY_BOUND: usize = GLOBAL_INFLIGHT_MEMORY + MAX_PRE_ADMIS
 #[cfg(any(feature = "webui", test))]
 const WEBSOCKET_RECEIVE_RESERVATION: u32 = 2 * P9_MAX_MSIZE;
 
+#[derive(Debug)]
+pub(crate) struct P9XattrPermit {
+    _retained: OwnedSemaphorePermit,
+    _global: OwnedSemaphorePermit,
+}
+
 pub(crate) struct P9GlobalAdmission {
     bytes: Arc<Semaphore>,
     requests: Arc<Semaphore>,
     transports: Arc<Semaphore>,
     receive_bytes: Arc<Semaphore>,
+    xattr_bytes: Arc<Semaphore>,
     pub(super) byte_limit: usize,
     request_limit: usize,
     pub(super) transport_limit: usize,
@@ -98,10 +105,31 @@ impl P9GlobalAdmission {
             requests: Arc::new(Semaphore::new(request_limit)),
             transports: Arc::new(Semaphore::new(transport_limit)),
             receive_bytes: Arc::new(Semaphore::new(transport_limit * P9_MAX_MSIZE as usize)),
+            xattr_bytes: Arc::new(Semaphore::new(byte_limit / 4)),
             byte_limit,
             request_limit,
             transport_limit,
         }
+    }
+
+    /// Retained attribute buffers share the request budget. Limit them to a
+    /// quarter of it so clients can still obtain credit to write and clunk.
+    pub(crate) fn try_admit_xattr(
+        self: &Arc<Self>,
+        bytes: usize,
+    ) -> Result<P9XattrPermit, crate::fs::errors::FsError> {
+        let bytes =
+            u32::try_from(bytes.max(1)).map_err(|_| crate::fs::errors::FsError::RetryLater)?;
+        let retained = Arc::clone(&self.xattr_bytes)
+            .try_acquire_many_owned(bytes)
+            .map_err(|_| crate::fs::errors::FsError::RetryLater)?;
+        let global = Arc::clone(&self.bytes)
+            .try_acquire_many_owned(bytes)
+            .map_err(|_| crate::fs::errors::FsError::RetryLater)?;
+        Ok(P9XattrPermit {
+            _retained: retained,
+            _global: global,
+        })
     }
 
     pub(crate) fn try_admit_transport(self: &Arc<Self>) -> anyhow::Result<P9TransportPermit> {

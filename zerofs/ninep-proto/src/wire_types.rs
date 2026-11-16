@@ -8,6 +8,17 @@ use deku::{DekuRead, DekuWrite, ctx::Endian};
 
 pub const VERSION_9P2000L: &[u8] = b"9P2000.L";
 pub const VERSION_9P2000L_ZEROFS: &[u8] = b"9P2000.L.Z";
+/// Insensitive exports use a distinct dialect so byte-exact clients refuse them.
+pub const VERSION_9P2000L_ZEROFS_CI: &[u8] = b"9P2000.L.Z.CI";
+
+/// The native kernel client supports only byte-exact directory names.
+pub fn kernel_dialect_supported(version: &[u8]) -> bool {
+    version == VERSION_9P2000L_ZEROFS
+}
+
+/// ZeroFS-private `Txattrcreate` removal flag. Requires size zero and no other flags.
+pub const XATTR_REMOVE_ZEROFS: u32 = 0x8000_0000;
+
 pub const NOFID: u32 = u32::MAX;
 
 pub const QID_TYPE_DIR: u8 = 0x80;
@@ -197,6 +208,8 @@ pub mod message_type {
     pub const RSETATTR: u8 = 27;
     pub const TXATTRWALK: u8 = 30;
     pub const RXATTRWALK: u8 = 31;
+    pub const TXATTRCREATE: u8 = 32;
+    pub const RXATTRCREATE: u8 = 33;
     pub const TREADDIR: u8 = 40;
     pub const RREADDIR: u8 = 41;
     pub const TFSYNC: u8 = 50;
@@ -227,6 +240,8 @@ pub mod message_type {
     pub const RWRITE: u8 = 119;
     pub const TCLUNK: u8 = 120;
     pub const RCLUNK: u8 = 121;
+    /// Exact-spelling compound walk. Its reply uses RWALKGETATTR.
+    pub const TWALKGETATTREXACT: u8 = 226;
     pub const TFALLOCATE: u8 = 228;
     pub const RFALLOCATE: u8 = 229;
     pub const TLOPENATREAD: u8 = 230;
@@ -441,4 +456,17 @@ pub struct Rlock {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rlerror {
     pub ecode: u32,
+}
+
+#[cfg(all(test, not(MODULE)))]
+mod name_mode_tests {
+    use super::*;
+
+    #[test]
+    fn kernel_refuses_insensitive_and_unknown_dialects() {
+        assert!(kernel_dialect_supported(VERSION_9P2000L_ZEROFS));
+        assert!(!kernel_dialect_supported(VERSION_9P2000L_ZEROFS_CI));
+        assert!(!kernel_dialect_supported(VERSION_9P2000L));
+        assert!(!kernel_dialect_supported(b"unknown"));
+    }
 }
