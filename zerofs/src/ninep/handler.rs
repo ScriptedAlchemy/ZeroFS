@@ -417,6 +417,10 @@ pub struct NinePHandler {
     handler_id: u64,
     /// If set, overrides the client-provided credentials on attach.
     credential_override: Option<(u32, u32)>,
+    #[cfg(test)]
+    exact_lookup_pause: Arc<Mutex<Option<SuccessTerminalPause>>>,
+    #[cfg(test)]
+    exact_pin_pause: Arc<Mutex<Option<SuccessTerminalPause>>>,
 }
 
 /// Retires a transport session on exit or unwind.
@@ -456,6 +460,10 @@ impl NinePHandler {
             lock_manager,
             handler_id: HANDLER_COUNTER.fetch_add(1, AtomicOrdering::SeqCst),
             credential_override: None,
+            #[cfg(test)]
+            exact_lookup_pause: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            exact_pin_pause: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1421,6 +1429,7 @@ impl NinePHandler {
         let mut current_id = src_fid.inode_id;
         let mut wqids = Vec::new();
         let mut last_inode = None;
+        let mut pending_directory_pin = None;
 
         for wname in tw.wnames {
             let name_bytes = Bytes::from(wname.data);
@@ -1439,6 +1448,14 @@ impl NinePHandler {
             let child_id = self
                 .walk_component(&src_fid.creds, src_fid.root, current_id, &name_bytes)
                 .await?;
+            #[cfg(test)]
+            if exact {
+                let pause = self.exact_lookup_pause.lock().unwrap().take();
+                if let Some(pause) = pause {
+                    let _ = pause.reached.send(());
+                    let _ = pause.resume.await;
+                }
+            }
             if check_spelling
                 && self
                     .filesystem
@@ -1450,6 +1467,13 @@ impl NinePHandler {
                 return Err(FsError::NotFound.into());
             }
             let child_inode = self.filesystem.inode_store.get(child_id).await?;
+            // Pin under the parent lock so final validation can wait for the
+            // child lock without losing this directory to a replacement.
+            pending_directory_pin = if check_spelling && child_inode.is_directory() {
+                Some(self.filesystem.new_open_handle(child_id))
+            } else {
+                None
+            };
             Self::step_path(&mut current_path, name_bytes, current_id, src_fid.root);
             wqids.push(inode_to_qid(&child_inode, child_id));
             current_id = child_id;
@@ -1461,7 +1485,21 @@ impl NinePHandler {
             Some(inode) => inode,
             None => self.filesystem.inode_store.get(current_id).await?,
         };
-        let directory_pin = self.pin_walked_directory(current_id).await?;
+        #[cfg(test)]
+        if exact {
+            let pause = self.exact_pin_pause.lock().unwrap().take();
+            if let Some(pause) = pause {
+                let _ = pause.reached.send(());
+                let _ = pause.resume.await;
+            }
+        }
+        let directory_pin = if stat_inode.is_directory() {
+            self.pin_walked_directory(current_id).await?
+        } else {
+            None
+        };
+        // Child-lock validation now owns the pin that will go into the fid.
+        drop(pending_directory_pin);
         self.install_walk_fid(
             tw.fid,
             tw.newfid,
@@ -3943,6 +3981,119 @@ mod tests {
                 assert!(handler.get_fid(2).is_err());
             }
         }
+    }
+
+    async fn exact_walk_replacement_at_pause(before_pin: bool, directory: bool) {
+        use crate::fs::name_mode::NameMode;
+
+        let fs = Arc::new(
+            ZeroFS::new_in_memory_with_name_mode(NameMode::Insensitive)
+                .await
+                .unwrap(),
+        );
+        let creds = test_creds();
+        let (original, _) = if directory {
+            fs.mkdir(&creds, 0, b"Foo", &SetAttributes::default()).await
+        } else {
+            fs.create(&creds, 0, b"Foo", &SetAttributes::default())
+                .await
+        }
+        .unwrap();
+        let (replacement, _) = if directory {
+            fs.mkdir(&creds, 0, b"replacement", &SetAttributes::default())
+                .await
+        } else {
+            fs.create(&creds, 0, b"replacement", &SetAttributes::default())
+                .await
+        }
+        .unwrap();
+        let handler = NinePHandler::new(fs.clone(), Arc::new(FileLockManager::new()));
+        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS_CI, b"").await;
+        let (reached, reached_rx) = tokio::sync::oneshot::channel();
+        let (resume, resume_rx) = tokio::sync::oneshot::channel();
+        let pause = if before_pin {
+            &handler.exact_pin_pause
+        } else {
+            &handler.exact_lookup_pause
+        };
+        *pause.lock().unwrap() = Some(SuccessTerminalPause {
+            reached,
+            resume: resume_rx,
+        });
+        let lookup_handler = handler.clone();
+        let lookup = tokio::spawn(async move {
+            request(
+                &lookup_handler,
+                2,
+                Message::Twalkgetattrexact(Twalkgetattr {
+                    fid: 1,
+                    newfid: 2,
+                    nwname: 1,
+                    wnames: vec![P9String::new(b"Foo".to_vec())],
+                }),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), reached_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        // Without the directory lock, complete the replacement between the
+        // lookup and spelling read. With it, rename must wait for this walk.
+        let directory_locked = fs.lock_manager.is_locked_for_test(0);
+        let auth = AuthContext::from(&creds);
+        let rename = fs.rename(&auth, 0, b"replacement", 0, b"Foo");
+        tokio::pin!(rename);
+        if directory_locked {
+            assert!(futures::poll!(&mut rename).is_pending());
+        } else {
+            tokio::time::timeout(std::time::Duration::from_secs(10), &mut rename)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        resume.send(()).unwrap();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), lookup)
+            .await
+            .unwrap()
+            .unwrap();
+        if directory_locked {
+            tokio::time::timeout(std::time::Duration::from_secs(10), rename)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let expected = if before_pin || directory_locked {
+            original
+        } else {
+            replacement
+        };
+        assert!(
+            matches!(response.body, Message::Rwalkgetattr(ref reply) if reply.stat.qid.path == expected),
+            "an atomic replacement must remain visible: {:?}",
+            response.body
+        );
+        if directory && (before_pin || directory_locked) {
+            assert!(fs.inode_store.get(original).await.unwrap().is_directory());
+            assert_eq!(handler.get_fid(2).unwrap().inode_id, original);
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_walk_survives_atomic_replacement() {
+        for directory in [false, true] {
+            exact_walk_replacement_at_pause(false, directory).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_file_walk_survives_replacement_before_pin() {
+        exact_walk_replacement_at_pause(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn exact_directory_walk_survives_replacement_before_pin() {
+        exact_walk_replacement_at_pause(true, true).await;
     }
 
     #[tokio::test]

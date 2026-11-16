@@ -83,10 +83,10 @@ impl ZeroFS {
         }
     }
 
-    /// Increment the open-handle count for `id`. MUST be invoked under
-    /// `lock_manager.acquire(id)` together with the inode-liveness `get`, so
-    /// that the increment and the "is the inode alive" check are serialized
-    /// against `remove`/`rename`'s defer-vs-delete decision on the same id.
+    /// Increment the open-handle count for `id`. Hold the inode lock alongside
+    /// the liveness read to order the increment against last unlink. A linked
+    /// directory can also be pinned under its parent's lock after validating
+    /// the entry, since directory removal and replacement take that lock too.
     // Public for library integration and DST harnesses.
     #[allow(dead_code)]
     pub fn open_handle_inc(&self, id: InodeId) {
@@ -113,9 +113,8 @@ impl ZeroFS {
     }
 
     /// Increment the open-handle count and return a guard that releases it on
-    /// drop; the caller stores it in the fid slot. Like `open_handle_inc`, must
-    /// be called under `lock_manager.acquire(id)` alongside the liveness `get`,
-    /// so the increment is ordered against `remove`/`rename`'s defer decision.
+    /// drop. The caller must order the increment against last unlink as
+    /// described by `open_handle_inc`, then store the guard in the fid slot.
     // Called by external library harnesses.
     #[allow(dead_code)]
     pub fn new_open_handle(&self, id: InodeId) -> OpenHandle {
