@@ -1461,7 +1461,14 @@ pub async fn run_server(
 
     info!("ZeroFS v{}", env!("CARGO_PKG_VERSION"));
 
-    let (settings, memory_budget) = load_and_validate_server_settings(&config_path)?;
+    let access_mode = match (read_only, checkpoint_name.is_some()) {
+        (false, false) => write_ack_access_mode(DatabaseMode::ReadWrite),
+        (true, false) => write_ack_access_mode(DatabaseMode::ReadOnly),
+        (false, true) => crate::writeback::config::WritebackAccessMode::Checkpoint,
+        (true, true) => anyhow::bail!("Cannot specify both --read-only and --checkpoint flags"),
+    };
+    let (settings, write_ack, memory_budget) =
+        load_and_validate_server_settings(&config_path, access_mode)?;
     install_validated_rss_cap(memory_budget.as_ref());
 
     let db_mode = match (read_only, &checkpoint_name) {
@@ -1480,9 +1487,6 @@ pub async fn run_server(
         }
     };
     validate_nbd_database_mode(settings.servers.nbd.as_ref(), db_mode)?;
-    let write_ack = settings
-        .filesystem_write_ack_settings(write_ack_access_mode(db_mode))
-        .context("Invalid filesystem write-acknowledgement configuration")?;
     if write_ack.mode == crate::fs::mutation::config::FilesystemWriteAckMode::VolatileMemory {
         warn!(
             volatile_memory_bytes = write_ack.volatile_memory_bytes,
@@ -1500,7 +1504,9 @@ pub async fn run_server(
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    let init_result = crate::cli::init::initialize_filesystem(&settings, db_mode).await?;
+    let init_result =
+        crate::cli::init::initialize_filesystem_with_write_ack(&settings, db_mode, write_ack)
+            .await?;
     let cache_owner = init_result._cache_owner.clone();
     let writeback_for_shutdown = init_result.writeback.clone();
     let writeback_for_metrics = init_result.writeback.clone();
@@ -2025,24 +2031,30 @@ pub async fn run_server(
 
 fn load_and_validate_server_settings(
     config_path: &std::path::Path,
-) -> Result<(Settings, Option<super::memory_budget::MemoryBudgetReceipt>)> {
+    access_mode: crate::writeback::config::WritebackAccessMode,
+) -> Result<(
+    Settings,
+    crate::fs::mutation::config::FilesystemWriteAckSettings,
+    Option<super::memory_budget::MemoryBudgetReceipt>,
+)> {
     let settings = Settings::from_file(config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
     settings
         .servers
         .require_listener_endpoint()
         .context("Invalid [servers] configuration")?;
-    let volatile_write_bytes = settings
-        .servers
-        .nbd
-        .as_ref()
-        .map(crate::config::NbdConfig::volatile_memory_bytes)
-        .transpose()?
-        .unwrap_or(0);
+    if settings.memory.is_some() {
+        anyhow::bail!(
+            "[memory] is available for planning only; production enforcement is not enabled"
+        );
+    }
+    let write_ack = settings
+        .filesystem_write_ack_settings(access_mode)
+        .context("Invalid filesystem write-acknowledgement configuration")?;
     let memory_budget =
-        super::memory_budget::validate_server_startup(&settings, volatile_write_bytes)
+        super::memory_budget::validate_server_startup(&settings, write_ack.volatile_memory_bytes)
             .context("Invalid startup memory budget")?;
-    Ok((settings, memory_budget))
+    Ok((settings, write_ack, memory_budget))
 }
 
 #[cfg(test)]
@@ -2245,13 +2257,112 @@ addresses = ["127.0.0.1:20490"]
         )
         .unwrap();
 
-        let error = load_and_validate_server_settings(&config).unwrap_err();
+        let error = load_and_validate_server_settings(
+            &config,
+            crate::writeback::config::WritebackAccessMode::ReadWrite,
+        )
+        .unwrap_err();
 
         assert!(format!("{error:#}").contains("Invalid startup memory budget"));
         assert!(
             !backend.exists(),
             "memory guard reached backend initialization"
         );
+    }
+
+    #[test]
+    fn startup_memory_admission_charges_shared_only_volatile_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = temp.path().join("backend-must-not-exist");
+        let config = temp.path().join("zerofs.toml");
+        std::fs::write(
+            &config,
+            format!(
+                r#"
+[cache]
+dir = {cache:?}
+disk_size_gb = 1.0
+[runtime]
+memory_limit_gb = 0.25
+[storage]
+url = {storage:?}
+encryption_password = "test"
+[servers.nfs]
+addresses = ["127.0.0.1:20490"]
+[filesystem]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 2.0
+[writeback]
+enabled = true
+dir = {journal:?}
+memory_size_gb = 1.0
+disk_size_gb = 8.0
+min_free_gb = 1.0
+"#,
+                cache = temp.path().join("cache"),
+                journal = temp.path().join("journal"),
+                storage = format!("file://{}", backend.display())
+            ),
+        )
+        .unwrap();
+        let error = load_and_validate_server_settings(
+            &config,
+            crate::writeback::config::WritebackAccessMode::ReadWrite,
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("2.00 GB volatile writes"), "{message}");
+        for mode in [
+            crate::writeback::config::WritebackAccessMode::ReadOnly,
+            crate::writeback::config::WritebackAccessMode::Checkpoint,
+        ] {
+            let error = load_and_validate_server_settings(&config, mode).unwrap_err();
+            assert!(
+                format!("{error:#}")
+                    .contains("Invalid filesystem write-acknowledgement configuration")
+            );
+        }
+        assert!(!backend.exists());
+        assert!(!temp.path().join("journal").exists());
+    }
+
+    #[test]
+    fn startup_memory_selector_cannot_enable_unbounded_serving() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = temp.path().join("backend-must-not-exist");
+        let config = temp.path().join("zerofs.toml");
+        std::fs::write(
+            &config,
+            format!(
+                r#"
+[cache]
+dir = {cache:?}
+disk_size_gb = 1.0
+[storage]
+url = {storage:?}
+encryption_password = "test"
+[servers.nfs]
+addresses = ["127.0.0.1:20490"]
+[memory]
+total = "4 GiB"
+"#,
+                cache = temp.path().join("cache"),
+                storage = format!("file://{}", backend.display())
+            ),
+        )
+        .unwrap();
+        let error = load_and_validate_server_settings(
+            &config,
+            crate::writeback::config::WritebackAccessMode::ReadWrite,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("production enforcement is not enabled")
+        );
+        assert!(!backend.exists());
+        assert!(!temp.path().join("cache").exists());
     }
 
     #[test]
@@ -2358,7 +2469,7 @@ min_free_gb = 256.0
             nbd.write_ack_mode,
             crate::config::NbdWriteAckMode::Materialized
         );
-        assert_eq!(nbd.volatile_memory_bytes().unwrap(), 0);
+        assert_eq!(nbd.volatile_memory_gb, 0.0);
     }
 
     #[test]

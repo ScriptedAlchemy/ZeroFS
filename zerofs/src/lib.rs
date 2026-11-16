@@ -19,6 +19,7 @@ pub mod length_checked_object_store;
 #[allow(dead_code)]
 mod linux_errno;
 mod local_object_store;
+pub mod memory;
 pub(crate) mod metadata_digest;
 #[cfg(test)]
 mod metadata_survival_tests;
