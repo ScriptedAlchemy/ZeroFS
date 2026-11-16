@@ -131,7 +131,7 @@ impl NinePClient {
     }
 
     /// Set an attribute with Linux XATTR_CREATE or XATTR_REPLACE flags, or zero.
-    /// A zero-length value with XATTR_REPLACE requests removal on the 9P wire.
+    /// A zero-length replacement preserves the attribute with an empty value.
     pub async fn set_xattr(
         &self,
         fid: u32,
@@ -145,6 +145,16 @@ impl NinePClient {
         if flags > 2 {
             return Err(ClientError::Errno(22));
         }
+        self.write_xattr(fid, name, value, flags).await
+    }
+
+    async fn write_xattr(
+        &self,
+        fid: u32,
+        name: &[u8],
+        value: &[u8],
+        flags: u32,
+    ) -> ClientResult<()> {
         let mut attr = self.xattr_fid(fid).await?;
         let result = async {
             match Self::xattr_rpc(
@@ -226,6 +236,6 @@ impl NinePClient {
     }
 
     pub async fn remove_xattr(&self, fid: u32, name: &[u8]) -> ClientResult<()> {
-        self.set_xattr(fid, name, b"", 2).await
+        self.write_xattr(fid, name, b"", XATTR_REMOVE_ZEROFS).await
     }
 }

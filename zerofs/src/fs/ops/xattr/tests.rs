@@ -275,9 +275,14 @@ async fn symlinks_and_fifos_reject_user_attributes() {
         .await
         .unwrap();
     }
+    let directory = fs
+        .mkdir(&creds, 0, b"directory", &SetAttributes::default())
+        .await
+        .unwrap()
+        .0;
     fs.set_xattr(
         &creds,
-        0,
+        directory,
         &name(b"user.directory"),
         value(b"dir"),
         XattrSetMode::Either,
@@ -600,4 +605,249 @@ async fn cancelled_queued_remove_holds_lock_until_next_create_can_see_apply() {
             .unwrap(),
         b"new".as_slice()
     );
+}
+
+#[tokio::test]
+async fn sticky_directory_user_xattrs_require_owner_or_root() {
+    let fs = ZeroFS::new_in_memory().await.unwrap();
+    let root = Credentials {
+        uid: 0,
+        gid: 0,
+        ..test_creds()
+    };
+    let owner = Credentials {
+        uid: 1000,
+        gid: 1000,
+        ..test_creds()
+    };
+    let other = Credentials {
+        uid: 1001,
+        gid: 1001,
+        ..test_creds()
+    };
+    let id = fs
+        .mkdir(
+            &root,
+            0,
+            b"sticky",
+            &SetAttributes {
+                uid: SetUid::Set(owner.uid),
+                mode: SetMode::Set(0o1777),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .0;
+    let key = name(b"user.key");
+    for caller in [&owner, &root] {
+        fs.set_xattr(caller, id, &key, value(b"allowed"), XattrSetMode::Either)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs.get_xattr(&other, id, &key, None).await.unwrap(),
+            b"allowed".as_slice()
+        );
+        assert_eq!(
+            fs.set_xattr(&other, id, &key, value(b"denied"), XattrSetMode::Replace)
+                .await,
+            Err(FsError::OperationNotPermitted)
+        );
+        assert_eq!(
+            fs.remove_xattr(&other, id, &key).await,
+            Err(FsError::OperationNotPermitted)
+        );
+        fs.remove_xattr(caller, id, &key).await.unwrap();
+    }
+    assert_eq!(
+        fs.set_xattr(&other, id, &key, value(b"denied"), XattrSetMode::Create)
+            .await,
+        Err(FsError::OperationNotPermitted)
+    );
+}
+
+#[tokio::test]
+async fn xattr_count_cap_allows_replace_and_delete_but_rejects_growth() {
+    let fs = ZeroFS::new_in_memory().await.unwrap();
+    let id = file(&fs, b"capped").await;
+    let mut txn = fs.db.new_transaction().unwrap();
+    for i in 0..4096 {
+        fs.xattr_store.put(
+            &mut txn,
+            id,
+            format!("user.{i:04}").as_bytes(),
+            Bytes::new(),
+        );
+    }
+    fs.write_coordinator.commit(txn).await.unwrap();
+    let creds = test_creds();
+    assert_eq!(fs.xattr_store.list(id).await.unwrap().len(), 4096);
+    fs.set_xattr(
+        &creds,
+        id,
+        &name(b"user.0000"),
+        value(b"replace"),
+        XattrSetMode::Replace,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fs.set_xattr(
+            &creds,
+            id,
+            &name(b"user.overflow"),
+            value(b""),
+            XattrSetMode::Create
+        )
+        .await,
+        Err(FsError::NoSpace)
+    );
+    fs.remove_xattr(&creds, id, &name(b"user.0000"))
+        .await
+        .unwrap();
+    fs.set_xattr(
+        &creds,
+        id,
+        &name(b"user.overflow"),
+        value(b""),
+        XattrSetMode::Create,
+    )
+    .await
+    .unwrap();
+    fs.remove(&test_auth(), 0, b"capped").await.unwrap();
+    assert_eq!(rows(&fs, id).await, 0);
+}
+
+#[tokio::test]
+async fn xattr_listing_refuses_rows_beyond_the_cap() {
+    let fs = ZeroFS::new_in_memory().await.unwrap();
+    let mut txn = fs.db.new_transaction().unwrap();
+    for i in 0..4097 {
+        fs.xattr_store
+            .put(&mut txn, 0, format!("user.{i:04}").as_bytes(), Bytes::new());
+    }
+    fs.write_coordinator.commit(txn).await.unwrap();
+    assert!(matches!(
+        fs.xattr_store.list(0).await,
+        Err(FsError::NoSpace)
+    ));
+}
+
+#[tokio::test]
+async fn xattr_set_is_submitted_before_detaching_and_shutdown_barrier() {
+    let fs = ZeroFS::new_in_memory().await.unwrap();
+    let id = file(&fs, b"shutdown").await;
+    let creds = test_creds();
+    let key = name(b"user.shutdown");
+    let mut setting =
+        Box::pin(fs.set_xattr(&creds, id, &key, value(b"queued"), XattrSetMode::Create));
+    assert!(futures::poll!(&mut setting).is_pending());
+    assert!(
+        fs.inode_store.pending_inode(id).is_some(),
+        "the setter detached before submitting its transaction"
+    );
+    fs.write_coordinator.barrier().await.unwrap();
+    assert_eq!(rows(&fs, id).await, 1);
+    assert!(fs.inode_store.get(id).await.is_ok());
+    fs.db.close().await.unwrap();
+    let result = setting.await;
+    assert!(result.is_ok(), "queued set returned {result:?}");
+}
+
+async fn nonregular_inode(fs: &ZeroFS, kind: FileType, filename: &[u8]) -> InodeId {
+    let root = Credentials {
+        uid: 0,
+        gid: 0,
+        ..test_creds()
+    };
+    let attrs = SetAttributes::default();
+    match kind {
+        FileType::Directory => fs.mkdir(&root, 0, filename, &attrs).await.unwrap().0,
+        FileType::Symlink => {
+            fs.symlink(&root, 0, filename, b"missing", &attrs)
+                .await
+                .unwrap()
+                .0
+        }
+        _ => {
+            fs.mknod(&root, 0, filename, kind, &attrs, Some((1, 3)))
+                .await
+                .unwrap()
+                .0
+        }
+    }
+}
+
+#[tokio::test]
+async fn nonregular_xattrs_are_deleted_on_last_unlink_rename_over_and_reclaim() {
+    for kind in [
+        FileType::Directory,
+        FileType::Symlink,
+        FileType::Fifo,
+        FileType::Socket,
+        FileType::CharDevice,
+        FileType::BlockDevice,
+    ] {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let root = Credentials {
+            uid: 0,
+            gid: 0,
+            ..test_creds()
+        };
+        let auth = (&root).into();
+        let key = name(b"trusted.cleanup");
+        let unlinked = nonregular_inode(&fs, kind, b"unlinked").await;
+        fs.set_xattr(&root, unlinked, &key, value(b"last"), XattrSetMode::Create)
+            .await
+            .unwrap();
+        fs.remove(&auth, 0, b"unlinked").await.unwrap();
+        assert_eq!(rows(&fs, unlinked).await, 0, "unlink {kind:?}");
+
+        let src = nonregular_inode(&fs, kind, b"src").await;
+        let dst = nonregular_inode(&fs, kind, b"dst").await;
+        for id in [src, dst] {
+            fs.set_xattr(&root, id, &key, value(b"rename"), XattrSetMode::Create)
+                .await
+                .unwrap();
+        }
+        fs.rename(&auth, 0, b"src", 0, b"dst").await.unwrap();
+        assert_eq!(rows(&fs, dst).await, 0, "rename target {kind:?}");
+        assert_eq!(rows(&fs, src).await, 1, "rename source {kind:?}");
+
+        let opened = nonregular_inode(&fs, kind, b"opened").await;
+        fs.open_handle_inc(opened);
+        fs.set_xattr(&root, opened, &key, value(b"reclaim"), XattrSetMode::Create)
+            .await
+            .unwrap();
+        fs.remove(&auth, 0, b"opened").await.unwrap();
+        assert_eq!(rows(&fs, opened).await, 1, "before reclaim {kind:?}");
+        fs.handle_closed(opened).await;
+        assert_eq!(rows(&fs, opened).await, 0, "after reclaim {kind:?}");
+        assert!(matches!(
+            fs.inode_store.get(opened).await,
+            Err(FsError::NotFound)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn xattr_set_returns_error_if_shutdown_has_closed_the_commit_queue() {
+    let fs = ZeroFS::new_in_memory().await.unwrap();
+    let id = file(&fs, b"closed-queue").await;
+    let worker = fs.write_coordinator.take_worker_for_tests();
+    worker.abort();
+    assert!(worker.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        fs.set_xattr(
+            &test_creds(),
+            id,
+            &name(b"user.late"),
+            value(b"error"),
+            XattrSetMode::Create
+        )
+        .await,
+        Err(FsError::IoError)
+    );
+    assert_eq!(rows(&fs, id).await, 0);
+    assert!(fs.inode_store.get(id).await.is_ok());
 }

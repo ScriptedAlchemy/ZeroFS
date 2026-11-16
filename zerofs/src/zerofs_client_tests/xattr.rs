@@ -7,6 +7,7 @@ use tokio::net::UnixStream;
 struct WireClient {
     stream: UnixStream,
     tag: u16,
+    zerofs: bool,
     shutdown: CancellationToken,
     _dir: tempfile::TempDir,
 }
@@ -25,13 +26,13 @@ impl WireClient {
         } else {
             self.tag
         };
-        let frame = P9Message::new(tag, body).to_bytes().unwrap();
+        let frame = P9Message::new(tag, body).to_bytes_ctx(self.zerofs).unwrap();
         self.stream.write_all(&frame).await.unwrap();
         let size = self.stream.read_u32_le().await.unwrap();
         let mut response = vec![0; size as usize];
         response[..4].copy_from_slice(&size.to_le_bytes());
         self.stream.read_exact(&mut response[4..]).await.unwrap();
-        let message = P9Message::from_bytes_ctx(&response, false).unwrap();
+        let message = P9Message::from_bytes_ctx(&response, self.zerofs).unwrap();
         assert_eq!(message.tag, tag);
         message.body
     }
@@ -71,7 +72,16 @@ impl WireClient {
 }
 
 async fn wire_setup() -> (WireClient, Arc<ZeroFS>, u64) {
-    let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+    wire_setup_version(b"9P2000.L").await
+}
+
+async fn wire_setup_version(version: &[u8]) -> (WireClient, Arc<ZeroFS>, u64) {
+    let mode = if version == VERSION_9P2000L_ZEROFS_CI {
+        crate::fs::name_mode::NameMode::Insensitive
+    } else {
+        crate::fs::name_mode::NameMode::Sensitive
+    };
+    let fs = Arc::new(ZeroFS::new_in_memory_with_name_mode(mode).await.unwrap());
     let id = fs
         .create(
             &crate::fs::permissions::Credentials::from_auth_context(
@@ -100,6 +110,7 @@ async fn wire_setup() -> (WireClient, Arc<ZeroFS>, u64) {
     let mut client = WireClient {
         stream: stream.expect("server did not start"),
         tag: 0,
+        zerofs: false,
         shutdown,
         _dir: dir,
     };
@@ -107,11 +118,12 @@ async fn wire_setup() -> (WireClient, Arc<ZeroFS>, u64) {
         client
             .rpc(Message::Tversion(Tversion {
                 msize: 64 * 1024,
-                version: P9String::new(b"9P2000.L".to_vec())
+                version: P9String::new(version.to_vec())
             }))
             .await,
         Message::Rversion(_)
     ));
+    client.zerofs = version != b"9P2000.L";
     assert!(matches!(
         client
             .rpc(Message::Tattach(Tattach {
@@ -319,4 +331,51 @@ async fn xattr_wire_cancelled_clunk_then_unlink_leaves_no_rows() {
     .await
     .unwrap();
     assert!(fs.xattr_store.list(id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn xattr_wire_private_dialects_preserve_empty_replace_and_remove_explicitly() {
+    for version in [VERSION_9P2000L_ZEROFS, VERSION_9P2000L_ZEROFS_CI] {
+        let (mut c, fs, id) = wire_setup_version(version).await;
+        c.clone_file(2).await;
+        assert!(matches!(c.create(2, 1, 1).await, Message::Rxattrcreate(_)));
+        c.write(2, 0, b"x").await;
+        assert!(matches!(c.clunk(2).await, Message::Rclunk(_)));
+        c.clone_file(3).await;
+        assert!(matches!(c.create(3, 0, 2).await, Message::Rxattrcreate(_)));
+        assert!(matches!(c.clunk(3).await, Message::Rclunk(_)));
+        assert!(
+            fs.xattr_store
+                .get(id, b"user.key")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        c.clone_file(4).await;
+        assert!(matches!(
+            c.create(4, 0, XATTR_REMOVE_ZEROFS).await,
+            Message::Rxattrcreate(_)
+        ));
+        assert!(matches!(c.clunk(4).await, Message::Rclunk(_)));
+        assert_eq!(
+            fs.xattr_store.get(id, b"user.key").await,
+            Err(crate::fs::errors::FsError::NoData)
+        );
+        c.clone_file(5).await;
+        errno(c.create(5, 1, XATTR_REMOVE_ZEROFS).await, 22);
+        errno(c.create(5, 0, XATTR_REMOVE_ZEROFS | 1).await, 22);
+        errno(c.create(5, 0, XATTR_REMOVE_ZEROFS | 2).await, 22);
+        assert!(matches!(
+            c.create(5, 0, XATTR_REMOVE_ZEROFS).await,
+            Message::Rxattrcreate(_)
+        ));
+        errno(c.clunk(5).await, 61);
+    }
+}
+
+#[tokio::test]
+async fn xattr_wire_plain_dialect_rejects_private_remove_flag() {
+    let (mut c, _, _) = wire_setup().await;
+    c.clone_file(2).await;
+    errno(c.create(2, 0, XATTR_REMOVE_ZEROFS).await, 22);
 }

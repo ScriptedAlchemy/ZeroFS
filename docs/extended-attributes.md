@@ -10,10 +10,12 @@ Exact attribute reads use the whole-key filter. Listing scans the inode's attrib
 prefix. Attribute mutations update ctime, the inode, and its directory-listing row
 in the same transaction. Deleting the final inode also deletes its attribute rows
 in that transaction. An open-unlinked inode retains its attributes until reclaim.
-Once a mutation has passed its checks and built its transaction, a spawned task
-holds its metadata fence and inode lock through apply. Cancelling the caller at
-that point does not cancel the commit. A later unlink takes the same inode lock,
-so its attribute scan includes the applied mutation.
+Once a mutation has passed its checks and built its transaction, the caller submits
+it to the commit queue before spawning a task. That task holds the metadata fence
+and inode lock through apply. Cancelling the caller at that point does not cancel
+the commit. A later unlink takes the same inode lock,
+so its attribute scan includes the applied mutation. A successful set can return
+before durability unless synchronous writes are enabled.
 
 Older binaries ignore attribute rows. An older binary that deletes an inode leaves
 its attribute rows behind. Inode ids are not reused, so those rows consume space
@@ -27,7 +29,10 @@ prefix must have a nonempty suffix. Values may be empty and may contain arbitrar
 bytes. The core and 9P server accept values up to 2,097,152 bytes. A larger value
 returns `E2BIG`. Reading a missing attribute or removing an absent attribute returns
 `ENODATA`. A nonzero read buffer that is too small returns `ERANGE`. A zero-size
-FUSE read probes the required length.
+FUSE read probes the required length. Each inode may carry at most 4,096 attributes.
+Adding a new name at that cap returns `ENOSPC`; replacing or deleting an existing
+name still works. Listing stops at the cap. Inode deletion carries only attribute
+keys, so the count cap keeps deletion within one bounded transaction.
 
 | Namespace | Read and list visibility | Set and remove |
 | --- | --- | --- |
@@ -38,8 +43,9 @@ FUSE read probes the required length.
 
 Only regular files and directories may carry `user.*` attributes. Access to that
 namespace on symlinks, FIFOs, sockets, or device nodes returns `EPERM`, including
-for uid 0. Unknown namespace prefixes return `EOPNOTSUPP`. POSIX ACL enforcement
-is not implemented by storing these attributes.
+for uid 0. On a directory with the sticky bit, only the owner or uid 0 may set or
+remove `user.*` attributes. Unknown namespace prefixes return `EOPNOTSUPP`.
+POSIX ACL enforcement is not implemented by storing these attributes.
 
 A set with flags zero creates or replaces an attribute. `XATTR_CREATE` requires the
 attribute to be absent and returns `EEXIST` if it exists. `XATTR_REPLACE` requires it
@@ -59,13 +65,15 @@ namespace, permission, or set-mode error. Disconnect discards values that have
 not reached the clunk commit. A commit already submitted by clunk may finish
 after disconnect.
 
-Linux removes an attribute with `Txattrcreate` using size zero and `XATTR_REPLACE`,
-then clunks the fid. The server follows that convention. Consequently, size zero
-with `XATTR_REPLACE` removes rather than stores an empty value over 9P. Flags zero
-or `XATTR_CREATE` can store an empty value. Linux v6.18 implements the sequence in
+Plain `9P2000.L` sessions follow Linux v9fs removal encoding. A `Txattrcreate`
+with size zero and `XATTR_REPLACE`, followed by clunk, removes the attribute.
+The ZeroFS dialects `9P2000.L.Z` and `9P2000.L.Z.CI` instead use the private
+`Txattrcreate.flags` bit `0x80000000` for removal. That flag requires size zero
+and no other flags. Plain sessions reject it with `EINVAL`. On ZeroFS sessions,
+size zero with `XATTR_REPLACE` stores an empty value in an existing attribute.
+The ZeroFS FUSE client uses the private removal flag. Linux v6.18 implements its
+plain-session sequence in
 [`v9fs_fid_xattr_set`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/fs/9p/xattr.c?h=v6.18).
-[`__vfs_removexattr`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/fs/xattr.c?h=v6.18)
-passes a NULL value, size zero, and `XATTR_REPLACE` to the filesystem handler.
 
 Xattr set and remove are not deduplicated across HA failover. `Tclunk` has no
 operation id. Retrying a successful create-only set may return `EEXIST`; retrying a
@@ -76,6 +84,6 @@ resolve that uncertainty. A completed mutation is covered by a later filesystem
 fsync cutoff under the configured durability contract.
 
 `zerofs mount` supports `getxattr`, `listxattr`, `setxattr`, and `removexattr` through
-`ninep-client`. Linux's own xattr limits apply before a request reaches ZeroFS.
-The 2 MiB core and 9P limit is not a claim that Linux FUSE accepts that size.
+`ninep-client`. Linux caps an attribute value at 65,536 bytes before a request
+reaches ZeroFS, even though the core and 9P store accept 2,097,152 bytes.
 NFSv3 and the separate Rust kernel client have no xattr API in this change.

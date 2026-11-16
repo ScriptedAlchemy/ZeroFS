@@ -11,6 +11,7 @@ pub(super) enum XattrFid {
     Write {
         name: XattrName,
         mode: XattrSetMode,
+        remove: bool,
         value: Vec<u8>,
         covered: Vec<u8>,
         received: usize,
@@ -56,7 +57,18 @@ impl NinePHandler {
 
     pub(super) async fn xattrcreate(&self, tx: Txattrcreate) -> P9Result<Message> {
         let name = XattrName::new(tx.name.as_ref())?;
-        let mode = XattrSetMode::from_flags(tx.flags)?;
+        let zerofs = self.zerofs_protocol_enabled();
+        let (mode, remove) = if zerofs && tx.flags == XATTR_REMOVE_ZEROFS {
+            if tx.size != 0 {
+                return Err(P9Error::InvalidArgument);
+            }
+            (XattrSetMode::Replace, true)
+        } else {
+            let mode = XattrSetMode::from_flags(tx.flags)?;
+            // Plain Linux v9fs uses an empty replacement to request removal.
+            let remove = !zerofs && tx.size == 0 && matches!(mode, XattrSetMode::Replace);
+            (mode, remove)
+        };
         if tx.size > XATTR_VALUE_MAX as u64 {
             return Err(FsError::TooBig.into());
         }
@@ -80,6 +92,7 @@ impl NinePHandler {
         slot.xattr = Some(XattrFid::Write {
             name,
             mode,
+            remove,
             value: vec![0; tx.size as usize],
             covered: vec![0; (tx.size as usize).div_ceil(8)],
             received: 0,
@@ -147,6 +160,7 @@ impl NinePHandler {
         if let Some(XattrFid::Write {
             name,
             mode,
+            remove,
             value,
             received,
             _memory,
@@ -156,9 +170,8 @@ impl NinePHandler {
             if received != value.len() {
                 return Err(P9Error::InvalidArgument);
             }
-            // Linux v9fs removes with Txattrcreate(size=0, flags=XATTR_REPLACE).
             // Keep the inode pin until the metadata transaction has committed.
-            if value.is_empty() && matches!(mode, XattrSetMode::Replace) {
+            if remove {
                 self.filesystem
                     .remove_xattr(&slot.fid.creds, slot.fid.inode_id, &name)
                     .await?;

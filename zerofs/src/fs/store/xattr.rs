@@ -6,6 +6,8 @@ use bytes::Bytes;
 use futures::StreamExt;
 use std::sync::Arc;
 
+pub(crate) const XATTR_COUNT_MAX: usize = 4096;
+
 #[derive(Clone)]
 pub struct XattrStore {
     db: Arc<Db>,
@@ -35,6 +37,9 @@ impl XattrStore {
         let mut names = Vec::new();
         while let Some(row) = rows.next().await {
             let (key, _) = row.map_err(|e| FsError::from_db_error(&e))?;
+            if names.len() == XATTR_COUNT_MAX {
+                return Err(FsError::NoSpace);
+            }
             names.push(key.slice(prefix.len()..));
         }
         Ok(names)
@@ -53,6 +58,8 @@ impl XattrStore {
         txn: &mut Transaction,
         id: InodeId,
     ) -> Result<(), FsError> {
+        // Deletes carry keys only. The attribute count cap keeps inode deletion
+        // within one bounded transaction, regardless of the stored value sizes.
         for name in self.list(id).await? {
             self.delete(txn, id, &name);
         }

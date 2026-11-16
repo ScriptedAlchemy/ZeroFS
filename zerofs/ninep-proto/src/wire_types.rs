@@ -16,6 +16,9 @@ pub fn kernel_dialect_supported(version: &[u8]) -> bool {
     version == VERSION_9P2000L_ZEROFS
 }
 
+/// ZeroFS-private `Txattrcreate` removal flag. Requires size zero and no other flags.
+pub const XATTR_REMOVE_ZEROFS: u32 = 0x8000_0000;
+
 pub const NOFID: u32 = u32::MAX;
 
 pub const QID_TYPE_DIR: u8 = 0x80;

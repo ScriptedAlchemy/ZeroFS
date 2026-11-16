@@ -90,6 +90,18 @@ async fn xattr_client_empty_values_and_namespace_errors() {
         b"user.empty\0"
     );
     client.set_xattr(fid, b"user.empty", b"", 2).await.unwrap();
+    assert!(
+        client
+            .get_xattr(fid, b"user.empty")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        client.list_xattrs(fid).await.unwrap().as_ref(),
+        b"user.empty\0"
+    );
+    client.remove_xattr(fid, b"user.empty").await.unwrap();
     errno(client.get_xattr(fid, b"user.empty").await, 61);
     errno(client.set_xattr(fid, b"system.acl", b"x", 0).await, 95);
     errno(client.set_xattr(fid, b"trusted.secret", b"x", 0).await, 1);

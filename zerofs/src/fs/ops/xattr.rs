@@ -52,6 +52,14 @@ impl XattrName {
                 if !matches!(inode, Inode::File(_) | Inode::Directory(_)) {
                     return Err(FsError::OperationNotPermitted);
                 }
+                if write
+                    && inode.is_directory()
+                    && inode.mode() & 0o1000 != 0
+                    && creds.uid != 0
+                    && creds.uid != inode.uid()
+                {
+                    return Err(FsError::OperationNotPermitted);
+                }
                 check_access(
                     inode,
                     creds,
@@ -194,6 +202,12 @@ impl ZeroFS {
             Some((_, XattrSetMode::Replace)) | None if !exists => return Err(FsError::NoData),
             _ => {}
         }
+        if value.is_some()
+            && !exists
+            && self.xattr_store.list(id).await?.len() >= crate::fs::store::xattr::XATTR_COUNT_MAX
+        {
+            return Err(FsError::NoSpace);
+        }
         let (sec, nsec) = get_current_time();
         match &mut inode {
             Inode::File(i) => {
@@ -228,12 +242,12 @@ impl ZeroFS {
                 .await?;
         }
         txn.set_dedup_result(op_id, DedupResult::Applied);
-        let coordinator = self.write_coordinator.clone();
+        let pending = self.write_coordinator.submit(txn)?;
         // Keep the lock through apply even if the request stops awaiting us.
         crate::task::spawn_named("xattr-commit", async move {
             let _fence = fence;
             let _guard = guard;
-            coordinator.commit(txn).await
+            pending.wait().await
         })
         .await
         .map_err(|_| FsError::IoError)?
