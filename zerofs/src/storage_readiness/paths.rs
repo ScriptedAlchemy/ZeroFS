@@ -82,7 +82,8 @@ pub(super) fn verify_cache_partitions(cache: &Path) -> Result<()> {
             if name
                 .to_str()
                 .and_then(|name| name.strip_prefix("foyer-storage-direct-fs-"))
-                .is_some_and(|id| id.len() == 8 && id.bytes().all(|byte| byte.is_ascii_digit()))
+                // Foyer pads to a minimum width of eight decimal digits.
+                .is_some_and(|id| id.len() >= 8 && id.bytes().all(|byte| byte.is_ascii_digit()))
             {
                 existing_ancestor(cache, &entry.path())?;
             }
