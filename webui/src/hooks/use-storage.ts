@@ -50,6 +50,8 @@ export function useStorageActivity() {
         try {
           for await (const sample of adminClient.streamStats({ intervalMs: 1000 }, { signal: abort.signal })) {
             if (abort.signal.aborted) return;
+            // StatsSnapshot fields are proto3 scalars without presence, so an omitted counter decodes as 0.
+            // The page says so next to these rows; distinguishing missing needs field presence in the proto.
             setActivity(
               known({
                 logicalBytesWritten: sample.bytesWritten,

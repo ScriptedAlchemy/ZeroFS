@@ -3,7 +3,7 @@ import { HardDrive, RefreshCw } from "lucide-react";
 import { useTitle } from "../hooks/use-title";
 import { useStorageActivity, useStoragePool } from "../hooks/use-storage";
 import { adminClient } from "../lib/grpc/client";
-import { formatSize } from "../lib/format";
+import { formatBinaryBytes } from "../lib/format";
 import { known, parseAffectedStatus, rpcFailure, unavailable } from "../lib/storage-status";
 import type { AffectedStatus, AffectedView, MemberStatus, Value } from "../lib/storage-status";
 import { Button } from "../components/ui/Button";
@@ -52,10 +52,10 @@ function Member({ member, onScan }: { member: MemberStatus; onScan: (id: string)
         </Button>
       </div>
       <dl className="space-y-2 text-sm">
-        <Row label="Configured capacity" value={member.capacity} format={formatSize} />
-        <Row label="Charged usage" value={member.used} format={formatSize} />
-        <Row label="Reserved uploads" value={member.reserved} format={formatSize} />
-        <Row label="Allocatable" value={member.available} format={formatSize} />
+        <Row label="Configured capacity" value={member.capacity} format={formatBinaryBytes} />
+        <Row label="Charged usage" value={member.used} format={formatBinaryBytes} />
+        <Row label="Reserved uploads" value={member.reserved} format={formatBinaryBytes} />
+        <Row label="Allocatable" value={member.available} format={formatBinaryBytes} />
         <Row label="Objects" value={member.objects} />
         <Row label="Pending uploads" value={member.pendingUploads} />
         <Row label="Cleanup debts" value={member.cleanupDebts} />
@@ -280,12 +280,30 @@ export function StoragePage() {
         {activity.state === "unavailable" ? (
           <Fact value={activity} />
         ) : (
-          <dl className="text-sm space-y-2">
-            <Row label="Logical bytes written" value={known(activity.value.logicalBytesWritten)} format={formatSize} />
-            <Row label="Logical bytes read" value={known(activity.value.logicalBytesRead)} format={formatSize} />
-            <Row label="Logical storage used" value={known(activity.value.logicalUsedBytes)} format={formatSize} />
-            <Row label="Inodes used" value={known(activity.value.usedInodes)} />
-          </dl>
+          <>
+            <p className="text-xs text-muted-foreground">
+              StreamStats sends these counters as plain protobuf numbers, so a counter the server omits arrives as 0. A
+              0 here can mean zero or not reported.
+            </p>
+            <dl className="text-sm space-y-2">
+              <Row
+                label="Logical bytes written"
+                value={known(activity.value.logicalBytesWritten)}
+                format={formatBinaryBytes}
+              />
+              <Row
+                label="Logical bytes read"
+                value={known(activity.value.logicalBytesRead)}
+                format={formatBinaryBytes}
+              />
+              <Row
+                label="Logical storage used"
+                value={known(activity.value.logicalUsedBytes)}
+                format={formatBinaryBytes}
+              />
+              <Row label="Inodes used" value={known(activity.value.usedInodes)} />
+            </dl>
+          </>
         )}
       </section>
       <section className="card-surface rounded-lg p-5 space-y-4">
