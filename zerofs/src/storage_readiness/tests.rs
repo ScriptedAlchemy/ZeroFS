@@ -841,6 +841,10 @@ fn readiness_symlinks_refuse_cache_and_journal_namespace_opens() {
             "cache",
             "bucket_fixture/parts_cache/foyer-storage-direct-fs-00000000",
         ),
+        (
+            "cache",
+            "bucket_fixture/parts_cache/foyer-storage-direct-fs-100000000",
+        ),
         ("journal", "bucket_fixture/blobs/00"),
         ("journal", "bucket_fixture/tmp"),
     ] {
