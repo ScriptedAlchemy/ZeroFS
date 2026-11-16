@@ -154,7 +154,6 @@ CARGO_TARGET_DIR="$PWD/target/m0-metadata-survival" \
   /Users/zackjackson/.cargo/bin/cargo +1.100.0 test --locked -p zerofs --lib \
   metadata_survival_tests:: -- --nocapture
 
-# Deliberately red acceptance: do not remove ignore or add should_panic.
 CARGO_TARGET_DIR="$PWD/target/m0-metadata-survival" \
   /Users/zackjackson/.cargo/bin/cargo +1.100.0 test --locked -p zerofs --lib \
   metadata_survival_tests::authority_device_loss_preserves_committed_namespace \

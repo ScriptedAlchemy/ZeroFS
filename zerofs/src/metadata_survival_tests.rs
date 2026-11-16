@@ -1,6 +1,3 @@
-//! M0 failure evidence against the real pool, key envelope, and namespace.
-//! See docs/metadata-survival-m0.md. No metadata redundancy is implemented here.
-
 use crate::block_transformer::ZeroFsBlockTransformer;
 use crate::config::Settings;
 use crate::db::SlateDbHandle;
@@ -35,24 +32,22 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
-        // macOS may spell its temp root through /var; catalog roots must not
-        // contain symlinks when opened by the production anchored directory API.
-        let root_path = root.path().canonicalize().unwrap();
+        let symlink_free_root = root.path().canonicalize().unwrap();
         for directory in ["authority-device/authority", "disk-a", "disk-b"] {
-            std::fs::create_dir_all(root_path.join(directory)).unwrap();
+            std::fs::create_dir_all(symlink_free_root.join(directory)).unwrap();
         }
         let uri = |name| {
-            url::Url::from_directory_path(root_path.join(name))
+            url::Url::from_directory_path(symlink_free_root.join(name))
                 .unwrap()
                 .to_string()
         };
         let document = serde_json::json!({
-            "cache": {"dir": root_path.join("cache"), "disk_size_gb": 0.001},
+            "cache": {"dir": symlink_free_root.join("cache"), "disk_size_gb": 0.001},
             "storage": {
                 "url": uri("authority-device/authority"),
                 "encryption_password": PASSWORD,
                 "pool": {
-                    "catalog_dir": root_path.join("authority-device/catalog"),
+                    "catalog_dir": symlink_free_root.join("authority-device/catalog"),
                     "members": [
                         {"id": "disk-a", "url": uri("disk-a"), "capacity_gb": 0.0002, "reserve_free_gb": 0.0},
                         {"id": "disk-b", "url": uri("disk-b"), "capacity_gb": 0.008, "reserve_free_gb": 0.0}
@@ -76,17 +71,14 @@ impl Fixture {
         match loss {
             Loss::Authority => {
                 std::fs::remove_dir_all(&authority).unwrap();
-                std::fs::create_dir(&authority).unwrap();
             }
             Loss::Catalog => std::fs::remove_dir_all(device.join("catalog")).unwrap(),
             Loss::AuthorityDevice => {
                 std::fs::remove_dir_all(&device).unwrap();
-                // Leave an empty replacement directory so the fault reaches
-                // metadata recovery rather than failing a directory probe.
-                std::fs::create_dir_all(&authority).unwrap();
             }
             Loss::WrappedKey => std::fs::remove_file(authority.join("zerofs.key")).unwrap(),
         }
+        std::fs::create_dir_all(&authority).unwrap();
     }
 }
 
@@ -107,7 +99,6 @@ async fn open(settings: &Settings, initialize: bool) -> Result<(Arc<ZeroFS>, Poo
     let key = if initialize {
         load_or_init_encryption_key(&store, &path, PASSWORD, false).await?
     } else {
-        // Recovery must not manufacture a replacement random key.
         load_existing_encryption_key(&store, &path, PASSWORD)
             .await
             .context("recover original encryption key")?
