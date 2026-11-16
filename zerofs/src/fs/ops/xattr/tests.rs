@@ -489,13 +489,17 @@ async fn cancelled_queued_set_then_unlink_leaves_no_attribute_rows() {
     let removing_fs = Arc::clone(&fs);
     let removing =
         tokio::spawn(async move { removing_fs.remove(&test_auth(), 0, b"cancelled").await });
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        while !matches!(fs.inode_store.pending_inode(id), Some(None)) {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("unlink did not reach the commit queue");
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            fs.lock_manager.acquire(id)
+        )
+        .await
+        .is_err(),
+        "cancelled setter released its inode lock before apply"
+    );
+    assert!(!removing.is_finished());
+    assert!(!matches!(fs.inode_store.pending_inode(id), Some(None)));
     drop(block_apply);
     removing.await.unwrap().unwrap();
     assert!(matches!(
@@ -503,4 +507,97 @@ async fn cancelled_queued_set_then_unlink_leaves_no_attribute_rows() {
         Err(FsError::NotFound)
     ));
     assert_eq!(rows(&fs, id).await, 0);
+}
+
+#[tokio::test]
+async fn queued_unlink_then_set_rejects_gone_inode_and_leaves_no_attribute_rows() {
+    let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+    let id = file(&fs, b"deleted").await;
+    let block_apply = fs.db.flush_barrier().write_owned().await;
+    let apply_reached = fs.write_coordinator.probe_next_apply();
+    let removing_fs = Arc::clone(&fs);
+    let removing =
+        tokio::spawn(async move { removing_fs.remove(&test_auth(), 0, b"deleted").await });
+    apply_reached.await.unwrap();
+    assert!(matches!(fs.inode_store.pending_inode(id), Some(None)));
+    let setting_fs = Arc::clone(&fs);
+    let mut setting = tokio::spawn(async move {
+        setting_fs
+            .set_xattr(
+                &test_creds(),
+                id,
+                &name(b"user.late"),
+                value(b"orphan"),
+                XattrSetMode::Either,
+            )
+            .await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut setting)
+            .await
+            .is_err(),
+        "setter did not wait for the queued unlink's inode lock"
+    );
+    drop(block_apply);
+    removing.await.unwrap().unwrap();
+    assert_eq!(setting.await.unwrap(), Err(FsError::NotFound));
+    assert!(matches!(
+        fs.inode_store.get(id).await,
+        Err(FsError::NotFound)
+    ));
+    assert_eq!(rows(&fs, id).await, 0);
+}
+
+#[tokio::test]
+async fn cancelled_queued_remove_holds_lock_until_next_create_can_see_apply() {
+    let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+    let id = file(&fs, b"replace").await;
+    fs.set_xattr(
+        &test_creds(),
+        id,
+        &name(b"user.key"),
+        value(b"old"),
+        XattrSetMode::Create,
+    )
+    .await
+    .unwrap();
+    let block_apply = fs.db.flush_barrier().write_owned().await;
+    let apply_reached = fs.write_coordinator.probe_next_apply();
+    let removing_fs = Arc::clone(&fs);
+    let removing = tokio::spawn(async move {
+        removing_fs
+            .remove_xattr(&test_creds(), id, &name(b"user.key"))
+            .await
+    });
+    apply_reached.await.unwrap();
+    removing.abort();
+    assert!(removing.await.unwrap_err().is_cancelled());
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            fs.lock_manager.acquire(id)
+        )
+        .await
+        .is_err()
+    );
+    let setting_fs = Arc::clone(&fs);
+    let setting = tokio::spawn(async move {
+        setting_fs
+            .set_xattr(
+                &test_creds(),
+                id,
+                &name(b"user.key"),
+                value(b"new"),
+                XattrSetMode::Create,
+            )
+            .await
+    });
+    drop(block_apply);
+    setting.await.unwrap().unwrap();
+    assert_eq!(
+        fs.get_xattr(&test_creds(), id, &name(b"user.key"), None)
+            .await
+            .unwrap(),
+        b"new".as_slice()
+    );
 }

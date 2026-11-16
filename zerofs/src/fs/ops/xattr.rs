@@ -175,10 +175,10 @@ impl ZeroFS {
         if self.replay_dedup_result(&op_id, applied)?.is_some() {
             return Ok(());
         }
-        let _fence = self
+        let fence = self
             .fence_metadata(ConflictScope::single(ConflictKey::Inode(id)))
             .await?;
-        let _guard = self.lock_manager.acquire(id).await;
+        let guard = self.lock_manager.acquire(id).await;
         if self.replay_dedup_result(&op_id, applied)?.is_some() {
             return Ok(());
         }
@@ -228,7 +228,15 @@ impl ZeroFS {
                 .await?;
         }
         txn.set_dedup_result(op_id, DedupResult::Applied);
-        self.write_coordinator.commit(txn).await
+        let coordinator = self.write_coordinator.clone();
+        // Keep the lock through apply even if the request stops awaiting us.
+        crate::task::spawn_named("xattr-commit", async move {
+            let _fence = fence;
+            let _guard = guard;
+            coordinator.commit(txn).await
+        })
+        .await
+        .map_err(|_| FsError::IoError)?
     }
 }
 

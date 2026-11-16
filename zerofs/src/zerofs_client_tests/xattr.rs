@@ -274,3 +274,49 @@ async fn xattr_wire_disconnect_discards_staged_value_and_releases_pin() {
     .unwrap();
     assert!(fs.xattr_store.list(id).await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn xattr_wire_cancelled_clunk_then_unlink_leaves_no_rows() {
+    let (mut c, fs, id) = wire_setup().await;
+    c.clone_file(2).await;
+    assert!(matches!(c.create(2, 4, 0).await, Message::Rxattrcreate(_)));
+    c.write(2, 0, b"abcd").await;
+    let block_apply = fs.db.flush_barrier().write_owned().await;
+    let apply_reached = fs.write_coordinator.probe_next_apply();
+    let clunking = tokio::spawn(async move { c.clunk(2).await });
+    apply_reached.await.unwrap();
+    clunking.abort();
+    assert!(clunking.await.unwrap_err().is_cancelled());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), fs.lock_manager.acquire(id))
+            .await
+            .is_err()
+    );
+    let removing_fs = Arc::clone(&fs);
+    let removing = tokio::spawn(async move {
+        removing_fs
+            .remove(
+                &(&crate::test_helpers::test_helpers_mod::test_auth()).into(),
+                0,
+                b"file",
+            )
+            .await
+    });
+    drop(block_apply);
+    removing.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            fs.reclaim_if_unreferenced(id).await;
+            if matches!(
+                fs.inode_store.get(id).await,
+                Err(crate::fs::errors::FsError::NotFound)
+            ) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(fs.xattr_store.list(id).await.unwrap().is_empty());
+}
