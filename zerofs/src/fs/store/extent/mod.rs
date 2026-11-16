@@ -484,6 +484,13 @@ impl ExtentStore {
         let mut batch = txn.into_inner();
         let (_, footprint_delta) =
             crate::fs::write_coordinator::stage_seg_deltas(&self.db, deltas, &mut batch).await?;
+        // A pinned underflow against an absent counter stages no row, and
+        // SlateDB rejects an empty batch. The commit worker skips the write
+        // in the same case.
+        if batch.is_empty() {
+            drop(extent_ref_guard);
+            return Ok(());
+        }
         let extent_location_cache_guard =
             self.invalidate_extent_location_cache(extent_location_cache_updates.keys().copied());
         self.db

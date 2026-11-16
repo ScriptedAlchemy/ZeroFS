@@ -478,9 +478,30 @@ pub(crate) async fn stage_seg_deltas(
     let mut out = Vec::with_capacity(bases.len());
     let mut fd = SegFootprintDelta::default();
     for (key, (net_live, net_total), (cur_live, cur_total)) in bases {
-        let live = (cur_live as i128 + net_live as i128).max(0) as u64;
         // `total` is monotonic: clamp to at least its current value.
         let total = (cur_total as i128 + net_total as i128).max(cur_total as i128) as u64;
+        let live = cur_live as i128 + net_live as i128;
+        let live = if live < 0 {
+            // A debit larger than the live bytes means the counter missed a
+            // credit for a frame that may still be referenced. Clamping to
+            // zero would mark the segment dead, so pin it fully live instead
+            // and leak its space rather than risk deleting referenced data.
+            tracing::error!(
+                segment = ?KeyCodec::new().parse_segcount_key(&key),
+                cur_live,
+                net_live,
+                "segment accounting bug: live-byte counter would underflow; \
+                 pinning the segment as fully live"
+            );
+            if total == 0 {
+                // No counter and no credit. Write nothing so the object stays
+                // with the orphan sweep, which verifies every pointer.
+                continue;
+            }
+            total
+        } else {
+            live as u64
+        };
         // Monitoring deltas use the clamped absolute values and saturating sums.
         fd.d_live = fd.d_live.saturating_add(live as i64 - cur_live as i64);
         fd.d_appended = fd
