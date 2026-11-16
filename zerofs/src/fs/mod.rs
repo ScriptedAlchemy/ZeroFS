@@ -409,3 +409,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod name_mode_tests;
