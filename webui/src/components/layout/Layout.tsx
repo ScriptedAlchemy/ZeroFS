@@ -1,16 +1,18 @@
-import { NavLink, Outlet } from "react-router";
-import { FolderOpen, BarChart3, TerminalSquare, Loader2, WifiOff } from "lucide-react";
+import { NavLink, Outlet, useLocation } from "react-router";
+import { FolderOpen, BarChart3, TerminalSquare, Loader2, WifiOff, HardDrive } from "lucide-react";
 import * as Tooltip from "@radix-ui/react-tooltip";
 import { useNinePVisualState } from "../../hooks/use-ninep-connection";
 
 const navItems = [
   { to: "/files", label: "Files", icon: FolderOpen },
   { to: "/dashboard", label: "Monitor", icon: BarChart3 },
+  { to: "/storage", label: "Storage", icon: HardDrive },
   { to: "/terminal", label: "Terminal", icon: TerminalSquare },
 ];
 
 export function Layout() {
   const connectionState = useNinePVisualState();
+  const { pathname } = useLocation();
 
   return (
     <Tooltip.Provider delayDuration={300}>
@@ -25,6 +27,7 @@ export function Layout() {
                 <div>
                   <NavLink
                     to={to}
+                    aria-label={label}
                     className={({ isActive }) =>
                       isActive
                         ? "flex items-center justify-center w-10 h-10 rounded-lg bg-accent text-foreground border border-border-bright"
@@ -49,7 +52,7 @@ export function Layout() {
         </nav>
         <main className="flex-1 overflow-auto bg-background relative">
           <Outlet />
-          {connectionState !== "connected" && (
+          {connectionState !== "connected" && !pathname.startsWith("/storage") && (
             <div className="absolute inset-0 bg-background/80 backdrop-blur-sm flex items-center justify-center z-[100]">
               <div className="flex flex-col items-center gap-4 text-center">
                 {connectionState === "connecting" ? (
