@@ -1,4 +1,4 @@
-# Declared storage profiles and startup readiness (S2)
+# Declared filesystem profiles and startup readiness
 
 `[storage.readiness]` adds opt-in identity verification before a local pool is
 opened. Omitting the section preserves ordinary local/cloud deployments. Setting
@@ -6,8 +6,14 @@ opened. Omitting the section preserves ordinary local/cloud deployments. Setting
 declaration's structure when loading configuration. No identity probes run in
 either case. `strict` must be written explicitly when this section is present.
 
-This implements placement-plan row S2 only. A successful preflight does not
-enable strict placement. Policy configuration, segment routing, relocation,
+This implements the filesystem-profile and startup-preflight portion of
+placement-plan row S2. S2 remains incomplete. Declarations for device roles,
+rated write budgets, and reserves still need the hardware-aware follow-up. The current
+schema binds storage paths to filesystems, not workload policies to devices.
+P1 remains blocked until the complete S2 row is delivered.
+
+A successful preflight does not enable strict placement. Policy configuration,
+segment routing, relocation,
 retention, profile-specific I/O tuning, and metadata survival are not implemented
 here. `[placement]` and `placement_enabled` are rejected as unknown fields.
 Existing first-fit segment placement retains its existing semantics.
@@ -21,9 +27,10 @@ journal path. Every enabled acknowledgement mode uses that journal, including
 must be durable before acknowledgement and remain valid through recovery.
 
 The hardware-aware follow-up must distinguish declared ratings, configured
-workload expectations, measured activity, and unavailable observations. S2 does
-not yet verify device serials, boot-device exclusion, endurance, power-loss
-protection, sustained throughput, or write budgets. Filesystem identity alone
+workload expectations, measured activity, and unavailable observations. This
+schema has no rated write budget or reserve declarations. It does not verify
+device serials, boot-device exclusion, endurance, power-loss protection,
+sustained throughput, or write budgets. Filesystem identity alone
 does not establish those facts. No declaration in this change activates the
 installed Crucial P3. Its proposed role is optional clean read retention, pending
 resolution of the old/untouched-region read anomaly and measured workload benefit.
@@ -136,7 +143,8 @@ build scratch is a separate volatile use; it changes no persistent fsync promise
 
 Independent full-copy capacity is currently insufficient. A proposed external
 18 TB drive is not empty or installed and contributes no available capacity.
-Recalculate after the operations-owned transfer finishes, using final inventory,
-engine overhead, other datasets, and reserves. Drive labels use decimal TB;
+Recalculate after the operations-owned transfer, whole-drive final audit, and
+physical installation, using final inventory, engine overhead, other datasets,
+and reserves. Drive labels use decimal TB;
 `zpool list` and `zfs list` values with a `T` suffix use TiB. Capacity verification
 and all migration safety gates remain required.
