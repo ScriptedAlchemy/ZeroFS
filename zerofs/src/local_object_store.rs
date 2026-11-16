@@ -50,13 +50,34 @@ const MAX_WORKERS: usize = 32;
 #[derive(Clone, Debug)]
 pub(crate) struct LocalConditionalStore {
     inner: LocalFileSystem,
+    readiness_root: Option<PathBuf>,
 }
 
 impl LocalConditionalStore {
     pub(crate) fn new() -> Self {
         Self {
             inner: LocalFileSystem::new().with_fsync(true),
+            readiness_root: None,
         }
+    }
+
+    pub(crate) fn with_readiness_root(mut self, root: PathBuf) -> Self {
+        self.readiness_root = Some(root);
+        self
+    }
+
+    fn check_location(&self, location: &Path) -> Result<()> {
+        check_readiness_path(
+            self.readiness_root.as_deref(),
+            &self.inner.path_to_filesystem(location)?,
+        )
+    }
+
+    fn check_tree(&self) -> Result<()> {
+        if let Some(root) = &self.readiness_root {
+            crate::storage_readiness::paths::verify_tree(root).map_err(generic)?;
+        }
+        Ok(())
     }
 }
 
@@ -71,6 +92,19 @@ fn generic(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Error
         store: STORE,
         source: source.into(),
     }
+}
+
+/// Recheck every existing component before LocalFileSystem opens a path.
+/// Replacements after this check can still race the path-based open.
+fn check_readiness_path(root: Option<&FsPath>, path: &FsPath) -> Result<()> {
+    if let Some(root) = root {
+        crate::storage_readiness::paths::existing_ancestor(root, path).map_err(generic)?;
+        if let Some(parent) = path.parent() {
+            crate::storage_readiness::paths::existing_ancestor(root, &parent.join(LOCK_FILE))
+                .map_err(generic)?;
+        }
+    }
+    Ok(())
 }
 
 /// LocalFileSystem's directory durability guarantee is supported on Unix.
@@ -167,7 +201,9 @@ impl ObjectStore for LocalConditionalStore {
         let path = self.inner.path_to_filesystem(location)?;
         let location = location.clone();
         let inner = self.inner.clone();
+        let root = self.readiness_root.clone();
         run_local(move || {
+            check_readiness_path(root.as_deref(), &path)?;
             let _locks = lock_parents(std::slice::from_ref(&path))?;
             if opts.extensions.get::<pool::PoolObjectCreate>().is_some() {
                 if !matches!(opts.mode, PutMode::Create) {
@@ -214,22 +250,29 @@ impl ObjectStore for LocalConditionalStore {
         let path = self.inner.path_to_filesystem(location)?;
         let location = location.clone();
         let inner = self.inner.clone();
+        let root = self.readiness_root.clone();
+        let check_root = root.clone();
+        let check_path = path.clone();
         let upload = run_local(move || {
+            check_readiness_path(check_root.as_deref(), &check_path)?;
             futures::executor::block_on(inner.put_multipart_opts(&location, opts))
         })
         .await?;
         Ok(Box::new(LocalMultipartUpload {
             upload: Some(upload),
             path,
+            readiness_root: root,
             parts: Arc::new(Parts::default()),
         }))
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+        self.check_location(location)?;
         self.inner.get_opts(location, options).await
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        self.check_location(location)?;
         self.inner.get_ranges(location, ranges).await
     }
 
@@ -238,13 +281,16 @@ impl ObjectStore for LocalConditionalStore {
         locations: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>> {
         let inner = self.inner.clone();
+        let root = self.readiness_root.clone();
         locations
             .map(move |location| {
                 let inner = inner.clone();
+                let root = root.clone();
                 async move {
                     let location = location?;
                     let path = inner.path_to_filesystem(&location)?;
                     run_local(move || {
+                        check_readiness_path(root.as_deref(), &path)?;
                         let _locks = lock_parents(std::slice::from_ref(&path))?;
                         futures::executor::block_on(inner.delete(&location))?;
                         // Upstream's with_fsync(true) does not cover standalone
@@ -260,6 +306,9 @@ impl ObjectStore for LocalConditionalStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        if let Err(error) = self.check_tree() {
+            return futures::stream::once(async { Err(error) }).boxed();
+        }
         self.inner.list(prefix)
     }
 
@@ -268,10 +317,14 @@ impl ObjectStore for LocalConditionalStore {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, Result<ObjectMeta>> {
+        if let Err(error) = self.check_tree() {
+            return futures::stream::once(async { Err(error) }).boxed();
+        }
         self.inner.list_with_offset(prefix, offset)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+        self.check_tree()?;
         self.inner.list_with_delimiter(prefix).await
     }
 
@@ -282,7 +335,11 @@ impl ObjectStore for LocalConditionalStore {
         ];
         let (from, to) = (from.clone(), to.clone());
         let inner = self.inner.clone();
+        let root = self.readiness_root.clone();
         run_local(move || {
+            for path in &paths {
+                check_readiness_path(root.as_deref(), path)?;
+            }
             let _locks = lock_parents(&paths)?;
             futures::executor::block_on(inner.copy_opts(&from, &to, options))
         })
@@ -296,7 +353,11 @@ impl ObjectStore for LocalConditionalStore {
         ];
         let (from, to) = (from.clone(), to.clone());
         let inner = self.inner.clone();
+        let root = self.readiness_root.clone();
         run_local(move || {
+            for path in &paths {
+                check_readiness_path(root.as_deref(), path)?;
+            }
             let _locks = lock_parents(&paths)?;
             // Directories are namespace containers, not objects. In particular
             // a directory rename must not move another writer's lock files.
@@ -342,6 +403,7 @@ impl Drop for PartGuard {
 struct LocalMultipartUpload {
     upload: Option<Box<dyn MultipartUpload>>,
     path: PathBuf,
+    readiness_root: Option<PathBuf>,
     parts: Arc<Parts>,
 }
 
@@ -385,7 +447,9 @@ impl MultipartUpload for LocalMultipartUpload {
             .take()
             .ok_or_else(|| generic("multipart upload already finished"))?;
         let path = self.path.clone();
+        let root = self.readiness_root.clone();
         run_local(move || {
+            check_readiness_path(root.as_deref(), &path)?;
             let _locks = lock_parents(&[path])?;
             futures::executor::block_on(upload.complete())
         })
@@ -397,7 +461,13 @@ impl MultipartUpload for LocalMultipartUpload {
             .upload
             .take()
             .ok_or_else(|| generic("multipart upload already finished"))?;
-        run_local(move || futures::executor::block_on(upload.abort())).await
+        let path = self.path.clone();
+        let root = self.readiness_root.clone();
+        run_local(move || {
+            check_readiness_path(root.as_deref(), &path)?;
+            futures::executor::block_on(upload.abort())
+        })
+        .await
     }
 }
 

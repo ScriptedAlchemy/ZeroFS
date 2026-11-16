@@ -5,6 +5,10 @@ directories and remote object stores into one filesystem. A storage pool holds
 permanent file data. It is independent of the clean read cache and the optional
 writeback journal.
 
+For opt-in, declared disk profiles and filesystem identity checks before opening
+a local pool, see [storage readiness](storage-readiness.md). This startup preflight
+does not enable strict placement.
+
 ## Native local storage
 
 Set `[storage].url` to a local directory:
