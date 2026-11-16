@@ -576,7 +576,11 @@ impl ZeroFS {
                     .update_inode_in_entry(&mut txn, d.parent, name, from_dirid, &from_dir)
                     .await?;
             }
+            #[cfg(feature = "failpoints")]
+            fail_point!(fp::RENAME_AFTER_NEW_ENTRY);
             self.write_coordinator.commit(txn).await?;
+            #[cfg(feature = "failpoints")]
+            fail_point!(fp::RENAME_AFTER_COMMIT);
             self.record_rename(&source_inode, old_path, to_dirid, to_name);
             return Ok(verified_content.map(VerifiedRenameOutcome::Published));
         }
