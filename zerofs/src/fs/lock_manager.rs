@@ -44,6 +44,13 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> KeyedLockManager<K> {
             .clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_locked_for_test(&self, key: K) -> bool {
+        self.locks
+            .get(&key)
+            .is_some_and(|lock| lock.try_lock().is_err())
+    }
+
     /// Acquire a lock for the given key
     pub async fn acquire(&self, key: K) -> KeyedLockGuard<K> {
         let lock = self.get_or_create_lock(&key);
