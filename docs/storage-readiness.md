@@ -108,6 +108,13 @@ readiness contract on Mac without mounting anything or accessing a NAS.
 ## Scope of evidence
 
 This is a startup preflight, including explicit `pool init` and maintenance opens.
+Both `debug reseed-writeback-predecessor` and
+`debug accept-remote-writeback-branch` refuse to run whenever readiness is
+configured, including `strict = false`. They refuse before
+opening the backend or the journal. Their stored backend identity does not bind
+a filesystem UUID or GUID, so it cannot validate a relocated journal's filesystem.
+Recovery without readiness retains its existing behavior.
+
 It runs before backend creation, catalog opening, cache initialization, and
 journal replay. Existing pool/catalog/member identity markers remain in force.
 An absent catalog is still rejected on ordinary reopen; readiness never rebuilds

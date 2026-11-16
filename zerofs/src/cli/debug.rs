@@ -252,6 +252,11 @@ pub async fn reseed_writeback_predecessor(
 ) -> Result<()> {
     let settings = Settings::from_file(&config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
+    if settings.storage.readiness.is_some() {
+        anyhow::bail!(
+            "storage readiness refuses --journal recovery because the supplied journal's filesystem binding cannot be verified"
+        );
+    }
     if !settings
         .writeback
         .as_ref()
@@ -331,6 +336,11 @@ pub async fn accept_remote_writeback_branch(
     let remote_sha256 = parse_sha256(&expected_remote_sha256, "remote SHA-256")?;
     let settings = Settings::from_file(&config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
+    if settings.storage.readiness.is_some() {
+        anyhow::bail!(
+            "storage readiness refuses --journal recovery because the supplied journal's filesystem binding cannot be verified"
+        );
+    }
     if !settings
         .writeback
         .as_ref()
@@ -721,6 +731,140 @@ mod tests {
         let config = temp.path().join(format!("config-{namespace}.toml"));
         fs::write(&config, toml::to_string(&settings).unwrap()).unwrap();
         (config, remote, prefix, identity)
+    }
+
+    async fn readiness_recovery_config(
+        temp: &TempDir,
+    ) -> (PathBuf, Arc<dyn ObjectStore>, String, JournalIdentity) {
+        let (config, remote, prefix, identity) = recovery_config(temp, "a", "a-password").await;
+        let mut document = serde_json::to_value(Settings::from_file(&config).unwrap()).unwrap();
+        let base = temp.path().to_path_buf();
+        let fast = base.join("fast");
+        let catalog = base.join("catalog");
+        let member = base.join("member");
+        for root in [
+            &catalog,
+            &member,
+            &fast.join("cache"),
+            &fast.join("journal"),
+        ] {
+            fs::create_dir_all(root).unwrap();
+        }
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&catalog, fs::Permissions::from_mode(0o700)).unwrap();
+        document["cache"]["dir"] = serde_json::json!(fast.join("cache"));
+        document["writeback"]["dir"] = serde_json::json!(fast.join("journal"));
+        document["storage"]["pool"] = serde_json::json!({
+            "catalog_dir": catalog,
+            "members": [{"id": "data", "url": url::Url::from_directory_path(member).unwrap().as_str(),
+                "capacity_gb": 0.01, "reserve_free_gb": 0.001}]
+        });
+        document["storage"]["readiness"] = serde_json::json!({
+            "strict": false, "authority": "durable", "catalog": "durable", "cache": "fast", "journal": "fast",
+            "members": {"data": "durable"},
+            "filesystems": [
+                {"id": "durable", "profile": "hdd-cmr", "mountpoint": base,
+                    "identity": {"kind": "zfs", "pool_guid": "101", "dataset_guid": "201"}},
+                {"id": "fast", "profile": "nvme", "mountpoint": fast,
+                    "identity": {"kind": "uuid", "uuid": "47166772-65c1-4ecf-8066-935452891add"}}
+            ]
+        });
+        fs::write(&config, toml::to_string(&document).unwrap()).unwrap();
+        let settings = Settings::from_file(&config).unwrap();
+        drop(
+            crate::storage_backend::open_pool_storage(&settings, true)
+                .await
+                .unwrap(),
+        );
+        (config, remote, prefix, identity)
+    }
+
+    #[tokio::test]
+    async fn readiness_refuses_relocated_reseed_journals_before_mutation() {
+        for strict in [false, true] {
+            let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+            let (config, remote, prefix, identity) = readiness_recovery_config(&temp).await;
+            let mut document: toml::Value =
+                toml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+            document["storage"]["readiness"]["strict"] = toml::Value::Boolean(strict);
+            fs::write(&config, toml::to_string(&document).unwrap()).unwrap();
+            let journal_path = temp.path().join("relocated-reseed-journal");
+            let predecessor = format!("{prefix}/recovery/predecessor");
+            remote
+                .put(
+                    &Path::from(predecessor.as_str()),
+                    (&b"remote predecessor"[..]).into(),
+                )
+                .await
+                .unwrap();
+            let journal = Journal::open(&journal_path, identity).unwrap();
+            journal
+                .commit_put(
+                    recovery_put(1, &predecessor, b"local predecessor"),
+                    b"local predecessor",
+                )
+                .unwrap();
+            journal.mark_remote(1, None).unwrap();
+            drop(journal);
+            let before = stopped_journal_files(&journal_path);
+            let result =
+                reseed_writeback_predecessor(config, journal_path.clone(), predecessor, 1).await;
+            assert!(
+                result.is_err(),
+                "readiness must refuse relocated recovery journals, strict={strict}"
+            );
+            assert!(
+                format!("{:#}", result.unwrap_err())
+                    .contains("storage readiness refuses --journal recovery")
+            );
+            assert_eq!(stopped_journal_files(&journal_path), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn readiness_refuses_relocated_accept_journals_before_mutation() {
+        for strict in [false, true] {
+            let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+            let (config, remote, prefix, identity) = readiness_recovery_config(&temp).await;
+            let mut document: toml::Value =
+                toml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+            document["storage"]["readiness"]["strict"] = toml::Value::Boolean(strict);
+            fs::write(&config, toml::to_string(&document).unwrap()).unwrap();
+            let journal_path = temp.path().join("relocated-accept-journal");
+            let manifest = format!("{prefix}/manifest/00000000000000000007.manifest");
+            let local = b"local manifest";
+            let payload = b"remote manifest";
+            remote
+                .put(&Path::from(manifest.as_str()), payload.as_slice().into())
+                .await
+                .unwrap();
+            let journal = Journal::open(&journal_path, identity).unwrap();
+            journal
+                .commit_put(recovery_put(1, &manifest, local), local)
+                .unwrap();
+            drop(journal);
+            let before = stopped_journal_files(&journal_path);
+            let result = accept_remote_writeback_branch(
+                config,
+                journal_path.clone(),
+                0,
+                1,
+                manifest,
+                hex_sha256(Sha256::digest(local).into()),
+                hex_sha256(Sha256::digest(payload).into()),
+                true,
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "readiness must refuse relocated recovery journals, strict={strict}"
+            );
+            assert!(
+                format!("{:#}", result.unwrap_err())
+                    .contains("storage readiness refuses --journal recovery")
+            );
+            assert_eq!(stopped_journal_files(&journal_path), before);
+        }
     }
 
     #[tokio::test]
