@@ -459,3 +459,48 @@ async fn xattrs_survive_database_reopen() {
         b"user.bytes\0".as_slice()
     );
 }
+
+#[tokio::test]
+async fn cancelled_queued_set_then_unlink_leaves_no_attribute_rows() {
+    let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+    let id = file(&fs, b"cancelled").await;
+    let block_apply = fs.db.flush_barrier().write_owned().await;
+    let apply_reached = fs.write_coordinator.probe_next_apply();
+    let setting_fs = Arc::clone(&fs);
+    let setting = tokio::spawn(async move {
+        setting_fs
+            .set_xattr(
+                &test_creds(),
+                id,
+                &name(b"user.pending"),
+                value(b"queued"),
+                XattrSetMode::Create,
+            )
+            .await
+    });
+    apply_reached.await.unwrap();
+    setting.abort();
+    assert!(setting.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        fs.xattr_store.get(id, b"user.pending").await,
+        Err(FsError::NoData)
+    );
+
+    let removing_fs = Arc::clone(&fs);
+    let removing =
+        tokio::spawn(async move { removing_fs.remove(&test_auth(), 0, b"cancelled").await });
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !matches!(fs.inode_store.pending_inode(id), Some(None)) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("unlink did not reach the commit queue");
+    drop(block_apply);
+    removing.await.unwrap().unwrap();
+    assert!(matches!(
+        fs.inode_store.get(id).await,
+        Err(FsError::NotFound)
+    ));
+    assert_eq!(rows(&fs, id).await, 0);
+}
