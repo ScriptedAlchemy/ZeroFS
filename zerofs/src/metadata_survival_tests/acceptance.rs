@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path};
 use tokio::sync::oneshot;
 
-const REPLICA_TIMEOUT: Duration = Duration::from_secs(30);
+const REPLICA_TIMEOUT: Duration = Duration::from_secs(90);
 const REPLACEMENT_DEVICE_ID: &str = "fixture-replacement-device";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,10 +29,28 @@ enum Row {
     ErroringReplica,
     CompetingWriter,
     ReplacementCatchUp,
+    DurableEnablement,
+    TerminalDisable,
+    StaleRestart,
+    CorruptDependency,
+    CorruptRecord,
+    HighestGeneration,
+    ConflictingForks,
+    PartialFanoutRestart,
+    BacklogRetry,
+    ReadFaultClosed,
+    ReadFaultReadOnly,
+    IdleAndBounds,
+    StatusLag,
+    PromoteAuthority,
+    OrphanCheckpoint,
+    AdmissionLockOrder,
+    DataOnlyLoss,
+    RetentionCrash,
 }
 
 impl Row {
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 32] = [
         Self::AuthorityLoss,
         Self::JournalBeforeBackend,
         Self::JournalAfterBackend,
@@ -47,7 +65,29 @@ impl Row {
         Self::ErroringReplica,
         Self::CompetingWriter,
         Self::ReplacementCatchUp,
+        Self::DurableEnablement,
+        Self::TerminalDisable,
+        Self::StaleRestart,
+        Self::CorruptDependency,
+        Self::CorruptRecord,
+        Self::HighestGeneration,
+        Self::ConflictingForks,
+        Self::PartialFanoutRestart,
+        Self::BacklogRetry,
+        Self::ReadFaultClosed,
+        Self::ReadFaultReadOnly,
+        Self::IdleAndBounds,
+        Self::StatusLag,
+        Self::PromoteAuthority,
+        Self::OrphanCheckpoint,
+        Self::AdmissionLockOrder,
+        Self::DataOnlyLoss,
+        Self::RetentionCrash,
     ];
+
+    fn review_case(self) -> bool {
+        Self::ALL[14..].contains(&self)
+    }
 
     fn fault(self) -> Option<ReplicaFault> {
         match self {
@@ -69,6 +109,7 @@ pub(crate) enum CommitPoint {
     AdmissionClosed,
     AdmittedWorkDrained,
     BackendCutoff,
+    CheckpointIntentSynced,
     CheckpointPublished,
     CheckpointSynced,
     CatalogPublished,
@@ -87,10 +128,11 @@ pub(crate) enum CommitPoint {
 }
 
 impl CommitPoint {
-    const ALL: [Self; 18] = [
+    const ALL: [Self; 19] = [
         Self::AdmissionClosed,
         Self::AdmittedWorkDrained,
         Self::BackendCutoff,
+        Self::CheckpointIntentSynced,
         Self::CheckpointPublished,
         Self::CheckpointSynced,
         Self::CatalogPublished,
@@ -181,8 +223,14 @@ fn valid_object_path(path: &Path) -> bool {
 
 // A test build of the future commit owner calls this at each actual boundary.
 // Merely reporting a requested cut as successful does not signal this channel.
+#[derive(Default)]
+struct CommitProgress {
+    durable_records: std::collections::BTreeSet<String>,
+}
+
 pub(crate) struct CommitCutHook {
     cut: Cut,
+    progress: Arc<std::sync::Mutex<CommitProgress>>,
     entered: Option<oneshot::Sender<CutEvent>>,
     release: Option<oneshot::Receiver<()>>,
 }
@@ -194,6 +242,7 @@ impl CommitCutHook {
         (
             Self {
                 cut,
+                progress: Arc::default(),
                 entered: Some(entered),
                 release: Some(release),
             },
@@ -209,6 +258,18 @@ impl CommitCutHook {
         replica: &str,
         object: &Path,
     ) {
+        if point == CommitPoint::CommitDirectorySynced
+            && side == Side::After
+            && ["authority", "disk-a-metadata"].contains(&replica)
+            && valid_object_path(object)
+            && object.starts_with("commits")
+        {
+            self.progress
+                .lock()
+                .unwrap()
+                .durable_records
+                .insert(replica.to_owned());
+        }
         if (point, side, replica) != (self.cut.point, self.cut.side, self.cut.replica)
             || !valid_object_path(object)
         {
@@ -242,6 +303,7 @@ struct SurvivalReceipt {
     digest: [u8; 32],
     mutation_cutoff: u64,
     envelope_epoch: u64,
+    sequence: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -359,6 +421,8 @@ struct Live {
     pool: Option<PoolObjectStore>,
     expected: State,
     reads: Vec<ReadRange>,
+    writeback: Option<WritebackObjectStore>,
+    replica_override: Option<[PathBuf; 2]>,
 }
 
 impl Live {
@@ -373,6 +437,42 @@ impl Live {
         if let Some(fs) = self.fs.take() {
             close(fs, self.pool.take().expect("writer pool")).await;
         }
+        if let Some(writeback) = self.writeback.take() {
+            writeback
+                .shutdown()
+                .await
+                .expect("shutdown acceptance writeback");
+        }
+    }
+
+    async fn attach_journal(&mut self) -> Result<()> {
+        self.close_writer().await;
+        let journal = self
+            .fixture
+            .root
+            .path()
+            .canonicalize()?
+            .join("journal-device/journal");
+        let (fs, pool, writeback) =
+            open_with_writeback(&self.fixture.settings, false, Some(journal)).await?;
+        let writeback = writeback.context("the interrupted fixture needs real writeback")?;
+        writeback.activate_remote()?;
+        self.fs = Some(fs);
+        self.pool = Some(pool);
+        self.writeback = Some(writeback);
+        // A local durability receipt must have actual journal coverage. This
+        // remains a real journal even when its remote backlog has drained.
+        overwrite_first_file(self, 31).await?;
+        let local = self.writeback.as_ref().unwrap().status()?;
+        ensure!(
+            local.local_seq > 0,
+            "the journal fixture must contain accepted objects"
+        );
+        ensure!(
+            !tree_hashes(&self.fixture.root.path().join("journal-device"))?.is_empty(),
+            "the journal device must contain real files"
+        );
+        Ok(())
     }
 
     async fn new(exact: bool) -> Result<Self> {
@@ -500,10 +600,15 @@ impl Live {
             pool: Some(pool),
             expected,
             reads,
+            writeback: None,
+            replica_override: None,
         })
     }
 
     fn replica_roots(&self) -> [PathBuf; 2] {
+        if let Some(roots) = &self.replica_override {
+            return roots.clone();
+        }
         [
             self.fixture.root.path().join("authority-device/authority"),
             self.fixture
@@ -540,6 +645,27 @@ struct JournalLossReport {
     local_only_suffix_lost: bool,
 }
 
+struct RecoverySources {
+    replicas: Vec<PathBuf>,
+    password: &'static str,
+    scratch_parent: PathBuf,
+}
+
+impl RecoverySources {
+    fn from_live(live: &Live) -> Self {
+        Self {
+            replicas: live
+                .replica_roots()
+                .into_iter()
+                .map(|root| root.join(".zerofs-survival/v1"))
+                .filter(|root| root.is_dir())
+                .collect(),
+            password: PASSWORD,
+            scratch_parent: live.fixture.root.path().join("recovery-scratch"),
+        }
+    }
+}
+
 struct Recovered {
     fs: Arc<ZeroFS>,
     pool: PoolObjectStore,
@@ -558,6 +684,9 @@ struct PausedCommit {
     candidate: Arc<std::sync::Mutex<Option<SurvivalReceipt>>>,
     entered: oneshot::Receiver<CutEvent>,
     release: oneshot::Sender<()>,
+    // Receipt delivery is independent of the task's later cleanup hooks.
+    receipt_returned: oneshot::Receiver<Result<SurvivalReceipt>>,
+    progress: Arc<std::sync::Mutex<CommitProgress>>,
     task: tokio::task::JoinHandle<Result<SurvivalReceipt>>,
 }
 
@@ -573,9 +702,11 @@ struct FaultObservation {
     prior_receipt: Option<SurvivalReceipt>,
     injected: Option<ReplicaFault>,
     elapsed: Duration,
-    survival_refused: bool,
-    writable_refused: bool,
-    reported_failed: bool,
+    commit_error: Option<SurvivalFailure>,
+    mutation_result: Option<Result<(), FsError>>,
+    before_status: Option<SurvivalStatus>,
+    after_status: Option<SurvivalStatus>,
+    retry_receipt: Option<SurvivalReceipt>,
     second_writer_refused: bool,
     first_writer_still_owns_lock: bool,
     online_catch_up_refused: bool,
@@ -592,6 +723,7 @@ struct PayloadRetentionObservation {
     old_total_bytes: u64,
     reclaim_passes: u64,
     reclaim_completed: bool,
+    unretained_dead_object: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -604,6 +736,8 @@ struct Observation {
     reads: Vec<(ReadRange, Result<[u8; 32], FsError>)>,
     reported_lost: Vec<LostRange>,
     admitted_pending_at_loss: bool,
+    commit_waited_for_admitted: bool,
+    late_arrival: Option<Result<(), FsError>>,
     cut: Option<Cut>,
     cut_object: Option<PathBuf>,
     journal_absent: bool,
@@ -614,6 +748,7 @@ struct Observation {
     read_only: bool,
     payload_retention: Option<PayloadRetentionObservation>,
     fault: FaultObservation,
+    review: Option<review_cases::ReviewObservation>,
 }
 
 #[async_trait]
@@ -622,7 +757,23 @@ trait Survival: Sync {
         None.context("the production interrupted-writer shutdown hook is absent")
     }
     async fn commit(&self, live: &Live) -> Result<SurvivalReceipt>;
-    async fn recover(&self, live: &Live, receipt: &SurvivalReceipt) -> Result<Option<Recovered>>;
+    async fn recover(&self, sources: &RecoverySources) -> Result<Option<Recovered>>;
+    async fn status(&self, _live: &Live) -> Result<SurvivalStatus> {
+        None.context("the production survival status hook is absent")
+    }
+    async fn clear_fault(&self, _live: &Live) -> Result<()> {
+        None.context("the production transient replica retry hook is absent")
+    }
+    async fn review_action(&self, _live: &mut Live, action: review_cases::Action) -> Result<()> {
+        let scenario = match action {
+            review_cases::Action::Enable(row) => format!("{row:?}"),
+            other => format!("{other:?}"),
+        };
+        None.with_context(|| format!("the production {scenario} scenario hook is absent"))
+    }
+    async fn owned_checkpoints(&self, _live: &Live) -> Result<Vec<slatedb::Checkpoint>> {
+        None.context("the production owned-checkpoint inspection hook is absent")
+    }
     async fn pause_commit(&self, _live: &Live, _cut: Cut) -> Result<Option<PausedCommit>> {
         Ok(None)
     }
@@ -645,7 +796,8 @@ impl Survival for CurrentImplementation {
         None.context("the production survival receipt hook is absent")
     }
 
-    async fn recover(&self, _live: &Live, _receipt: &SurvivalReceipt) -> Result<Option<Recovered>> {
+    async fn recover(&self, sources: &RecoverySources) -> Result<Option<Recovered>> {
+        let _bootstrap_inputs = (&sources.replicas, sources.password, &sources.scratch_parent);
         None.context("the production offline recovery hook is absent")
     }
 }
@@ -675,11 +827,146 @@ impl Survival for StubSurvival {
             digest: Sha256::digest(b"stub success").into(),
             mutation_cutoff: live.fs().capture_mutation_cutoff().sequence,
             envelope_epoch: 1,
+            sequence: 1,
         })
     }
-    async fn recover(&self, _live: &Live, _receipt: &SurvivalReceipt) -> Result<Option<Recovered>> {
+    async fn recover(&self, _sources: &RecoverySources) -> Result<Option<Recovered>> {
         Ok(None)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+enum SurvivalFailure {
+    #[error("replica deadline expired before record publication")]
+    Timeout,
+    #[error("metadata replica is full")]
+    Full,
+    #[error("metadata replica is stale")]
+    Stale,
+    #[error("metadata replica I/O failed")]
+    Io,
+    #[error("durable survival configuration is missing or mismatched")]
+    Configuration,
+    #[error("survival was disabled by a terminal record")]
+    Disabled,
+    #[error("metadata authentication or dependency verification failed")]
+    Corrupt,
+    #[error("authenticated commit chains conflict")]
+    Fork,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SurvivalStatus {
+    last_sequence: Option<u64>,
+    last_digest: Option<[u8; 32]>,
+    completed_at: Option<u64>,
+    lag: Duration,
+    failed_replicas: BTreeMap<String, String>,
+    admission_open: bool,
+    owned_checkpoints: usize,
+}
+
+async fn probe_create(live: &Live, name: &[u8]) -> Result<Result<(), FsError>> {
+    let auth = AuthContext::default();
+    let creds = Credentials::from_auth_context(&auth);
+    Ok(tokio::time::timeout(
+        Duration::from_secs(2),
+        live.fs().create(&creds, 0, name, &SetAttributes::default()),
+    )
+    .await
+    .context("a mutation remained queued beyond its admission bound")?
+    .map(|_| ()))
+}
+
+async fn overwrite_first_file(live: &mut Live, seed: u32) -> Result<()> {
+    let file = live.reads[0].inode;
+    let data = payload(seed).slice(..FINAL_SIZE);
+    live.fs()
+        .write(&AuthContext::default(), file, 0, &data)
+        .await?;
+    let _ = live.fs().administrative_remote_durability().await?;
+    live.expected = State::capture(live.fs(), live.pool(), &live.replica_roots()[0]).await?;
+    let placements = live.pool().placements().await?;
+    let mut current_reads = live.reads.clone();
+    for range in current_reads.iter_mut().filter(|r| r.inode == file) {
+        let loc = live
+            .fs()
+            .db
+            .get_bytes(
+                &KeyCodec::new().extent_key(file, range.offset / crate::fs::EXTENT_SIZE as u64),
+            )
+            .await?
+            .context("successor extent")?;
+        let loc = FrameLoc::decode(&loc).context("successor frame")?;
+        range.member = Some(
+            placements
+                .iter()
+                .find(|p| {
+                    p.location
+                        .as_ref()
+                        .ends_with(loc.segid.object_key().as_str())
+                })
+                .context("successor mapping")?
+                .member_id
+                .clone(),
+        );
+        range.sha256 = Sha256::digest(
+            &data[range.offset as usize..range.offset as usize + range.length as usize],
+        )
+        .into();
+    }
+    live.reads = current_reads;
+    Ok(())
+}
+
+async fn create_dead_control(live: &Live, range: &ReadRange) -> Result<(PathBuf, [u8; 32])> {
+    // The first successor was never committed for survival. Overwriting it
+    // again makes that exact segment an unretained control for the same pass.
+    let key = KeyCodec::new().extent_key(range.inode, 0);
+    let loc = live
+        .fs()
+        .db
+        .get_bytes(&key)
+        .await?
+        .context("dead control extent")?;
+    let loc = FrameLoc::decode(&loc).context("dead control frame")?;
+    let placement = live
+        .pool()
+        .placements()
+        .await?
+        .into_iter()
+        .find(|p| {
+            p.location
+                .as_ref()
+                .ends_with(loc.segid.object_key().as_str())
+        })
+        .context("dead control physical generation")?;
+    let path = live
+        .fixture
+        .root
+        .path()
+        .join(format!("{}-device/data", placement.member_id))
+        .join(placement.physical_key);
+    ensure!(path.is_file(), "the dead control must exist before reclaim");
+    let data = payload(103).slice(..range.length as usize);
+    live.fs()
+        .write(&AuthContext::default(), range.inode, 0, &data)
+        .await?;
+    let _ = live.fs().administrative_remote_durability().await?;
+    let counter = live
+        .fs()
+        .db
+        .get_bytes(&KeyCodec::new().segcount_key(loc.segid.epoch, loc.segid.counter))
+        .await?
+        .context("dead control segment counter")?;
+    ensure!(
+        KeyCodec::decode_segcount(&counter)
+            .context("dead control counts")?
+            .0
+            == 0,
+        "the control is still live"
+    );
+    Ok((path, Sha256::digest(data).into()))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -758,21 +1045,66 @@ fn fault_oracle(row: Row, live: &Live, observed: &Observation) -> Result<()> {
         "{fault:?} replica hook is absent or did not inject the requested fault"
     );
     match fault {
-        ReplicaFault::Slow => {
+        ReplicaFault::Slow | ReplicaFault::Full | ReplicaFault::Stale | ReplicaFault::Io => {
+            let prior = observed
+                .receipt
+                .as_ref()
+                .context("no prior fault receipt")?;
+            let before = actual
+                .before_status
+                .as_ref()
+                .context("no status before the fault")?;
+            let after = actual
+                .after_status
+                .as_ref()
+                .context("no status after the fault")?;
             ensure!(
-                actual.elapsed >= REPLICA_TIMEOUT,
-                "the slow replica did not cross the 30-second timeout"
+                before.last_sequence == Some(prior.sequence)
+                    && after.last_sequence == before.last_sequence
+                    && after.last_digest == before.last_digest
+                    && after.completed_at == before.completed_at,
+                "a failed attempt advanced the successful recovery point"
             );
             ensure!(
-                actual.survival_refused && actual.reported_failed,
-                "the timed-out replica must stop survival acknowledgements and be reported failed"
+                after.lag >= before.lag && after.failed_replicas.contains_key("disk-a-metadata"),
+                "status omitted growing lag or the failed replica identity"
             );
-        }
-        ReplicaFault::Full | ReplicaFault::Stale | ReplicaFault::Io => {
+            let expected = match fault {
+                ReplicaFault::Slow => SurvivalFailure::Timeout,
+                ReplicaFault::Full => SurvivalFailure::Full,
+                ReplicaFault::Stale => SurvivalFailure::Stale,
+                ReplicaFault::Io => SurvivalFailure::Io,
+                _ => unreachable!(),
+            };
             ensure!(
-                actual.survival_refused && actual.reported_failed,
-                "the failed replica must stop survival acknowledgements"
+                actual.commit_error == Some(expected),
+                "the commit did not return its specific fault"
             );
+            if fault == ReplicaFault::Slow {
+                ensure!(
+                    actual.elapsed >= REPLICA_TIMEOUT
+                        && actual.elapsed <= REPLICA_TIMEOUT + Duration::from_secs(5),
+                    "the slow replica must return within its 90-second timeout plus settlement margin"
+                );
+                ensure!(
+                    after.admission_open && actual.mutation_result == Some(Ok(())),
+                    "a pre-record timeout must reopen mutation admission"
+                );
+                let retry = actual
+                    .retry_receipt
+                    .as_ref()
+                    .context("online retry returned no receipt")?;
+                ensure!(
+                    retry.sequence > prior.sequence,
+                    "online retry did not advance the generation"
+                );
+                verify_replica_record(live, retry, RecordCoverage::AllRequired)?;
+            } else {
+                ensure!(
+                    !after.admission_open && actual.mutation_result == Some(Err(FsError::IoError)),
+                    "a failed metadata replica must reject an actual mutation with EIO"
+                );
+            }
         }
         ReplicaFault::SecondWriter => {
             ensure!(
@@ -839,15 +1171,6 @@ fn fault_oracle(row: Row, live: &Live, observed: &Observation) -> Result<()> {
             );
         }
     }
-    if !matches!(
-        fault,
-        ReplicaFault::SecondWriter | ReplicaFault::Replacement
-    ) {
-        ensure!(
-            actual.writable_refused,
-            "the failed metadata replica must leave the share read-only"
-        );
-    }
     verify_replica_record(
         live,
         observed
@@ -860,6 +1183,9 @@ fn fault_oracle(row: Row, live: &Live, observed: &Observation) -> Result<()> {
 }
 
 fn oracle(row: Row, live: &Live, observed: &Observation) -> Result<()> {
+    if row.review_case() {
+        return review_cases::oracle(row, live, observed);
+    }
     if row.fault().is_some() {
         return fault_oracle(row, live, observed);
     }
@@ -872,8 +1198,10 @@ fn oracle(row: Row, live: &Live, observed: &Observation) -> Result<()> {
                 .context("no overwrite and reclaim evidence")?,
         )?,
         Row::AdmittedWriteLoss => ensure!(
-            observed.admitted_pending_at_loss,
-            "no admitted write was blocked mid-commit at device loss"
+            observed.admitted_pending_at_loss
+                && observed.commit_waited_for_admitted
+                && observed.late_arrival == Some(Err(FsError::ReadOnlyFilesystem)),
+            "the admitted write must overlap a waiting commit and a bounded rejected late arrival"
         ),
         Row::InterruptedCommit => {
             ensure!(
@@ -968,6 +1296,14 @@ fn payload_retention_oracle(live: &Live, observed: &PayloadRetentionObservation)
         observed.reclaim_completed && observed.reclaim_passes > 0,
         "a completed reclaim pass must actually run after the overwrite"
     );
+    let dead = observed
+        .unretained_dead_object
+        .as_ref()
+        .context("no dead unretained control object")?;
+    ensure!(
+        !dead.exists(),
+        "reclaim retained an unreferenced control object, so disabling GC could pass"
+    );
     let bytes = std::fs::read(&observed.old_object)
         .context("reclaim deleted payload still needed by the survival receipt")?;
     ensure!(
@@ -1039,31 +1375,40 @@ async fn overwrite_and_reclaim(live: &Live) -> Result<PayloadRetentionObservatio
         old_live_bytes == 0 && old_total_bytes > 0,
         "the fixture must make the receipt's segment fully reclaimable"
     );
+    println!("METADATA_SURVIVAL_RECLAIM_PHASE prepare-unretained-control");
+    let (unretained_dead_object, successor_hash) =
+        tokio::time::timeout(Duration::from_secs(10), create_dead_control(live, &range))
+            .await
+            .context("the dead control preparation did not finish")??;
+    println!("METADATA_SURVIVAL_RECLAIM_PHASE collect");
     let stats = live.fs().extent_store.segment_gc_stats();
     let before = stats.passes.load(std::sync::atomic::Ordering::Relaxed);
     // The live export pin must already have transferred to the ledger. Run a
     // full pass so a permanent-checkpoint skip cannot satisfy this contract.
-    let pass = live
-        .fs()
-        .extent_store
-        .reclaim_segments_gated(
+    let pass = tokio::time::timeout(
+        Duration::from_secs(30),
+        live.fs().extent_store.reclaim_segments_gated(
             || std::future::ready(Ok(Some((chrono::Utc::now(), None)))),
             None,
             Duration::ZERO,
             |_| false,
             64 * 1024 * 1024,
-        )
-        .await?;
+        ),
+    )
+    .await
+    .context("the reclaim pass did not finish")??;
+    println!("METADATA_SURVIVAL_RECLAIM_PHASE collected");
     let after = stats.passes.load(std::sync::atomic::Ordering::Relaxed);
     Ok(PayloadRetentionObservation {
         range,
         old_object,
         old_object_digest,
-        successor_hash: Sha256::digest(successor).into(),
+        successor_hash,
         old_live_bytes,
         old_total_bytes,
         reclaim_passes: after.saturating_sub(before),
         reclaim_completed: matches!(pass.status, crate::fs::store::PassStatus::Completed { .. }),
+        unretained_dead_object: Some(unretained_dead_object),
     })
 }
 
@@ -1153,7 +1498,6 @@ fn recovery_read_plan<'a>(
 async fn collect_recovery(
     live: &Live,
     driver: &dyn Survival,
-    receipt: &SurvivalReceipt,
     read_generations: &[(&SurvivalReceipt, &[ReadRange])],
     observed: &mut Observation,
 ) -> Result<()> {
@@ -1162,7 +1506,7 @@ async fn collect_recovery(
         .iter()
         .map(|root| tree_hashes(&root.join(".zerofs-survival/v1")))
         .collect::<Result<_>>()?;
-    if let Some(recovered) = driver.recover(live, receipt).await? {
+    if let Some(recovered) = driver.recover(&RecoverySources::from_live(live)).await? {
         let result = async {
             ensure!(
                 recovered.authority.starts_with(recovered.scratch.path()),
@@ -1183,8 +1527,6 @@ async fn collect_recovery(
                     .await,
                 Err(FsError::ReadOnlyFilesystem)
             );
-            // Select the hashes and placements before issuing reads. The
-            // predecessor and interrupted successor have different contents.
             for range in recovery_read_plan(&recovered.commit_digest, read_generations)? {
                 let read = recovered
                     .fs
@@ -1219,9 +1561,15 @@ async fn collect_recovery(
 
 fn lose_device(live: &Live, lost: Device) -> Result<()> {
     let device = live.fixture.root.path().join(lost.directory());
-    if !device.exists() {
-        std::fs::create_dir_all(&device)?;
-    }
+    ensure!(
+        device.is_dir(),
+        "cannot lose a device that never existed: {}",
+        device.display()
+    );
+    ensure!(
+        !tree_hashes(&device)?.is_empty(),
+        "cannot lose an empty fixture device"
+    );
     std::fs::remove_dir_all(device)?;
     ensure!(
         !live.fixture.root.path().join(lost.directory()).exists(),
@@ -1266,14 +1614,7 @@ async fn recover_after_loss(
     mut observed: Observation,
 ) -> Result<()> {
     remove_active_originals(live, &mut observed)?;
-    collect_recovery(
-        live,
-        driver,
-        &receipt,
-        &[(&receipt, &live.reads)],
-        &mut observed,
-    )
-    .await?;
+    collect_recovery(live, driver, &[(&receipt, &live.reads)], &mut observed).await?;
     observed.receipt = Some(receipt);
     oracle(row, live, &observed)
 }
@@ -1388,8 +1729,35 @@ async fn journal_case(row: Row, live: &mut Live, driver: &dyn Survival) -> Resul
 }
 
 async fn one_case(row: Row, live: &mut Live, driver: &dyn Survival) -> Result<()> {
-    if let Some(fault) = row.fault() {
-        let mut fault = driver.fault(live, fault).await?;
+    if row.review_case() {
+        let observed = review_cases::exercise(row, live, driver).await?;
+        return oracle(row, live, &observed);
+    }
+    if let Some(kind) = row.fault() {
+        let mut fault = driver.fault(live, kind).await?;
+        if matches!(
+            kind,
+            ReplicaFault::Slow | ReplicaFault::Full | ReplicaFault::Stale | ReplicaFault::Io
+        ) && fault.injected == Some(kind)
+        {
+            fault.before_status = Some(driver.status(live).await?);
+            let started = std::time::Instant::now();
+            let result = tokio::time::timeout(
+                REPLICA_TIMEOUT + Duration::from_secs(5),
+                driver.commit(live),
+            )
+            .await?;
+            fault.elapsed = started.elapsed();
+            fault.commit_error = result
+                .err()
+                .and_then(|e| e.downcast_ref::<SurvivalFailure>().copied());
+            fault.after_status = Some(driver.status(live).await?);
+            fault.mutation_result = Some(probe_create(live, b"fault-mutation").await?);
+            if kind == ReplicaFault::Slow {
+                driver.clear_fault(live).await?;
+                fault.retry_receipt = Some(driver.commit(live).await?);
+            }
+        }
         let observed = Observation {
             receipt: fault.prior_receipt.take(),
             fault,
@@ -1421,32 +1789,62 @@ async fn one_case(row: Row, live: &mut Live, driver: &dyn Survival) -> Result<()
         .await;
     }
     if row == Row::AdmittedWriteLoss {
-        let pause = driver
+        let write = driver
             .pause_write(live)
             .await?
             .context("the admitted-write mid-commit hook is absent")?;
+        let mut commit = None;
         let result = async {
-            let receipt = driver.commit(live).await?;
-            verify_replica_record(live, &receipt, RecordCoverage::AllRequired)?;
+            let prior = driver.commit(live).await?;
+            verify_replica_record(live, &prior, RecordCoverage::AllRequired)?;
             live.expected =
                 State::capture(live.fs(), live.pool(), &live.replica_roots()[0]).await?;
+            write
+                .start
+                .send(())
+                .map_err(|_| anyhow::anyhow!("write start barrier closed"))?;
+            tokio::time::timeout(Duration::from_secs(5), write.admitted).await??;
+            let cut = Cut {
+                point: CommitPoint::AdmittedWorkDrained,
+                side: Side::Before,
+                replica: "authority",
+                lost: Device::Authority,
+            };
+            let pause = driver
+                .pause_commit(live, cut)
+                .await?
+                .context("the production commit drain hook is absent")?;
             pause
                 .start
                 .send(())
-                .map_err(|_| anyhow::anyhow!("the write start barrier closed"))?;
-            tokio::time::timeout(Duration::from_secs(5), pause.admitted).await??;
+                .map_err(|_| anyhow::anyhow!("commit start barrier closed"))?;
+            let event = tokio::time::timeout(Duration::from_secs(5), pause.entered).await??;
+            let waiting =
+                event.cut == cut && !pause.task.is_finished() && !write.task.is_finished();
+            // Release the artificial hook. Only the admitted write may now
+            // prevent the real drain from completing.
+            let _ = pause.release.send(());
+            commit = Some(pause.task);
+            let late = probe_create(live, b"late-arrival").await?;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let pending = !write.task.is_finished();
+            let drained_wait = waiting && !commit.as_ref().unwrap().is_finished();
             ensure!(
-                !pause.task.is_finished(),
-                "the admitted write completed before device loss"
+                pending && drained_wait,
+                "commit did not wait for admitted work"
             );
             lose_device(live, Device::Authority)?;
-            Ok(receipt)
+            Ok((prior, pending, drained_wait, late))
         }
         .await;
-        drop(pause.release);
-        pause.task.abort();
-        let _ = pause.task.await;
-        let receipt = result?;
+        drop(write.release);
+        write.task.abort();
+        let _ = write.task.await;
+        if let Some(task) = commit {
+            task.abort();
+            let _ = task.await;
+        }
+        let (receipt, pending, waited, late) = result?;
         driver.crash_writer(live).await?;
         return recover_after_loss(
             row,
@@ -1454,7 +1852,9 @@ async fn one_case(row: Row, live: &mut Live, driver: &dyn Survival) -> Result<()
             driver,
             receipt,
             Observation {
-                admitted_pending_at_loss: true,
+                admitted_pending_at_loss: pending,
+                commit_waited_for_admitted: waited,
+                late_arrival: Some(late),
                 ..Default::default()
             },
         )
@@ -1480,52 +1880,11 @@ async fn one_case(row: Row, live: &mut Live, driver: &dyn Survival) -> Result<()
     lose_and_recover(row, live, driver, receipt, lost, Observation::default()).await
 }
 
-async fn overwrite_first_file(live: &mut Live, seed: u32) -> Result<()> {
-    let file = live.reads[0].inode;
-    let data = payload(seed).slice(..FINAL_SIZE);
-    live.fs()
-        .write(&AuthContext::default(), file, 0, &data)
-        .await?;
-    let _ = live.fs().administrative_remote_durability().await?;
-    live.expected = State::capture(live.fs(), live.pool(), &live.replica_roots()[0]).await?;
-    let placements = live.pool().placements().await?;
-    let mut current_reads = live.reads.clone();
-    for range in current_reads.iter_mut().filter(|r| r.inode == file) {
-        let loc = live
-            .fs()
-            .db
-            .get_bytes(
-                &KeyCodec::new().extent_key(file, range.offset / crate::fs::EXTENT_SIZE as u64),
-            )
-            .await?
-            .context("successor extent")?;
-        let loc = FrameLoc::decode(&loc).context("successor frame")?;
-        range.member = Some(
-            placements
-                .iter()
-                .find(|p| {
-                    p.location
-                        .as_ref()
-                        .ends_with(loc.segid.object_key().as_str())
-                })
-                .context("successor mapping")?
-                .member_id
-                .clone(),
-        );
-        range.sha256 = Sha256::digest(
-            &data[range.offset as usize..range.offset as usize + range.length as usize],
-        )
-        .into();
-    }
-    live.reads = current_reads;
-    Ok(())
-}
-
 async fn interrupted_case(
     live: &mut Live,
     driver: &dyn Survival,
     cut: Cut,
-    pause: PausedCommit,
+    mut pause: PausedCommit,
 ) -> Result<()> {
     let candidate_slot = Arc::clone(&pause.candidate);
     let result: Result<(CutEvent, SurvivalReceipt, State, Vec<ReadRange>)> = async {
@@ -1543,16 +1902,21 @@ async fn interrupted_case(
         );
         verify_replica_record(live, &middle, RecordCoverage::AllRequired)?;
         overwrite_first_file(live, 87).await?;
+        survival_test_support::create_debts(live.pool()).await?;
         let prior = driver
             .commit(live)
             .await
             .context("the prior receipt must precede the interrupted successor")?;
         ensure!(
-            prior.digest != middle.digest && prior.digest != oldest.digest,
+            prior.digest != middle.digest
+                && prior.digest != oldest.digest
+                && oldest.sequence < middle.sequence
+                && middle.sequence < prior.sequence,
             "the predecessor must be a new generation after the overwrite"
         );
         verify_replica_record(live, &prior, RecordCoverage::AllRequired)?;
         let prior_state = State::capture(live.fs(), live.pool(), &live.replica_roots()[0]).await?;
+        survival_test_support::require_nonzero_debts(&prior_state.catalog)?;
         let prior_reads = live.reads.clone();
         // Change a current file so a mixture of predecessor and candidate state
         // cannot satisfy either complete-generation oracle.
@@ -1593,24 +1957,48 @@ async fn interrupted_case(
     // A complete unacknowledged candidate is legal after record publication.
     // The driver may name it only when its real hook has built that record.
     let candidate = candidate_slot.lock().unwrap().clone();
-    let probe = candidate.as_ref().unwrap_or(&prior);
+    let returned = pause.receipt_returned.try_recv().ok().transpose()?;
+    let requires_publication = matches!(
+        cut.point,
+        CommitPoint::RetirementLogged
+            | CommitPoint::CheckpointReleased
+            | CommitPoint::DependencyDeleted
+            | CommitPoint::DebtCompletionCommitted
+    ) || (cut.point == CommitPoint::CommitDirectorySynced
+        && cut.side == Side::After
+        && cut.replica == "disk-a-metadata");
+    let all_records = requires_publication
+        || pause.progress.lock().unwrap().durable_records.len() == live.replica_roots().len();
+    let may_select_prior = returned.is_none() && !all_records;
     let mut read_generations = vec![(&prior, prior_reads.as_slice())];
     if let Some(candidate) = &candidate {
         ensure!(
             candidate.digest != prior.digest,
-            "the candidate reused the predecessor digest"
+            "candidate reused the predecessor digest"
         );
         read_generations.push((candidate, live.reads.as_slice()));
     }
     remove_active_originals(live, &mut observed)?;
-    collect_recovery(live, driver, probe, &read_generations, &mut observed).await?;
+    collect_recovery(live, driver, &read_generations, &mut observed).await?;
     let receipt = if observed.recovered_digest == Some(prior.digest) {
+        ensure!(
+            may_select_prior,
+            "recovery rolled back a returned or fully durable commit"
+        );
         live.expected = prior_state;
         live.reads = prior_reads;
         prior
     } else {
-        observed.recovered_unacknowledged_candidate = true;
-        candidate.context("recovery selected a generation with no complete candidate record")?
+        observed.recovered_unacknowledged_candidate = may_select_prior;
+        let candidate = candidate
+            .context("recovery selected a generation with no complete candidate record")?;
+        if let Some(returned) = returned {
+            ensure!(
+                returned.digest == candidate.digest,
+                "returned receipt differs from candidate"
+            );
+        }
+        candidate
     };
     observed.receipt = Some(receipt);
     oracle(Row::InterruptedCommit, live, &observed)
@@ -1632,11 +2020,17 @@ async fn finish(mut live: Live, row: Row, result: Result<()>) -> Result<()> {
 async fn acceptance(row: Row) -> Result<()> {
     if row == Row::InterruptedCommit {
         let mut failures = Vec::new();
-        let mut idle_fixture = Some(Live::new(false).await?);
+        let mut first = Live::new(false).await?;
+        first.attach_journal().await?;
+        let mut idle_fixture = Some(first);
         for cut in cuts() {
             let mut live = match idle_fixture.take() {
                 Some(live) => live,
-                None => Live::new(false).await?,
+                None => {
+                    let mut fresh = Live::new(false).await?;
+                    fresh.attach_journal().await?;
+                    fresh
+                }
             };
             let result = match CurrentImplementation.pause_commit(&live, cut).await? {
                 Some(pause) => {
@@ -1688,7 +2082,7 @@ macro_rules! acceptance_row {
                 Duration::from_secs(if Row::$row == Row::InterruptedCommit {
                     5400
                 } else {
-                    180
+                    600
                 }),
                 acceptance(Row::$row),
             )
@@ -1774,7 +2168,12 @@ acceptance_row!(
 async fn every_acceptance_oracle_rejects_success_without_survival() -> Result<()> {
     let live = Live::new(true).await?;
     let receipt = StubSurvival.commit(&live).await?;
-    ensure!(StubSurvival.recover(&live, &receipt).await?.is_none());
+    ensure!(
+        StubSurvival
+            .recover(&RecoverySources::from_live(&live))
+            .await?
+            .is_none()
+    );
     let mut rejected = 0;
     for row in Row::ALL {
         // Feed successful stub output directly to the same oracle used by the
@@ -1783,6 +2182,30 @@ async fn every_acceptance_oracle_rejects_success_without_survival() -> Result<()
         let error = oracle(row, &live, &observed)
             .expect_err("a successful no-op passed an acceptance oracle");
 
+        let before_status = SurvivalStatus {
+            last_sequence: Some(receipt.sequence),
+            last_digest: Some(receipt.digest),
+            completed_at: Some(1),
+            lag: Duration::from_secs(1),
+            failed_replicas: BTreeMap::new(),
+            admission_open: true,
+            owned_checkpoints: 0,
+        };
+        let mut after_status = before_status.clone();
+        after_status.lag = REPLICA_TIMEOUT;
+        after_status.failed_replicas.insert(
+            "disk-a-metadata".to_owned(),
+            "injected replica fault".to_owned(),
+        );
+        after_status.admission_open = row == Row::SlowReplica;
+        let commit_error = match row {
+            Row::FullReplica => SurvivalFailure::Full,
+            Row::StaleReplica => SurvivalFailure::Stale,
+            Row::ErroringReplica => SurvivalFailure::Io,
+            _ => SurvivalFailure::Timeout,
+        };
+        let mut retry = receipt.clone();
+        retry.sequence += 1;
         let optimistic = Observation {
             receipt: Some(receipt.clone()),
             recovered: Some(live.expected.clone()),
@@ -1794,6 +2217,11 @@ async fn every_acceptance_oracle_rejects_success_without_survival() -> Result<()
                 .map(|range| (range.clone(), Ok(range.sha256)))
                 .collect(),
             admitted_pending_at_loss: true,
+            commit_waited_for_admitted: true,
+            late_arrival: Some(Err(FsError::ReadOnlyFilesystem)),
+            review: row
+                .review_case()
+                .then(|| review_cases::optimistic(row, &live, &receipt)),
             cut: Some(cuts()[0]),
             cut_object: Some("objects/stub".into()),
             journal_absent: true,
@@ -1809,9 +2237,15 @@ async fn every_acceptance_oracle_rejects_success_without_survival() -> Result<()
             fault: FaultObservation {
                 injected: row.fault(),
                 elapsed: REPLICA_TIMEOUT,
-                survival_refused: true,
-                writable_refused: true,
-                reported_failed: true,
+                commit_error: Some(commit_error),
+                mutation_result: Some(if row == Row::SlowReplica {
+                    Ok(())
+                } else {
+                    Err(FsError::IoError)
+                }),
+                before_status: Some(before_status),
+                after_status: Some(after_status),
+                retry_receipt: Some(retry),
                 second_writer_refused: true,
                 first_writer_still_owns_lock: true,
                 online_catch_up_refused: true,
@@ -1851,6 +2285,7 @@ fn record_oracle_distinguishes_acknowledgement_from_interrupted_fanout() -> Resu
         relative_record: "commits/1/3.json".into(),
         digest: Sha256::digest(bytes).into(),
         mutation_cutoff: 3,
+        sequence: 3,
         envelope_epoch: 1,
     };
     let records = roots
@@ -1905,12 +2340,14 @@ fn recovery_reads_follow_the_selected_generation() -> Result<()> {
         relative_record: "commits/1/2.json".into(),
         digest: [2; 32],
         mutation_cutoff: 2,
+        sequence: 2,
         envelope_epoch: 1,
     };
     let candidate = SurvivalReceipt {
         relative_record: "commits/1/3.json".into(),
         digest: [3; 32],
         mutation_cutoff: 3,
+        sequence: 3,
         envelope_epoch: 1,
     };
     let prior_reads = [ReadRange {
@@ -2057,6 +2494,13 @@ async fn unretained_superseded_payload_is_reclaimed() -> Result<()> {
             !observed.old_object.exists(),
             "the control must delete the old payload"
         );
+        ensure!(
+            observed
+                .unretained_dead_object
+                .as_ref()
+                .is_some_and(|path| !path.exists()),
+            "the control must delete the unretained intermediate payload"
+        );
         let error = payload_retention_oracle(&live, &observed)
             .expect_err("the retention oracle accepted actual missing payload");
         println!(
@@ -2074,7 +2518,7 @@ async fn unretained_superseded_payload_is_reclaimed() -> Result<()> {
 
 #[tokio::test]
 async fn commit_cut_hook_blocks_each_requested_boundary() -> Result<()> {
-    ensure!(cuts().len() == 288);
+    ensure!(cuts().len() == 304);
     for cut in cuts() {
         let (mut hook, entered, release) = CommitCutHook::channel(cut);
         // A different replica must not trigger this boundary.
@@ -2115,3 +2559,6 @@ async fn commit_cut_hook_blocks_each_requested_boundary() -> Result<()> {
     }
     Ok(())
 }
+
+#[path = "review_cases.rs"]
+mod review_cases;
