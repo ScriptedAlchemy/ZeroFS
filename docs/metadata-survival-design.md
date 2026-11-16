@@ -559,7 +559,12 @@ operations. A parser that merely accepts the table cannot satisfy the contract.
 
 Every recovery row requires a receipt naming a commit digest, a mutation cutoff
 and an envelope epoch. The test reads that record from each configured replica
-before loss and checks its hash. It captures namespace rows, all eight catalog
+before loss and checks its hash; an absent configured directory cannot shrink
+the acknowledgement set. An interrupted, unacknowledged candidate is different:
+its record may exist on only one survivor after partial fanout, but every copy
+that exists must have the expected digest. Recovery reads use the hashes and
+placements captured for the generation actually selected, whether predecessor
+or candidate. It captures namespace rows, all eight catalog
 tables as exact key/value bytes and the original key envelope at the receipt.
 Catalog bytes cover pool identity, the complete member set, every mapping's
 physical generation and checksum, debts and capacity charges. The exact-recovery
@@ -603,6 +608,11 @@ counterexample to payload survival today, not a passing survival row.
 The typed cut matrix currently names 18 points, two sides, two replicas and four
 logical devices, for 288 hook requests. Dependency publication and sync points
 must repeat for each actual dependency path when the production owner is wired.
+The interrupted fixture first commits three generations with different file
+contents, then interrupts a fourth. The third can retire the oldest generation
+under the two-generation policy; the fourth can record that deletion's debt
+completion and retire the next oldest generation. A two-generation fixture would
+never reach retirement, dependency deletion or the later debt-completion boundary.
 The stage does not claim that it has injected any of those cuts. A missing hook
 returns a specific prerequisite failure. Each exercised cut needs a fresh
 fixture. The matrix returns success only if every requested case passes; it has
@@ -625,9 +635,16 @@ reports and still requires physical replica evidence. A separate comparison
 test rejects removal or mutation of catalog rows, envelope fields and exact
 range outcomes. Both run in the ordinary module suite.
 
-The ordinary module run skips the 14 acceptance rows and passes the four
-durability and retention controls, the two mutation checks and the test of the 288 requested
-test-channel boundaries. Those channel events are not production commit cuts.
+Two focused oracle tests distinguish full acknowledgement from interrupted
+record fanout and select predecessor or candidate read plans using the recovered
+commit digest. They reject a missing required replica, conflicting surviving
+records and an unknown generation. These are comparison and file-evidence tests;
+they do not exercise production recovery or establish file-sync durability.
+
+The ordinary module run skips the 14 acceptance rows and includes the four
+durability and retention controls, the two mutation checks, the two focused
+oracle checks and the test of the 288 requested test-channel boundaries. Those
+channel events are not production commit cuts.
 Each ignored row must also be run explicitly,
 with its specific missing-dependency line retained. These intentional failures
 are design evidence, not survival evidence. The external report records exact

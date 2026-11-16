@@ -410,7 +410,7 @@ impl Live {
             let _ = fs.administrative_remote_durability().await?;
             let loc = fs
                 .db
-                .get_bytes(&KeyCodec.extent_key(inode, 0))
+                .get_bytes(&KeyCodec::new().extent_key(inode, 0))
                 .await?
                 .context("extra file extent")?;
             let loc = FrameLoc::decode(&loc).context("extra file frame")?;
@@ -448,7 +448,8 @@ impl Live {
             }
             for offset in (0..data.len()).step_by(crate::fs::EXTENT_SIZE) {
                 let length = (data.len() - offset).min(crate::fs::EXTENT_SIZE);
-                let key = KeyCodec.extent_key(inode, (offset / crate::fs::EXTENT_SIZE) as u64);
+                let key =
+                    KeyCodec::new().extent_key(inode, (offset / crate::fs::EXTENT_SIZE) as u64);
                 let loc = fs
                     .db
                     .get_bytes(&key)
@@ -599,6 +600,7 @@ struct Observation {
     recovered: Option<State>,
     recovered_digest: Option<[u8; 32]>,
     recovered_epoch: Option<u64>,
+    recovered_unacknowledged_candidate: bool,
     reads: Vec<(ReadRange, Result<[u8; 32], FsError>)>,
     reported_lost: Vec<LostRange>,
     admitted_pending_at_loss: bool,
@@ -680,7 +682,26 @@ impl Survival for StubSurvival {
     }
 }
 
-fn verify_replica_record(live: &Live, receipt: &SurvivalReceipt) -> Result<()> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecordCoverage {
+    AllRequired,
+    AllSurviving,
+    InterruptedCandidate,
+}
+
+fn verify_replica_record(
+    live: &Live,
+    receipt: &SurvivalReceipt,
+    coverage: RecordCoverage,
+) -> Result<()> {
+    verify_replica_record_at(&live.replica_roots(), receipt, coverage)
+}
+
+fn verify_replica_record_at(
+    roots: &[PathBuf],
+    receipt: &SurvivalReceipt,
+    coverage: RecordCoverage,
+) -> Result<()> {
     ensure!(
         receipt
             .relative_record
@@ -692,22 +713,40 @@ fn verify_replica_record(live: &Live, receipt: &SurvivalReceipt) -> Result<()> {
         receipt.relative_record.starts_with("commits"),
         "receipt must name a commit"
     );
-    let roots = live.replica_roots();
     ensure!(
         roots.iter().any(|root| root.exists()),
         "no metadata replica survived"
     );
-    for replica in roots.iter().filter(|root| root.exists()) {
+    let mut verified = 0;
+    for replica in roots {
+        if !replica.exists() && coverage != RecordCoverage::AllRequired {
+            continue;
+        }
         let record = replica
             .join(".zerofs-survival/v1")
             .join(&receipt.relative_record);
-        let bytes = std::fs::read(&record)
-            .with_context(|| format!("receipt commit is absent on {}", replica.display()))?;
+        let bytes = match std::fs::read(&record) {
+            Ok(bytes) => bytes,
+            Err(error)
+                if coverage == RecordCoverage::InterruptedCandidate
+                    && error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                // Dependencies precede record fanout. An interrupted successor
+                // may therefore be complete on only one surviving replica.
+                continue;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("receipt commit is absent on {}", replica.display()));
+            }
+        };
         ensure!(
             <[u8; 32]>::from(Sha256::digest(bytes)) == receipt.digest,
             "receipt commit digest mismatch"
         );
+        verified += 1;
     }
+    ensure!(verified > 0, "no surviving replica contains the commit");
     Ok(())
 }
 
@@ -815,6 +854,7 @@ fn fault_oracle(row: Row, live: &Live, observed: &Observation) -> Result<()> {
             .receipt
             .as_ref()
             .context("no prior survival receipt for the fault case")?,
+        RecordCoverage::AllSurviving,
     )?;
     Ok(())
 }
@@ -888,7 +928,15 @@ fn oracle(row: Row, live: &Live, observed: &Observation) -> Result<()> {
         .receipt
         .as_ref()
         .context("no named survival receipt")?;
-    verify_replica_record(live, receipt)?;
+    verify_replica_record(
+        live,
+        receipt,
+        if row == Row::InterruptedCommit && observed.recovered_unacknowledged_candidate {
+            RecordCoverage::InterruptedCandidate
+        } else {
+            RecordCoverage::AllSurviving
+        },
+    )?;
     ensure!(
         observed.recovered_digest == Some(receipt.digest),
         "recovery did not select the receipt commit"
@@ -936,7 +984,7 @@ async fn overwrite_and_reclaim(live: &Live) -> Result<PayloadRetentionObservatio
         .find(|range| range.names.iter().any(|name| name == "/lost.bin"))
         .context("the isolated payload-retention file")?
         .clone();
-    let key = KeyCodec.extent_key(range.inode, 0);
+    let key = KeyCodec::new().extent_key(range.inode, 0);
     let old = live.fs().db.get_bytes(&key).await?.context("old extent")?;
     let old = FrameLoc::decode(&old).context("old frame location")?;
     let placement = live
@@ -982,7 +1030,7 @@ async fn overwrite_and_reclaim(live: &Live) -> Result<PayloadRetentionObservatio
     let counter = live
         .fs()
         .db
-        .get_bytes(&KeyCodec.segcount_key(old.segid.epoch, old.segid.counter))
+        .get_bytes(&KeyCodec::new().segcount_key(old.segid.epoch, old.segid.counter))
         .await?
         .context("the old segment counter")?;
     let (old_live_bytes, old_total_bytes) =
@@ -1091,10 +1139,22 @@ fn tree_hashes(root: &Path) -> Result<BTreeMap<PathBuf, [u8; 32]>> {
     Ok(output)
 }
 
+fn recovery_read_plan<'a>(
+    recovered_digest: &[u8; 32],
+    generations: &[(&SurvivalReceipt, &'a [ReadRange])],
+) -> Result<&'a [ReadRange]> {
+    generations
+        .iter()
+        .find(|(receipt, _)| receipt.digest == *recovered_digest)
+        .map(|(_, reads)| *reads)
+        .context("recovery selected a generation with no captured read plan")
+}
+
 async fn collect_recovery(
     live: &Live,
     driver: &dyn Survival,
     receipt: &SurvivalReceipt,
+    read_generations: &[(&SurvivalReceipt, &[ReadRange])],
     observed: &mut Observation,
 ) -> Result<()> {
     let sources: Vec<_> = live
@@ -1123,7 +1183,9 @@ async fn collect_recovery(
                     .await,
                 Err(FsError::ReadOnlyFilesystem)
             );
-            for range in &live.reads {
+            // Select the hashes and placements before issuing reads. The
+            // predecessor and interrupted successor have different contents.
+            for range in recovery_read_plan(&recovered.commit_digest, read_generations)? {
                 let read = recovered
                     .fs
                     .read_file(
@@ -1204,7 +1266,14 @@ async fn recover_after_loss(
     mut observed: Observation,
 ) -> Result<()> {
     remove_active_originals(live, &mut observed)?;
-    collect_recovery(live, driver, &receipt, &mut observed).await?;
+    collect_recovery(
+        live,
+        driver,
+        &receipt,
+        &[(&receipt, &live.reads)],
+        &mut observed,
+    )
+    .await?;
     observed.receipt = Some(receipt);
     oracle(row, live, &observed)
 }
@@ -1217,7 +1286,7 @@ async fn lose_and_recover(
     lost: Device,
     observed: Observation,
 ) -> Result<()> {
-    verify_replica_record(live, &receipt)?;
+    verify_replica_record(live, &receipt, RecordCoverage::AllRequired)?;
     lose_device(live, lost)?;
     if matches!(row, Row::JournalBeforeBackend | Row::JournalAfterBackend) {
         lose_device(live, Device::Authority)?;
@@ -1234,7 +1303,7 @@ async fn journal_case(row: Row, live: &mut Live, driver: &dyn Survival) -> Resul
         receipt.mutation_cutoff == live.fs().capture_mutation_cutoff().sequence,
         "the receipt does not cover the captured prefix"
     );
-    verify_replica_record(live, &receipt)?;
+    verify_replica_record(live, &receipt, RecordCoverage::AllRequired)?;
     live.expected = State::capture(live.fs(), live.pool(), &live.replica_roots()[0]).await?;
     // Close the original writer before attaching a paused writeback journal.
     live.close_writer().await;
@@ -1333,7 +1402,7 @@ async fn one_case(row: Row, live: &mut Live, driver: &dyn Survival) -> Result<()
     }
     if row == Row::PayloadRetention {
         let receipt = driver.commit(live).await?;
-        verify_replica_record(live, &receipt)?;
+        verify_replica_record(live, &receipt, RecordCoverage::AllRequired)?;
         live.expected = State::capture(live.fs(), live.pool(), &live.replica_roots()[0]).await?;
         let retained = overwrite_and_reclaim(live).await?;
         payload_retention_oracle(live, &retained)?;
@@ -1358,7 +1427,7 @@ async fn one_case(row: Row, live: &mut Live, driver: &dyn Survival) -> Result<()
             .context("the admitted-write mid-commit hook is absent")?;
         let result = async {
             let receipt = driver.commit(live).await?;
-            verify_replica_record(live, &receipt)?;
+            verify_replica_record(live, &receipt, RecordCoverage::AllRequired)?;
             live.expected =
                 State::capture(live.fs(), live.pool(), &live.replica_roots()[0]).await?;
             pause
@@ -1411,6 +1480,47 @@ async fn one_case(row: Row, live: &mut Live, driver: &dyn Survival) -> Result<()
     lose_and_recover(row, live, driver, receipt, lost, Observation::default()).await
 }
 
+async fn overwrite_first_file(live: &mut Live, seed: u32) -> Result<()> {
+    let file = live.reads[0].inode;
+    let data = payload(seed).slice(..FINAL_SIZE);
+    live.fs()
+        .write(&AuthContext::default(), file, 0, &data)
+        .await?;
+    let _ = live.fs().administrative_remote_durability().await?;
+    live.expected = State::capture(live.fs(), live.pool(), &live.replica_roots()[0]).await?;
+    let placements = live.pool().placements().await?;
+    let mut current_reads = live.reads.clone();
+    for range in current_reads.iter_mut().filter(|r| r.inode == file) {
+        let loc = live
+            .fs()
+            .db
+            .get_bytes(
+                &KeyCodec::new().extent_key(file, range.offset / crate::fs::EXTENT_SIZE as u64),
+            )
+            .await?
+            .context("successor extent")?;
+        let loc = FrameLoc::decode(&loc).context("successor frame")?;
+        range.member = Some(
+            placements
+                .iter()
+                .find(|p| {
+                    p.location
+                        .as_ref()
+                        .ends_with(loc.segid.object_key().as_str())
+                })
+                .context("successor mapping")?
+                .member_id
+                .clone(),
+        );
+        range.sha256 = Sha256::digest(
+            &data[range.offset as usize..range.offset as usize + range.length as usize],
+        )
+        .into();
+    }
+    live.reads = current_reads;
+    Ok(())
+}
+
 async fn interrupted_case(
     live: &mut Live,
     driver: &dyn Survival,
@@ -1419,52 +1529,34 @@ async fn interrupted_case(
 ) -> Result<()> {
     let candidate_slot = Arc::clone(&pause.candidate);
     let result: Result<(CutEvent, SurvivalReceipt, State, Vec<ReadRange>)> = async {
+        // Three completed generations precede the candidate: the third may
+        // retire the first, and the fourth can record that cleanup's completion.
+        // The two-generation retention policy otherwise leaves retirement and
+        // later debt-completion cut points unreachable.
+        let oldest = driver.commit(live).await?;
+        verify_replica_record(live, &oldest, RecordCoverage::AllRequired)?;
+        overwrite_first_file(live, 86).await?;
+        let middle = driver.commit(live).await?;
+        ensure!(
+            middle.digest != oldest.digest,
+            "the second commit must name a new generation"
+        );
+        verify_replica_record(live, &middle, RecordCoverage::AllRequired)?;
+        overwrite_first_file(live, 87).await?;
         let prior = driver
             .commit(live)
             .await
             .context("the prior receipt must precede the interrupted successor")?;
-        verify_replica_record(live, &prior)?;
+        ensure!(
+            prior.digest != middle.digest && prior.digest != oldest.digest,
+            "the predecessor must be a new generation after the overwrite"
+        );
+        verify_replica_record(live, &prior, RecordCoverage::AllRequired)?;
         let prior_state = State::capture(live.fs(), live.pool(), &live.replica_roots()[0]).await?;
         let prior_reads = live.reads.clone();
         // Change a current file so a mixture of predecessor and candidate state
         // cannot satisfy either complete-generation oracle.
-        let file = live.reads[0].inode;
-        let data = payload(88).slice(..FINAL_SIZE);
-        live.fs()
-            .write(&AuthContext::default(), file, 0, &data)
-            .await?;
-        let _ = live.fs().administrative_remote_durability().await?;
-        live.expected = State::capture(live.fs(), live.pool(), &live.replica_roots()[0]).await?;
-        let placements = live.pool().placements().await?;
-        let mut current_reads = live.reads.clone();
-        for range in current_reads.iter_mut().filter(|r| r.inode == file) {
-            let loc = live
-                .fs()
-                .db
-                .get_bytes(&KeyCodec.extent_key(file, range.offset / crate::fs::EXTENT_SIZE as u64))
-                .await?
-                .context("candidate extent")?;
-            let loc = FrameLoc::decode(&loc).context("candidate frame")?;
-            range.member = Some(
-                placements
-                    .iter()
-                    .find(|p| {
-                        p.location
-                            .as_ref()
-                            .ends_with(loc.segid.object_key().as_str())
-                    })
-                    .context("candidate mapping")?
-                    .member_id
-                    .clone(),
-            );
-        }
-        live.reads = current_reads;
-        for range in live.reads.iter_mut().filter(|r| r.inode == file) {
-            range.sha256 = Sha256::digest(
-                &data[range.offset as usize..range.offset as usize + range.length as usize],
-            )
-            .into();
-        }
+        overwrite_first_file(live, 88).await?;
         pause
             .start
             .send(())
@@ -1502,13 +1594,22 @@ async fn interrupted_case(
     // The driver may name it only when its real hook has built that record.
     let candidate = candidate_slot.lock().unwrap().clone();
     let probe = candidate.as_ref().unwrap_or(&prior);
+    let mut read_generations = vec![(&prior, prior_reads.as_slice())];
+    if let Some(candidate) = &candidate {
+        ensure!(
+            candidate.digest != prior.digest,
+            "the candidate reused the predecessor digest"
+        );
+        read_generations.push((candidate, live.reads.as_slice()));
+    }
     remove_active_originals(live, &mut observed)?;
-    collect_recovery(live, driver, probe, &mut observed).await?;
+    collect_recovery(live, driver, probe, &read_generations, &mut observed).await?;
     let receipt = if observed.recovered_digest == Some(prior.digest) {
         live.expected = prior_state;
         live.reads = prior_reads;
         prior
     } else {
+        observed.recovered_unacknowledged_candidate = true;
         candidate.context("recovery selected a generation with no complete candidate record")?
     };
     observed.receipt = Some(receipt);
@@ -1732,10 +1833,114 @@ async fn every_acceptance_oracle_rejects_success_without_survival() -> Result<()
     );
     // Also prove that accepting a named receipt cannot skip physical evidence.
     ensure!(
-        verify_replica_record(&live, &receipt).is_err(),
+        verify_replica_record(&live, &receipt, RecordCoverage::AllRequired).is_err(),
         "the stub manufactured a durable commit"
     );
     finish(live, Row::ExactRecovery, Ok(())).await
+}
+
+#[test]
+fn record_oracle_distinguishes_acknowledgement_from_interrupted_fanout() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let roots = [
+        fixture.path().join("authority"),
+        fixture.path().join("replica"),
+    ];
+    let bytes = b"complete candidate record";
+    let receipt = SurvivalReceipt {
+        relative_record: "commits/1/3.json".into(),
+        digest: Sha256::digest(bytes).into(),
+        mutation_cutoff: 3,
+        envelope_epoch: 1,
+    };
+    let records = roots
+        .iter()
+        .map(|root| {
+            root.join(".zerofs-survival/v1")
+                .join(&receipt.relative_record)
+        })
+        .collect::<Vec<_>>();
+    for record in &records {
+        std::fs::create_dir_all(record.parent().unwrap())?;
+    }
+    ensure!(
+        verify_replica_record_at(&roots, &receipt, RecordCoverage::InterruptedCandidate).is_err(),
+        "a candidate needs at least one real commit record"
+    );
+    std::fs::write(&records[0], bytes)?;
+    verify_replica_record_at(&roots, &receipt, RecordCoverage::InterruptedCandidate)?;
+    ensure!(
+        verify_replica_record_at(&roots, &receipt, RecordCoverage::AllRequired).is_err(),
+        "partial fanout cannot acknowledge a survival receipt"
+    );
+    ensure!(
+        verify_replica_record_at(&roots, &receipt, RecordCoverage::AllSurviving).is_err(),
+        "an acknowledged receipt must be present on every surviving replica"
+    );
+    std::fs::write(&records[1], b"conflicting candidate record")?;
+    ensure!(
+        verify_replica_record_at(&roots, &receipt, RecordCoverage::InterruptedCandidate).is_err(),
+        "a valid copy cannot hide a conflicting surviving record"
+    );
+    std::fs::write(&records[1], bytes)?;
+    verify_replica_record_at(&roots, &receipt, RecordCoverage::AllRequired)?;
+    std::fs::remove_dir_all(&roots[1])?;
+    verify_replica_record_at(&roots, &receipt, RecordCoverage::AllSurviving)?;
+    verify_replica_record_at(&roots, &receipt, RecordCoverage::InterruptedCandidate)?;
+    ensure!(
+        verify_replica_record_at(&roots, &receipt, RecordCoverage::AllRequired).is_err(),
+        "a missing required replica cannot disappear from the acknowledgement set"
+    );
+    std::fs::remove_dir_all(&roots[0])?;
+    ensure!(
+        verify_replica_record_at(&roots, &receipt, RecordCoverage::InterruptedCandidate).is_err(),
+        "a lost last record cannot satisfy candidate recovery"
+    );
+    Ok(())
+}
+
+#[test]
+fn recovery_reads_follow_the_selected_generation() -> Result<()> {
+    let prior = SurvivalReceipt {
+        relative_record: "commits/1/2.json".into(),
+        digest: [2; 32],
+        mutation_cutoff: 2,
+        envelope_epoch: 1,
+    };
+    let candidate = SurvivalReceipt {
+        relative_record: "commits/1/3.json".into(),
+        digest: [3; 32],
+        mutation_cutoff: 3,
+        envelope_epoch: 1,
+    };
+    let prior_reads = [ReadRange {
+        names: vec!["/changed.bin".into(), "/alias".into()],
+        inode: 1,
+        offset: 0,
+        length: 4,
+        member: Some("disk-a".into()),
+        sha256: Sha256::digest(b"past").into(),
+    }];
+    let mut candidate_reads = prior_reads.clone();
+    candidate_reads[0].member = Some("disk-b".into());
+    candidate_reads[0].sha256 = Sha256::digest(b"next").into();
+    let generations = [
+        (&prior, prior_reads.as_slice()),
+        (&candidate, candidate_reads.as_slice()),
+    ];
+    ensure!(
+        recovery_read_plan(&prior.digest, &generations)? == prior_reads,
+        "predecessor recovery must use its original hashes and lost-member mapping"
+    );
+    ensure!(
+        recovery_read_plan(&candidate.digest, &generations)? == candidate_reads,
+        "candidate recovery must use the successor hashes and placement"
+    );
+    ensure!(
+        recovery_read_plan(&[1; 32], &generations).is_err(),
+        "a retired or unknown generation cannot borrow another generation's read plan"
+    );
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
