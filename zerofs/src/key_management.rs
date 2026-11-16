@@ -314,6 +314,7 @@ pub(crate) async fn load_existing_encryption_key_with_mode(
 ///
 /// This preserves the original API and on-disk format for callers that do not
 /// select a name mode. An existing insensitive envelope is rejected.
+#[allow(dead_code)] // Retained for crate callers that use the default name mode.
 pub async fn load_or_init_encryption_key(
     object_store: &Arc<dyn ObjectStore>,
     db_path: &Path,
