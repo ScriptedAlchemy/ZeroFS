@@ -121,6 +121,9 @@ pub struct SegmentStore {
     counter: AtomicU64,
     /// Count of ranged segment GETs issued (a read-amplification metric).
     read_calls: AtomicU64,
+    /// Count of uncached rereads after a cached frame run failed its
+    /// integrity checks.
+    integrity_refetches: AtomicU64,
     /// Warms the parts cache with a just-written segment (see
     /// [`SegmentWarmHook`]); that cache is the only segment cache.
     warm: Option<SegmentWarmHook>,
@@ -139,6 +142,7 @@ impl SegmentStore {
             epoch,
             counter: AtomicU64::new(0),
             read_calls: AtomicU64::new(0),
+            integrity_refetches: AtomicU64::new(0),
             warm,
         }
     }
@@ -444,17 +448,99 @@ impl SegmentStore {
         first_frame: u32,
         slots: &[(InodeId, u64)],
     ) -> Result<Vec<Bytes>> {
+        let decode = |region: &[u8]| {
+            crate::segment::read_frames_from_region(&self.codec, region, segid, first_frame, slots)
+        };
         let region = self
             .read_run_region(segid, byte_offset, byte_len, true)
             .await?;
-        let frames = crate::segment::read_frames_from_region(
-            &self.codec,
-            &region,
-            segid,
-            first_frame,
-            slots,
-        )?;
+        let frames = match decode(&region) {
+            Ok(frames) => frames,
+            Err(cached_error) => {
+                self.refetch_run_after_integrity_failure(
+                    segid,
+                    byte_offset,
+                    byte_len,
+                    cached_error,
+                    decode,
+                )
+                .await?
+            }
+        };
         Ok(frames.into_iter().map(Bytes::from).collect())
+    }
+
+    /// The parts cache admits ranged responses after a length check only, so a
+    /// same-length corrupt response stays cached and fails every later read of
+    /// its frames. After such a failure, evict those parts and read the run
+    /// once more from the backend. The retry must have the run's exact length
+    /// and pass the same frame parsing and AEAD checks. After it passes, the
+    /// cache admits only the parts that lie wholly inside the run. A part that
+    /// also holds a neighbouring frame's bytes stays uncached, because this
+    /// decode did not authenticate them. A second failure returns the
+    /// integrity error; there is no further retry.
+    async fn refetch_run_after_integrity_failure<T>(
+        &self,
+        segid: Segid,
+        byte_offset: u64,
+        byte_len: u32,
+        cached_error: SegmentError,
+        decode: impl Fn(&[u8]) -> std::result::Result<T, SegmentError>,
+    ) -> Result<T> {
+        self.integrity_refetches.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            "segment {segid:?} frames at {byte_offset}+{byte_len} failed integrity checks \
+             from the parts cache ({cached_error}); evicting and refetching once"
+        );
+        let path = Path::from(segid.object_key());
+        let mut opts = GetOptions {
+            range: Some(GetRange::Bounded(
+                byte_offset..byte_offset + u64::from(byte_len),
+            )),
+            ..Default::default()
+        };
+        opts.extensions
+            .insert(crate::object_store_prefetch::RefetchCorruptRange);
+        let outcome = async {
+            let mut result = self
+                .object_store
+                .get_opts(&path, opts)
+                .await
+                .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
+            let admission = result
+                .extensions
+                .remove::<crate::object_store_prefetch::AuthenticatedRefetch>();
+            let region = result
+                .bytes()
+                .await
+                .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
+            self.read_calls.fetch_add(1, Ordering::Relaxed);
+            if region.len() != byte_len as usize {
+                return Err(
+                    SegmentError::Malformed("refetched frame run has the wrong length").into(),
+                );
+            }
+            let decoded = decode(&region)?;
+            if let Some(admission) = admission {
+                admission.admit();
+            }
+            Ok(decoded)
+        }
+        .await;
+        let label = if outcome.is_ok() {
+            "recovered"
+        } else {
+            "failed"
+        };
+        metrics::counter!("zerofs_segment_cache_integrity_refetches_total", "outcome" => label)
+            .increment(1);
+        if let Err(error) = &outcome {
+            tracing::error!(
+                "segment {segid:?} frames at {byte_offset}+{byte_len} still failed after an \
+                 uncached refetch: {error}"
+            );
+        }
+        outcome
     }
 
     /// As [`Self::read_run`] but AEAD-verify only, returning still-compressed
@@ -550,6 +636,12 @@ impl SegmentStore {
     #[cfg(test)]
     pub(crate) fn read_calls(&self) -> u64 {
         self.read_calls.load(Ordering::Relaxed)
+    }
+
+    /// Uncached rereads issued after a cached frame run failed its checks.
+    #[cfg(test)]
+    pub(crate) fn integrity_refetches(&self) -> u64 {
+        self.integrity_refetches.load(Ordering::Relaxed)
     }
 
     /// List every `segments/` object currently present. Production reclaim

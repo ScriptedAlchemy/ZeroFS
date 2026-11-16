@@ -6,6 +6,8 @@
 //! programmable harness, driven through a shared [`FaultControls`] handle.
 
 use async_trait::async_trait;
+#[cfg(test)]
+use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt};
 use object_store::path::Path;
 use object_store::{
@@ -57,6 +59,22 @@ pub struct FaultControls {
     #[cfg(test)]
     head_release: Arc<Notify>,
     forced_put_etag: StdMutex<Option<String>>,
+    /// Return the next N non-head bodies with the right length and wrong bytes.
+    #[cfg(test)]
+    corrupt_next_gets: AtomicUsize,
+    /// Flip the bytes inside one absolute object range on the next N
+    /// non-head bodies, leaving the rest of each body intact.
+    #[cfg(test)]
+    corrupt_range_next_gets: AtomicUsize,
+    #[cfg(test)]
+    corrupt_range: StdMutex<std::ops::Range<u64>>,
+    /// Hold the next N non-head bodies until `release_get_bodies`.
+    #[cfg(test)]
+    hold_next_get_bodies: AtomicUsize,
+    #[cfg(test)]
+    get_bodies_released: AtomicBool,
+    #[cfg(test)]
+    get_body_release: Arc<Notify>,
 }
 
 impl FaultControls {
@@ -76,6 +94,34 @@ impl FaultControls {
     pub(crate) fn truncate_gets(&self, n: usize, by: usize) {
         self.truncate_bytes.store(by, Ordering::SeqCst);
         self.truncate_next_gets.store(n, Ordering::SeqCst);
+    }
+    /// Make the next `n` non-head gets return a same-length body rotated by
+    /// half its length, the shape of a corrupted ranged response that passes a
+    /// length check.
+    #[cfg(test)]
+    pub(crate) fn corrupt_gets(&self, n: usize) {
+        self.corrupt_next_gets.store(n, Ordering::SeqCst);
+    }
+    /// Make the next `n` non-head gets flip every byte that falls inside the
+    /// absolute object range `range`. A get that [`Self::corrupt_gets`]
+    /// already corrupts does not use one of these.
+    #[cfg(test)]
+    pub(crate) fn corrupt_range_in_gets(&self, n: usize, range: std::ops::Range<u64>) {
+        *self.corrupt_range.lock().unwrap() = range;
+        self.corrupt_range_next_gets.store(n, Ordering::SeqCst);
+    }
+    /// Hold the bodies of the next `n` non-head gets until
+    /// [`Self::release_get_bodies`]. The request and its metadata return first,
+    /// so the caller can register the fetch as in flight.
+    #[cfg(test)]
+    pub(crate) fn hold_get_bodies(&self, n: usize) {
+        self.get_bodies_released.store(false, Ordering::SeqCst);
+        self.hold_next_get_bodies.store(n, Ordering::SeqCst);
+    }
+    #[cfg(test)]
+    pub(crate) fn release_get_bodies(&self) {
+        self.get_bodies_released.store(true, Ordering::SeqCst);
+        self.get_body_release.notify_waiters();
     }
     pub(crate) fn get_count(&self) -> usize {
         self.gets.load(Ordering::SeqCst)
@@ -279,6 +325,12 @@ impl ObjectStore for FaultStore {
             return Err(Self::transient("get"));
         }
         let result = self.inner.get_opts(location, options).await?;
+        #[cfg(test)]
+        let result = if head {
+            result
+        } else {
+            self.corrupt_or_hold(result)
+        };
         // Head replies carry no body; only short-circuit truncation for them.
         if head || !take_one(&self.ctl.truncate_next_gets) {
             return Ok(result);
@@ -345,6 +397,56 @@ impl ObjectStore for FaultStore {
     }
 }
 
+#[cfg(test)]
+impl FaultStore {
+    fn corrupt_or_hold(&self, result: GetResult) -> GetResult {
+        let corrupt = take_one(&self.ctl.corrupt_next_gets);
+        let flip = (!corrupt && take_one(&self.ctl.corrupt_range_next_gets))
+            .then(|| self.ctl.corrupt_range.lock().unwrap().clone());
+        let hold = take_one(&self.ctl.hold_next_get_bodies);
+        if !corrupt && flip.is_none() && !hold {
+            return result;
+        }
+        let controls = self.ctl.clone();
+        let meta = result.meta.clone();
+        let range = result.range.clone();
+        let attributes = result.attributes.clone();
+        let body_start = range.start;
+        let body = async move {
+            while hold && !controls.get_bodies_released.load(Ordering::SeqCst) {
+                let released = controls.get_body_release.notified();
+                if controls.get_bodies_released.load(Ordering::SeqCst) {
+                    break;
+                }
+                released.await;
+            }
+            let bytes = result.bytes().await?;
+            if let Some(flip) = flip {
+                let mut flipped = bytes.to_vec();
+                let from = flip.start.saturating_sub(body_start) as usize;
+                let to = (flip.end.saturating_sub(body_start) as usize).min(flipped.len());
+                for byte in flipped.iter_mut().take(to).skip(from) {
+                    *byte ^= 0xFF;
+                }
+                return Ok(Bytes::from(flipped));
+            }
+            if !corrupt || bytes.len() < 2 {
+                return Ok(bytes);
+            }
+            let mut rotated = bytes.to_vec();
+            rotated.rotate_left(bytes.len() / 2);
+            Ok(Bytes::from(rotated))
+        };
+        GetResult {
+            payload: GetResultPayload::Stream(stream::once(body).boxed()),
+            meta,
+            range,
+            attributes,
+            extensions: Default::default(),
+        }
+    }
+}
+
 struct ActivePut {
     controls: Arc<FaultControls>,
 }
@@ -368,7 +470,6 @@ impl Drop for ActivePut {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
     use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
     use std::time::Duration;
@@ -444,6 +545,41 @@ mod tests {
             store.get(&path).await.unwrap().bytes().await.unwrap().len(),
             100
         );
+    }
+
+    #[tokio::test]
+    async fn corrupts_a_bounded_number_of_gets_without_changing_length() {
+        let (store, ctl) = FaultStore::new(Arc::new(InMemory::new()));
+        let path = Path::from("k");
+        let body: Vec<u8> = (0..100u8).collect();
+        store.put(&path, body.clone().into()).await.unwrap();
+
+        ctl.corrupt_gets(1);
+        let corrupt = store.get(&path).await.unwrap().bytes().await.unwrap();
+        assert_eq!(corrupt.len(), body.len());
+        assert_ne!(corrupt.as_ref(), body.as_slice());
+        let clean = store.get(&path).await.unwrap().bytes().await.unwrap();
+        assert_eq!(clean.as_ref(), body.as_slice());
+    }
+
+    #[tokio::test]
+    async fn held_get_bodies_wait_for_release() {
+        let (store, ctl) = FaultStore::new(Arc::new(InMemory::new()));
+        let path = Path::from("k");
+        store.put(&path, b"held".to_vec().into()).await.unwrap();
+
+        ctl.hold_get_bodies(1);
+        let held = store.get(&path).await.unwrap();
+        let body = tokio::spawn(async move { held.bytes().await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!body.is_finished());
+        ctl.release_get_bodies();
+        let got = tokio::time::timeout(Duration::from_secs(1), body)
+            .await
+            .expect("released body did not finish")
+            .unwrap()
+            .unwrap();
+        assert_eq!(&got[..], b"held");
     }
 
     #[tokio::test]

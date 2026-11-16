@@ -32,6 +32,84 @@ pub struct SkipPartsCache;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CacheRangeOnly;
 
+/// Marker in `GetOptions::extensions` for a bounded GET whose earlier cached
+/// bytes failed frame authentication or decoding. The store drops the cached
+/// parts covering the range, fences fetches already in flight for the object,
+/// and reads the part-aligned range from the backend without caching it. The
+/// response carries an [`AuthenticatedRefetch`] that the caller admits after
+/// the requested range authenticates. Admission caches only the parts that lie
+/// wholly inside the requested range. A part that also holds bytes outside it
+/// stays uncached, because the caller's check did not cover those bytes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RefetchCorruptRange;
+
+/// Response extension of a [`RefetchCorruptRange`] GET. [`Self::admit`] caches
+/// each refetched part whose every byte lies inside the requested range;
+/// dropping it caches nothing. Admission is skipped if the object was
+/// invalidated after the refetch began.
+#[derive(Clone)]
+pub(crate) struct AuthenticatedRefetch(Arc<RefetchAdmission>);
+
+struct RefetchAdmission {
+    parts: HybridCache<PartKey, Bytes>,
+    part_counts: Cache<Path, usize>,
+    admission_cap_bytes: u64,
+    part_size_bytes: usize,
+    location: Path,
+    generation: CacheGeneration,
+    read: ReadLease,
+    start_part: PartId,
+    /// Part-aligned bytes, starting at `start_part`.
+    bytes: Bytes,
+    /// The requested range, the only bytes the caller authenticated.
+    verified: Range<u64>,
+    object_size: u64,
+}
+
+impl AuthenticatedRefetch {
+    pub(crate) fn admit(&self) {
+        let admission = &*self.0;
+        let ctx = AdmissionCtx {
+            parts: &admission.parts,
+            part_counts: &admission.part_counts,
+            admission_cap_bytes: admission.admission_cap_bytes,
+            part_size_bytes: admission.part_size_bytes,
+        };
+        let part_size = admission.part_size_bytes as u64;
+        admission.read.publish(|| {
+            for (i, part) in admission
+                .bytes
+                .chunks(admission.part_size_bytes)
+                .enumerate()
+            {
+                let start = (admission.start_part + i) as u64 * part_size;
+                let end = start + part.len() as u64;
+                let whole = part.len() == admission.part_size_bytes || end == admission.object_size;
+                if !whole || start < admission.verified.start || end > admission.verified.end {
+                    continue;
+                }
+                // Owned copy, so a cached part never pins the whole response.
+                ctx.admit_part(
+                    &admission.location,
+                    &admission.generation,
+                    admission.start_part + i,
+                    Bytes::copy_from_slice(part),
+                );
+            }
+        });
+    }
+}
+
+impl Debug for AuthenticatedRefetch {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthenticatedRefetch")
+            .field("location", &self.0.location)
+            .field("start_part", &self.0.start_part)
+            .field("len", &self.0.bytes.len())
+            .finish()
+    }
+}
+
 const DEFAULT_PART_SIZE_BYTES: usize = 128 * 1024;
 const HEADS_CAPACITY_ENTRIES: usize = 16 * 1024;
 const ACCESS_TRACKER_CAPACITY: usize = 8 * 1024;
@@ -1009,6 +1087,174 @@ impl PrefetchingObjectStore {
         }
     }
 
+    /// Serve a [`RefetchCorruptRange`] GET. Cached bytes for the range failed
+    /// authentication, so they are dropped before the backend read. Rotating
+    /// the object revision makes every fetch already in flight refuse to
+    /// publish, because such a fetch may carry the same corrupt response.
+    /// Removing the registry slots keeps later reads from joining one. The
+    /// backend bytes are returned uncached. Once the requested range
+    /// authenticates, the caller admits the parts that lie wholly inside it
+    /// through [`AuthenticatedRefetch`].
+    async fn refetch_corrupt_range(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        let Some(GetRange::Bounded(requested)) = options.range.clone() else {
+            return Err(object_store::Error::Generic {
+                store: "PrefetchingObjectStore",
+                source: "an integrity refetch needs a bounded range".into(),
+            });
+        };
+        if requested.start >= requested.end {
+            return Err(object_store::Error::Generic {
+                store: "PrefetchingObjectStore",
+                source: format!("inconsistent range {}..{}", requested.start, requested.end).into(),
+            });
+        }
+        let aligned = self.align_range(&requested, self.part_size_bytes);
+        let part_size = self.part_size_bytes as u64;
+        let start_part: PartId = (aligned.start / part_size)
+            .try_into()
+            .expect("part id exceeds usize");
+        let end_part: PartId = (aligned.end / part_size)
+            .try_into()
+            .expect("part id exceeds usize");
+
+        // The lease is taken at eviction, before the backend read, so an
+        // overwrite or delete that lands during the read fences admission.
+        let (read, expected) = self.evict_corrupt_parts(location, start_part..end_part);
+
+        let result = self
+            .inner
+            .get_opts(
+                location,
+                GetOptions {
+                    range: Some(GetRange::Bounded(aligned.clone())),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let meta = result.meta.clone();
+        let attributes = result.attributes.clone();
+        let fetched = result.range.clone();
+        let generation = read.generation(&meta);
+        if let Some(expected) = expected
+            && !same_object_identity(&expected, &meta)
+        {
+            return Err(object_store::Error::Generic {
+                store: "PrefetchingObjectStore",
+                source: format!("object {location} changed identity during an integrity refetch")
+                    .into(),
+            });
+        }
+        let bytes = result.bytes().await?;
+        // A length check, as on every ranged read. The authenticity check
+        // belongs to the caller, which owns the frame keys.
+        let fetched_len = fetched.end.saturating_sub(fetched.start);
+        if fetched.start != aligned.start || bytes.len() as u64 != fetched_len {
+            return Err(object_store::Error::Generic {
+                store: "PrefetchingObjectStore",
+                source: format!(
+                    "integrity refetch of {location} returned {} bytes for {fetched:?}, \
+                     requested {aligned:?}",
+                    bytes.len()
+                )
+                .into(),
+            });
+        }
+        let start = (requested.start - aligned.start) as usize;
+        if start >= bytes.len() {
+            return Err(object_store::Error::Generic {
+                store: "PrefetchingObjectStore",
+                source: format!("range start {} >= size {}", requested.start, meta.size).into(),
+            });
+        }
+        let end = ((requested.end.min(fetched.end)) - aligned.start) as usize;
+        let payload = bytes.slice(start..end);
+        let verified = requested.start..requested.start + (end - start) as u64;
+        let mut extensions = object_store::Extensions::default();
+        extensions.insert(AuthenticatedRefetch(Arc::new(RefetchAdmission {
+            parts: self.parts.clone(),
+            part_counts: self.part_counts.clone(),
+            admission_cap_bytes: self.admission_cap_bytes,
+            part_size_bytes: self.part_size_bytes,
+            location: location.clone(),
+            generation,
+            read,
+            start_part,
+            bytes,
+            verified: verified.clone(),
+            object_size: meta.size,
+        })));
+        Ok(GetResult {
+            payload: GetResultPayload::Stream(stream::once(async move { Ok(payload) }).boxed()),
+            meta,
+            range: verified,
+            attributes,
+            extensions,
+        })
+    }
+
+    /// Drop the cached parts in `part_ids` for the object's current
+    /// generation and fence fetches already in flight. Returns a lease on the
+    /// new revision and the metadata the cached parts belonged to, when it is
+    /// still known.
+    fn evict_corrupt_parts(
+        &self,
+        location: &Path,
+        part_ids: Range<PartId>,
+    ) -> (ReadLease, Option<ObjectMeta>) {
+        let state = self.read_lease(location).state;
+        let mut revision = state.revision.lock().unwrap();
+        let head = self.read_head(location).map(|(meta, _)| meta);
+        let generation = head
+            .as_ref()
+            .map(|meta| CacheGeneration::from_meta(meta, *revision))
+            .or_else(|| {
+                self.generations
+                    .get(location)
+                    .map(|entry| entry.value().clone())
+            });
+        if let Some(generation) = &generation {
+            let mut fetches = self.fetches.lock().unwrap();
+            for part_id in part_ids {
+                let key = PartKey::new(location, self.part_size_bytes, generation, part_id);
+                // `remove` drops the memory entry and the disk-tier index entry.
+                self.parts.remove(&key);
+                fetches.remove(&key);
+            }
+        }
+        let next = uuid::Uuid::new_v4();
+        *revision = next;
+        // An unversioned generation embeds the revision. Move the remembered
+        // generation along with it so a later lease cannot reopen the old
+        // instance and its unverified parts. Versioned keys do not change.
+        if let Some(CacheGeneration::Unversioned {
+            size,
+            modified_nanos,
+            ..
+        }) = generation
+        {
+            self.generations.insert(
+                location.clone(),
+                CacheGeneration::Unversioned {
+                    cache_instance: next,
+                    size,
+                    modified_nanos,
+                },
+            );
+        }
+        drop(revision);
+        (
+            ReadLease {
+                state,
+                revision: next,
+            },
+            head,
+        )
+    }
+
     /// Backend GET that does not `save_get_result`, `read_part`, or
     /// `spawn_async_prefetch`. GC/compaction use this (or `SkipPartsCache`).
     async fn get_opts_uncached(
@@ -1906,6 +2152,16 @@ impl PrefetchingObjectStore {
     }
 }
 
+/// Whether `fetched` is the same object incarnation as `cached`. Unversioned
+/// stores only expose size and modification time.
+fn same_object_identity(cached: &ObjectMeta, fetched: &ObjectMeta) -> bool {
+    if cached.e_tag.is_some() || cached.version.is_some() {
+        cached.e_tag == fetched.e_tag && cached.version == fetched.version
+    } else {
+        cached.size == fetched.size && cached.last_modified == fetched.last_modified
+    }
+}
+
 impl Debug for PrefetchingObjectStore {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("PrefetchingObjectStore")
@@ -1928,6 +2184,9 @@ impl ObjectStore for PrefetchingObjectStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
+        if options.extensions.get::<RefetchCorruptRange>().is_some() {
+            return self.refetch_corrupt_range(location, options).await;
+        }
         if options.extensions.get::<SkipPartsCache>().is_some() {
             return self.get_opts_uncached(location, options).await;
         }
@@ -2700,6 +2959,446 @@ mod tests {
         assert!(
             fetched <= cache_aligned_end,
             "overlapping frame reads fetched duplicate parts: {seen:?}"
+        );
+    }
+
+    /// A sealed segment behind a fault store and the parts cache, read through
+    /// a `SegmentStore` the way `ExtentStore` reads file data.
+    struct CorruptionFixture {
+        cache: Arc<PrefetchingObjectStore>,
+        controls: Arc<crate::fault_store::FaultControls>,
+        reader: crate::segment_store::SegmentStore,
+        frames: Vec<(u64, u64, Bytes)>,
+        locations: Vec<(u64, u64, crate::segment::FrameLoc)>,
+        object: Bytes,
+        _dir: TempDir,
+    }
+
+    const CORRUPTION_PART: usize = 4 * 1024;
+
+    impl CorruptionFixture {
+        async fn new() -> Self {
+            use crate::config::CompressionConfig;
+            use crate::frame_codec::FrameCodec;
+            use crate::segment::SEGMENT_INFO;
+            use crate::segment_store::SegmentStore;
+
+            let codec = || FrameCodec::new(&[7; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+            let mem = Arc::new(InMemory::new());
+            // Seal straight into the backend so the parts cache starts cold;
+            // sealing through the cache would warm it with the good bytes.
+            let writer = SegmentStore::new(mem.clone(), codec(), 5, None);
+            let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+            let frames: Vec<(u64, u64, Bytes)> = (0..4u64)
+                .map(|extent| {
+                    let bytes: Vec<u8> = (0..6000)
+                        .map(|_| {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 7;
+                            seed ^= seed << 17;
+                            seed as u8
+                        })
+                        .collect();
+                    (1, extent, Bytes::from(bytes))
+                })
+                .collect();
+            let locations = writer.seal(&frames).await.unwrap();
+            let path = Path::from(locations[0].2.segid.object_key());
+            let object = mem.get(&path).await.unwrap().bytes().await.unwrap();
+            let (faulty, controls) = crate::fault_store::FaultStore::new(mem);
+            let (cache, dir) = store_over(faulty, CORRUPTION_PART).await;
+            let cache = Arc::new(cache);
+            let reader = SegmentStore::new(cache.clone(), codec(), 6, None);
+            Self {
+                cache,
+                controls,
+                reader,
+                frames,
+                locations,
+                object,
+                _dir: dir,
+            }
+        }
+
+        fn path(&self) -> Path {
+            Path::from(self.locations[0].2.segid.object_key())
+        }
+
+        fn run_bounds(&self) -> (u64, u32) {
+            let first = self.locations[0].2;
+            let last = self.locations.last().unwrap().2;
+            let end = last.byte_offset + u64::from(last.byte_len);
+            (first.byte_offset, (end - first.byte_offset) as u32)
+        }
+
+        fn slots(&self) -> Vec<(u64, u64)> {
+            self.locations.iter().map(|(i, e, _)| (*i, *e)).collect()
+        }
+
+        async fn read(&self) -> Result<Vec<Bytes>, crate::segment_store::SegmentStoreError> {
+            let (offset, len) = self.run_bounds();
+            let first = self.locations[0].2;
+            self.reader
+                .read_run(first.segid, offset, len, first.frame_index, &self.slots())
+                .await
+        }
+
+        fn assert_frames(&self, got: &[Bytes]) {
+            assert_eq!(got.len(), self.frames.len());
+            for (got, (_, _, want)) in got.iter().zip(&self.frames) {
+                assert_eq!(got, want);
+            }
+        }
+
+        async fn read_frame(
+            &self,
+            index: usize,
+        ) -> Result<Vec<Bytes>, crate::segment_store::SegmentStoreError> {
+            let (inode, extent, loc) = self.locations[index];
+            self.reader
+                .read_run(
+                    loc.segid,
+                    loc.byte_offset,
+                    loc.byte_len,
+                    loc.frame_index,
+                    &[(inode, extent)],
+                )
+                .await
+        }
+
+        /// Cached parts covering the run whose bytes differ from the stored
+        /// object, and the number of covering parts cached at all.
+        async fn cached_part_mismatches(&self) -> (Vec<usize>, usize) {
+            let (offset, len) = self.run_bounds();
+            let first = offset as usize / CORRUPTION_PART;
+            let last = (offset as usize + len as usize).div_ceil(CORRUPTION_PART);
+            let mut bad = Vec::new();
+            let mut cached = 0;
+            for part in first..last {
+                if let Some(bytes) = self.cache.cached_part(&self.path(), part).await {
+                    let start = part * CORRUPTION_PART;
+                    let end = (start + CORRUPTION_PART).min(self.object.len());
+                    if bytes.as_ref() != &self.object[start..end] {
+                        bad.push(part);
+                    }
+                    cached += 1;
+                }
+            }
+            (bad, cached)
+        }
+
+        /// Every part covering the run is either absent or holds the object's
+        /// true bytes; returns how many were cached.
+        async fn assert_cache_holds_only_true_bytes(&self) -> usize {
+            let (bad, cached) = self.cached_part_mismatches().await;
+            assert!(
+                bad.is_empty(),
+                "cache parts {bad:?} differ from the stored object"
+            );
+            cached
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Neighbour {
+        Before,
+        After,
+    }
+
+    /// The retry returns the requested frame intact, but bytes of a
+    /// neighbouring frame in the same cache parts are corrupt. The repair must
+    /// not cache those unauthenticated bytes, or the neighbour's next read
+    /// fails from the cache.
+    async fn repair_does_not_cache_unauthenticated_neighbour_bytes(neighbour: Neighbour) {
+        let fixture = CorruptionFixture::new().await;
+        let target = 1;
+        let loc = fixture.locations[target].2;
+        let run = loc.byte_offset..loc.byte_offset + u64::from(loc.byte_len);
+        let part = CORRUPTION_PART as u64;
+        assert!(
+            !run.start.is_multiple_of(part) && !run.end.is_multiple_of(part),
+            "the target frame must share its first and last cache parts with neighbours"
+        );
+        let (flip, neighbour_index) = match neighbour {
+            Neighbour::Before => (run.start - run.start % part..run.start, target - 1),
+            Neighbour::After => (run.end..run.end.next_multiple_of(part), target + 1),
+        };
+
+        // The first fetch is corrupt throughout. The retry is intact inside
+        // the target frame and corrupt only in the neighbouring bytes.
+        fixture.controls.corrupt_gets(1);
+        fixture.controls.corrupt_range_in_gets(1, flip);
+        let got = fixture
+            .read_frame(target)
+            .await
+            .expect("the requested frame is intact on the retry");
+        assert_eq!(got, vec![fixture.frames[target].2.clone()]);
+        assert_eq!(fixture.reader.integrity_refetches(), 1);
+
+        let (bad, _) = fixture.cached_part_mismatches().await;
+        let neighbour_read = fixture.read_frame(neighbour_index).await;
+        assert!(
+            bad.is_empty() && fixture.reader.integrity_refetches() == 1,
+            "the repair cached unauthenticated parts {bad:?}; the neighbour read \
+             needed {} integrity refetches in total and returned {:?}",
+            fixture.reader.integrity_refetches(),
+            neighbour_read.as_ref().map(|frames| frames.len()),
+        );
+        assert_eq!(
+            neighbour_read.unwrap(),
+            vec![fixture.frames[neighbour_index].2.clone()]
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_does_not_cache_corrupt_bytes_before_the_run() {
+        repair_does_not_cache_unauthenticated_neighbour_bytes(Neighbour::Before).await;
+    }
+
+    #[tokio::test]
+    async fn repair_does_not_cache_corrupt_bytes_after_the_run() {
+        repair_does_not_cache_unauthenticated_neighbour_bytes(Neighbour::After).await;
+    }
+
+    #[tokio::test]
+    async fn corrupted_cached_segment_part_is_refetched_once_and_replaced() {
+        let fixture = CorruptionFixture::new().await;
+        fixture.controls.corrupt_gets(1);
+
+        let got = fixture
+            .read()
+            .await
+            .expect("one uncached retry must recover a corrupted cached part");
+        fixture.assert_frames(&got);
+        assert_eq!(
+            fixture.controls.get_count(),
+            2,
+            "one cold GET and exactly one retry"
+        );
+        assert_eq!(fixture.reader.integrity_refetches(), 1);
+        assert!(
+            fixture.assert_cache_holds_only_true_bytes().await > 0,
+            "the parts inside the authenticated run should be cached"
+        );
+
+        // Parts the run shares with the segment's other bytes were left
+        // uncached, so the first later read may fetch them once, normally.
+        fixture.assert_frames(&fixture.read().await.unwrap());
+        let gets = fixture.controls.get_count();
+        for _ in 0..3 {
+            fixture.assert_frames(&fixture.read().await.unwrap());
+        }
+        assert_eq!(
+            fixture.reader.integrity_refetches(),
+            1,
+            "later reads need no further integrity refetch"
+        );
+        assert_eq!(
+            fixture.controls.get_count(),
+            gets,
+            "later reads are served from the cache"
+        );
+        fixture.assert_cache_holds_only_true_bytes().await;
+    }
+
+    #[tokio::test]
+    async fn corrupt_retry_returns_the_integrity_error_without_looping() {
+        let fixture = CorruptionFixture::new().await;
+        fixture.controls.corrupt_gets(2);
+
+        let error = fixture
+            .read()
+            .await
+            .expect_err("a corrupt retry must not be accepted");
+        assert!(
+            matches!(error, crate::segment_store::SegmentStoreError::Segment(_)),
+            "expected a frame integrity error, got {error:?}"
+        );
+        assert_eq!(
+            fixture.controls.get_count(),
+            2,
+            "one cold GET and exactly one retry"
+        );
+        fixture.assert_cache_holds_only_true_bytes().await;
+
+        fixture.assert_frames(&fixture.read().await.unwrap());
+        assert_eq!(fixture.controls.get_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn uncached_segment_reads_are_unchanged() {
+        let fixture = CorruptionFixture::new().await;
+        let (offset, len) = fixture.run_bounds();
+        let first = fixture.locations[0].2;
+        let slots = fixture.slots();
+
+        fixture.controls.corrupt_gets(1);
+        let result = fixture
+            .reader
+            .read_compressed_run(first.segid, offset, len, first.frame_index, &slots)
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(crate::segment_store::SegmentStoreError::Segment(_))
+            ),
+            "compaction reads authenticate the bytes they fetched"
+        );
+        assert_eq!(
+            fixture.controls.get_count(),
+            1,
+            "no retry for uncached reads"
+        );
+        assert_eq!(fixture.assert_cache_holds_only_true_bytes().await, 0);
+
+        fixture
+            .reader
+            .read_compressed_run(first.segid, offset, len, first.frame_index, &slots)
+            .await
+            .unwrap();
+        assert_eq!(fixture.controls.get_count(), 2);
+
+        fixture.assert_frames(&fixture.read().await.unwrap());
+        assert_eq!(
+            fixture.controls.get_count(),
+            3,
+            "a clean cached read does not retry"
+        );
+    }
+
+    async fn integrity_refetch_fences_an_older_in_flight_fetch(unversioned: bool) {
+        const PART: usize = 4 * 1024;
+        let mem = Arc::new(InMemory::new());
+        let path = Path::from("segments/in-flight-corruption");
+        let body: Vec<u8> = (0..4 * PART).map(|i| (i % 251) as u8).collect();
+        mem.put(&path, body.clone().into()).await.unwrap();
+        let backend: Arc<dyn ObjectStore> = Arc::new(DelayRecordingStore {
+            inner: mem,
+            ranges: Arc::new(std::sync::Mutex::new(Vec::new())),
+            delay: std::time::Duration::ZERO,
+            body_gate: None,
+            unversioned,
+        });
+        let (faulty, controls) = crate::fault_store::FaultStore::new(backend);
+        let (store, _dir) = store_over(faulty, PART).await;
+        let store = Arc::new(store);
+        let ranged = |range: Range<u64>| {
+            let mut options = GetOptions {
+                range: Some(GetRange::Bounded(range)),
+                ..Default::default()
+            };
+            options.extensions.insert(CacheRangeOnly);
+            options
+        };
+        let target = 2 * PART as u64..3 * PART as u64;
+        let want = &body[2 * PART..3 * PART];
+
+        // Learn the object generation so the next read leads a window fetch.
+        let first = store.get_opts(&path, ranged(0..PART as u64)).await.unwrap();
+        assert_eq!(first.bytes().await.unwrap().as_ref(), &body[..PART]);
+
+        // An older fetch of the same part receives a corrupt body and stalls
+        // before it can publish.
+        controls.corrupt_gets(1);
+        controls.hold_get_bodies(1);
+        let before = controls.get_count();
+        let stale = {
+            let store = store.clone();
+            let path = path.clone();
+            let options = ranged(target.clone());
+            tokio::spawn(async move { store.get_opts(&path, options).await?.bytes().await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while controls.get_count() == before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the stale fetch never reached the backend");
+
+        let mut options = GetOptions {
+            range: Some(GetRange::Bounded(target.clone())),
+            ..Default::default()
+        };
+        options.extensions.insert(RefetchCorruptRange);
+        let mut refetched = store.get_opts(&path, options).await.unwrap();
+        let admission = refetched
+            .extensions
+            .remove::<AuthenticatedRefetch>()
+            .expect("an aligned refetch is admissible");
+        assert_eq!(refetched.bytes().await.unwrap().as_ref(), want);
+        admission.admit();
+
+        controls.release_get_bodies();
+        let stale = stale.await.unwrap().unwrap();
+        assert_ne!(
+            stale.as_ref(),
+            want,
+            "the stale fetch carried corrupt bytes"
+        );
+
+        assert_eq!(
+            store.cached_part(&path, 2).await.as_deref(),
+            Some(want),
+            "the older fetch must not replace the authenticated part"
+        );
+        let gets = controls.get_count();
+        let again = store.get_opts(&path, ranged(target)).await.unwrap();
+        assert_eq!(again.bytes().await.unwrap().as_ref(), want);
+        assert_eq!(
+            controls.get_count(),
+            gets,
+            "the repaired part is served from cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn integrity_refetch_fences_an_older_in_flight_fetch_versioned() {
+        integrity_refetch_fences_an_older_in_flight_fetch(false).await;
+    }
+
+    #[tokio::test]
+    async fn integrity_refetch_fences_an_older_in_flight_fetch_unversioned() {
+        integrity_refetch_fences_an_older_in_flight_fetch(true).await;
+    }
+
+    #[tokio::test]
+    async fn unadmitted_integrity_refetch_caches_nothing() {
+        let fixture = CorruptionFixture::new().await;
+        // Poison the cache through an ordinary cached read.
+        fixture.controls.corrupt_gets(1);
+        let (offset, len) = fixture.run_bounds();
+        let range = offset..offset + u64::from(len);
+        let mut options = GetOptions {
+            range: Some(GetRange::Bounded(range.clone())),
+            ..Default::default()
+        };
+        options.extensions.insert(CacheRangeOnly);
+        let poisoned = fixture
+            .cache
+            .get_opts(&fixture.path(), options)
+            .await
+            .unwrap();
+        assert_ne!(
+            poisoned.bytes().await.unwrap().as_ref(),
+            &fixture.object[offset as usize..(offset + u64::from(len)) as usize]
+        );
+
+        let mut options = GetOptions {
+            range: Some(GetRange::Bounded(range)),
+            ..Default::default()
+        };
+        options.extensions.insert(RefetchCorruptRange);
+        let refetched = fixture
+            .cache
+            .get_opts(&fixture.path(), options)
+            .await
+            .unwrap();
+        drop(refetched);
+        assert_eq!(
+            fixture.assert_cache_holds_only_true_bytes().await,
+            0,
+            "the refetch evicts the corrupt parts and caches nothing until admitted"
         );
     }
 
