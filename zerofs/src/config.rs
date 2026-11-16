@@ -2919,15 +2919,7 @@ volatile_memory_gb = 2.0
 
         let nbd = settings.servers.nbd.as_ref().unwrap();
         assert_eq!(nbd.write_ack_mode, NbdWriteAckMode::VolatileMemory);
-        assert_eq!(
-            settings
-                .filesystem_write_ack_settings(
-                    crate::writeback::config::WritebackAccessMode::ReadWrite,
-                )
-                .unwrap()
-                .volatile_memory_bytes,
-            2_000_000_000
-        );
+        assert_eq!(nbd.volatile_memory_gb, 2.0);
     }
 
     #[test]
