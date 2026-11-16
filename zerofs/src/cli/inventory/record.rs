@@ -27,11 +27,12 @@ impl<T: Serialize> Serialize for Field<T> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Reason {
     PermissionDenied,
     NotSupportedByFilesystem,
+    FormatNotSupportedByFilesystem,
     NotImplementedOnPlatform,
     #[cfg(target_os = "linux")]
     NotApplicableOnPlatform,
@@ -44,7 +45,40 @@ pub(crate) enum Reason {
     Io,
 }
 
+impl Reason {
+    pub(super) fn counts_as_complete(self) -> bool {
+        match self {
+            Self::NotCollectedForKind
+            | Self::NotRequested
+            | Self::NotDecoded
+            | Self::FormatNotSupportedByFilesystem => true,
+            #[cfg(target_os = "linux")]
+            Self::NotApplicableOnPlatform => true,
+            _ => false,
+        }
+    }
+}
+
 impl<T> Field<T> {
+    pub(super) fn is_complete(&self) -> bool {
+        match self {
+            Self::Observed(_) => true,
+            Self::Unavailable { reason, .. } => reason.counts_as_complete(),
+        }
+    }
+
+    pub(super) fn format_probe(self) -> Self {
+        match self {
+            Self::Unavailable {
+                reason: Reason::NotSupportedByFilesystem,
+                errno,
+            } => Self::Unavailable {
+                reason: Reason::FormatNotSupportedByFilesystem,
+                errno,
+            },
+            other => other,
+        }
+    }
     pub(super) fn unavailable(reason: Reason) -> Self {
         Self::Unavailable {
             reason,

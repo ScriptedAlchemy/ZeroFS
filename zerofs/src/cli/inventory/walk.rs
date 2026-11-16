@@ -116,9 +116,9 @@ impl<W: Write> Walker<'_, W> {
         let before = match fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(stat) => stat,
             Err(error) => {
-                self.tree_complete = false;
-                self.output
-                    .emit(&Record::Entry(Box::new(failed_entry(&path, error))))?;
+                let entry = failed_entry(&path, error);
+                self.tree_complete &= entry.kind.is_complete();
+                self.output.emit(&Record::Entry(Box::new(entry)))?;
                 return Ok(());
             }
         };
@@ -130,7 +130,7 @@ impl<W: Write> Walker<'_, W> {
             entry.acl = Field::unavailable(Reason::NotImplementedOnPlatform);
         }
         if identity(&before).dev != self.root_dev {
-            self.tree_complete = false;
+            self.tree_complete &= Reason::MountBoundary.counts_as_complete();
             entry.xattrs = Field::unavailable(Reason::MountBoundary);
             entry.acl = Field::unavailable(Reason::MountBoundary);
             entry.data_extents = Field::unavailable(Reason::MountBoundary);
@@ -249,15 +249,16 @@ impl<W: Write> Walker<'_, W> {
     }
 
     fn unreadable(&mut self, path: &[u8], error: Errno) {
-        self.tree_complete = false;
+        let error = Field::error(error);
+        self.tree_complete &= error.is_complete();
         self.derived.push(Record::DirectoryUnreadable {
             path: RawBytes::new(path),
-            error: Field::error(error),
+            error,
         });
     }
 
     fn changed(&mut self, path: &[u8]) {
-        self.tree_complete = false;
+        self.tree_complete &= Reason::EntryChanged.counts_as_complete();
         self.derived.push(Record::EntryChanged {
             path: RawBytes::new(path),
             error: Field::unavailable(Reason::EntryChanged),

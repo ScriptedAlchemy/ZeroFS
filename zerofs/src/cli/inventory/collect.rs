@@ -40,7 +40,7 @@ pub(super) fn xattrs(fd: BorrowedFd<'_>) -> Field<Vec<Xattr>> {
     let bytes = match variable_bytes(|buf| flistxattr(fd, buf)) {
         Ok(bytes) => bytes,
         Err(Errno::RANGE) => return Field::unavailable(Reason::EntryChanged),
-        Err(error) => return Field::error(error),
+        Err(error) => return Field::error(error).format_probe(),
     };
     let mut names = bytes
         .split(|b| *b == 0)

@@ -14,7 +14,7 @@ pub(super) fn acl(fd: BorrowedFd<'_>) -> Field<Vec<RawAcl>> {
         .into_iter()
         .map(|(format, name)| RawAcl {
             format,
-            raw: xattr(fd, OsStr::new(name)),
+            raw: xattr(fd, OsStr::new(name)).format_probe(),
             decoded: Field::unavailable(Reason::NotDecoded),
         })
         .collect(),

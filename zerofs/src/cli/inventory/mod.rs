@@ -10,7 +10,7 @@ pub(crate) mod record;
 mod walk;
 
 use anyhow::Result;
-use record::{Record, Summary, hex};
+use record::{Reason, Record, Summary, hex};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -72,13 +72,9 @@ impl<W: Write> Manifest<W> {
                     && let Some(reason) = object.get("reason").and_then(Value::as_str)
                 {
                     *self.reasons.entry(reason.to_owned()).or_default() += 1;
-                    if !matches!(
-                        reason,
-                        "not_collected_for_kind"
-                            | "not_requested"
-                            | "not_decoded"
-                            | "not_applicable_on_platform"
-                    ) {
+                    let reason: Reason = serde_json::from_value(Value::String(reason.to_owned()))
+                        .expect("the manifest serializes inventory reasons");
+                    if !reason.counts_as_complete() {
                         self.complete = false;
                     }
                 }
