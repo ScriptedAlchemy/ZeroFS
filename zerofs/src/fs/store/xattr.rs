@@ -58,10 +58,20 @@ impl XattrStore {
         txn: &mut Transaction,
         id: InodeId,
     ) -> Result<(), FsError> {
-        // Deletes carry keys only. The attribute count cap keeps inode deletion
-        // within one bounded transaction, regardless of the stored value sizes.
-        for name in self.list(id).await? {
-            self.delete(txn, id, &name);
+        // Stream rows instead of using the capped public listing. The cap is
+        // an admission rule for new attributes, not a reason to strand an
+        // inode written by an earlier development build. Only keys remain in
+        // the caller's transaction, keeping cleanup atomic with inode deletion
+        // without retaining all names or any attribute values separately.
+        let mut rows = self
+            .db
+            .scan_prefix(self.key_codec.xattr_prefix(id), None, 64 * 1024)
+            .await
+            .map_err(|e| FsError::from_db_error(&e))?;
+        while let Some(row) = rows.next().await {
+            let (key, _) = row.map_err(|e| FsError::from_db_error(&e))?;
+            // Detach from scanner buffers before retaining the deletion key.
+            txn.delete_bytes(&Bytes::copy_from_slice(&key));
         }
         Ok(())
     }

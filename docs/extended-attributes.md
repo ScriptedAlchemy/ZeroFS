@@ -31,8 +31,11 @@ returns `E2BIG`. Reading a missing attribute or removing an absent attribute ret
 `ENODATA`. A nonzero read buffer that is too small returns `ERANGE`. A zero-size
 FUSE read probes the required length. Each inode may carry at most 4,096 attributes.
 Adding a new name at that cap returns `ENOSPC`; replacing or deleting an existing
-name still works. Listing stops at the cap. Inode deletion carries only attribute
-keys, so the count cap keeps deletion within one bounded transaction.
+name still works. Listing stops at the cap. Inode deletion streams the attribute
+rows directly and carries only their keys in the same transaction as deletion.
+It does not apply the listing cap, so excess rows from an earlier development
+build cannot block unlink or open-inode reclaim. Newly admitted writes remain
+bounded by the count cap.
 
 | Namespace | Read and list visibility | Set and remove |
 | --- | --- | --- |
@@ -87,3 +90,10 @@ fsync cutoff under the configured durability contract.
 `ninep-client`. Linux caps an attribute value at 65,536 bytes before a request
 reaches ZeroFS, even though the core and 9P store accept 2,097,152 bytes.
 NFSv3 and the separate Rust kernel client have no xattr API in this change.
+
+Client and server must both include extended-attribute support. A new client
+connected to a server from `main` receives `EOPNOTSUPP` for get and list: that
+server recognizes `Txattrwalk` but rejects it. Set and remove receive `ENOSYS`
+because its decoder does not recognize `Txattrcreate`. No attribute changes in
+either case. Earlier development encodings from this unmerged change are not
+supported peers.

@@ -93,16 +93,18 @@ enabled = false
                     print(f"{label} log:\n{log.read()}", flush=True)
                 raise
             finally:
-                if os.path.ismount(mountpoint):
-                    subprocess.run(["fusermount3", "-u", str(mountpoint)], check=True, timeout=20)
-                for process in [mount, server]:
-                    if process is not None:
-                        process.terminate()
-                        try:
-                            process.wait(timeout=20)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                            process.wait(timeout=10)
+                try:
+                    if os.path.ismount(mountpoint):
+                        subprocess.run(["fusermount3", "-u", str(mountpoint)], check=True, timeout=20)
+                finally:
+                    for process in [mount, server]:
+                        if process is not None:
+                            process.terminate()
+                            try:
+                                process.wait(timeout=20)
+                            except subprocess.TimeoutExpired:
+                                process.kill()
+                                process.wait(timeout=10)
         assert not os.path.ismount(mountpoint)
     assert not root.exists()
     print(f"fixture_removed={root}", flush=True)

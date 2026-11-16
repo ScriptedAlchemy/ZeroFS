@@ -734,6 +734,62 @@ async fn xattr_listing_refuses_rows_beyond_the_cap() {
 }
 
 #[tokio::test]
+async fn over_cap_attributes_do_not_block_unlink_or_open_inode_reclaim() {
+    let fs = ZeroFS::new_in_memory().await.unwrap();
+    let neighbor = file(&fs, b"neighbor").await;
+    fs.set_xattr(
+        &test_creds(),
+        neighbor,
+        &name(b"user.keep"),
+        value(b"neighbor"),
+        XattrSetMode::Create,
+    )
+    .await
+    .unwrap();
+    for keep_open in [false, true] {
+        let id = file(&fs, b"over-cap").await;
+        // Bypass write admission to model rows from an earlier development
+        // build. Such an inode must still be removable in one transaction.
+        let mut txn = fs.db.new_transaction().unwrap();
+        for i in 0..=crate::fs::store::xattr::XATTR_COUNT_MAX {
+            fs.xattr_store.put(
+                &mut txn,
+                id,
+                format!("user.{i:04}").as_bytes(),
+                Bytes::new(),
+            );
+        }
+        fs.write_coordinator.commit(txn).await.unwrap();
+        assert!(matches!(
+            fs.xattr_store.list(id).await,
+            Err(FsError::NoSpace)
+        ));
+        if keep_open {
+            fs.open_handle_inc(id);
+        }
+        fs.remove(&test_auth(), 0, b"over-cap").await.unwrap();
+        if keep_open {
+            assert_eq!(
+                rows(&fs, id).await,
+                crate::fs::store::xattr::XATTR_COUNT_MAX + 1
+            );
+            fs.handle_closed(id).await;
+        }
+        assert_eq!(rows(&fs, id).await, 0);
+        assert!(matches!(
+            fs.inode_store.get(id).await,
+            Err(FsError::NotFound)
+        ));
+        assert_eq!(
+            fs.get_xattr(&test_creds(), neighbor, &name(b"user.keep"), None)
+                .await
+                .unwrap(),
+            b"neighbor".as_slice()
+        );
+    }
+}
+
+#[tokio::test]
 async fn xattr_set_is_submitted_before_detaching_and_shutdown_barrier() {
     let fs = ZeroFS::new_in_memory().await.unwrap();
     let id = file(&fs, b"shutdown").await;

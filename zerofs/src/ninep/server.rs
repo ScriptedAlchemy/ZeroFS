@@ -2691,6 +2691,72 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn tclunk_cannot_overtake_an_earlier_exact_walk() {
+        for clunk_fid in [1, 2] {
+            let filesystem = Arc::new(
+                ZeroFS::new_in_memory_with_name_mode(crate::fs::name_mode::NameMode::Insensitive)
+                    .await
+                    .unwrap(),
+            );
+            let directory = filesystem
+                .mkdir(
+                    &crate::fs::test_util::test_creds(),
+                    0,
+                    b"Dir",
+                    &crate::fs::types::SetAttributes::default(),
+                )
+                .await
+                .unwrap()
+                .0;
+            let handler = Arc::new(NinePHandler::new(
+                Arc::clone(&filesystem),
+                Arc::new(FileLockManager::new()),
+            ));
+            establish_session(&handler, 0, b"test", 1000, Some([0; 16])).await;
+            // Stop the exact walk while it pins the directory, before it can
+            // install newfid. Clunk of either source or destination must wait.
+            let inode_lock = filesystem.lock_manager.acquire(directory).await;
+            let mut io = DispatchFixture::new(handler, 4);
+            io.dispatch(
+                10,
+                Message::Twalkgetattrexact(ninep_proto::Twalkgetattr {
+                    fid: 1,
+                    newfid: 2,
+                    nwname: 1,
+                    wnames: vec![P9String::new(b"Dir".to_vec())],
+                }),
+            )
+            .await;
+            io.dispatch(11, Message::Tclunk(Tclunk { fid: clunk_fid }))
+                .await;
+            io.expect_quiet("clunk must wait for the exact walk's fid installation")
+                .await;
+            drop(inode_lock);
+            let (tag, walked) = io.recv("exact walk response").await;
+            assert_eq!(tag, 10);
+            assert!(matches!(walked.body, Message::Rwalkgetattr(_)));
+            let (tag, clunked) = io.recv("clunk response").await;
+            assert_eq!(tag, 11);
+            assert!(matches!(clunked.body, Message::Rclunk(_)));
+            io.dispatch(
+                12,
+                Message::Tgetattr(Tgetattr {
+                    fid: clunk_fid,
+                    request_mask: GETATTR_ALL,
+                }),
+            )
+            .await;
+            assert!(matches!(
+                io.recv("clunked fid must remain absent").await.1.body,
+                Message::Rlerror(_)
+            ));
+            if clunk_fid == 2 {
+                assert_eq!(filesystem.open_handle_count(directory), 0);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn tclunk_cannot_overtake_an_earlier_lopenat_install() {
         let (filesystem, mut io, open, clunk) = race_lopenat_with(
             11,

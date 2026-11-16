@@ -15,7 +15,6 @@ on:
       - "zerofs/proto/**"
       - "Makefile"
   pull_request:
-    branches: ["main", "develop"]
     paths:
       - "webui/**"
       - "zerofs/ninep-client/**"
