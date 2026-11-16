@@ -1,5 +1,3 @@
-//! Startup readiness only. Passing this preflight never enables placement.
-
 mod config;
 #[cfg(any(target_os = "linux", test))]
 mod linux;
@@ -10,8 +8,6 @@ pub(crate) use config::ReadinessConfig;
 use config::{FilesystemIdentity, absolute_path};
 use std::path::{Path, PathBuf};
 
-/// Facts about the filesystem actually containing a role's existing root.
-/// Providers must report errors for unknown identity, mount or unlock state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct MountedFilesystem {
     mountpoint: PathBuf,
@@ -52,7 +48,7 @@ pub(super) fn verify_with(settings: &Settings, provider: &dyn IdentityProvider) 
     if !config.strict {
         return Ok(());
     }
-    let roots = config.roots(settings)?;
+    let roots = config.validated_roots(settings)?;
     let mut verified = Vec::new();
     for root in &roots {
         let path = root.path.canonicalize().with_context(|| {
@@ -66,7 +62,6 @@ pub(super) fn verify_with(settings: &Settings, provider: &dyn IdentityProvider) 
             bail!("readiness {} root is not a directory", root.role)
         }
         let mountpoint = &root.filesystem.mountpoint;
-        // A declared mount root must itself be canonical, not a symlink alias.
         absolute_path(mountpoint)?;
         if mountpoint.canonicalize()? != *mountpoint {
             bail!(

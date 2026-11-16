@@ -663,7 +663,6 @@ pub struct StorageConfig {
     /// Permanent segment placement across local disks and remote stores.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pool: Option<StoragePoolConfig>,
-    /// Opt-in filesystem identity checks before opening a local storage pool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) readiness: Option<crate::storage_readiness::ReadinessConfig>,
 }

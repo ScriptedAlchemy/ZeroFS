@@ -102,7 +102,7 @@ impl Fixture {
             .readiness
             .as_ref()
             .unwrap()
-            .roots(&settings)
+            .validated_roots(&settings)
             .unwrap();
         roots
             .iter()
@@ -162,7 +162,6 @@ fn verifies_every_active_role_with_injected_facts_and_shared_control_filesystem(
     let fixture = Fixture::new();
     fixture.verify().unwrap();
     assert_eq!(fixture.calls.get(), 5);
-    // hdd-smr is a declaration, with exactly the same identity requirements.
     let mut smr = Fixture::new();
     smr.document["storage"]["readiness"]["filesystems"][0]["profile"] = json!("hdd-smr");
     smr.verify().unwrap();
@@ -465,7 +464,7 @@ fn different_profiles_cannot_describe_the_same_zfs_capacity() {
 }
 
 #[test]
-fn symlink_overlap_and_mountpoint_aliases_fail_closed() {
+fn symlinked_roots_cannot_overlap() {
     use std::os::unix::fs::symlink;
     let mut fixture = Fixture::new();
     let authority = fixture.path("authority");
@@ -473,13 +472,16 @@ fn symlink_overlap_and_mountpoint_aliases_fail_closed() {
     symlink(&authority, &alias).unwrap();
     fixture.document["storage"]["pool"]["catalog_dir"] = json!(alias);
     error_contains(fixture.verify(), "must not overlap");
+}
+
+#[test]
+fn symlinked_mountpoint_fails_runtime_canonical_check() {
+    use std::os::unix::fs::symlink;
     let mut fixture = Fixture::new();
     let original = fixture.path("authority").parent().unwrap().to_path_buf();
     let alias = original.with_file_name("mount-alias");
     symlink(&original, &alias).unwrap();
     fixture.document["storage"]["readiness"]["filesystems"][0]["mountpoint"] = json!(alias);
-    // Keep configured role paths under the alias, so this reaches the runtime
-    // canonical-mount-root check rather than failing structural validation.
     fixture.document["storage"]["url"] = json!(
         url::Url::from_directory_path(alias.join("authority"))
             .unwrap()

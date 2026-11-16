@@ -1,4 +1,3 @@
-# Synthetic parser fixture only. No values here identify real storage.
 [cache]
 dir = "/fixture/fast/cache"
 disk_size_gb = 1.0
@@ -31,7 +30,6 @@ data = "durable"
 id = "durable"
 profile = "hdd-smr"
 mountpoint = "/fixture/durable"
-# Values intentionally exercise unsigned GUIDs beyond TOML's integer range.
 identity = { kind = "zfs", pool_guid = "18446744073709551614", dataset_guid = "18446744073709551615" }
 
 [[storage.readiness.filesystems]]

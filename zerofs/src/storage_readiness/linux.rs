@@ -1,6 +1,3 @@
-//! Read-only Linux mount/identity adapter. Parser and probe fixtures also run
-//! on macOS; they do not establish Linux or TrueNAS runtime acceptance.
-
 use super::{FilesystemIdentity, MountedFilesystem};
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;

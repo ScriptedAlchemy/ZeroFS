@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
-/// Operator declarations only. Identity discovery never chooses a profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum DiskProfile {
@@ -49,7 +48,6 @@ pub(crate) struct FilesystemDeclaration {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReadinessConfig {
-    /// Required explicitly; false retains the ordinary storage-open behavior.
     pub(super) strict: bool,
     pub(super) authority: String,
     pub(super) catalog: String,
@@ -91,11 +89,13 @@ fn local_url(raw: &str) -> Result<PathBuf> {
 
 impl ReadinessConfig {
     pub(crate) fn validate(&self, settings: &Settings) -> Result<()> {
-        self.roots(settings).map(|_| ())
+        self.validated_roots(settings).map(|_| ())
     }
 
-    /// Structural validation has no host probes, directory creation, or I/O.
-    pub(super) fn roots<'a>(&'a self, settings: &Settings) -> Result<Vec<StorageRoot<'a>>> {
+    pub(super) fn validated_roots<'a>(
+        &'a self,
+        settings: &Settings,
+    ) -> Result<Vec<StorageRoot<'a>>> {
         let pool = settings
             .storage
             .pool
@@ -118,7 +118,6 @@ impl ReadinessConfig {
             absolute_path(&filesystem.mountpoint)?;
             match &filesystem.identity {
                 FilesystemIdentity::Uuid { uuid } => {
-                    // The supported UUID adapter handles ext4 and XFS UUIDs.
                     let parsed = uuid::Uuid::parse_str(uuid).context("invalid filesystem UUID")?;
                     if parsed.is_nil() || parsed.hyphenated().to_string() != *uuid {
                         bail!("filesystem UUID must be nonzero, lowercase and hyphenated");
