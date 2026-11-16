@@ -282,8 +282,22 @@ pub async fn save_wrapped_key_to_object_store(
     Ok(())
 }
 
-/// Load the existing encryption key without initializing remote state.
+/// Load the existing key for a case-sensitive database without initializing state.
+///
+/// Keep the original API for callers that do not select a name mode. It must
+/// still reject an insensitive envelope rather than silently opening that store.
+#[allow(dead_code)] // Retained for crate callers that use the default name mode.
 pub(crate) async fn load_existing_encryption_key(
+    object_store: &Arc<dyn ObjectStore>,
+    db_path: &Path,
+    password: &str,
+) -> Result<[u8; 32]> {
+    load_existing_encryption_key_with_mode(object_store, db_path, password, NameMode::Sensitive)
+        .await
+}
+
+/// Load the existing encryption key without initializing remote state.
+pub(crate) async fn load_existing_encryption_key_with_mode(
     object_store: &Arc<dyn ObjectStore>,
     db_path: &Path,
     password: &str,
@@ -296,12 +310,32 @@ pub(crate) async fn load_existing_encryption_key(
     unwrap_key_blocking(password, wrapped_key.wrapped_key).await
 }
 
-/// Load or initialize encryption key from object store.
+/// Load or initialize the key for a case-sensitive database.
+///
+/// This preserves the original API and on-disk format for callers that do not
+/// select a name mode. An existing insensitive envelope is rejected.
+pub async fn load_or_init_encryption_key(
+    object_store: &Arc<dyn ObjectStore>,
+    db_path: &Path,
+    password: &str,
+    read_only: bool,
+) -> Result<[u8; 32]> {
+    load_or_init_encryption_key_with_mode(
+        object_store,
+        db_path,
+        password,
+        NameMode::Sensitive,
+        read_only,
+    )
+    .await
+}
+
+/// Load or initialize encryption key from object store with an explicit name mode.
 ///
 /// This loads the wrapped encryption key from the object store and unwraps it
 /// using the provided password. If no key exists, a new one is generated and
 /// stored.
-pub async fn load_or_init_encryption_key(
+pub async fn load_or_init_encryption_key_with_mode(
     object_store: &Arc<dyn ObjectStore>,
     db_path: &Path,
     password: &str,
@@ -450,6 +484,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_key_loading_api_keeps_sensitive_defaults_and_rejects_insensitive() {
+        use crate::fault_store::FaultStore;
+        let (fault, controls) = FaultStore::new(store());
+        let store: Arc<dyn ObjectStore> = fault;
+        let path = Path::from("legacy-api");
+        let key = load_or_init_encryption_key(&store, &path, "pw", false)
+            .await
+            .unwrap();
+        assert_eq!(
+            load_or_init_encryption_key(&store, &path, "pw", true)
+                .await
+                .unwrap(),
+            key
+        );
+        assert_eq!(
+            load_existing_encryption_key(&store, &path, "pw")
+                .await
+                .unwrap(),
+            key
+        );
+
+        let envelope = load_wrapped_key_from_object_store(&store, &path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(envelope.version, 1);
+        assert_eq!(envelope.name_mode, NameMode::Sensitive);
+        let insensitive = KeyEnvelope::new(envelope.wrapped_key, NameMode::Insensitive);
+        save_wrapped_key_to_object_store(&store, &path, &insensitive)
+            .await
+            .unwrap();
+        let puts = controls.put_count();
+
+        for read_only in [false, true] {
+            let error = load_or_init_encryption_key(&store, &path, "pw", read_only)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("name mode mismatch"));
+        }
+        let error = load_existing_encryption_key(&store, &path, "pw")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("name mode mismatch"));
+        assert_eq!(controls.put_count(), puts);
+    }
+
+    #[tokio::test]
     async fn invalid_envelopes_never_initialize_a_replacement() {
         use crate::fault_store::FaultStore;
         let (fault, controls) = FaultStore::new(store());
@@ -478,7 +559,7 @@ mod tests {
             for read_only in [false, true] {
                 for mode in [NameMode::Sensitive, NameMode::Insensitive] {
                     assert!(
-                        load_or_init_encryption_key(&store, &path, "pw", mode, read_only)
+                        load_or_init_encryption_key_with_mode(&store, &path, "pw", mode, read_only)
                             .await
                             .is_err()
                     );
@@ -509,7 +590,14 @@ mod tests {
         for mode in [NameMode::Sensitive, NameMode::Insensitive] {
             let store = store.clone();
             tasks.push(tokio::spawn(async move {
-                load_or_init_encryption_key(&store, &Path::from("race"), "pw", mode, false).await
+                load_or_init_encryption_key_with_mode(
+                    &store,
+                    &Path::from("race"),
+                    "pw",
+                    mode,
+                    false,
+                )
+                .await
             }));
         }
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -531,9 +619,15 @@ mod tests {
             if mode == winner.name_mode {
                 let dek = result.unwrap();
                 assert_eq!(
-                    load_or_init_encryption_key(&store, &Path::from("race"), "pw", mode, true)
-                        .await
-                        .unwrap(),
+                    load_or_init_encryption_key_with_mode(
+                        &store,
+                        &Path::from("race"),
+                        "pw",
+                        mode,
+                        true
+                    )
+                    .await
+                    .unwrap(),
                     dek
                 );
             } else {
@@ -596,7 +690,7 @@ mod tests {
         let path = Path::from("modes");
         for mode in [NameMode::Sensitive, NameMode::Insensitive] {
             assert!(
-                load_or_init_encryption_key(&store, &path, "pw", mode, true)
+                load_or_init_encryption_key_with_mode(&store, &path, "pw", mode, true)
                     .await
                     .is_err()
             );
@@ -614,9 +708,10 @@ mod tests {
                 NameMode::Sensitive
             };
             for read_only in [false, true] {
-                let error = load_or_init_encryption_key(&store, &path, "pw", wrong, read_only)
-                    .await
-                    .unwrap_err();
+                let error =
+                    load_or_init_encryption_key_with_mode(&store, &path, "pw", wrong, read_only)
+                        .await
+                        .unwrap_err();
                 assert!(error.to_string().contains("name mode mismatch"));
             }
             assert_eq!(controls.put_count(), puts);
@@ -699,15 +794,15 @@ mod tests {
         let pw = "shared-cluster-password";
 
         let (ka, kb) = tokio::join!(
-            load_or_init_encryption_key(&store, &db_path, pw, NameMode::Sensitive, false),
-            load_or_init_encryption_key(&store, &db_path, pw, NameMode::Sensitive, false),
+            load_or_init_encryption_key(&store, &db_path, pw, false),
+            load_or_init_encryption_key(&store, &db_path, pw, false),
         );
         let ka = ka.expect("node A init");
         let kb = kb.expect("node B init");
         assert_eq!(ka, kb, "concurrent initializers must converge on one key");
 
         // A later loader gets that same committed key.
-        let kc = load_or_init_encryption_key(&store, &db_path, pw, NameMode::Sensitive, false)
+        let kc = load_or_init_encryption_key(&store, &db_path, pw, false)
             .await
             .expect("later load");
         assert_eq!(ka, kc, "a later load must return the committed key");
@@ -725,7 +820,7 @@ mod tests {
         let db_path = Path::from("data");
         let (old_pw, new_pw) = ("old-pw-123", "new-pw-456");
 
-        let dek = load_or_init_encryption_key(&store, &db_path, old_pw, NameMode::Sensitive, false)
+        let dek = load_or_init_encryption_key(&store, &db_path, old_pw, false)
             .await
             .unwrap();
 
@@ -734,15 +829,14 @@ mod tests {
             .unwrap();
 
         assert!(
-            load_or_init_encryption_key(&store, &db_path, old_pw, NameMode::Sensitive, false)
+            load_or_init_encryption_key(&store, &db_path, old_pw, false)
                 .await
                 .is_err(),
             "the old password must stop unwrapping the key"
         );
-        let dek2 =
-            load_or_init_encryption_key(&store, &db_path, new_pw, NameMode::Sensitive, false)
-                .await
-                .unwrap();
+        let dek2 = load_or_init_encryption_key(&store, &db_path, new_pw, false)
+            .await
+            .unwrap();
         assert_eq!(dek, dek2, "rotation must preserve the data key");
     }
 
@@ -759,15 +853,9 @@ mod tests {
     #[tokio::test]
     async fn read_only_init_without_a_key_errors() {
         let store = store();
-        let err = load_or_init_encryption_key(
-            &store,
-            &Path::from("data"),
-            "pw",
-            NameMode::Sensitive,
-            true,
-        )
-        .await
-        .unwrap_err();
+        let err = load_or_init_encryption_key(&store, &Path::from("data"), "pw", true)
+            .await
+            .unwrap_err();
         assert!(format!("{err:#}").contains("read-only"), "got: {err:#}");
     }
 
@@ -775,11 +863,11 @@ mod tests {
     async fn reload_with_wrong_password_errors() {
         let store = store();
         let db_path = Path::from("data");
-        load_or_init_encryption_key(&store, &db_path, "right", NameMode::Sensitive, false)
+        load_or_init_encryption_key(&store, &db_path, "right", false)
             .await
             .unwrap();
         assert!(
-            load_or_init_encryption_key(&store, &db_path, "wrong", NameMode::Sensitive, false)
+            load_or_init_encryption_key(&store, &db_path, "wrong", false)
                 .await
                 .is_err()
         );
