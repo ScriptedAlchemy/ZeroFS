@@ -77,3 +77,26 @@ pub(super) fn xattrs_result(
             .collect(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_listing_is_complete_but_permission_failure_is_not() {
+        for error in [Errno::OPNOTSUPP, Errno::ACCESS] {
+            let attrs = xattrs_result(Err(error), |_| panic!("a failed listing has no names"));
+            assert_eq!(attrs.is_complete(), error == Errno::OPNOTSUPP);
+            let value = serde_json::to_value(attrs).unwrap();
+            assert_eq!(value["errno"], error.raw_os_error());
+            assert_eq!(
+                value["reason"],
+                if error == Errno::OPNOTSUPP {
+                    "format_not_supported_by_filesystem"
+                } else {
+                    "permission_denied"
+                }
+            );
+        }
+    }
+}
