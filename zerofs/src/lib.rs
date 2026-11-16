@@ -74,6 +74,22 @@ pub async fn run_cli() -> Result<()> {
     let cli = cli::Cli::parse_args();
 
     match cli.command {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        cli::Commands::Inventory {
+            root,
+            hash,
+            max_entries_per_second,
+            work_dir,
+            resume_from,
+        } => {
+            cli::inventory::run(
+                &root,
+                hash,
+                max_entries_per_second,
+                work_dir.as_deref(),
+                resume_from.as_deref(),
+            )?;
+        }
         cli::Commands::Upload {
             target,
             source,
