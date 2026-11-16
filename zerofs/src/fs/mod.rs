@@ -44,6 +44,7 @@ pub use self::gc::GarbageCollector;
 pub use handle::OpenHandle;
 #[cfg(feature = "webui")]
 pub(crate) use ops::{VerifiedFileContent, VerifiedFileExpectation, VerifiedRenameOutcome};
+pub use ops::{XATTR_VALUE_MAX, XattrName, XattrSetMode, XattrValue};
 
 use self::errors::FsError;
 use self::inode::InodeId;
