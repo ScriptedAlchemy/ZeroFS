@@ -790,6 +790,54 @@ async fn over_cap_attributes_do_not_block_unlink_or_open_inode_reclaim() {
 }
 
 #[tokio::test]
+async fn rename_overwrite_deletes_xattrs_beyond_cap() {
+    let fs = ZeroFS::new_in_memory().await.unwrap();
+    let src = file(&fs, b"src").await;
+    let dst = file(&fs, b"dst").await;
+    fs.set_xattr(
+        &test_creds(),
+        src,
+        &name(b"user.keep"),
+        value(b"source"),
+        XattrSetMode::Create,
+    )
+    .await
+    .unwrap();
+    let count = crate::fs::store::xattr::XATTR_COUNT_MAX + 1;
+    let mut txn = fs.db.new_transaction().unwrap();
+    for i in 0..count {
+        fs.xattr_store.put(
+            &mut txn,
+            dst,
+            format!("user.{i:04}").as_bytes(),
+            Bytes::new(),
+        );
+    }
+    fs.write_coordinator.commit(txn).await.unwrap();
+    assert_eq!(rows(&fs, dst).await, count);
+    assert!(matches!(
+        fs.xattr_store.list(dst).await,
+        Err(FsError::NoSpace)
+    ));
+
+    fs.rename(&test_auth(), 0, b"src", 0, b"dst").await.unwrap();
+
+    assert_eq!(rows(&fs, dst).await, 0);
+    assert!(matches!(
+        fs.inode_store.get(dst).await,
+        Err(FsError::NotFound)
+    ));
+    assert_eq!(fs.lookup(&test_creds(), 0, b"dst").await.unwrap(), src);
+    assert_eq!(rows(&fs, src).await, 1);
+    assert_eq!(
+        fs.get_xattr(&test_creds(), src, &name(b"user.keep"), None)
+            .await
+            .unwrap(),
+        b"source".as_slice()
+    );
+}
+
+#[tokio::test]
 async fn xattr_set_is_submitted_before_detaching_and_shutdown_barrier() {
     let fs = ZeroFS::new_in_memory().await.unwrap();
     let id = file(&fs, b"shutdown").await;
