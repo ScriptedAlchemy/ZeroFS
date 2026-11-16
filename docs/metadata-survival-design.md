@@ -4,8 +4,10 @@ This is the first design stage of the metadata survival implementation. It is
 verified against ZeroFS commit `9b67f82eddedb30d268ac31fccaa0e3d49d9f2c3`.
 The survival gate still fails. This change adds no replication, recovery command,
 survival acknowledgement or placement capability. The proposed mechanism is
-promising on source inspection only. The ignored acceptance tests record missing
-dependencies, not a safety proof. The coordinator accepted the first mechanism
+promising on source inspection only. The authority-loss acceptance test still
+fails. Two ordinary journal-loss controls exercise today's backend durability;
+the remaining recovery matrix is an implementation requirement, not executed
+coverage. The coordinator accepted the first mechanism
 and its operating limits on November 16, 2026. Those decisions appear below as
 requirements. They do not establish that the mechanism works.
 
@@ -34,7 +36,8 @@ The coordinator's proposal needs four corrections before implementation.
    transaction while the state stays fixed. Survival is a distinct, explicitly
    requested receipt. Quiescence adds latency and pauses admission for that
    receipt. Ordinary buffered and local SSD acknowledgements retain their current
-   meaning and cost.
+   meaning. Admission pauses and replicated allocation intents may increase their
+   cost and latency while survival is configured.
 3. Deleting the primary object before its replicas does not protect the last
    recovery generation. Every dependency and physical payload generation needed
    by a selectable commit needs retention before any deletion. Deferred cleanup
@@ -81,7 +84,7 @@ local Cargo checkout, not inferred from upstream documentation.
 | Writeback placement | `zerofs/src/cli/init.rs:267` attaches writeback above the backend after loading the key. Hooks at lines 1167 through 1207 capture and wait for object coverage. `zerofs/src/writeback/bootstrap.rs:27` recovers a paused overlay. The authority replica wrapper belongs below writeback, so a local journal acknowledgement does not imply replicated durability. Survival records bypass the evictable cache and journal and reach every metadata device directly. |
 | Writeback retirement | `zerofs/src/writeback/journal.rs:1371` advances remote completion. `zerofs/src/writeback/journal.rs:1720` removes remote prefixes. A survival commit must stop relying on a journal prefix before it retires it. Losing the journal may still lose a documented local-only suffix. |
 | Writer locks | `zerofs/src/pool_object_store/catalog.rs:250` holds an exclusive catalog lock. `zerofs/src/local_object_store.rs:95` orders local locks and keeps their files stable. Neither locks every metadata replica. Add a persistent lock file on each replica and hold every exclusive lock for the writer's lifetime, together with the existing SlateDB writer epoch. |
-| Config parsing | `zerofs/src/config.rs:669` denies unknown pool fields. `Settings::from_file` at line 1958 parses and validates. The acceptance fixture deliberately submits the proposed `metadata_survival` table here. This is a real missing dependency today. |
+| Config parsing | `zerofs/src/config.rs:669` denies unknown pool fields. `Settings::from_file` at line 1958 parses and validates. The proposed `metadata_survival` table is unsupported. Configuration acceptance alone provides no replication or recovery evidence. |
 
 The pinned SlateDB implementation supplies several useful pieces, with limits.
 
@@ -132,6 +135,57 @@ survival acknowledgement and reports the failed replica. It never drops a
 replica from the acknowledgement set on its own. Memory and SSD acknowledgement
 modes do not become survival receipts. Admission must remain bounded while
 survival cannot progress, and retained dependencies must remain protected.
+
+### Behavior of the live share after a failure
+
+While survival is configured, a failed replica health check, I/O error, ENOSPC,
+identity mismatch, stale replica or commit deadline closes **all mutation
+admission**, including memory and local-SSD acknowledgement modes. New writes,
+metadata changes and destructive maintenance fail with an explicit storage
+error. Already admitted operations retain their ownership until they settle;
+they may have their ordinary durability outcome but cannot receive a survival
+receipt for an incompletely replicated generation. A deadline stops waiting by
+the caller; it must not release the owner's locks or cancel an in-progress
+fsync. Queued, unadmitted requests are rejected rather than held indefinitely.
+
+Reads may continue only while their namespace and catalog view remains valid.
+The loss of the authority or journal must stop the normal export if that view
+cannot be guaranteed; hot cached metadata is not evidence that a cold read can
+succeed. A lost payload device returns `EIO` for current ranges on that device,
+never zeros or obsolete data, while verified unaffected ranges remain readable.
+There is no automatic writable failover. The operator stops the writer and
+opens explicit read-only recovery at a validated generation. Normal writable
+service resumes only after offline catch-up restores every configured replica
+and a fresh startup validates the fixed membership and its exclusive locks.
+
+### Latency, space and write budgets
+
+The first version permits one owned survival commit at a time. Its request
+waits for drain, backend flush, checkpoint export, and durable dependency and
+commit-record publication on **every** replica. With the sequential publication
+order below, the fsync costs add across replicas; an HDD replica participates
+in this foreground latency even when the authority is NVMe. Ordinary writes
+outside a requested commit do not gain a survival guarantee. They can still
+wait behind the commit's closed admission gate.
+
+Deployment must supply a finite commit deadline, an admission byte/request
+budget and a metadata-retention byte budget; activation must refuse absent or
+zero budgets. These are requirements for the implementation, not configuration
+fields supported today. Exhausting any budget closes mutation admission and
+reports which budget failed. A timeout never authorizes dropping a replica,
+forgetting an acknowledged generation or silently switching acknowledgement
+semantics. No latency SLO or endurance estimate is established by this PR.
+
+Capacity accounting includes the live metadata, the union of dependencies for
+selectable generations, one candidate, durable intents, scratch/export
+headroom and the configured free reserve, on each capacity domain. Immutable
+dependency bytes may be shared by digest; a shared byte stays charged until
+its final retention reference is gone. For `R` replicas and `D` newly copied
+metadata bytes, copying alone writes at least `R * D` bytes before catalog,
+record, filesystem and sync overhead. The implementation must measure per-replica
+bytes written, fsync latency, commit elapsed time, queued admission and retained
+bytes. Enabling it on HDD replicas requires measured peak metadata churn and
+space/write budgets, not the assumption that metadata is always small.
 
 The first implementation is single-host only. Configuring metadata replicas
 together with HA replication is refused. Before opening a writer, acquire an
@@ -210,7 +264,7 @@ Atomic rename without a parent sync is not a completed durable publication.
    for the backend cutoff while maintenance remains paused. The owner must not
    hold a pool lock needed by writeback replay. Pool operations carry an existing
    admission token instead of reacquiring the closed admission gate.
-3. The owner creates a non-expiring `Durable` SlateDB checkpoint and receives its
+3. The owner creates a temporary non-expiring `Durable` SlateDB checkpoint and receives its
    manifest ID. It drains the checkpoint's metadata writes through writeback to
    the replicated backend. It enumerates the checkpoint's full dependency graph
    and hashes the actual bytes. Compaction publication and GC must remain paused
@@ -237,13 +291,51 @@ Atomic rename without a parent sync is not a completed durable publication.
    mutation and object cutoffs. A caller cancellation cannot cancel the owned
    commit task or release its exclusion early. Lost replies permit a complete
    unacknowledged generation to recover.
-8. The owner may release admission. Cleanup can retire dependencies of older
-   commits only when every configured replica has a newer durable commit and no
-   reader or retained checkpoint references them. It logs each deletion intent
+8. The owner transfers dependency protection to the durable survival-retention
+   ledger and explicitly deletes its temporary SlateDB checkpoint through
+   `Admin::delete_checkpoint`. It drains that manifest update before releasing
+   admission. Cleanup can retire dependencies of older commits only when every
+   configured replica has a newer durable commit and no reader or retained
+   generation references them. It logs each deletion intent
    on every replica first. It deletes the primary object before replica copies
    only within this permission. Physical debt remains charged until a subsequent
    survival commit records completion. A loss mid-cleanup therefore preserves
    conservative, possibly already satisfied debt and never undercounts it.
+
+### Checkpoint and generation retirement
+
+A survival checkpoint is an export pin, not a permanent live SlateDB reader.
+The current segment-GC gate in `zerofs/src/fs/gc.rs` pauses deletion and
+compaction whenever *any* non-expiring checkpoint exists. Merely retiring the
+oldest checkpoint while keeping the newest would therefore still prevent
+reclamation forever. The implementation must release every owned export pin
+once its complete immutable dependency bundle is protected on every replica.
+Read-only recovery opens that verified bundle in scratch and does not depend
+on the continued existence of its checkpoint in the live authority.
+
+Replacing the pin requires an explicit retention ledger consulted by **all**
+metadata and payload deletion/remap paths. It records references by generation
+and by recovery reader. The current and preceding selectable generations remain
+protected through publication; an older generation may be retired only after
+every replica durably acknowledges a newer commit and all its readers close.
+Retirement is itself an authenticated, durable record on every replica. Recovery
+must reject retired generations, while retaining their small chain records if
+the selected generation still needs them for authentication. Only after this
+record is durable everywhere may dependency references be decremented and
+unreferenced bytes become cleanup debts. A crash during retirement may leak
+space temporarily; it must never invalidate a selectable generation.
+
+On an aborted candidate, the owner records whether any commit record was
+published. Before record publication, it may release the export pin after
+durably recording abandonment and all candidate allocation debts, preserving
+the preceding generation's references. After any record publication, the
+candidate remains recoverable until publication is completed or an explicit
+offline repair resolves it. Failure to retire a pin keeps admission closed;
+startup reconciles owned checkpoint IDs from durable intents before resuming.
+Never delete arbitrary user checkpoints. Repeated-commit tests must show that
+owned pins return to zero and retained space stabilizes after readers and
+cleanup settle. If the live GC paths cannot honor this ledger, survival remains
+disabled; keeping a permanent checkpoint is not a deployable substitute.
 
 The wrapper must serialize conditional operations as one logical decision under
 the fenced owner. It uses the primary's create or compare-and-swap decision and
@@ -304,33 +396,54 @@ report an obsolete segment frame as current loss. Holes remain holes. Reads of
 lost ranges return a defined I/O error, and unaffected ranges verify their
 original hashes. This per-file reporting path does not exist today.
 
-## Failing acceptance matrix
+## Implemented evidence and required acceptance matrix
 
-`zerofs/src/metadata_survival_tests.rs` keeps the existing authority-loss test and
-adds separately ignored rows. Every row uses disposable local directories,
-closes workers and reloads the existing encrypted namespace before its loss.
-Removing a directory models permanent state loss, not power loss. The fixture
-does not model independent hardware devices or a process killed during fsync.
-It must remove its directories before reporting an expected failure.
+`zerofs/src/metadata_survival_tests.rs` contains three ordinary controls and one
+ignored authority-loss acceptance test. The baseline checks four real failures
+after a cold-open control: loss of authority objects, catalog, whole authority
+device and wrapped key. Two journal controls create an SSD-durable suffix with
+remote replay paused, then discard the journal either before or after draining
+it to the backend. They cold-read the exact expected namespace and payload.
+They prove today's writeback cutoff behavior only: no metadata replica or
+survival receipt exists in those fixtures.
 
-| Acceptance row | Required cold result and current missing dependency |
+The earlier proposed-configuration tests have been removed. Accepting an unknown
+configuration table cannot demonstrate replication, and repeating that parse
+128 times cannot exercise 128 commit cuts. A normal test run must never label
+these missing scenarios as passed or executed. The sole ignored acceptance
+test performs a real authority-device loss and still fails at the missing
+catalog. Adding a success-returning configuration stub cannot satisfy it.
+
+The following matrix is **required but unimplemented**, except for that failing
+authority-loss reproduction. It must be implemented against production hooks
+before the survival gate can pass. Directory removal models state loss, not
+independent hardware or power loss; process-kill/fsync testing is a separate gate.
+
+| Acceptance row | Required fixture, observation and failure oracle |
 | --- | --- |
-| Authority device loss | Keep the existing real pool and namespace test. Current recovery fails because the catalog is missing. |
-| Journal loss before backend cutoff | Create a real SSD-durable suffix with remote replay paused, discard the journal and cold-read the prior backend prefix. Then require a survival generation through the proposed replica configuration. The current parser rejects that configuration. The local-only suffix is allowed to disappear. |
-| Journal loss after backend cutoff | Drain the real writeback suffix to the pool, discard the journal and cold-read that exact suffix. Require the committed recovery generation without relying on the journal. The current parser rejects the proposed configuration. |
-| Payload member with a metadata replica lost | Configure the proposed sibling replica directory, lose its whole logical device and attempt cold recovery. The current parser prevents provisioning a real metadata replica. The row must report that limit instead of copying files to fake replication. |
-| Writes in flight during loss | Keep an admitted operation blocked, lose a device, discard its uncommitted work and cold-recover the last survival prefix. The replica configuration and commit owner do not exist. The fixture must label that prerequisite before claiming the concurrency cut was exercised. |
-| Every interrupted commit step | Enumerate before and after each durable step above, each replica and each single-device loss. Attempt the proposed configuration for each case and collect every failure. No survival cut hook exists yet, so none of these cuts is exercised by stage 1. No synthetic commit record counts as an implementation test. |
-| Exact catalog, cleanup debts and envelope epoch | Cold recovery must compare every catalog table and identity field, nonzero upload and garbage debts, capacity accounting, original envelope digest and committed epoch. The proposed configuration fails first. An empty debt list or the legacy envelope's format version is not evidence of debt or epoch recovery. |
+| Authority device loss | Provision real replicas, obtain and validate a survival receipt, record its cutoffs and digests, close all workers, remove the entire authority device, then cold-open from surviving replicas and compare the complete namespace and payload. The existing no-replica test is only the failing baseline. |
+| Journal loss before backend cutoff | First obtain a validated survival receipt for prefix A on every replica. Admit an SSD-only suffix B while remote replay is blocked, prove B has not reached its cutoff, lose the journal and recover A through the production recovery reader. Verify the selected generation/receipt, exact A contents and absence of B; simply opening the intact original authority is insufficient. |
+| Journal loss after backend cutoff | Drain B, explicitly obtain its survival receipt and verify the record and dependency digests on every replica before journal loss. Recover that exact generation without the journal and compare B. A backend receipt alone must fail this test. |
+| Payload member with a metadata replica lost | Put at least one **current** extent on the member to be lost and an unaffected current extent elsewhere; also create an obsolete frame on that member. Record exact inode, all hardlink paths, offsets and lengths from the committed namespace. Lose the whole member/replica device. Verify names and metadata, exact lost-range reporting, `EIO` for lost current ranges, original hashes for unaffected ranges, and no loss claim for the obsolete frame. Requiring intact payload on the lost member is incorrect. |
+| Writes in flight during loss | A production admission/materialization barrier must report an admitted operation actually blocked before the device is lost. Acknowledge prefix A beforehand, race B against loss, then kill/restart without graceful flush. Recover at least A, allow only complete B if it reached a valid commit, and reject torn namespace/catalog combinations. Assert that the hook fired and the blocked task was outstanding at the loss. |
+| Every interrupted commit publication and sync | Inject before/after every durable publication and sync, recording the exact step, replica and object. Kill the process at the observed hook, lose each eligible device in turn and cold-recover. Require the last acknowledged prefix or a complete later unacknowledged prefix, compare all dependency digests and prove no source mutation. A case is executed only if its exact hook was reached; count actual events, not eight high-level prose steps times a fixed multiplier. |
+| Exact catalog, debts and key epoch | Before committing, induce real failed uploads and failed physical cleanup so both debt tables are nonempty. Export every catalog table in one transaction and record sorted byte keys/values, identity, counters, charges, envelope digest and committed key epoch. After losing the authority, compare the full recovered export and epoch. Namespace-only checks and empty debts cannot satisfy this row. |
+| Replica slow/full/I/O/corruption/staleness | Inject each failure separately before and during publication. Observe bounded mutation rejection, no survival success, retained acknowledged dependencies and the live-share behavior specified above. A delay must exceed the configured deadline, ENOSPC must leave the configured reserve intact, and corruption/staleness must be detected from evidence rather than trusted labels. |
+| Competing writers and catch-up | Run distinct processes, prove only one can hold all replica locks, and attempt a writer with a missing/stale replica. Require refusal until offline verified catch-up completes. Verify pool/membership/epoch equality and all commit dependencies before the repaired set can acknowledge again. |
+| Checkpoint retirement and bounded retention | Commit repeatedly while overwriting/removing data, retain a reader on an older generation and then release it. Inject crashes before/after retirement records and checkpoint deletion. Verify acknowledged generations remain recoverable, owned live pins reach zero, old generation references retire safely, and retained capacity/debts are reclaimed after cleanup. |
 
-The ordinary module run must skip every acceptance row and pass the baseline
-reproduction. Explicitly running each ignored test must fail at the catalog or
-configuration dependency named above. The external evidence directory records
-the exact tested head, commands, counts, failure lines and cleanup inventory.
-The full matrix in the comparison document still applies, including key-only
-loss, catalog-only loss, corrupt and full replicas, metadata-only workloads,
-stale repair and refusal of password changes. Interrupted password changes must
-pass their credential matrix before that operation can be enabled.
+Each positive recovery case needs a negative control: disable actual replica
+publication or replace the commit/recovery operation with a success-only stub.
+The test must then fail on missing or mismatched receipt, dependency, catalog,
+range or hook evidence. Test setup must verify nonzero debts, actual in-flight
+work and current lost extents instead of trusting the intended fixture. These
+negative controls are not implemented in this design PR either.
+
+Record the exact tested head, commands, observed hook events, assertions and
+cleanup result with each run. The full matrix in the comparison document still
+applies, including key-only/catalog-only loss, metadata-only workloads and
+password-change refusal. No passing ordinary suite, enabled config parser or
+count of ignored cases opens the metadata-survival or migration gate.
 
 ## Unverified assumptions
 

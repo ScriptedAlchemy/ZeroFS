@@ -487,16 +487,17 @@ async fn authority_device_loss_preserves_committed_namespace() {
         .expect("Committed namespace must survive authority-device loss");
 }
 
-// These directories model state loss on logical devices, not power loss.
-// Replica provisioning and commit cut hooks do not exist at this head. Keep
-// those prerequisites visible instead of manufacturing replica files in tests.
-struct ProposedMetadataSurvivalFixture {
+// These are controls for the existing writeback durability contract, not
+// metadata-survival acceptance tests. No replica is configured and a backend
+// receipt is not a survival receipt. Keep the unimplemented recovery matrix in
+// the design document rather than letting configuration parsing stand in for it.
+struct DurablePrefixFixture {
     fixture: Fixture,
     expected: ExpectedNamespace,
     pool_id: String,
 }
 
-impl ProposedMetadataSurvivalFixture {
+impl DurablePrefixFixture {
     async fn new() -> Self {
         let fixture = Fixture::new();
         let (fs, pool) = open(&fixture.settings, true).await.unwrap();
@@ -504,13 +505,13 @@ impl ProposedMetadataSurvivalFixture {
         let _ = fs.administrative_remote_durability().await.unwrap();
         let pool_id = pool.status().await.unwrap().pool_id;
         close(fs, pool).await;
-        let proposed = Self {
+        let control = Self {
             fixture,
             expected,
             pool_id,
         };
-        proposed.verify_cold_prefix(&proposed.expected).await;
-        proposed
+        control.verify_cold_prefix(&control.expected).await;
+        control
     }
 
     async fn verify_cold_prefix(&self, expected: &ExpectedNamespace) {
@@ -518,47 +519,7 @@ impl ProposedMetadataSurvivalFixture {
         let result = verify_namespace(&fs, expected).await;
         assert_eq!(pool.status().await.unwrap().pool_id, self.pool_id);
         close(fs, pool).await;
-        result.expect("real cold namespace control must pass before the missing prerequisite");
-    }
-
-    fn proposed_settings(&self) -> Result<Settings> {
-        let config = self.fixture.root.path().join("fixture.toml");
-        let mut document: toml::Value = toml::from_str(&std::fs::read_to_string(&config)?)?;
-        let replica_dir = self
-            .fixture
-            .root
-            .path()
-            .canonicalize()?
-            .join("disk-a-device/metadata-replica");
-        let survival = toml::Value::try_from(serde_json::json!({
-            "format_version": 1,
-            "authority_replica_id": "authority",
-            "authority_device_id": "fixture-authority-device",
-            "recovery_mode": "read_only",
-            "reserve_free_bytes": 65536,
-            "replicas": [{
-                "id": "disk-a-metadata",
-                "device_id": "fixture-disk-a-device",
-                "dir": replica_dir,
-            }],
-        }))?;
-        document["storage"]["pool"]
-            .as_table_mut()
-            .unwrap()
-            .insert("metadata_survival".to_owned(), survival);
-        let proposed_config = self.fixture.root.path().join("proposed-recovery.toml");
-        std::fs::write(&proposed_config, toml::to_string(&document)?)?;
-        Settings::from_file(proposed_config).context(
-            "Cold recovery cannot configure metadata replicas. See docs/metadata-survival-design.md",
-        )
-    }
-
-    async fn attempt_cold_recovery(&self) -> Result<()> {
-        let settings = self.proposed_settings()?;
-        let (fs, pool) = open(&settings, false).await?;
-        let result = verify_namespace(&fs, &self.expected).await;
-        close(fs, pool).await;
-        result
+        result.expect("cold namespace and payload must match the expected durable prefix");
     }
 
     fn finish(self, case: &str, result: Result<()>) -> Result<()> {
@@ -567,12 +528,13 @@ impl ProposedMetadataSurvivalFixture {
         self.fixture
             .root
             .close()
-            .expect("remove acceptance fixture");
-        assert!(!root.exists(), "acceptance fixture must be absent");
+            .expect("remove durability-control fixture");
+        assert!(!root.exists(), "durability-control fixture must be absent");
         println!(
-            "METADATA_SURVIVAL_ACCEPTANCE {}",
+            "METADATA_SURVIVAL_DURABILITY_CONTROL {}",
             serde_json::json!({
                 "case": case,
+                "survival_acceptance": "not exercised",
                 "cold_control": "passed",
                 "cleanup": "passed",
                 "fixture": root,
@@ -584,21 +546,21 @@ impl ProposedMetadataSurvivalFixture {
 }
 
 async fn observe_journal_device_loss(after_backend_cutoff: bool) -> Result<()> {
-    let mut proposed = ProposedMetadataSurvivalFixture::new().await;
-    let journal_device = proposed
+    let mut control = DurablePrefixFixture::new().await;
+    let journal_device = control
         .fixture
         .root
         .path()
         .canonicalize()?
         .join("journal-device");
     let (fs, pool, writeback) = open_with_writeback(
-        &proposed.fixture.settings,
+        &control.fixture.settings,
         false,
         Some(journal_device.join("journal")),
     )
     .await?;
     let writeback = writeback.unwrap();
-    let mut suffix = proposed.expected.clone();
+    let mut suffix = control.expected.clone();
     suffix.payload = payload(3).slice(..FINAL_SIZE);
     fs.write(&AuthContext::default(), suffix.file, 0, &suffix.payload)
         .await
@@ -625,7 +587,7 @@ async fn observe_journal_device_loss(after_backend_cutoff: bool) -> Result<()> {
             receipt.object_coverage,
             ObjectCoverage::Writeback { .. }
         ));
-        proposed.expected = suffix;
+        control.expected = suffix;
     }
     close(fs, pool).await;
     if after_backend_cutoff {
@@ -639,7 +601,7 @@ async fn observe_journal_device_loss(after_backend_cutoff: bool) -> Result<()> {
     drop(writeback);
     std::fs::remove_dir_all(&journal_device)?;
     assert!(!journal_device.exists());
-    proposed.verify_cold_prefix(&proposed.expected).await;
+    control.verify_cold_prefix(&control.expected).await;
     println!(
         "METADATA_SURVIVAL_JOURNAL_LOSS {}",
         serde_json::json!({
@@ -651,124 +613,28 @@ async fn observe_journal_device_loss(after_backend_cutoff: bool) -> Result<()> {
             "survival_commit": "not implemented",
         })
     );
-    let result = proposed.attempt_cold_recovery().await;
-    proposed.finish(
+    control.finish(
         if after_backend_cutoff {
             "journal-device-after-backend-cutoff"
         } else {
             "journal-device-before-backend-cutoff"
         },
-        result,
+        Ok(()),
     )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Journal-independent survival commits are missing. See docs/metadata-survival-design.md."]
-async fn journal_device_loss_before_backend_cutoff_preserves_committed_prefix() {
+async fn journal_loss_before_backend_cutoff_preserves_only_the_backend_prefix() {
     tokio::time::timeout(Duration::from_secs(120), observe_journal_device_loss(false))
         .await
-        .expect("journal-loss acceptance exceeded deadline")
-        .expect("The backend prefix needs a survival generation after journal-device loss");
+        .expect("journal-loss control exceeded deadline")
+        .expect("The existing backend prefix must remain readable after journal loss");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Journal-independent survival commits are missing. See docs/metadata-survival-design.md."]
-async fn journal_device_loss_after_backend_cutoff_preserves_committed_prefix() {
+async fn journal_loss_after_backend_cutoff_preserves_the_drained_suffix() {
     tokio::time::timeout(Duration::from_secs(120), observe_journal_device_loss(true))
         .await
-        .expect("journal-loss acceptance exceeded deadline")
-        .expect("The drained suffix needs a survival generation after journal-device loss");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Payload members cannot hold configured metadata replicas. See docs/metadata-survival-design.md."]
-async fn data_member_with_metadata_replica_loss_preserves_namespace_and_reports_ranges() {
-    let proposed = ProposedMetadataSurvivalFixture::new().await;
-    std::fs::remove_dir_all(proposed.fixture.root.path().join("disk-a-device")).unwrap();
-    let result = proposed
-        .attempt_cold_recovery()
-        .await
-        .context("Cannot provision the metadata replica or report exact missing file ranges yet");
-    proposed
-        .finish("data-member-with-metadata-replica", result)
-        .expect("Metadata and unaffected ranges must survive loss of the replica's data device");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "The survival commit owner and loss hooks are missing. See docs/metadata-survival-design.md."]
-async fn writes_in_flight_during_loss_preserve_last_survival_commit() {
-    let proposed = ProposedMetadataSurvivalFixture::new().await;
-    proposed.fixture.lose(Loss::AuthorityDevice);
-    let result = proposed.attempt_cold_recovery().await.context(
-        "The in-flight cut requires replica admission and drain hooks. Concurrency was not exercised",
-    );
-    proposed
-        .finish("writes-in-flight-prerequisite", result)
-        .expect("An admitted write must not invalidate the last survival commit");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Replica commit cut hooks are missing. See docs/metadata-survival-design.md."]
-async fn interrupted_commit_at_every_step_preserves_a_consistent_generation() {
-    let proposed = ProposedMetadataSurvivalFixture::new().await;
-    let mut blocked = Vec::new();
-    // None of these cuts can run until production accepts replica configuration.
-    // Collect every prerequisite failure so the first one does not hide the rest.
-    for step in 1..=8 {
-        for side in ["before", "after"] {
-            for replica in ["authority", "disk-a-metadata"] {
-                for lost_device in [
-                    "authority-device",
-                    "journal-device",
-                    "disk-a-device",
-                    "disk-b-device",
-                ] {
-                    let result = proposed.attempt_cold_recovery().await;
-                    println!(
-                        "METADATA_SURVIVAL_COMMIT_CUT {}",
-                        serde_json::json!({
-                            "step": step, "side": side, "replica": replica,
-                            "lost_device": lost_device, "cut_exercised": false,
-                            "error": result.as_ref().err().map(|error| format!("{error:#}")),
-                        })
-                    );
-                    if let Err(error) = result {
-                        blocked.push(format!(
-                            "Step {step} {side} on {replica} with {lost_device} lost. {error:#}"
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    let result = if blocked.is_empty() {
-        Err(anyhow::anyhow!(
-            "Replica configuration is now accepted. Wire the production commit cut hooks before accepting this matrix"
-        ))
-    } else {
-        Err(anyhow::anyhow!(
-            "{} commit-cut cases stopped at the missing prerequisite. No commit cut was exercised. {}",
-            blocked.len(),
-            blocked[0]
-        ))
-    };
-    proposed
-        .finish("interrupted-commit-prerequisites", result)
-        .expect("Every interrupted commit must recover one consistent generation");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Catalog export, nonzero replicated debts and key epochs are missing. See docs/metadata-survival-design.md."]
-async fn recovery_preserves_exact_catalog_identity_cleanup_debts_and_key_epoch() {
-    let proposed = ProposedMetadataSurvivalFixture::new().await;
-    proposed.fixture.lose(Loss::AuthorityDevice);
-    let result = proposed.attempt_cold_recovery().await.context(
-        "Exact recovery requires a complete catalog export, nonzero upload and garbage debts, and a committed envelope epoch",
-    );
-    proposed
-        .finish(
-            "catalog-identity-cleanup-debts-key-epoch-prerequisite",
-            result,
-        )
-        .expect("Recovery must preserve exact catalog identity, cleanup debts and the key epoch");
+        .expect("journal-loss control exceeded deadline")
+        .expect("The remotely durable suffix must remain readable after journal loss");
 }

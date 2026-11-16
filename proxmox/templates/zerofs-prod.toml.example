@@ -1,6 +1,6 @@
 [cache]
 dir = "/srv/zerofs-persist/cache"
-disk_size_gb = 1000.0
+disk_size_gb = 200.0
 memory_size_gb = 32.0
 
 [runtime]
@@ -13,8 +13,8 @@ encryption_password = "${ZEROFS_STORAGE_PASSWORD}"
 [sftp]
 identity_file = "/srv/zerofs-persist/current/storage-key"
 known_hosts = "/srv/zerofs-persist/current/known_hosts"
-max_connections = 8
-read_concurrency = 4
+max_connections = 10
+read_concurrency = 64
 write_concurrency = 16
 segment_size_mib = 32
 read_cache_part_size_kib = 1024
@@ -27,10 +27,11 @@ ignore_fsync = false
 enabled = true
 ack_mode = "ssd"
 memory_size_gb = 4.0
-disk_size_gb = 64.0
-min_free_gb = 32.0
+disk_size_gb = 256.0
+min_free_gb = 128.0
 dir = "/srv/zerofs-persist/state/writeback"
 shutdown_flush = "local"
+upload_concurrency = 12
 
 [servers.ninep]
 addresses = ["10.10.10.30:5564"]
