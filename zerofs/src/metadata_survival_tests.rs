@@ -159,6 +159,10 @@ async fn open_with_writeback(
                 wal_enabled: false,
                 l0_sst_size_bytes: usize::MAX - 1,
                 max_unflushed_bytes: usize::MAX,
+                // Compaction is disabled for stable fixture files. Repeated
+                // commit and reclaim flushes must fit without an L0 stall.
+                l0_max_ssts: 1024,
+                l0_max_ssts_per_key: 1024,
                 flush_interval: None,
                 compactor_options: None,
                 garbage_collector_options: None,
