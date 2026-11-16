@@ -1586,34 +1586,91 @@ impl Filesystem for Fuse9P {
     #[allow(clippy::too_many_arguments)]
     fn setxattr(
         &self,
-        _req: &Request,
-        _ino: INodeNo,
-        _name: &OsStr,
-        _value: &[u8],
-        _flags: i32,
-        _position: u32,
+        req: &Request,
+        ino: INodeNo,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        position: u32,
         reply: ReplyEmpty,
     ) {
-        reply.error(Errno::ENOSYS);
+        if position != 0 {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+        let client = Arc::clone(&self.client);
+        let inodes = Arc::clone(&self.inodes);
+        let identity = UserIdentity::from_request(req);
+        let name = name.as_bytes().to_vec();
+        let value = value.to_vec();
+        self.rt.spawn(async move {
+            let result = async {
+                let fid = user_fid(&client, &inodes, identity, ino.0).await?;
+                client.set_xattr(fid, &name, &value, flags as u32).await
+            }
+            .await;
+            match result {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
     }
 
-    fn getxattr(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        _name: &OsStr,
-        _size: u32,
-        reply: ReplyXattr,
-    ) {
-        reply.error(Errno::ENOSYS);
+    fn getxattr(&self, req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        let client = Arc::clone(&self.client);
+        let inodes = Arc::clone(&self.inodes);
+        let identity = UserIdentity::from_request(req);
+        let name = name.as_bytes().to_vec();
+        self.rt.spawn(async move {
+            let result = async {
+                let fid = user_fid(&client, &inodes, identity, ino.0).await?;
+                client.get_xattr(fid, &name).await
+            }
+            .await;
+            match result {
+                Ok(value) if size == 0 => reply.size(value.len() as u32),
+                Ok(value) if value.len() > size as usize => reply.error(Errno::ERANGE),
+                Ok(value) => reply.data(&value),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
     }
 
-    fn listxattr(&self, _req: &Request, _ino: INodeNo, _size: u32, reply: ReplyXattr) {
-        reply.error(Errno::ENOSYS);
+    fn listxattr(&self, req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        let client = Arc::clone(&self.client);
+        let inodes = Arc::clone(&self.inodes);
+        let identity = UserIdentity::from_request(req);
+        self.rt.spawn(async move {
+            let result = async {
+                let fid = user_fid(&client, &inodes, identity, ino.0).await?;
+                client.list_xattrs(fid).await
+            }
+            .await;
+            match result {
+                Ok(value) if size == 0 => reply.size(value.len() as u32),
+                Ok(value) if value.len() > size as usize => reply.error(Errno::ERANGE),
+                Ok(value) => reply.data(&value),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
     }
 
-    fn removexattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
-        reply.error(Errno::ENOSYS);
+    fn removexattr(&self, req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let client = Arc::clone(&self.client);
+        let inodes = Arc::clone(&self.inodes);
+        let identity = UserIdentity::from_request(req);
+        let name = name.as_bytes().to_vec();
+        self.rt.spawn(async move {
+            let result = async {
+                let fid = user_fid(&client, &inodes, identity, ino.0).await?;
+                client.remove_xattr(fid, &name).await
+            }
+            .await;
+            match result {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
     }
 
     fn bmap(&self, _req: &Request, _ino: INodeNo, _blocksize: u32, _idx: u64, reply: ReplyBmap) {

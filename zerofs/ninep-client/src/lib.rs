@@ -63,6 +63,7 @@ mod runtime;
 mod web_transport;
 #[cfg(not(target_arch = "wasm32"))]
 mod write_progress;
+mod xattr;
 
 /// The 9P "no tag" sentinel. We never allocate it for a normal request.
 const NOTAG: u16 = 0xFFFF;
@@ -1770,6 +1771,15 @@ impl NinePClient {
         exact_tag: Option<u16>,
         body: Message,
     ) -> ClientResult<Message> {
+        Self::send_raw_at_tag_ctx(conn, exact_tag, body, false).await
+    }
+
+    async fn send_raw_at_tag_ctx(
+        conn: &Conn,
+        exact_tag: Option<u16>,
+        body: Message,
+        op_id_enabled: bool,
+    ) -> ClientResult<Message> {
         let permit = conn
             .writer_tx
             .reserve()
@@ -1801,7 +1811,7 @@ impl NinePClient {
             drop(permit);
             return Err(ClientError::Disconnected);
         }
-        let bytes = match P9Message::new(tag, body).to_bytes() {
+        let bytes = match P9Message::new(tag, body).to_bytes_ctx(op_id_enabled) {
             Ok(b) => b,
             Err(e) => return Err(ClientError::Codec(e)),
         };
