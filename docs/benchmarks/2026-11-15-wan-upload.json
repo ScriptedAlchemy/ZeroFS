@@ -1,0 +1,67 @@
+{
+  "date": "2026-11-15",
+  "revision": "5ac4d4304f04699d9e0895ec60516a6bbad5c57d",
+  "workflow_run": 43680127479,
+  "artifact_sha256": {
+    "linux_amd64_pgo": "161f9f3c65a38764f4e0bd86d38e468094b2528a76965b9ac937f8af4f9252b9",
+    "darwin_aarch64_pgo": "e9cae3670ae758530ef7e49ea9b7a95933f9ad358cf8f9e5ac56ce7acbac487f"
+  },
+  "scope": "Operational observations; cache warmth and concurrent work were not controlled",
+  "mac_tunnel_udp_capture": {
+    "offered_mbps": 600,
+    "inner_datagrams": 818238,
+    "matching_encrypted_sent": 419423,
+    "sent_matched_remote": 419260,
+    "capture_kernel_drops": 0
+  },
+  "linux_route": {
+    "rtt_ms_approx": 70,
+    "udp_offered_mbps": 600,
+    "udp_received_mbps": 594.373972,
+    "tcp_cubic_one_stream_mbps": 31.939578,
+    "tcp_bbr_one_stream_mbps": 315.43308,
+    "tcp_bbr_two_streams_mbps": 537.487854,
+    "lan_ssh_relay_two_streams_mbps": 547.809229
+  },
+  "native_single_file_uploads": [
+    {
+      "path": "server-local Unix P9 socket",
+      "bytes": 268435456,
+      "seconds": 0.8987771328538656,
+      "verified_readback": true
+    },
+    {
+      "path": "Mac LAN SSH relay through Linux NAS; default TCP buffer ceiling",
+      "jobs": 1,
+      "bytes": 1073741824,
+      "seconds": 26.598868708126247
+    },
+    {
+      "path": "Mac LAN SSH relay through Linux NAS; 16 MiB TCP buffer ceiling",
+      "jobs": 1,
+      "bytes": 1073741824,
+      "seconds": 13.563300540903583,
+      "sha256": "80b520dc0ea35117211ff30f8eb10976b4bf88019c5bf80831b40b1fcd3bcd26",
+      "verified_readback": true
+    },
+    {
+      "path": "Mac LAN SSH relay through Linux NAS; 16 MiB TCP buffer ceiling",
+      "jobs": 1,
+      "bytes": 4294967296,
+      "seconds": 57.65864241588861,
+      "sha256": "58022337f65f61b008d0e3ce1381a3706bc3fa843353cccb91d8be1b7b14b7a3",
+      "verified_readback": true
+    }
+  ],
+  "durability_boundary": "SSD acknowledgement and native publication; remote Storage Box completion excluded",
+  "source": "Internal SSD for generated payloads; concurrent local media migration remained active",
+  "writeback": {
+    "ssd_gb": 256,
+    "min_free_gb": 128,
+    "memory_gb": 4,
+    "ack_mode": "ssd",
+    "sftp_connections": 10,
+    "remote_drain_near_gigabit_verified": false
+  },
+  "cleanup": "Owned generated payloads, readbacks, captures, temporary container/image, deployment staging and diagnostic port grants removed"
+}

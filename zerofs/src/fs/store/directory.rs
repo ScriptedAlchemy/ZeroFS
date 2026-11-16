@@ -126,6 +126,8 @@ impl DirectoryStore {
     }
 
     /// Check the stored spelling with a point read, without directory read access.
+    /// The caller holds the directory's namespace lock through this check and
+    /// any preceding folded lookup so a replacement cannot split the reads.
     pub(crate) async fn get_exact(&self, dir_id: InodeId, name: &[u8]) -> Result<InodeId, FsError> {
         let (inode_id, cookie) = self.get_entry_with_cookie(dir_id, name).await?;
         let scan = self

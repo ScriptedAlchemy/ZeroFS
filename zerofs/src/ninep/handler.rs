@@ -1424,12 +1424,22 @@ impl NinePHandler {
 
         for wname in tw.wnames {
             let name_bytes = Bytes::from(wname.data);
+            let check_spelling = exact
+                && self.filesystem.name_mode() == crate::fs::name_mode::NameMode::Insensitive
+                && !matches!(name_bytes.as_ref(), b"." | b"..");
+            // Keep the entry, its preserved spelling, and its inode in one
+            // namespace view. An atomic replacement/recase must not land
+            // between the folded lookup and the exact-spelling check and make
+            // a continuously present name spuriously return ENOENT.
+            let _directory_guard = if check_spelling {
+                Some(self.filesystem.lock_manager.acquire(current_id).await)
+            } else {
+                None
+            };
             let child_id = self
                 .walk_component(&src_fid.creds, src_fid.root, current_id, &name_bytes)
                 .await?;
-            if exact
-                && self.filesystem.name_mode() == crate::fs::name_mode::NameMode::Insensitive
-                && !matches!(name_bytes.as_ref(), b"." | b"..")
+            if check_spelling
                 && self
                     .filesystem
                     .directory_store
@@ -3933,6 +3943,61 @@ mod tests {
                 assert!(handler.get_fid(2).is_err());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn exact_walk_waits_for_atomic_replacement_to_apply() {
+        use crate::fs::name_mode::NameMode;
+        let fs = Arc::new(
+            ZeroFS::new_in_memory_with_name_mode(NameMode::Insensitive)
+                .await
+                .unwrap(),
+        );
+        let creds = test_creds();
+        fs.create(&creds, 0, b"Foo", &SetAttributes::default())
+            .await
+            .unwrap();
+        let replacement = fs
+            .create(&creds, 0, b"replacement", &SetAttributes::default())
+            .await
+            .unwrap()
+            .0;
+        let handler = NinePHandler::new(fs.clone(), Arc::new(FileLockManager::new()));
+        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+
+        // Hold the rename after it has queued the old inode's deletion but
+        // before the namespace transaction applies. Foo exists throughout.
+        let block_apply = fs.db.flush_barrier().write_owned().await;
+        let apply_reached = fs.write_coordinator.probe_next_apply();
+        let renaming_fs = fs.clone();
+        let renaming = tokio::spawn(async move {
+            renaming_fs
+                .rename(&AuthContext::from(&creds), 0, b"replacement", 0, b"Foo")
+                .await
+        });
+        apply_reached.await.unwrap();
+        let mut walking = Box::pin(request(
+            &handler,
+            2,
+            Message::Twalkgetattrexact(Twalkgetattr {
+                fid: 1,
+                newfid: 2,
+                nwname: 1,
+                wnames: vec![P9String::new(b"Foo".to_vec())],
+            }),
+        ));
+        assert!(
+            futures::poll!(walking.as_mut()).is_pending(),
+            "exact lookup observed an unapplied replacement"
+        );
+        drop(block_apply);
+        renaming.await.unwrap().unwrap();
+        let response = walking.await;
+        assert!(
+            matches!(response.body, Message::Rwalkgetattr(ref reply) if reply.stat.qid.path == replacement),
+            "{:?}",
+            response.body
+        );
     }
 
     #[tokio::test]
