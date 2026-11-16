@@ -16,6 +16,8 @@ pub(crate) use recovery::PoolRecovery;
 mod tests;
 
 pub use catalog::CATALOG_FILE_NAME;
+#[cfg(test)]
+pub(crate) use catalog::survival_test_support;
 use catalog::{Catalog, Entry, Garbage, Physical, StoredAttribute, Upload};
 
 use async_trait::async_trait;

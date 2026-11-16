@@ -22,6 +22,9 @@ use uuid::Uuid;
 
 use crate::writeback::anchored_dir::AnchoredDir;
 
+#[cfg(test)]
+pub(crate) mod survival_test_support;
+
 #[derive(Debug, thiserror::Error)]
 #[error("no pool member has sufficient capacity and local free-space reserve")]
 pub(super) struct NoCapacity;
