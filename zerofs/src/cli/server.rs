@@ -2024,16 +2024,8 @@ fn load_and_validate_server_settings(
         .servers
         .require_listener_endpoint()
         .context("Invalid [servers] configuration")?;
-    let volatile_write_bytes = settings
-        .servers
-        .nbd
-        .as_ref()
-        .map(crate::config::NbdConfig::volatile_memory_bytes)
-        .transpose()?
-        .unwrap_or(0);
-    let memory_budget =
-        super::memory_budget::validate_server_startup(&settings, volatile_write_bytes)
-            .context("Invalid startup memory budget")?;
+    let memory_budget = super::memory_budget::validate_server_startup(&settings)
+        .context("Invalid startup memory budget")?;
     Ok((settings, memory_budget))
 }
 
@@ -2350,7 +2342,7 @@ min_free_gb = 256.0
             nbd.write_ack_mode,
             crate::config::NbdWriteAckMode::Materialized
         );
-        assert_eq!(nbd.volatile_memory_bytes().unwrap(), 0);
+        assert_eq!(nbd.volatile_memory_gb, 0.0);
     }
 
     #[test]

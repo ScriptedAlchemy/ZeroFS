@@ -42,10 +42,11 @@ impl StartupMemoryTiers {
         Ok(Self {
             clean_cache_bytes,
             object_writeback_bytes,
-            // The caller supplies the one normalized volatile-write budget. In
-            // configurations that retain a legacy NBD alias, it must not be
-            // added a second time here.
-            volatile_write_bytes,
+            // Raw input and accepted overlay have independent gates. Matching
+            // legacy aliases resolve to one setting before charging both stages.
+            volatile_write_bytes: volatile_write_bytes
+                .checked_mul(2)
+                .context("volatile-write ownership-stage allowance overflowed")?,
         })
     }
 }
@@ -70,11 +71,9 @@ pub(crate) struct MemoryBudgetReceipt {
     pub(crate) rss_pressure_cap_bytes: u64,
 }
 
-pub(crate) fn validate_server_startup(
-    settings: &Settings,
-    volatile_write_bytes: u64,
-) -> Result<Option<MemoryBudgetReceipt>> {
-    let tiers = StartupMemoryTiers::from_settings(settings, volatile_write_bytes)?;
+pub(crate) fn validate_server_startup(settings: &Settings) -> Result<Option<MemoryBudgetReceipt>> {
+    let write_ack = settings.filesystem_write_ack_settings(WritebackAccessMode::ReadWrite)?;
+    let tiers = StartupMemoryTiers::from_settings(settings, write_ack.volatile_memory_bytes)?;
     let detected = detect_process_cgroup_v2_memory_limit()?;
     let configured = settings.runtime_memory_limit_bytes()?;
     let Some(envelope) = select_memory_limit(detected, configured)? else {
@@ -758,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn tier_accounting_counts_the_normalized_volatile_budget_once() {
+    fn tier_accounting_charges_both_normalized_volatile_stages() {
         let mut settings = crate::config::Settings::generate_default();
         settings.cache.dir = "/tmp/zerofs-clean".into();
         settings.cache.memory_size_gb = Some(64.0);
@@ -778,6 +777,6 @@ mod tests {
 
         assert_eq!(tiers.clean_cache_bytes, 64_000_000_000);
         assert_eq!(tiers.object_writeback_bytes, 4_000_000_000);
-        assert_eq!(tiers.volatile_write_bytes, 7_000_000_000);
+        assert_eq!(tiers.volatile_write_bytes, 14_000_000_000);
     }
 }

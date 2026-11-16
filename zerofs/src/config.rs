@@ -138,8 +138,7 @@ pub struct Settings {
     pub(crate) cache: CacheConfig,
     pub(crate) storage: StorageConfig,
     pub(crate) servers: ServerConfig,
-    /// Process-level resource limits used when container namespaces hide the
-    /// parent cgroup envelope.
+    /// Process memory admission settings and an optional dedicated envelope.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     runtime: Option<RuntimeConfig>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -180,6 +179,28 @@ pub struct RuntimeConfig {
     /// A shared parent cgroup is only a ceiling and cannot supply this budget.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     memory_limit_gb: Option<f64>,
+    /// Optional increase over the computed residency reserve, in decimal GB.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    unmodeled_residency_reserve_gb: Option<f64>,
+    /// Optional increase over the computed kernel and allocator headroom, in decimal GB.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    engine_headroom_gb: Option<f64>,
+}
+
+fn runtime_memory_bytes(name: &str, value: f64) -> Result<u64> {
+    if !value.is_finite() || value <= 0.0 {
+        anyhow::bail!("[runtime] {name} must be a finite positive number");
+    }
+    let bytes = (value * 1_000_000_000.0).round();
+    if bytes >= u64::MAX as f64 {
+        anyhow::bail!("[runtime] {name} is too large");
+    }
+    if bytes < 1.0 {
+        anyhow::bail!(
+            "[runtime] {name} must be a finite positive number resolving to at least one byte"
+        );
+    }
+    Ok(bytes as u64)
 }
 
 /// In-process SSH implementation used for SFTP sessions.
@@ -1472,18 +1493,6 @@ impl NbdConfig {
             _ => Ok(()),
         }
     }
-
-    pub(crate) fn volatile_memory_bytes(&self) -> Result<u64> {
-        self.validate()?;
-        if self.write_ack_mode == NbdWriteAckMode::Materialized {
-            return Ok(0);
-        }
-        let bytes = self.volatile_memory_gb * 1_000_000_000.0;
-        if bytes > u64::MAX as f64 {
-            anyhow::bail!("[servers.nbd] volatile_memory_gb exceeds this platform's address space");
-        }
-        Ok(bytes.round() as u64)
-    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -1948,21 +1957,30 @@ impl Settings {
     }
 
     pub(crate) fn runtime_memory_limit_bytes(&self) -> Result<Option<u64>> {
-        let Some(value) = self
-            .runtime
+        self.runtime
             .as_ref()
             .and_then(|runtime| runtime.memory_limit_gb)
-        else {
-            return Ok(None);
-        };
-        if !value.is_finite() || value <= 0.0 {
-            anyhow::bail!("[runtime] memory_limit_gb must be a finite positive number");
-        }
-        let bytes = value * 1_000_000_000.0;
-        if bytes > u64::MAX as f64 {
-            anyhow::bail!("[runtime] memory_limit_gb is too large");
-        }
-        Ok(Some(bytes.round() as u64))
+            .map(|value| runtime_memory_bytes("memory_limit_gb", value))
+            .transpose()
+    }
+
+    pub(crate) fn runtime_memory_reserve_bytes(&self) -> Result<(Option<u64>, Option<u64>)> {
+        let residency = self
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.unmodeled_residency_reserve_gb);
+        let process = self
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.engine_headroom_gb);
+        Ok((
+            residency
+                .map(|value| runtime_memory_bytes("unmodeled_residency_reserve_gb", value))
+                .transpose()?,
+            process
+                .map(|value| runtime_memory_bytes("engine_headroom_gb", value))
+                .transpose()?,
+        ))
     }
 
     pub(crate) fn from_file(config_path: impl AsRef<std::path::Path>) -> Result<Self> {
@@ -1986,6 +2004,7 @@ impl Settings {
     pub(crate) fn validate(&self) -> Result<()> {
         self.servers.validate()?;
         self.runtime_memory_limit_bytes()?;
+        self.runtime_memory_reserve_bytes()?;
         if let Some(pool) = &self.storage.pool {
             pool.validate(self)?;
         }
@@ -2882,7 +2901,7 @@ write_ack_mode = "volatile_memory"
     }
 
     #[test]
-    fn nbd_volatile_memory_ack_normalizes_its_byte_budget() {
+    fn nbd_volatile_memory_ack_parses_its_legacy_budget() {
         let settings = write_and_load(
             r#"
 [cache]
@@ -2903,7 +2922,7 @@ volatile_memory_gb = 2.0
 
         let nbd = settings.servers.nbd.as_ref().unwrap();
         assert_eq!(nbd.write_ack_mode, NbdWriteAckMode::VolatileMemory);
-        assert_eq!(nbd.volatile_memory_bytes().unwrap(), 2_000_000_000);
+        assert_eq!(settings.filesystem_write_ack_settings(crate::writeback::config::WritebackAccessMode::ReadWrite).unwrap().volatile_memory_bytes, 2_000_000_000);
     }
 
     #[test]

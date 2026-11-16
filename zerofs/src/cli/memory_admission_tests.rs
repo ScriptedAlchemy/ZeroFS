@@ -58,7 +58,7 @@ fn admission(root: &Path, text: &str) -> Result<MemoryBudgetReceipt> {
     let path = root.join("config.toml");
     std::fs::write(&path, text)?;
     let settings = Settings::from_file(path)?;
-    validate_server_startup(&settings, 0)?.context("test requires a dedicated memory envelope")
+    validate_server_startup(&settings)?.context("test requires a dedicated memory envelope")
 }
 
 #[test]
