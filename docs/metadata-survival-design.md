@@ -5,7 +5,9 @@ verified against ZeroFS commit `9b67f82eddedb30d268ac31fccaa0e3d49d9f2c3`.
 The survival gate still fails. This change adds no replication, recovery command,
 survival acknowledgement or placement capability. The proposed mechanism is
 promising on source inspection only. The ignored acceptance tests record missing
-dependencies, not a safety proof.
+dependencies, not a safety proof. The coordinator accepted the first mechanism
+and its operating limits on November 16, 2026. Those decisions appear below as
+requirements. They do not establish that the mechanism works.
 
 The chosen direction in [the comparison](metadata-survival-m0.md) is one live
 namespace and catalog with redundant recovery generations. Payload remains
@@ -25,11 +27,14 @@ The coordinator's proposal needs four corrections before implementation.
    configuration rather than assume that the authority wrapper covers it.
 2. A flush and an independently exported catalog do not identify the same prefix.
    The existing database barrier excludes database writes, but not catalog
-   mutations, migration, health changes or cleanup. The smallest proposed
-   alternative is a quiescent survival commit under one new serialization owner.
+   mutations, migration, health changes or cleanup. The accepted first mechanism
+   is a quiescent survival commit under one new serialization owner.
    It pauses mutation admission and maintenance, drains admitted work, seals and
    flushes, pins an exact SlateDB checkpoint, then exports one redb read
-   transaction while the state stays fixed. This costs availability and latency.
+   transaction while the state stays fixed. Survival is a distinct, explicitly
+   requested receipt. Quiescence adds latency and pauses admission for that
+   receipt. Ordinary buffered and local SSD acknowledgements retain their current
+   meaning and cost.
 3. Deleting the primary object before its replicas does not protect the last
    recovery generation. Every dependency and physical payload generation needed
    by a selectable commit needs retention before any deletion. Deferred cleanup
@@ -72,9 +77,10 @@ local Cargo checkout, not inferred from upstream documentation.
 | Catalog contents and identity | `zerofs/src/pool_object_store/catalog.rs:40` defines eight tables. Identity at line 51 includes the pool UUID, authority prefix and canonical catalog directory. Opening checks the directory at line 295 and the marker at line 302. The current snapshot at line 932 exports only mappings and hidden legacy objects. Add a complete logical export and a versioned recovery binding, rather than copying `pool.redb` or calling the partial snapshot a backup. |
 | Payload publication and cleanup | `zerofs/src/pool_object_store/mod.rs:856` writes a fresh physical generation, publishes its catalog entry at line 943 and immediately cleans the previous generation at line 946. `delete_owned` at line 1803 retires and cleans. `cleanup_garbage` at line 1327 deletes bytes before forgetting debt. All three need recovery-reference retention and replicated cleanup intents. |
 | Startup side effects | `zerofs/src/pool_object_store/mod.rs:534` configures members, line 584 finishes initialization and line 588 invokes pending recovery. `zerofs/src/pool_object_store/catalog.rs:271` opens a write transaction even for ordinary reopen. A read-only recovery path must bypass these operations. |
-| Key loading and rotation | `zerofs/src/cli/init.rs:225` normally uses load-or-initialize. `zerofs/src/key_management.rs:210` instead refuses a missing existing envelope. Recovery must use the latter behavior. The envelope at line 25 has salt, nonce, wrapped DEK and version, but no pool binding, epoch or encoded KDF parameters. Password change at line 302 overwrites one envelope at line 323. Survival mode must serialize that change as its own commit. |
+| Key loading and rotation | `zerofs/src/cli/init.rs:225` normally uses load-or-initialize. `zerofs/src/key_management.rs:210` instead refuses a missing existing envelope. Recovery must use the latter behavior. The envelope at line 25 has salt, nonce, wrapped DEK and version, but no pool binding, epoch or encoded KDF parameters. Password change at line 302 overwrites one envelope at line 323. The first survival version must refuse password changes whenever metadata replicas are configured. |
 | Writeback placement | `zerofs/src/cli/init.rs:267` attaches writeback above the backend after loading the key. Hooks at lines 1167 through 1207 capture and wait for object coverage. `zerofs/src/writeback/bootstrap.rs:27` recovers a paused overlay. The authority replica wrapper belongs below writeback, so a local journal acknowledgement does not imply replicated durability. Survival records bypass the evictable cache and journal and reach every metadata device directly. |
 | Writeback retirement | `zerofs/src/writeback/journal.rs:1371` advances remote completion. `zerofs/src/writeback/journal.rs:1720` removes remote prefixes. A survival commit must stop relying on a journal prefix before it retires it. Losing the journal may still lose a documented local-only suffix. |
+| Writer locks | `zerofs/src/pool_object_store/catalog.rs:250` holds an exclusive catalog lock. `zerofs/src/local_object_store.rs:95` orders local locks and keeps their files stable. Neither locks every metadata replica. Add a persistent lock file on each replica and hold every exclusive lock for the writer's lifetime, together with the existing SlateDB writer epoch. |
 | Config parsing | `zerofs/src/config.rs:669` denies unknown pool fields. `Settings::from_file` at line 1958 parses and validates. The acceptance fixture deliberately submits the proposed `metadata_survival` table here. This is a real missing dependency today. |
 
 The pinned SlateDB implementation supplies several useful pieces, with limits.
@@ -121,15 +127,36 @@ absent authority, catalog, journal or payload member root without recreating it.
 It reads surviving configured replicas and materializes verified state only into
 an owned temporary directory. `recovery_mode = "normal"` never elects a surviving
 replica automatically. It refuses survival commits after any configured replica
-is unavailable, corrupt, full, stale or bound to another pool. Strict survival
-mode stops new mutations on such failure, in addition to withholding survival
-receipts. Memory and SSD acknowledgement modes do not become survival receipts.
+is unavailable, corrupt, full, stale or bound to another pool. The writer stops
+survival acknowledgement and reports the failed replica. It never drops a
+replica from the acknowledgement set on its own. Memory and SSD acknowledgement
+modes do not become survival receipts. Admission must remain bounded while
+survival cannot progress, and retained dependencies must remain protected.
 
-The first version requires an externally fenced single writer. It rejects HA
-replication and membership changes while serving. Replacement is an offline,
-explicit epoch transition with verified catch-up on every new replica before
-the next writable open. Local directory locks and SlateDB writer epochs alone
-cannot fence two disjoint surviving metadata devices.
+The first implementation is single-host only. Configuring metadata replicas
+together with HA replication is refused. Before opening a writer, acquire an
+exclusive lock on every configured replica in stable replica-ID order. Hold
+all locks for the writer's lifetime, together with the existing database writer
+epoch. Failure to acquire any lock refuses the writable open and releases the
+locks already acquired. Lock files remain stable and must never be unlinked
+while an owner may hold them. This is a local OS locking contract, not a
+multi-host election protocol.
+
+No external freshness service is required. Freshness relies on acknowledgement
+on every configured replica and mandatory offline verified catch-up before a
+replica that missed any commit may rejoin. Under these rules every surviving
+configured replica contains every acknowledged commit. Recovery selects the
+highest valid chained commit among the surviving replicas and refuses when they
+disagree on pool identity or membership epoch. Recovery cannot rule out a
+replica that was swapped for an older copy of itself. Authentication and a local
+exclusive lock cannot detect that stale self-copy without independent history.
+
+Membership changes while serving are refused. Replacement remains an offline,
+explicit epoch transition with verified catch-up before the next writable open.
+Password changes are refused whenever metadata replicas are configured until
+the credential matrix passes. The name mode is carried inside the `zerofs.key`
+envelope under the coordinator's PR 78 contract. Replicate that envelope byte
+for byte. There is no separate name-mode object or dependency.
 
 ## Proposed on-disk formats
 
@@ -140,13 +167,14 @@ No record stores a raw DEK or password.
 
 | File | Proposed content |
 | --- | --- |
+| `writer.lock` | A persistent lock file opened and exclusively locked on each configured replica before writable startup. The writer holds every lock until shutdown. Recovery locks existing surviving files without creating or modifying source files. The lock file is not commit content and carries no freshness claim. |
 | `identity.json` | The format version, pool UUID, replica ID, device binding, fixed membership digest, membership epoch and original authority and catalog bindings. It is immutable within an epoch and authenticated after key bootstrap. |
-| `keys/<epoch>.json` | A versioned key envelope containing Argon2id version and parameters, salt, XChaCha20-Poly1305 nonce and ciphertext, DEK identity digest, pool UUID and envelope epoch. AEAD associated data binds the pool and epoch. The commit names its exact digest. Legacy `zerofs.key` is retained as an exact dependency during migration. |
+| `keys/<epoch>.json` | A versioned recovery record containing the exact `zerofs.key` envelope bytes encoded as hex, their SHA-256, the original envelope version, its required KDF algorithm and parameters, the DEK identity digest, pool UUID and envelope epoch. The name mode remains inside those original envelope bytes. The authenticated commit binds this record and the exact envelope digest to the pool and epoch. Recovery copies the original envelope bytes without rewrapping the DEK or inventing another name-mode field. |
 | `catalog/<generation>.json` | A complete logical export of all eight catalog tables under one redb read transaction. Sorted table names and sorted byte keys carry their exact byte values, plus original identity, generation, schema versions and allocation counters. Decode and validate known values before import. Byte preservation avoids silently dropping future health or debt fields. Unknown schema versions refuse recovery. |
-| `dependencies/<generation>.json` | The checkpoint UUID, exact manifest ID and path, all transitive manifest and SST dependencies with lengths and SHA-256, bucket identity, key envelope, `zerofs.namemode` and the catalog export digest. It also names every live physical segment generation and its owner, length and checksum from that catalog. Missing payload is distinguishable from missing metadata. |
+| `dependencies/<generation>.json` | The checkpoint UUID, exact manifest ID and path, all transitive manifest and SST dependencies with lengths and SHA-256, bucket identity, the exact `zerofs.key` envelope bytes including name mode, and the catalog export digest. It also names every live physical segment generation and its owner, length and checksum from that catalog. Missing payload is distinguishable from missing metadata. |
 | `objects/<sha256>` | Immutable byte copies of metadata dependencies. Mutable logical objects and future overwrites cannot destroy a retained commit's bytes. A dependency map reconstructs the selected logical names in scratch. Live authority names still use the existing SlateDB layout. |
 | `intents/<epoch>/<sequence>.json` | Authenticated, chained safety records for new physical allocations, remaps and cleanup attempts. An allocation intent with its exact physical key reaches every replica before bytes can be written. A deletion intent names the retired generation and the commit that permits deletion. Completion may only reduce debt in a later committed catalog export. |
-| `commits/<epoch>/<sequence>.json` | A canonical authenticated commit with pool UUID, membership digest and epoch, writer epoch, sequence, predecessor digest, mutation incarnation and cutoff, object journal incarnation and cutoff or direct-backend coverage, SlateDB checkpoint and manifest identity, dependency-list digest, catalog generation and digest, envelope epoch and digest, and name-mode digest. |
+| `commits/<epoch>/<sequence>.json` | A canonical authenticated commit with pool UUID, membership digest and epoch, writer epoch, sequence, predecessor digest, mutation incarnation and cutoff, object journal incarnation and cutoff or direct-backend coverage, SlateDB checkpoint and manifest identity, dependency-list digest, catalog generation and digest, envelope epoch and digest. The envelope digest covers the name mode too. |
 
 Use a specified canonical UTF-8 JSON encoding with lexicographically sorted
 object keys, decimal integers, no duplicate keys, no floats and no insignificant
@@ -154,17 +182,16 @@ whitespace. Encode bytes and digests as lowercase hex. Compute SHA-256 and a
 domain-separated HMAC-SHA-256 over the canonical bytes excluding the MAC field.
 Derive the MAC key from the recovered DEK using HKDF with the pool UUID and the
 literal `zerofs-metadata-survival-v1`. Pin this encoding with golden vectors
-before writing persistent state. The current bincode key envelope does not
-implement this proposal.
+before writing persistent state. These authenticated recovery records do not
+exist at the pinned head. They preserve the original key envelope bytes.
 
 Recovery starts with bounded envelope candidates and the independently supplied
 password and expected pool identity. It unwraps a candidate, verifies commit
-authentication and then verifies the envelope's exact digest and binding. An
-authenticated chain does not by itself prevent an operator supplying only an
-old replica. Offline restoration must supply an independent last accepted epoch
-and minimum commit digest or explicitly acknowledge unknown freshness. The
+authentication and then verifies the envelope's exact digest and binding,
+including its name mode. It requires no external freshness floor. The
 one-device-loss claim assumes the configured surviving device has not also been
-rolled back or corrupted.
+rolled back or corrupted. Recovery must explicitly report that it cannot rule
+out a replica replaced by an older copy of itself.
 
 ## Exact survival commit ordering
 
@@ -172,8 +199,9 @@ The numbers below are named cut points for the acceptance matrix. Cut immediatel
 before and after each durable file publication and each sync, on each replica.
 Atomic rename without a parent sync is not a completed durable publication.
 
-1. The owner checks the external writer fence, pool identity, membership and
-   metadata capacity on every configured replica. It closes admission to new
+1. The owner verifies that it still holds every configured replica's exclusive
+   lock and the existing database writer epoch. It checks pool identity,
+   membership and metadata capacity on every configured replica. It closes admission to new
    namespace and pool mutations. It drains already admitted mutations and stops
    maintenance at an explicit idle acknowledgement. It does not hold the
    database barrier while waiting for workers that need that barrier.
@@ -193,7 +221,8 @@ Atomic rename without a parent sync is not a completed durable publication.
    and garbage are explicit debts, not live mappings. It includes member health,
    faults, hidden legacy entries, identities and counters.
 5. For each replica in configured ID order, the owner stores and syncs immutable
-   envelope, name mode, catalog export, dependency bytes and dependency list.
+   key envelope with its name mode, catalog export, dependency bytes and
+   dependency list.
    It syncs each file and affected parent directory, then verifies lengths and
    hashes from that replica. It installs retention for the candidate and the
    preceding selectable commit. No commit record is written until every replica
@@ -234,10 +263,13 @@ Destructive remaps and cleanup cannot invalidate the last selectable commit.
 
 ## Interrupted states and recovery decisions
 
-Recovery requires external fencing before inspecting replicas. It opens sources
-read-only, validates identities and authentication, and groups records by epoch,
-sequence and digest. It selects the highest complete valid chained commit in
-the permitted epoch. A commit may exist on only one surviving replica because
+Recovery is a single-host operation. Before inspecting source content, it takes
+exclusive locks on the existing lock files of every surviving configured
+replica. It opens source content read-only, validates identities and
+authentication, and groups records by epoch, sequence and digest. It refuses
+survivors that disagree on pool identity or membership epoch. It selects the
+highest complete valid chained commit among the surviving replicas in that
+epoch. A commit may exist on only one surviving replica because
 all dependencies reached every replica before record fanout. Recovery may expose
 that complete unacknowledged prefix. It never exposes a partial transaction.
 
@@ -251,8 +283,8 @@ that complete unacknowledged prefix. It never exposes a partial transaction.
 | Cleanup stops before or after a physical deletion. | Open the selected catalog without replaying cleanup. Keep its exact debts and later intents. A later writable repair rechecks generation identity before satisfying a debt. |
 | A referenced metadata dependency is missing, corrupt or has the wrong digest. | Refuse that recovery. Do not silently fall back below the latest valid authenticated commit and hide possible loss of an acknowledged prefix. Missing payload on the declared lost data device is reported separately. |
 | Two authenticated records conflict at one epoch and sequence, or chains fork. | Refuse recovery. Do not use timestamps, directory order or a two-replica majority. |
-| A replica is old or belongs to another pool or membership. | Refuse unsafe participation and withhold survival success. Read-only recovery must validate the allowed chain and freshness floor. Repair requires external fencing and a verified epoch transition. |
-| A password change stops mid-commit. | Preserve both envelope generations. Before all replicas have the new commit, the old password remains a supported recovery credential for the previous acknowledged commit. A new credential may open a complete unacknowledged candidate. After success the new epoch is required by the external freshness floor. |
+| A replica missed a commit or belongs to another pool or membership. | Refuse unsafe participation and withhold survival success. A replica that missed a commit may rejoin only after offline verified catch-up. Recovery refuses survivors with different pool identities or membership epochs. It cannot rule out an older copy substituted for the same replica. |
+| A password change is requested. | Refuse it before any envelope write while metadata replicas are configured. Interrupted credential changes remain outside the first version until their matrix passes. |
 
 Materialization reconstructs only the selected manifest and its named dependency
 map in a new scratch authority. It imports the catalog export into a new scratch
@@ -297,9 +329,10 @@ configuration dependency named above. The external evidence directory records
 the exact tested head, commands, counts, failure lines and cleanup inventory.
 The full matrix in the comparison document still applies, including key-only
 loss, catalog-only loss, corrupt and full replicas, metadata-only workloads,
-stale repair and interrupted password changes.
+stale repair and refusal of password changes. Interrupted password changes must
+pass their credential matrix before that operation can be enabled.
 
-## Assumptions and questions for implementation
+## Unverified assumptions
 
 - Not verified: The full set of namespace, catalog, health, compaction, GC and
   membership mutators can share the proposed admission and drain protocol
@@ -312,21 +345,30 @@ stale repair and interrupted password changes.
   and the new manager need interrupted-sync tests.
 - Not verified: Recovery can preserve catalog identity while rebinding physical
   paths without weakening the existing wrong-pool and wrong-directory checks.
-- Not verified: The new key envelope, canonical encoding, HMAC bootstrap and
-  credential transition have a reviewed compatibility and authentication
-  contract. Current key wrapping authenticates no pool or epoch associated data.
-- Not verified: `zerofs.namemode` is absent at the pinned head. Its eventual
-  format and create/load behavior must be reviewed when the names change lands.
-  Survival mode must refuse an unknown or missing required name-mode record.
+- Not verified: The key recovery record, canonical encoding and HMAC bootstrap
+  have a reviewed compatibility and authentication contract. Current key wrapping
+  at the pinned head authenticates no pool or epoch associated data. The commit
+  must supply that binding without altering the replicated envelope bytes.
+  Credential transitions remain disabled until their matrix passes.
+- Not verified: This checkout predates PR 78, so the name-mode field and its
+  create/load compatibility inside `zerofs.key` have not been source-verified
+  here. The accepted contract requires an exact copy of the envelope and no
+  separate name-mode dependency. Verify the merged envelope schema before
+  implementation and refuse an unknown required mode.
+- Not verified: Exclusive locks on every replica and the existing database
+  writer epoch fence every single-host writer path through loss and restart.
+  Test lock lifetime, competing startup, missing replicas and offline catch-up.
 - Not verified: Operator device IDs map to independent hardware and all mount,
-  filesystem encryption, password and fencing material survives one device loss.
-  Local directory fixtures cannot prove those deployment conditions.
+  filesystem encryption and password material survives one device loss. Local
+  directory fixtures cannot prove those deployment conditions.
 
-The coordinator must decide whether the first writable version may stop all
-new mutation admission when a replica fails, which external service supplies
-writer fencing and freshness floors, and whether password changes should remain
-disabled until their full matrix passes. The proposed initial version favors
-offline replacement and a fixed membership. Writable recovery, election,
-degraded commits, automatic membership changes, payload redundancy, hardware
-power-loss claims, NAS validation, benchmarks, ACLs, extended attributes and
-strict placement enablement stay outside this stage.
+The coordinator has answered the initial operating-policy questions. The first
+version uses a quiescent commit, a fixed replica set, lifetime exclusive locks
+on every replica and all-replica acknowledgement on one host. HA and password
+changes are refused. No external freshness service is part of this contract,
+and recovery reports the stale self-copy limit. The remaining work is to test
+the assumptions above, including the exact drain and checkpoint APIs. If the
+serialization owner cannot exclude every mutator without deadlock, stop.
+Writable recovery, election, degraded commits, automatic membership changes,
+payload redundancy, hardware power-loss claims, NAS validation, benchmarks,
+ACLs, extended attributes and strict placement enablement stay outside this stage.
