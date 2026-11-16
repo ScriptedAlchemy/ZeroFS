@@ -7,6 +7,8 @@ pub mod inode;
 pub mod key_codec;
 pub mod lock_manager;
 pub mod metrics;
+pub mod name_mode;
+mod name_uppercase;
 pub mod permissions;
 pub mod stats;
 pub mod store;

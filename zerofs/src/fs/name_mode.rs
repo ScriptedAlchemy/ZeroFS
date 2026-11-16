@@ -1,0 +1,115 @@
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+
+use super::name_uppercase::SIMPLE_UPPERCASE;
+
+/// The lookup rule is fixed when the filesystem is created.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NameMode {
+    #[default]
+    Sensitive,
+    Insensitive,
+}
+
+impl NameMode {
+    /// Fold valid characters with Unicode 5.0.0 simple uppercase, without normalization.
+    /// Invalid UTF-8 bytes retain their original values.
+    pub fn key<'a>(self, name: &'a [u8]) -> Cow<'a, [u8]> {
+        if self == Self::Sensitive {
+            return Cow::Borrowed(name);
+        }
+        let mut folded = Vec::with_capacity(name.len());
+        let mut rest = name;
+        while !rest.is_empty() {
+            match std::str::from_utf8(rest) {
+                Ok(valid) => {
+                    fold_valid(valid, &mut folded);
+                    break;
+                }
+                Err(error) => {
+                    let (valid, tail) = rest.split_at(error.valid_up_to());
+                    fold_valid(
+                        std::str::from_utf8(valid).expect("valid UTF-8 prefix"),
+                        &mut folded,
+                    );
+                    let invalid_len = error.error_len().unwrap_or(tail.len());
+                    folded.extend_from_slice(&tail[..invalid_len]);
+                    rest = &tail[invalid_len..];
+                }
+            }
+        }
+        if folded == name {
+            Cow::Borrowed(name)
+        } else {
+            Cow::Owned(folded)
+        }
+    }
+}
+
+fn fold_valid(valid: &str, output: &mut Vec<u8>) {
+    for character in valid.chars() {
+        let upper = if character.is_ascii() {
+            character.to_ascii_uppercase()
+        } else {
+            SIMPLE_UPPERCASE
+                .binary_search_by_key(&character, |&(from, _)| from)
+                .map(|index| SIMPLE_UPPERCASE[index].1)
+                .unwrap_or(character)
+        };
+        output.extend_from_slice(upper.encode_utf8(&mut [0; 4]).as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unicode_5_simple_uppercase_examples() {
+        for (name, expected) in [
+            ("aAz", "AAZ"),
+            ("éàø", "ÉÀØ"),
+            ("ß", "ß"),
+            ("ı", "I"),
+            ("ſ", "S"),
+            ("ςσ", "ΣΣ"),
+            ("\u{a7d1}", "\u{a7d1}"),
+            ("", ""),
+        ] {
+            assert_eq!(
+                NameMode::Insensitive.key(name.as_bytes()),
+                expected.as_bytes()
+            );
+            assert_eq!(NameMode::Sensitive.key(name.as_bytes()), name.as_bytes());
+        }
+        assert_ne!(
+            NameMode::Insensitive.key("é".as_bytes()),
+            NameMode::Insensitive.key("e\u{301}".as_bytes())
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_passes_through_between_folded_letters() {
+        assert_eq!(
+            NameMode::Insensitive.key(b"a\xffb\xc3\xa9\xc0c\xe2\x82"),
+            b"A\xffB\xc3\x89\xc0C\xe2\x82".as_slice()
+        );
+        assert_eq!(NameMode::Sensitive.key(b"a\xffb"), b"a\xffb".as_slice());
+    }
+
+    #[test]
+    fn table_is_ordered_and_folding_is_idempotent() {
+        assert!(
+            SIMPLE_UPPERCASE
+                .windows(2)
+                .all(|pair| pair[0].0 < pair[1].0)
+        );
+        for &(lower, upper) in SIMPLE_UPPERCASE {
+            let mut bytes = [0; 4];
+            let key = NameMode::Insensitive.key(lower.encode_utf8(&mut bytes).as_bytes());
+            assert_eq!(std::str::from_utf8(&key).unwrap(), upper.to_string());
+            assert_eq!(NameMode::Insensitive.key(&key), key);
+        }
+    }
+}
