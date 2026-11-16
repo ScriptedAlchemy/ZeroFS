@@ -161,7 +161,7 @@ function HealthSummary({ member }: { member: MemberStatus }) {
   const headline = health.issues.length
     ? `${health.issues.length} health ${health.issues.length === 1 ? "issue" : "issues"} reported`
     : limited
-      ? "Monitoring is limited"
+      ? "Monitoring or evacuation is limited"
       : health.unavailable.length
         ? "Health not fully reported"
         : observed
@@ -251,6 +251,9 @@ function Member({ member, onScan }: { member: MemberStatus; onScan: (id: string)
           </Row>
           <Row label="Evacuation capacity sufficient" value={member.evacuationCapacitySufficient}>
             {yesNo}
+          </Row>
+          <Row label="Unavailable members" value={member.unavailableMembers}>
+            {(ids) => (ids.length ? ids.join(", ") : "None")}
           </Row>
           <Row label="Safe to remove" value={member.safeToRemove}>
             {yesNo}

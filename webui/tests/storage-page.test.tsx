@@ -35,7 +35,7 @@ const member = {
     last_sample: { device: "synthetic", failed: false },
     observed_ms: null,
   },
-  evacuation_capacity: { sufficient: true },
+  evacuation_capacity: { sufficient: true, unavailable_members: [] },
 };
 const pool = (members: unknown[]) =>
   JSON.stringify({
@@ -289,7 +289,7 @@ describe("Storage page monitoring limits", () => {
     cleanup();
     client.getPoolStatus.mockResolvedValue({ json: pool([{ ...member, ...extra, health }]) });
     render(<StoragePage />);
-    await screen.findByText("hdd-a");
+    await screen.findAllByText("hdd-a");
   }
 
   it("never shows the healthy state while a monitor is degraded, silent or unreported", async () => {
@@ -298,12 +298,12 @@ describe("Storage page monitoring limits", () => {
     expect(screen.getByText(/^Kernel error coverage: current boot kernel ring/)).toBeTruthy();
 
     await show({ ...observed, kernel_coverage: "kernel watcher unavailable: Permission denied" });
-    expect(screen.getByText("Monitoring is limited")).toBeTruthy();
+    expect(screen.getByText("Monitoring or evacuation is limited")).toBeTruthy();
     expect(screen.getByText("kernel watcher unavailable: Permission denied")).toBeTruthy();
     expect(screen.queryByText("No health issues reported")).toBeNull();
 
     await show({ ...observed, kernel_coverage: null });
-    expect(screen.getByText("Monitoring is limited")).toBeTruthy();
+    expect(screen.getByText("Monitoring or evacuation is limited")).toBeTruthy();
     expect(screen.queryByText("No health issues reported")).toBeNull();
 
     await show(without(observed, "kernel_coverage"));
@@ -311,8 +311,24 @@ describe("Storage page monitoring limits", () => {
     expect(screen.queryByText("No health issues reported")).toBeNull();
 
     await show({ ...observed, last_sample: null });
-    expect(screen.getByText("Monitoring is limited")).toBeTruthy();
+    expect(screen.getByText("Monitoring or evacuation is limited")).toBeTruthy();
     expect(screen.getByText("no sample recorded")).toBeTruthy();
+
+    await show(observed, { evacuation_capacity: { sufficient: true, unavailable_members: ["hdd-a"] } });
+    expect(screen.getByText("1 health issue reported")).toBeTruthy();
+    expect(screen.getByText(/storage binding or free-space check failed/)).toBeTruthy();
+    expect(screen.queryByText("No health issues reported")).toBeNull();
+
+    await show(observed, { evacuation_capacity: { sufficient: true, unavailable_members: ["hdd-b"] } });
+    expect(screen.getByText("No health issues reported")).toBeTruthy();
+
+    await show(observed, { evacuation_capacity: { sufficient: false, unavailable_members: [] } });
+    expect(screen.getByText("Monitoring or evacuation is limited")).toBeTruthy();
+    expect(screen.queryByText("No health issues reported")).toBeNull();
+
+    await show(observed, { evacuation_capacity: { sufficient: true } });
+    expect(screen.getByText("Health not fully reported")).toBeTruthy();
+    expect(screen.queryByText("No health issues reported")).toBeNull();
 
     await show(observed, { unreadable_objects: 3 });
     expect(screen.getByText("1 health issue reported")).toBeTruthy();

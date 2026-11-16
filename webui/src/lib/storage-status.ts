@@ -60,6 +60,8 @@ export interface MemberStatus {
   /** Whether the server holds a SMART sample for this member. */
   smartSampled: Value<boolean>;
   evacuationCapacitySufficient: Value<boolean>;
+  /** Members whose binding or free-space check failed when the server computed evacuation capacity. */
+  unavailableMembers: Value<string[]>;
   observedMs: Value<number>;
 }
 
@@ -97,6 +99,9 @@ function member(raw: unknown): Value<MemberStatus> {
           : unavailable("last_sample has an unsupported value"),
     evacuationCapacitySufficient: object(row.evacuation_capacity)
       ? field(object(row.evacuation_capacity)!, "sufficient", flag)
+      : unavailable("evacuation_capacity was not reported by the server"),
+    unavailableMembers: object(row.evacuation_capacity)
+      ? list(object(row.evacuation_capacity)!, "unavailable_members", stringValue)
       : unavailable("evacuation_capacity was not reported by the server"),
     observedMs:
       health?.observed_ms === null
@@ -335,6 +340,15 @@ export function memberHealth(member: MemberStatus): MemberHealth {
     health.unavailable.push({ label: "Unreadable objects", reason: unreadable.reason });
   else if (unreadable.value > 0)
     health.issues.push({ label: "Unreadable objects", text: unreadable.value.toLocaleString("en-US") });
+  const gone = member.unavailableMembers;
+  if (gone.state === "unavailable") health.unavailable.push({ label: "Member availability", reason: gone.reason });
+  else if (member.id.state === "known" && gone.value.includes(member.id.value))
+    health.issues.push({ label: "Member unavailable", text: "its storage binding or free-space check failed" });
+  const capacity = member.evacuationCapacitySufficient;
+  if (capacity.state === "unavailable")
+    health.unavailable.push({ label: "Evacuation capacity", reason: capacity.reason });
+  else if (!capacity.value)
+    health.limits.push({ label: "Evacuation capacity", text: "not enough healthy space to evacuate this member" });
   const kernel = member.kernelCoverage;
   if (kernel.state === "unavailable")
     health.unavailable.push({ label: "Kernel error monitoring", reason: kernel.reason });

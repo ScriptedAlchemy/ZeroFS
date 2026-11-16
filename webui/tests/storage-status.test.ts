@@ -277,6 +277,8 @@ test("member health separates reported problems from observations the server omi
     issues: [{ label: "Monitoring error", text: "SMART unavailable" }],
     limits: [],
     unavailable: [
+      { label: "Member availability", reason: "evacuation_capacity was not reported by the server" },
+      { label: "Evacuation capacity", reason: "evacuation_capacity was not reported by the server" },
       { label: "Kernel error monitoring", reason: "kernel_coverage was not reported by the server" },
       { label: "SMART sample", reason: "last_sample was not reported by the server" },
     ],
@@ -285,7 +287,7 @@ test("member health separates reported problems from observations the server omi
     value(parsePoolStatus(JSON.stringify({ ...pool, members: [{ ...member, health: undefined }] }))).members,
   )[0];
   assert.equal(memberHealth(silent).issues.length, 0);
-  assert.equal(memberHealth(silent).unavailable.length, 6);
+  assert.equal(memberHealth(silent).unavailable.length, 8);
 });
 
 test("view summary reports one row per pathname with its extent count", async () => {
