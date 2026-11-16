@@ -12,6 +12,9 @@ use crate::key_management::{load_existing_encryption_key, load_or_init_encryptio
 use crate::pool_object_store::PoolObjectStore;
 use crate::segment::{FOOTER_LEN, parse_footer};
 use crate::storage_backend::open_pool_storage;
+use crate::writeback::config::{AckMode, ShutdownFlush, WritebackSettings};
+use crate::writeback::model::JournalIdentity;
+use crate::writeback::store::WritebackObjectStore;
 use anyhow::{Context, Result, ensure};
 use bytes::Bytes;
 use object_store::{ObjectStore, prefix::PrefixStore};
@@ -33,7 +36,12 @@ impl Fixture {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
         let symlink_free_root = root.path().canonicalize().unwrap();
-        for directory in ["authority-device/authority", "disk-a", "disk-b"] {
+        for directory in [
+            "authority-device/authority",
+            "disk-a-device/data",
+            "disk-a-device/metadata-replica",
+            "disk-b-device/data",
+        ] {
             std::fs::create_dir_all(symlink_free_root.join(directory)).unwrap();
         }
         let uri = |name| {
@@ -49,8 +57,8 @@ impl Fixture {
                 "pool": {
                     "catalog_dir": symlink_free_root.join("authority-device/catalog"),
                     "members": [
-                        {"id": "disk-a", "url": uri("disk-a"), "capacity_gb": 0.0002, "reserve_free_gb": 0.0},
-                        {"id": "disk-b", "url": uri("disk-b"), "capacity_gb": 0.008, "reserve_free_gb": 0.0}
+                        {"id": "disk-a", "url": uri("disk-a-device/data"), "capacity_gb": 0.0002, "reserve_free_gb": 0.0},
+                        {"id": "disk-b", "url": uri("disk-b-device/data"), "capacity_gb": 0.008, "reserve_free_gb": 0.0}
                     ]
                 }
             },
@@ -91,6 +99,15 @@ enum Loss {
 }
 
 async fn open(settings: &Settings, initialize: bool) -> Result<(Arc<ZeroFS>, PoolObjectStore)> {
+    let (fs, pool, _) = open_with_writeback(settings, initialize, None).await?;
+    Ok((fs, pool))
+}
+
+async fn open_with_writeback(
+    settings: &Settings,
+    initialize: bool,
+    journal_dir: Option<PathBuf>,
+) -> Result<(Arc<ZeroFS>, PoolObjectStore, Option<WritebackObjectStore>)> {
     let (opened, pool) = open_pool_storage(settings, initialize)
         .await
         .context("open original pool")?;
@@ -103,10 +120,50 @@ async fn open(settings: &Settings, initialize: bool) -> Result<(Arc<ZeroFS>, Poo
             .await
             .context("recover original encryption key")?
     };
+    let (store, writeback) = if let Some(dir) = journal_dir {
+        let identity = JournalIdentity {
+            format_version: 1,
+            bucket_id: pool.status().await?.pool_id,
+            backend_endpoint: settings.storage.url.clone(),
+            database_prefix: path.to_string(),
+            backend_kind: "file".to_owned(),
+            encryption_key_identity_sha256: Sha256::digest(key).into(),
+        };
+        let attached = crate::writeback::bootstrap::attach(
+            store,
+            WritebackSettings {
+                dir,
+                ack_mode: AckMode::Ssd,
+                memory_bytes: 16 * 1024 * 1024,
+                disk_bytes: 64 * 1024 * 1024,
+                min_free_bytes: 1,
+                high_watermark_percent: 95,
+                resume_percent: 85,
+                upload_concurrency: 2,
+                local_concurrency: 2,
+                shutdown_flush: ShutdownFlush::Local,
+            },
+            identity,
+            "metadata-survival",
+        )
+        .await?;
+        (attached.store, Some(attached.lifecycle))
+    } else {
+        (store, None)
+    };
     let transformer: Arc<dyn BlockTransformer> =
         ZeroFsBlockTransformer::new_arc(&key, settings.compression());
     let db = Arc::new(
         DbBuilder::new(path.clone(), Arc::clone(&store))
+            .with_settings(slatedb::config::Settings {
+                wal_enabled: false,
+                l0_sst_size_bytes: usize::MAX - 1,
+                max_unflushed_bytes: usize::MAX,
+                flush_interval: None,
+                compactor_options: None,
+                garbage_collector_options: None,
+                ..Default::default()
+            })
             .with_block_transformer(transformer)
             .with_filter_policies(crate::fs::filter_policy::filter_policies())
             .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
@@ -127,10 +184,47 @@ async fn open(settings: &Settings, initialize: bool) -> Result<(Arc<ZeroFS>, Poo
     .await?;
     fs.write_ack = settings
         .filesystem_write_ack_settings(crate::writeback::config::WritebackAccessMode::ReadWrite)?;
+    if let Some(writeback) = &writeback {
+        let local = writeback.clone();
+        fs.flush_coordinator
+            .set_local_durability_barrier(Arc::new(move || {
+                let local = local.clone();
+                Box::pin(async move {
+                    local
+                        .wait_local_through_accepted()
+                        .await
+                        .map_err(|_| FsError::IoError)
+                })
+            }));
+        let captured = writeback.clone();
+        fs.flush_coordinator
+            .set_object_capture(Arc::new(move || captured.object_coverage()));
+        let waited = writeback.clone();
+        fs.flush_coordinator
+            .set_object_wait(Arc::new(move |coverage, target| {
+                let waited = waited.clone();
+                Box::pin(async move {
+                    match coverage {
+                        ObjectCoverage::DirectRemote => Ok(()),
+                        ObjectCoverage::Writeback {
+                            journal_incarnation,
+                            sequence,
+                        } => waited
+                            .wait_coverage(
+                                journal_incarnation.as_uuid(),
+                                sequence,
+                                target == DurabilityTarget::RemoteBackend,
+                            )
+                            .await
+                            .map_err(crate::fs::mutation::durability::DurabilityError::Object),
+                    }
+                })
+            }));
+    }
     let fs = Arc::new(fs);
     fs.install_volatile_overlay();
     fs.start_materializer();
-    Ok((fs, pool))
+    Ok((fs, pool, writeback))
 }
 
 async fn close(fs: Arc<ZeroFS>, pool: PoolObjectStore) {
@@ -152,6 +246,7 @@ fn payload(seed: u32) -> Bytes {
         .into()
 }
 
+#[derive(Clone)]
 struct ExpectedNamespace {
     directory: u64,
     file: u64,
@@ -297,7 +392,8 @@ async fn member_objects(fixture: &Fixture, pool: &PoolObjectStore) -> Vec<Member
             let path = fixture
                 .root
                 .path()
-                .join(placement.member_id)
+                .join(format!("{}-device", placement.member_id))
+                .join("data")
                 .join(placement.physical_key);
             let body = std::fs::read(&path).unwrap();
             let footer = &body[body.len() - FOOTER_LEN..];
@@ -383,10 +479,296 @@ async fn baseline_metadata_loss_is_not_recoverable() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "M0: authority-device survival is missing; see docs/metadata-survival-m0.md"]
+#[ignore = "Authority-device recovery is missing. See docs/metadata-survival-design.md."]
 async fn authority_device_loss_preserves_committed_namespace() {
     tokio::time::timeout(Duration::from_secs(60), observe_loss(Loss::AuthorityDevice))
         .await
         .expect("authority-loss acceptance exceeded deadline")
-        .expect("M0 gate failed: committed namespace must survive authority-device loss");
+        .expect("Committed namespace must survive authority-device loss");
+}
+
+// These directories model state loss on logical devices, not power loss.
+// Replica provisioning and commit cut hooks do not exist at this head. Keep
+// those prerequisites visible instead of manufacturing replica files in tests.
+struct ProposedMetadataSurvivalFixture {
+    fixture: Fixture,
+    expected: ExpectedNamespace,
+    pool_id: String,
+}
+
+impl ProposedMetadataSurvivalFixture {
+    async fn new() -> Self {
+        let fixture = Fixture::new();
+        let (fs, pool) = open(&fixture.settings, true).await.unwrap();
+        let expected = populate(&fs).await;
+        let _ = fs.administrative_remote_durability().await.unwrap();
+        let pool_id = pool.status().await.unwrap().pool_id;
+        close(fs, pool).await;
+        let proposed = Self {
+            fixture,
+            expected,
+            pool_id,
+        };
+        proposed.verify_cold_prefix(&proposed.expected).await;
+        proposed
+    }
+
+    async fn verify_cold_prefix(&self, expected: &ExpectedNamespace) {
+        let (fs, pool) = open(&self.fixture.settings, false).await.unwrap();
+        let result = verify_namespace(&fs, expected).await;
+        assert_eq!(pool.status().await.unwrap().pool_id, self.pool_id);
+        close(fs, pool).await;
+        result.expect("real cold namespace control must pass before the missing prerequisite");
+    }
+
+    fn proposed_settings(&self) -> Result<Settings> {
+        let config = self.fixture.root.path().join("fixture.toml");
+        let mut document: toml::Value = toml::from_str(&std::fs::read_to_string(&config)?)?;
+        let replica_dir = self
+            .fixture
+            .root
+            .path()
+            .canonicalize()?
+            .join("disk-a-device/metadata-replica");
+        let survival = toml::Value::try_from(serde_json::json!({
+            "format_version": 1,
+            "authority_replica_id": "authority",
+            "authority_device_id": "fixture-authority-device",
+            "recovery_mode": "read_only",
+            "reserve_free_bytes": 65536,
+            "replicas": [{
+                "id": "disk-a-metadata",
+                "device_id": "fixture-disk-a-device",
+                "dir": replica_dir,
+            }],
+        }))?;
+        document["storage"]["pool"]
+            .as_table_mut()
+            .unwrap()
+            .insert("metadata_survival".to_owned(), survival);
+        let proposed_config = self.fixture.root.path().join("proposed-recovery.toml");
+        std::fs::write(&proposed_config, toml::to_string(&document)?)?;
+        Settings::from_file(proposed_config).context(
+            "Cold recovery cannot configure metadata replicas. See docs/metadata-survival-design.md",
+        )
+    }
+
+    async fn attempt_cold_recovery(&self) -> Result<()> {
+        let settings = self.proposed_settings()?;
+        let (fs, pool) = open(&settings, false).await?;
+        let result = verify_namespace(&fs, &self.expected).await;
+        close(fs, pool).await;
+        result
+    }
+
+    fn finish(self, case: &str, result: Result<()>) -> Result<()> {
+        let error = result.as_ref().err().map(|error| format!("{error:#}"));
+        let root = self.fixture.root.path().to_owned();
+        self.fixture
+            .root
+            .close()
+            .expect("remove acceptance fixture");
+        assert!(!root.exists(), "acceptance fixture must be absent");
+        println!(
+            "METADATA_SURVIVAL_ACCEPTANCE {}",
+            serde_json::json!({
+                "case": case,
+                "cold_control": "passed",
+                "cleanup": "passed",
+                "fixture": root,
+                "error": error,
+            })
+        );
+        result
+    }
+}
+
+async fn observe_journal_device_loss(after_backend_cutoff: bool) -> Result<()> {
+    let mut proposed = ProposedMetadataSurvivalFixture::new().await;
+    let journal_device = proposed
+        .fixture
+        .root
+        .path()
+        .canonicalize()?
+        .join("journal-device");
+    let (fs, pool, writeback) = open_with_writeback(
+        &proposed.fixture.settings,
+        false,
+        Some(journal_device.join("journal")),
+    )
+    .await?;
+    let writeback = writeback.unwrap();
+    let mut suffix = proposed.expected.clone();
+    suffix.payload = payload(3).slice(..FINAL_SIZE);
+    fs.write(&AuthContext::default(), suffix.file, 0, &suffix.payload)
+        .await
+        .unwrap();
+    let receipt = fs
+        .flush_coordinator
+        .durable_through(fs.capture_mutation_cutoff(), DurabilityTarget::LocalSsd)
+        .await
+        .unwrap();
+    assert_eq!(receipt.target, DurabilityTarget::LocalSsd);
+    assert!(matches!(
+        receipt.object_coverage,
+        ObjectCoverage::Writeback { .. }
+    ));
+    verify_namespace(&fs, &suffix).await.unwrap();
+    let local = writeback.status().unwrap();
+    assert!(local.local_seq > local.remote_seq);
+    assert_eq!(local.remote_seq, 0, "remote replay must still be paused");
+    if after_backend_cutoff {
+        writeback.activate_remote().unwrap();
+        let receipt = fs.administrative_remote_durability().await.unwrap();
+        assert_eq!(receipt.target, DurabilityTarget::RemoteBackend);
+        assert!(matches!(
+            receipt.object_coverage,
+            ObjectCoverage::Writeback { .. }
+        ));
+        proposed.expected = suffix;
+    }
+    close(fs, pool).await;
+    if after_backend_cutoff {
+        writeback
+            .wait_remote(writeback.accepted_sequence())
+            .await
+            .unwrap();
+    }
+    let status = writeback.status().unwrap();
+    writeback.shutdown().await.unwrap();
+    drop(writeback);
+    std::fs::remove_dir_all(&journal_device)?;
+    assert!(!journal_device.exists());
+    proposed.verify_cold_prefix(&proposed.expected).await;
+    println!(
+        "METADATA_SURVIVAL_JOURNAL_LOSS {}",
+        serde_json::json!({
+            "after_backend_cutoff": after_backend_cutoff,
+            "local_sequence": status.local_seq,
+            "remote_sequence": status.remote_seq,
+            "journal_absent": true,
+            "cold_prefix": "passed",
+            "survival_commit": "not implemented",
+        })
+    );
+    let result = proposed.attempt_cold_recovery().await;
+    proposed.finish(
+        if after_backend_cutoff {
+            "journal-device-after-backend-cutoff"
+        } else {
+            "journal-device-before-backend-cutoff"
+        },
+        result,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "Journal-independent survival commits are missing. See docs/metadata-survival-design.md."]
+async fn journal_device_loss_before_backend_cutoff_preserves_committed_prefix() {
+    tokio::time::timeout(Duration::from_secs(120), observe_journal_device_loss(false))
+        .await
+        .expect("journal-loss acceptance exceeded deadline")
+        .expect("The backend prefix needs a survival generation after journal-device loss");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "Journal-independent survival commits are missing. See docs/metadata-survival-design.md."]
+async fn journal_device_loss_after_backend_cutoff_preserves_committed_prefix() {
+    tokio::time::timeout(Duration::from_secs(120), observe_journal_device_loss(true))
+        .await
+        .expect("journal-loss acceptance exceeded deadline")
+        .expect("The drained suffix needs a survival generation after journal-device loss");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "Payload members cannot hold configured metadata replicas. See docs/metadata-survival-design.md."]
+async fn data_member_with_metadata_replica_loss_preserves_namespace_and_reports_ranges() {
+    let proposed = ProposedMetadataSurvivalFixture::new().await;
+    std::fs::remove_dir_all(proposed.fixture.root.path().join("disk-a-device")).unwrap();
+    let result = proposed
+        .attempt_cold_recovery()
+        .await
+        .context("Cannot provision the metadata replica or report exact missing file ranges yet");
+    proposed
+        .finish("data-member-with-metadata-replica", result)
+        .expect("Metadata and unaffected ranges must survive loss of the replica's data device");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "The survival commit owner and loss hooks are missing. See docs/metadata-survival-design.md."]
+async fn writes_in_flight_during_loss_preserve_last_survival_commit() {
+    let proposed = ProposedMetadataSurvivalFixture::new().await;
+    proposed.fixture.lose(Loss::AuthorityDevice);
+    let result = proposed.attempt_cold_recovery().await.context(
+        "The in-flight cut requires replica admission and drain hooks. Concurrency was not exercised",
+    );
+    proposed
+        .finish("writes-in-flight-prerequisite", result)
+        .expect("An admitted write must not invalidate the last survival commit");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "Replica commit cut hooks are missing. See docs/metadata-survival-design.md."]
+async fn interrupted_commit_at_every_step_preserves_a_consistent_generation() {
+    let proposed = ProposedMetadataSurvivalFixture::new().await;
+    let mut blocked = Vec::new();
+    // None of these cuts can run until production accepts replica configuration.
+    // Collect every prerequisite failure so the first one does not hide the rest.
+    for step in 1..=8 {
+        for side in ["before", "after"] {
+            for replica in ["authority", "disk-a-metadata"] {
+                for lost_device in [
+                    "authority-device",
+                    "journal-device",
+                    "disk-a-device",
+                    "disk-b-device",
+                ] {
+                    let result = proposed.attempt_cold_recovery().await;
+                    println!(
+                        "METADATA_SURVIVAL_COMMIT_CUT {}",
+                        serde_json::json!({
+                            "step": step, "side": side, "replica": replica,
+                            "lost_device": lost_device, "cut_exercised": false,
+                            "error": result.as_ref().err().map(|error| format!("{error:#}")),
+                        })
+                    );
+                    if let Err(error) = result {
+                        blocked.push(format!(
+                            "Step {step} {side} on {replica} with {lost_device} lost. {error:#}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let result = if blocked.is_empty() {
+        Err(anyhow::anyhow!(
+            "Replica configuration is now accepted. Wire the production commit cut hooks before accepting this matrix"
+        ))
+    } else {
+        Err(anyhow::anyhow!(
+            "{} commit-cut cases stopped at the missing prerequisite. No commit cut was exercised. {}",
+            blocked.len(),
+            blocked[0]
+        ))
+    };
+    proposed
+        .finish("interrupted-commit-prerequisites", result)
+        .expect("Every interrupted commit must recover one consistent generation");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "Catalog export, nonzero replicated debts and key epochs are missing. See docs/metadata-survival-design.md."]
+async fn recovery_preserves_exact_catalog_identity_cleanup_debts_and_key_epoch() {
+    let proposed = ProposedMetadataSurvivalFixture::new().await;
+    proposed.fixture.lose(Loss::AuthorityDevice);
+    let result = proposed.attempt_cold_recovery().await.context(
+        "Exact recovery requires a complete catalog export, nonzero upload and garbage debts, and a committed envelope epoch",
+    );
+    proposed
+        .finish(
+            "catalog-identity-cleanup-debts-key-epoch-prerequisite",
+            result,
+        )
+        .expect("Recovery must preserve exact catalog identity, cleanup debts and the key epoch");
 }
