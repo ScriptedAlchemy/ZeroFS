@@ -7,19 +7,30 @@ tree. The command has no output-file option.
 ```sh
 zerofs inventory /path/to/owned/source > /path/outside/source/inventory.jsonl
 zerofs inventory /path/to/owned/source --hash sha256 > /path/outside/source/hashed.jsonl
+zerofs inventory /path/to/owned/source --max-entries-per-second 100 > /path/outside/source/paced.jsonl
 ```
 
 The collector opens the root and child directories without following their final
 symlink components. It resolves children relative to directory descriptors,
 sorts names by raw bytes, and checks opened entries against their preceding
 `statat` observations. It does not follow symlinks or descend across device
-boundaries. FIFOs, sockets, and devices receive stat metadata only.
+boundaries. Linux also compares statx mount IDs to reject bind mounts within the
+same filesystem, including bind mounts of individual files. If the kernel omits
+`STATX_MNT_ID` or the query fails, `mount_id_unavailable` makes the entry
+incomplete and the collector skips its reads and descendants. macOS detects
+different-device mounts through `st_dev`. It cannot identify a mount that keeps
+the same device number. The command is available only on Linux and macOS.
 
 The command does not change modes, ownership, timestamps, ACLs, or xattrs, and it
 does not create files under the source. Reading directory entries or hashing
-contents can update atime under the mount's policy. Only a read-only mount
-prevents these updates. Recorded atime comes from the stat before opening each
-entry. The inventory is not an atomic filesystem snapshot. Use a stable source
+contents can update atime under the mount's policy. Linux opens files and
+directories with `O_NOATIME`, then retries without it on `EPERM`. The initial
+header's `noatime_fallback` reports the root open. The final `header_update`
+record replaces that value with the result for all opens, including directory
+scans. `noatime_requested` is false on macOS, which has no such open flag.
+Linux `readlinkat` can update symlink atime even when file and directory opens
+use `O_NOATIME`. Only a read-only mount prevents all these updates. Recorded
+atime comes from the stat before opening each entry. The inventory is not an atomic filesystem snapshot. Use a stable source
 or a filesystem snapshot when concurrent changes matter.
 
 ## Records and completeness
@@ -37,8 +48,11 @@ relative to the root. The root entry has an empty path.
 
 Every metadata field has either `status: "observed"` with a `value`, or
 `status: "unavailable"` with a `reason` and nullable `errno`. An observed empty
-list means that the API reported no values. A failed listing produces a
-`directory_unreadable` record. It does not establish an empty directory.
+list means that the API reported no values. Each xattr list also has a
+`trusted_namespace` field. Linux can return an observed list while that field
+reports `trusted_namespace_not_visible`. The list then contains only the names
+the process could see, and the inventory is incomplete. A failed directory
+listing produces a `directory_unreadable` record. It does not establish an empty directory.
 
 Entries include the kind, device and inode, link count, uid and gid, full mode,
 nanosecond access, modification and change times, birth time when available,
@@ -62,14 +76,28 @@ inode flag queries also count as complete when they return `ENOTTY` or
 `EOPNOTSUPP`. These answers use `format_not_supported_by_filesystem` and retain
 the errno.
 
-Linux reads symlink xattrs with `llistxattr` and `lgetxattr` through
-`/proc/self/fd/<parent fd>/<name>`. The path stays anchored to the opened parent
+Linux probes trusted xattr visibility once per run. The header records the
+result in `trusted_xattr_namespace`. Visibility requires effective
+`CAP_SYS_ADMIN`, bit 21 of `/proc/self/status`'s `CapEff`, in the initial user
+namespace. The collector recognizes the initial namespace by Linux's reserved
+`/proc/self/ns/user` inode number, 4026531837. Child user namespaces, unrecognized
+namespace IDs, and failed proc reads count as not visible even if `CapEff`
+contains the bit. This conservative rule can report an incomplete inventory on
+a kernel that uses another initial namespace ID. macOS has no `trusted.*`
+namespace, which the header states explicitly.
+
+Linux reads symlink, FIFO, socket, and device xattrs with `llistxattr` and
+`lgetxattr` through `/proc/self/fd/<parent fd>/<name>`. The path stays anchored to the opened parent
 and the calls do not follow the final symlink. The collector checks the entry
-before and after these reads. A missing or inaccessible proc fd anchor produces
-`proc_fd_unavailable` and makes the inventory incomplete. POSIX ACLs are
+before and after these reads, including its mount ID. It never opens FIFO,
+socket, or device nodes to collect their metadata. A missing or inaccessible
+proc fd anchor produces `proc_fd_unavailable` and makes the inventory incomplete. POSIX ACLs are
 inapplicable to Linux symlinks. The collector still probes their NFSv4 XDR ACLs.
-The collector does not decode ACLs. The decoded field remains unavailable with
-the reason `not_decoded`.
+Other special nodes receive all three Linux ACL probes. macOS FIFO, socket,
+and device xattrs and ACLs use `not_implemented_on_platform`, which makes the
+inventory incomplete. macOS path APIs cannot use `/dev/fd/<parent>/<name>` as
+a directory anchor on the tested host. The collector does not decode ACLs.
+The decoded field remains unavailable with the reason `not_decoded`.
 
 Hashing is off by default. `--hash sha256` reads regular file contents and
 records their SHA-256 values. The collector rechecks regular file metadata
@@ -77,8 +105,10 @@ after reading it. A mismatch produces an `entry_changed` record and invalidates
 the fields read through the descriptor. The original stat fields remain the
 pre-open observations.
 
-Derived records follow the entries. Hardlink groups contain the paths found
-in the tree and the observed link count. Links outside the tree equal that
+Schema 2 emits mount boundaries, changed entries, unreadable directories, and
+name collisions during traversal. A directory's collision records precede its
+children. Hardlink groups follow traversal and precede the final header update,
+summary, and digest. Hardlink groups contain the paths found in the tree and the observed link count. Links outside the tree equal that
 count minus the paths found only when the traversal completed and the link
 observations agree. Otherwise, the outside count remains unavailable.
 
@@ -88,8 +118,8 @@ Unicode case fold of the NFC forms with `unicase` 2.10 or later. Version 2.9
 reordered three-character folds and failed the ligature regression test.
 These rules do not claim equivalence to Samba or ZFS. They do not include the
 OpenZFS insensitive rule. That rule will use the shared fold function when the
-case-insensitive naming work adds it. Non-UTF-8 names retain their exact bytes,
-do not participate in Unicode rules, and increment `non_utf8_names`.
+case-insensitive naming work in PR 78 lands. Non-UTF-8 names retain their exact
+bytes, do not participate in Unicode rules, and increment `non_utf8_names`.
 
 The summary counts unavailable fields and diagnostic reasons. Intentional
 omissions for an entry kind, fields inapplicable on the platform, an unrequested
@@ -98,6 +128,25 @@ inventory incomplete. Collection failures, unsupported applicable APIs, changed
 entries, unreadable directories, and skipped device boundaries do.
 The command exits with code 0 for a complete inventory, code 3 for an incomplete
 inventory, and another nonzero code for usage, root, or output errors.
+
+## Load and memory
+
+`--max-entries-per-second <n>` accepts a positive integer and defaults to
+unlimited. The collector sleeps between entry starts when the previous entry
+took less than the requested interval. It does not limit hashing bytes or pace
+the directory listing calls. There is no resume support. An interrupted run
+requires a new traversal.
+
+The collector holds a directory's raw names in memory while it sorts them and
+visits its children. Active ancestor directories retain their remaining names.
+Collision detection also needs per-directory Unicode grouping storage. Ordinary
+single-link files do not enter the hardlink map. Each distinct non-directory
+inode with `nlink > 1` needs a 16-byte identity key and a 40-byte group value on a
+64-bit target, plus B-tree and allocator overhead. Each stored path needs a
+24-byte vector descriptor plus its raw path bytes and spare capacity. The path
+list itself can have spare capacity. Memory therefore grows with the number of
+hardlinked inodes and the total bytes of their paths. Diagnostic records do not
+accumulate for the whole tree.
 
 The last line contains the SHA-256 of every preceding output byte, including
 each newline. It excludes its own line. Output order and serialization are
