@@ -114,11 +114,23 @@ async fn open_with_writeback(
     let store: Arc<dyn ObjectStore> = Arc::from(opened.store);
     let path = opened.path;
     let key = if initialize {
-        load_or_init_encryption_key(&store, &path, PASSWORD, false).await?
+        load_or_init_encryption_key(
+            &store,
+            &path,
+            PASSWORD,
+            crate::fs::name_mode::NameMode::Sensitive,
+            false,
+        )
+        .await?
     } else {
-        load_existing_encryption_key(&store, &path, PASSWORD)
-            .await
-            .context("recover original encryption key")?
+        load_existing_encryption_key(
+            &store,
+            &path,
+            PASSWORD,
+            crate::fs::name_mode::NameMode::Sensitive,
+        )
+        .await
+        .context("recover original encryption key")?
     };
     let (store, writeback) = if let Some(dir) = journal_dir {
         let identity = JournalIdentity {
