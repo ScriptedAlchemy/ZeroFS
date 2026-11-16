@@ -908,6 +908,7 @@ impl ReconciledDb {
         self,
         mut startup: StartupContext,
         settings: &Settings,
+        write_ack: crate::fs::mutation::config::FilesystemWriteAckSettings,
     ) -> Result<InitResult> {
         let ReconciledDb {
             open,
@@ -1153,16 +1154,7 @@ impl ReconciledDb {
         )
         .await
         .context("Failed to initialize filesystem")?;
-        let access_mode = match db_mode {
-            DatabaseMode::ReadWrite => crate::writeback::config::WritebackAccessMode::ReadWrite,
-            DatabaseMode::ReadOnly => crate::writeback::config::WritebackAccessMode::ReadOnly,
-            DatabaseMode::Checkpoint(_) => {
-                crate::writeback::config::WritebackAccessMode::Checkpoint
-            }
-        };
-        fs.write_ack = settings
-            .filesystem_write_ack_settings(access_mode)
-            .context("Invalid filesystem write-acknowledgement configuration")?;
+        fs.write_ack = write_ack;
 
         if let Some(writeback) = writeback.clone() {
             let barrier_store = writeback.clone();
@@ -1256,6 +1248,7 @@ impl ReconciledDb {
 pub async fn initialize_filesystem(
     settings: &Settings,
     db_mode: DatabaseMode,
+    write_ack: crate::fs::mutation::config::FilesystemWriteAckSettings,
 ) -> Result<InitResult> {
     let startup = StartupContext::prepare(settings, db_mode).await?;
     let cleanup_writeback = startup.writeback.clone();
@@ -1277,7 +1270,7 @@ pub async fn initialize_filesystem(
                 };
                 match db.reconcile_tail(&mut startup).await? {
                     ReconcileOutcome::Reconciled(db) => {
-                        return (*db).into_filesystem(startup, settings).await;
+                        return (*db).into_filesystem(startup, settings, write_ack).await;
                     }
                     ReconcileOutcome::RetryRole => continue 'role_election,
                     ReconcileOutcome::RetryWriter => continue,

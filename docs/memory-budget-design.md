@@ -10,6 +10,20 @@ A previous startup rejection on a different baseline reported a requirement of 4
 
 The operator selected a 4 GiB total budget as the target to qualify on November 16, 2026. ZFS ARC will be capped at deployment. Four GiB remains an unmeasured target. Step 1 adds planning and accounting types while retaining the legacy startup policy. The explicit budget cannot enable a bounded production mode until the later allocation and recovery work passes qualification.
 
+## Step 1 implementation boundary
+
+The shared `memory` library module exposes a pure planner, an injected-file detector, byte and entry leases, and one serialized `ResolvedMemoryPlan` receipt. The planner requires named working-set requirements and requested maxima for every pool. Future implementation steps must derive those inputs from enabled protocols and dependency geometry. A successful unit fixture does not qualify any backend.
+
+The planner funds all minimum requirements first. It divides the remaining bytes by caller-supplied integer weights and caps each extra share at its requested maximum. Rounding and unused shares become headroom. Explicit dirty maxima must be minimum requirements. Clean capacity can be zero. Every plan reserves separate progress capacity and unallocated headroom. Pool capacities sum exactly to the selected budget.
+
+The configuration loader parses `[memory]`, but server startup refuses that section until production enforcement is complete. Legacy configurations keep their existing startup policy and fixed reserves. The server resolves shared filesystem write acknowledgement before admission and passes that same resolved value into filesystem initialization. Planning charges the raw-input and accepted-overlay stages separately. Matching legacy aliases do not create extra stages.
+
+The byte parser accepts an unsigned integer and an explicit unit. It supports B, KiB, MiB, GiB, TiB, kB, MB, GB, and TB. Fractions resolve against actual observations and round downward without converting the detected byte count to floating point. Missing sources remain unavailable observations. Host capacity can come only from a readable MemTotal field, and swap never adds capacity.
+
+Acquire multiple ordinary pools in their declared order before taking filesystem locks. Each lease reserves bytes and one entry. Waiting records have a separate count limit. A `Bytes` owner retains its lease through clones and slices. Callers must acquire backing capacity before allocating and include container overhead in their requirements. These types do not yet account for production allocations.
+
+- Not verified: Cgroup behavior under a real limit, production memory bounds, and the 4 GiB target remain unqualified.
+
 ## The five main findings
 
 1. Startup adds 32 GiB for previously observed unmodeled residency and 8 GiB for process and companion overhead. These are admission reserves. The calculation does not allocate or touch those 40 GiB. Reducing those constants would remove a rejection without bounding the allocations that motivated it.
@@ -312,6 +326,6 @@ A dependency change may require its own upstream review, but its API should be s
 - Dependency work must establish finite allocation strategies for SlateDB table and snapshot lifetimes, Foyer disk indexes and queues, NFS copies, and native SFTP buffers. Exact resident amplification is not known from these source reads.
 - The operator's required crash guarantee must distinguish ordinary buffered acknowledgements from completed durable barriers. Survival of every RAM-only acknowledgement through OOM is not possible without a different durable landing contract.
 - The production cgroup hierarchy, effective `memory.max` and `memory.high`, per-container limits, Plex peaks, and ARC reclaim behavior remain unknown. The single snapshot does not resolve them.
-- Not verified: No build or test was run. This analysis does not prove that any proposed envelope starts, stays within its resident allowance, avoids OOM, meets throughput requirements, or recovers dirty data. The container tests and integrity checks are proposed validation, not completed evidence.
+- Not verified: Source inspection and step 1 unit fixtures do not prove that any proposed envelope starts, stays within its resident allowance, avoids OOM, meets throughput requirements, or recovers dirty data. The tests under real cgroup limits and the integrity checks remain proposed qualification work.
 - Not verified: The historical approximately 28.6 GiB excess residency was read from a source comment. This task did not reproduce that OOM or establish which present allocation paths account for those bytes.
 

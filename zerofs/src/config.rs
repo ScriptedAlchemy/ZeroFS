@@ -142,6 +142,9 @@ pub struct Settings {
     /// parent cgroup envelope.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     runtime: Option<RuntimeConfig>,
+    /// Parsed for planning. Explicit budget enforcement is not enabled yet.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub(crate) memory: Option<crate::memory::MemorySelector>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub(crate) filesystem: Option<FilesystemConfig>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -1469,18 +1472,6 @@ impl NbdConfig {
             _ => Ok(()),
         }
     }
-
-    pub(crate) fn volatile_memory_bytes(&self) -> Result<u64> {
-        self.validate()?;
-        if self.write_ack_mode == NbdWriteAckMode::Materialized {
-            return Ok(0);
-        }
-        let bytes = self.volatile_memory_gb * 1_000_000_000.0;
-        if bytes > u64::MAX as f64 {
-            anyhow::bail!("[servers.nbd] volatile_memory_gb exceeds this platform's address space");
-        }
-        Ok(bytes.round() as u64)
-    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -1976,6 +1967,14 @@ impl Settings {
     pub(crate) fn validate(&self) -> Result<()> {
         self.servers.validate()?;
         self.runtime_memory_limit_bytes()?;
+        if self.memory.is_some()
+            && self
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.memory_limit_gb.is_some())
+        {
+            anyhow::bail!("[memory] conflicts with [runtime] memory_limit_gb; declare one budget");
+        }
         if let Some(pool) = &self.storage.pool {
             pool.validate(self)?;
         }
@@ -2276,6 +2275,7 @@ impl Settings {
                 }),
             },
             runtime: None,
+            memory: None,
             filesystem: None,
             lsm: None,
             gc: None,
@@ -2887,13 +2887,23 @@ encryption_password = "test"
 addresses = ["127.0.0.1:10809"]
 write_ack_mode = "volatile_memory"
 volatile_memory_gb = 2.0
+
+[writeback]
+enabled = true
+dir = "/tmp/writeback"
+memory_size_gb = 1.0
+disk_size_gb = 8.0
+min_free_gb = 1.0
 "#,
         )
         .unwrap();
 
         let nbd = settings.servers.nbd.as_ref().unwrap();
         assert_eq!(nbd.write_ack_mode, NbdWriteAckMode::VolatileMemory);
-        assert_eq!(nbd.volatile_memory_bytes().unwrap(), 2_000_000_000);
+        let resolved = settings
+            .filesystem_write_ack_settings(crate::writeback::config::WritebackAccessMode::ReadWrite)
+            .unwrap();
+        assert_eq!(resolved.volatile_memory_bytes, 2_000_000_000);
     }
 
     #[test]
@@ -3051,6 +3061,40 @@ encryption_password = "test-password"
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn memory_selector_parses_without_enabling_enforcement() {
+        let config = writeback_sftp_config(1.0, "[memory]\ntotal = '4 GiB'\n");
+        let settings = write_and_load(&config).unwrap();
+        assert_eq!(
+            settings.memory,
+            Some(crate::memory::MemorySelector::Total(4 * 1024 * 1024 * 1024))
+        );
+        assert!(settings.runtime_memory_limit_bytes().unwrap().is_none());
+        let serialized = toml::to_string(&settings).unwrap();
+        let roundtrip: Settings = toml::from_str(&serialized).unwrap();
+        assert_eq!(roundtrip.memory, settings.memory);
+    }
+
+    #[test]
+    fn memory_selector_rejects_a_second_legacy_budget() {
+        let config = writeback_sftp_config(
+            1.0,
+            "[memory]\ntotal = '4 GiB'\n[runtime]\nmemory_limit_gb = 4.0\n",
+        );
+        let error = write_and_load(&config).unwrap_err();
+        assert!(error.to_string().contains("conflicts with [runtime]"));
+    }
+
+    #[test]
+    fn memory_selector_rejects_an_empty_table_and_conflicting_selectors() {
+        for table in [
+            "[memory]",
+            "[memory]\ntotal = '4 GiB'\nfraction_of_limit = 0.5",
+        ] {
+            assert!(write_and_load(&writeback_sftp_config(1.0, table)).is_err());
+        }
     }
 
     #[test]
