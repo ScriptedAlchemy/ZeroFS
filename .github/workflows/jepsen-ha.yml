@@ -68,7 +68,7 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein \
             -o /usr/local/bin/lein
           sudo chmod +x /usr/local/bin/lein
-          lein version
+          sudo env HOME=/root LEIN_ROOT=1 JAVA_HOME="$JAVA_HOME" /usr/local/bin/lein version
 
       - name: Install guest JDK, Leiningen, and gnuplot
         if: matrix.mount-client == 'native'
@@ -295,6 +295,7 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein \
             -o /usr/local/bin/lein
           sudo chmod +x /usr/local/bin/lein
+          sudo env HOME=/root LEIN_ROOT=1 JAVA_HOME="$JAVA_HOME" /usr/local/bin/lein version
 
       - name: Install guest JDK, Leiningen, and gnuplot
         if: matrix.mount-client == 'native'
