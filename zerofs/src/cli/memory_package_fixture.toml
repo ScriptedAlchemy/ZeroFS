@@ -1,0 +1,54 @@
+# Package configuration at truenas-storage-union-safety 63d7a22.
+[runtime]
+memory_limit_gb = 8.0
+
+[cache]
+dir = "/storage/cache"
+disk_size_gb = 0.064
+memory_size_gb = 0.001
+warm_metadata = "off"
+
+[storage]
+url = "file:///storage/metadata"
+encryption_password = "REPLACE_WITH_EVALUATION_ENCRYPTION_PASSWORD"
+
+[storage.pool]
+catalog_dir = "/storage/catalog"
+
+[[storage.pool.members]]
+id = "member-a"
+url = "file:///storage/member-a"
+capacity_gb = 1.0
+reserve_free_gb = 0.01
+
+[[storage.pool.members]]
+id = "member-b"
+url = "file:///storage/member-b"
+capacity_gb = 1.0
+reserve_free_gb = 0.01
+
+[filesystem]
+name_mode = "insensitive"
+compression = "lz4"
+ignore_fsync = false
+write_ack_mode = "materialized"
+
+[lsm]
+sync_writes = false
+
+[servers.ninep]
+addresses = []
+unix_socket = "/run/zerofs-app/9p.sock"
+
+[servers.rpc]
+addresses = []
+unix_socket = "/run/zerofs-app/admin.sock"
+
+[servers.webui]
+addresses = ["0.0.0.0:8080"]
+uid = 1000
+gid = 1000
+
+[telemetry]
+enabled = false
+
