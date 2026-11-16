@@ -246,8 +246,12 @@ cp proxmox/templates/zerofs.env.example /secure/zerofs-prod.env
 chmod 600 /secure/zerofs-prod.env
 ```
 
-Production defaults to a 1 TB clean disk cache, 32.0 decimal GB of clean read
-RAM, a distinct 4.0 decimal GB writeback staging tier, and a 64 GB SSD journal.
+Production defaults to a 200 GB clean disk cache, 32.0 decimal GB of clean read
+RAM, a distinct 4.0 decimal GB writeback staging tier, and a 256 GB SSD journal
+with a 128 GB free-space floor. The journal absorbs bursts while remote storage
+drains; increasing it does not increase sustained remote throughput. Size the
+clean cache, journal and reserve against the actual persistent filesystem's
+available capacity before deploying.
 `[runtime] memory_limit_gb = 96.0` declares the dedicated ZeroFS envelope; it
 is not another cache. Validation reserves room for the eventual 16.0 GB
 unified volatile tier plus the memory guard's 32 GiB unmodeled-residency and 8
@@ -257,9 +261,19 @@ CT remains 98304 MiB (96 GiB), which is larger than the 96.0 decimal-GB ZeroFS
 envelope and leaves the difference for the container. Dev keeps its smaller
 clean cache, separate 4 GB staging tier, and 16 GB volatile NBD tier.
 
-Every SFTP session field is capped at four in both roles. The dev template uses
-a role-local `file://` backend by default; enabling SFTP requires a distinct URL
-namespace and session values no greater than four.
+The production SFTP profile uses ten physical connections, 64 concurrent reads,
+16 concurrent writes and 12 writeback upload workers. Validation caps the pool
+at ten physical connections and each direction at the smaller of 64 or 16 times
+the connection count. Ten consumes the entire Storage Box account allowance:
+do not run a separate SFTP benchmark or another pool against that account
+without first budgeting slots across all users. The dev template uses a
+role-local `file://` backend by default; enabling SFTP requires a distinct URL
+namespace and the same aggregate account budget.
+
+For single-file WAN upload measurements, Linux TCP tuning and a scoped LAN
+relay around a slow macOS tunnel, see
+[WAN upload throughput](../docs/wan-upload-throughput.md). These are client-path
+settings; ZeroFS's Storage Box transport remains native Rust SFTP.
 
 ## Dry-run production creation or update
 
