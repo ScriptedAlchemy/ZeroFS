@@ -73,6 +73,9 @@ pub async fn run_cli() -> Result<()> {
     let cli = cli::Cli::parse_args();
 
     match cli.command {
+        cli::Commands::Inventory { root, hash } => {
+            cli::inventory::run(&root, hash)?;
+        }
         cli::Commands::Upload {
             target,
             source,
