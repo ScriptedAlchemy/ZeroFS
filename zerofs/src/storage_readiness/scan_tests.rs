@@ -31,8 +31,7 @@ fn storage_readiness_startup_leaves_data_entry_symlinks_for_their_open_checks() 
         fixture.path("journal").join("bucket_fixture/blobs/00"),
     ] {
         std::fs::create_dir_all(&directory).unwrap();
-        std::os::unix::fs::symlink(directory.join("missing"), directory.join("unchecked"))
-            .unwrap();
+        std::os::unix::fs::symlink(directory.join("missing"), directory.join("unchecked")).unwrap();
     }
     for strict in [true, false] {
         fixture.document["storage"]["readiness"]["strict"] = json!(strict);
