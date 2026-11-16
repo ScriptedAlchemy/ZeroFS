@@ -180,10 +180,14 @@ jobs:
 
       - name: Download and extract Linux kernel
         run: |
-          # Download Linux kernel source
-          echo "Downloading Linux kernel 7.2-rc1..."
+          # Validate the complete fixture on runner-local storage first. Network
+          # failures must fail setup before leaving partial files on ZFS.
+          archive="$RUNNER_TEMP/linux-7.2-rc1.tar.gz"
+          python3 "$GITHUB_WORKSPACE/scripts/ci/fetch-linux-source.py" \
+            --version 7.2-rc1 --output "$archive"
           cd /mnt/zfsdata
-          sudo wget -q https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/snapshot/linux-7.2-rc1.tar.gz
+          # Keep the archive in the ZFS backup/checksum workload, as before.
+          sudo cp "$archive" linux-7.2-rc1.tar.gz
 
           # Show download size
           ls -lh linux-7.2-rc1.tar.gz
