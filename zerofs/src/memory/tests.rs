@@ -275,6 +275,67 @@ fn memory_detector_maps_escaped_mounts_and_private_namespaces() {
 }
 
 #[test]
+fn memory_detector_nested_binds_do_not_hide_visible_ancestor_limits() {
+    for (current, outer_root, nested_root) in [
+        ("/parent/service", "/", "/parent/service"),
+        ("/parent/service", "/host/ns", "/host/ns/parent/service"),
+    ] {
+        for file in ["memory.max", "memory.high"] {
+            let ancestor = format!("/cg/parent/{file}");
+            for reverse in [false, true] {
+                let mut mounts = [
+                    format!("36 25 0:32 {outer_root} /cg rw - cgroup2 cgroup rw"),
+                    format!("37 25 0:32 {nested_root} /nested rw - cgroup2 cgroup rw"),
+                ];
+                if reverse {
+                    mounts.reverse();
+                }
+                let detected = fixture(&[
+                    ("/proc/self/cgroup", &format!("0::{current}")),
+                    ("/proc/self/mountinfo", &mounts.join("\n")),
+                    ("/nested/memory.max", "8589934592"),
+                    ("/cg/parent/service/memory.max", "8589934592"),
+                    (&ancestor, "4294967296"),
+                ])
+                .unwrap();
+                let limit = detected.effective_limit().unwrap();
+                assert_eq!(limit.bytes, 4 * GIB);
+                assert_eq!(limit.role, LimitRole::SharedAncestor);
+                assert_eq!(limit.source, Path::new(&ancestor));
+                assert!(MemorySelector::Total(5 * GIB).resolve(&detected).is_err());
+            }
+        }
+    }
+}
+
+#[test]
+fn memory_detector_retains_readable_aliases_when_another_mount_is_denied() {
+    let files = BTreeMap::from([
+        ("/proc/self/cgroup", "0::/parent/service"),
+        (
+            "/proc/self/mountinfo",
+            "36 25 0:32 / /denied rw - cgroup2 cgroup rw\n37 25 0:32 / /cg rw - cgroup2 cgroup rw",
+        ),
+        ("/cg/parent/service/memory.max", "4294967296"),
+    ]);
+    let detected = detect_limits_with(|path| {
+        if path.starts_with("/denied") {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
+        files
+            .get(path.to_str().unwrap())
+            .map(|value| value.as_bytes().to_vec())
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+    })
+    .unwrap();
+    assert_eq!(detected.effective_limit().unwrap().bytes, 4 * GIB);
+    assert!(detected.observations.iter().any(|row| {
+        row.source == Path::new("/denied/parent/service/memory.max")
+            && matches!(&row.value, Observation::Unavailable { reason } if reason.contains("PermissionDenied"))
+    }));
+}
+
+#[test]
 fn memory_planner_fits_four_gib_and_names_a_requirement_that_does_not_fit() {
     let receipt = plan(4 * GIB, &example(), VolatileBudget::default()).unwrap();
     assert_eq!(

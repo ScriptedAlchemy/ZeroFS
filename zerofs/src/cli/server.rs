@@ -1497,7 +1497,8 @@ pub async fn run_server(
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let init_result =
-        crate::cli::init::initialize_filesystem(&settings, db_mode, write_ack).await?;
+        crate::cli::init::initialize_filesystem_with_write_ack(&settings, db_mode, write_ack)
+            .await?;
     let cache_owner = init_result._cache_owner.clone();
     let writeback_for_shutdown = init_result.writeback.clone();
     let writeback_for_metrics = init_result.writeback.clone();

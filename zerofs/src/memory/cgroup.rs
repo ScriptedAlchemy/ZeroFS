@@ -42,35 +42,47 @@ pub(crate) fn parse_cgroup2_mounts(contents: &[u8]) -> Result<Vec<(PathBuf, Path
     Ok(mounts)
 }
 
-pub(crate) fn select_cgroup2_mount(
+pub(crate) fn map_cgroup2_mounts(
     current: &Path,
     mounts: &[(PathBuf, PathBuf)],
-) -> Option<(PathBuf, PathBuf)> {
-    let exact = mounts
+) -> Vec<(PathBuf, PathBuf)> {
+    let exact = matching_cgroup2_mounts(current, mounts);
+    if !exact.is_empty() {
+        return exact;
+    }
+
+    // A private cgroup namespace exposes its own root as `/`, while mountinfo
+    // may retain the host-side subtree in the mount root field. Infer that
+    // namespace root from the shallowest mount, then retain every alias or
+    // nested bind that exposes the process cgroup. Keep mountinfo order as the
+    // deterministic tie-break when more than one root is equally shallow.
+    let Some((root, _)) = mounts
+        .iter()
+        .min_by_key(|(root, _)| root.components().count())
+    else {
+        return Vec::new();
+    };
+    let relative = current.strip_prefix(Path::new("/")).unwrap_or(current);
+    matching_cgroup2_mounts(&root.join(relative), mounts)
+}
+
+fn matching_cgroup2_mounts(
+    current: &Path,
+    mounts: &[(PathBuf, PathBuf)],
+) -> Vec<(PathBuf, PathBuf)> {
+    // A nested bind can expose the current cgroup without exposing a tighter
+    // ancestor. Inspect all matching mounts instead of allowing that bind to
+    // hide ceilings visible through a broader mount. Retain aliases as well:
+    // a limit can be readable through one mount and unavailable through another.
+    mounts
         .iter()
         .filter_map(|(root, mountpoint)| {
             current
                 .strip_prefix(root)
                 .ok()
-                .map(|relative| (root, mountpoint, relative))
+                .map(|relative| (mountpoint.clone(), mountpoint.join(relative)))
         })
-        .max_by_key(|(root, _, _)| root.components().count());
-    if let Some((_, mountpoint, relative)) = exact {
-        return Some((mountpoint.clone(), mountpoint.join(relative)));
-    }
-
-    // A private cgroup namespace exposes its own root as `/`, while mountinfo
-    // may retain the host-side subtree in the mount root field. In that case,
-    // the process cgroup path is already relative to the mounted subtree. A
-    // deeper root is a nested bind, not the namespace root; prefer the
-    // shallowest root and retain mountinfo order as the deterministic tie-break.
-    mounts
-        .iter()
-        .min_by_key(|(root, _)| root.components().count())
-        .map(|(_, mountpoint)| {
-            let relative = current.strip_prefix(Path::new("/")).unwrap_or(current);
-            (mountpoint.clone(), mountpoint.join(relative))
-        })
+        .collect()
 }
 
 pub(crate) fn unescape_mountinfo(value: &[u8]) -> Result<OsString> {

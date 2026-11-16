@@ -1,9 +1,10 @@
 use crate::config::Settings;
 #[cfg(test)]
 use crate::memory::cgroup::unescape_mountinfo;
-use crate::memory::cgroup::{parse_cgroup2_mounts, parse_unified_cgroup, select_cgroup2_mount};
+use crate::memory::cgroup::{map_cgroup2_mounts, parse_cgroup2_mounts, parse_unified_cgroup};
 use crate::writeback::config::WritebackAccessMode;
 use anyhow::{Context, Result, bail};
+use std::collections::BTreeSet;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -209,53 +210,56 @@ fn detect_cgroup_v2_memory_limit(
         return Ok(CgroupMemoryLimits::default());
     }
     let current = parse_unified_cgroup(&cgroup)?;
-    let Some((mountpoint, mut path)) = select_cgroup2_mount(&current, &mounts) else {
-        return Ok(CgroupMemoryLimits::default());
-    };
     let mut limits = CgroupMemoryLimits::default();
-    let mut is_current = true;
-    loop {
-        let limit_path = path.join("memory.max");
-        match std::fs::read_to_string(&limit_path) {
-            Ok(raw) => {
-                let value = raw.trim();
-                if value != "max" {
-                    let hard_limit_bytes = value.parse::<u64>().with_context(|| {
-                        format!(
-                            "invalid cgroup memory limit {value:?} in {}",
-                            limit_path.display()
-                        )
-                    })?;
-                    let slot = if is_current {
-                        &mut limits.dedicated
-                    } else {
-                        &mut limits.shared_ceiling
-                    };
-                    if slot
-                        .as_ref()
-                        .is_none_or(|current| hard_limit_bytes < current.hard_limit_bytes)
-                    {
-                        *slot = Some(MemoryEnvelope {
-                            hard_limit_bytes,
-                            source: limit_path,
-                        });
+    let mut seen = BTreeSet::new();
+    for (mountpoint, mut path) in map_cgroup2_mounts(&current, &mounts) {
+        let mut is_current = true;
+        loop {
+            let limit_path = path.join("memory.max");
+            if seen.insert(limit_path.clone()) {
+                match std::fs::read_to_string(&limit_path) {
+                    Ok(raw) => {
+                        let value = raw.trim();
+                        if value != "max" {
+                            let hard_limit_bytes = value.parse::<u64>().with_context(|| {
+                                format!(
+                                    "invalid cgroup memory limit {value:?} in {}",
+                                    limit_path.display()
+                                )
+                            })?;
+                            let slot = if is_current {
+                                &mut limits.dedicated
+                            } else {
+                                &mut limits.shared_ceiling
+                            };
+                            if slot
+                                .as_ref()
+                                .is_none_or(|current| hard_limit_bytes < current.hard_limit_bytes)
+                            {
+                                *slot = Some(MemoryEnvelope {
+                                    hard_limit_bytes,
+                                    source: limit_path,
+                                });
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("reading {}", limit_path.display()));
                     }
                 }
             }
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| format!("reading {}", limit_path.display()));
+            if path == mountpoint {
+                break;
             }
+            path = path
+                .parent()
+                .filter(|parent| parent.starts_with(&mountpoint))
+                .context("cgroup path escaped its cgroup2 mount")?
+                .to_path_buf();
+            is_current = false;
         }
-        if path == mountpoint {
-            break;
-        }
-        path = path
-            .parent()
-            .filter(|parent| parent.starts_with(&mountpoint))
-            .context("cgroup path escaped its cgroup2 mount")?
-            .to_path_buf();
-        is_current = false;
     }
     Ok(limits)
 }
@@ -468,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn cgroup_discovery_selects_the_most_specific_matching_mount() {
+    fn cgroup_discovery_preserves_all_matching_mounts() {
         let current = Path::new("/system.slice/zerofs.service");
         let mounts = vec![
             (PathBuf::from("/"), PathBuf::from("/sys/fs/cgroup")),
@@ -478,13 +482,60 @@ mod tests {
             ),
         ];
 
-        let selected = select_cgroup2_mount(current, &mounts).unwrap();
+        let selected = map_cgroup2_mounts(current, &mounts);
 
-        assert_eq!(selected.0, PathBuf::from("/run/zerofs-cgroup"));
         assert_eq!(
-            selected.1,
-            PathBuf::from("/run/zerofs-cgroup/zerofs.service")
+            selected,
+            vec![
+                (
+                    PathBuf::from("/sys/fs/cgroup"),
+                    PathBuf::from("/sys/fs/cgroup/system.slice/zerofs.service")
+                ),
+                (
+                    PathBuf::from("/run/zerofs-cgroup"),
+                    PathBuf::from("/run/zerofs-cgroup/zerofs.service")
+                ),
+            ]
         );
+    }
+
+    #[test]
+    fn nested_cgroup_bind_cannot_hide_a_tighter_visible_parent_from_startup() {
+        let temp = tempfile::tempdir().unwrap();
+        let outer = temp.path().join("outer");
+        let nested = temp.path().join("nested");
+        fs::create_dir_all(outer.join("parent/service")).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(outer.join("parent/service/memory.max"), "8589934592").unwrap();
+        fs::write(nested.join("memory.max"), "8589934592").unwrap();
+        fs::write(outer.join("parent/memory.max"), "4294967296").unwrap();
+        let proc_cgroup = temp.path().join("cgroup.txt");
+        fs::write(&proc_cgroup, "0::/parent/service").unwrap();
+        let mountinfo = temp.path().join("mountinfo.txt");
+        for reverse in [false, true] {
+            let mut mounts = [
+                format!("36 25 0:32 / {} rw - cgroup2 cgroup rw", outer.display()),
+                format!(
+                    "37 25 0:32 /parent/service {} rw - cgroup2 cgroup rw",
+                    nested.display()
+                ),
+            ];
+            if reverse {
+                mounts.reverse();
+            }
+            fs::write(&mountinfo, mounts.join("\n")).unwrap();
+            let detected = detect_cgroup_v2_memory_limit(&proc_cgroup, &mountinfo).unwrap();
+            assert_eq!(
+                detected.shared_ceiling.as_ref().unwrap().hard_limit_bytes,
+                4 * GIB
+            );
+            assert_eq!(
+                detected.shared_ceiling.as_ref().unwrap().source,
+                outer.join("parent/memory.max")
+            );
+            let error = select_memory_limit(detected, None).unwrap_err();
+            assert!(error.to_string().contains("exceeds the shared ancestor"));
+        }
     }
 
     #[test]
@@ -501,7 +552,7 @@ mod tests {
             ),
         ];
 
-        let selected = select_cgroup2_mount(current, &mounts).unwrap();
+        let selected = map_cgroup2_mounts(current, &mounts).remove(0);
 
         assert_eq!(selected.0, PathBuf::from("/sys/fs/cgroup"));
         assert_eq!(selected.1, PathBuf::from("/sys/fs/cgroup"));
@@ -561,7 +612,7 @@ mod tests {
         let mount = PathBuf::from(OsString::from_vec(b"/sys/cgroup-\xfe".to_vec()));
         let current = root.join("zerofs");
 
-        let selected = select_cgroup2_mount(&current, &[(root, mount.clone())]).unwrap();
+        let selected = map_cgroup2_mounts(&current, &[(root, mount.clone())]).remove(0);
 
         assert_eq!(
             selected.0.as_os_str().as_bytes(),

@@ -1244,8 +1244,29 @@ impl ReconciledDb {
     }
 }
 
-/// Run role election, database open, reconciliation, and activation.
+/// Initialize the filesystem after resolving write acknowledgement settings.
+///
+/// Keep the original entry point while server startup shares its prevalidated
+/// settings with memory admission through `initialize_filesystem_with_write_ack`.
+#[allow(dead_code)] // Compatibility entry point for callers outside server startup.
 pub async fn initialize_filesystem(
+    settings: &Settings,
+    db_mode: DatabaseMode,
+) -> Result<InitResult> {
+    let access_mode = match db_mode {
+        DatabaseMode::ReadWrite => crate::writeback::config::WritebackAccessMode::ReadWrite,
+        DatabaseMode::ReadOnly => crate::writeback::config::WritebackAccessMode::ReadOnly,
+        DatabaseMode::Checkpoint(_) => crate::writeback::config::WritebackAccessMode::Checkpoint,
+    };
+    let write_ack = settings
+        .filesystem_write_ack_settings(access_mode)
+        .context("Invalid filesystem write-acknowledgement configuration")?;
+    initialize_filesystem_with_write_ack(settings, db_mode, write_ack).await
+}
+
+/// Run role election, database open, reconciliation, and activation using the
+/// write acknowledgement settings already validated by server memory admission.
+pub async fn initialize_filesystem_with_write_ack(
     settings: &Settings,
     db_mode: DatabaseMode,
     write_ack: crate::fs::mutation::config::FilesystemWriteAckSettings,

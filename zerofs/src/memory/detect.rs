@@ -1,6 +1,7 @@
-use super::cgroup::{parse_cgroup2_mounts, parse_unified_cgroup, select_cgroup2_mount};
+use super::cgroup::{map_cgroup2_mounts, parse_cgroup2_mounts, parse_unified_cgroup};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
+use std::collections::BTreeSet;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
@@ -111,45 +112,59 @@ pub fn detect_limits_with(
                 validate_path(root)?;
                 validate_path(mount)?;
             }
-            let (mount, mut path) =
-                select_cgroup2_mount(&current, &mounts).context("no visible cgroup v2 mount")?;
-            let mut role = LimitRole::Dedicated;
-            loop {
-                for (name, kind) in [
-                    ("memory.max", LimitKind::Hard),
-                    ("memory.high", LimitKind::High),
-                ] {
-                    let source = path.join(name);
-                    let value = match read(&source) {
-                        Ok(raw) => {
-                            let raw = std::str::from_utf8(&raw)
-                                .with_context(|| format!("invalid limit at {}", source.display()))?
-                                .trim();
-                            if raw == "max" {
-                                Observation::Unlimited
-                            } else {
-                                if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit())
-                                {
-                                    bail!("invalid cgroup limit {raw:?} at {}", source.display());
-                                }
-                                Observation::Available(raw.parse().with_context(|| {
-                                    format!("invalid cgroup limit at {}", source.display())
-                                })?)
-                            }
+            let mappings = map_cgroup2_mounts(&current, &mounts);
+            if mappings.is_empty() {
+                bail!("no visible cgroup v2 mount");
+            }
+            let mut seen = BTreeSet::new();
+            for (mount, mut path) in mappings {
+                let mut role = LimitRole::Dedicated;
+                loop {
+                    for (name, kind) in [
+                        ("memory.max", LimitKind::Hard),
+                        ("memory.high", LimitKind::High),
+                    ] {
+                        let source = path.join(name);
+                        if !seen.insert(source.clone()) {
+                            continue;
                         }
-                        Err(error) => unavailable(error),
-                    };
-                    result.push(source, role, kind, value);
+                        let value = match read(&source) {
+                            Ok(raw) => {
+                                let raw = std::str::from_utf8(&raw)
+                                    .with_context(|| {
+                                        format!("invalid limit at {}", source.display())
+                                    })?
+                                    .trim();
+                                if raw == "max" {
+                                    Observation::Unlimited
+                                } else {
+                                    if raw.is_empty()
+                                        || !raw.bytes().all(|byte| byte.is_ascii_digit())
+                                    {
+                                        bail!(
+                                            "invalid cgroup limit {raw:?} at {}",
+                                            source.display()
+                                        );
+                                    }
+                                    Observation::Available(raw.parse().with_context(|| {
+                                        format!("invalid cgroup limit at {}", source.display())
+                                    })?)
+                                }
+                            }
+                            Err(error) => unavailable(error),
+                        };
+                        result.push(source, role, kind, value);
+                    }
+                    if path == mount {
+                        break;
+                    }
+                    path = path
+                        .parent()
+                        .filter(|parent| parent.starts_with(&mount))
+                        .context("cgroup path escaped its mount")?
+                        .to_path_buf();
+                    role = LimitRole::SharedAncestor;
                 }
-                if path == mount {
-                    break;
-                }
-                path = path
-                    .parent()
-                    .filter(|parent| parent.starts_with(&mount))
-                    .context("cgroup path escaped its mount")?
-                    .to_path_buf();
-                role = LimitRole::SharedAncestor;
             }
         }
     }
