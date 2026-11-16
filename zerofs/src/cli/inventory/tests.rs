@@ -4,7 +4,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use tempfile::TempDir;
 
 // Parallel fixture tests panic the macOS 27.2 kernel on machines with many cores.
-static FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(super) static FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn fixture() -> TempDir {
     let temp = tempfile::Builder::new()

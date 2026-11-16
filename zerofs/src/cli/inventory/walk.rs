@@ -39,6 +39,17 @@ struct Walker<'a, W> {
     pacer: Pacer,
 }
 
+pub(super) struct Options<'a> {
+    pub work_dir: Option<&'a Path>,
+    pub resume_from: Option<&'a Path>,
+    pub memory_bytes: usize,
+}
+
+pub(super) fn inventory_with_options(root: &Path, hash: bool, rate: Option<NonZeroU32>, options: Options<'_>, writer: impl Write) -> Result<bool> {
+    let _ = (options.work_dir, options.resume_from, options.memory_bytes);
+    inventory(root, hash, rate, writer)
+}
+
 pub(super) fn inventory(
     root: &Path,
     hash: bool,
