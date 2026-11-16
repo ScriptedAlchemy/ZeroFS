@@ -103,7 +103,20 @@ pub(super) fn birth(parent: BorrowedFd<'_>, name: &OsStr, stat: &Stat) -> Field<
 }
 
 pub(super) fn flags(_stat: &Stat) -> Field<u32> {
-    Field::unavailable(Reason::NotApplicableOnPlatform)
+    Field::unavailable(Reason::NotCollectedForKind)
+}
+
+pub(super) fn fd_flags(fd: BorrowedFd<'_>) -> Field<u32> {
+    match rustix::fs::ioctl_getflags(fd) {
+        Ok(flags) => Field::Observed(flags.bits()),
+        Err(error @ (rustix::io::Errno::NOTTY | rustix::io::Errno::OPNOTSUPP)) => {
+            Field::Unavailable {
+                reason: Reason::FormatNotSupportedByFilesystem,
+                errno: Some(error.raw_os_error()),
+            }
+        }
+        Err(error) => Field::error(error),
+    }
 }
 
 pub(super) fn filesystem(stat: &StatFs) -> Filesystem {
@@ -136,6 +149,20 @@ pub(super) fn filesystem(stat: &StatFs) -> Filesystem {
 mod tests {
     use super::*;
     use rustix::fd::AsFd;
+
+    #[test]
+    fn unsupported_inode_flags_are_complete() {
+        let (socket, _) = std::os::unix::net::UnixStream::pair().unwrap();
+        let flags = fd_flags(socket.as_fd());
+        assert_eq!(
+            flags,
+            Field::Unavailable {
+                reason: Reason::FormatNotSupportedByFilesystem,
+                errno: Some(rustix::io::Errno::NOTTY.raw_os_error()),
+            }
+        );
+        assert!(flags.is_complete());
+    }
 
     #[test]
     fn unavailable_proc_anchor_is_incomplete() {

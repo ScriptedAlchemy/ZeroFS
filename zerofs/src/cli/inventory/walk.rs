@@ -129,6 +129,10 @@ impl<W: Write> Walker<'_, W> {
             entry.xattrs = Field::unavailable(Reason::MountBoundary);
             entry.acl = Field::unavailable(Reason::MountBoundary);
             entry.data_extents = Field::unavailable(Reason::MountBoundary);
+            #[cfg(target_os = "linux")]
+            if matches!(entry_kind, EntryKind::File | EntryKind::Directory) {
+                entry.platform_flags = Field::unavailable(Reason::MountBoundary);
+            }
             self.output.emit(&Record::Entry(Box::new(entry)))?;
             self.derived.push(Record::MountBoundary {
                 path: RawBytes::new(&path),
@@ -223,6 +227,10 @@ impl<W: Write> Walker<'_, W> {
     fn collect_fd(&self, entry: &mut Entry, fd: BorrowedFd<'_>, kind: EntryKind) {
         entry.xattrs = collect::xattrs(fd);
         entry.acl = platform::acl(fd);
+        #[cfg(target_os = "linux")]
+        {
+            entry.platform_flags = platform::fd_flags(fd);
+        }
         if kind == EntryKind::File {
             if let Field::Observed(size) = entry.size {
                 entry.data_extents = extents(fd, size);
@@ -236,6 +244,10 @@ impl<W: Write> Walker<'_, W> {
     fn open_failed(&mut self, entry: &mut Entry, kind: EntryKind, path: &[u8], error: Errno) {
         entry.xattrs = Field::error(error);
         entry.acl = Field::error(error);
+        #[cfg(target_os = "linux")]
+        {
+            entry.platform_flags = Field::error(error);
+        }
         if kind == EntryKind::File {
             entry.data_extents = Field::error(error);
             if self.hash {
@@ -410,6 +422,13 @@ fn failed_entry(path: &[u8], error: Errno) -> Entry {
 }
 
 fn invalidate_reads(entry: &mut Entry, reason: Reason) {
+    #[cfg(target_os = "linux")]
+    if matches!(
+        entry.kind,
+        Field::Observed(EntryKind::File | EntryKind::Directory)
+    ) {
+        entry.platform_flags = Field::unavailable(reason);
+    }
     entry.xattrs = Field::unavailable(reason);
     entry.acl = Field::unavailable(reason);
     entry.data_extents = Field::unavailable(reason);
