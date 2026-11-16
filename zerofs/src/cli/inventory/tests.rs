@@ -35,6 +35,35 @@ fn summary(records: &[Value]) -> &Value {
 }
 
 #[test]
+fn unsupported_metadata_formats_are_complete_but_extent_failures_are_not() {
+    let mut output = Manifest::new(Vec::new());
+    output.count_unavailable(&serde_json::json!({
+        "status": "unavailable", "reason": "format_not_supported_by_filesystem", "errno": 95
+    }));
+    assert!(output.complete);
+    assert_eq!(output.reasons["format_not_supported_by_filesystem"], 1);
+    output.count_unavailable(&serde_json::json!({
+        "status": "unavailable", "reason": "not_supported_by_filesystem", "errno": 22
+    }));
+    assert!(!output.complete);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_plain_tree_is_complete() {
+    let temp = fixture();
+    fs::write(temp.path().join("file"), b"data").unwrap();
+    fs::create_dir(temp.path().join("directory")).unwrap();
+    symlink("file", temp.path().join("link")).unwrap();
+    let (complete, _, records) = scan(temp.path(), false);
+    assert!(complete, "{records:#?}");
+    assert_eq!(summary(&records)["complete"], true);
+    for path in ["", "file", "directory"] {
+        assert_eq!(entry(&records, path)["platform_flags"]["status"], "observed");
+    }
+}
+
+#[test]
 fn files_hardlinks_symlinks_and_fifo() {
     let temp = fixture();
     let root = temp.path().join("tree");
