@@ -342,7 +342,7 @@ impl ZeroFS {
                                     .fetch_add(1, Ordering::Relaxed);
                             }
 
-                            self.inode_store.delete(&mut txn, file_id);
+                            self.delete_inode(&mut txn, file_id);
 
                             #[cfg(feature = "failpoints")]
                             fail_point!(fp::REMOVE_AFTER_INODE_DELETE);
@@ -367,7 +367,7 @@ impl ZeroFS {
                             #[cfg(feature = "failpoints")]
                             fail_point!(fp::REMOVE_AFTER_ORPHAN_ADD);
                         } else {
-                            self.inode_store.delete(&mut txn, file_id);
+                            self.delete_inode(&mut txn, file_id);
 
                             #[cfg(feature = "failpoints")]
                             fail_point!(fp::RMDIR_AFTER_INODE_DELETE);
@@ -408,7 +408,7 @@ impl ZeroFS {
                             #[cfg(feature = "failpoints")]
                             fail_point!(fp::REMOVE_AFTER_ORPHAN_ADD);
                         } else {
-                            self.inode_store.delete(&mut txn, file_id);
+                            self.delete_inode(&mut txn, file_id);
                             self.stats.links_deleted.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -436,7 +436,7 @@ impl ZeroFS {
                             #[cfg(feature = "failpoints")]
                             fail_point!(fp::REMOVE_AFTER_ORPHAN_ADD);
                         } else {
-                            self.inode_store.delete(&mut txn, file_id);
+                            self.delete_inode(&mut txn, file_id);
                         }
                     }
                 }

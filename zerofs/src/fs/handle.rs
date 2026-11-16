@@ -76,6 +76,12 @@ impl DeferredOrphanReclaim {
 }
 
 impl ZeroFS {
+    /// Stage deletion of an inode. The caller holds its inode lock and owns
+    /// the transaction that removes its namespace and data references.
+    pub(crate) fn delete_inode(&self, txn: &mut crate::db::Transaction, id: InodeId) {
+        self.inode_store.delete(txn, id);
+    }
+
     pub(crate) fn deferred_orphan_reclaim(&self, inode_id: InodeId) -> DeferredOrphanReclaim {
         DeferredOrphanReclaim {
             inode_id,
@@ -212,7 +218,7 @@ impl ZeroFS {
                         .tombstones_created
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                self.inode_store.delete(&mut txn, id);
+                self.delete_inode(&mut txn, id);
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::CLUNK_AFTER_RECLAIM_INODE_DELETE);
@@ -234,7 +240,7 @@ impl ZeroFS {
             Ok(Inode::Symlink(s)) if s.nlink == 0 => {
                 // Dataless orphan
                 let mut txn = self.db.new_transaction()?;
-                self.inode_store.delete(&mut txn, id);
+                self.delete_inode(&mut txn, id);
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::CLUNK_AFTER_RECLAIM_INODE_DELETE);
@@ -256,7 +262,7 @@ impl ZeroFS {
                     return Ok(());
                 }
                 let mut txn = self.db.new_transaction()?;
-                self.inode_store.delete(&mut txn, id);
+                self.delete_inode(&mut txn, id);
                 self.directory_store.delete_directory(&mut txn, id);
 
                 #[cfg(feature = "failpoints")]
@@ -278,7 +284,7 @@ impl ZeroFS {
             {
                 // Dataless orphan
                 let mut txn = self.db.new_transaction()?;
-                self.inode_store.delete(&mut txn, id);
+                self.delete_inode(&mut txn, id);
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::CLUNK_AFTER_RECLAIM_INODE_DELETE);
