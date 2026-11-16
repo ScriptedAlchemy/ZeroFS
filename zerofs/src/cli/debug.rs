@@ -138,7 +138,7 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("Password validation failed: {}", e))?;
 
         let db_path = Path::from(actual_db_path.clone());
-        let encryption_key = key_management::load_or_init_encryption_key(
+        let encryption_key = key_management::load_or_init_encryption_key_with_mode(
             &object_store,
             &db_path,
             &password,
@@ -710,7 +710,7 @@ mod tests {
         BucketIdentity::get_or_create(&remote, &prefix)
             .await
             .unwrap();
-        key_management::load_or_init_encryption_key(
+        key_management::load_or_init_encryption_key_with_mode(
             &remote,
             &Path::from(prefix.clone()),
             password,

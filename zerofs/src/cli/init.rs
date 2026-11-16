@@ -224,7 +224,7 @@ impl StartupContext {
             info!("Loading or initializing encryption key from object store");
             let db_path = Path::from(actual_db_path.clone());
             let name_mode = settings.name_mode();
-            let encryption_key = key_management::load_or_init_encryption_key(
+            let encryption_key = key_management::load_or_init_encryption_key_with_mode(
                 &object_store,
                 &db_path,
                 &password,
@@ -1324,7 +1324,7 @@ pub(crate) async fn load_existing_writeback_identity(
     let bucket = bucket_identity::BucketIdentity::load(object_store, database_prefix)
         .await
         .context("failed to load existing bucket identity for writeback recovery")?;
-    let encryption_key = key_management::load_existing_encryption_key(
+    let encryption_key = key_management::load_existing_encryption_key_with_mode(
         object_store,
         &Path::from(database_prefix),
         &settings.storage.encryption_password,
