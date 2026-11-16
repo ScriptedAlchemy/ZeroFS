@@ -22,6 +22,37 @@ def wait_for(predicate, process, label):
     raise TimeoutError(label)
 
 
+def teardown(mountpoint, processes):
+    errors = []
+    try:
+        if os.path.ismount(mountpoint):
+            subprocess.run(["fusermount3", "-u", str(mountpoint)], check=True, timeout=20)
+    except (OSError, subprocess.SubprocessError) as error:
+        errors.append(f"unmount failed: {error}")
+    finally:
+        for process in processes:
+            if process is None:
+                continue
+            try:
+                process.terminate()
+                process.wait(timeout=20)
+            except (OSError, subprocess.SubprocessError) as error:
+                errors.append(f"process required a kill: {error}")
+                try:
+                    process.kill()
+                    process.wait(timeout=10)
+                except (OSError, subprocess.SubprocessError) as error:
+                    errors.append(f"process kill failed: {error}")
+    if os.path.ismount(mountpoint):
+        errors.append("mount required a lazy unmount")
+        try:
+            subprocess.run(["fusermount3", "-uz", str(mountpoint)], check=True, timeout=20)
+        except (OSError, subprocess.SubprocessError) as error:
+            errors.append(f"lazy unmount failed: {error}")
+    if errors:
+        raise RuntimeError("; ".join(errors))
+
+
 def check(binary, relaxed):
     with tempfile.TemporaryDirectory(prefix="zerofs-case-fuse-") as fixture:
         root = Path(fixture)
@@ -93,18 +124,7 @@ enabled = false
                     print(f"{label} log:\n{log.read()}", flush=True)
                 raise
             finally:
-                try:
-                    if os.path.ismount(mountpoint):
-                        subprocess.run(["fusermount3", "-u", str(mountpoint)], check=True, timeout=20)
-                finally:
-                    for process in [mount, server]:
-                        if process is not None:
-                            process.terminate()
-                            try:
-                                process.wait(timeout=20)
-                            except subprocess.TimeoutExpired:
-                                process.kill()
-                                process.wait(timeout=10)
+                teardown(mountpoint, [mount, server])
         assert not os.path.ismount(mountpoint)
     assert not root.exists()
     print(f"fixture_removed={root}", flush=True)
