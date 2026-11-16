@@ -1,10 +1,10 @@
 # Declared filesystem profiles and startup readiness
 
 `[storage.readiness]` adds opt-in identity verification before a local pool is
-opened. Omitting the section preserves ordinary local/cloud deployments. Setting
-`strict = false` retains the ordinary open behavior while still checking the
-declaration's structure when loading configuration. No identity probes run in
-either case. `strict` must be written explicitly when this section is present.
+opened. Omitting the section preserves ordinary local and cloud deployments.
+Setting `strict = false` retains the ordinary open behavior while config loading
+still checks the declarations. No identity probes run in either case. `strict`
+must be written explicitly when this section is present.
 
 This completes the declarations and startup preflight for storage readiness.
 The schema binds storage paths to filesystems and declares device roles, lifetime
@@ -31,9 +31,9 @@ device sets with those declarations. A boot flag remains declared intent, even
 after the verifier excludes that declared serial from the storage roots.
 Endurance, power-loss protection, sustained throughput, workload expectations,
 and write budgets remain unavailable. Filesystem identity alone does not
-establish those facts. No declaration in this change activates the
-installed Crucial P3. Its proposed role is optional clean read retention, pending
-resolution of the old/untouched-region read anomaly and measured workload benefit.
+establish those facts. No declaration in this change activates the Crucial P3
+SSD. Its proposed role is optional clean read retention, pending resolution of
+the read anomaly in old or untouched regions and measured workload benefit.
 Cache fills, promotions, and rebuilds write bytes even though cache hits do not.
 
 Budget pressure must refuse new work before acceptance. It must preserve and
@@ -46,7 +46,8 @@ semantics. It is not a fallback from an unsatisfied journal policy.
 Declare each filesystem once with an ID, its canonical mountpoint, its stable
 identity, and one operator-selected profile: `nvme`, `hdd-cmr`, or `hdd-smr`.
 Profiles are never inferred from devices, model names, mount types, or timings.
-No profile changes scheduling or promises SMR performance in S2.
+The declared-profile and startup-readiness checks do not change scheduling or
+promise SMR performance.
 
 Bind authority, catalog, cache, and every pool member to those IDs. Bind `journal`
 when writeback is enabled; omit it otherwise. Authority, catalog, and data members
@@ -69,13 +70,14 @@ anything. Nested mounts cannot substitute for the declared mountpoint. Declared 
 Authority, catalog, and one member may share a filesystem through disjoint
 directories. Journal and cache may likewise share the NVMe filesystem. Multiple
 data members cannot use the same capacity domain. For ext4/XFS, that domain is
-the filesystem UUID; for ZFS, it is the **pool GUID**, even across distinct dataset
-GUIDs. This conservatively rejects shared-pool member quotas that could otherwise
-count pool free space twice. Aliased declarations and conflicting profiles in one
-capacity domain are rejected. S2 performs no capacity summation or new admission
-accounting. Shared control/data space still needs the existing reserves.
+the filesystem UUID; for ZFS, it is the pool GUID, even across distinct dataset
+GUIDs. This conservatively rejects shared-pool member quotas that could
+otherwise count pool free space twice. Aliased declarations and conflicting
+profiles in one capacity domain are rejected. Storage readiness performs no
+capacity summation or new admission accounting. Shared control/data space still
+needs the existing reserves.
 
-ZFS GUIDs are canonical nonzero decimal **strings**, preserving the full unsigned
+ZFS GUIDs are canonical nonzero decimal strings, preserving the full unsigned
 64-bit range through TOML. UUIDs are nonzero lowercase hyphenated UUID strings.
 Dataset names alone and directory existence alone cannot establish readiness.
 
@@ -176,18 +178,20 @@ opening the backend or the journal. Their stored backend identity does not bind
 a filesystem UUID or GUID, so it cannot validate a relocated journal's filesystem.
 Recovery without readiness retains its existing behavior.
 
-It runs before backend creation, catalog opening, cache initialization, and
-journal replay. Existing pool/catalog/member identity markers remain in force.
-An absent catalog is still rejected on ordinary reopen; readiness never rebuilds
-it. Expected filesystem bindings are operator-owned configuration, not new
-catalog records or a migration of existing volume formats.
+The preflight runs before backend creation, catalog opening, cache
+initialization, and journal replay. Existing pool/catalog/member identity
+markers remain in force. An absent catalog is still rejected on ordinary reopen;
+readiness never rebuilds it. Expected filesystem bindings are operator-owned
+configuration, not new catalog records or a migration of existing volume
+formats.
 
-S2 does **not** pin mounts or directory descriptors through the server lifetime,
-and does not guard every publication or resumed write against later mount loss.
-There remains a race between preflight and later path-based storage opens. The
-placement track must provide its continuing mutation/publication readiness
-contract before strict placement can be enabled. Passing this startup check is
-not a runtime loss-of-mount guarantee, a durability receipt, or a migration gate.
+Startup readiness does not pin mounts or directory descriptors through the
+server lifetime. It does not guard every publication or resumed write against
+later mount loss. There remains a race between preflight and later path-based
+storage opens. The placement track must provide its continuing
+mutation/publication readiness contract before strict placement can be enabled.
+Passing this startup check is not a runtime loss-of-mount guarantee, a
+durability receipt, or a migration gate.
 
 Local tests cover injected missing/wrong/locked/read-only/unknown identities for
 every role, ordinary fallback directories, aliases, shared ZFS capacity,
@@ -208,9 +212,12 @@ A fresh check rejects that mount.
   devices, and host bind mounts outside the container were not exercised. The
   completed preflight holds no handle and cannot detect later mount changes.
 
-No TrueNAS app/container mount visibility, encrypted dataset lifecycle, ACL, SMB,
-hardware durability, or performance acceptance is claimed. Colocating control
-metadata on HDD does not satisfy the separate one-device-loss survival gate.
+- Not verified: This change claims no acceptance of TrueNAS app or container
+  mount visibility, the encrypted dataset lifecycle, ACL or SMB compatibility,
+  hardware durability, or performance.
+
+Colocating control metadata on HDD does not satisfy the separate one-device-loss
+survival gate.
 
 ## Runtime and migration preconditions remain separate
 
