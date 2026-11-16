@@ -1,8 +1,8 @@
 use super::Manifest;
 use super::record::{NameCollision, RawBytes, Record};
 use super::spill::{GROUP_ROWS, Rows, Sorter};
-use icu_normalizer::ComposingNormalizer;
 use anyhow::Result;
+use icu_normalizer::ComposingNormalizer;
 use std::io::Write;
 
 const OPENZFS_RULE: &str = "openzfs-insensitive-unicode-5.0.0";
@@ -16,7 +16,9 @@ fn key(rule: usize, name: &[u8]) -> Option<Vec<u8>> {
     let nfc = ComposingNormalizer::new_nfc();
     let canonical = nfc.normalize(text);
     Some(if rule == 2 {
-        unicase::UniCase::unicode(canonical.as_ref()).to_folded_case().into_bytes()
+        unicase::UniCase::unicode(canonical.as_ref())
+            .to_folded_case()
+            .into_bytes()
     } else {
         canonical.into_owned().into_bytes()
     })
