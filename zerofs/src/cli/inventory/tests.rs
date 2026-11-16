@@ -14,7 +14,7 @@ fn fixture() -> TempDir {
 
 fn scan(root: &Path, hash: bool) -> (bool, Vec<u8>, Vec<Value>) {
     let mut bytes = Vec::new();
-    let complete = walk::inventory(root, hash, &mut bytes).unwrap();
+    let complete = walk::inventory(root, hash, None, &mut bytes).unwrap();
     let records = bytes
         .split(|b| *b == b'\n')
         .filter(|line| !line.is_empty())
@@ -56,8 +56,9 @@ fn linux_plain_tree_is_complete() {
     fs::create_dir(temp.path().join("directory")).unwrap();
     symlink("file", temp.path().join("link")).unwrap();
     let (complete, _, records) = scan(temp.path(), false);
-    assert!(complete, "{records:#?}");
-    assert_eq!(summary(&records)["complete"], true);
+    let visible = platform::trusted_xattr_namespace().visible == Some(true);
+    assert_eq!(complete, visible, "{records:#?}");
+    assert_eq!(summary(&records)["complete"], visible);
     for path in ["", "file", "directory"] {
         assert_eq!(
             entry(&records, path)["platform_flags"]["status"],
@@ -106,9 +107,12 @@ fn files_hardlinks_symlinks_and_fifo() {
         "missing"
     );
     assert_eq!(entry(&records, "fifo")["kind"]["value"], "fifo");
+    #[cfg(target_os = "linux")]
+    assert_eq!(entry(&records, "fifo")["xattrs"]["status"], "observed");
+    #[cfg(target_os = "macos")]
     assert_eq!(
         entry(&records, "fifo")["xattrs"]["reason"],
-        "not_collected_for_kind"
+        "not_implemented_on_platform"
     );
     assert_eq!(summary(&records)["entries"], 7);
 }
@@ -216,11 +220,15 @@ fn unreadable_directory_is_incomplete() {
         "run the permission fixture as an unprivileged user"
     );
     assert_eq!(summary(&records)["complete"], false);
-    assert!(
-        records
-            .iter()
-            .any(|r| r["record"] == "directory_unreadable" && r["path"]["display"] == "blocked")
-    );
+    let unreadable = records
+        .iter()
+        .position(|r| r["record"] == "directory_unreadable" && r["path"]["display"] == "blocked")
+        .unwrap();
+    let file = records
+        .iter()
+        .position(|r| r["record"] == "entry" && r["path"]["display"] == "file")
+        .unwrap();
+    assert!(unreadable < file);
     assert!(
         !records
             .iter()
@@ -247,7 +255,7 @@ fn root_symlink_and_file_are_rejected() {
         temp.path().join("file"),
     ] {
         let mut output = Vec::new();
-        assert!(walk::inventory(&path, false, &mut output).is_err());
+        assert!(walk::inventory(&path, false, None, &mut output).is_err());
         assert!(output.is_empty());
     }
 }
@@ -326,7 +334,7 @@ fn directory_replacement_keeps_the_open_anchor() {
         bytes: Vec::new(),
         replaced: false,
     };
-    assert!(!walk::inventory(&root, true, &mut writer).unwrap());
+    assert!(!walk::inventory(&root, true, None, &mut writer).unwrap());
     assert!(writer.replaced);
     let records = writer
         .bytes
@@ -349,7 +357,26 @@ fn directory_replacement_keeps_the_open_anchor() {
 fn snapshot(path: &Path) -> Vec<Value> {
     use std::os::unix::ffi::OsStrExt;
     let mut paths = vec![path.to_path_buf()];
+    #[cfg(target_os = "macos")]
     paths.extend(fs::read_dir(path).unwrap().map(|e| e.unwrap().path()));
+    #[cfg(target_os = "linux")]
+    {
+        let fd = rustix::fs::open(
+            path,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOATIME,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        for item in rustix::fs::Dir::new(fd).unwrap() {
+            let item = item.unwrap();
+            let name = item.file_name().to_bytes();
+            if name != b"." && name != b".." {
+                paths.push(path.join(std::ffi::OsStr::from_bytes(name)));
+            }
+        }
+    }
     paths.sort();
     paths.into_iter().map(|p| {
         let m = fs::symlink_metadata(&p).unwrap();
@@ -359,8 +386,18 @@ fn snapshot(path: &Path) -> Vec<Value> {
             let value = collect::variable_bytes(|buf| rustix::fs::lgetxattr(&p, std::ffi::OsStr::from_bytes(name), buf)).unwrap();
             attrs.insert(hex(name), hex(&value));
         }
-        serde_json::json!({"path": p.as_os_str().as_bytes(), "mode": m.mode(), "uid": m.uid(), "gid": m.gid(),
-            "mtime": [m.mtime(), m.mtime_nsec()], "ctime": [m.ctime(), m.ctime_nsec()], "xattrs": attrs})
+        let observed = serde_json::json!({"path": p.as_os_str().as_bytes(), "mode": m.mode(), "uid": m.uid(), "gid": m.gid(),
+            "mtime": [m.mtime(), m.mtime_nsec()], "ctime": [m.ctime(), m.ctime_nsec()], "xattrs": attrs});
+        // readlinkat can update symlink atime even when file opens use O_NOATIME.
+        #[cfg(target_os = "linux")]
+        let observed = {
+            let mut observed = observed;
+            if !m.file_type().is_symlink() {
+                observed["atime"] = serde_json::json!([m.atime(), m.atime_nsec()]);
+            }
+            observed
+        };
+        observed
     }).collect()
 }
 
@@ -378,8 +415,27 @@ fn source_metadata_is_unchanged() {
         rustix::fs::XattrFlags::empty(),
     )
     .unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        let file = fs::File::open(temp.path().join("file")).unwrap();
+        file.set_times(
+            fs::FileTimes::new()
+                .set_accessed(std::time::UNIX_EPOCH + std::time::Duration::from_secs(123456)),
+        )
+        .unwrap();
+    }
     let before = snapshot(temp.path());
-    scan(temp.path(), true);
+    let (_, _, records) = scan(temp.path(), true);
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        records
+            .iter()
+            .find(|r| r["record"] == "header_update")
+            .unwrap()["noatime_fallback"],
+        false
+    );
+    #[cfg(target_os = "macos")]
+    let _ = records;
     assert_eq!(before, snapshot(temp.path()));
 }
 
@@ -540,4 +596,223 @@ fn linux_inode_flags_include_nodump() {
         })
     );
     rustix::fs::ioctl_setflags(&file, original).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn review_trusted_namespace_visibility() {
+    let status = fs::read_to_string("/proc/self/status").unwrap();
+    let capabilities = u64::from_str_radix(
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("CapEff:"))
+            .unwrap()
+            .trim(),
+        16,
+    )
+    .unwrap();
+    let initial_namespace =
+        fs::read_link("/proc/self/ns/user").unwrap() == Path::new("user:[4026531837]");
+    let visible = initial_namespace && capabilities & (1 << 21) != 0;
+    let temp = fixture();
+    fs::write(temp.path().join("file"), b"data").unwrap();
+    let (complete, _, records) = scan(temp.path(), false);
+    assert_eq!(records[0]["trusted_xattr_namespace"]["visible"], visible);
+    if !visible {
+        for path in ["", "file"] {
+            assert_eq!(
+                entry(&records, path)["xattrs"]["trusted_namespace"]["reason"],
+                "trusted_namespace_not_visible"
+            );
+        }
+        assert!(!complete);
+        assert_eq!(summary(&records)["complete"], false);
+    }
+}
+
+#[test]
+fn review_special_node_metadata() {
+    let temp = fixture();
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(temp.path().join("fifo"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    let _socket = std::os::unix::net::UnixListener::bind(temp.path().join("socket")).unwrap();
+    let (complete, _, records) = scan(temp.path(), false);
+    for path in ["fifo", "socket"] {
+        let node = entry(&records, path);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(node["xattrs"]["status"], "observed", "{node:#}");
+            let probes = node["acl"]["value"].as_array().unwrap();
+            assert_eq!(probes.len(), 3);
+            assert_eq!(probes[0]["raw"]["status"], "observed");
+        }
+        #[cfg(target_os = "macos")]
+        for field in ["xattrs", "acl"] {
+            assert_eq!(node[field]["reason"], "not_implemented_on_platform");
+        }
+    }
+    #[cfg(target_os = "macos")]
+    assert!(!complete);
+    #[cfg(target_os = "linux")]
+    let _ = complete;
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn review_same_device_bind_mount_is_not_traversed() {
+    if std::env::var("ZEROFS_INVENTORY_BIND_MOUNT_TEST").as_deref() != Ok("1") {
+        eprintln!(
+            "SKIP real bind mount fixture; set ZEROFS_INVENTORY_BIND_MOUNT_TEST=1 with CAP_SYS_ADMIN"
+        );
+        return;
+    }
+    struct Unmount(std::path::PathBuf);
+    impl Drop for Unmount {
+        fn drop(&mut self) {
+            assert!(
+                std::process::Command::new("umount")
+                    .arg(&self.0)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+    }
+    let temp = fixture();
+    let root = temp.path().join("root");
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(root.join("mounted")).unwrap();
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("secret"), b"must not hash").unwrap();
+    fs::write(root.join("mounted-file"), []).unwrap();
+    for (name, kind, major, minor) in [("char", "c", "1", "3"), ("block", "b", "7", "250")] {
+        assert!(
+            std::process::Command::new("mknod")
+                .arg(root.join(name))
+                .args([kind, major, minor])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let mut mounts = Vec::new();
+    for (source, target) in [
+        (outside.clone(), root.join("mounted")),
+        (outside.join("secret"), root.join("mounted-file")),
+    ] {
+        assert!(
+            std::process::Command::new("mount")
+                .arg("--bind")
+                .arg(source)
+                .arg(&target)
+                .status()
+                .unwrap()
+                .success()
+        );
+        mounts.push(Unmount(target));
+    }
+    assert_eq!(
+        fs::metadata(&root).unwrap().dev(),
+        fs::metadata(root.join("mounted")).unwrap().dev()
+    );
+    let (complete, _, records) = scan(&root, true);
+    assert!(
+        !records
+            .iter()
+            .any(|r| r["path"]["display"] == "mounted/secret")
+    );
+    for path in ["mounted", "mounted-file"] {
+        assert!(
+            records
+                .iter()
+                .any(|r| r["record"] == "mount_boundary" && r["path"]["display"] == path)
+        );
+        assert_ne!(
+            entry(&records, path)["content_sha256"]["status"],
+            "observed"
+        );
+    }
+    assert!(!complete);
+    for path in ["char", "block"] {
+        let node = entry(&records, path);
+        assert_eq!(node["xattrs"]["status"], "observed", "{node:#}");
+        assert_eq!(node["acl"]["value"][0]["raw"]["status"], "observed");
+        assert_eq!(node["content_sha256"]["reason"], "not_collected_for_kind");
+    }
+    drop(mounts);
+}
+
+#[test]
+fn pacing_limits_entry_starts_and_preserves_output() {
+    let temp = fixture();
+    for name in ["a", "b", "c"] {
+        fs::write(temp.path().join(name), b"data").unwrap();
+    }
+    scan(temp.path(), false);
+    let (_, unlimited, _) = scan(temp.path(), false);
+    let mut paced = Vec::new();
+    let start = std::time::Instant::now();
+    walk::inventory(
+        temp.path(),
+        false,
+        std::num::NonZeroU32::new(20),
+        &mut paced,
+    )
+    .unwrap();
+    assert!(start.elapsed() >= std::time::Duration::from_millis(150));
+    assert_eq!(paced, unlimited);
+}
+
+#[test]
+fn collisions_are_emitted_before_directory_entries() {
+    let temp = fixture();
+    fs::write(temp.path().join("file"), b"lower").unwrap();
+    fs::write(temp.path().join("FILE"), b"upper").unwrap();
+    // Case-insensitive fixture filesystems cannot hold both names.
+    if fs::read_dir(temp.path()).unwrap().count() != 2 {
+        return;
+    }
+    let (_, _, records) = scan(temp.path(), false);
+    let collision = records
+        .iter()
+        .position(|r| r["record"] == "name_collision")
+        .unwrap();
+    let first_child = records
+        .iter()
+        .position(|r| r["record"] == "entry" && r["path"]["display"] == "FILE")
+        .unwrap();
+    assert!(collision < first_child);
+    assert_eq!(records[0]["schema"], 2);
+}
+
+#[test]
+fn pacing_cli_requires_a_positive_rate() {
+    use clap::Parser;
+    for rate in ["0", "-1", "no", "4294967296"] {
+        assert!(
+            crate::cli::Cli::try_parse_from([
+                "zerofs",
+                "inventory",
+                "/tmp",
+                "--max-entries-per-second",
+                rate,
+            ])
+            .is_err()
+        );
+    }
+    assert!(
+        crate::cli::Cli::try_parse_from([
+            "zerofs",
+            "inventory",
+            "/tmp",
+            "--max-entries-per-second",
+            "100",
+        ])
+        .is_ok()
+    );
 }
