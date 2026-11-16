@@ -38,6 +38,7 @@ jobs:
           scripts.tests.test_release_pgo_workflow
           scripts.tests.test_jepsen_native_deps
           scripts.tests.test_lein_deps_retry
+          scripts.tests.test_linux_source_download
           scripts.tests.test_local_storage_pool_diagnostics
           scripts.tests.test_case_insensitive_fuse_cleanup
       - name: Run Proxmox deployment regressions
