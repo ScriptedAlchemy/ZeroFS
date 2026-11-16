@@ -40,6 +40,8 @@ jobs:
           scripts.tests.test_jepsen_native_deps
           scripts.tests.test_lein_deps_retry
           scripts.tests.test_local_storage_pool_diagnostics
+      - name: Run Proxmox deployment regressions
+        run: python3 -m unittest discover -s proxmox/tests -p 'test_*.py'
 
   build:
     uses: ./.github/workflows/_build-ci-bin.yml
