@@ -381,7 +381,7 @@ addresses = ["10.10.10.30:9567"]
             settings["filesystem"]["max_size_gb"] * 1_000_000_000,
             5 * 1024**4,
         )
-        self.assertEqual(settings["sftp"]["max_connections"], 8)
+        self.assertEqual(settings["sftp"]["max_connections"], 10)
         self.assertEqual(settings["sftp"]["write_concurrency"], 16)
 
     def test_prod_enforces_bounded_clean_cache_and_distinct_writeback_ram(
@@ -572,7 +572,7 @@ addresses = ["10.10.10.30:9567"]
 
     def test_sftp_concurrency_respects_connections_and_transport_cap(self) -> None:
         invalid = (
-            ("max_connections = 4", "max_connections = 9", "max_connections"),
+            ("max_connections = 4", "max_connections = 11", "max_connections"),
             ("write_concurrency = 4", "write_concurrency = 65", "write_concurrency"),
             (
                 "max_connections = 4\nread_concurrency = 4",
@@ -589,6 +589,25 @@ addresses = ["10.10.10.30:9567"]
                     "10.10.10.30",
                     role="prod",
                 )
+
+    def test_sftp_accepts_full_account_pool_with_bounded_request_concurrency(self) -> None:
+        full_pool = (
+            self.prod_config()
+            .replace("max_connections = 4", "max_connections = 10")
+            .replace("read_concurrency = 4", "read_concurrency = 64")
+            .replace("write_concurrency = 4", "write_concurrency = 16")
+        )
+        deploy.validate_server_config(
+            self.write_config(full_pool), "10.10.10.30", role="prod"
+        )
+        with self.assertRaisesRegex(ValueError, "read_concurrency"):
+            deploy.validate_server_config(
+                self.write_config(
+                    full_pool.replace("read_concurrency = 64", "read_concurrency = 65")
+                ),
+                "10.10.10.30",
+                role="prod",
+            )
 
 
 class PlanTests(unittest.TestCase):
