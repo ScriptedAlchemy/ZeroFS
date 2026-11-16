@@ -126,6 +126,8 @@ comfy-table = "7.1"
 num-format = "0.4"
 libc = "0.2"
 rustix = { version = "1.1.4", features = ["fs"] }
+icu_normalizer = { version = "2.1", default-features = false, features = ["compiled_data"] }
+unicase = "2.10"
 dashmap = "6.1"
 uuid = { version = "1.17", features = ["v4", "serde"] }
 toml = "0.9"
