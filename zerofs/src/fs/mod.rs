@@ -28,7 +28,9 @@ use self::flush_coordinator::FlushCoordinator;
 use self::lock_manager::KeyedLockManager;
 use self::metrics::FileSystemStats;
 use self::stats::FileSystemGlobalStats;
-use self::store::{DirectoryStore, ExtentStore, InodeStore, OrphanStore, TombstoneStore};
+use self::store::{
+    DirectoryStore, ExtentStore, InodeStore, OrphanStore, TombstoneStore, XattrStore,
+};
 use self::tracing::AccessTracer;
 use self::write_coordinator::WriteCoordinator;
 use crate::db::Db;
@@ -121,6 +123,7 @@ pub struct ZeroFS {
     pub inode_store: InodeStore,
     pub tombstone_store: TombstoneStore,
     pub orphan_store: OrphanStore,
+    pub xattr_store: XattrStore,
     /// In-memory, process-global open-file pins for each inode. Empty after a
     /// restart by construction; used to pick the defer-vs-delete branch in
     /// `remove`/`rename`.

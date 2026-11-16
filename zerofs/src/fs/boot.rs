@@ -199,6 +199,7 @@ impl ZeroFS {
         let directory_store = DirectoryStore::new(db.clone(), key_codec.clone());
         let inode_store = InodeStore::new(db.clone(), key_codec.clone(), next_inode_id);
         let tombstone_store = TombstoneStore::new(db.clone(), key_codec.clone());
+        let xattr_store = super::store::XattrStore::new(db.clone(), key_codec.clone());
         let orphan_store = OrphanStore::new(db.clone(), key_codec.clone());
 
         // Carry the durability lineage only across a coverage-proven, untainted
@@ -248,6 +249,7 @@ impl ZeroFS {
             inode_store,
             tombstone_store,
             orphan_store,
+            xattr_store,
             open_handles: Arc::new(DashMap::new()),
             reclaim_tx,
             reclaim_rx: Arc::new(Mutex::new(Some(reclaim_rx))),

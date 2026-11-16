@@ -724,7 +724,7 @@ impl ZeroFS {
                         self.orphan_store.add(&mut txn, target_id);
                         target_deferred = true;
                     } else {
-                        self.delete_inode(&mut txn, target_id);
+                        self.delete_inode(&mut txn, target_id).await?;
                     }
                 };
             }
@@ -770,7 +770,7 @@ impl ZeroFS {
                                 .fetch_add(1, Ordering::Relaxed);
                         }
 
-                        self.delete_inode(&mut txn, target_id);
+                        self.delete_inode(&mut txn, target_id).await?;
                         quota_settlement = Some(crate::fs::quota::QuotaSettlement::Shrink {
                             quota: std::sync::Arc::clone(&self.quota),
                             bytes: file.size,
@@ -789,7 +789,7 @@ impl ZeroFS {
                         self.orphan_store.add(&mut txn, target_id);
                         target_deferred = true;
                     } else {
-                        self.delete_inode(&mut txn, target_id);
+                        self.delete_inode(&mut txn, target_id).await?;
                         self.directory_store.delete_directory(&mut txn, target_id);
                     }
                 }
@@ -817,7 +817,7 @@ impl ZeroFS {
                         self.orphan_store.add(&mut txn, target_id);
                         target_deferred = true;
                     } else {
-                        self.delete_inode(&mut txn, target_id);
+                        self.delete_inode(&mut txn, target_id).await?;
                     }
                 }
                 Inode::Fifo(mut special) => {
