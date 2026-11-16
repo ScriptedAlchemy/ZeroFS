@@ -10,6 +10,8 @@ pub mod debug;
 pub mod fatrace;
 pub mod flush;
 mod init;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) mod inventory;
 mod memory_budget;
 pub mod monitor;
 pub mod nbd;
@@ -29,6 +31,20 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Inventory source metadata as JSON Lines without a server or configuration
+    ///
+    /// Reads may update atime; only a read-only mount prevents this. Exit 3 means
+    /// the inventory is incomplete. Collision rules do not model Samba or ZFS.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Inventory {
+        root: PathBuf,
+        /// Read regular file contents to compute SHA-256 (disabled by default)
+        #[arg(long, value_enum)]
+        hash: Option<inventory::HashAlgorithm>,
+        /// Limit entry starts per second (unlimited by default)
+        #[arg(long)]
+        max_entries_per_second: Option<std::num::NonZeroU32>,
+    },
     /// Upload a file or directory directly over ZeroFS 9P
     Upload {
         /// 9P server address: host[:port], tcp://host:port, unix:/path, or ws:// URL
