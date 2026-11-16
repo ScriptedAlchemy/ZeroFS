@@ -13,8 +13,9 @@ later replaces a path component.
 - Keep multipart staging creation, completion, abort, cancellation, and drop
   cleanup relative to the captured directory descriptors. A failed readiness
   recheck must not run a path-based destructor against a replacement tree.
-- Give cache partition creation, resizing, and reopening the same anchored
-  contract. A replacement symlink must not redirect an open or `set_len`.
+- Give cache directory and partition creation, resizing, reopening, and pruning
+  the same anchored contract. A replacement symlink must not redirect an open,
+  `set_len`, or partition deletion.
 - Move the scoped object listing walk to anchored handles. Preserve its lazy
   execution, prefix bounds, symlink refusals, and streaming behavior while
   preventing concurrent parent replacement from redirecting enumeration.
@@ -29,7 +30,8 @@ tree. The operation must either fail before publication or finish exclusively
 inside the retained original tree. Verify the external tree's file contents,
 sizes, and directory entries are unchanged. Cover authority and member reads,
 writes, copies, renames, deletes, and all listing variants; multipart completion,
-abort, dropped uploads, and cancelled parts; and cache partition open and resize.
+abort, dropped uploads, and cancelled parts; and cache directory creation,
+partition open, resize, and prune deletion.
 
 Run conditional-write and crash-durability regressions as well as these path
 tests. Measure cold metadata enumeration on a populated HDD before claiming an

@@ -3,9 +3,10 @@
 `[storage.readiness]` adds opt-in identity verification before a local pool is
 opened. Omitting the section preserves ordinary local and cloud deployments.
 Setting `strict = false` skips host identity and filesystem-size observations.
-Config loading still checks the declarations. Both strict modes check existing
-symlinks on structural paths before storage opens and on requested object paths
-before I/O. `strict` must be written explicitly when this section is present.
+Config loading still checks the declarations. With either value of `strict`,
+checks reject existing symlinks below the declared role root on structural paths
+before storage opens and on requested object paths before I/O. `strict` must be
+written explicitly when this section is present.
 
 This completes the declarations and startup preflight for storage readiness.
 The schema binds storage paths to filesystems and declares device roles, lifetime
@@ -226,8 +227,11 @@ evidence unavailable in strict mode.
 ## Threat model
 
 Strict readiness guards against storage that is absent, unmounted, locked,
-read-only, misidentified, or declared wrongly when a command starts. Both strict
-modes reject symlinks present when they check a path. Startup preflight checks fixed
+read-only, misidentified, or declared wrongly when a command starts. With either
+value of `strict`, checks reject symlinks below the declared role root that are
+present at check time. The root and its ancestors may themselves be symlinks;
+strict verification canonicalizes the root to observe its filesystem identity.
+Startup preflight checks fixed
 structural paths and sets bounded by configuration, such as the active cache
 namespace's partition leaves. It never enumerates a set that grows with stored
 data, such as object files or journal blobs. Per-object operations check
@@ -239,11 +243,13 @@ Readiness does not protect against a process that can change entries inside a
 storage root while the server runs. That process can already delete pool data.
 These runtime races remain:
 
-- `put_opts` checks a path before path-based I/O. Swapping a checked marker or
-  parent directory for a symlink between the check and write can redirect a
-  member payload write. Foyer opens a cache partition by path and calls
-  `set_len`. Replacing that partition with a symlink after its check can
-  truncate a file outside the root.
+- `put_opts` checks a path before path-based I/O. Swapping a checked member
+  identity marker or parent directory for a symlink between the check and write
+  can redirect a member payload write. Parent replacement can also redirect
+  directory and mutation-lock creation. Foyer opens a cache partition by path
+  and calls `set_len`. Replacing that partition with a symlink after its check
+  can truncate or extend a file outside the root. Cache pruning also deletes
+  partitions by path, so a replaced parent can redirect deletion outside the root.
 - Multipart `complete` and `abort` take ownership of the native upload before
   checking its path. If that check fails, they drop the upload. The
   `object_store` crate's destructor removes its staging path by name. A parent
@@ -258,13 +264,17 @@ pinned `object_store` 0.14.1 and `foyer-storage` 0.22.3 sources.
 | Authority and member writes and reads | `zerofs/src/local_object_store.rs:189`, `:263`, and `:268`. Native file opens are at `object_store/src/local.rs:1069`, `:1363`, and `:506`. |
 | Authority and member deletion, copying, and renaming | `zerofs/src/local_object_store.rs:273`, `:327`, and `:345`. Native unlink, link, and rename calls are at `object_store/src/local.rs:780`, `:652`, `:971`, and `:955`. |
 | Object listing directory walks and metadata reads | `zerofs/src/local_object_store/listing.rs:127`, `:34`, and `:72`. |
-| Native directory creation, mutation locks, and directory sync opens | `zerofs/src/local_object_store.rs:125`, `:150`, and `:108`. The native backend also creates parents and syncs directories at `object_store/src/local.rs:924` and `:1051`. |
+| Native directory creation, parent resolution, mutation locks, and directory sync opens | `zerofs/src/local_object_store.rs:131`, `:132`, `:150`, and `:108`. The native backend also creates parents and syncs directories at `object_store/src/local.rs:924` and `:1051`. |
+| Object metadata checks before rename and native pool creation | `zerofs/src/local_object_store.rs:363` and `zerofs/src/local_object_store/pool.rs:69`. |
 | Multipart staging, publication, abort, and destructor cleanup | `zerofs/src/local_object_store.rs:239`, `:433`, and `:455`; `object_store/src/local.rs:1069`, `:1161`, `:1175`, `:1188`, and `:1189`. Part writes retain the opened staging file. |
 | Cache namespace creation and ownership lock | `zerofs/src/cli/server.rs:742` and `:756`. The lock leaf uses `O_NOFOLLOW`, but its parents use path resolution. |
-| Cache partition inspection and cache directory creation | `zerofs/src/cli/server.rs:815`, `:860`, and `:931`. |
+| Cache partition enumeration, inspection, and pruning | `zerofs/src/cli/server.rs:795`, `:808`, `:815`, and `:839`. |
+| Cache directory creation | `zerofs/src/cli/server.rs:860` and `:931`; `foyer-storage/src/io/device/fs.rs:86` and `:96`. |
 | Cache partition open and resize | `foyer-storage/src/io/device/fs.rs:154` and `:155`, through the builders in `zerofs/src/cli/server.rs:880` and `:948`. |
 
 Catalog and journal storage already use descriptor-anchored no-follow handles.
+Native pool-generation recovery cleanup also uses an anchored no-follow walker
+at `zerofs/src/local_object_store/pool.rs:101`.
 Moving authority objects, member objects, and cache partitions onto that pattern
 is tracked in [the anchored I/O follow-up](storage-readiness-anchored-io.md),
 including replacement-race and cleanup tests. Readiness does not retain mount
