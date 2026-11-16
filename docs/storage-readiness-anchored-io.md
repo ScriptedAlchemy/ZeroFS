@@ -15,9 +15,9 @@ later replaces a path component.
   recheck must not run a path-based destructor against a replacement tree.
 - Give cache partition creation, resizing, and reopening the same anchored
   contract. A replacement symlink must not redirect an open or `set_len`.
-- Enumerate object directories through anchored handles. Remove the separate
-  whole-tree scan only once enumeration itself refuses symlinks and does not
-  follow replacement paths.
+- Move the scoped object listing walk to anchored handles. Preserve its lazy
+  execution, prefix bounds, symlink refusals, and streaming behavior while
+  preventing concurrent parent replacement from redirecting enumeration.
 - Preserve startup identity and mounted-filesystem checks. Anchoring an inode
   does not by itself prove continued mount identity or device durability.
 
@@ -33,5 +33,5 @@ abort, dropped uploads, and cancelled parts; and cache partition open and resize
 
 Run conditional-write and crash-durability regressions as well as these path
 tests. Measure cold metadata enumeration on a populated HDD before claiming an
-improvement to startup or listing latency. Keep the remaining runtime
+improvement to HDD startup or listing latency. Keep the remaining runtime
 loss-of-mount and durability-receipt contracts explicit.

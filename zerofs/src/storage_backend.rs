@@ -184,23 +184,15 @@ pub(crate) async fn open_pool_storage(
                 health_device: member.health_device.clone(),
             });
         }
-        Ok(if initialize {
-            PoolObjectStore::initialize(
-                Arc::from(authority),
-                path.clone(),
-                config.catalog_dir.clone(),
-                members,
-            )
-            .await?
-        } else {
-            PoolObjectStore::open(
-                Arc::from(authority),
-                path.clone(),
-                config.catalog_dir.clone(),
-                members,
-            )
-            .await?
-        })
+        Ok(PoolObjectStore::open_with_preflight(
+            Arc::from(authority),
+            path.clone(),
+            config.catalog_dir.clone(),
+            members,
+            initialize,
+            |pool_id| crate::storage_readiness::verify_pool_paths(settings, pool_id),
+        )
+        .await?)
     }
     .await;
     match result {

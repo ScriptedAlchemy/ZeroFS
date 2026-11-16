@@ -452,30 +452,49 @@ impl Drop for CancelOnDrop {
 }
 
 impl PoolObjectStore {
+    #[cfg(test)]
     pub async fn initialize(
         authority: Arc<dyn ObjectStore>,
         authority_prefix: Path,
         catalog_dir: PathBuf,
         members: Vec<PoolMember>,
     ) -> object_store::Result<Self> {
-        Self::open_inner(authority, authority_prefix, catalog_dir, members, true).await
+        Self::open_with_preflight(
+            authority,
+            authority_prefix,
+            catalog_dir,
+            members,
+            true,
+            |_| Ok(()),
+        )
+        .await
     }
 
+    #[cfg(test)]
     pub async fn open(
         authority: Arc<dyn ObjectStore>,
         authority_prefix: Path,
         catalog_dir: PathBuf,
         members: Vec<PoolMember>,
     ) -> object_store::Result<Self> {
-        Self::open_inner(authority, authority_prefix, catalog_dir, members, false).await
+        Self::open_with_preflight(
+            authority,
+            authority_prefix,
+            catalog_dir,
+            members,
+            false,
+            |_| Ok(()),
+        )
+        .await
     }
 
-    async fn open_inner(
+    pub(crate) async fn open_with_preflight(
         authority: Arc<dyn ObjectStore>,
         authority_prefix: Path,
         catalog_dir: PathBuf,
         members: Vec<PoolMember>,
         initialize: bool,
+        preflight: impl FnOnce(&str) -> anyhow::Result<()> + Send,
     ) -> object_store::Result<Self> {
         let marker_path = authority_prefix
             .clone()
@@ -495,6 +514,10 @@ impl PoolObjectStore {
         .await
         .map_err(|e| error(format!("pool catalog open task failed: {e}")))?
         .map_err(|e| error(format!("pool catalog open failed: {e:#}")))?;
+        // The catalog supplies the active pool UUID. Check its fixed member
+        // paths before marker creation or recovery can write member objects.
+        preflight(&catalog.identity.pool_id)
+            .map_err(|issue| error(format!("pool storage preflight failed: {issue:#}")))?;
         let member_indices = members
             .iter()
             .enumerate()

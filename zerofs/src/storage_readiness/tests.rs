@@ -609,25 +609,20 @@ async fn readiness_symlinks_refuse_pool_init_and_server_backend_open_before_writ
                 ".zerofs-pool/00000000-0000-0000-0000-000000000001/objects",
             ),
             ("catalog", "pool.lock"),
-            ("cache", "bucket_fixture/hybrid_cache"),
-            (
-                "cache",
-                "bucket_fixture/parts_cache/foyer-storage-direct-fs-00000000",
-            ),
-            ("journal", "bucket_fixture/blobs/00"),
-            ("journal", "bucket_fixture/tmp"),
         ] {
             let mut fixture = Fixture::new();
             fixture.document["storage"]["readiness"]["strict"] = json!(false);
             let settings = fixture.parse().unwrap();
-            if !initialize {
-                drop(
-                    crate::storage_backend::open_pool_storage(&settings, true)
-                        .await
-                        .unwrap(),
-                );
+            let mut relative = relative.to_owned();
+            if !initialize || relative.contains("00000000-0000-0000-0000-000000000001") {
+                let initialized = crate::storage_backend::open_pool_storage(&settings, true)
+                    .await
+                    .unwrap();
+                let pool_id = initialized.1.status().await.unwrap().pool_id;
+                relative = relative.replace("00000000-0000-0000-0000-000000000001", &pool_id);
+                drop(initialized);
             }
-            let child = fixture.path(role).join(relative);
+            let child = fixture.path(role).join(&relative);
             if child.is_dir() {
                 std::fs::remove_dir_all(&child).unwrap();
             } else if child.exists() {
@@ -659,7 +654,10 @@ async fn readiness_symlinks_refuse_pool_init_and_server_backend_open_before_writ
             error_contains(result, "symlink");
             let mut strict_settings = settings.clone();
             strict_settings.storage.readiness.as_mut().unwrap().strict = true;
-            error_contains(verify_with(&strict_settings, &fixture), "symlink");
+            error_contains(
+                verify_open_paths_with(&strict_settings, &fixture, &[(role, child)]),
+                "symlink",
+            );
         }
     }
 }
@@ -779,8 +777,10 @@ fn reserve_above_observed_size_or_unavailable_size_refuses_strict_open() {
     }
 }
 
-#[test]
-fn readiness_refuses_internal_and_dangling_symlinks_below_every_role() {
+#[tokio::test]
+async fn readiness_refuses_internal_and_dangling_symlinks_below_every_role() {
+    use futures::TryStreamExt;
+    use object_store::{ObjectStore, ObjectStoreExt};
     for role in ["authority", "catalog", "member data", "cache", "journal"] {
         for dangling in [true, false] {
             let mut fixture = Fixture::new();
@@ -793,9 +793,74 @@ fn readiness_refuses_internal_and_dangling_symlinks_below_every_role() {
             std::os::unix::fs::symlink(target, &link).unwrap();
             for strict in [true, false] {
                 fixture.document["storage"]["readiness"]["strict"] = json!(strict);
-                error_contains(fixture.verify(), "symlink");
+                if matches!(role, "authority" | "member data") {
+                    // Arbitrary object names are checked at use, not enumerated
+                    // during startup. Keep both operation and listing coverage.
+                    fixture.verify().unwrap();
+                    let store = crate::local_object_store::LocalConditionalStore::new()
+                        .with_readiness_root(root.clone());
+                    let prefix = object_store::path::Path::from_absolute_path(&root).unwrap();
+                    let object = prefix.clone().join("child").join("object");
+                    assert!(
+                        store
+                            .get(&object)
+                            .await
+                            .unwrap_err()
+                            .to_string()
+                            .contains("symlink")
+                    );
+                    assert!(
+                        store
+                            .list(Some(&prefix))
+                            .try_collect::<Vec<_>>()
+                            .await
+                            .unwrap_err()
+                            .to_string()
+                            .contains("symlink")
+                    );
+                } else {
+                    error_contains(
+                        verify_open_paths_with(
+                            &fixture.parse().unwrap(),
+                            &fixture,
+                            &[(role, link.clone())],
+                        ),
+                        "symlink",
+                    );
+                }
             }
         }
+    }
+}
+
+#[test]
+fn readiness_symlinks_refuse_cache_and_journal_namespace_opens() {
+    for (role, relative) in [
+        ("cache", "bucket_fixture/hybrid_cache"),
+        (
+            "cache",
+            "bucket_fixture/parts_cache/foyer-storage-direct-fs-00000000",
+        ),
+        ("journal", "bucket_fixture/blobs/00"),
+        ("journal", "bucket_fixture/tmp"),
+    ] {
+        let mut fixture = Fixture::new();
+        fixture.document["storage"]["readiness"]["strict"] = json!(false);
+        let root = fixture.path(role);
+        let link = root.join(relative);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("sentinel"), b"unchanged").unwrap();
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        error_contains(
+            verify_bucket_paths(&fixture.parse().unwrap(), "bucket_fixture"),
+            "symlink",
+        );
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read(outside.path().join("sentinel")).unwrap(),
+            b"unchanged"
+        );
     }
 }
 

@@ -82,7 +82,7 @@ pub(super) fn verify_with(settings: &Settings, provider: &dyn IdentityProvider) 
     let roots = config.validated_roots(settings)?;
     if !config.strict {
         for root in &roots {
-            paths::verify_tree(&root.path)
+            paths::verify_role(root)
                 .with_context(|| format!("storage readiness failed for {}", root.role))?;
         }
         return Ok(());
@@ -120,7 +120,7 @@ pub(super) fn verify_with(settings: &Settings, provider: &dyn IdentityProvider) 
             bail!("readiness {} root is not a directory", root.role)
         }
         verify_identity(config, root, &path, provider)?;
-        paths::verify_tree(&root.path)
+        paths::verify_role(root)
             .with_context(|| format!("storage readiness failed for {}", root.role))?;
         verified.push((root, path));
     }
@@ -234,12 +234,7 @@ fn verify_open_paths_with(
     paths: &[(&str, PathBuf)],
 ) -> Result<()> {
     verify_with(settings, provider)?;
-    let Some(config) = settings
-        .storage
-        .readiness
-        .as_ref()
-        .filter(|config| config.strict)
-    else {
+    let Some(config) = &settings.storage.readiness else {
         return Ok(());
     };
     let roots = config.validated_roots(settings)?;
@@ -253,11 +248,37 @@ fn verify_open_paths_with(
         if !path.starts_with(&root.path) {
             bail!("readiness {role} open path escapes its declared role");
         }
-        let existing = paths::existing_ancestor(&root.path, path)?.canonicalize()?;
+        let existing = paths::existing_ancestor(&root.path, path)?;
+        if !config.strict {
+            continue;
+        }
+        let existing = existing.canonicalize()?;
         if !existing.starts_with(root.path.canonicalize()?) {
             bail!("readiness {role} open path escapes its declared role");
         }
         verify_identity(config, root, &existing, provider)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_pool_paths(settings: &Settings, pool_id: &str) -> Result<()> {
+    let Some(config) = &settings.storage.readiness else {
+        return Ok(());
+    };
+    let roots = config.validated_roots(settings)?;
+    for root in &roots {
+        let RoleName::Member(id) = &root.role else {
+            continue;
+        };
+        let pool = root.path.join(".zerofs-pool").join(pool_id);
+        for path in [
+            pool.join("members").join(id),
+            pool.join("members/.zerofs-local-mutations#0"),
+            pool.join("objects"),
+            pool.join("objects/.zerofs-local-mutations#0"),
+        ] {
+            paths::existing_ancestor(&root.path, &path)?;
+        }
     }
     Ok(())
 }
@@ -282,9 +303,31 @@ pub(crate) fn verify_bucket_paths(settings: &Settings, namespace: &str) -> Resul
             ("journal", journal.join("journal.redb")),
             ("journal", journal.join("blobs")),
             ("journal", journal.join("tmp")),
+            ("journal", journal.join("tmp/multipart")),
         ]);
     }
-    verify_open_paths(settings, &paths)
+    verify_open_paths(settings, &paths)?;
+    if settings.storage.readiness.is_some() {
+        paths::verify_cache_partitions(&cache)?;
+        if let Some(writeback) = settings
+            .writeback
+            .as_ref()
+            .filter(|writeback| writeback.enabled)
+        {
+            // These 256 shard directories are fixed by the journal format.
+            // Check their components without enumerating any blob entries.
+            for shard in 0..256 {
+                paths::existing_ancestor(
+                    &writeback.dir,
+                    &writeback
+                        .dir
+                        .join(namespace)
+                        .join(format!("blobs/{shard:02x}")),
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

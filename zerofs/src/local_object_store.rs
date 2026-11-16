@@ -20,13 +20,14 @@
 //! pool starvation. File publication and ETag generation remain the upstream
 //! implementation, preserving the existing on-disk layout and read semantics.
 
+mod listing;
 pub(crate) mod pool;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use fs4::fs_std::FileExt;
 use futures::stream::BoxStream;
-use futures::{FutureExt, StreamExt, TryStreamExt};
+use futures::{FutureExt, StreamExt};
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
 use object_store::{
@@ -71,17 +72,6 @@ impl LocalConditionalStore {
             self.readiness_root.as_deref(),
             &self.inner.path_to_filesystem(location)?,
         )
-    }
-
-    async fn check_tree(&self) -> Result<()> {
-        if let Some(root) = self.readiness_root.clone() {
-            // A tree scan can perform millions of metadata operations. Use the
-            // same bounded native workers as mutations instead of blocking a
-            // Tokio executor while constructing or polling a listing.
-            run_local(move || crate::storage_readiness::paths::verify_tree(&root).map_err(generic))
-                .await?;
-        }
-        Ok(())
     }
 }
 
@@ -310,17 +300,10 @@ impl ObjectStore for LocalConditionalStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
-        if self.readiness_root.is_none() {
-            return self.inner.list(prefix);
+        if let Some(root) = &self.readiness_root {
+            return listing::list(root, prefix, None);
         }
-        let store = self.clone();
-        let prefix = prefix.cloned();
-        futures::stream::once(async move {
-            store.check_tree().await?;
-            Ok::<_, Error>(store.inner.list(prefix.as_ref()))
-        })
-        .try_flatten()
-        .boxed()
+        self.inner.list(prefix)
     }
 
     fn list_with_offset(
@@ -328,22 +311,16 @@ impl ObjectStore for LocalConditionalStore {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, Result<ObjectMeta>> {
-        if self.readiness_root.is_none() {
-            return self.inner.list_with_offset(prefix, offset);
+        if let Some(root) = &self.readiness_root {
+            return listing::list(root, prefix, Some(offset));
         }
-        let store = self.clone();
-        let prefix = prefix.cloned();
-        let offset = offset.clone();
-        futures::stream::once(async move {
-            store.check_tree().await?;
-            Ok::<_, Error>(store.inner.list_with_offset(prefix.as_ref(), &offset))
-        })
-        .try_flatten()
-        .boxed()
+        self.inner.list_with_offset(prefix, offset)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
-        self.check_tree().await?;
+        if let Some(root) = &self.readiness_root {
+            return listing::list_with_delimiter(root, prefix).await;
+        }
         self.inner.list_with_delimiter(prefix).await
     }
 
@@ -591,8 +568,8 @@ mod tests {
         let listing = store.list(Some(&prefix));
         let offset_listing = store.list_with_offset(Some(&prefix), &prefix.clone().join("a"));
 
-        // Stream construction is lazy. Validate on the worker before any
-        // object metadata is emitted, including changes made before polling.
+        // Stream construction is lazy. The listing worker must reject a
+        // symlink added before polling.
         let outside = TempDir::new().unwrap();
         let link = directory.path().join("foreign");
         std::os::unix::fs::symlink(outside.path(), &link).unwrap();

@@ -3,9 +3,9 @@
 `[storage.readiness]` adds opt-in identity verification before a local pool is
 opened. Omitting the section preserves ordinary local and cloud deployments.
 Setting `strict = false` skips host identity and filesystem-size observations.
-Config loading still checks the declarations. Both strict modes reject existing
-symlinks below declared role roots before storage opens. `strict` must be written
-explicitly when this section is present.
+Config loading still checks the declarations. Both strict modes check existing
+symlinks on structural paths before storage opens and on requested object paths
+before I/O. `strict` must be written explicitly when this section is present.
 
 This completes the declarations and startup preflight for storage readiness.
 The schema binds storage paths to filesystems and declares device roles, lifetime
@@ -63,11 +63,16 @@ journal directories. Readiness creates nothing. A role may be a dedicated child
 directory on its declared mounted filesystem. Role directories must be disjoint,
 including after resolving symlinks. The Linux adapter rejects every mount
 strictly below a declared role root. It also checks the containing filesystem
-against the declaration. Before opening storage, preflight inspects every
-existing child in the authority, catalog, member, cache, and journal trees
-without following symlinks. This includes
-`.zerofs-pool`, object directories, cache partitions, and journal blob shards.
-It rejects symlinks even when their targets stay inside the declared root.
+against the declaration. Before opening storage, preflight checks fixed
+structural paths, including `.zerofs-pool`, the active pool directory, member
+markers, object directory roots, catalog files, and the active bucket's cache
+and journal directories. It also checks existing cache partitions before the
+cache engine opens them. Their count is bounded by cache configuration.
+Startup does not enumerate authority objects, member payloads, or journal blobs.
+Object operations check each existing path component when they use it. Listings
+reject symlinks while walking the requested subtree. Journal blob opens use
+descriptor-anchored no-follow handles. The checks reject symlinks even when
+their targets stay inside the declared root.
 Missing children use their closest existing ancestor without creating anything.
 Nested mounts cannot substitute for the declared mountpoint. Declared
 mountpoints must themselves be canonical paths.
@@ -217,54 +222,70 @@ checks can independently reject missing, overlapping, or unsafe paths. Omitting
 device declarations also leaves serial, backing-device, and boot exclusion
 evidence unavailable in strict mode.
 
-## Scope of evidence
+## Threat model
 
-### Threat model and remaining path-based I/O
+Strict readiness guards against storage that is absent, unmounted, locked,
+read-only, misidentified, or declared wrongly when a command starts. Both strict
+modes reject symlinks present when they check a path. Startup checks fixed
+structural paths and sets bounded by configuration, such as the active cache
+namespace's partition leaves. It never enumerates a set that grows with stored
+data, such as object files or journal blobs. Per-object operations check
+components before I/O, and a listing checks directories as it walks its
+requested subtree.
 
-Readiness guards against wrong, missing, unmounted, locked, or misidentified
-storage at startup. Storage roots must be owned and controlled by the operator
-and service. It does not defend against another process with write access to a
-storage root while the server runs. Such a process can replace directories after
-a successful check or remove the pool's data directly.
+Storage roots must be owned and controlled by the operator and service.
+Readiness does not protect against a process that can change entries inside a
+storage root while the server runs. That process can already delete pool data.
+These runtime races remain:
 
-The authority object store, member object stores, and Foyer cache partitions
-still open by path. A replacement symlink between validation and a subsequent
-open can redirect a write, truncate a cache partition outside the root, or
-redirect multipart staging-file cleanup. The checks reject already-present
-symlinks; they do not make those operations atomic with validation. The catalog
-and journal use descriptor-anchored no-follow handles. The remaining conversion
+- `put_opts` checks a path before path-based I/O. Swapping a checked marker or
+  parent directory for a symlink between the check and write can redirect a
+  member payload write. Foyer opens a cache partition by path and calls
+  `set_len`. Replacing that partition with a symlink after its check can
+  truncate a file outside the root.
+- Multipart `complete` and `abort` take ownership of the native upload before
+  checking its path. If that check fails, they drop the upload. The
+  `object_store` crate's destructor removes its staging path by name. A parent
+  swapped for a symlink during the upload can make cleanup delete a same-named
+  file outside the root, even though completion or abort reports an error.
+
+The unanchored sites below retain this risk. The dependency references name the
+pinned `object_store` 0.14.1 and `foyer-storage` 0.22.3 sources.
+
+| Operation | Source |
+| --- | --- |
+| Authority and member writes and reads | `zerofs/src/local_object_store.rs:189`, `:263`, and `:268`. Native file opens are at `object_store/src/local.rs:1069`, `:1363`, and `:506`. |
+| Authority and member deletion, copying, and renaming | `zerofs/src/local_object_store.rs:273`, `:327`, and `:345`. Native unlink, link, and rename calls are at `object_store/src/local.rs:780`, `:652`, `:971`, and `:955`. |
+| Object listing directory walks and metadata reads | `zerofs/src/local_object_store/listing.rs:126`, `:30`, and `:68`. |
+| Native directory creation, mutation locks, and directory sync opens | `zerofs/src/local_object_store.rs:125`, `:150`, and `:108`. The native backend also creates parents and syncs directories at `object_store/src/local.rs:924` and `:1051`. |
+| Multipart staging, publication, abort, and destructor cleanup | `zerofs/src/local_object_store.rs:239`, `:433`, and `:455`; `object_store/src/local.rs:1069`, `:1161`, `:1175`, `:1188`, and `:1189`. Part writes retain the opened staging file. |
+| Cache namespace creation and ownership lock | `zerofs/src/cli/server.rs:742` and `:756`. The lock leaf uses `O_NOFOLLOW`, but its parents use path resolution. |
+| Cache partition inspection and cache directory creation | `zerofs/src/cli/server.rs:815`, `:860`, and `:931`. |
+| Cache partition open and resize | `foyer-storage/src/io/device/fs.rs:154` and `:155`, through the builders in `zerofs/src/cli/server.rs:880` and `:948`. |
+
+Catalog and journal storage already use descriptor-anchored no-follow handles.
+Moving authority objects, member objects, and cache partitions onto that pattern
 is tracked in [the anchored I/O follow-up](storage-readiness-anchored-io.md),
-including the required replacement-race and cleanup tests.
+including replacement-race and cleanup tests. Readiness does not retain mount
+handles for the lifetime of the server, so a later mount replacement also
+remains outside this contract.
 
-### Tree-scan work
+## Listing work
 
-Each preflight scans every existing entry below every declared role root. Let
-`N` be the number of entries, `D` the number of directories including the root,
-and `S` the sum of directory depths relative to the root. One scan performs
-`N` no-follow metadata queries and `D` directory enumerations. Because the
-walker reopens each pending directory from its root, it also performs `S`
-directory-component opens, plus one enumeration open per directory. Its work
-is therefore `O(N + S)`, not constant time or just one probe per device. For a
-tree with maximum depth `h`, `S <= (D - 1) * h`. Pending relative directory paths
-consume `O(D * h)` path components in the worst case; open descriptors remain
-bounded independently of the number of entries. No file payloads are read.
+Listings use the existing bounded native workers, with at most 32 local
+operations in flight across mutations and listings. Stream construction does no
+filesystem I/O. The worker checks the prefix's existing components when the
+stream is first polled, then rejects symlink entries while walking that subtree.
+A delimiter listing walks one directory level. Recursive listings stream batches
+of at most 1,024 entries and can return an error after earlier batches succeeded.
+They do not scan the rest of the role root before returning results.
 
-Every invocation repeats this work: backend opening and bucket cache/journal
-verification each invoke a full preflight. Object `list`, `list_with_offset`,
-and `list_with_delimiter` also scan the whole corresponding root, even for a
-narrow listing prefix. A million-entry root needs a million metadata queries
-per scan. This can add minutes on an HDD with cold metadata; there is no measured
-HDD latency or wall-clock upper bound. Plan startup budgets from the actual tree
-and device, not the number of configured members.
+Remaining readiness, listing, and cache-pruning walks log progress every five
+seconds while processing entries. Cancelling a caller does not stop a batch
+already running in a worker. Descriptor-anchored enumeration remains follow-up
+work for protection against concurrent parent replacement.
 
-Runtime listing scans run on the existing bounded native-worker pool (at most
-32 local operations in flight across mutations and scans), so the scan does not
-block the Tokio executor. A listing emits no objects before its scan succeeds.
-Cancelling the caller does not terminate a scan already running in a worker.
-Descriptor-anchored object enumeration in the follow-up should remove this
-duplicate whole-tree scan without weakening the symlink refusal.
-
-### Startup and recovery contract
+## Scope of evidence
 
 This is a startup preflight, including explicit `pool init` and maintenance opens.
 Both `debug reseed-writeback-predecessor` and
@@ -274,12 +295,14 @@ opening the backend or the journal. Their stored backend identity does not bind
 a filesystem UUID or GUID, so it cannot validate a relocated journal's filesystem.
 Recovery without readiness retains its existing behavior.
 
-The preflight runs before backend creation, catalog opening, cache
-initialization, and journal replay. Existing pool/catalog/member identity
-markers remain in force. An absent catalog is still rejected on ordinary reopen;
-readiness never rebuilds it. Expected filesystem bindings are operator-owned
-configuration, not new catalog records or a migration of existing volume
-formats.
+Root and catalog-path preflight runs before backend creation and catalog
+opening. The catalog then supplies the active pool UUID for fixed member-path
+checks before marker creation or recovery writes. Bucket-path and cache
+partition checks precede cache initialization and journal replay. Existing
+pool/catalog/member identity markers remain in force. An absent catalog is
+still rejected on ordinary reopen; readiness never rebuilds it. Expected
+filesystem bindings are operator-owned configuration, not new catalog records
+or a migration of existing volume formats.
 
 Startup readiness does not pin mounts or directory descriptors through the
 server lifetime. It does not guard every publication or resumed write against
