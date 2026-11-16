@@ -117,6 +117,7 @@ impl CrashTestContext {
                 ),
                 None,
                 zerofs::config::StoreProfile::default(),
+                zerofs::fs::name_mode::NameMode::Sensitive,
             )
             .await
             .unwrap(),

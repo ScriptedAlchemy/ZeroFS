@@ -114,6 +114,7 @@ pub(crate) fn validate_filename_length(filename: &[u8]) -> Result<(), FsError> {
 
 #[derive(Clone)]
 pub struct ZeroFS {
+    name_mode: name_mode::NameMode,
     pub db: Arc<Db>,
     pub extent_store: ExtentStore,
     pub directory_store: DirectoryStore,
@@ -179,6 +180,12 @@ pub struct ZeroFS {
     /// connections (a retry may arrive on a new one); on a standby it is also fed
     /// by the replication stream.
     pub(crate) dedup: Arc<crate::dedup::DedupCache>,
+}
+
+impl ZeroFS {
+    pub fn name_mode(&self) -> name_mode::NameMode {
+        self.name_mode
+    }
 }
 
 #[derive(Clone)]

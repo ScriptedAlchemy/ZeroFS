@@ -849,6 +849,7 @@ mod tests {
             ),
             None,
             crate::config::StoreProfile::default(),
+            crate::fs::name_mode::NameMode::Sensitive,
         )
         .await
         .unwrap();

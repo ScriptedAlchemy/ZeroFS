@@ -194,7 +194,8 @@ async fn real_writeback_fs(
         ),
         None,
         crate::config::StoreProfile::default(),
-    )
+                crate::fs::name_mode::NameMode::Sensitive,
+)
     .await
     .unwrap();
     fs.write_ack = FilesystemWriteAckSettings {

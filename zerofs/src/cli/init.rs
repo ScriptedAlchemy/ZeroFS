@@ -42,6 +42,7 @@ struct StartupContext {
     /// the filesystem so the RPC server can stream backend requests (`otrace`).
     object_tracer: ObjectTracer,
     actual_db_path: String,
+    name_mode: crate::fs::name_mode::NameMode,
     block_transformer: Arc<dyn BlockTransformer>,
     segment_codec: crate::frame_codec::FrameCodec,
     cache_config: CacheConfig,
@@ -222,6 +223,14 @@ impl StartupContext {
 
             info!("Loading or initializing encryption key from object store");
             let db_path = Path::from(actual_db_path.clone());
+            let name_mode = crate::name_mode_record::load_or_init(
+                &object_store,
+                &db_path,
+                settings.name_mode(),
+                db_mode.is_read_only(),
+            )
+            .await
+            .context("Failed to check filesystem name mode")?;
             let encryption_key = key_management::load_or_init_encryption_key(
                 &object_store,
                 &db_path,
@@ -308,6 +317,7 @@ impl StartupContext {
                 wal_object_store,
                 object_tracer,
                 actual_db_path,
+                name_mode,
                 block_transformer,
                 segment_codec: crate::frame_codec::FrameCodec::new(
                     &encryption_key,
@@ -952,6 +962,7 @@ impl ReconciledDb {
             wal_object_store,
             object_tracer,
             actual_db_path,
+            name_mode,
             block_transformer,
             segment_codec,
             cache_config: _,
@@ -1150,6 +1161,7 @@ impl ReconciledDb {
             segment_codec,
             segment_warm,
             store_profile,
+            name_mode,
         )
         .await
         .context("Failed to initialize filesystem")?;
@@ -1512,6 +1524,48 @@ mod role_decision_tests {
     }
 
     #[tokio::test]
+    async fn name_mode_mismatch_refuses_before_receiver_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let metadata = root.join("metadata");
+        std::fs::create_dir(&metadata).unwrap();
+        std::fs::write(metadata.join("zerofs.namemode"), [1, 1]).unwrap();
+        let mut settings = crate::config::Settings::generate_default();
+        settings.storage.url = url::Url::from_directory_path(&metadata)
+            .unwrap()
+            .to_string();
+        settings.storage.encryption_password = "name-mode-startup-test".into();
+        settings.cache.dir = root.join("cache");
+        settings.aws = None;
+        settings.replication = Some(crate::config::ReplicationConfig {
+            node_id: "mode-test-standby".into(),
+            role: ReplicationRole::Standby,
+            peers: Vec::new(),
+            replication_listen: Some("invalid-receiver-address".into()),
+            force_recovery: false,
+        });
+        let error = super::initialize_filesystem(&settings, DatabaseMode::ReadWrite)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            format!("{error:#}").contains("name mode mismatch"),
+            "{error:#}"
+        );
+        assert!(!metadata.join("zerofs.key").exists());
+        settings.filesystem = Some(toml::from_str("name_mode = 'insensitive'").unwrap());
+        let error = super::initialize_filesystem(&settings, DatabaseMode::ReadWrite)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            format!("{error:#}").contains("invalid replication_listen address"),
+            "{error:#}"
+        );
+        assert!(metadata.join("zerofs.key").exists());
+    }
+
+    #[tokio::test]
     async fn peer_silence_refreshes_ownership() {
         let (fault_store, faults) = FaultStore::new(Arc::new(InMemory::new()));
         let store: Arc<dyn ObjectStore> = fault_store;
@@ -1532,6 +1586,7 @@ mod role_decision_tests {
             wal_object_store: None,
             object_tracer: crate::object_trace::ObjectTracer::new(),
             actual_db_path: "db".into(),
+            name_mode: crate::fs::name_mode::NameMode::Sensitive,
             block_transformer: crate::block_transformer::ZeroFsBlockTransformer::new_arc(
                 &[0; 32],
                 CompressionConfig::default(),

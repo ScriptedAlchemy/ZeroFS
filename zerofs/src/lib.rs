@@ -22,6 +22,7 @@ mod local_object_store;
 pub(crate) mod metadata_digest;
 #[cfg(target_os = "linux")]
 mod mount;
+mod name_mode_record;
 mod nbd;
 mod net_util;
 mod nfs;
