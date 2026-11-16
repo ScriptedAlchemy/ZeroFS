@@ -410,7 +410,7 @@ impl Live {
             let _ = fs.administrative_remote_durability().await?;
             let loc = fs
                 .db
-                .get_bytes(&KeyCodec.extent_key(inode, 0))
+                .get_bytes(&KeyCodec::new().extent_key(inode, 0))
                 .await?
                 .context("extra file extent")?;
             let loc = FrameLoc::decode(&loc).context("extra file frame")?;
@@ -448,7 +448,8 @@ impl Live {
             }
             for offset in (0..data.len()).step_by(crate::fs::EXTENT_SIZE) {
                 let length = (data.len() - offset).min(crate::fs::EXTENT_SIZE);
-                let key = KeyCodec.extent_key(inode, (offset / crate::fs::EXTENT_SIZE) as u64);
+                let key =
+                    KeyCodec::new().extent_key(inode, (offset / crate::fs::EXTENT_SIZE) as u64);
                 let loc = fs
                     .db
                     .get_bytes(&key)
@@ -936,7 +937,7 @@ async fn overwrite_and_reclaim(live: &Live) -> Result<PayloadRetentionObservatio
         .find(|range| range.names.iter().any(|name| name == "/lost.bin"))
         .context("the isolated payload-retention file")?
         .clone();
-    let key = KeyCodec.extent_key(range.inode, 0);
+    let key = KeyCodec::new().extent_key(range.inode, 0);
     let old = live.fs().db.get_bytes(&key).await?.context("old extent")?;
     let old = FrameLoc::decode(&old).context("old frame location")?;
     let placement = live
@@ -982,7 +983,7 @@ async fn overwrite_and_reclaim(live: &Live) -> Result<PayloadRetentionObservatio
     let counter = live
         .fs()
         .db
-        .get_bytes(&KeyCodec.segcount_key(old.segid.epoch, old.segid.counter))
+        .get_bytes(&KeyCodec::new().segcount_key(old.segid.epoch, old.segid.counter))
         .await?
         .context("the old segment counter")?;
     let (old_live_bytes, old_total_bytes) =
@@ -1441,7 +1442,9 @@ async fn interrupted_case(
             let loc = live
                 .fs()
                 .db
-                .get_bytes(&KeyCodec.extent_key(file, range.offset / crate::fs::EXTENT_SIZE as u64))
+                .get_bytes(
+                    &KeyCodec::new().extent_key(file, range.offset / crate::fs::EXTENT_SIZE as u64),
+                )
                 .await?
                 .context("candidate extent")?;
             let loc = FrameLoc::decode(&loc).context("candidate frame")?;
