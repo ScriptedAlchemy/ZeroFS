@@ -3,6 +3,9 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use tempfile::TempDir;
 
+// Parallel fixture tests panic the macOS 27.2 kernel on machines with many cores.
+static FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn fixture() -> TempDir {
     let temp = tempfile::Builder::new()
         .prefix("zerofs-inventory-test-")
@@ -51,6 +54,7 @@ fn unsupported_metadata_formats_are_complete_but_extent_failures_are_not() {
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_plain_tree_is_complete() {
+    let _guard = FIXTURE_LOCK.lock().unwrap();
     let temp = fixture();
     fs::write(temp.path().join("file"), b"data").unwrap();
     fs::create_dir(temp.path().join("directory")).unwrap();
@@ -69,6 +73,7 @@ fn linux_plain_tree_is_complete() {
 
 #[test]
 fn files_hardlinks_symlinks_and_fifo() {
+    let _guard = FIXTURE_LOCK.lock().unwrap();
     let temp = fixture();
     let root = temp.path().join("tree");
     fs::create_dir(&root).unwrap();
@@ -119,6 +124,7 @@ fn files_hardlinks_symlinks_and_fifo() {
 
 #[test]
 fn sparse_extents_and_xattrs() {
+    let _guard = FIXTURE_LOCK.lock().unwrap();
     use std::io::{Seek, SeekFrom};
     let temp = fixture();
     let path = temp.path().join("sparse");
@@ -205,6 +211,7 @@ impl Drop for RestorePermissions {
 
 #[test]
 fn unreadable_directory_is_incomplete() {
+    let _guard = FIXTURE_LOCK.lock().unwrap();
     let temp = fixture();
     let blocked = temp.path().join("blocked");
     fs::create_dir(&blocked).unwrap();
@@ -246,6 +253,7 @@ fn unreadable_directory_is_incomplete() {
 
 #[test]
 fn root_symlink_and_file_are_rejected() {
+    let _guard = FIXTURE_LOCK.lock().unwrap();
     let temp = fixture();
     symlink(temp.path(), temp.path().join("link")).unwrap();
     fs::write(temp.path().join("file"), b"data").unwrap();
@@ -262,6 +270,7 @@ fn root_symlink_and_file_are_rejected() {
 
 #[test]
 fn deterministic_jsonl_and_digest() {
+    let _guard = FIXTURE_LOCK.lock().unwrap();
     let temp = fixture();
     for name in ["z", "b", "a"] {
         fs::write(temp.path().join(name), name).unwrap();
@@ -297,6 +306,7 @@ fn deterministic_jsonl_and_digest() {
 
 #[test]
 fn directory_replacement_keeps_the_open_anchor() {
+    let _guard = FIXTURE_LOCK.lock().unwrap();
     struct ReplacingWriter<'a> {
         root: &'a Path,
         outside: &'a Path,
@@ -403,6 +413,7 @@ fn snapshot(path: &Path) -> Vec<Value> {
 
 #[test]
 fn source_metadata_is_unchanged() {
+    let _guard = FIXTURE_LOCK.lock().unwrap();
     let temp = fixture();
     fs::write(temp.path().join("file"), b"content").unwrap();
     fs::create_dir(temp.path().join("directory")).unwrap();
@@ -442,6 +453,7 @@ fn source_metadata_is_unchanged() {
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_extended_acl_and_symlink_metadata() {
+    let _guard = FIXTURE_LOCK.lock().unwrap();
     let temp = fixture();
     let path = temp.path().join("file");
     fs::write(&path, b"data").unwrap();
@@ -473,6 +485,7 @@ fn macos_extended_acl_and_symlink_metadata() {
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_non_utf8_names_and_symlink_metadata() {
+    let _guard = FIXTURE_LOCK.lock().unwrap();
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
     let temp = fixture();
@@ -535,6 +548,7 @@ fn linux_non_utf8_names_and_symlink_metadata() {
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_raw_acl_probes() {
+    let _guard = FIXTURE_LOCK.lock().unwrap();
     use rustix::fd::AsFd;
     let temp = fixture();
     let path = temp.path().join("file");
@@ -582,6 +596,7 @@ fn linux_raw_acl_probes() {
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_inode_flags_include_nodump() {
+    let _guard = FIXTURE_LOCK.lock().unwrap();
     let temp = fixture();
     let path = temp.path().join("file");
     let file = fs::File::create(&path).unwrap();
@@ -601,6 +616,7 @@ fn linux_inode_flags_include_nodump() {
 #[cfg(target_os = "linux")]
 #[test]
 fn review_trusted_namespace_visibility() {
+    let _guard = FIXTURE_LOCK.lock().unwrap();
     let status = fs::read_to_string("/proc/self/status").unwrap();
     let capabilities = u64::from_str_radix(
         status
@@ -632,6 +648,7 @@ fn review_trusted_namespace_visibility() {
 
 #[test]
 fn review_special_node_metadata() {
+    let _guard = FIXTURE_LOCK.lock().unwrap();
     let temp = fixture();
     assert!(
         std::process::Command::new("mkfifo")
@@ -665,6 +682,7 @@ fn review_special_node_metadata() {
 #[cfg(target_os = "linux")]
 #[test]
 fn review_same_device_bind_mount_is_not_traversed() {
+    let _guard = FIXTURE_LOCK.lock().unwrap();
     if std::env::var("ZEROFS_INVENTORY_BIND_MOUNT_TEST").as_deref() != Ok("1") {
         eprintln!(
             "SKIP real bind mount fixture; set ZEROFS_INVENTORY_BIND_MOUNT_TEST=1 with CAP_SYS_ADMIN"
@@ -749,6 +767,7 @@ fn review_same_device_bind_mount_is_not_traversed() {
 
 #[test]
 fn pacing_limits_entry_starts_and_preserves_output() {
+    let _guard = FIXTURE_LOCK.lock().unwrap();
     let temp = fixture();
     for name in ["a", "b", "c"] {
         fs::write(temp.path().join(name), b"data").unwrap();
@@ -770,6 +789,7 @@ fn pacing_limits_entry_starts_and_preserves_output() {
 
 #[test]
 fn collisions_are_emitted_before_directory_entries() {
+    let _guard = FIXTURE_LOCK.lock().unwrap();
     let temp = fixture();
     fs::write(temp.path().join("file"), b"lower").unwrap();
     fs::write(temp.path().join("FILE"), b"upper").unwrap();

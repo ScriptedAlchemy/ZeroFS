@@ -153,6 +153,9 @@ each newline. It excludes its own line. Output order and serialization are
 deterministic for the same metadata observations and collector build. A source
 whose atime changes between runs can produce different output.
 
+The macOS collector's tests were last run on macOS before this serialization
+change and are not rerun on the host.
+
 - Not verified: TrueNAS and ZFS collection and ACL exposure require runs on those
   platforms. Local fixtures do not establish which ACLs or xattrs a NAS carries,
   its space usage, or Samba's name matching behavior.
