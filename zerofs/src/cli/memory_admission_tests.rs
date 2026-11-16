@@ -27,6 +27,7 @@ fn admission(root: &Path, text: &str) -> Result<MemoryBudgetReceipt> {
 fn package_profile_uses_its_measured_policy_and_fits_eight_gib() {
     let temp = tempfile::tempdir().unwrap();
     let receipt = admission(temp.path(), &package_config(temp.path(), 8 * GIB)).unwrap();
+    assert_eq!(receipt.required_bytes, 6_543_114_240);
     assert!(receipt.required_bytes < 8 * GIB);
     assert!(format!("{receipt:?}").contains("small-nas-package-v1"));
     assert!(!temp.path().join("metadata").exists());
@@ -111,11 +112,6 @@ fn unmeasured_configurations_keep_legacy_reserves_and_report_first_bound() {
             "gc",
         ),
         ("enabled = false", "enabled = true", "telemetry"),
-        (
-            "[telemetry]",
-            "[replication]\nnode_id = \"test\"\nrole = \"leader\"\n[telemetry]",
-            "replication",
-        ),
     ] {
         let changed = base.replace(before, after);
         assert_ne!(base, changed, "fixture did not contain {before}");
@@ -137,6 +133,12 @@ fn unmeasured_configurations_keep_legacy_reserves_and_report_first_bound() {
     let receipt = admission(temp.path(), no_webui).unwrap();
     assert!(format!("{receipt:?}").contains("servers.webui"));
     assert_eq!(receipt.required_bytes, 40 * GIB + CLEAN);
+    let replicated = base.replace(
+        "[telemetry]",
+        "[replication]\nnode_id = \"test\"\nrole = \"leader\"\n[telemetry]",
+    );
+    let error = format!("{:#}", admission(temp.path(), &replicated).unwrap_err());
+    assert!(error.contains("does not support [replication]"), "{error}");
 }
 
 #[test]
@@ -169,7 +171,10 @@ fn shared_volatile_writes_charge_both_stages_without_recharging_matching_aliases
     let matching =
         format!("{shared}write_ack_mode = \"volatile_memory\"\nvolatile_memory_gb = 0.2\n");
     let receipt = admission(temp.path(), &shared).unwrap();
-    assert_eq!(receipt.required_bytes, CLEAN + 40 * GIB + 750_000_000 + 400_000_000);
+    assert_eq!(
+        receipt.required_bytes,
+        CLEAN + 40 * GIB + 750_000_000 + 400_000_000
+    );
     assert_eq!(
         receipt.required_bytes,
         admission(temp.path(), &matching).unwrap().required_bytes
@@ -313,19 +318,20 @@ fn pool_and_direct_write_mode_are_part_of_the_measured_envelope() {
             "storage.pool",
             0,
         ),
-        (
-            base.replace(
-                "write_ack_mode = \"materialized\"",
-                "write_ack_mode = \"volatile_memory\"\nvolatile_memory_gb = 0.2",
-            ),
-            "filesystem.write_ack_mode",
-            400_000_000,
-        ),
     ] {
         let receipt = admission(temp.path(), &text).unwrap();
         assert_eq!(receipt.required_bytes, CLEAN + 40 * GIB + additional);
         assert!(format!("{receipt:?}").contains(bound));
     }
+    let volatile = base.replace(
+        "write_ack_mode = \"materialized\"",
+        "write_ack_mode = \"volatile_memory\"\nvolatile_memory_gb = 0.2",
+    );
+    let error = format!("{:#}", admission(temp.path(), &volatile).unwrap_err());
+    assert!(
+        error.contains("requires the enabled [writeback] tier"),
+        "{error}"
+    );
 }
 
 #[test]

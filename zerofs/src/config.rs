@@ -138,7 +138,6 @@ pub struct Settings {
     pub(crate) cache: CacheConfig,
     pub(crate) storage: StorageConfig,
     pub(crate) servers: ServerConfig,
-    /// Process memory admission settings and an optional dedicated envelope.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     runtime: Option<RuntimeConfig>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -179,10 +178,8 @@ pub struct RuntimeConfig {
     /// A shared parent cgroup is only a ceiling and cannot supply this budget.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     memory_limit_gb: Option<f64>,
-    /// Optional increase over the computed residency reserve, in decimal GB.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     unmodeled_residency_reserve_gb: Option<f64>,
-    /// Optional increase over the computed kernel and allocator headroom, in decimal GB.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     engine_headroom_gb: Option<f64>,
 }
@@ -1969,7 +1966,7 @@ impl Settings {
             .runtime
             .as_ref()
             .and_then(|runtime| runtime.unmodeled_residency_reserve_gb);
-        let process = self
+        let headroom = self
             .runtime
             .as_ref()
             .and_then(|runtime| runtime.engine_headroom_gb);
@@ -1977,7 +1974,7 @@ impl Settings {
             residency
                 .map(|value| runtime_memory_bytes("unmodeled_residency_reserve_gb", value))
                 .transpose()?,
-            process
+            headroom
                 .map(|value| runtime_memory_bytes("engine_headroom_gb", value))
                 .transpose()?,
         ))
@@ -2922,7 +2919,15 @@ volatile_memory_gb = 2.0
 
         let nbd = settings.servers.nbd.as_ref().unwrap();
         assert_eq!(nbd.write_ack_mode, NbdWriteAckMode::VolatileMemory);
-        assert_eq!(settings.filesystem_write_ack_settings(crate::writeback::config::WritebackAccessMode::ReadWrite).unwrap().volatile_memory_bytes, 2_000_000_000);
+        assert_eq!(
+            settings
+                .filesystem_write_ack_settings(
+                    crate::writeback::config::WritebackAccessMode::ReadWrite,
+                )
+                .unwrap()
+                .volatile_memory_bytes,
+            2_000_000_000
+        );
     }
 
     #[test]

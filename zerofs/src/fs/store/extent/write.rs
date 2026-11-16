@@ -154,6 +154,9 @@ pub(crate) const SEAL_THRESHOLD: usize = 256 * 1024 * 1024;
 /// also has at most one open generation.
 pub(crate) const MAX_INFLIGHT_SEALS: usize = 4;
 
+pub(crate) const DEFAULT_DIRECT_SEGMENT_BYTES: u64 =
+    (OPEN_SEGMENT_LANES + MAX_INFLIGHT_SEALS) as u64 * SEAL_THRESHOLD as u64;
+
 /// The in-RAM open segment. Frames are sealed (compressed+encrypted) and appended
 /// here at write time, so an extent's location is known and committed eagerly;
 /// the segment object is PUT only on flush or when it crosses [`SEAL_THRESHOLD`].

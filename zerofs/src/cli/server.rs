@@ -2165,6 +2165,7 @@ mod tests {
             required_bytes: 88 * gib,
             remaining_bytes: 8 * gib,
             rss_pressure_cap_bytes: validated_service_cap,
+            accounting: "memory_policy=legacy reason=server test fixture".into(),
         };
 
         crate::alloc_rss::set_rss_cap_bytes(0);
@@ -2342,7 +2343,13 @@ min_free_gb = 256.0
             nbd.write_ack_mode,
             crate::config::NbdWriteAckMode::Materialized
         );
-        assert_eq!(nbd.volatile_memory_gb, 0.0);
+        assert_eq!(
+            settings
+                .filesystem_write_ack_settings(write_ack_access_mode(DatabaseMode::ReadWrite))
+                .unwrap()
+                .volatile_memory_bytes,
+            2_000_000_000
+        );
     }
 
     #[test]
