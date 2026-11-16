@@ -5,26 +5,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
-#[serde(try_from = "String", into = "String")]
-pub(super) struct Serial(String);
-
-impl TryFrom<String> for Serial {
-    type Error = &'static str;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        if value.trim().is_empty() || value.trim() != value {
-            return Err("device serial must be nonempty without surrounding whitespace");
-        }
-        Ok(Self(value))
-    }
-}
-
-impl From<Serial> for String {
-    fn from(value: Serial) -> Self {
-        value.0
-    }
-}
+pub(super) use super::identity::Serial;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(try_from = "String", into = "String")]

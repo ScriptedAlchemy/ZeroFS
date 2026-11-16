@@ -1,3 +1,6 @@
+#[path = "linux_devices.rs"]
+pub(super) mod devices;
+
 use super::{FilesystemIdentity, MountedFilesystem};
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;

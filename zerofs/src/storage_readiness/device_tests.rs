@@ -281,3 +281,175 @@ fn declared_reserve_compares_against_the_existing_pool_default() {
         assert_eq!(settings.writeback.as_ref().unwrap().min_free_gb, 0.001);
     }
 }
+struct HardwareProvider<'a> {
+    fixture: &'a Fixture,
+    devices: BTreeMap<PathBuf, DeviceObservation>,
+    backing: BTreeMap<PathBuf, std::collections::HashSet<Serial>>,
+}
+
+impl<'a> HardwareProvider<'a> {
+    fn new(fixture: &'a Fixture) -> Self {
+        let settings = fixture.parse().unwrap();
+        let config = settings.storage.readiness.as_ref().unwrap();
+        let devices = config
+            .devices
+            .iter()
+            .map(|device| {
+                (
+                    device.by_id.clone(),
+                    DeviceObservation {
+                        block_device: true,
+                        serial: Some(device.serial.clone()),
+                    },
+                )
+            })
+            .collect();
+        let backing = config
+            .validated_roots(&settings)
+            .unwrap()
+            .iter()
+            .map(|root| {
+                (
+                    root.path.clone(),
+                    config
+                        .devices
+                        .iter()
+                        .filter(|device| device.roles.contains(&root.role))
+                        .map(|device| device.serial.clone())
+                        .collect(),
+                )
+            })
+            .collect();
+        Self {
+            fixture,
+            devices,
+            backing,
+        }
+    }
+}
+
+impl IdentityProvider for HardwareProvider<'_> {
+    fn observe(&self, root: &Path) -> Result<MountedFilesystem> {
+        self.fixture.observe(root)
+    }
+    fn observe_device(&self, by_id: &Path) -> Result<DeviceObservation> {
+        self.devices
+            .get(by_id)
+            .cloned()
+            .context("device evidence unavailable")
+    }
+    fn backing_serials(&self, root: &Path) -> Result<std::collections::HashSet<Serial>> {
+        self.backing
+            .get(root)
+            .cloned()
+            .context("backing serials unavailable")
+    }
+}
+
+#[test]
+fn strict_device_identity_and_backing_checks_accept_matching_evidence() {
+    let mut fixture = Fixture::new();
+    hardware(&mut fixture);
+    verify_with(&fixture.parse().unwrap(), &HardwareProvider::new(&fixture)).unwrap();
+}
+
+#[test]
+fn non_strict_device_declarations_do_not_probe_the_host() {
+    let mut fixture = Fixture::new();
+    hardware(&mut fixture);
+    fixture.document["storage"]["readiness"]["strict"] = json!(false);
+    fixture.verify().unwrap();
+    assert_eq!(fixture.calls.get(), 0);
+}
+
+#[test]
+fn strict_device_refusals_leave_every_role_directory_empty() {
+    for (failure, expected) in [
+        ("missing", "device evidence unavailable"),
+        ("not-block", "block device"),
+        ("no-serial", "serial unavailable"),
+        ("wrong-serial", "serial does not match"),
+        ("backing-unavailable", "backing serials unavailable"),
+        ("backing-different", "backing device set"),
+        ("boot-backing", "boot device"),
+    ] {
+        let mut fixture = Fixture::new();
+        hardware(&mut fixture);
+        let settings = fixture.parse().unwrap();
+        let mut provider = HardwareProvider::new(&fixture);
+        let path = PathBuf::from("/dev/disk/by-id/nvme-EXAMPLE-NVME-0001");
+        let root = fixture.path("cache");
+        match failure {
+            "missing" => {
+                provider.devices.remove(&path);
+            }
+            "not-block" => provider.devices.get_mut(&path).unwrap().block_device = false,
+            "no-serial" => provider.devices.get_mut(&path).unwrap().serial = None,
+            "wrong-serial" => {
+                provider.devices.get_mut(&path).unwrap().serial =
+                    Some(Serial::try_from("EXAMPLE-WRONG-0001".to_owned()).unwrap())
+            }
+            "backing-unavailable" => {
+                provider.backing.remove(&root);
+            }
+            "backing-different" | "boot-backing" => {
+                let serial = if failure == "boot-backing" {
+                    "EXAMPLE-BOOT-0001"
+                } else {
+                    "EXAMPLE-WRONG-0001"
+                };
+                provider.backing.insert(
+                    root,
+                    [Serial::try_from(serial.to_owned()).unwrap()]
+                        .into_iter()
+                        .collect(),
+                );
+            }
+            _ => unreachable!(),
+        }
+        error_contains(verify_with(&settings, &provider), expected);
+        for root in fixture.facts.keys() {
+            assert_eq!(std::fs::read_dir(root).unwrap().count(), 0, "{failure}");
+        }
+    }
+}
+
+#[test]
+fn readiness_fixture_removes_its_owned_tree() {
+    let fixture = Fixture::new();
+    let path = fixture._temp.path().to_path_buf();
+    assert!(path.exists());
+    drop(fixture);
+    assert!(!path.try_exists().unwrap());
+}
+
+#[test]
+fn actual_open_paths_keep_the_declared_backing_device_set() {
+    for role in ["authority", "catalog", "member data", "cache", "journal"] {
+        let mut fixture = Fixture::new();
+        hardware(&mut fixture);
+        let root = fixture.path(role);
+        let child = root.join("actual-child");
+        std::fs::create_dir(&child).unwrap();
+        fixture
+            .facts
+            .insert(child.clone(), fixture.facts[&root].clone());
+        let settings = fixture.parse().unwrap();
+        let mut provider = HardwareProvider::new(&fixture);
+        provider
+            .backing
+            .insert(child.clone(), provider.backing[&root].clone());
+        verify_open_paths_with(&settings, &provider, &[(role, child.clone())]).unwrap();
+        provider.backing.insert(
+            child.clone(),
+            [Serial::try_from("EXAMPLE-WRONG-0001".to_owned()).unwrap()]
+                .into_iter()
+                .collect(),
+        );
+        error_contains(
+            verify_open_paths_with(&settings, &provider, &[(role, child.clone())]),
+            "backing device set",
+        );
+        assert_eq!(std::fs::read_dir(child).unwrap().count(), 0);
+    }
+}

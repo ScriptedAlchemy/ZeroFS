@@ -11,17 +11,36 @@ use config::FilesystemIdentity;
 pub(crate) use config::ReadinessConfig;
 use config::{StorageRoot, absolute_path};
 use devices::RoleName;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use identity::MountedFilesystem;
+use identity::{DeviceObservation, MountedFilesystem, Serial};
 
 pub(super) trait IdentityProvider {
     fn observe(&self, root: &Path) -> Result<MountedFilesystem>;
+
+    fn observe_device(&self, _by_id: &Path) -> Result<DeviceObservation> {
+        bail!("device identity unavailable from this adapter")
+    }
+
+    fn backing_serials(&self, _root: &Path) -> Result<HashSet<Serial>> {
+        bail!("backing device serials unavailable from this adapter")
+    }
 }
 
 struct HostIdentityProvider;
 
 impl IdentityProvider for HostIdentityProvider {
+    #[cfg(target_os = "linux")]
+    fn observe_device(&self, by_id: &Path) -> Result<DeviceObservation> {
+        linux::devices::observe_device(by_id)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn backing_serials(&self, root: &Path) -> Result<HashSet<Serial>> {
+        linux::devices::backing_serials(root)
+    }
+
     fn observe(&self, root: &Path) -> Result<MountedFilesystem> {
         #[cfg(target_os = "linux")]
         {
@@ -47,6 +66,26 @@ pub(super) fn verify_with(settings: &Settings, provider: &dyn IdentityProvider) 
         return Ok(());
     }
     let roots = config.validated_roots(settings)?;
+    for device in &config.devices {
+        let observation = provider.observe_device(&device.by_id).with_context(|| {
+            format!(
+                "storage readiness device evidence unavailable at {}",
+                device.by_id.display()
+            )
+        })?;
+        if !observation.block_device {
+            bail!("readiness {} is not a block device", device.by_id.display());
+        }
+        let serial = observation
+            .serial
+            .context("readiness device serial unavailable")?;
+        if serial != device.serial {
+            bail!(
+                "readiness device serial does not match its declaration at {}",
+                device.by_id.display()
+            );
+        }
+    }
     let mut verified = Vec::new();
     for root in &roots {
         let path = root.path.canonicalize().with_context(|| {
@@ -59,7 +98,7 @@ pub(super) fn verify_with(settings: &Settings, provider: &dyn IdentityProvider) 
         if !path.is_dir() {
             bail!("readiness {} root is not a directory", root.role)
         }
-        verify_identity(root, &path, provider)?;
+        verify_identity(config, root, &path, provider)?;
         verified.push((root, path));
     }
     for (index, (left, left_path)) in verified.iter().enumerate() {
@@ -77,6 +116,7 @@ pub(super) fn verify_with(settings: &Settings, provider: &dyn IdentityProvider) 
 }
 
 fn verify_identity(
+    config: &ReadinessConfig,
     root: &StorageRoot<'_>,
     path: &Path,
     provider: &dyn IdentityProvider,
@@ -112,6 +152,36 @@ fn verify_identity(
             "readiness {} filesystem must be writable, mounted and unlocked",
             root.role
         );
+    }
+    if !config.devices.is_empty() {
+        let serials = provider.backing_serials(path).with_context(|| {
+            format!(
+                "readiness {} backing device evidence unavailable",
+                root.role
+            )
+        })?;
+        if config
+            .devices
+            .iter()
+            .any(|device| device.boot && serials.contains(&device.serial))
+        {
+            bail!(
+                "readiness {} is backed by a declared boot device",
+                root.role
+            );
+        }
+        let declared = config
+            .devices
+            .iter()
+            .filter(|device| device.roles.contains(&root.role))
+            .map(|device| device.serial.clone())
+            .collect::<HashSet<_>>();
+        if serials.is_empty() || serials != declared {
+            bail!(
+                "readiness {} backing device set does not match declared roles",
+                root.role
+            );
+        }
     }
     Ok(())
 }
@@ -161,7 +231,7 @@ fn verify_open_paths_with(
         if !existing.starts_with(root.path.canonicalize()?) {
             bail!("readiness {role} open path escapes its declared role");
         }
-        verify_identity(root, &existing, provider)?;
+        verify_identity(config, root, &existing, provider)?;
     }
     Ok(())
 }

@@ -32,3 +32,30 @@ pub(crate) struct MountedFilesystem {
     pub(super) writable: bool,
     pub(super) unlocked: bool,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) struct Serial(String);
+
+impl TryFrom<String> for Serial {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value.trim().is_empty() || value.trim() != value {
+            return Err("device serial must be nonempty without surrounding whitespace");
+        }
+        Ok(Self(value))
+    }
+}
+
+impl From<Serial> for String {
+    fn from(value: Serial) -> Self {
+        value.0
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DeviceObservation {
+    pub(super) block_device: bool,
+    pub(super) serial: Option<Serial>,
+}
