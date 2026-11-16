@@ -1,0 +1,98 @@
+# Declared storage profiles and startup readiness (S2)
+
+`[storage.readiness]` adds opt-in identity verification before a local pool is
+opened. Omitting the section preserves ordinary local/cloud deployments. Setting
+`strict = false` retains the ordinary open behavior while still checking the
+declaration's structure when loading configuration. No identity probes run in
+either case. `strict` must be written explicitly when this section is present.
+
+This implements placement-plan row S2 only. A successful preflight does not
+enable strict placement. Policy configuration, segment routing, relocation,
+retention, profile-specific I/O tuning, and metadata survival are not implemented
+here. `[placement]` and `placement_enabled` are rejected as unknown fields.
+Existing first-fit segment placement retains its existing semantics.
+
+## Declarations and role bindings
+
+Declare each filesystem once with an ID, its canonical mountpoint, its stable
+identity, and one operator-selected profile: `nvme`, `hdd-cmr`, or `hdd-smr`.
+Profiles are never inferred from devices, model names, mount types, or timings.
+No profile changes scheduling or promises SMR performance in S2.
+
+Bind authority, catalog, cache, and every pool member to those IDs. Bind `journal`
+when writeback is enabled; omit it otherwise. Authority, catalog, and data members
+must declare an HDD profile; cache and journal must declare `nvme`. These are
+validated declarations, not hardware detection. The strict graph supports local
+`file://` pool roots only and rejects a separate WAL store rather than leaving a
+storage role unchecked.
+
+All active role directories must already exist, including catalog, cache, and
+journal directories. Readiness creates nothing. A role may be a dedicated child
+directory on its declared mounted filesystem. Role directories must be disjoint,
+including after resolving symlinks. Nested mounts cannot substitute for the
+declared mountpoint. Declared mountpoints must themselves be canonical paths.
+
+Authority, catalog, and one member may share a filesystem through disjoint
+directories. Journal and cache may likewise share the NVMe filesystem. Multiple
+data members cannot use the same capacity domain. For ext4/XFS, that domain is
+the filesystem UUID; for ZFS, it is the **pool GUID**, even across distinct dataset
+GUIDs. This conservatively rejects shared-pool member quotas that could otherwise
+count pool free space twice. Aliased declarations and conflicting profiles in one
+capacity domain are rejected. S2 performs no capacity summation or new admission
+accounting. Shared control/data space still needs the existing reserves.
+
+ZFS GUIDs are canonical nonzero decimal **strings**, preserving the full unsigned
+64-bit range through TOML. UUIDs are nonzero lowercase hyphenated UUID strings.
+Dataset names alone and directory existence alone cannot establish readiness.
+
+The complete [synthetic configuration](examples/storage-readiness.toml) is parser
+tested. Its paths, IDs, GUIDs, and UUID are fixtures, not discovered operator values
+or evidence of an installed disk. Use independently obtained real identities for
+an actual deployment; do not substitute those fixture values.
+
+## Host evidence and failures
+
+The native adapter currently targets Linux:
+
+| Filesystem | Required read-only evidence |
+| --- | --- |
+| ext4 / XFS | Containing mount from `/proc/self/mountinfo`, mounted filesystem root `/`, matching path `st_dev`, matching available block-device `st_rdev`, and UUID from uncached `blkid -p` on that mounted device. |
+| ZFS | Containing mount and path device agreement, mounted filesystem root `/`, pool GUID from `zpool get`, and dataset GUID, `mounted=yes`, exact mountpoint, `readonly=off`, and known `keystatus` from `zfs get`. Key status must be `available` or `none`. |
+
+Both mount and superblock options must say writable. Mount-table or path-device
+changes during an observation reject it. Probe errors, missing tools/devices,
+permission errors, unavailable keys, unknown properties, ambiguous overmounts,
+unsupported filesystems, and mismatched identities fail closed. The adapter only
+reads; it never mounts, unlocks, imports a pool, formats, or repairs storage.
+Mounted ext4/XFS evidence establishes access to the mapped filesystem, not an
+independent assertion about underlying encryption configuration.
+
+macOS has no strict host identity adapter. Strict opening and `pool init` fail
+before storage mutation there; ordinary deployments continue to use their
+existing behavior. Injected identity and command-output providers exercise the
+readiness contract on Mac without mounting anything or accessing a NAS.
+
+## Scope of evidence
+
+This is a startup preflight, including explicit `pool init` and maintenance opens.
+It runs before backend creation, catalog opening, cache initialization, and
+journal replay. Existing pool/catalog/member identity markers remain in force.
+An absent catalog is still rejected on ordinary reopen; readiness never rebuilds
+it. Expected filesystem bindings are operator-owned configuration, not new
+catalog records or a migration of existing volume formats.
+
+S2 does **not** pin mounts or directory descriptors through the server lifetime,
+and does not guard every publication or resumed write against later mount loss.
+There remains a race between preflight and later path-based storage opens. The
+placement track must provide its continuing mutation/publication readiness
+contract before strict placement can be enabled. Passing this startup check is
+not a runtime loss-of-mount guarantee, a durability receipt, or a migration gate.
+
+Local tests cover injected missing/wrong/locked/read-only/unknown identities for
+every role, ordinary fallback directories, aliases, shared ZFS capacity,
+independent members, config round-trips, and Mac rejection before mutation.
+Mount-table and command-output tests verify parsing and rejection behavior. They
+do not establish Linux mount, block-device, or OpenZFS runtime behavior. No
+TrueNAS app/container mount visibility, encrypted dataset lifecycle, ACL, SMB,
+hardware durability, or performance acceptance is claimed. Colocating control
+metadata on HDD does not satisfy the separate one-device-loss survival gate.
