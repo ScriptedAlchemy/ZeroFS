@@ -3036,27 +3036,114 @@ mod tests {
             }
         }
 
-        /// Every part covering the run is either absent or holds the object's
-        /// true bytes; returns how many were cached.
-        async fn assert_cache_holds_only_true_bytes(&self) -> usize {
+        async fn read_frame(
+            &self,
+            index: usize,
+        ) -> Result<Vec<Bytes>, crate::segment_store::SegmentStoreError> {
+            let (inode, extent, loc) = self.locations[index];
+            self.reader
+                .read_run(
+                    loc.segid,
+                    loc.byte_offset,
+                    loc.byte_len,
+                    loc.frame_index,
+                    &[(inode, extent)],
+                )
+                .await
+        }
+
+        /// Cached parts covering the run whose bytes differ from the stored
+        /// object, and the number of covering parts cached at all.
+        async fn cached_part_mismatches(&self) -> (Vec<usize>, usize) {
             let (offset, len) = self.run_bounds();
             let first = offset as usize / CORRUPTION_PART;
             let last = (offset as usize + len as usize).div_ceil(CORRUPTION_PART);
+            let mut bad = Vec::new();
             let mut cached = 0;
             for part in first..last {
                 if let Some(bytes) = self.cache.cached_part(&self.path(), part).await {
                     let start = part * CORRUPTION_PART;
                     let end = (start + CORRUPTION_PART).min(self.object.len());
-                    assert_eq!(
-                        bytes.as_ref(),
-                        &self.object[start..end],
-                        "cache part {part} differs from the stored object"
-                    );
+                    if bytes.as_ref() != &self.object[start..end] {
+                        bad.push(part);
+                    }
                     cached += 1;
                 }
             }
+            (bad, cached)
+        }
+
+        /// Every part covering the run is either absent or holds the object's
+        /// true bytes; returns how many were cached.
+        async fn assert_cache_holds_only_true_bytes(&self) -> usize {
+            let (bad, cached) = self.cached_part_mismatches().await;
+            assert!(
+                bad.is_empty(),
+                "cache parts {bad:?} differ from the stored object"
+            );
             cached
         }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Neighbour {
+        Before,
+        After,
+    }
+
+    /// The retry returns the requested frame intact, but bytes of a
+    /// neighbouring frame in the same cache parts are corrupt. The repair must
+    /// not cache those unauthenticated bytes, or the neighbour's next read
+    /// fails from the cache.
+    async fn repair_does_not_cache_unauthenticated_neighbour_bytes(neighbour: Neighbour) {
+        let fixture = CorruptionFixture::new().await;
+        let target = 1;
+        let loc = fixture.locations[target].2;
+        let run = loc.byte_offset..loc.byte_offset + u64::from(loc.byte_len);
+        let part = CORRUPTION_PART as u64;
+        assert!(
+            !run.start.is_multiple_of(part) && !run.end.is_multiple_of(part),
+            "the target frame must share its first and last cache parts with neighbours"
+        );
+        let (flip, neighbour_index) = match neighbour {
+            Neighbour::Before => (run.start - run.start % part..run.start, target - 1),
+            Neighbour::After => (run.end..run.end.next_multiple_of(part), target + 1),
+        };
+
+        // The first fetch is corrupt throughout. The retry is intact inside
+        // the target frame and corrupt only in the neighbouring bytes.
+        fixture.controls.corrupt_gets(1);
+        fixture.controls.corrupt_range_in_gets(1, flip);
+        let got = fixture
+            .read_frame(target)
+            .await
+            .expect("the requested frame is intact on the retry");
+        assert_eq!(got, vec![fixture.frames[target].2.clone()]);
+        assert_eq!(fixture.reader.integrity_refetches(), 1);
+
+        let (bad, _) = fixture.cached_part_mismatches().await;
+        let neighbour_read = fixture.read_frame(neighbour_index).await;
+        assert!(
+            bad.is_empty() && fixture.reader.integrity_refetches() == 1,
+            "the repair cached unauthenticated parts {bad:?}; the neighbour read \
+             needed {} integrity refetches in total and returned {:?}",
+            fixture.reader.integrity_refetches(),
+            neighbour_read.as_ref().map(|frames| frames.len()),
+        );
+        assert_eq!(
+            neighbour_read.unwrap(),
+            vec![fixture.frames[neighbour_index].2.clone()]
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_does_not_cache_corrupt_bytes_before_the_run() {
+        repair_does_not_cache_unauthenticated_neighbour_bytes(Neighbour::Before).await;
+    }
+
+    #[tokio::test]
+    async fn repair_does_not_cache_corrupt_bytes_after_the_run() {
+        repair_does_not_cache_unauthenticated_neighbour_bytes(Neighbour::After).await;
     }
 
     #[tokio::test]

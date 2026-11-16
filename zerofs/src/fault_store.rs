@@ -62,6 +62,12 @@ pub struct FaultControls {
     /// Return the next N non-head bodies with the right length and wrong bytes.
     #[cfg(test)]
     corrupt_next_gets: AtomicUsize,
+    /// Flip the bytes inside one absolute object range on the next N
+    /// non-head bodies, leaving the rest of each body intact.
+    #[cfg(test)]
+    corrupt_range_next_gets: AtomicUsize,
+    #[cfg(test)]
+    corrupt_range: StdMutex<std::ops::Range<u64>>,
     /// Hold the next N non-head bodies until `release_get_bodies`.
     #[cfg(test)]
     hold_next_get_bodies: AtomicUsize,
@@ -95,6 +101,14 @@ impl FaultControls {
     #[cfg(test)]
     pub(crate) fn corrupt_gets(&self, n: usize) {
         self.corrupt_next_gets.store(n, Ordering::SeqCst);
+    }
+    /// Make the next `n` non-head gets flip every byte that falls inside the
+    /// absolute object range `range`. A get that [`Self::corrupt_gets`]
+    /// already corrupts does not use one of these.
+    #[cfg(test)]
+    pub(crate) fn corrupt_range_in_gets(&self, n: usize, range: std::ops::Range<u64>) {
+        *self.corrupt_range.lock().unwrap() = range;
+        self.corrupt_range_next_gets.store(n, Ordering::SeqCst);
     }
     /// Hold the bodies of the next `n` non-head gets until
     /// [`Self::release_get_bodies`]. The request and its metadata return first,
@@ -387,14 +401,17 @@ impl ObjectStore for FaultStore {
 impl FaultStore {
     fn corrupt_or_hold(&self, result: GetResult) -> GetResult {
         let corrupt = take_one(&self.ctl.corrupt_next_gets);
+        let flip = (!corrupt && take_one(&self.ctl.corrupt_range_next_gets))
+            .then(|| self.ctl.corrupt_range.lock().unwrap().clone());
         let hold = take_one(&self.ctl.hold_next_get_bodies);
-        if !corrupt && !hold {
+        if !corrupt && flip.is_none() && !hold {
             return result;
         }
         let controls = self.ctl.clone();
         let meta = result.meta.clone();
         let range = result.range.clone();
         let attributes = result.attributes.clone();
+        let body_start = range.start;
         let body = async move {
             while hold && !controls.get_bodies_released.load(Ordering::SeqCst) {
                 let released = controls.get_body_release.notified();
@@ -404,6 +421,15 @@ impl FaultStore {
                 released.await;
             }
             let bytes = result.bytes().await?;
+            if let Some(flip) = flip {
+                let mut flipped = bytes.to_vec();
+                let from = flip.start.saturating_sub(body_start) as usize;
+                let to = (flip.end.saturating_sub(body_start) as usize).min(flipped.len());
+                for byte in flipped.iter_mut().take(to).skip(from) {
+                    *byte ^= 0xFF;
+                }
+                return Ok(Bytes::from(flipped));
+            }
             if !corrupt || bytes.len() < 2 {
                 return Ok(bytes);
             }

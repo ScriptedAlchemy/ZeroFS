@@ -121,6 +121,9 @@ pub struct SegmentStore {
     counter: AtomicU64,
     /// Count of ranged segment GETs issued (a read-amplification metric).
     read_calls: AtomicU64,
+    /// Count of uncached rereads after a cached frame run failed its
+    /// integrity checks.
+    integrity_refetches: AtomicU64,
     /// Warms the parts cache with a just-written segment (see
     /// [`SegmentWarmHook`]); that cache is the only segment cache.
     warm: Option<SegmentWarmHook>,
@@ -139,6 +142,7 @@ impl SegmentStore {
             epoch,
             counter: AtomicU64::new(0),
             read_calls: AtomicU64::new(0),
+            integrity_refetches: AtomicU64::new(0),
             warm,
         }
     }
@@ -481,6 +485,7 @@ impl SegmentStore {
         cached_error: SegmentError,
         decode: impl Fn(&[u8]) -> std::result::Result<T, SegmentError>,
     ) -> Result<T> {
+        self.integrity_refetches.fetch_add(1, Ordering::Relaxed);
         tracing::warn!(
             "segment {segid:?} frames at {byte_offset}+{byte_len} failed integrity checks \
              from the parts cache ({cached_error}); evicting and refetching once"
@@ -629,6 +634,12 @@ impl SegmentStore {
     #[cfg(test)]
     pub(crate) fn read_calls(&self) -> u64 {
         self.read_calls.load(Ordering::Relaxed)
+    }
+
+    /// Uncached rereads issued after a cached frame run failed its checks.
+    #[cfg(test)]
+    pub(crate) fn integrity_refetches(&self) -> u64 {
+        self.integrity_refetches.load(Ordering::Relaxed)
     }
 
     /// List every `segments/` object currently present. Production reclaim
