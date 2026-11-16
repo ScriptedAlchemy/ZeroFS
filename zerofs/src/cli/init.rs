@@ -1524,6 +1524,31 @@ mod role_decision_tests {
     }
 
     #[tokio::test]
+    async fn insensitive_key_refuses_legacy_parser_after_password_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let metadata = temp.path().join("metadata");
+        std::fs::create_dir(&metadata).unwrap();
+        let mut settings = crate::config::Settings::generate_default();
+        settings.storage.url = url::Url::from_directory_path(&metadata).unwrap().to_string();
+        settings.storage.encryption_password = "name-mode-startup-test".into();
+        settings.cache.dir = temp.path().join("cache");
+        settings.aws = None;
+        settings.filesystem = Some(toml::from_str("name_mode = 'insensitive'").unwrap());
+        let startup = StartupContext::prepare(&settings, DatabaseMode::ReadWrite).await.unwrap();
+        let bytes = std::fs::read(metadata.join("zerofs.key")).unwrap();
+        assert!(bincode::deserialize::<crate::key_management::WrappedDataKey>(&bytes).is_err());
+        crate::key_management::change_encryption_password(
+            &startup.object_store, &Path::from(""), &settings.storage.encryption_password, "new-name-mode-password"
+        ).await.unwrap();
+        let bytes = std::fs::read(metadata.join("zerofs.key")).unwrap();
+        assert!(bincode::deserialize::<crate::key_management::WrappedDataKey>(&bytes).is_err());
+        drop(startup);
+        settings.storage.encryption_password = "new-name-mode-password".into();
+        let startup = StartupContext::prepare(&settings, DatabaseMode::ReadWrite).await.unwrap();
+        drop(startup);
+    }
+
+    #[tokio::test]
     async fn name_mode_mismatch_refuses_before_receiver_start() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();

@@ -3657,6 +3657,76 @@ async fn test_abandoned_batch_reservation_leaves_a_sound_segment() {
 }
 
 #[tokio::test]
+async fn insensitive_case_only_rename_is_atomic_when_interrupted() {
+    use zerofs::fs::name_mode::NameMode;
+    let _scenario = fail::FailScenario::setup();
+    for point in [fp::RENAME_AFTER_NEW_ENTRY, fp::RENAME_AFTER_COMMIT] {
+        let ctx = CrashTestContext::new();
+        let fs = ctx.create_fs_with_name_mode(NameMode::Insensitive).await;
+        let creds = test_creds();
+        let auth = AuthContext::from(&creds);
+        let (inode, _) = fs.create(&creds, 0, b"Foo", &SetAttributes::default()).await.unwrap();
+        fs.write(&auth, inode, 0, &Bytes::from_static(b"payload")).await.unwrap();
+        fs.flush_coordinator.flush().await.unwrap();
+        fail::cfg(point, "panic").unwrap();
+        let task_fs = fs.clone();
+        let interrupted = tokio::spawn(async move {
+            task_fs.rename(&auth, 0, b"Foo", 0, b"foo").await
+        }).await;
+        fail::remove(point);
+        assert!(interrupted.is_err_and(|error| error.is_panic()), "{point} did not interrupt the rename");
+        drop(fs);
+        let reopened = ctx.create_fs_with_name_mode(NameMode::Insensitive).await;
+        let report = verify_consistency(&reopened).await.unwrap();
+        assert!(report.is_consistent(), "{point}: {report}");
+        let entries: Vec<_> = reopened.directory_store.list(0).await.unwrap().try_collect().await.unwrap();
+        assert_eq!(entries.len(), 1, "{point}");
+        let before = entries[0].name == b"Foo";
+        let after = entries[0].name == b"foo";
+        assert!(before ^ after, "{point}: {:?}", entries[0].name);
+        assert_eq!(reopened.lookup(&creds, 0, b"FOO").await.unwrap(), inode);
+        assert_eq!(reopened.read_file(&AuthContext::from(&creds), inode, 0, 7).await.unwrap().0.as_ref(), b"payload");
+    }
+}
+
+#[tokio::test]
+async fn insensitive_create_is_atomic_when_interrupted() {
+    use zerofs::fs::name_mode::NameMode;
+    let _scenario = fail::FailScenario::setup();
+    for point in [fp::CREATE_AFTER_INODE, fp::CREATE_AFTER_DIR_ENTRY, fp::CREATE_AFTER_COMMIT] {
+        let ctx = CrashTestContext::new();
+        let fs = ctx.create_fs_with_name_mode(NameMode::Insensitive).await;
+        let creds = test_creds();
+        fs.flush_coordinator.flush().await.unwrap();
+        fail::cfg(point, "panic").unwrap();
+        let task_fs = fs.clone();
+        let task_creds = creds;
+        let interrupted = tokio::spawn(async move {
+            task_fs.create(&task_creds, 0, b"Foo", &SetAttributes::default()).await
+        }).await;
+        fail::remove(point);
+        assert!(interrupted.is_err_and(|error| error.is_panic()), "{point} did not interrupt the create");
+        drop(fs);
+        let reopened = ctx.create_fs_with_name_mode(NameMode::Insensitive).await;
+        let report = verify_consistency(&reopened).await.unwrap();
+        assert!(report.is_consistent(), "{point}: {report}");
+        let entries: Vec<_> = reopened.directory_store.list(0).await.unwrap().try_collect().await.unwrap();
+        let before = entries.is_empty();
+        let after = entries.len() == 1 && entries[0].name == b"Foo";
+        assert!(before ^ after, "{point}: {} entries", entries.len());
+        match reopened.lookup(&creds, 0, b"foo").await {
+            Ok(inode) => {
+                assert!(after, "{point}");
+                assert_eq!(entries[0].inode_id, inode);
+                assert!(matches!(reopened.create(&creds, 0, b"FOO", &SetAttributes::default()).await, Err(zerofs::fs::errors::FsError::Exists)));
+            }
+            Err(zerofs::fs::errors::FsError::NotFound) => assert!(before, "{point}"),
+            other => panic!("{point}: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
 async fn insensitive_names_and_collisions_survive_reopen() {
     use zerofs::fs::name_mode::NameMode;
     let _scenario = fail::FailScenario::setup();
