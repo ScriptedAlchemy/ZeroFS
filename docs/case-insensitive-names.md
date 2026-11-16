@@ -26,3 +26,16 @@ that restriction on an old binary. Backups and metadata recovery must preserve
 `zerofs.namemode` along with `zerofs.key`.
 
 - Not verified: Linux FUSE, the native kernel client and Samba acceptance have not run on this Mac. Equivalence with a running ZFS filesystem remains unverified.
+
+Insensitive lookup uses Unicode 5.0.0 simple uppercase. It leaves invalid UTF-8
+bytes unchanged and folds valid characters around them. It does not normalize
+names, so NFC and NFD spellings can coexist. The 255-byte filename limit applies
+to the supplied name, even when its lookup key grows after folding.
+
+Creating a file, directory, symlink, hardlink or special node at a fold-equal
+name returns `EEXIST`. A rename onto a different entry replaces that entry.
+A rename that changes only the spelling of one entry keeps its inode and cookie
+and updates its listing name and inode backpointer. An exact-byte rename remains
+a no-op. Renaming `x` onto `Y` when `x` and `y` are distinct hardlinks to the same
+inode leaves both entries unchanged. POSIX requires this successful no-op when
+the two names already refer to the same file.

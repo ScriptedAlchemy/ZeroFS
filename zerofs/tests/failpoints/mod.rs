@@ -72,6 +72,11 @@ impl CrashTestContext {
 
     /// Create a new filesystem instance
     async fn create_fs(&self) -> Arc<ZeroFS> {
+        self.create_fs_with_name_mode(zerofs::fs::name_mode::NameMode::Sensitive)
+            .await
+    }
+
+    async fn create_fs_with_name_mode(&self, mode: zerofs::fs::name_mode::NameMode) -> Arc<ZeroFS> {
         let db_path = Path::from("slatedb");
         // Mirror the production durability-critical SlateDB config (see
         // cli/server.rs): WAL off + effectively disabled size thresholds mean the
@@ -117,7 +122,7 @@ impl CrashTestContext {
                 ),
                 None,
                 zerofs::config::StoreProfile::default(),
-                zerofs::fs::name_mode::NameMode::Sensitive,
+                mode,
             )
             .await
             .unwrap(),
@@ -3649,4 +3654,104 @@ async fn test_abandoned_batch_reservation_leaves_a_sound_segment() {
         report.is_consistent(),
         "Inconsistent after reclaim:\n{report}"
     );
+}
+
+#[tokio::test]
+async fn insensitive_names_and_collisions_survive_reopen() {
+    use zerofs::fs::name_mode::NameMode;
+    let _scenario = fail::FailScenario::setup();
+    let ctx = CrashTestContext::new();
+    let fs = ctx.create_fs_with_name_mode(NameMode::Insensitive).await;
+    let creds = test_creds();
+    let auth = AuthContext::from(&creds);
+    let attrs = SetAttributes::default();
+    let (foo, _) = fs.create(&creds, 0, b"Foo", &attrs).await.unwrap();
+    for result in [
+        fs.create(&creds, 0, b"foo", &attrs).await,
+        fs.mkdir(&creds, 0, b"foo", &attrs).await,
+        fs.symlink(&creds, 0, b"foo", b"target", &attrs).await,
+        fs.mknod(&creds, 0, b"foo", FileType::Fifo, &attrs, None)
+            .await,
+    ] {
+        assert!(matches!(result, Err(zerofs::fs::errors::FsError::Exists)));
+    }
+    assert!(matches!(
+        fs.link(&auth, foo, 0, b"foo").await,
+        Err(zerofs::fs::errors::FsError::Exists)
+    ));
+    fs.rename(&auth, 0, b"Foo", 0, b"foo").await.unwrap();
+    fs.write(&auth, foo, 0, &Bytes::from_static(b"payload"))
+        .await
+        .unwrap();
+    fs.setattr(&creds, foo, &attrs).await.unwrap();
+    let (a, _) = fs.create(&creds, 0, b"a", &attrs).await.unwrap();
+    fs.create(&creds, 0, b"b", &attrs).await.unwrap();
+    fs.rename(&auth, 0, b"a", 0, b"B").await.unwrap();
+    fs.rename(&auth, 0, b"B", 0, b"B").await.unwrap();
+    let (x, _) = fs.create(&creds, 0, b"x", &attrs).await.unwrap();
+    fs.link(&auth, x, 0, b"y").await.unwrap();
+    fs.rename(&auth, 0, b"x", 0, b"Y").await.unwrap();
+    for name in [b"a\xffb".as_slice(), "é".as_bytes(), "e\u{301}".as_bytes()] {
+        fs.create(&creds, 0, name, &attrs).await.unwrap();
+    }
+    let mut recased = Vec::new();
+    for (old, new, kind) in [
+        (b"Dir".as_slice(), b"dir".as_slice(), FileType::Directory),
+        (b"Sym", b"sym", FileType::Symlink),
+        (b"Pipe", b"pipe", FileType::Fifo),
+    ] {
+        let (id, _) = match kind {
+            FileType::Directory => fs.mkdir(&creds, 0, old, &attrs).await.unwrap(),
+            FileType::Symlink => fs.symlink(&creds, 0, old, b"foo", &attrs).await.unwrap(),
+            _ => fs.mknod(&creds, 0, old, kind, &attrs, None).await.unwrap(),
+        };
+        fs.rename(&auth, 0, old, 0, new).await.unwrap();
+        recased.push((new, id));
+    }
+    let report = verify_consistency(&fs).await.unwrap();
+    assert!(report.errors.is_empty(), "{report:?}");
+    fs.flush_coordinator.flush().await.unwrap();
+    drop(fs);
+    let fs = ctx.create_fs_with_name_mode(NameMode::Insensitive).await;
+    assert_eq!(fs.lookup(&creds, 0, b"FOO").await.unwrap(), foo);
+    assert_eq!(fs.lookup(&creds, 0, b"b").await.unwrap(), a);
+    assert_eq!(fs.lookup(&creds, 0, b"X").await.unwrap(), x);
+    assert_eq!(fs.lookup(&creds, 0, b"Y").await.unwrap(), x);
+    fs.lookup(&creds, 0, b"A\xffB").await.unwrap();
+    assert!(matches!(
+        fs.create(&creds, 0, b"FOO", &attrs).await,
+        Err(zerofs::fs::errors::FsError::Exists)
+    ));
+    let entries: Vec<_> = fs
+        .directory_store
+        .list(0)
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    for name in [
+        b"foo".as_slice(),
+        b"B",
+        b"x",
+        b"y",
+        b"a\xffb",
+        "é".as_bytes(),
+        "e\u{301}".as_bytes(),
+    ] {
+        assert!(entries.iter().any(|entry| entry.name == name));
+    }
+    let codec = KeyCodec::with_name_mode(NameMode::Insensitive);
+    for (name, id) in recased.into_iter().chain([(b"foo".as_slice(), foo), (b"B".as_slice(), a)]) {
+        assert_eq!(fs.lookup(&creds, 0, name).await.unwrap(), id);
+        let entry = fs.db.get_bytes(&codec.dir_entry_key(0, name)).await.unwrap().unwrap();
+        let (_, cookie) = KeyCodec::decode_dir_entry(&entry).unwrap();
+        let row = fs.db.get_bytes(&codec.dir_scan_key(0, cookie)).await.unwrap().unwrap();
+        let (display, embedded) = zerofs::fs::store::directory::decode_dir_scan_value(&row).unwrap();
+        assert_eq!(display, name);
+        let zerofs::fs::store::directory::DirScanValue::WithInode { inode, .. } = embedded else { panic!("expected embedded inode") };
+        assert_eq!(bincode::serialize(&inode).unwrap(), bincode::serialize(&fs.inode_store.get(id).await.unwrap()).unwrap());
+    }
+    let report = verify_consistency(&fs).await.unwrap();
+    assert!(report.errors.is_empty(), "{report:?}");
 }
