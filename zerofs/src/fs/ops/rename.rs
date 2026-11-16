@@ -14,6 +14,7 @@ use crate::fs::tracing::FileOperation;
 use crate::fs::types::AuthContext;
 use crate::fs::{
     EXTENT_SIZE, SMALL_FILE_TOMBSTONE_THRESHOLD, ZeroFS, get_current_time, validate_filename,
+    validate_filename_length,
 };
 use ::tracing::debug;
 use std::sync::atomic::Ordering;
@@ -267,7 +268,11 @@ impl ZeroFS {
             return Err(FsError::InvalidArgument);
         }
 
-        validate_filename(from_name)?;
+        validate_filename_length(from_name)?;
+        validate_filename_length(to_name)?;
+        if to_name == b"." || to_name == b".." {
+            return Err(FsError::Exists);
+        }
         validate_filename(to_name)?;
 
         // Replay a completed rename before resolving source and target names.
@@ -281,10 +286,6 @@ impl ZeroFS {
         if from_name == b"." || from_name == b".." {
             return Err(FsError::InvalidArgument);
         }
-        if to_name == b"." || to_name == b".." {
-            return Err(FsError::Exists);
-        }
-
         if verification.is_none() && from_dirid == to_dirid && from_name == to_name {
             // No-op renames still publish a durable replay result.
             if crate::dedup::has_op_id(&op_id) {

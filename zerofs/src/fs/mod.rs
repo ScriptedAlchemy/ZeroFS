@@ -89,15 +89,22 @@ pub(crate) const TOTAL_INODES: u64 = 1 << 48;
 /// Names are opaque bytes, excluding path separators, NUL and dot components.
 /// [`NAME_MAX`] applies to the preserved name's byte length.
 pub(crate) fn validate_filename(filename: &[u8]) -> Result<(), FsError> {
-    if filename.len() > NAME_MAX {
-        Err(FsError::NameTooLong)
-    } else if filename.is_empty()
+    validate_filename_length(filename)?;
+    if filename.is_empty()
         || filename == b"."
         || filename == b".."
         || filename.contains(&b'/')
         || filename.contains(&0)
     {
         Err(FsError::InvalidArgument)
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_filename_length(filename: &[u8]) -> Result<(), FsError> {
+    if filename.len() > NAME_MAX {
+        Err(FsError::NameTooLong)
     } else {
         Ok(())
     }
@@ -236,14 +243,64 @@ mod tests {
             );
             assert_eq!(
                 fs.rename(&auth, 0, name, 0, b"other").await,
-                Err(FsError::InvalidArgument)
+                Err(if name.is_empty() || name == b"." || name == b".." {
+                    FsError::InvalidArgument
+                } else {
+                    FsError::NotFound
+                })
             );
             assert_eq!(
                 fs.rename(&auth, 0, b"valid", 0, name).await,
-                Err(FsError::InvalidArgument)
+                Err(if name == b"." || name == b".." {
+                    FsError::Exists
+                } else {
+                    FsError::InvalidArgument
+                })
             );
         }
         assert_eq!(fs.lookup(&creds, 0, b"valid").await.unwrap(), file);
+    }
+
+    #[tokio::test]
+    async fn legacy_invalid_names_can_be_removed_and_renamed() {
+        use super::test_util::{test_auth, test_creds};
+        use super::types::SetAttributes;
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let creds = test_creds();
+        let auth = test_auth();
+        for name in [b"old/name".as_slice(), b"old\0name"] {
+            for rename in [false, true] {
+                let (id, _) = fs
+                    .create(&creds, 0, b"seed", &SetAttributes::default())
+                    .await
+                    .unwrap();
+                let (_, cookie) = fs
+                    .directory_store
+                    .get_entry_with_cookie(0, b"seed")
+                    .await
+                    .unwrap();
+                let mut inode = fs.inode_store.get(id).await.unwrap();
+                let Inode::File(file) = &mut inode else {
+                    unreachable!()
+                };
+                file.name = Some(name.to_vec());
+                let mut txn = fs.db.new_transaction().unwrap();
+                fs.directory_store
+                    .unlink_entry(&mut txn, 0, b"seed", cookie);
+                fs.inode_store.save(&mut txn, id, &inode).unwrap();
+                fs.directory_store
+                    .add(&mut txn, 0, name, id, cookie, Some(&inode));
+                fs.write_coordinator.commit(txn).await.unwrap();
+                if rename {
+                    fs.rename(&auth, 0, name, 0, b"rescued").await.unwrap();
+                    assert_eq!(fs.lookup(&creds, 0, b"rescued").await.unwrap(), id);
+                    fs.remove(&auth, 0, b"rescued").await.unwrap();
+                } else {
+                    fs.remove(&auth, 0, name).await.unwrap();
+                }
+                assert_eq!(fs.lookup(&creds, 0, name).await, Err(FsError::NotFound));
+            }
+        }
     }
 
     #[tokio::test]

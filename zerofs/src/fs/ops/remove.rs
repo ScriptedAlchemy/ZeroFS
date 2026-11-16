@@ -13,7 +13,7 @@ use crate::fs::permissions::{AccessMode, Credentials, check_access, check_sticky
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::AuthContext;
 use crate::fs::{
-    EXTENT_SIZE, SMALL_FILE_TOMBSTONE_THRESHOLD, ZeroFS, get_current_time, validate_filename,
+    EXTENT_SIZE, SMALL_FILE_TOMBSTONE_THRESHOLD, ZeroFS, get_current_time, validate_filename_length,
 };
 use std::sync::atomic::Ordering;
 
@@ -157,7 +157,7 @@ impl ZeroFS {
         expected_directory: Option<bool>,
         expected_entry: Option<(InodeId, u64)>,
     ) -> Result<bool, FsError> {
-        validate_filename(name)?;
+        validate_filename_length(name)?;
 
         // Replay a completed remove before resolving the missing entry.
         if self
