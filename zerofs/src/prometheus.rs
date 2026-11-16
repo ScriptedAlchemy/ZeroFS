@@ -571,6 +571,10 @@ fn collect_segment_gc_stats(stats: &SegmentGcStats) {
 }
 
 fn collect_jemalloc_stats() {
+    let (cap, braking, trips) = crate::alloc_rss::pressure_observation();
+    gauge!("zerofs_memory_pressure_cap_bytes").set(cap as f64);
+    gauge!("zerofs_memory_pressure_active").set(u8::from(braking) as f64);
+    counter!("zerofs_memory_pressure_trips_total").absolute(trips);
     let mem = crate::alloc_rss::JemallocMemStats::read();
     gauge!("zerofs_jemalloc_allocated_bytes").set(mem.allocated as f64);
     gauge!("zerofs_jemalloc_resident_bytes").set(mem.resident as f64);
