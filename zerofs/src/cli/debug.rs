@@ -762,6 +762,10 @@ mod tests {
         document["storage"]["readiness"] = serde_json::json!({
             "strict": false, "authority": "durable", "catalog": "durable", "cache": "fast", "journal": "fast",
             "members": {"data": "durable"},
+            "reserves": [
+                {"filesystem": "durable", "bytes": 1_000_000},
+                {"filesystem": "fast", "bytes": 1_000_000}
+            ],
             "filesystems": [
                 {"id": "durable", "profile": "hdd-cmr", "mountpoint": base,
                     "identity": {"kind": "zfs", "pool_guid": "101", "dataset_guid": "201"}},

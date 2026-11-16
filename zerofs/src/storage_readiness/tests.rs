@@ -42,6 +42,7 @@ impl Fixture {
                 "readiness": {
                     "strict": true, "authority": "durable", "catalog": "durable", "cache": "fast", "journal": "fast",
                     "members": { "data": "durable" },
+                    "reserves": [{"filesystem": "durable", "bytes": 1_000_000}, {"filesystem": "fast", "bytes": 1_000_000}],
                     "filesystems": [
                         { "id": "durable", "profile": "hdd-cmr", "mountpoint": durable,
                             "identity": { "kind": "zfs", "pool_guid": "101", "dataset_guid": "201" } },
@@ -106,7 +107,7 @@ impl Fixture {
             .unwrap();
         roots
             .iter()
-            .find(|root| root.role == role)
+            .find(|root| root.role.to_string() == role)
             .unwrap()
             .path
             .clone()
@@ -396,6 +397,10 @@ fn independent_hdd_member_is_accepted() {
             "id": "other", "profile": "hdd-smr", "mountpoint": mountpoint,
             "identity": { "kind": "zfs", "pool_guid": "102", "dataset_guid": "202" }
         }));
+    fixture.document["storage"]["readiness"]["reserves"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"filesystem": "other", "bytes": 1_000_000}));
     fixture.facts.insert(
         path,
         MountedFilesystem {
@@ -580,3 +585,5 @@ fn a_real_open_path_cannot_escape_its_declared_role_or_filesystem() {
         );
     }
 }
+#[path = "device_tests.rs"]
+mod device_tests;

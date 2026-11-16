@@ -1,3 +1,4 @@
+use super::devices::{DeviceDeclaration, RoleName};
 use crate::config::Settings;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,13 @@ pub(crate) struct FilesystemDeclaration {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct ReserveDeclaration {
+    filesystem: String,
+    bytes: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ReadinessConfig {
     pub(super) strict: bool,
     pub(super) authority: String,
@@ -35,10 +43,13 @@ pub(crate) struct ReadinessConfig {
     pub(super) journal: Option<String>,
     pub(super) members: BTreeMap<String, String>,
     pub(super) filesystems: Vec<FilesystemDeclaration>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) devices: Vec<DeviceDeclaration>,
+    reserves: Vec<ReserveDeclaration>,
 }
 
 pub(super) struct StorageRoot<'a> {
-    pub(super) role: String,
+    pub(super) role: RoleName,
     pub(super) path: PathBuf,
     pub(super) filesystem: &'a FilesystemDeclaration,
 }
@@ -125,17 +136,17 @@ impl ReadinessConfig {
         };
         let mut roots = vec![
             StorageRoot {
-                role: "authority".into(),
+                role: RoleName::Authority,
                 path: local_url(&settings.storage.url)?,
                 filesystem: resolve(&self.authority)?,
             },
             StorageRoot {
-                role: "catalog".into(),
+                role: RoleName::Catalog,
                 path: pool.catalog_dir.clone(),
                 filesystem: resolve(&self.catalog)?,
             },
             StorageRoot {
-                role: "cache".into(),
+                role: RoleName::Cache,
                 path: settings.cache.dir.clone(),
                 filesystem: resolve(&self.cache)?,
             },
@@ -143,7 +154,7 @@ impl ReadinessConfig {
         match settings.writeback.as_ref().filter(|w| w.enabled) {
             Some(writeback) => {
                 roots.push(StorageRoot {
-                    role: "journal".into(),
+                    role: RoleName::Journal,
                     path: writeback.dir.clone(),
                     filesystem: resolve(self.journal.as_deref().context(
                         "readiness journal binding is required when writeback is enabled",
@@ -176,7 +187,7 @@ impl ReadinessConfig {
                 );
             }
             roots.push(StorageRoot {
-                role: format!("member {}", member.id),
+                role: RoleName::Member(member.id.clone()),
                 path: local_url(&member.url)?,
                 filesystem,
             });
@@ -189,10 +200,10 @@ impl ReadinessConfig {
                     root.role
                 );
             }
-            match (root.role.as_str(), root.filesystem.profile) {
-                ("cache" | "journal", DiskProfile::Nvme) => {}
-                ("cache" | "journal", _) => bail!("readiness {} must declare nvme", root.role),
-                ("authority" | "catalog", DiskProfile::Nvme) => {
+            match (&root.role, root.filesystem.profile) {
+                (RoleName::Journal, DiskProfile::Nvme) => {}
+                (RoleName::Journal, _) => bail!("readiness journal must declare nvme"),
+                (RoleName::Authority | RoleName::Catalog, DiskProfile::Nvme) => {
                     bail!("readiness {} must declare hdd-cmr or hdd-smr", root.role)
                 }
                 _ => {}
@@ -213,6 +224,72 @@ impl ReadinessConfig {
                 }
             }
         }
+        self.validate_devices(&roots)?;
+        self.validate_reserves(settings, &roots)?;
         Ok(roots)
+    }
+
+    fn validate_devices(&self, roots: &[StorageRoot<'_>]) -> Result<()> {
+        let mut serials = HashSet::new();
+        let mut paths = HashSet::new();
+        for device in &self.devices {
+            if !serials.insert(&device.serial) {
+                bail!("duplicate serial in readiness devices");
+            }
+            if !paths.insert(&device.by_id) {
+                bail!("duplicate by-id in readiness devices");
+            }
+            device.validate(roots)?;
+        }
+        Ok(())
+    }
+
+    fn validate_reserves(&self, settings: &Settings, roots: &[StorageRoot<'_>]) -> Result<()> {
+        let mut reserves = BTreeMap::new();
+        for reserve in &self.reserves {
+            let filesystem = self
+                .filesystems
+                .iter()
+                .find(|filesystem| filesystem.id == reserve.filesystem)
+                .context("reserve references an unknown readiness filesystem")?;
+            if reserves
+                .insert(filesystem.identity.capacity_domain(), reserve.bytes)
+                .is_some()
+            {
+                bail!("readiness requires exactly one reserve per capacity domain");
+            }
+        }
+        for filesystem in &self.filesystems {
+            if !reserves.contains_key(&filesystem.identity.capacity_domain()) {
+                bail!("missing reserve for readiness filesystem {}", filesystem.id);
+            }
+        }
+        let declared_for = |role: &RoleName| -> Result<u64> {
+            let root = roots
+                .iter()
+                .find(|root| root.role == *role)
+                .context("missing reserve role binding")?;
+            Ok(reserves[&root.filesystem.identity.capacity_domain()])
+        };
+        let pool = settings
+            .storage
+            .pool
+            .as_ref()
+            .context("missing readiness pool")?;
+        for member in &pool.members {
+            if declared_for(&RoleName::Member(member.id.clone()))? < member.reserve_free_bytes()? {
+                bail!(
+                    "declared domain reserve is below enforced reserve_free_gb for member {}",
+                    member.id
+                );
+            }
+        }
+        if let Some(writeback) =
+            settings.writeback_settings(crate::writeback::config::WritebackAccessMode::ReadWrite)?
+            && declared_for(&RoleName::Journal)? < writeback.min_free_bytes
+        {
+            bail!("declared domain reserve is below enforced writeback min_free_gb");
+        }
+        Ok(())
     }
 }

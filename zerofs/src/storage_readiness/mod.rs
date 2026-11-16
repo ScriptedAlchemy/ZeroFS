@@ -1,4 +1,5 @@
 mod config;
+mod devices;
 mod identity;
 #[cfg(any(target_os = "linux", test))]
 mod linux;
@@ -9,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use config::FilesystemIdentity;
 pub(crate) use config::ReadinessConfig;
 use config::{StorageRoot, absolute_path};
+use devices::RoleName;
 use std::path::{Path, PathBuf};
 
 use identity::MountedFilesystem;
@@ -135,9 +137,10 @@ fn verify_open_paths_with(
     let roots = config.validated_roots(settings)?;
     for (role, path) in paths {
         absolute_path(path)?;
+        let role_name = RoleName::try_from((*role).to_owned()).map_err(anyhow::Error::msg)?;
         let root = roots
             .iter()
-            .find(|root| root.role == *role)
+            .find(|root| root.role == role_name)
             .with_context(|| format!("undeclared readiness open role {role}"))?;
         if !path.starts_with(&root.path) {
             bail!("readiness {role} open path escapes its declared role");
