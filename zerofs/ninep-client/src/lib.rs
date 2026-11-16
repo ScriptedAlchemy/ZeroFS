@@ -450,6 +450,7 @@ struct Conn {
     lineage_token: AtomicU64,
     /// Writer epoch returned by `Tgetlineage`; zero for standalone servers.
     writer_epoch: AtomicU64,
+    case_insensitive: AtomicBool,
     /// Set by whichever of the reader/writer tasks first sees the socket fail.
     dead: AtomicBool,
     /// Monotonic base for [`Conn::last_alive`].
@@ -659,6 +660,7 @@ pub struct NinePClient {
     /// Negotiated once for the logical session. Reconnects must match it so an
     /// ambiguous mutation can be resent byte-for-byte.
     msize: u32,
+    case_insensitive: bool,
     /// Suppresses repeated message-size mismatch warnings for this logical session.
     msize_mismatch_warned: Arc<AtomicBool>,
     fid_ctr: AtomicU32,
@@ -767,6 +769,7 @@ impl NinePClient {
 
         let client = Arc::new(Self {
             targets,
+            case_insensitive: conn.case_insensitive.load(Ordering::Acquire),
             conn: ArcSwap::new(conn),
             live: AtomicBool::new(true),
             terminal_errno: AtomicU32::new(0),
@@ -803,6 +806,7 @@ impl NinePClient {
             tag_ctr: AtomicU16::new(0),
             lineage_token: AtomicU64::new(0),
             writer_epoch: AtomicU64::new(0),
+            case_insensitive: AtomicBool::new(false),
             dead: AtomicBool::new(false),
             base: runtime::Clock::now(),
             last_alive: AtomicU64::new(0),
@@ -985,6 +989,7 @@ impl NinePClient {
         )
         .await?;
 
+        self.check_name_mode(&conn)?;
         // Settlement and snapshot/replay/install are mutually exclusive.
         let _transition = self.session_transition.lock().await;
         debug_assert_eq!(msize, self.msize);
@@ -997,6 +1002,19 @@ impl NinePClient {
         old.writer_shutdown.notify_one();
 
         Ok(())
+    }
+
+    fn check_name_mode(&self, conn: &Conn) -> ClientResult<()> {
+        if conn.case_insensitive.load(Ordering::Acquire) != self.case_insensitive {
+            conn.shutdown();
+            return Err(ClientError::Unexpected("filesystem name mode"));
+        }
+        Ok(())
+    }
+
+    /// Report the fixed directory lookup rule negotiated for this session.
+    pub fn case_insensitive(&self) -> bool {
+        self.case_insensitive
     }
 
     /// Resets a failed candidate before close. The ordered `Tversion` reply
@@ -3188,13 +3206,19 @@ async fn version_on(conn: &Conn, requested: u32) -> ClientResult<u32> {
     {
         Message::Rlerror(e) => Err(ClientError::Errno(e.ecode)),
         Message::Rversion(rv) => {
-            if rv.version.data != VERSION_9P2000L_ZEROFS {
-                warn!(
-                    "server did not accept the required ZeroFS dialect: {:?}",
-                    rv.version.as_str().unwrap_or("<non-UTF-8>")
-                );
-                return Err(ClientError::Unexpected("version"));
-            }
+            let case_insensitive = match rv.version.data.as_slice() {
+                VERSION_9P2000L_ZEROFS => false,
+                VERSION_9P2000L_ZEROFS_CI => true,
+                _ => {
+                    warn!(
+                        "server did not accept the required ZeroFS dialect: {:?}",
+                        rv.version.as_str().unwrap_or("<non-UTF-8>")
+                    );
+                    return Err(ClientError::Unexpected("version"));
+                }
+            };
+            conn.case_insensitive
+                .store(case_insensitive, Ordering::Release);
             // Linux v9fs requires msize >= 4096.
             let negotiated = rv.msize.min(requested);
             if negotiated < 4096 {
@@ -3502,6 +3526,7 @@ fn test_conn_with_receiver_at(base: runtime::Clock) -> (Arc<Conn>, mpsc::Receive
         tag_ctr: AtomicU16::new(0),
         lineage_token: AtomicU64::new(0),
         writer_epoch: AtomicU64::new(0),
+        case_insensitive: AtomicBool::new(false),
         dead: AtomicBool::new(false),
         base,
         last_alive: AtomicU64::new(0),
@@ -3529,6 +3554,7 @@ mod session_transition_tests {
     fn test_client(conn: Arc<Conn>) -> Arc<NinePClient> {
         Arc::new(NinePClient {
             targets: Vec::new(),
+            case_insensitive: conn.case_insensitive.load(Ordering::Acquire),
             conn: ArcSwap::new(conn),
             live: AtomicBool::new(true),
             terminal_errno: AtomicU32::new(0),
@@ -3648,6 +3674,44 @@ mod session_transition_tests {
         let result = client.replay(conn).await;
         responder.await.unwrap();
         result
+    }
+
+    #[tokio::test]
+    async fn name_mode_negotiation_accepts_both_modes_and_rejects_a_changed_reconnect() {
+        for (version, insensitive) in [
+            (VERSION_9P2000L_ZEROFS, false),
+            (VERSION_9P2000L_ZEROFS_CI, true),
+        ] {
+            let (conn, mut requests) = test_conn_with_receiver();
+            let responder_conn = Arc::clone(&conn);
+            let responder = tokio::spawn(async move {
+                let request = recv_request(&mut requests, "version request").await;
+                assert!(matches!(request.body, Message::Tversion(_)));
+                reply(
+                    &responder_conn,
+                    request.tag,
+                    Message::Rversion(Rversion {
+                        msize: 8192,
+                        version: P9String::new(version.to_vec()),
+                    }),
+                );
+            });
+            assert_eq!(version_on(&conn, 8192).await.unwrap(), 8192);
+            responder.await.unwrap();
+            let client = test_client(conn);
+            assert_eq!(client.case_insensitive(), insensitive);
+            let candidate = test_conn();
+            candidate
+                .case_insensitive
+                .store(insensitive, Ordering::Release);
+            client.check_name_mode(&candidate).unwrap();
+            candidate
+                .case_insensitive
+                .store(!insensitive, Ordering::Release);
+            assert!(client.check_name_mode(&candidate).is_err());
+            assert!(candidate.dead.load(Ordering::Acquire));
+            assert!(candidate.pending.is_empty());
+        }
     }
 
     #[tokio::test]

@@ -974,7 +974,10 @@ impl NinePHandler {
         self.lock_manager.release_session_locks(self.handler_id);
 
         let requested = version_str.as_bytes();
-        if requested != VERSION_9P2000L && requested != VERSION_9P2000L_ZEROFS {
+        if requested != VERSION_9P2000L
+            && requested != VERSION_9P2000L_ZEROFS
+            && requested != VERSION_9P2000L_ZEROFS_CI
+        {
             debug!("Client requested an unsupported 9P dialect, returning unknown");
             return Ok(Message::Rversion(Rversion {
                 msize: tv.msize,
@@ -983,14 +986,22 @@ impl NinePHandler {
         }
 
         let msize = tv.msize.min(P9_MAX_MSIZE);
-        let zerofs_protocol = requested == VERSION_9P2000L_ZEROFS;
+        let zerofs_protocol = requested != VERSION_9P2000L;
         let mut state = self.session_state();
         state.msize = msize;
         state.zerofs_protocol = zerofs_protocol;
 
+        let advertised = if zerofs_protocol {
+            match self.filesystem.name_mode() {
+                crate::fs::name_mode::NameMode::Sensitive => VERSION_9P2000L_ZEROFS,
+                crate::fs::name_mode::NameMode::Insensitive => VERSION_9P2000L_ZEROFS_CI,
+            }
+        } else {
+            VERSION_9P2000L
+        };
         Ok(Message::Rversion(Rversion {
             msize,
-            version: P9String::new(requested.to_vec()),
+            version: P9String::new(advertised.to_vec()),
         }))
     }
 
@@ -2800,6 +2811,39 @@ mod tests {
             attach(handler, 1, 1, b"test", aname, 1000).await.body,
             Message::Rattach(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn name_mode_selects_a_dialect_the_kernel_can_refuse() {
+        for mode in [
+            crate::fs::name_mode::NameMode::Sensitive,
+            crate::fs::name_mode::NameMode::Insensitive,
+        ] {
+            let fs = Arc::new(ZeroFS::new_in_memory_with_name_mode(mode).await.unwrap());
+            let handler = NinePHandler::new(fs, Arc::new(FileLockManager::new()));
+            let response = negotiate(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS).await;
+            let Message::Rversion(version) = response.body else {
+                panic!("expected version reply")
+            };
+            assert_eq!(
+                ninep_proto::kernel_dialect_supported(&version.version.data),
+                mode == crate::fs::name_mode::NameMode::Sensitive
+            );
+            assert_eq!(
+                version.version.data,
+                if mode == crate::fs::name_mode::NameMode::Sensitive {
+                    VERSION_9P2000L_ZEROFS
+                } else {
+                    VERSION_9P2000L_ZEROFS_CI
+                }
+            );
+            assert!(handler.zerofs_protocol_enabled());
+            let response = negotiate(&handler, DEFAULT_MSIZE, VERSION_9P2000L).await;
+            let Message::Rversion(version) = response.body else {
+                panic!("expected version reply")
+            };
+            assert_eq!(version.version.data, VERSION_9P2000L);
+        }
     }
 
     async fn start_plain_session(handler: &NinePHandler) {

@@ -1563,6 +1563,9 @@ mod role_decision_tests {
             "{error:#}"
         );
         assert!(metadata.join("zerofs.key").exists());
+        temp.close().unwrap();
+        assert!(!root.exists());
+        println!("name_mode_startup_fixture_removed={}", root.display());
     }
 
     #[tokio::test]

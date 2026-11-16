@@ -39,3 +39,16 @@ and updates its listing name and inode backpointer. An exact-byte rename remains
 a no-op. Renaming `x` onto `Y` when `x` and `y` are distinct hardlinks to the same
 inode leaves both entries unchanged. POSIX requires this successful no-op when
 the two names already refer to the same file.
+
+Private 9P clients receive `9P2000.L.Z.CI` for an insensitive export and
+`9P2000.L.Z` for a sensitive export. The userspace client accepts both and
+retains the selected mode for the logical session. It rejects a reconnect
+candidate with a different mode before replaying requests. The native kernel
+client accepts only the sensitive dialect and refuses an insensitive mount.
+Older userspace clients also refuse the new dialect.
+
+The FUSE bridge uses the negotiated mode to disable negative-entry caching
+for insensitive exports, including relaxed mounts. Plain `9P2000.L` still
+passes names as bytes. Its client cache behavior, Linux v9fs and Samba over
+FUSE require separate acceptance tests before this option leaves experimental
+status. This change does not alter the HA replication protocol.

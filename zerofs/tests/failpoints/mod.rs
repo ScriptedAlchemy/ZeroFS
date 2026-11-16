@@ -3742,15 +3742,34 @@ async fn insensitive_names_and_collisions_survive_reopen() {
         assert!(entries.iter().any(|entry| entry.name == name));
     }
     let codec = KeyCodec::with_name_mode(NameMode::Insensitive);
-    for (name, id) in recased.into_iter().chain([(b"foo".as_slice(), foo), (b"B".as_slice(), a)]) {
+    for (name, id) in recased
+        .into_iter()
+        .chain([(b"foo".as_slice(), foo), (b"B".as_slice(), a)])
+    {
         assert_eq!(fs.lookup(&creds, 0, name).await.unwrap(), id);
-        let entry = fs.db.get_bytes(&codec.dir_entry_key(0, name)).await.unwrap().unwrap();
+        let entry = fs
+            .db
+            .get_bytes(&codec.dir_entry_key(0, name))
+            .await
+            .unwrap()
+            .unwrap();
         let (_, cookie) = KeyCodec::decode_dir_entry(&entry).unwrap();
-        let row = fs.db.get_bytes(&codec.dir_scan_key(0, cookie)).await.unwrap().unwrap();
-        let (display, embedded) = zerofs::fs::store::directory::decode_dir_scan_value(&row).unwrap();
+        let row = fs
+            .db
+            .get_bytes(&codec.dir_scan_key(0, cookie))
+            .await
+            .unwrap()
+            .unwrap();
+        let (display, embedded) =
+            zerofs::fs::store::directory::decode_dir_scan_value(&row).unwrap();
         assert_eq!(display, name);
-        let zerofs::fs::store::directory::DirScanValue::WithInode { inode, .. } = embedded else { panic!("expected embedded inode") };
-        assert_eq!(bincode::serialize(&inode).unwrap(), bincode::serialize(&fs.inode_store.get(id).await.unwrap()).unwrap());
+        let zerofs::fs::store::directory::DirScanValue::WithInode { inode, .. } = embedded else {
+            panic!("expected embedded inode")
+        };
+        assert_eq!(
+            bincode::serialize(&inode).unwrap(),
+            bincode::serialize(&fs.inode_store.get(id).await.unwrap()).unwrap()
+        );
     }
     let report = verify_consistency(&fs).await.unwrap();
     assert!(report.errors.is_empty(), "{report:?}");
