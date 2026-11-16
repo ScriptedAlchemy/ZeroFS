@@ -10,6 +10,7 @@ pub mod debug;
 pub mod fatrace;
 pub mod flush;
 mod init;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) mod inventory;
 mod memory_budget;
 pub mod monitor;
@@ -34,6 +35,7 @@ pub enum Commands {
     ///
     /// Reads may update atime; only a read-only mount prevents this. Exit 3 means
     /// the inventory is incomplete. Collision rules do not model Samba or ZFS.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     Inventory {
         root: PathBuf,
         /// Read regular file contents to compute SHA-256 (disabled by default)

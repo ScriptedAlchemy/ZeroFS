@@ -73,6 +73,7 @@ pub async fn run_cli() -> Result<()> {
     let cli = cli::Cli::parse_args();
 
     match cli.command {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         cli::Commands::Inventory { root, hash } => {
             cli::inventory::run(&root, hash)?;
         }
