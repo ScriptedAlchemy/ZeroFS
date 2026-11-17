@@ -4166,6 +4166,115 @@ mod tests {
         );
     }
 
+    /// Damaged journal headers on which redb 4.1 asserts instead of returning
+    /// an error. A torn header page can carry a wrong page size, which redb
+    /// asserts on at page_manager.rs:230, and a zero region size, which
+    /// redb's layout arithmetic asserts on at layout.rs:23. Both opens must
+    /// return an error naming the file and leave it untouched.
+    #[test]
+    fn a_journal_database_with_a_damaged_header_is_refused_with_its_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let database = root.join("journal.redb");
+        let journal = open_temp_journal(&temp, "bucket-a");
+        journal
+            .commit_put(put_record(1, "segments/1", b"pending"), b"pending")
+            .unwrap();
+        drop(journal);
+        let clean = fs::read(&database).unwrap();
+
+        let mut wrong_page_size = clean.clone();
+        wrong_page_size[12..16].copy_from_slice(&8192_u32.to_le_bytes());
+        let mut zero_region = clean;
+        zero_region[20..24].copy_from_slice(&0_u32.to_le_bytes());
+        for (case, damaged) in [
+            ("wrong page size", wrong_page_size),
+            ("zero region size", zero_region),
+        ] {
+            fs::write(&database, &damaged).unwrap();
+            for (open, result) in [
+                ("open", Journal::open(&root, identity("bucket-a")).map(drop)),
+                ("open_existing", Journal::open_existing(&root).map(drop)),
+            ] {
+                let message = format!("{:#}", result.unwrap_err());
+                assert!(
+                    message.contains(&database.display().to_string()),
+                    "{case}, {open}: {message}"
+                );
+            }
+            assert_eq!(fs::read(&database).unwrap(), damaged, "{case}");
+        }
+    }
+
+    /// The silent outcome of the storage-union fault lane's test_34: the
+    /// journal device dropped the writes of later commits while the file kept
+    /// its size, so redb opens the older commit cleanly and the later
+    /// acknowledged records are gone. Nothing outside the journal records how
+    /// far it had got, so this open cannot tell; see "Named gap: a writeback
+    /// journal that lost acknowledged writes" in
+    /// docs/metadata-survival-design.md. Change this test when that record
+    /// exists and startup compares against it.
+    #[test]
+    fn a_journal_rolled_back_to_an_older_commit_opens_at_that_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let database = root.join("journal.redb");
+        let journal = open_temp_journal(&temp, "bucket-a");
+        journal
+            .commit_put(put_record(1, "segments/1", b"kept"), b"kept")
+            .unwrap();
+        // A fresh database starts with surplus space that its first commits
+        // trim. Closing trims it to the minimum, so the reopened journal is
+        // settled, as a journal that has been running is.
+        drop(journal);
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let window_opened = fs::read(&database).unwrap();
+        let blobs = journal.root().join("blobs");
+        let blobs_when_the_window_opened = walk_files(&blobs);
+        for sequence in 2..=4 {
+            let path = format!("segments/{sequence}");
+            journal
+                .commit_put(put_record(sequence, &path, b"lost"), b"lost")
+                .unwrap();
+        }
+        // The server is killed here, so no close commit trims the file. What
+        // the restored device holds: every byte written after the window
+        // opened is gone, and file sizes and names survive.
+        let size = fs::metadata(&database).unwrap().len() as usize;
+        assert!(size >= window_opened.len(), "this case keeps the file size");
+        drop(journal);
+        let mut rolled_back = window_opened;
+        rolled_back.resize(size, 0);
+        fs::write(&database, &rolled_back).unwrap();
+        for blob in walk_files(&blobs) {
+            if !blobs_when_the_window_opened.contains(&blob) {
+                let length = fs::metadata(&blob).unwrap().len() as usize;
+                fs::write(&blob, vec![0; length]).unwrap();
+            }
+        }
+
+        let reopened = Journal::open(&root, identity("bucket-a")).unwrap();
+        let snapshot = reopened.snapshot().unwrap();
+        assert_eq!(snapshot.local_seq, 1, "the lost commits are not visible");
+        assert_eq!(reopened.read_blob(1).unwrap(), b"kept");
+        drop(reopened);
+        let reopened = Journal::open_existing(&root).unwrap();
+        assert_eq!(reopened.snapshot().unwrap().local_seq, 1);
+    }
+
+    fn walk_files(directory: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files.extend(walk_files(&path));
+            } else {
+                files.push(path);
+            }
+        }
+        files
+    }
+
     /// redb marks its file recovery-required when a writer opens it and clears
     /// the mark when the writer closes it, so a killed server leaves the mark.
     /// The identity read refused such a file through redb's read-only open; it
