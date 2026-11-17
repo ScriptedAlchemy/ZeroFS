@@ -7,28 +7,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use zerofs_client::Client;
 
-/// Locate the workspace zerofs binary, building it on demand.
+/// The zerofs binary Cargo built for this test, unless `ZEROFS_BIN` names another.
 fn zerofs_binary() -> PathBuf {
-    if let Ok(bin) = std::env::var("ZEROFS_BIN") {
-        return PathBuf::from(bin);
-    }
-    let exe = std::env::current_exe().expect("current_exe");
-    let debug_dir = exe
-        .parent()
-        .and_then(Path::parent)
-        .expect("test executable outside target dir");
-    let candidate = debug_dir.join("zerofs");
-    if candidate.exists() {
-        return candidate;
-    }
-    let status = Command::new(env!("CARGO"))
-        .args(["build", "-p", "zerofs", "--bin", "zerofs"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .status()
-        .expect("failed to run cargo build -p zerofs");
-    assert!(status.success(), "cargo build -p zerofs failed");
-    assert!(candidate.exists(), "zerofs binary missing after build");
-    candidate
+    std::env::var_os("ZEROFS_BIN").map_or_else(
+        || PathBuf::from(env!("CARGO_BIN_EXE_zerofs")),
+        PathBuf::from,
+    )
 }
 
 /// A `zerofs run` child; killed and reaped on drop.
