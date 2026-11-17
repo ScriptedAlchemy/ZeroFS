@@ -165,6 +165,7 @@ async fn failover_client_transparently_reroutes() {
     let l_cfg = dir.path().join("leader.toml");
     let s_cfg = dir.path().join("standby.toml");
 
+    let leader_repl = format!("127.0.0.1:{}", free_port());
     let standby_repl = format!("127.0.0.1:{}", free_port());
     write_config(
         &l_cfg,
@@ -175,7 +176,7 @@ async fn failover_client_transparently_reroutes() {
         &l_9p,
         &l_rpc,
         Some(&standby_repl),
-        None,
+        Some(&leader_repl),
     );
     write_config(
         &s_cfg,
@@ -185,7 +186,7 @@ async fn failover_client_transparently_reroutes() {
         "standby",
         &s_9p,
         &s_rpc,
-        None,
+        Some(&leader_repl),
         Some(&standby_repl),
     );
 
@@ -245,6 +246,7 @@ async fn failover_client_reroutes_mutating_ops() {
     let l_cfg = dir.path().join("leader.toml");
     let s_cfg = dir.path().join("standby.toml");
 
+    let leader_repl = format!("127.0.0.1:{}", free_port());
     let standby_repl = format!("127.0.0.1:{}", free_port());
     write_config(
         &l_cfg,
@@ -255,7 +257,7 @@ async fn failover_client_reroutes_mutating_ops() {
         &l_9p,
         &l_rpc,
         Some(&standby_repl),
-        None,
+        Some(&leader_repl),
     );
     write_config(
         &s_cfg,
@@ -265,7 +267,7 @@ async fn failover_client_reroutes_mutating_ops() {
         "standby",
         &s_9p,
         &s_rpc,
-        None,
+        Some(&leader_repl),
         Some(&standby_repl),
     );
 
@@ -324,6 +326,7 @@ async fn open_file_handle_survives_failover() {
     let l_cfg = dir.path().join("leader.toml");
     let s_cfg = dir.path().join("standby.toml");
 
+    let leader_repl = format!("127.0.0.1:{}", free_port());
     let standby_repl = format!("127.0.0.1:{}", free_port());
     write_config(
         &l_cfg,
@@ -334,7 +337,7 @@ async fn open_file_handle_survives_failover() {
         &l_9p,
         &l_rpc,
         Some(&standby_repl),
-        None,
+        Some(&leader_repl),
     );
     write_config(
         &s_cfg,
@@ -344,7 +347,7 @@ async fn open_file_handle_survives_failover() {
         "standby",
         &s_9p,
         &s_rpc,
-        None,
+        Some(&leader_repl),
         Some(&standby_repl),
     );
 
@@ -410,6 +413,7 @@ async fn client_reroutes_around_a_fenced_but_alive_leader() {
     let l_cfg = dir.path().join("leader.toml");
     let s_cfg = dir.path().join("standby.toml");
 
+    let leader_repl = format!("127.0.0.1:{}", free_port());
     let standby_repl = format!("127.0.0.1:{}", free_port());
     write_config(
         &l_cfg,
@@ -420,7 +424,7 @@ async fn client_reroutes_around_a_fenced_but_alive_leader() {
         &l_9p,
         &dir.path().join("leader-rpc.sock"),
         Some(&standby_repl),
-        None,
+        Some(&leader_repl),
     );
     write_config(
         &s_cfg,
@@ -430,7 +434,7 @@ async fn client_reroutes_around_a_fenced_but_alive_leader() {
         "standby",
         &s_9p,
         &dir.path().join("standby-rpc.sock"),
-        None,
+        Some(&leader_repl),
         Some(&standby_repl),
     );
 
@@ -506,6 +510,7 @@ async fn facade_reroutes_on_fenced_leader() {
     let l_cfg = dir.path().join("leader.toml");
     let s_cfg = dir.path().join("standby.toml");
 
+    let leader_repl = format!("127.0.0.1:{}", free_port());
     let standby_repl = format!("127.0.0.1:{}", free_port());
     write_config(
         &l_cfg,
@@ -516,7 +521,7 @@ async fn facade_reroutes_on_fenced_leader() {
         &l_9p,
         &dir.path().join("leader-rpc.sock"),
         Some(&standby_repl),
-        None,
+        Some(&leader_repl),
     );
     write_config(
         &s_cfg,
@@ -526,7 +531,7 @@ async fn facade_reroutes_on_fenced_leader() {
         "standby",
         &s_9p,
         &dir.path().join("standby-rpc.sock"),
-        None,
+        Some(&leader_repl),
         Some(&standby_repl),
     );
 
