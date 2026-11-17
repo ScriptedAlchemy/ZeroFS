@@ -11,6 +11,10 @@ use std::path::{Component, Path};
 use tokio::sync::oneshot;
 
 const REPLICA_TIMEOUT: Duration = Duration::from_secs(90);
+// The proposed `final_pause_max_milliseconds` default. A mutation that finds
+// admission closed for a commit waits at most this long, then fails with
+// EAGAIN. Latched closed admission refuses mutations at once.
+const FINAL_PAUSE_MAX: Duration = Duration::from_millis(1000);
 const REPLACEMENT_DEVICE_ID: &str = "fixture-replacement-device";
 
 /// A production prerequisite that the current implementation lacks. Every
@@ -148,6 +152,8 @@ acceptance_rows! {
             "the production DataOnlyLoss scenario hook is absent";
         RetentionCrash => retained_dependency_union_survives_restart_and_repeated_sweep,
             "the production RetentionCrash scenario hook is absent";
+        MetadataReplicaLoss => metadata_replica_device_loss_while_writable_closes_admission,
+            "the production MetadataReplicaLoss scenario hook is absent";
     }
 }
 
@@ -931,6 +937,8 @@ enum SurvivalFailure {
     Corrupt,
     #[error("authenticated commit chains conflict")]
     Fork,
+    #[error("metadata replica device is lost")]
+    Lost,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -948,7 +956,7 @@ async fn probe_create(live: &Live, name: &[u8]) -> Result<Result<(), FsError>> {
     let auth = AuthContext::default();
     let creds = Credentials::from_auth_context(&auth);
     Ok(tokio::time::timeout(
-        Duration::from_secs(2),
+        FINAL_PAUSE_MAX + Duration::from_secs(1),
         live.fs().create(&creds, 0, name, &SetAttributes::default()),
     )
     .await
@@ -1278,7 +1286,7 @@ fn oracle(row: Row, live: &Live, observed: &Observation) -> Result<()> {
         Row::AdmittedWriteLoss => ensure!(
             observed.admitted_pending_at_loss
                 && observed.commit_waited_for_admitted
-                && observed.late_arrival == Some(Err(FsError::ReadOnlyFilesystem)),
+                && observed.late_arrival == Some(Err(FsError::RetryLater)),
             "the admitted write must overlap a waiting commit and a bounded rejected late arrival"
         ),
         Row::InterruptedCommit => {
@@ -2218,7 +2226,7 @@ async fn every_acceptance_oracle_rejects_success_without_survival() -> Result<()
                 .collect(),
             admitted_pending_at_loss: true,
             commit_waited_for_admitted: true,
-            late_arrival: Some(Err(FsError::ReadOnlyFilesystem)),
+            late_arrival: Some(Err(FsError::RetryLater)),
             review: row
                 .review_case()
                 .then(|| review_cases::optimistic(row, &live, &receipt)),

@@ -609,7 +609,7 @@ pub(super) async fn exercise(
                 .await
             });
             let started = std::time::Instant::now();
-            let late_result = tokio::time::timeout(Duration::from_secs(2), late)
+            let late_result = tokio::time::timeout(FINAL_PAUSE_MAX + Duration::from_secs(1), late)
                 .await??
                 .map(|_| ());
             // Late admission must return while the inode remains held. It
@@ -687,6 +687,46 @@ pub(super) async fn exercise(
                     .await?;
             }
             result.statuses.push(driver.status(live).await?);
+        }
+        Row::MetadataReplicaLoss => {
+            // disk-a holds the second metadata copy and current payload. The
+            // writer stays open, so the share is writable when the disk dies.
+            result.statuses.push(driver.status(live).await?);
+            lose_device(live, Device::DiskA)?;
+            result.before_files = survival_tree(live)?;
+            let Err(error) = driver.commit(live).await else {
+                anyhow::bail!("a commit succeeded without its metadata replica");
+            };
+            result.errors.push(
+                *error
+                    .downcast_ref::<SurvivalFailure>()
+                    .context("unrelated replica-loss commit error")?,
+            );
+            result.statuses.push(driver.status(live).await?);
+            driver.review_action(live, Action::EvictReadCaches).await?;
+            let lost = live
+                .reads
+                .iter()
+                .find(|r| r.member.as_deref() == Some("disk-a"))
+                .context("sole-copy range on the lost disk")?
+                .clone();
+            let safe = live
+                .reads
+                .iter()
+                .find(|r| r.member.as_deref() == Some("disk-b"))
+                .context("range on the surviving disk")?
+                .clone();
+            result.api.push(probe_read(live, &lost).await?);
+            result.api.push(probe_read(live, &safe).await?);
+            result
+                .api
+                .push(probe_create(live, b"after-replica-loss").await?);
+            result.after_files = survival_tree(live)?;
+            // Writable startup needs offline promotion or verified replacement.
+            live.close_writer().await;
+            result
+                .errors
+                .push(action_error(driver, live, Action::Restart).await?);
         }
         _ => anyhow::bail!("not an independent-review row"),
     }
@@ -851,7 +891,12 @@ pub(super) fn oracle(row: Row, live: &Live, observed: &Observation) -> Result<()
                 == [
                     Err(FsError::IoError),
                     Ok(()),
-                    Err(FsError::ReadOnlyFilesystem)
+                    // A commit's closed phase is transient. A latch is not.
+                    Err(if row == Row::ReadFaultClosed {
+                        FsError::RetryLater
+                    } else {
+                        FsError::ReadOnlyFilesystem
+                    })
                 ]
                 && evidence.before_catalog.is_some()
                 && evidence.before_catalog == evidence.after_catalog,
@@ -917,10 +962,10 @@ pub(super) fn oracle(row: Row, live: &Live, observed: &Observation) -> Result<()
             "startup left an owned orphan checkpoint"
         ),
         Row::AdmissionLockOrder => ensure!(
-            evidence.api == [Err(FsError::ReadOnlyFilesystem), Ok(())]
+            evidence.api == [Err(FsError::RetryLater), Ok(())]
                 && evidence
                     .lock_wait
-                    .is_some_and(|wait| wait <= Duration::from_secs(2)),
+                    .is_some_and(|wait| wait <= FINAL_PAUSE_MAX + Duration::from_secs(1)),
             "admission waited while holding an inode lock"
         ),
         Row::DataOnlyLoss => ensure!(
@@ -934,6 +979,42 @@ pub(super) fn oracle(row: Row, live: &Live, observed: &Observation) -> Result<()
                 && evidence.statuses.last().is_some_and(|s| s.admission_open),
             "crashed sweep lost retention or disabled all reclaim"
         ),
+        Row::MetadataReplicaLoss => {
+            ensure!(
+                evidence.errors == [SurvivalFailure::Lost, SurvivalFailure::Lost],
+                "a commit or a writable restart proceeded without the lost metadata replica"
+            );
+            let [before, after] = evidence.statuses.as_slice() else {
+                anyhow::bail!("replica loss needs one status before and one after the loss");
+            };
+            ensure!(
+                before.admission_open
+                    && before.failed_replicas.is_empty()
+                    && before.last_sequence == Some(prior.sequence),
+                "the share was not writable at a current generation before the loss"
+            );
+            ensure!(
+                !after.admission_open
+                    && after.failed_replicas.contains_key("disk-a-metadata")
+                    && after.last_sequence == before.last_sequence
+                    && after.last_digest == before.last_digest
+                    && after.completed_at == before.completed_at,
+                "replica loss left admission open, hid the replica or moved the recovery point"
+            );
+            ensure!(
+                evidence.api
+                    == [
+                        Err(FsError::IoError),
+                        Ok(()),
+                        Err(FsError::ReadOnlyFilesystem)
+                    ],
+                "replica loss must return EIO for lost payload, keep other reads and refuse writes with EROFS"
+            );
+            ensure!(
+                !evidence.before_files.is_empty() && evidence.before_files == evidence.after_files,
+                "a failed commit changed the surviving metadata copy"
+            );
+        }
         _ => anyhow::bail!("not an independent-review row"),
     }
     for (path, digest) in &evidence.retained {
@@ -986,14 +1067,34 @@ pub(super) fn optimistic(row: Row, live: &Live, receipt: &SurvivalReceipt) -> Re
         result.api = vec![
             Err(FsError::IoError),
             Ok(()),
-            Err(FsError::ReadOnlyFilesystem),
+            Err(if row == Row::ReadFaultClosed {
+                FsError::RetryLater
+            } else {
+                FsError::ReadOnlyFilesystem
+            }),
         ];
     }
     if row == Row::DataOnlyLoss {
         result.api = vec![Err(FsError::IoError), Ok(()), Ok(())];
     }
     if row == Row::AdmissionLockOrder {
-        result.api = vec![Err(FsError::ReadOnlyFilesystem), Ok(())];
+        result.api = vec![Err(FsError::RetryLater), Ok(())];
+    }
+    if row == Row::MetadataReplicaLoss {
+        let mut closed = status.clone();
+        closed.admission_open = false;
+        closed
+            .failed_replicas
+            .insert("disk-a-metadata".to_owned(), "device lost".to_owned());
+        result.statuses = vec![status.clone(), closed];
+        result.errors = vec![SurvivalFailure::Lost; 2];
+        result.api = vec![
+            Err(FsError::IoError),
+            Ok(()),
+            Err(FsError::ReadOnlyFilesystem),
+        ];
+        result.before_files = BTreeMap::from([("0/commits/stub".into(), receipt.digest)]);
+        result.after_files = result.before_files.clone();
     }
     result
 }
