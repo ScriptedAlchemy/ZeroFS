@@ -120,9 +120,9 @@ fn inspect_blobs(block: &[u8]) -> (Vec<BlobLayout>, bool) {
 pub(crate) struct UndefinedBytes {
     /// Partition files of the cache's block size that were read.
     pub(crate) partitions: usize,
-    /// Partition files of another size, which hold no data blocks.
+    /// Partition files of another size, which were not read as data blocks.
     pub(crate) other_partitions: usize,
-    /// Blocks with an index whose entries could not all be inspected.
+    /// Partitions with invalid geometry or a blob that could not be fully inspected.
     pub(crate) incomplete_partitions: usize,
     pub(crate) blobs: usize,
     pub(crate) entries: usize,
@@ -286,8 +286,8 @@ pub(crate) enum ScanStatus {
     Clean,
     /// Some index tail or padding byte is non-zero.
     UndefinedBytes,
-    /// A cache had no entries on disk, was not scanned, or had an
-    /// incomplete blob that could not be fully inspected.
+    /// A cache had no entries on disk, was not scanned, or had invalid
+    /// geometry or an incomplete blob that could not be fully inspected.
     NothingScanned,
 }
 
@@ -533,7 +533,14 @@ fn scan_cache_files_with_hook(
             continue;
         }
         let scanned = if current || options.legacy {
-            Some(scan_partitions(&dir, kind.block_size(), |_, _| {})?)
+            let mut counts = scan_partitions(&dir, kind.block_size(), |_, _| {})?;
+            if current && kind == CacheKind::RawParts {
+                // This layout has no tombstone log. Every partition must be
+                // a full data block, so a truncated or foreign-size file is
+                // missing evidence, not an auxiliary partition to ignore.
+                counts.incomplete_partitions += counts.other_partitions;
+            }
+            Some(counts)
         } else {
             None
         };
@@ -631,8 +638,8 @@ pub(crate) fn render(report: &ScanReport) -> String {
         if counts.incomplete_partitions > 0 {
             let _ = writeln!(
                 out,
-                "  {} partitions have a damaged or incomplete blob; their remaining entries \
-                 could not be scanned, so this is not evidence that the cache is clean",
+                "  {} partitions have invalid geometry or an incomplete blob; their remaining \
+                 entries could not be scanned, so this is not evidence that the cache is clean",
                 counts.incomplete_partitions
             );
         }

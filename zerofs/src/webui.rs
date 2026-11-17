@@ -9,6 +9,7 @@ use crate::ninep::lock_manager::FileLockManager;
 use crate::ninep::server::{
     ConnectionContext, InflightRegistry, P9AcceptedWorkTracker, P9GlobalAdmission, P9PendingFrames,
     P9Response, P9TransportPermit, response_may_be_emitted, settle_request_tasks,
+    with_response_authority,
 };
 use crate::rpc::proto;
 use crate::rpc::server::AdminRpcServer;
@@ -269,20 +270,23 @@ async fn handle_9p_ws(
         let _cancel_connection_on_exit = writer_authority_lost.clone().drop_guard();
         while let Some(response) = rx.recv().await {
             let (tag, response_bytes, admission) = response.into_guarded_parts();
-            if !response_may_be_emitted(&response_db, &response_bytes) {
-                warn!(
-                    "Dropping successful WebSocket 9P response for tag {tag} after serving \
-                     authority was lost; closing the connection"
-                );
-                writer_authority_lost.cancel();
-                break;
-            }
-            if ws_tx
-                .send(WsMessage::Binary(response_bytes.into()))
-                .await
-                .is_err()
+            let response_bytes = bytes::Bytes::from(response_bytes);
+            match with_response_authority(
+                ws_tx.send(WsMessage::Binary(response_bytes.clone())),
+                || response_may_be_emitted(&response_db, &response_bytes),
+            )
+            .await
             {
-                break;
+                None => {
+                    warn!(
+                        "Dropping successful WebSocket 9P response for tag {tag} after serving \
+                         authority was lost; closing the connection"
+                    );
+                    writer_authority_lost.cancel();
+                    break;
+                }
+                Some(Err(_)) => break,
+                Some(Ok(())) => {}
             }
             *writer_activity.lock().unwrap() = tokio::time::Instant::now();
             drop(admission);

@@ -88,6 +88,17 @@ impl QuotaSettlement {
 }
 
 impl LogicalQuota {
+    /// Unknown persisted usage must not be treated as an empty filesystem.
+    /// Reads and metadata inspection can continue, but quota reservations
+    /// fail until the counters are repaired and the filesystem is reopened.
+    pub(crate) fn from_known_usage(max_bytes: u64, committed: Option<u64>) -> Arc<Self> {
+        let quota = Self::new(max_bytes, committed.unwrap_or_default());
+        if committed.is_none() {
+            Self::poison(&mut quota.lock(), "persistent usage totals are unreadable");
+        }
+        quota
+    }
+
     pub(crate) fn new(max_bytes: u64, committed: u64) -> Arc<Self> {
         Arc::new(Self {
             max_bytes,
@@ -302,6 +313,10 @@ impl Drop for ProvisionalQuotaReservation {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "quota/recovery_tests.rs"]
+mod recovery_tests;
 
 #[cfg(test)]
 mod tests {

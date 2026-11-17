@@ -612,7 +612,11 @@ impl NFSFileSystem for NFSAdapter {
             }
         };
 
-        let (used_bytes, used_inodes) = self.fs.global_stats.get_totals();
+        let (used_bytes, used_inodes) = self
+            .fs
+            .global_stats
+            .known_totals()
+            .ok_or(nfsstat3::NFS3ERR_IO)?;
 
         // Fixed, signed-safe inode capacity (see fs::TOTAL_INODES): a u64::MAX-based
         // count renders negative under GNU `stat`/`df`. `available` = capacity - in-use.

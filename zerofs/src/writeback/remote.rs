@@ -1001,6 +1001,13 @@ fn is_terminal_remote_error(error: &object_store::Error) -> bool {
     if crate::retrying_object_store::has_capacity_source(error) {
         return false;
     }
+    // Quarantine may reject a selected member before placement publication.
+    // Replay can select a fresh member while the pool retains any cleanup debt
+    // for the refused generation. Only this typed refusal proves that boundary;
+    // media, identity, and uncertain catalog commit failures remain terminal.
+    if crate::pool_object_store::is_prepublication_allocation_refusal(error) {
+        return false;
+    }
     if crate::retrying_object_store::has_permanent_source(error) {
         return true;
     }
@@ -1607,15 +1614,19 @@ async fn abort_remote_multipart<T>(
     match bounded_remote_step(record, "multipart abort", owner.abort()).await {
         Ok(()) => Err(error),
         Err(abort_error) => {
-            if crate::sftp_object_store::recover_transient_staging_cleanup(&abort_error).await? {
-                // Preserve the original publication error, including permanent
-                // failures; settling a transient cleanup must never mask it.
-                Err(error)
-            } else {
-                Err(generic_error(format!(
-                    "{error}; remote multipart abort also failed: {abort_error}"
-                )))
+            if !crate::sftp_object_store::recover_transient_staging_cleanup(&abort_error).await? {
+                tracing::warn!(
+                    sequence = record.sequence,
+                    path = %record.path,
+                    error = %error,
+                    %abort_error,
+                    "remote multipart abort failed; retaining upload for cleanup"
+                );
             }
+            // The owner still queues the unresolved upload for cleanup, which
+            // independently fences replay. Preserve the original error's type:
+            // a later successful abort cannot make a permanent failure retryable.
+            Err(error)
         }
     }
 }
@@ -1894,6 +1905,12 @@ fn missing_remote_predecessor(
 
 #[cfg(test)]
 mod capacity_tests;
+
+#[cfg(test)]
+mod cleanup_tests;
+
+#[cfg(test)]
+mod placement_tests;
 
 #[cfg(test)]
 mod tests {

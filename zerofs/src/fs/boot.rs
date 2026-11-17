@@ -238,7 +238,7 @@ impl ZeroFS {
         let (reclaim_tx, reclaim_rx) = tokio::sync::mpsc::unbounded_channel();
         dedup.set_reclaim_sender(&reclaim_tx);
 
-        let committed = global_stats.get_totals().0;
+        let committed = global_stats.known_totals().map(|(bytes, _)| bytes);
         let fs = Self {
             name_mode,
             db: db.clone(),
@@ -270,7 +270,7 @@ impl ZeroFS {
             lineage_token,
             serving_writer_epoch,
             max_bytes,
-            quota: crate::fs::quota::LogicalQuota::new(max_bytes, committed),
+            quota: crate::fs::quota::LogicalQuota::from_known_usage(max_bytes, committed),
             tracer: AccessTracer::new(),
             object_tracer,
             dedup,

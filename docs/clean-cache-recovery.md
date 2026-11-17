@@ -110,7 +110,9 @@ does not call a clean prefix proof that the cache is clean. Files of another
 partition size are counted separately without being loaded into memory. An
 all-zero index page marks the end of a blob chain; a nonzero page that cannot
 be parsed makes the result incomplete. This includes stale tails of reused
-blocks whose remaining bytes cannot be identified by the current index.
+blocks whose remaining bytes cannot be identified by the current index. A
+current raw-parts cache has no auxiliary tombstone partitions, so any partition
+of another size also makes its scan incomplete.
 
 | Exit status | Meaning |
 |---|---|
