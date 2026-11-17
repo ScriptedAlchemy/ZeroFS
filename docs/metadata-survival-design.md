@@ -31,10 +31,11 @@ when a retained generation or candidate needs those bytes.
 
 One serialization owner establishes a common namespace and catalog prefix.
 It pre-drains writeback with admission open, then briefly closes admission for
-the final drain, seal, flush, checkpoint, export and all-replica record.
-Ordinary memory, local SSD and backend receipts keep their current meaning.
-They can wait at this bounded gate, but do not wait for a survival receipt of
-their own. Recovery uses verified immutable copies in owned scratch and never
+the final drain, seal, flush, checkpoint and catalog export. It reopens
+admission before any replica I/O, so replica publication runs with writes
+admitted. Ordinary memory, local SSD and backend receipts keep their current
+meaning. They can wait at this bounded gate, but do not wait for a survival
+receipt of their own. Recovery uses verified immutable copies in owned scratch and never
 opens the surviving sources through today's mutating startup path.
 
 This stage changes design text and executable acceptance contracts only.
@@ -104,6 +105,9 @@ commit_interval_seconds = 60
 replica_timeout_seconds = 90
 commit_deadline_seconds = 180
 checkpoint_lifetime_seconds = 600
+predrain_max_seconds = 120
+final_residual_max_bytes = 16777216
+final_pause_max_milliseconds = 1000
 
 [[storage.pool.metadata_survival.replicas]]
 id = "disk-a-metadata"
@@ -180,12 +184,12 @@ The metadata replica set must not depend on a single capacity HDD alone.
 
 | Event | Required live behavior |
 | --- | --- |
-| The authority or a metadata replica device is lost. | Close mutation admission. Stop normal export if its namespace view is unsafe. Require offline promotion or verified replacement before writable startup. |
+| The authority or a metadata replica device is lost. | Close mutation admission. Mutations fail at once with EROFS. Stop normal export if its namespace view is unsafe. Require offline promotion or verified replacement before writable startup. |
 | A data member holding no metadata replica is lost. | Keep unaffected files writable. Exclude the lost member from allocation. Return EIO for exactly its current sole-copy ranges. Keep names, holes and empty files. |
 | The NVMe journal is lost. | Stop service and recover a survival generation. Report the later local-only suffix as lost. Do not invent an exact lost-write count from a missing journal. |
-| A replica times out before any record publication. | Abort the attempt, settle owned I/O, reopen admission, report increasing lag and retry online. Do not advance the last successful sequence. |
-| A timeout or crash leaves a durable record on only some replicas. | Stop new publication and reconcile that exact candidate before admission opens again. A replica that missed a durable record needs offline repair if reconciliation cannot complete. |
-| A replica is full, stale, corrupt, has the wrong identity or returns an I/O error. | Refuse survival success, report the replica and latch mutation admission closed. Preserve retained generations and bounded queued work. |
+| A replica times out before any record publication. | Abort the attempt, settle owned I/O, report increasing lag and retry online. Admission stays open. Do not advance the last successful sequence. |
+| A timeout or crash leaves a durable record on only some replicas. | Close admission, stop new publication and reconcile that exact candidate before admission opens again. A replica that missed a durable record needs offline repair if reconciliation cannot complete. |
+| A replica is full, stale, corrupt, has the wrong identity or returns an I/O error. | Refuse survival success, report the replica and latch mutation admission closed. Mutations fail at once with EIO. Preserve retained generations and bounded queued work. |
 | A competing writer starts. | Refuse it while the first writer retains all replica locks. |
 | A replica is replaced. | Refuse online replacement. Require an offline epoch transition and verified identities and all retained bytes. |
 
@@ -197,24 +201,157 @@ durable commit requires offline repair. Identity conflicts and unverifiable
 bytes refuse the check rather than permitting unsafe service.
 
 The proposed per-replica timeout is 90 seconds, including publication, sync and
-verification, to allow HDD spin-up beyond 30 seconds. The final commit deadline
-is 180 seconds. These are design defaults, not measured latency promises.
+verification, to allow HDD spin-up beyond 30 seconds. The proposed commit
+deadline is 180 seconds, counted from closing admission to the last record.
 The checkpoint lifetime is 600 seconds and must exceed the commit deadline plus
 the maximum owned-I/O settlement margin. A timeout cannot cancel an in-progress
 fsync or release its locks early. Stop issuing new I/O, settle owned operations,
-record abandonment, then reopen admission. A device that cannot settle or is
+record abandonment, then report the failure. A device that cannot settle or is
 actually lost follows the device-loss rule. Injected timeout tests must bound
-the call by the timeout plus a five-second settlement margin. Queued unadmitted
-mutations receive a specific bounded retryable error when an attempt aborts.
+the call by the timeout plus a five-second settlement margin.
+
+### What a write waits for
+
+Every number in this section is a proposed default. None of them comes from a
+measurement. The defaults that depend on HDD latency stay unverified until the
+HDD measurement below runs.
+
+A survival attempt has three phases, and only the middle one closes admission.
+
+| Phase | Admission | What a new mutation waits for | When the budget runs out |
+| --- | --- | --- | --- |
+| Pre-drain | Open | Nothing that survival adds. Ordinary writeback backpressure is unchanged. | After `predrain_max_seconds` the owner skips the attempt with admission still open, returns `Timeout` to an explicit request and reports lag. Writers see nothing. |
+| Final pause | Closed | The admission gate, for at most `final_pause_max_milliseconds` from the mutation's arrival. | The owner aborts before any record, settles its own I/O and reopens admission. A mutation still waiting when its own bound expires fails without effect with EAGAIN. |
+| Replica publication | Open | Nothing. Replica I/O, including HDD fsync and spin-up, runs after admission reopens. | A replica timeout ends the attempt with `Timeout` and admission stays open. A full, stale, corrupt or failing replica latches admission closed. |
+
+Latched states do not make a mutation wait. While a replica fault holds
+admission closed, a mutation fails at once with EIO. After the authority or a
+metadata replica device is lost, and in offline recovery, a mutation fails at
+once with EROFS until offline promotion or verified replacement.
+
+These errors reach programs unchanged through both client paths.
+`FsError::RetryLater` maps to errno 11, EAGAIN, at `zerofs/src/fs/errors.rs:141`.
+`FsError::ReadOnlyFilesystem` maps to errno 30, EROFS, at line 148, and
+`FsError::IoError` to errno 5, EIO. The 9P server returns that errno in its
+`Rlerror` reply, and the Linux v9fs client returns it from the system call,
+such as write(2). The FUSE client `zerofs mount` speaks 9P to the server and
+answers the kernel with the same errno at `zerofs/src/mount.rs:255`, so a
+program on a FUSE mount sees the same value. ZeroFS already returns EAGAIN this
+way when writeback admission is backpressured, at
+`zerofs/src/fs/mutation/overlay_helpers.rs:61`. EAGAIN rather than EROFS keeps
+the read-only error for states that need an operator.
+
+| Key | Proposed default | Needs measuring on HDD-backed replicas or members |
+| --- | --- | --- |
+| `predrain_max_seconds` | 120 | Yes. HDD payload members absorb the pre-drain backlog. |
+| `final_residual_max_bytes` | 16,777,216 (16 MiB) | Yes. The final pause waits for this residual to reach HDD payload members. |
+| `final_pause_max_milliseconds` | 1,000 | Yes, through the residual drain. Seal, flush, checkpoint and catalog export touch only the authority device. |
+| `replica_timeout_seconds` | 90 | Yes. It must cover publication, sync and spin-up on an HDD replica. |
+| `commit_deadline_seconds` | 180 | Yes. It must cover publication on every replica. |
+| `commit_interval_seconds` | 60 | Yes, for standby. It decides whether HDDs can sleep while writes continue. |
+| `checkpoint_lifetime_seconds` | 600 | Only through the commit deadline it must exceed. |
+
+The 16 MiB residual is a guess sized to leave most of the 1,000 ms pause for
+seal, flush, checkpoint and export. The acceptance probes bound one mutation by
+the final pause plus one second, through `FINAL_PAUSE_MAX` in
+`zerofs/src/metadata_survival_tests/acceptance.rs`. The closed-phase rows
+expect EAGAIN, and the latched read-only and device-loss rows expect EROFS.
 
 Before closing admission, pre-drain the accepted writeback cutoff with writes
-still admitted. Wait until remaining lag fits configured byte and final-pause
-budgets. If incoming traffic prevents this, skip that attempt with admission
-open and report lag. The final closed phase handles only bounded residual work.
+still admitted. Close admission only when the remaining lag is at most
+`final_residual_max_bytes`. If incoming traffic keeps the lag above that for
+`predrain_max_seconds`, skip the attempt with admission open and report lag.
 A 200 GB backlog must not turn an ordinary bulk copy into a read-only outage.
 A missed deadline never permits dropping a replica or forgetting a generation.
 Finite admission and retention budgets remain mandatory. Budget exhaustion
 refuses mutations before consuming the physical free reserve.
+
+Reopening admission before replica publication is a proposal from the review
+follow-up and needs the coordinator's confirmation. The earlier ordering kept
+admission closed until every replica held the record, which put HDD fsync and
+spin-up inside the pause, for up to the 180-second commit deadline. The
+candidate is fixed once the checkpoint exists and the catalog export is taken.
+The ledger protects its dependencies from the writes that follow, so replica
+publication does not need admission closed.
+
+### Measurement that settles the HDD budgets
+
+The HDD-dependent defaults above are unverified. This measurement settles them.
+Run it on the NAS that will run survival, against the HDD that would hold a
+metadata replica and separately against one HDD payload member. Keep the
+production filesystem, ZFS `sync` setting, record size and any SLOG device
+unchanged. An SSD, a virtual disk or ubuntu-main does not count.
+
+The probe writes each file, fsyncs it and then fsyncs its directory. That is
+the `2 * N` sync pattern of one replica publication. Save it as
+`fsync-probe.py`:
+
+```python
+#!/usr/bin/env python3
+# Times one metadata-replica publication per commit: each file is written and
+# fsynced, then its directory is fsynced. Prints one JSON line.
+import argparse, json, os, statistics, time
+
+parser = argparse.ArgumentParser()
+parser.add_argument("directory", help="an empty directory on the disk under test")
+parser.add_argument("--sizes", default="1048576,65536,16384", help="bytes per file")
+parser.add_argument("--commits", type=int, default=200)
+args = parser.parse_args()
+sizes = [int(size) for size in args.sizes.split(",")]
+payloads = [os.urandom(size) for size in sizes]
+directory = os.open(args.directory, os.O_RDONLY | os.O_DIRECTORY)
+seconds = []
+for commit in range(args.commits):
+    started = time.monotonic()
+    for index, payload in enumerate(payloads):
+        path = os.path.join(args.directory, f"{commit}-{index}")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        view = memoryview(payload)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fsync(fd)
+        os.close(fd)
+        os.fsync(directory)
+    seconds.append(time.monotonic() - started)
+for name in os.listdir(args.directory):
+    os.unlink(os.path.join(args.directory, name))
+os.fsync(directory)
+seconds.sort()
+print(json.dumps({
+    "commits": len(seconds), "sizes": sizes,
+    "p50": statistics.median(seconds),
+    "p99": seconds[min(len(seconds) - 1, int(len(seconds) * 0.99))],
+    "max": seconds[-1],
+}))
+```
+
+Make an empty directory beside the replica directory on each disk, for example
+`/mnt/disk-a/fsync-probe`, and run these three measurements.
+
+1. Replica publication on a spinning disk. Run
+   `python3 fsync-probe.py /mnt/disk-a/fsync-probe` on the replica disk. The
+   default sizes are the worked example above, with 1 MiB of SSTs, 64 KiB of
+   catalog and 16 KiB of record. Repeat with
+   `--sizes 1048576,1048576,1048576,1048576,1048576,1048576,1048576,1048576,1048576,1048576`
+   and with `--sizes 16384` to bracket the range.
+2. Replica publication from standby. Spin the replica disk down with
+   `hdparm -y /dev/<disk>`, confirm standby with `hdparm -C /dev/<disk>`, then
+   run the probe with `--commits 1`. Repeat ten times and keep every result.
+   On TrueNAS CORE use `camcontrol standby` and `camcontrol cmd` instead.
+3. Residual drain on a payload member. On the HDD payload member, run the
+   probe with `--sizes 16777216 --commits 50`, then with 4194304 and with
+   1048576 in place of 16777216.
+
+Record the disk model and firmware, the pool layout, the `sync` and SLOG
+settings, the standby timer and every JSON line. Then apply these rules.
+
+| Result | Design change |
+| --- | --- |
+| Any standby run in measurement 2 exceeds 60 seconds. | Raise `replica_timeout_seconds` to at least 1.5 times the largest standby result and `commit_deadline_seconds` to twice that, or refuse metadata replicas on disks with standby enabled. |
+| The spinning p99 in measurement 1 exceeds 9 seconds, a tenth of the replica timeout. | Ordinary commits would run close to the timeout. Raise the timeout as above or move the replica off HDD. |
+| The p99 in measurement 3 at 16 MiB exceeds 500 ms, half the final pause. | Lower `final_residual_max_bytes` to the largest size whose p99 stays under 500 ms. |
+| The p99 in measurement 3 at 1 MiB exceeds 500 ms. | No residual budget fits a 1,000 ms pause on this hardware. The coordinator must choose a longer `final_pause_max_milliseconds`, which writers then wait for at each commit. |
+| Every result stays inside these limits. | Keep the defaults, record the results here and remove the unverified label. |
 
 Commits run on explicit request and an adaptive configurable interval, initially
 60 seconds. Skip publication when the mutation cutoff, catalog generation and
@@ -331,8 +468,9 @@ older copy of the same otherwise valid device without independent history.
 The acceptance hook cuts before and after actual publications and syncs, with
 the affected relative object path. Rename without parent sync is incomplete.
 
-1. Hold the fixed membership locks and writer epoch. Validate identity, capacity
-   and durable enablement. Pre-drain with admission open. If bounded final work
+1. Hold the fixed membership locks and writer epoch. Validate every replica's
+   identity, capacity and durable enablement before any I/O. Pre-drain with
+   admission open. If bounded final work
    cannot be reached, report lag and retry later with admission still open.
 2. Close admission, drain existing tokens and pause maintenance without holding
    inode, pool, catalog or database locks. Take the database barrier only after
@@ -348,9 +486,11 @@ the affected relative object path. Rename without parent sync is incomplete.
    namespace segment references against it and preserve verified unchanged
    chunks. Advisory read and monitor writes remain deferred. Include all table
    bytes, health, faults, hidden entries, identities, counters and real debts.
+   Pin the candidate's dependencies in the in-memory ledger, then reopen
+   admission. The final pause ends here, before any replica I/O.
 5. In stable replica-ID order, publish and sync all new key, catalog and metadata
    dependency bytes and lists. Verify lengths and hashes on every replica.
-   Protect candidate and retained generations in the ledger. No record may be
+   Make the candidate's ledger protection durable before any record. No record may be
    published until all replicas have every metadata dependency. Payload stays
    on its assigned member and is pinned there by exact physical generation.
 6. Publish the identical authenticated commit record in replica order, with file
@@ -362,14 +502,15 @@ the affected relative object path. Rename without parent sync is incomplete.
    A caller cancellation cannot cancel the owner's task or release exclusion.
 8. Transfer the export pin to immutable ledger protection, delete the owned live
    checkpoint with `Admin::delete_checkpoint` and drain that authority update.
-   Reopen admission. Retirement can then mark old generations with no readers,
+   Retirement can then mark old generations with no readers,
    publish its batch and compact anchor everywhere, and sweep unmarked bytes.
    Keep physical capacity debt until a later committed export covers completion.
 
 ### Abort, restart and retirement
 
 Before any record publication, a deadline abort records abandonment and candidate
-debts, releases its owned pin, settles I/O and reopens admission. A timeout alone
+debts, releases its owned pin and settles I/O. Admission is already open, or
+reopens if the abort happened in the final pause. A timeout alone
 does not make a replica stale. After partial durable fanout, startup locks all
 replicas and reconciles before opening admission. Find the highest unique
 candidate present anywhere, validate every dependency everywhere, and complete
@@ -447,7 +588,19 @@ contracts that require actual production bindings. Every row runs its oracle
 against both success-only and optimistic stub observations in the ordinary
 mutation test. A parser accepting the table or a driver claiming success cannot
 supply replica files, a cold namespace, an observed API error or a completed
-sweep. Missing bindings fail with their exact prerequisite and remove fixtures.
+sweep.
+
+A second ordinary test, `every_acceptance_row_fails_for_its_stated_reason`,
+runs every row's real driver path against the current implementation, four
+rows at a time with a 120-second budget per row. Each row must fail, and the
+root cause must be exactly the `Missing` prerequisite the row states. A pass, a
+panic, a timeout or any other error fails the test. One macro defines the row
+enum, `Row::ALL`, each stated reason and each ignored test, so a new row is
+covered by both ordinary tests without editing them. The check reaches each
+row's first missing prerequisite and nothing after it. The interrupted-commit
+row requests all 304 cuts, but each stops at the absent cut hook on one reused
+fixture, so no cut runs. Its 5,400-second budget applies only once that hook
+exists, and this test then fails until the row's stated reason changes.
 
 Every acknowledged receipt requires the record on every configured replica
 before loss. A missing directory cannot shrink that set. An interrupted
@@ -473,6 +626,14 @@ a real create and read status before and after it. The slow row verifies online
 retry and bounds timeout settlement. Full, stale and I/O failures require
 specific errors, failed replica identity and unchanged success sequence.
 
+The metadata replica loss row removes the disk that holds the second metadata
+copy and a sole-copy payload range while the writer is open. A commit attempt
+and a writable restart must each fail with `Lost`. Status must show admission
+closed, name `disk-a-metadata` and keep the last successful sequence, digest and
+completion time. The lost range must return EIO, the other range must read
+correctly and a create must fail with EROFS. The failed commit must leave the
+surviving metadata copy unchanged.
+
 The rows cover authority, journal and combined data/replica loss, exact catalog
 and key recovery, retained payload with an unretained dead control, interrupted
 commits, admitted work, replica faults, writer locks and offline replacement.
@@ -481,7 +642,8 @@ re-enablement, stale startup, corrupt dependency and record bytes, highest-chain
 selection with two valid generations, conflicting forks, partial-fanout restart,
 a backlog exceeding the deadline, deferred read faults while closed and
 read-only, idle skipping, record bounds and zero owned pins, lag status,
-authority promotion, orphan checkpoint recovery and crash-safe shared retention.
+authority promotion, orphan checkpoint recovery, crash-safe shared retention
+and live loss of the metadata replica disk.
 No case from the independent review is deferred without an acceptance row.
 
 Run formatting and the two CI clippy commands on the host through
@@ -524,8 +686,16 @@ require separate deployment tests. No NAS access or benchmarks belong here.
 - Not verified: Catalog path rebinding preserves existing wrong-pool protection.
 - Not verified: This branch predates the integrated name-mode envelope schema.
   Verify the merged schema and refuse an unknown required mode before implementation.
-- Not verified: Hardware identities, filesystem unlock material, measured HDD
-  latency, write cost and capacity budgets meet deployment requirements.
+- Not verified: Hardware identities, filesystem unlock material, write cost and
+  capacity budgets meet deployment requirements.
+- Not verified: The HDD-dependent budgets in the write-wait section fit real
+  HDDs. They stay unverified until the HDD measurement runs on the NAS.
+- Not verified: Reopening admission before replica publication is safe in every
+  mutator path. It depends on the ledger protecting the candidate from the
+  writes that follow the pause.
+- Not verified: The Linux v9fs client and the FUSE kernel module pass EAGAIN to
+  the program unchanged. This follows from the ZeroFS sources cited above. No
+  mounted test checked it.
 
 The coordinator selected a fixed all-replica single-host commit. HA, password
 changes, automatic membership changes, payload redundancy, ACLs, extended
