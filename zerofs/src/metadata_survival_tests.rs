@@ -6,9 +6,12 @@ use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs};
 use crate::fs::mutation::durability::{DurabilityTarget, ObjectCoverage};
+use crate::fs::name_mode::NameMode;
 use crate::fs::permissions::Credentials;
 use crate::fs::types::{AuthContext, SetAttributes, SetGid, SetMode, SetSize, SetUid};
-use crate::key_management::{load_existing_encryption_key, load_or_init_encryption_key};
+use crate::key_management::{
+    load_existing_encryption_key_with_mode, load_or_init_encryption_key_with_mode,
+};
 use crate::pool_object_store::PoolObjectStore;
 use crate::segment::{FOOTER_LEN, parse_footer};
 use crate::storage_backend::open_pool_storage;
@@ -114,9 +117,10 @@ async fn open_with_writeback(
     let store: Arc<dyn ObjectStore> = Arc::from(opened.store);
     let path = opened.path;
     let key = if initialize {
-        load_or_init_encryption_key(&store, &path, PASSWORD, false).await?
+        load_or_init_encryption_key_with_mode(&store, &path, PASSWORD, NameMode::Sensitive, false)
+            .await?
     } else {
-        load_existing_encryption_key(&store, &path, PASSWORD)
+        load_existing_encryption_key_with_mode(&store, &path, PASSWORD, NameMode::Sensitive)
             .await
             .context("recover original encryption key")?
     };
