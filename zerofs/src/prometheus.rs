@@ -600,7 +600,7 @@ fn collect_jemalloc_stats() {
             gauge!(name).set(bytes as f64);
         }
         gauge!("zerofs_jemalloc_arenas").set(pages.arenas as f64);
-        for (mib, count) in [128, 256, 512, 1024]
+        for (mib, count) in crate::alloc_rss::LARGE_EXTENT_MIB
             .into_iter()
             .zip(pages.large_extent_counts)
         {
