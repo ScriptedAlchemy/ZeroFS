@@ -271,7 +271,14 @@ pub(crate) fn verify_bucket_paths(settings: &Settings, namespace: &str) -> Resul
     let mut paths = vec![
         (RoleName::Cache, cache.clone()),
         (RoleName::Cache, cache.join(".zerofs-clean-cache.lock")),
-        (RoleName::Cache, cache.join("hybrid_cache")),
+        (
+            RoleName::Cache,
+            cache.join(crate::cli::server::LEGACY_BLOCK_CACHE_DIR),
+        ),
+        (
+            RoleName::Cache,
+            cache.join(crate::cli::server::BLOCK_CACHE_DIR),
+        ),
         (
             RoleName::Cache,
             cache.join(crate::object_store_prefetch::LEGACY_PARTS_CACHE_DIR),
