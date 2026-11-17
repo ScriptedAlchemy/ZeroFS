@@ -39,6 +39,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+#[cfg(test)]
+mod cache_files_tests;
 mod mutation_lifecycle;
 use mutation_lifecycle::{LifecycleOwners, MutationLifecycle};
 
