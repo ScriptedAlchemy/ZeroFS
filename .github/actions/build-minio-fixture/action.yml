@@ -14,6 +14,12 @@ runs:
       with:
         go-version: '1.24.x'
         cache: false
+    # Both tools are pinned to one commit each, so their modules never change.
+    # Keeping them means most runs need nothing from the Go module servers.
+    - uses: actions/cache@v4
+      with:
+        path: ~/go/pkg/mod
+        key: minio-fixture-modules-${{ runner.os }}-${{ runner.arch }}-7aac2a2c-77f82e18
     - name: Build pinned tools
       shell: bash
       env:
