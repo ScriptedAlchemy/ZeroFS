@@ -537,17 +537,7 @@ impl ZeroFS {
             };
             let (now_sec, now_nsec) = get_current_time();
             set_rename_backpointer(&mut source_inode, to_dirid, to_name);
-            let (ctime, ctime_nsec) = match &mut source_inode {
-                Inode::Directory(i) => (&mut i.ctime, &mut i.ctime_nsec),
-                Inode::File(i) => (&mut i.ctime, &mut i.ctime_nsec),
-                Inode::Symlink(i) => (&mut i.ctime, &mut i.ctime_nsec),
-                Inode::Fifo(i)
-                | Inode::Socket(i)
-                | Inode::CharDevice(i)
-                | Inode::BlockDevice(i) => (&mut i.ctime, &mut i.ctime_nsec),
-            };
-            *ctime = now_sec;
-            *ctime_nsec = now_nsec;
+            source_inode.set_ctime(now_sec, now_nsec);
             let mut txn = self.db.new_transaction()?;
             txn.set_dedup_result(op_id, DedupResult::Rename);
             self.inode_store
