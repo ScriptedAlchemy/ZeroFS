@@ -987,6 +987,27 @@ mod tests {
         }
     }
 
+    /// Linux `mode_strip_sgid` (fs/inode.c) clears an inherited setgid bit
+    /// only when group execute is also set.
+    #[tokio::test]
+    async fn inherited_group_keeps_sgid_without_group_execute() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let dir = setgid_dir(&fs, b"sgid-no-exec").await;
+        let attr = SetAttributes {
+            mode: SetMode::Set(0o2644),
+            ..Default::default()
+        };
+        let (_, file) = fs.create(&test_creds(), dir, b"file", &attr).await.unwrap();
+        let (_, fifo) = fs
+            .mknod(&test_creds(), dir, b"fifo", FileType::Fifo, &attr, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            (file.gid, file.mode, fifo.gid, fifo.mode),
+            (SETGID_PARENT_GID, 0o2644, SETGID_PARENT_GID, 0o2644)
+        );
+    }
+
     #[tokio::test]
     async fn create_file_inherits_setgid_parent_group() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
