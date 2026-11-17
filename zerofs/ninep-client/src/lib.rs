@@ -6373,11 +6373,12 @@ mod session_transition_tests {
 
             let held_client = Arc::clone(&client);
             let held = tokio::spawn(async move { held_client.getattr(1, 0).await });
+            // Writes take their permit before staging the payload.
             let queued_client = Arc::clone(&client);
-            let queued = tokio::spawn(async move { queued_client.getattr(2, 0).await });
+            let queued = tokio::spawn(async move { queued_client.write(7, 0, b"q").await });
             assert!(settle(held, "the admitted getattr").await.is_err());
             assert!(
-                settle(queued, "the getattr queued for admission")
+                settle(queued, "the write queued for admission")
                     .await
                     .is_err()
             );
