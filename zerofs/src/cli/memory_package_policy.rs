@@ -88,5 +88,5 @@ pub(super) const HEADROOM_BYTES: u64 =
     round_up((ENGINE_PEAK_BYTES * 15).div_ceil(100) + (KERNEL_PEAK_BYTES * 125).div_ceil(100));
 pub(super) const EVIDENCE: &str = "computed from ci+webui package-baseline-ci-limit64g-cache0.001-wb0-jobs8-primary/samples.jsonl; R=ceil64MiB(1.10*3241541632); H=ceil64MiB(0.15*3241541632+1.25*137129984)";
 
-pub(super) const QUALIFIED_LOGICAL_BYTES: u64 = 12 * 1024 * 1024 * 1024 + 5000 * 1024;
-pub(super) const QUALIFIED_REGULAR_FILES: u64 = 5001;
+pub(super) const QUALIFIED_LOGICAL_BYTES: u64 = 50 * 1024 * 1024 * 1024 + 50_000 * 1024;
+pub(super) const QUALIFIED_REGULAR_FILES: u64 = 50_039;

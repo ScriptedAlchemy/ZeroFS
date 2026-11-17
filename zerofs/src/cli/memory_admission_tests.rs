@@ -443,8 +443,8 @@ fn json_receipt_distinguishes_empirical_coverage_from_legacy_policy() {
     let receipt = admission(temp.path(), &base).unwrap();
     let json = serde_json::to_value(receipt).unwrap();
     let state = &json["stored_state_qualification"];
-    assert_eq!(state["logical_bytes"], 12 * GIB + 5000 * 1024);
-    assert_eq!(state["regular_files"], 5001);
+    assert_eq!(state["logical_bytes"], 50 * GIB + 50_000 * 1024);
+    assert_eq!(state["regular_files"], 50_039);
     assert_eq!(state["enforcement"], "empirical_not_enforced");
     let legacy = base.replace("memory_size_gb = 0.001", "memory_size_gb = 1.0");
     let receipt = admission(temp.path(), &legacy).unwrap();
