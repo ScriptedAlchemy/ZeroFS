@@ -414,7 +414,7 @@ async fn xattrs_survive_database_reopen() {
     let block_transformer: Arc<dyn BlockTransformer> =
         ZeroFsBlockTransformer::new_arc(&test_key, CompressionConfig::default());
 
-    // Path must match `new_in_memory_read_only` so the reader finds the db.
+    // The path must match `new_in_memory_read_only` so the reader finds the db.
     let slatedb = Arc::new(
         DbBuilder::new(Path::from("test_slatedb"), object_store.clone())
             .with_block_transformer(block_transformer)

@@ -475,7 +475,7 @@ impl AdminService for AdminRpcServer {
             interval_ms,
         )))
         .map(move |_| {
-            // Absent rather than a partial sum when a stats shard was unreadable at boot.
+            // The totals are absent, not a partial sum, when a stats shard was unreadable at boot.
             let usage = global_stats.known_totals();
             let mem = JemallocMemStats::read();
             Ok(proto::StatsSnapshot {
@@ -1027,8 +1027,8 @@ mod tests {
         .await;
         let (client, shutdown, _dir) = setup_fs(fs, checkpoint_manager, false).await;
         let sample = first_stats_sample(&client).await;
-        // Absent on the wire: prost decodes an optional field to None only when the
-        // field was not sent.
+        // The fields are absent on the wire. Prost decodes an optional field to None
+        // only when the field was not sent.
         assert_eq!(sample.used_bytes, None);
         assert_eq!(sample.used_inodes, None);
         // The process-lifetime I/O counters do not depend on the shards.

@@ -1038,7 +1038,7 @@ impl Catalog {
         active: Option<&super::EvacuationProgress>,
     ) -> Result<PoolStatus> {
         let tx = self.database.begin_read()?;
-        // Read after the snapshot opens, so every observation it holds is no later.
+        // Read the clock after the snapshot opens, so no observation in it is later.
         let generated_ms = chrono::Utc::now().timestamp_millis();
         let mut counts = BTreeMap::<String, u64>::new();
         let mut mapped_objects = 0_u64;

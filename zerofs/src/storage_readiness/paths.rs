@@ -56,9 +56,10 @@ pub(super) fn verify_role(root: &super::config::StorageRoot<'_>) -> Result<()> {
         RoleName::Cache | RoleName::Journal => &[],
     };
     // Startup checks fixed paths and sets bounded by configuration. Never
-    // enumerate authority/member objects or journal blobs, whose counts grow
-    // with stored data. Object operations check their components before I/O;
-    // listings reject symlinks while walking only their requested subtree.
+    // enumerate authority objects, member objects or journal blobs, whose
+    // counts grow with stored data. Object operations check their components
+    // before I/O; listings reject symlinks while walking only their requested
+    // subtree.
     for child in children {
         existing_ancestor(&root.path, &root.path.join(child))?;
     }
