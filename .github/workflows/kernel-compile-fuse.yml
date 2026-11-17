@@ -135,8 +135,15 @@ jobs:
 
       - name: Download Linux kernel
         run: |
+          # Fetch and validate the archive on runner-local disk, so a network
+          # failure fails here and is never mistaken for a mount failure. The
+          # validated archive is then written to the mount and unpacked there.
+          archive="$RUNNER_TEMP/linux-7.2-rc1.tar.gz"
+          python3 "$GITHUB_WORKSPACE/scripts/ci/fetch-linux-source.py" \
+            --version 7.2-rc1 --output "$archive"
           cd /mnt/zerofs
-          wget -q https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/snapshot/linux-7.2-rc1.tar.gz
+          cp "$archive" linux-7.2-rc1.tar.gz
+          cmp "$archive" linux-7.2-rc1.tar.gz
           tar -xf linux-7.2-rc1.tar.gz
           rm linux-7.2-rc1.tar.gz
 
