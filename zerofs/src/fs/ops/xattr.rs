@@ -40,12 +40,26 @@ impl XattrName {
         }
     }
 
-    pub(crate) fn check(
+    fn check_read(&self, inode: &Inode, creds: &Credentials) -> Result<(), FsError> {
+        if self.as_bytes() == b"security.capability" {
+            return Err(FsError::NoData);
+        }
+        self.check_access(inode, creds, false)
+    }
+
+    pub(crate) fn check_mutation(
         &self,
         inode: &Inode,
         creds: &Credentials,
-        write: bool,
+        remove: bool,
     ) -> Result<(), FsError> {
+        if !remove && self.as_bytes() == b"security.capability" {
+            return Err(FsError::NotSupported);
+        }
+        self.check_access(inode, creds, true)
+    }
+
+    fn check_access(&self, inode: &Inode, creds: &Credentials, write: bool) -> Result<(), FsError> {
         match self.namespace()? {
             b"user" => {
                 if !matches!(inode, Inode::File(_) | Inode::Directory(_)) {
@@ -115,7 +129,7 @@ impl ZeroFS {
     ) -> Result<Bytes, FsError> {
         let _guard = self.lock_manager.acquire(id).await;
         let inode = self.inode_store.get(id).await?;
-        name.check(&inode, creds, false)?;
+        name.check_read(&inode, creds)?;
         self.xattr_store.get(id, name.as_bytes()).await
     }
 
@@ -125,7 +139,7 @@ impl ZeroFS {
         let mut list = Vec::new();
         for name in self.xattr_store.list(id).await? {
             let name = XattrName::new(&name)?;
-            if name.check(&inode, creds, false).is_ok() {
+            if name.check_read(&inode, creds).is_ok() {
                 list.extend_from_slice(name.as_bytes());
                 list.push(0);
             }
@@ -166,7 +180,7 @@ impl ZeroFS {
             .await?;
         let guard = self.lock_manager.acquire(id).await;
         let mut inode = self.inode_store.get(id).await?;
-        name.check(&inode, creds, true)?;
+        name.check_mutation(&inode, creds, value.is_none())?;
         let exists = match self.xattr_store.get(id, name.as_bytes()).await {
             Ok(_) => true,
             Err(FsError::NoData) => false,
