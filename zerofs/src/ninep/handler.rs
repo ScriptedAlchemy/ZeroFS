@@ -655,7 +655,8 @@ impl NinePHandler {
 
     /// Returns the effective GID for a create-type operation. When a credential
     /// override is active, the server-configured GID is used instead of
-    /// whatever the client sent.
+    /// whatever the client sent. Creates pass it in the credentials rather
+    /// than as an explicit group, so a setgid parent's group still wins.
     fn effective_gid(&self, client_gid: u32, fid_creds: &Credentials) -> u32 {
         if self.credential_override.is_some() {
             fid_creds.gid
@@ -1868,7 +1869,7 @@ impl NinePHandler {
                 &SetAttributes {
                     mode: SetMode::Set(mode),
                     uid: SetUid::Set(parent_fid.creds.uid),
-                    gid: SetGid::Set(gid),
+                    gid: SetGid::NoChange,
                     ..Default::default()
                 },
                 op_id,
@@ -2197,7 +2198,7 @@ impl NinePHandler {
                 &SetAttributes {
                     mode: SetMode::Set(tm.mode),
                     uid: SetUid::Set(parent_fid.creds.uid),
-                    gid: SetGid::Set(gid),
+                    gid: SetGid::NoChange,
                     ..Default::default()
                 },
                 op_id,
@@ -2239,7 +2240,7 @@ impl NinePHandler {
                 &SetAttributes {
                     mode: SetMode::Set(SYMLINK_DEFAULT_MODE),
                     uid: SetUid::Set(parent_fid.creds.uid),
-                    gid: SetGid::Set(gid),
+                    gid: SetGid::NoChange,
                     ..Default::default()
                 },
                 op_id,
@@ -2294,7 +2295,7 @@ impl NinePHandler {
                 &SetAttributes {
                     mode: SetMode::Set(tm.mode & 0o7777),
                     uid: SetUid::Set(parent_fid.creds.uid),
-                    gid: SetGid::Set(gid),
+                    gid: SetGid::NoChange,
                     ..Default::default()
                 },
                 rdev,

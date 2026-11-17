@@ -110,6 +110,7 @@ impl ZeroFS {
 
                 let new_gid = new_entry_gid(dir, &attr.gid, creds);
                 let final_mode = strip_sgid_unless_member(
+                    dir,
                     match &attr.mode {
                         SetMode::Set(m) => validate_mode(*m),
                         SetMode::NoChange => 0o666,
@@ -501,6 +502,7 @@ impl ZeroFS {
 
                 let new_gid = new_entry_gid(dir, &attr.gid, creds);
                 let final_mode = strip_sgid_unless_member(
+                    dir,
                     if let SetMode::Set(m) = attr.mode {
                         validate_mode(m)
                     } else {

@@ -117,7 +117,9 @@ impl NFSAdapter {
         let mut attr = SetAttributes::from(attr);
         if let Some(identity) = self.shared_identity {
             attr.uid = SetUid::Set(identity.uid);
-            attr.gid = SetGid::Set(identity.gid);
+            // The identity's group is in the credentials, so a setgid
+            // parent's group still wins.
+            attr.gid = SetGid::NoChange;
         }
         attr
     }
