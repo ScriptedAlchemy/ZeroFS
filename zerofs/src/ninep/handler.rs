@@ -4029,7 +4029,68 @@ mod tests {
         }
     }
 
-    async fn exact_walk_replacement_at_pause(before_pin: bool, directory: bool) {
+    /// The two ways a session asks for an exact-spelling walk.
+    #[derive(Clone, Copy, Debug)]
+    enum ExactWalkSession {
+        /// The private dialect's per-request `Twalkgetattrexact`.
+        Private,
+        /// A plain `9P2000.L` `Twalk` on a listener set to exact lookup.
+        Standard,
+    }
+
+    impl ExactWalkSession {
+        const ALL: [Self; 2] = [Self::Private, Self::Standard];
+
+        async fn start(self, fs: &Arc<ZeroFS>, version: &[u8]) -> NinePHandler {
+            let handler = NinePHandler::new(fs.clone(), Arc::new(FileLockManager::new()));
+            let (handler, version) = match self {
+                Self::Private => (handler, version),
+                Self::Standard => (
+                    handler.with_standard_lookup(NameMatch::Exact),
+                    VERSION_9P2000L,
+                ),
+            };
+            start_session(&handler, DEFAULT_MSIZE, version, b"").await;
+            handler
+        }
+
+        fn walk(self, names: &[&[u8]]) -> Message {
+            let wnames: Vec<_> = names
+                .iter()
+                .map(|name| P9String::new(name.to_vec()))
+                .collect();
+            let nwname = wnames.len() as u16;
+            match self {
+                Self::Private => Message::Twalkgetattrexact(Twalkgetattr {
+                    fid: 1,
+                    newfid: 2,
+                    nwname,
+                    wnames,
+                }),
+                Self::Standard => Message::Twalk(Twalk {
+                    fid: 1,
+                    newfid: 2,
+                    nwname,
+                    wnames,
+                }),
+            }
+        }
+
+        /// The inode the walk reached, or `None` for an error reply.
+        fn reached(response: &Message) -> Option<u64> {
+            match response {
+                Message::Rwalkgetattr(reply) => Some(reply.stat.qid.path),
+                Message::Rwalk(reply) => reply.wqids.last().map(|qid| qid.path),
+                _ => None,
+            }
+        }
+    }
+
+    async fn exact_walk_replacement_at_pause(
+        session: ExactWalkSession,
+        before_pin: bool,
+        directory: bool,
+    ) {
         use crate::fs::name_mode::NameMode;
 
         let fs = Arc::new(
@@ -4053,8 +4114,7 @@ mod tests {
                 .await
         }
         .unwrap();
-        let handler = NinePHandler::new(fs.clone(), Arc::new(FileLockManager::new()));
-        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS_CI, b"").await;
+        let handler = session.start(&fs, VERSION_9P2000L_ZEROFS_CI).await;
         let (reached, reached_rx) = tokio::sync::oneshot::channel();
         let (resume, resume_rx) = tokio::sync::oneshot::channel();
         let pause = if before_pin {
@@ -4067,19 +4127,8 @@ mod tests {
             resume: resume_rx,
         });
         let lookup_handler = handler.clone();
-        let lookup = tokio::spawn(async move {
-            request(
-                &lookup_handler,
-                2,
-                Message::Twalkgetattrexact(Twalkgetattr {
-                    fid: 1,
-                    newfid: 2,
-                    nwname: 1,
-                    wnames: vec![P9String::new(b"Foo".to_vec())],
-                }),
-            )
-            .await
-        });
+        let lookup =
+            tokio::spawn(async move { request(&lookup_handler, 2, session.walk(&[b"Foo"])).await });
         tokio::time::timeout(std::time::Duration::from_secs(10), reached_rx)
             .await
             .unwrap()
@@ -4114,9 +4163,10 @@ mod tests {
         } else {
             replacement
         };
-        assert!(
-            matches!(response.body, Message::Rwalkgetattr(ref reply) if reply.stat.qid.path == expected),
-            "an atomic replacement must remain visible: {:?}",
+        assert_eq!(
+            ExactWalkSession::reached(&response.body),
+            Some(expected),
+            "{session:?}: an atomic replacement must remain visible: {:?}",
             response.body
         );
         if directory && (before_pin || directory_locked) {
@@ -4127,23 +4177,35 @@ mod tests {
 
     #[tokio::test]
     async fn exact_walk_survives_atomic_replacement() {
-        for directory in [false, true] {
-            exact_walk_replacement_at_pause(false, directory).await;
+        for session in ExactWalkSession::ALL {
+            for directory in [false, true] {
+                exact_walk_replacement_at_pause(session, false, directory).await;
+            }
         }
     }
 
     #[tokio::test]
     async fn exact_file_walk_survives_replacement_before_pin() {
-        exact_walk_replacement_at_pause(true, false).await;
+        for session in ExactWalkSession::ALL {
+            exact_walk_replacement_at_pause(session, true, false).await;
+        }
     }
 
     #[tokio::test]
     async fn exact_directory_walk_survives_replacement_before_pin() {
-        exact_walk_replacement_at_pause(true, true).await;
+        for session in ExactWalkSession::ALL {
+            exact_walk_replacement_at_pause(session, true, true).await;
+        }
     }
 
     #[tokio::test]
     async fn exact_walk_waits_for_atomic_replacement_to_apply() {
+        for session in ExactWalkSession::ALL {
+            exact_walk_waits_for_replacement(session).await;
+        }
+    }
+
+    async fn exact_walk_waits_for_replacement(session: ExactWalkSession) {
         use crate::fs::name_mode::NameMode;
         let fs = Arc::new(
             ZeroFS::new_in_memory_with_name_mode(NameMode::Insensitive)
@@ -4159,8 +4221,7 @@ mod tests {
             .await
             .unwrap()
             .0;
-        let handler = NinePHandler::new(fs.clone(), Arc::new(FileLockManager::new()));
-        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+        let handler = session.start(&fs, VERSION_9P2000L_ZEROFS).await;
 
         // Hold the rename after it has queued the old inode's deletion but
         // before the namespace transaction applies. Foo exists throughout.
@@ -4173,28 +4234,405 @@ mod tests {
                 .await
         });
         apply_reached.await.unwrap();
-        let mut walking = Box::pin(request(
-            &handler,
-            2,
-            Message::Twalkgetattrexact(Twalkgetattr {
-                fid: 1,
-                newfid: 2,
-                nwname: 1,
-                wnames: vec![P9String::new(b"Foo".to_vec())],
-            }),
-        ));
+        let mut walking = Box::pin(request(&handler, 2, session.walk(&[b"Foo"])));
         assert!(
             futures::poll!(walking.as_mut()).is_pending(),
-            "exact lookup observed an unapplied replacement"
+            "{session:?}: exact lookup observed an unapplied replacement"
         );
         drop(block_apply);
         renaming.await.unwrap().unwrap();
         let response = walking.await;
-        assert!(
-            matches!(response.body, Message::Rwalkgetattr(ref reply) if reply.stat.qid.path == replacement),
-            "{:?}",
+        assert_eq!(
+            ExactWalkSession::reached(&response.body),
+            Some(replacement),
+            "{session:?}: {:?}",
             response.body
         );
+    }
+
+    /// The errno of an error reply, or `None` for any other reply.
+    fn errno(response: &P9Message) -> Option<u32> {
+        match response.body {
+            Message::Rlerror(Rlerror { ecode }) => Some(ecode),
+            _ => None,
+        }
+    }
+
+    /// An insensitive filesystem behind a plain `9P2000.L` session whose
+    /// listener uses `rule`. Fid 1 is the attach root.
+    async fn standard_session(
+        mode: crate::fs::name_mode::NameMode,
+        rule: Option<NameMatch>,
+    ) -> (Arc<ZeroFS>, NinePHandler) {
+        let fs = Arc::new(ZeroFS::new_in_memory_with_name_mode(mode).await.unwrap());
+        let mut handler = NinePHandler::new(fs.clone(), Arc::new(FileLockManager::new()));
+        if let Some(rule) = rule {
+            handler = handler.with_standard_lookup(rule);
+        }
+        start_plain_session(&handler).await;
+        assert!(!handler.zerofs_protocol_enabled());
+        (fs, handler)
+    }
+
+    async fn make_entry(fs: &ZeroFS, parent: InodeId, name: &[u8], directory: bool) -> InodeId {
+        let creds = test_creds();
+        if directory {
+            fs.mkdir(&creds, parent, name, &SetAttributes::default())
+                .await
+        } else {
+            fs.create(&creds, parent, name, &SetAttributes::default())
+                .await
+        }
+        .unwrap()
+        .0
+    }
+
+    /// Walk from fid 1 to fid 2 and return the reached inode, then clunk
+    /// fid 2. An error reply returns its errno and must leave fid 2 unused.
+    async fn walk_to(handler: &NinePHandler, names: &[&[u8]]) -> Result<u64, u32> {
+        let response = walk_fid(handler, 10, 1, 2, names).await;
+        if let Some(ecode) = errno(&response) {
+            assert!(handler.get_fid(2).is_err(), "{names:?}");
+            return Err(ecode);
+        }
+        let Message::Rwalk(reply) = response.body else {
+            panic!("{names:?}: expected a walk reply");
+        };
+        assert_eq!(reply.wqids.len(), names.len(), "{names:?}");
+        request(handler, 11, Message::Tclunk(Tclunk { fid: 2 })).await;
+        Ok(reply.wqids.last().unwrap().path)
+    }
+
+    async fn unlink_at(handler: &NinePHandler, name: &[u8], directory: bool) -> P9Message {
+        request(
+            handler,
+            12,
+            Message::Tunlinkat(Tunlinkat {
+                dirfid: 1,
+                name: P9String::new(name.to_vec()),
+                flags: if directory { AT_REMOVEDIR } else { 0 },
+            }),
+        )
+        .await
+    }
+
+    async fn rename_at(handler: &NinePHandler, from: &[u8], to: &[u8]) -> P9Message {
+        request(
+            handler,
+            13,
+            Message::Trenameat(Trenameat {
+                olddirfid: 1,
+                oldname: P9String::new(from.to_vec()),
+                newdirfid: 1,
+                newname: P9String::new(to.to_vec()),
+            }),
+        )
+        .await
+    }
+
+    /// Stored spellings in the attach root, through an opened clone of fid 1.
+    async fn root_listing(handler: &NinePHandler) -> Vec<(Vec<u8>, u64)> {
+        expect_walk(handler, 14, 1, 20, &[]).await;
+        open_fid(handler, 15, 20, O_RDONLY as u32).await;
+        let response = request(
+            handler,
+            16,
+            Message::Treaddir(Treaddir {
+                fid: 20,
+                offset: 0,
+                count: 8192,
+            }),
+        )
+        .await;
+        let Message::Rreaddir(reply) = response.body else {
+            panic!("expected a readdir reply: {:?}", response.body);
+        };
+        request(handler, 17, Message::Tclunk(Tclunk { fid: 20 })).await;
+        reply
+            .to_entries()
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.name.data, entry.qid.path))
+            .filter(|(name, _)| name != b"." && name != b"..")
+            .collect()
+    }
+
+    /// Every create-type request for `name` in the attach root, each paired
+    /// with its reply. `link_source` is a walkable regular file.
+    async fn create_each_kind(
+        handler: &NinePHandler,
+        name: &[u8],
+        link_source: &[u8],
+    ) -> Vec<(&'static str, P9Message)> {
+        let name = || P9String::new(name.to_vec());
+        expect_walk(handler, 30, 1, 21, &[]).await;
+        expect_walk(handler, 31, 1, 22, &[link_source]).await;
+        let replies = vec![
+            (
+                "Tlcreate",
+                request(
+                    handler,
+                    32,
+                    Message::Tlcreate(Tlcreate {
+                        fid: 21,
+                        name: name(),
+                        flags: O_RDWR as u32,
+                        mode: 0o644,
+                        gid: 1000,
+                    }),
+                )
+                .await,
+            ),
+            (
+                "Tmkdir",
+                request(
+                    handler,
+                    33,
+                    Message::Tmkdir(Tmkdir {
+                        dfid: 1,
+                        name: name(),
+                        mode: 0o755,
+                        gid: 1000,
+                    }),
+                )
+                .await,
+            ),
+            (
+                "Tmknod",
+                request(
+                    handler,
+                    34,
+                    Message::Tmknod(Tmknod {
+                        dfid: 1,
+                        name: name(),
+                        mode: S_IFIFO | 0o644,
+                        major: 0,
+                        minor: 0,
+                        gid: 1000,
+                    }),
+                )
+                .await,
+            ),
+            (
+                "Tsymlink",
+                request(
+                    handler,
+                    35,
+                    Message::Tsymlink(Tsymlink {
+                        dfid: 1,
+                        name: name(),
+                        symtgt: P9String::new(b"target".to_vec()),
+                        gid: 1000,
+                    }),
+                )
+                .await,
+            ),
+            (
+                "Tlink",
+                request(
+                    handler,
+                    36,
+                    Message::Tlink(Tlink {
+                        dfid: 1,
+                        fid: 22,
+                        name: name(),
+                    }),
+                )
+                .await,
+            ),
+        ];
+        request(handler, 37, Message::Tclunk(Tclunk { fid: 21 })).await;
+        request(handler, 38, Message::Tclunk(Tclunk { fid: 22 })).await;
+        replies
+    }
+
+    #[tokio::test]
+    async fn standard_exact_lookup_matches_the_stored_spelling() {
+        use crate::fs::name_mode::NameMode;
+        use crate::linux_errno::{EEXIST, ENOENT};
+        for directory in [false, true] {
+            let kind = if directory { "directory" } else { "file" };
+            let (fs, handler) =
+                standard_session(NameMode::Insensitive, Some(NameMatch::Exact)).await;
+            let id = make_entry(&fs, 0, b"Foo", directory).await;
+            make_entry(&fs, 0, b"Other", false).await;
+
+            assert_eq!(walk_to(&handler, &[b"foo"]).await, Err(ENOENT), "{kind}");
+            assert_eq!(walk_to(&handler, &[b"Foo"]).await, Ok(id), "{kind}");
+
+            // A name that matches only by case does not name the entry.
+            let response = unlink_at(&handler, b"foo", directory).await;
+            assert_eq!(errno(&response), Some(ENOENT), "{kind}");
+            let response = rename_at(&handler, b"foo", b"Moved").await;
+            assert_eq!(errno(&response), Some(ENOENT), "{kind}");
+            assert_eq!(walk_to(&handler, &[b"Foo"]).await, Ok(id), "{kind}");
+            assert_eq!(walk_to(&handler, &[b"Moved"]).await, Err(ENOENT));
+
+            // The filesystem's uniqueness rule still rejects a fold-equal name.
+            for (request, response) in create_each_kind(&handler, b"foo", b"Other").await {
+                assert_eq!(errno(&response), Some(EEXIST), "{kind}: {request}");
+            }
+
+            // A case-only rename reaches the filesystem and takes effect.
+            let response = rename_at(&handler, b"Foo", b"foo").await;
+            assert!(
+                matches!(response.body, Message::Rrenameat(_)),
+                "{kind}: {:?}",
+                response.body
+            );
+            let listing = root_listing(&handler).await;
+            assert!(listing.contains(&(b"foo".to_vec(), id)), "{kind}");
+            assert!(!listing.iter().any(|(name, _)| name == b"Foo"), "{kind}");
+            assert_eq!(walk_to(&handler, &[b"foo"]).await, Ok(id), "{kind}");
+            assert_eq!(walk_to(&handler, &[b"Foo"]).await, Err(ENOENT), "{kind}");
+
+            // Unlink by the stored spelling works.
+            let response = unlink_at(&handler, b"foo", directory).await;
+            assert!(
+                matches!(response.body, Message::Runlinkat(_)),
+                "{kind}: {:?}",
+                response.body
+            );
+            assert!(matches!(
+                fs.lookup(&test_creds(), 0, b"FOO").await,
+                Err(FsError::NotFound)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn standard_exact_rename_onto_another_entrys_spelling_replaces_it() {
+        use crate::fs::name_mode::NameMode;
+        use crate::linux_errno::ENOENT;
+        for directory in [false, true] {
+            let kind = if directory { "directory" } else { "file" };
+            let (fs, handler) =
+                standard_session(NameMode::Insensitive, Some(NameMatch::Exact)).await;
+            let source = make_entry(&fs, 0, b"Source", directory).await;
+            let victim = make_entry(&fs, 0, b"Victim", directory).await;
+
+            let response = rename_at(&handler, b"Source", b"victim").await;
+            assert!(
+                matches!(response.body, Message::Rrenameat(_)),
+                "{kind}: {:?}",
+                response.body
+            );
+            let listing = root_listing(&handler).await;
+            assert_eq!(listing, vec![(b"victim".to_vec(), source)], "{kind}");
+            assert_eq!(walk_to(&handler, &[b"victim"]).await, Ok(source));
+            assert_eq!(walk_to(&handler, &[b"Victim"]).await, Err(ENOENT));
+            assert!(fs.inode_store.get(victim).await.is_err(), "{kind}");
+        }
+    }
+
+    #[tokio::test]
+    async fn standard_exact_walk_checks_every_component() {
+        use crate::fs::name_mode::NameMode;
+        use crate::linux_errno::ENOENT;
+        let (fs, handler) = standard_session(NameMode::Insensitive, Some(NameMatch::Exact)).await;
+        let parent = make_entry(&fs, 0, b"Parent", true).await;
+        let child = make_entry(&fs, parent, b"Child", false).await;
+
+        assert_eq!(walk_to(&handler, &[b"Parent", b"Child"]).await, Ok(child));
+        assert_eq!(walk_to(&handler, &[b"parent", b"Child"]).await, Err(ENOENT));
+        // A later miss returns the walked prefix and publishes no fid.
+        let response = walk_fid(&handler, 40, 1, 2, &[b"Parent", b"child"]).await;
+        let Message::Rwalk(reply) = response.body else {
+            panic!("expected a partial walk: {:?}", response.body);
+        };
+        assert_eq!(
+            reply.wqids.iter().map(|qid| qid.path).collect::<Vec<_>>(),
+            vec![parent]
+        );
+        assert!(handler.get_fid(2).is_err());
+    }
+
+    #[tokio::test]
+    async fn standard_lookup_defaults_to_folded_names() {
+        use crate::fs::name_mode::NameMode;
+        for rule in [None, Some(NameMatch::Folded)] {
+            for directory in [false, true] {
+                let (fs, handler) = standard_session(NameMode::Insensitive, rule).await;
+                let id = make_entry(&fs, 0, b"Foo", directory).await;
+                assert_eq!(walk_to(&handler, &[b"foo"]).await, Ok(id));
+                assert_eq!(walk_to(&handler, &[b"FOO"]).await, Ok(id));
+                let response = rename_at(&handler, b"foo", b"Bar").await;
+                assert!(matches!(response.body, Message::Rrenameat(_)));
+                assert_eq!(root_listing(&handler).await, vec![(b"Bar".to_vec(), id)]);
+                let response = unlink_at(&handler, b"bar", directory).await;
+                assert!(matches!(response.body, Message::Runlinkat(_)));
+                assert!(root_listing(&handler).await.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn private_dialect_ignores_the_standard_lookup_setting() {
+        use crate::fs::name_mode::NameMode;
+        use crate::linux_errno::ENOENT;
+        let fs = Arc::new(
+            ZeroFS::new_in_memory_with_name_mode(NameMode::Insensitive)
+                .await
+                .unwrap(),
+        );
+        let handler = NinePHandler::new(fs.clone(), Arc::new(FileLockManager::new()))
+            .with_standard_lookup(NameMatch::Exact);
+        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+        assert!(handler.zerofs_protocol_enabled());
+        let id = make_entry(&fs, 0, b"Foo", false).await;
+
+        assert_eq!(walk_to(&handler, &[b"foo"]).await, Ok(id));
+        for (body, found) in [
+            (ExactWalkSession::Private.walk(&[b"foo"]), false),
+            (
+                Message::Twalkgetattr(Twalkgetattr {
+                    fid: 1,
+                    newfid: 2,
+                    nwname: 1,
+                    wnames: vec![P9String::new(b"foo".to_vec())],
+                }),
+                true,
+            ),
+        ] {
+            let response = request(&handler, 41, body).await;
+            if found {
+                assert_eq!(ExactWalkSession::reached(&response.body), Some(id));
+                request(&handler, 42, Message::Tclunk(Tclunk { fid: 2 })).await;
+            } else {
+                assert_eq!(errno(&response), Some(ENOENT));
+            }
+        }
+        let response = rename_at(&handler, b"foo", b"Bar").await;
+        assert!(matches!(response.body, Message::Rrenameat(_)));
+        let response = unlink_at(&handler, b"bar", false).await;
+        assert!(matches!(response.body, Message::Runlinkat(_)));
+
+        // Renegotiating the standard dialect on the same connection applies it.
+        let id = make_entry(&fs, 0, b"Foo", false).await;
+        start_plain_session(&handler).await;
+        assert_eq!(walk_to(&handler, &[b"foo"]).await, Err(ENOENT));
+        assert_eq!(walk_to(&handler, &[b"Foo"]).await, Ok(id));
+    }
+
+    #[tokio::test]
+    async fn exact_standard_lookup_is_inert_on_a_sensitive_filesystem() {
+        use crate::fs::name_mode::NameMode;
+        use crate::linux_errno::ENOENT;
+        let (fs, handler) = standard_session(NameMode::Sensitive, Some(NameMatch::Exact)).await;
+        let upper = make_entry(&fs, 0, b"Foo", false).await;
+        assert_eq!(walk_to(&handler, &[b"Foo"]).await, Ok(upper));
+        assert_eq!(walk_to(&handler, &[b"foo"]).await, Err(ENOENT));
+        // Byte-distinct names stay distinct entries, as without the setting.
+        expect_walk(&handler, 43, 1, 23, &[]).await;
+        create_file(&handler, 44, 23, b"foo").await;
+        let lower = handler.get_fid(23).unwrap().inode_id;
+        assert_ne!(lower, upper);
+        assert_eq!(walk_to(&handler, &[b"foo"]).await, Ok(lower));
+        let response = rename_at(&handler, b"Foo", b"Bar").await;
+        assert!(matches!(response.body, Message::Rrenameat(_)));
+        let response = unlink_at(&handler, b"foo", false).await;
+        assert!(matches!(response.body, Message::Runlinkat(_)));
+        assert_eq!(root_listing(&handler).await, vec![(b"Bar".to_vec(), upper)]);
     }
 
     #[tokio::test]
