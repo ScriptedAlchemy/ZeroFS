@@ -1,4 +1,4 @@
-import { NavLink, Outlet, useLocation } from "react-router";
+import { NavLink, Outlet } from "react-router";
 import { FolderOpen, BarChart3, TerminalSquare, Loader2, WifiOff, HardDrive } from "lucide-react";
 import * as Tooltip from "@radix-ui/react-tooltip";
 import { useNinePVisualState } from "../../hooks/use-ninep-connection";
@@ -10,10 +10,7 @@ const navItems = [
   { to: "/terminal", label: "Terminal", icon: TerminalSquare },
 ];
 
-export function Layout() {
-  const connectionState = useNinePVisualState();
-  const { pathname } = useLocation();
-
+export function Layout({ needsFileConnection }: { needsFileConnection: boolean }) {
   return (
     <Tooltip.Provider delayDuration={300}>
       <div className="flex h-screen">
@@ -52,32 +49,38 @@ export function Layout() {
         </nav>
         <main className="flex-1 overflow-auto bg-background relative">
           <Outlet />
-          {connectionState !== "connected" && !pathname.startsWith("/storage") && (
-            <div className="absolute inset-0 bg-background/80 backdrop-blur-sm flex items-center justify-center z-[100]">
-              <div className="flex flex-col items-center gap-4 text-center">
-                {connectionState === "connecting" ? (
-                  <>
-                    <Loader2 size={28} className="animate-spin text-primary" />
-                    <div>
-                      <p className="text-sm font-medium">Connecting to server</p>
-                      <p className="text-xs text-muted mt-1">Establishing 9P connection...</p>
-                    </div>
-                  </>
-                ) : (
-                  <>
-                    <WifiOff size={28} className="text-destructive" />
-                    <div>
-                      <p className="text-sm font-medium">Connection lost</p>
-                      <p className="text-xs text-muted mt-1">Attempting to reconnect...</p>
-                    </div>
-                    <Loader2 size={16} className="animate-spin text-muted" />
-                  </>
-                )}
-              </div>
-            </div>
-          )}
+          {needsFileConnection && <FileConnectionOverlay />}
         </main>
       </div>
     </Tooltip.Provider>
+  );
+}
+
+function FileConnectionOverlay() {
+  const connectionState = useNinePVisualState();
+  if (connectionState === "connected") return null;
+  return (
+    <div className="absolute inset-0 bg-background/80 backdrop-blur-sm flex items-center justify-center z-[100]">
+      <div className="flex flex-col items-center gap-4 text-center">
+        {connectionState === "connecting" ? (
+          <>
+            <Loader2 size={28} className="animate-spin text-primary" />
+            <div>
+              <p className="text-sm font-medium">Connecting to server</p>
+              <p className="text-xs text-muted mt-1">Establishing 9P connection...</p>
+            </div>
+          </>
+        ) : (
+          <>
+            <WifiOff size={28} className="text-destructive" />
+            <div>
+              <p className="text-sm font-medium">Connection lost</p>
+              <p className="text-xs text-muted mt-1">Attempting to reconnect...</p>
+            </div>
+            <Loader2 size={16} className="animate-spin text-muted" />
+          </>
+        )}
+      </div>
+    </div>
   );
 }

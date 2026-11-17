@@ -34,7 +34,7 @@ ZeroFS differentiates itself from other "filesystem on S3" projects by:
 | **Compression** | zstd or lz4, before encryption. Codec changeable at any time without migration. |
 | **Caching** | Memory and disk tiers. |
 | **High availability** | Optional leader/standby over the same bucket for automatic failover. |
-| **Web UI** | File manager, dashboard, in-browser terminal. |
+| **Web UI** | File manager, live dashboard, read-only pool status, in-browser terminal. |
 | **Backends** | Amazon S3, Google Cloud Storage, Azure Blob, any S3-compatible store, local disk. |
 
 ## Quick Start
@@ -256,7 +256,7 @@ The file manager speaks 9P over WebSocket. Drag-and-drop uploads work, including
   width="700">
 </p>
 
-The dashboard streams stats over gRPC-web, plus a file access tracer.
+The dashboard streams filesystem statistics and file-access events over gRPC-web. Open **Storage** for per-member capacity, health, and affected paths.
 
 <p align="center">
     <img src="https://raw.githubusercontent.com/Barre/ZeroFS/refs/heads/main/assets/webui/terminal.png" alt="ZeroFS Web UI Terminal"

@@ -28,7 +28,7 @@ export default function App() {
   return (
     <Routes>
       <Route
-        element={<Layout />}
+        element={<Layout needsFileConnection={page === "files" || page === "terminal"} />}
       >
         <Route
           path="*"
