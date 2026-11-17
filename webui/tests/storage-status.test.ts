@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { loadPoolStatus, parseAffectedStatus, parsePoolStatus, rpcFailure } from "../src/lib/storage-status.ts";
+import {
+  capacityBreakdown,
+  loadPoolStatus,
+  memberHealth,
+  parseAffectedStatus,
+  parsePoolStatus,
+  rpcFailure,
+  summarizeView,
+} from "../src/lib/storage-status.ts";
 import type { Value } from "../src/lib/storage-status.ts";
 
 function value<T>(result: Value<T>): T {
@@ -251,8 +259,7 @@ test("affected scans reject mismatched members, malformed payloads, and missing 
     assert.equal(field.state, "unavailable");
 });
 
-test("capacity breakdown needs all four byte counts and never invents a remainder", async () => {
-  const { capacityBreakdown } = await import("../src/lib/storage-status.ts");
+test("capacity breakdown needs all four byte counts and never invents a remainder", () => {
   const disk = value(value(parsePoolStatus(JSON.stringify(pool))).members)[0];
   assert.deepEqual(value(capacityBreakdown(disk)), {
     capacity: 10000,
@@ -270,8 +277,7 @@ test("capacity breakdown needs all four byte counts and never invents a remainde
   assert.equal(capacityBreakdown(over).state, "unavailable");
 });
 
-test("member health separates reported problems from observations the server omitted", async () => {
-  const { memberHealth } = await import("../src/lib/storage-status.ts");
+test("member health separates reported problems from observations the server omitted", () => {
   const disk = value(value(parsePoolStatus(JSON.stringify(pool))).members)[0];
   assert.deepEqual(memberHealth(disk), {
     issues: [{ label: "Monitoring error", text: "SMART unavailable" }],
@@ -290,8 +296,7 @@ test("member health separates reported problems from observations the server omi
   assert.equal(memberHealth(silent).unavailable.length, 8);
 });
 
-test("view summary reports one row per pathname with its extent count", async () => {
-  const { summarizeView } = await import("../src/lib/storage-status.ts");
+test("view summary reports one row per pathname with its extent count", () => {
   const parsed = value(parseAffectedStatus(JSON.stringify(affected), "hdd-a"));
   const summary = value(summarizeView(value(parsed.views)[0]));
   assert.equal(summary.paths.length, 1);

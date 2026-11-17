@@ -56,12 +56,12 @@ export function DashboardPage() {
         />
         <StatCard
           title="Bytes Read"
-          value={reported(snapshot.bytesRead, formatSize)}
+          value={formatSize(snapshot.bytesRead)}
           icon={<Activity size={18} strokeWidth={1.5} />}
         />
         <StatCard
           title="Bytes Written"
-          value={reported(snapshot.bytesWritten, formatSize)}
+          value={formatSize(snapshot.bytesWritten)}
           icon={<HardDrive size={18} strokeWidth={1.5} />}
         />
         <StatCard

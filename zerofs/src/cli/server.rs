@@ -86,11 +86,13 @@ impl DatabaseMode {
 
 /// Access mode used to resolve the shared write-acknowledgement contract:
 /// volatile acknowledgement requires a read-write single-writer server.
-fn write_ack_access_mode(db_mode: DatabaseMode) -> crate::writeback::config::WritebackAccessMode {
-    match db_mode {
-        DatabaseMode::ReadWrite => crate::writeback::config::WritebackAccessMode::ReadWrite,
-        DatabaseMode::ReadOnly => crate::writeback::config::WritebackAccessMode::ReadOnly,
-        DatabaseMode::Checkpoint(_) => crate::writeback::config::WritebackAccessMode::Checkpoint,
+impl From<DatabaseMode> for crate::writeback::config::WritebackAccessMode {
+    fn from(db_mode: DatabaseMode) -> Self {
+        match db_mode {
+            DatabaseMode::ReadWrite => Self::ReadWrite,
+            DatabaseMode::ReadOnly => Self::ReadOnly,
+            DatabaseMode::Checkpoint(_) => Self::Checkpoint,
+        }
     }
 }
 
@@ -1584,8 +1586,8 @@ pub async fn run_server(
     info!("ZeroFS v{}", env!("CARGO_PKG_VERSION"));
 
     let access_mode = match (read_only, checkpoint_name.is_some()) {
-        (false, false) => write_ack_access_mode(DatabaseMode::ReadWrite),
-        (true, false) => write_ack_access_mode(DatabaseMode::ReadOnly),
+        (false, false) => crate::writeback::config::WritebackAccessMode::ReadWrite,
+        (true, false) => crate::writeback::config::WritebackAccessMode::ReadOnly,
         (false, true) => crate::writeback::config::WritebackAccessMode::Checkpoint,
         (true, true) => anyhow::bail!("Cannot specify both --read-only and --checkpoint flags"),
     };
@@ -1593,19 +1595,14 @@ pub async fn run_server(
         load_and_validate_server_settings(&config_path, access_mode)?;
     install_validated_rss_cap(memory_budget.as_ref());
 
-    let db_mode = match (read_only, &checkpoint_name) {
-        (false, None) => DatabaseMode::ReadWrite,
-        (true, None) => DatabaseMode::ReadOnly,
-        (false, Some(name)) => {
+    let db_mode = match &checkpoint_name {
+        None if read_only => DatabaseMode::ReadOnly,
+        None => DatabaseMode::ReadWrite,
+        Some(name) => {
             let uuid = resolve_checkpoint_name(&settings, name)
                 .await
                 .with_context(|| format!("Failed to resolve checkpoint '{}'", name))?;
             DatabaseMode::Checkpoint(uuid)
-        }
-        (true, Some(_)) => {
-            return Err(anyhow::anyhow!(
-                "Cannot specify both --read-only and --checkpoint flags"
-            ));
         }
     };
     validate_nbd_database_mode(settings.servers.nbd.as_ref(), db_mode)?;
@@ -1627,8 +1624,7 @@ pub async fn run_server(
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let init_result =
-        crate::cli::init::initialize_filesystem_with_write_ack(&settings, db_mode, write_ack)
-            .await?;
+        crate::cli::init::initialize_filesystem(&settings, db_mode, write_ack).await?;
     let cache_owner = init_result._cache_owner.clone();
     tokio::spawn(init_result.metadata_fault.clone().exit_when_tripped());
     let writeback_for_shutdown = init_result.writeback.clone();
@@ -2553,7 +2549,7 @@ min_free_gb = 256.0
             DatabaseMode::Checkpoint(uuid::Uuid::nil()),
         ] {
             let error = settings
-                .filesystem_write_ack_settings(write_ack_access_mode(db_mode))
+                .filesystem_write_ack_settings(db_mode.into())
                 .unwrap_err();
             assert!(
                 format!("{error:#}").contains("read-write"),
@@ -2561,7 +2557,7 @@ min_free_gb = 256.0
             );
         }
         settings
-            .filesystem_write_ack_settings(write_ack_access_mode(DatabaseMode::ReadWrite))
+            .filesystem_write_ack_settings(DatabaseMode::ReadWrite.into())
             .unwrap();
     }
 
@@ -2594,7 +2590,7 @@ min_free_gb = 256.0
         )
         .unwrap();
         let write_ack = settings
-            .filesystem_write_ack_settings(write_ack_access_mode(DatabaseMode::ReadWrite))
+            .filesystem_write_ack_settings(DatabaseMode::ReadWrite.into())
             .unwrap();
         assert_eq!(
             nbd_volatile_budget(write_ack),

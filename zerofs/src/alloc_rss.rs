@@ -190,6 +190,9 @@ pub(crate) fn purge_arenas() {
     let _ = unsafe { tikv_jemalloc_ctl::raw::write::<()>(b"arena.*.purge\0", ()) };
 }
 
+/// Large extent sizes, in MiB, counted by `ArenaPageStats::large_extent_counts` in this order.
+pub(crate) const LARGE_EXTENT_MIB: [usize; 4] = [128, 256, 512, 1024];
+
 #[derive(Clone, Copy)]
 pub(crate) struct ArenaPageStats {
     pub(crate) active_bytes: u64,
@@ -198,15 +201,15 @@ pub(crate) struct ArenaPageStats {
     pub(crate) small_allocated_bytes: u64,
     pub(crate) large_allocated_bytes: u64,
     pub(crate) arenas: u32,
-    pub(crate) large_extent_counts: [u64; 4],
+    pub(crate) large_extent_counts: [u64; LARGE_EXTENT_MIB.len()],
 }
 
 impl ArenaPageStats {
     fn read() -> Option<Self> {
         let read_size = |name: &[u8]| unsafe { tikv_jemalloc_ctl::raw::read::<usize>(name).ok() };
         let page = read_size(b"arenas.page\0")? as u64;
-        let mut large_extent_counts = [0; 4];
-        let sizes = [128, 256, 512, 1024].map(|mib| mib * 1024 * 1024);
+        let mut large_extent_counts = [0; LARGE_EXTENT_MIB.len()];
+        let sizes = LARGE_EXTENT_MIB.map(|mib| mib * 1024 * 1024);
         let classes = unsafe { tikv_jemalloc_ctl::raw::read::<u32>(b"arenas.nlextents\0").ok()? };
         for index in 0..classes {
             let name = format!("arenas.lextent.{index}.size\0");

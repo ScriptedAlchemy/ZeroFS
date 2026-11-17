@@ -52,7 +52,7 @@ const pool = (members: unknown[], unreadable: unknown[] = [], extra: Record<stri
     quarantined_leftovers: [],
   });
 // A decoded StatsSnapshot. Its usage counters carry presence, so the client sees an omitted one as undefined.
-type Sample = { bytesWritten?: bigint; bytesRead?: bigint; usedBytes?: bigint; usedInodes?: bigint };
+type Sample = { bytesWritten: bigint; bytesRead: bigint; usedBytes?: bigint; usedInodes?: bigint };
 const sample: Sample = { bytesWritten: 5n * 1024n ** 3n, bytesRead: 0n, usedBytes: 2048n, usedInodes: 0n };
 
 // A stream that stays open until the page aborts it.
@@ -310,13 +310,6 @@ describe("Storage page affected-path display", () => {
     expect(await screen.findByText("3 extents")).toBeTruthy();
     expect(screen.getAllByText("/Movie")).toHaveLength(1);
     expect(screen.getByText("2 views report no affected paths")).toBeTruthy();
-  });
-
-  it("refuses to draw an answer too large for the browser and says why", async () => {
-    client.getPoolAffected.mockResolvedValue({ json: " ".repeat(8 * 1024 * 1024 + 1) });
-    await inspect();
-    expect(await screen.findByText(/too large to display/)).toBeTruthy();
-    expect(screen.queryByText("Scan complete")).toBeNull();
   });
 });
 

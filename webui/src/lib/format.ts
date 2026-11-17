@@ -28,11 +28,6 @@ export function binaryBytesParts(bytes: bigint | number): { short: string; exact
   return { short: `${value.toFixed(1)} ${binaryUnits[unit]}`, exact: grouped };
 }
 
-export function formatBinaryBytes(bytes: bigint | number): string {
-  const { short, exact } = binaryBytesParts(bytes);
-  return exact === null ? short : `${short} (${exact})`;
-}
-
 export function formatSizeFixed(bytes: number): string {
   const units = [" B", "KB", "MB", "GB", "TB"];
   if (bytes === 0) return `${"0.0".padStart(5)} ${units[1]}`;

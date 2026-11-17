@@ -93,7 +93,10 @@ impl Fixture {
     }
 
     async fn start(&self) -> anyhow::Result<InitResult> {
-        initialize_filesystem(&self.settings, DatabaseMode::ReadWrite).await
+        let write_ack = self
+            .settings
+            .filesystem_write_ack_settings(DatabaseMode::ReadWrite.into())?;
+        initialize_filesystem(&self.settings, DatabaseMode::ReadWrite, write_ack).await
     }
 
     /// Drop the clean caches so the next start reads metadata from the store.

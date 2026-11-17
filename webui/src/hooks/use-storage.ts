@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { adminClient } from "../lib/grpc/client";
-import { loadPoolStatus, known, rpcFailure, unavailable } from "../lib/storage-status";
+import { loadPoolStatus, known, unavailable } from "../lib/storage-status";
 import type { PoolResult, Value } from "../lib/storage-status";
+import { useStatsStream } from "./use-stats";
 
 export interface StorageActivity {
   logicalBytesWritten: Value<bigint>;
@@ -10,7 +11,7 @@ export interface StorageActivity {
   usedInodes: Value<bigint>;
 }
 
-// These StatsSnapshot counters carry presence: the server omits one it cannot state.
+// The StatsSnapshot usage counters carry presence: the server omits one it cannot state.
 const counter = (value: bigint | undefined, name: string): Value<bigint> =>
   value === undefined ? unavailable(`${name} was not reported by the server`) : known(value);
 
@@ -41,50 +42,16 @@ export function useStoragePool() {
   return { result, loading, lastSuccess, refresh };
 }
 
-export function useStorageActivity() {
-  const [activity, setActivity] = useState<Value<StorageActivity>>(
-    unavailable("Stats stream has not supplied a sample"),
-  );
-  const [lastSuccess, setLastSuccess] = useState<Date | null>(null);
-
-  useEffect(() => {
-    const abort = new AbortController();
-    async function run() {
-      while (!abort.signal.aborted) {
-        try {
-          for await (const sample of adminClient.streamStats({ intervalMs: 1000 }, { signal: abort.signal })) {
-            if (abort.signal.aborted) return;
-            setActivity(
-              known({
-                logicalBytesWritten: counter(sample.bytesWritten, "bytes_written"),
-                logicalBytesRead: counter(sample.bytesRead, "bytes_read"),
-                logicalUsedBytes: counter(sample.usedBytes, "used_bytes"),
-                usedInodes: counter(sample.usedInodes, "used_inodes"),
-              }),
-            );
-            setLastSuccess(new Date());
-          }
-          if (!abort.signal.aborted) setActivity(unavailable("Stats stream ended"));
-        } catch (error) {
-          if (abort.signal.aborted) return;
-          setActivity(unavailable(rpcFailure(error).reason));
-        }
-        if (!abort.signal.aborted) {
-          await new Promise<void>((resolve) => {
-            const timer = setTimeout(done, 2000);
-            function done() {
-              clearTimeout(timer);
-              abort.signal.removeEventListener("abort", done);
-              resolve();
-            }
-            abort.signal.addEventListener("abort", done, { once: true });
-          });
-        }
-      }
-    }
-    void run();
-    return () => abort.abort();
-  }, []);
-
-  return { activity, lastSuccess };
+export function useStorageActivity(): { activity: Value<StorageActivity>; lastSuccess: Date | null } {
+  const { latest, receivedAt } = useStatsStream(1000);
+  const activity =
+    latest.state === "unavailable"
+      ? latest
+      : known({
+          logicalBytesWritten: known(latest.value.bytesWritten),
+          logicalBytesRead: known(latest.value.bytesRead),
+          logicalUsedBytes: counter(latest.value.usedBytes, "used_bytes"),
+          usedInodes: counter(latest.value.usedInodes, "used_inodes"),
+        });
+  return { activity, lastSuccess: receivedAt };
 }

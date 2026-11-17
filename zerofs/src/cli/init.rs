@@ -274,13 +274,7 @@ impl StartupContext {
             let retried_remote = Arc::new(crate::retrying_object_store::RetryingObjectStore::new(
                 traced_remote,
             )) as Arc<dyn object_store::ObjectStore>;
-            let (object_store, writeback) = match settings.writeback_settings(match db_mode {
-                DatabaseMode::ReadWrite => crate::writeback::config::WritebackAccessMode::ReadWrite,
-                DatabaseMode::ReadOnly => crate::writeback::config::WritebackAccessMode::ReadOnly,
-                DatabaseMode::Checkpoint(_) => {
-                    crate::writeback::config::WritebackAccessMode::Checkpoint
-                }
-            })? {
+            let (object_store, writeback) = match settings.writeback_settings(db_mode.into())? {
                 Some(writeback_settings) => {
                     let identity = writeback_journal_identity(
                         settings,
@@ -1260,29 +1254,9 @@ impl ReconciledDb {
     }
 }
 
-/// Initialize the filesystem after resolving write acknowledgement settings.
-///
-/// Keep the original entry point while server startup shares its prevalidated
-/// settings with memory admission through `initialize_filesystem_with_write_ack`.
-#[allow(dead_code)] // Compatibility entry point for callers outside server startup.
-pub async fn initialize_filesystem(
-    settings: &Settings,
-    db_mode: DatabaseMode,
-) -> Result<InitResult> {
-    let access_mode = match db_mode {
-        DatabaseMode::ReadWrite => crate::writeback::config::WritebackAccessMode::ReadWrite,
-        DatabaseMode::ReadOnly => crate::writeback::config::WritebackAccessMode::ReadOnly,
-        DatabaseMode::Checkpoint(_) => crate::writeback::config::WritebackAccessMode::Checkpoint,
-    };
-    let write_ack = settings
-        .filesystem_write_ack_settings(access_mode)
-        .context("Invalid filesystem write-acknowledgement configuration")?;
-    initialize_filesystem_with_write_ack(settings, db_mode, write_ack).await
-}
-
 /// Run role election, database open, reconciliation, and activation using the
 /// write acknowledgement settings already validated by server memory admission.
-pub async fn initialize_filesystem_with_write_ack(
+pub async fn initialize_filesystem(
     settings: &Settings,
     db_mode: DatabaseMode,
     write_ack: crate::fs::mutation::config::FilesystemWriteAckSettings,
@@ -1610,7 +1584,8 @@ mod role_decision_tests {
             force_recovery: false,
         });
         for mode in [DatabaseMode::ReadWrite, DatabaseMode::ReadOnly] {
-            let error = super::initialize_filesystem(&settings, mode)
+            let write_ack = settings.filesystem_write_ack_settings(mode.into()).unwrap();
+            let error = super::initialize_filesystem(&settings, mode, write_ack)
                 .await
                 .err()
                 .unwrap();
@@ -1624,7 +1599,10 @@ mod role_decision_tests {
             );
         }
         settings.filesystem = Some(toml::from_str("name_mode = 'insensitive'").unwrap());
-        let error = super::initialize_filesystem(&settings, DatabaseMode::ReadWrite)
+        let write_ack = settings
+            .filesystem_write_ack_settings(DatabaseMode::ReadWrite.into())
+            .unwrap();
+        let error = super::initialize_filesystem(&settings, DatabaseMode::ReadWrite, write_ack)
             .await
             .err()
             .unwrap();
