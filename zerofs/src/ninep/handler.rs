@@ -1468,6 +1468,29 @@ impl NinePHandler {
         })
     }
 
+    /// Take the pin a walked fid needs once every component has resolved.
+    ///
+    /// Only a directory gets a pin. A target already known to be something
+    /// else skips the inode read, so a file replaced after its component
+    /// resolved cannot turn a successful walk into ENOENT.
+    /// `walked_directory` is `None` when the walk resolved no component.
+    /// `pending` is the pin an exact match took under the parent lock. It is
+    /// released only after the child-lock validation has taken its own.
+    async fn pin_walk_target(
+        &self,
+        target: InodeId,
+        walked_directory: Option<bool>,
+        pending: Option<OpenHandle>,
+    ) -> P9Result<Option<OpenHandle>> {
+        let pin = if walked_directory == Some(false) {
+            None
+        } else {
+            self.pin_walked_directory(target).await?
+        };
+        drop(pending);
+        Ok(pin)
+    }
+
     #[cfg(test)]
     async fn pause_before_exact_walk_pin(&self, rule: NameMatch) {
         if rule == NameMatch::Exact {
@@ -1486,6 +1509,7 @@ impl NinePHandler {
         let mut current_id = src_fid.inode_id;
         let mut wqids = Vec::new();
         let mut pending_directory_pin = None;
+        let mut walked_directory = None;
         let has_wnames = !tw.wnames.is_empty();
 
         for (i, wname) in tw.wnames.into_iter().enumerate() {
@@ -1511,6 +1535,7 @@ impl NinePHandler {
             Self::step_path(&mut current_path, name_bytes, current_id, src_fid.root);
             wqids.push(inode_to_qid(&step.inode, step.id));
             current_id = step.id;
+            walked_directory = Some(step.inode.is_directory());
             pending_directory_pin = step.exact_pin;
         }
 
@@ -1527,10 +1552,10 @@ impl NinePHandler {
             };
             #[cfg(test)]
             self.pause_before_exact_walk_pin(rule).await;
+            let directory_pin = self
+                .pin_walk_target(current_id, walked_directory, pending_directory_pin)
+                .await?;
             // In-place replacement drops the old slot's resource guards.
-            let directory_pin = self.pin_walked_directory(current_id).await?;
-            // Child-lock validation now owns the pin that will go into the fid.
-            drop(pending_directory_pin);
             self.install_walk_fid(tw.fid, tw.newfid, new_fid, directory_pin)?;
         }
 
@@ -1571,13 +1596,13 @@ impl NinePHandler {
         };
         #[cfg(test)]
         self.pause_before_exact_walk_pin(rule).await;
-        let directory_pin = if stat_inode.is_directory() {
-            self.pin_walked_directory(current_id).await?
-        } else {
-            None
-        };
-        // Child-lock validation now owns the pin that will go into the fid.
-        drop(pending_directory_pin);
+        let directory_pin = self
+            .pin_walk_target(
+                current_id,
+                Some(stat_inode.is_directory()),
+                pending_directory_pin,
+            )
+            .await?;
         self.install_walk_fid(
             tw.fid,
             tw.newfid,
