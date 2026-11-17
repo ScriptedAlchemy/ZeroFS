@@ -630,7 +630,7 @@ impl Filesystem for Fuse9P {
                         client.free_fid(fid);
                     }
                 }
-                // Cache misses only when the negotiated name mode permits it.
+                // Cache a negative entry only when the negotiated name mode permits it.
                 Err(e) if !negative_ttl.is_zero() && e.to_errno() == libc::ENOENT => {
                     reply.entry(&negative_ttl, &negative_attr(), Generation(0));
                 }

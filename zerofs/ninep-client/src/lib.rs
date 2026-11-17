@@ -2141,7 +2141,8 @@ impl NinePClient {
     }
 
     /// Walk by stored spelling for the FUSE bridge. Ordinary walks still fold.
-    /// Insensitive exports negotiate the private CI dialect before using this request.
+    /// Insensitive exports negotiate the private case-insensitive dialect before
+    /// using this request.
     pub async fn walk_getattr_exact(
         &self,
         fid: u32,
@@ -6006,7 +6007,7 @@ mod session_transition_tests {
             for exchange in exchanges {
                 exchange.await.unwrap().unwrap();
             }
-            // The waiting xattrwalk, its clunk and the ordinary write.
+            // Answer the waiting xattrwalk, its clunk and the ordinary write.
             for _ in 0..3 {
                 let step = recv_op_request(&mut requests, "admitted waiter").await;
                 answer(&conn, &step);
