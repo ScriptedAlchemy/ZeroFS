@@ -922,7 +922,7 @@ fn parts_engine_knobs(disk_bytes: usize) -> PartsEngineKnobs {
     }
 }
 
-async fn build_parts_hybrid(
+pub(crate) async fn build_parts_hybrid(
     cache_root: &std::path::Path,
     memory_bytes: usize,
     disk_bytes: usize,
@@ -956,6 +956,10 @@ async fn build_parts_hybrid(
                     .map_err(|e| foyer_build_error("parts foyer device build failed", e))?,
             )
             .with_block_size(PARTS_BLOCK_SIZE)
+            // Recovery on open replays every entry still in a disk block. The
+            // log keeps a removed part removed across a restart, which a
+            // part dropped after failing frame authentication relies on.
+            .with_tombstone_log(true)
             .with_submit_queue_size_threshold(knobs.submit_queue_bytes)
             .with_flushers(knobs.flushers)
             .with_reclaimers(knobs.flushers)

@@ -2966,6 +2966,7 @@ mod tests {
     /// a `SegmentStore` the way `ExtentStore` reads file data.
     struct CorruptionFixture {
         cache: Arc<PrefetchingObjectStore>,
+        backend: Arc<dyn ObjectStore>,
         controls: Arc<crate::fault_store::FaultControls>,
         reader: crate::segment_store::SegmentStore,
         frames: Vec<(u64, u64, Bytes)>,
@@ -2976,14 +2977,19 @@ mod tests {
 
     const CORRUPTION_PART: usize = 4 * 1024;
 
+    fn corruption_codec() -> crate::frame_codec::FrameCodec {
+        crate::frame_codec::FrameCodec::new(
+            &[7; 32],
+            crate::segment::SEGMENT_INFO,
+            crate::config::CompressionConfig::Lz4,
+        )
+    }
+
     impl CorruptionFixture {
         async fn new() -> Self {
-            use crate::config::CompressionConfig;
-            use crate::frame_codec::FrameCodec;
-            use crate::segment::SEGMENT_INFO;
             use crate::segment_store::SegmentStore;
 
-            let codec = || FrameCodec::new(&[7; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+            let codec = corruption_codec;
             let mem = Arc::new(InMemory::new());
             // Seal straight into the backend so the parts cache starts cold;
             // sealing through the cache would warm it with the good bytes.
@@ -3006,11 +3012,13 @@ mod tests {
             let path = Path::from(locations[0].2.segid.object_key());
             let object = mem.get(&path).await.unwrap().bytes().await.unwrap();
             let (faulty, controls) = crate::fault_store::FaultStore::new(mem);
-            let (cache, dir) = store_over(faulty, CORRUPTION_PART).await;
+            let backend: Arc<dyn ObjectStore> = faulty;
+            let (cache, dir) = store_over(backend.clone(), CORRUPTION_PART).await;
             let cache = Arc::new(cache);
             let reader = SegmentStore::new(cache.clone(), codec(), 6, None);
             Self {
                 cache,
+                backend,
                 controls,
                 reader,
                 frames,
@@ -3018,6 +3026,33 @@ mod tests {
                 object,
                 _dir: dir,
             }
+        }
+
+        /// Read through a new store and reader over `parts`, as a restarted
+        /// process would. The backend and its fault controls are kept.
+        fn attach(&mut self, parts: HybridCache<PartKey, Bytes>) {
+            self.cache = Arc::new(PrefetchingObjectStore::with_options(
+                self.backend.clone(),
+                parts,
+                CORRUPTION_PART,
+            ));
+            self.reader = crate::segment_store::SegmentStore::new(
+                self.cache.clone(),
+                corruption_codec(),
+                6,
+                None,
+            );
+        }
+
+        /// Keys of the cache parts covering the whole frame run.
+        fn run_part_keys(&self) -> Vec<PartKey> {
+            let generation = cached_generation(&self.cache, &self.path());
+            let (offset, len) = self.run_bounds();
+            let first = offset as usize / CORRUPTION_PART;
+            let last = (offset as usize + len as usize).div_ceil(CORRUPTION_PART);
+            (first..last)
+                .map(|part| PartKey::new(&self.path(), CORRUPTION_PART, &generation, part))
+                .collect()
         }
 
         fn path(&self) -> Path {
@@ -3158,6 +3193,142 @@ mod tests {
     #[tokio::test]
     async fn repair_does_not_cache_corrupt_bytes_after_the_run() {
         repair_does_not_cache_unauthenticated_neighbour_bytes(Neighbour::After).await;
+    }
+
+    /// The parts cache exactly as the server builds it, over `dir`.
+    async fn open_production_parts_cache(dir: &std::path::Path) -> HybridCache<PartKey, Bytes> {
+        crate::cli::server::build_parts_hybrid(
+            dir,
+            MEM,
+            256 * 1024 * 1024,
+            &tokio::runtime::Handle::current(),
+            crate::cache_metrics::FoyerMetricsRegistry::default(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parts_cache_written_without_a_tombstone_log_opens_with_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Path::from("segments/upgrade");
+        let generation = CacheGeneration::Versioned {
+            e_tag: Some("upgrade".into()),
+            version: None,
+        };
+        let value = |part: usize| Bytes::from(vec![part as u8; 4096]);
+        // The previous server configuration: the same device and block size,
+        // with no tombstone log partition.
+        let previous = HybridCacheBuilder::new()
+            .with_name("test-previous-parts")
+            .memory(MEM)
+            .with_weighter(|_: &PartKey, v: &Bytes| v.len())
+            .storage()
+            .with_io_engine_config(PsyncIoEngineConfig::new())
+            .with_engine_config(
+                BlockEngineConfig::new(
+                    foyer::DeviceBuilder::build(
+                        FsDeviceBuilder::new(dir.path().join("parts_cache"))
+                            .with_capacity(256 * 1024 * 1024),
+                    )
+                    .unwrap(),
+                )
+                .with_block_size(64 * 1024 * 1024),
+            )
+            .build()
+            .await
+            .unwrap();
+        for part in 0..64 {
+            previous.insert(PartKey::new(&path, 4096, &generation, part), value(part));
+        }
+        previous.close().await.unwrap();
+        drop(previous);
+
+        let upgraded = open_production_parts_cache(dir.path()).await;
+        for part in 0..64 {
+            let key = PartKey::new(&path, 4096, &generation, part);
+            if let Some(entry) = upgraded.get(&key).await.unwrap() {
+                assert_eq!(
+                    entry.value(),
+                    &value(part),
+                    "part {part} recovered wrong bytes"
+                );
+            }
+        }
+        upgraded.close().await.unwrap();
+    }
+
+    /// Put a corrupt run on the disk tier only, repair it, then reopen the
+    /// cache. Returns the integrity refetches the read after reopening needed.
+    async fn repair_a_corrupt_disk_tier_part() -> u64 {
+        let mut fixture = CorruptionFixture::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (offset, len) = fixture.run_bounds();
+        let run = offset as usize..offset as usize + len as usize;
+        let mut cached_range = GetOptions {
+            range: Some(GetRange::Bounded(run.start as u64..run.end as u64)),
+            ..Default::default()
+        };
+        cached_range.extensions.insert(CacheRangeOnly);
+
+        // Admit one corrupt response through the ordinary cached read path,
+        // then close the cache so foyer flushes the memory tier to disk.
+        let parts = open_production_parts_cache(dir.path()).await;
+        fixture.attach(parts.clone());
+        fixture.controls.corrupt_gets(1);
+        let poisoned = fixture
+            .cache
+            .get_opts(&fixture.path(), cached_range)
+            .await
+            .unwrap();
+        assert_ne!(
+            poisoned.bytes().await.unwrap().as_ref(),
+            &fixture.object[run.clone()]
+        );
+        let keys = fixture.run_part_keys();
+        parts.close().await.unwrap();
+        drop(parts);
+
+        // A reopened cache starts with an empty memory tier, so every part
+        // of the run is served from disk.
+        let parts = open_production_parts_cache(dir.path()).await;
+        for key in &keys {
+            assert!(!parts.memory().contains(key), "{key:?} is in memory");
+            assert!(parts.storage().may_contains(key), "{key:?} is not on disk");
+        }
+        fixture.attach(parts.clone());
+        // Learn the object metadata without a data read, as a warm process
+        // would already have it.
+        fixture.cache.head(&fixture.path()).await.unwrap();
+        let gets = fixture.controls.get_count();
+        fixture.assert_frames(&fixture.read().await.unwrap());
+        assert_eq!(fixture.reader.integrity_refetches(), 1);
+        assert_eq!(
+            fixture.controls.get_count(),
+            gets + 1,
+            "the first decode used the disk tier and the only backend read was the retry"
+        );
+        fixture.assert_cache_holds_only_true_bytes().await;
+        parts.close().await.unwrap();
+        drop(parts);
+
+        // Reopen again and read the run.
+        let parts = open_production_parts_cache(dir.path()).await;
+        fixture.attach(parts.clone());
+        fixture.cache.head(&fixture.path()).await.unwrap();
+        fixture.assert_frames(&fixture.read().await.unwrap());
+        let refetches = fixture.reader.integrity_refetches();
+        parts.close().await.unwrap();
+        refetches
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn corrupt_disk_tier_part_stays_repaired_across_a_cache_reopen() {
+        assert_eq!(
+            repair_a_corrupt_disk_tier_part().await,
+            0,
+            "a part the repair deleted came back from disk after the cache reopened"
+        );
     }
 
     #[tokio::test]
