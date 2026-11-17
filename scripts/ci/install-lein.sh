@@ -3,14 +3,14 @@
 # dependencies. Pass --root when the job runs the launcher as root.
 set -euo pipefail
 
-curl_command=(curl)
 bootstrap=(lein)
 if [[ "${1:-}" == "--root" ]]; then
-  curl_command=(sudo curl)
   bootstrap=(sudo env HOME=/root LEIN_ROOT=1 JAVA_HOME="$JAVA_HOME" /usr/local/bin/lein)
 fi
 
-"${curl_command[@]}" --fail --location --show-error --retry 3 --retry-all-errors \
+# The download always runs under sudo. Two of the four original steps wrote the
+# launcher without it and two with it, and sudo works in all four jobs.
+sudo curl --fail --location --show-error --retry 3 --retry-all-errors \
   --connect-timeout 15 --max-time 60 --retry-max-time 180 \
   https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein \
   -o /usr/local/bin/lein
