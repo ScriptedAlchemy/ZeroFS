@@ -13,7 +13,9 @@ use crate::{
 };
 
 use super::RECEIVE_BATCH_BYTES;
-use super::errors::{message_size_errno, not_connected_errno, protocol_errno};
+use super::errors::{
+    message_size_errno, not_connected_errno, protocol_errno, unsupported_request_errno,
+};
 use super::registry::is_tombstoned_locked;
 use super::session::{Dispatch, Session, SessionState, SessionStatus};
 use super::signals::{SendSignalMask, resume_interrupted_send, sleep_uninterruptible_tick};
@@ -562,6 +564,10 @@ impl ExpectedResponse {
             Request::Tstatfs { .. } => Self::Statfs,
             Request::Tlock { .. } => Self::Lock,
             Request::Tgetlock { .. } => Self::Getlock,
+            // Extended attributes are not implemented in the kernel client.
+            Request::Txattrwalk { .. } | Request::Txattrcreate { .. } => {
+                return Err(unsupported_request_errno());
+            }
         })
     }
 
