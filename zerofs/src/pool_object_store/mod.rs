@@ -10,8 +10,11 @@ mod capacity;
 mod catalog;
 mod health;
 mod recovery;
+mod space;
 pub use health::{MemberHealth, SegmentFault, SmartSample};
 pub(crate) use recovery::PoolRecovery;
+#[cfg(test)]
+pub use space::{FilesystemSpace, FreeSpace};
 #[cfg(test)]
 mod tests;
 
@@ -78,6 +81,9 @@ pub struct PoolMember {
     pub local_path: Option<PathBuf>,
     pub min_free_bytes: u64,
     pub health_device: Option<PathBuf>,
+    /// Real free space of a local member. `None` reads `statvfs` on
+    /// `local_path`; tests inject exact numbers. Unused for remote members.
+    pub free_space: Option<Arc<dyn space::FreeSpace>>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -100,6 +106,23 @@ pub struct PoolMemberStatus {
     /// Allocatable bytes after quota, reservations, and local free-space reserve.
     pub available_bytes: u64,
     pub evacuation_capacity: EvacuationCapacity,
+    pub space: MemberSpace,
+}
+
+/// What a member's backing filesystem really reports, beside the declared
+/// `capacity_bytes`. Remote members have no filesystem: their figures are null.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct MemberSpace {
+    /// Free bytes the filesystem reports (`statvfs` `f_bavail`), before the
+    /// member's free-space reserve.
+    pub filesystem_free_bytes: Option<u64>,
+    /// Size of the filesystem (`statvfs` `f_blocks`).
+    pub filesystem_total_bytes: Option<u64>,
+    /// The declared capacity is larger than the filesystem. Thin provisioning
+    /// and quotas make that legitimate, so it is a warning, not an error.
+    pub declared_exceeds_filesystem: bool,
+    /// Why placement skips this member for lack of room; null when it has room.
+    pub full: Option<space::Full>,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -165,6 +188,7 @@ struct PoolInner {
     health_changed: tokio::sync::Notify,
     safety_failure: tokio_util::sync::CancellationToken,
     active_uploads: Arc<StdMutex<BTreeSet<String>>>,
+    no_space: space::NoSpaceMarks,
     #[cfg(test)]
     reserve_pause: StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     #[cfg(test)]
@@ -353,6 +377,20 @@ fn native_media_error(failure: &object_store::Error) -> bool {
         cause = error.source();
     }
     false
+}
+
+/// Turn "no member has room" into the typed no-space error that the segment
+/// store reports as ENOSPC. It is permanent, so the retry layer returns it at
+/// once instead of waiting for space that may never come back on its own.
+fn storage_full(failure: object_store::Error, size: u64) -> object_store::Error {
+    if has_cause::<catalog::NoCapacity>(&failure) {
+        permanent(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            format!("no pool member has room for a {size}-byte object"),
+        ))
+    } else {
+        failure
+    }
 }
 
 fn serialize_path<S: serde::Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
@@ -549,6 +587,7 @@ impl PoolObjectStore {
                 health_changed: tokio::sync::Notify::new(),
                 safety_failure: tokio_util::sync::CancellationToken::new(),
                 active_uploads: Arc::new(StdMutex::new(BTreeSet::new())),
+                no_space: space::NoSpaceMarks::default(),
                 #[cfg(test)]
                 reserve_pause: StdMutex::new(None),
                 #[cfg(test)]
@@ -612,10 +651,37 @@ impl PoolObjectStore {
         }
         pool.catalog(Catalog::finish_initialization).await?;
         // Idle remote members are deliberately not opened or probed here.
+        pool.warn_declared_beyond_filesystem();
         // Only durable unfinished operations need recovery; an unavailable
         // member keeps its debt charged rather than making local data vanish.
         pool.recover_pending().await?;
         Ok(pool)
+    }
+
+    /// A declared capacity above the filesystem's size is legitimate under
+    /// thin provisioning or a quota that will grow, so the pool warns rather
+    /// than refusing to start. Placement still never trusts the declared figure
+    /// beyond the free space the filesystem reports.
+    fn warn_declared_beyond_filesystem(&self) {
+        for warning in self.declared_beyond_filesystem() {
+            tracing::warn!("{warning}");
+        }
+    }
+
+    /// One line per local member whose declared capacity exceeds the size of
+    /// its filesystem, naming the member and both numbers.
+    pub(crate) fn declared_beyond_filesystem(&self) -> Vec<String> {
+        self.inner
+            .members
+            .iter()
+            .filter_map(|member| match member.filesystem_space() {
+                Some(Ok(space)) if member.capacity_bytes > space.total => Some(format!(
+                    "pool member {} declares {} bytes of capacity but its filesystem holds only {} bytes ({} free); placement uses the filesystem's real free space",
+                    member.id, member.capacity_bytes, space.total, space.available,
+                )),
+                _ => None,
+            })
+            .collect()
     }
 
     async fn catalog<T: Send + 'static>(
@@ -838,6 +904,19 @@ impl PoolObjectStore {
         size: u64,
         target: Option<String>,
     ) -> object_store::Result<OwnedUpload> {
+        self.reserve_excluding(location, size, target, &BTreeSet::new())
+            .await
+    }
+
+    /// Reserve on the first eligible member that has room, skipping members
+    /// marked full and `refused` (members this write already found full).
+    async fn reserve_excluding(
+        &self,
+        location: &Path,
+        size: u64,
+        target: Option<String>,
+        refused: &BTreeSet<String>,
+    ) -> object_store::Result<OwnedUpload> {
         if size > MAX_TRANSFER_BYTES {
             return Err(unsupported(format!(
                 "pool segment exceeds the {MAX_TRANSFER_BYTES}-byte transfer bound"
@@ -857,9 +936,12 @@ impl PoolObjectStore {
             }
         }
         let members = self.inner.members.clone();
+        let mut skip: BTreeSet<String> =
+            self.inner.no_space.current(&members).into_keys().collect();
+        skip.extend(refused.iter().cloned());
         let key = location.to_string();
         let upload = self
-            .catalog(move |catalog| catalog.reserve(&key, size, &members, target.as_deref()))
+            .catalog(move |catalog| catalog.reserve(&key, size, &members, target.as_deref(), &skip))
             .await?;
         #[cfg(test)]
         crash_cutpoint("after_reserve");
@@ -999,21 +1081,56 @@ impl PoolObjectStore {
         let _guard = self.key_lock(&location).write_owned().await;
         let previous = self.visible(&location).await?;
         Self::check_mode(&location, &options.mode, previous.as_ref())?;
+        self.put_spilling(location, payload, options, previous, None, cancelled)
+            .await
+    }
+
+    /// Publish a new object, moving it to the next member with room when the
+    /// chosen member's write returns no-space. Each member is tried at most
+    /// once, so a put makes at most one write per member before it reports
+    /// that the pool is full.
+    async fn put_spilling(
+        &self,
+        location: Path,
+        payload: PutPayload,
+        options: PutOptions,
+        previous: Option<Entry>,
+        mut reserved: Option<OwnedUpload>,
+        cancelled: Arc<AtomicBool>,
+    ) -> object_store::Result<PutResult> {
         let size = u64::try_from(payload.content_length())
             .map_err(|_| error("pool payload length overflow"))?;
-        let upload = self.reserve(&location, size, None).await?;
-        self.put_reserved(ReservedPut {
-            location,
-            payload,
-            options,
-            upload,
-            previous,
-            preserve: None,
-            cancelled,
-            verify: false,
-            automatic: false,
-        })
-        .await
+        let mut refused = BTreeSet::new();
+        loop {
+            let upload = match reserved.take() {
+                Some(upload) => upload,
+                None => self
+                    .reserve_excluding(&location, size, None, &refused)
+                    .await
+                    .map_err(|e| storage_full(e, size))?,
+            };
+            let member = upload.member_id.clone();
+            let outcome = self
+                .put_reserved(ReservedPut {
+                    location: location.clone(),
+                    payload: payload.clone(),
+                    options: options.clone(),
+                    upload,
+                    previous: previous.clone(),
+                    preserve: None,
+                    cancelled: cancelled.clone(),
+                    verify: false,
+                    automatic: false,
+                })
+                .await;
+            match outcome {
+                Err(failure) if crate::retrying_object_store::is_no_space(&failure) => {
+                    self.inner.no_space.mark(self.member(&member)?);
+                    refused.insert(member);
+                }
+                outcome => return outcome,
+            }
+        }
     }
 
     async fn begin_multipart_owned(
@@ -1034,7 +1151,10 @@ impl PoolObjectStore {
         let _guard = self.key_lock(&location).write_owned().await;
         let previous = self.visible(&location).await?;
         Self::check_mode(&location, &PutMode::Create, previous.as_ref())?;
-        let upload = self.reserve(&location, length, None).await?;
+        let upload = self
+            .reserve(&location, length, None)
+            .await
+            .map_err(|e| storage_full(e, length))?;
         capability.acknowledge();
         Ok(Box::new(PoolMultipartUpload {
             _owner: self.inner.tasks.token(),
@@ -1529,10 +1649,11 @@ impl PoolObjectStore {
             })
             .collect();
         let members = self.inner.members.clone();
+        let full = self.inner.no_space.current(&members);
         let evacuating = self.inner.evacuating.lock().unwrap().clone();
         let snapshot = evacuating.clone();
         let mut status = self
-            .catalog(move |catalog| catalog.status(&members, snapshot.as_ref()))
+            .catalog(move |catalog| catalog.status(&members, snapshot.as_ref(), &full))
             .await?;
         #[cfg(test)]
         {
@@ -2282,18 +2403,8 @@ impl MultipartUpload for PoolMultipartUpload {
                 put.attributes = options.attributes;
                 put.tags = options.tags;
                 put.extensions = options.extensions;
-                pool.put_reserved(ReservedPut {
-                    location,
-                    payload,
-                    options: put,
-                    upload,
-                    previous,
-                    preserve: None,
-                    cancelled,
-                    verify: false,
-                    automatic: false,
-                })
-                .await
+                pool.put_spilling(location, payload, put, previous, Some(upload), cancelled)
+                    .await
             })
             .await
             .map_err(|e| error(format!("pool multipart completion task failed: {e}")))?

@@ -79,12 +79,18 @@ pub(crate) enum DurabilityError {
     Object(#[source] WritebackError),
     #[error("durability wait closed before target")]
     Closed,
+    /// The data could not be made durable because storage is full. Clients
+    /// see ENOSPC, so they can tell full storage from a broken one.
+    #[error("no storage space for the data to become durable")]
+    NoSpace,
 }
 
 impl DurabilityError {
     pub(crate) fn from_flush(error: FsError) -> Self {
         if error == FsError::ShuttingDown {
             Self::Closed
+        } else if error == FsError::NoSpace {
+            Self::NoSpace
         } else {
             Self::FilesystemFlush(anyhow::anyhow!("{error}"))
         }
@@ -127,6 +133,7 @@ impl From<DurabilityError> for FsError {
             DurabilityError::StaleMutationIncarnation
             | DurabilityError::StaleJournalIncarnation => FsError::StaleHandle,
             DurabilityError::Closed => FsError::ShuttingDown,
+            DurabilityError::NoSpace => FsError::NoSpace,
             DurabilityError::Materialization(error) => error,
             DurabilityError::FilesystemFlush(_) | DurabilityError::Object(_) => FsError::IoError,
         }

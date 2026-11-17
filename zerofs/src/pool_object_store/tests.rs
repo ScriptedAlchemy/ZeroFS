@@ -103,6 +103,7 @@ impl Fixture {
             local_path: None,
             min_free_bytes: 0,
             health_device: None,
+            free_space: None,
         }
     }
 
@@ -1536,6 +1537,7 @@ async fn two_through_five_physical_roots_preserve_exact_unique_placements() {
                 local_path: Some(directory.canonicalize().unwrap()),
                 min_free_bytes: 0,
                 health_device: None,
+                free_space: None,
             });
         }
         let pool = PoolObjectStore::initialize(
@@ -1830,6 +1832,7 @@ async fn persistent_pool(root: &std::path::Path, initialize: bool) -> PoolObject
             local_path: Some(root.join(id)),
             min_free_bytes: 0,
             health_device: None,
+            free_space: None,
         })
         .collect();
     if initialize {

@@ -220,6 +220,7 @@ pub(crate) async fn open_pool_storage(
                 },
                 min_free_bytes: member.reserve_free_bytes()?,
                 health_device: member.health_device.clone(),
+                free_space: None,
             });
         }
         Ok(PoolObjectStore::open_with_preflight(

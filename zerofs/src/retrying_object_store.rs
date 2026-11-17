@@ -76,6 +76,26 @@ pub(crate) fn has_permanent_source(err: &object_store::Error) -> bool {
     false
 }
 
+/// True when a backend says it has no room: a native ENOSPC or EDQUOT, or an
+/// I/O error of kind `StorageFull` or `QuotaExceeded`, anywhere in the cause
+/// chain. Full is not broken: callers report it as ENOSPC, never EIO.
+pub(crate) fn is_no_space(err: &object_store::Error) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(error) = current {
+        if let Some(io) = error.downcast_ref::<std::io::Error>()
+            && (matches!(io.raw_os_error(), Some(libc::ENOSPC | libc::EDQUOT))
+                || matches!(
+                    io.kind(),
+                    std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+                ))
+        {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
 #[derive(Debug)]
 pub struct RetryingObjectStore {
     inner: Arc<dyn ObjectStore>,

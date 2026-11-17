@@ -657,6 +657,7 @@ impl Catalog {
         size: u64,
         members: &[PoolMember],
         target: Option<&str>,
+        skip: &BTreeSet<String>,
     ) -> Result<Upload> {
         let mut tx = self.database.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
@@ -682,7 +683,8 @@ impl Catalog {
                 .iter()
                 .filter(|m| target.is_none_or(|id| id == m.id))
             {
-                if health_in(&tx, &member.id)?.quarantine.is_some()
+                if skip.contains(&member.id)
+                    || health_in(&tx, &member.id)?.quarantine.is_some()
                     || health_in(&tx, &member.id)?.monitoring_error.is_some()
                 {
                     continue;
@@ -697,23 +699,20 @@ impl Catalog {
                     .used
                     .checked_add(record.reserved)
                     .context("pool usage overflow")?;
-                if record.capacity.saturating_sub(occupied) < size {
+                // Outstanding reservations may not have reached the device
+                // yet. Counting all of them is deliberately conservative.
+                let physical = match member.filesystem_space() {
+                    None => None,
+                    Some(Ok(space)) => Some(super::space::physical_room(
+                        space,
+                        member.min_free_bytes,
+                        local_reserved,
+                    )),
+                    Some(Err(_)) => continue,
+                };
+                let declared = record.capacity.saturating_sub(occupied);
+                if super::space::room(declared, physical).is_none_or(|room| room < size) {
                     continue;
-                }
-                if let Some(path) = &member.local_path {
-                    let Ok(available) = fs4::available_space(path) else {
-                        continue;
-                    };
-                    // Outstanding reservations may not have reached the device
-                    // yet. Counting all of them is deliberately conservative.
-                    let required = member
-                        .min_free_bytes
-                        .checked_add(local_reserved)
-                        .and_then(|n| n.checked_add(size))
-                        .context("pool free-space reservation overflow")?;
-                    if available < required {
-                        continue;
-                    }
                 }
                 record.reserved = record
                     .reserved
@@ -1036,6 +1035,7 @@ impl Catalog {
         &self,
         order: &[PoolMember],
         active: Option<&super::EvacuationProgress>,
+        full: &BTreeMap<String, i64>,
     ) -> Result<PoolStatus> {
         let tx = self.database.begin_read()?;
         // Read the clock after the snapshot opens, so no observation in it is later.
@@ -1221,6 +1221,7 @@ impl Catalog {
                     ..Default::default()
                 },
                 available_bytes: 0,
+                space: Default::default(),
                 health,
                 safe_to_remove,
                 safe_to_pull_with_known_loss,
@@ -1231,7 +1232,7 @@ impl Catalog {
                 evacuation,
             });
         }
-        super::capacity::assess(order, &mut members, &evacuation_segments);
+        super::capacity::assess(order, &mut members, &evacuation_segments, full);
         let multiple_failures = members
             .iter()
             .filter(|member| {
@@ -1392,6 +1393,7 @@ mod catalog_lock_tests {
             local_path: None,
             min_free_bytes: 0,
             health_device: None,
+            free_space: None,
         };
         catalog.configure_members(&[member]).unwrap();
         catalog.finish_initialization().unwrap();
@@ -1562,8 +1564,9 @@ mod legacy_health_compatibility {
             local_path: None,
             min_free_bytes: 0,
             health_device: None,
+            free_space: None,
         };
-        let status = catalog.status(&[config], None).unwrap();
+        let status = catalog.status(&[config], None, &BTreeMap::new()).unwrap();
         assert_eq!(status.mapped_objects, 1);
         assert_eq!(status.members[0].used_bytes, 7);
         assert!(status.members[0].health.quarantine.is_none());
@@ -1620,6 +1623,7 @@ mod empty_quarantine_tests {
                 local_path: None,
                 min_free_bytes: 0,
                 health_device: None,
+                free_space: None,
             })
             .collect::<Vec<_>>();
         catalog.configure_members(&members).unwrap();
@@ -1635,7 +1639,7 @@ mod empty_quarantine_tests {
         size: u64,
     ) -> Entry {
         let upload = catalog
-            .reserve(location, size, members, Some(member))
+            .reserve(location, size, members, Some(member), &BTreeSet::new())
             .unwrap();
         let entry = Entry {
             physical: Physical::Member {
@@ -1686,7 +1690,7 @@ mod empty_quarantine_tests {
         assert_eq!(catalog.empty_ownership_scans.load(Ordering::Relaxed), 1);
         assert!(
             catalog
-                .reserve("new-data", 0, &members, Some("old"))
+                .reserve("new-data", 0, &members, Some("old"), &BTreeSet::new())
                 .is_err()
         );
         let marker = catalog.identity.marker().unwrap();
@@ -1712,7 +1716,7 @@ mod empty_quarantine_tests {
         let (_root, catalog, members) = fixture();
         let zero = insert(&catalog, &members, "zero-data", "old", 0);
         let upload = catalog
-            .reserve("zero-upload", 0, &members, Some("old"))
+            .reserve("zero-upload", 0, &members, Some("old"), &BTreeSet::new())
             .unwrap();
         insert(&catalog, &members, "current-data", "current", 8);
         quarantine(&catalog);
