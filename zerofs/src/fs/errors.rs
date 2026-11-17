@@ -53,6 +53,10 @@ pub enum FsError {
     LeaderRejectedBeforeApply,
     #[error("Server shutting down")]
     ShuttingDown,
+    /// The client cancelled the request before it changed any state. Only a
+    /// 9P `Tflush` produces it, and its reply is never sent.
+    #[error("Request abandoned by its client")]
+    Abandoned,
 }
 
 impl From<bincode::Error> for FsError {
@@ -86,6 +90,7 @@ impl From<FsError> for nfsstat3 {
             FsError::LeaderLeaseExpired => nfsstat3::NFS3ERR_IO,
             FsError::LeaderRejectedBeforeApply => nfsstat3::NFS3ERR_IO,
             FsError::ShuttingDown => nfsstat3::NFS3ERR_IO,
+            FsError::Abandoned => nfsstat3::NFS3ERR_IO,
         }
     }
 }
@@ -154,6 +159,7 @@ impl FsError {
             // errno consumers must see an ordinary I/O failure.
             FsError::LeaderRejectedBeforeApply => crate::linux_errno::EIO,
             FsError::ShuttingDown => ninep_proto::P9_ENOTLEADER,
+            FsError::Abandoned => crate::linux_errno::EINTR,
         }
     }
 }
@@ -198,6 +204,7 @@ mod tests {
             (FsError::LeaderLeaseExpired, ninep_proto::P9_ENOTLEADER),
             (FsError::LeaderRejectedBeforeApply, 5),
             (FsError::ShuttingDown, ninep_proto::P9_ENOTLEADER),
+            (FsError::Abandoned, 4),
         ] {
             assert_eq!(error.to_errno(), expected, "{error:?}");
         }

@@ -37,7 +37,7 @@ impl NinePHandler {
         let memory =
             crate::ninep::server::P9GlobalAdmission::shared().try_admit_xattr(data.len())?;
         let size = data.len() as u64;
-        let mut state = self.connected_session()?;
+        let mut state = self.session_for_update()?;
         if state.fids.contains_key(&tx.newfid) {
             return Err(P9Error::FidInUse);
         }
@@ -76,7 +76,7 @@ impl NinePHandler {
         let _guard = self.filesystem.lock_manager.acquire(fid.inode_id).await;
         let inode = self.filesystem.inode_store.get(fid.inode_id).await?;
         name.check(&inode, &fid.creds, true)?;
-        let mut state = self.connected_session()?;
+        let mut state = self.session_for_update()?;
         let slot = state.fids.get_mut(&tx.fid).ok_or(P9Error::BadFid)?;
         if slot.xattr.is_some() || slot.fid.opened {
             return Err(P9Error::FidAlreadyOpen);
@@ -119,6 +119,9 @@ impl NinePHandler {
     pub(super) fn write_xattr(&self, tw: &Twrite) -> Option<P9Result<Message>> {
         let mut state = self.session_state();
         let xattr = state.fids.get_mut(&tw.fid)?.xattr.as_mut()?;
+        if let Err(abandoned) = crate::abandonment::pass_point_of_no_return() {
+            return Some(Err(FsError::from(abandoned).into()));
+        }
         let XattrFid::Write {
             value,
             covered,

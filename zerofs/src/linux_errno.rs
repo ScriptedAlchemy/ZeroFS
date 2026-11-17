@@ -4,6 +4,7 @@
 
 pub(crate) const EPERM: u32 = 1;
 pub(crate) const ENOENT: u32 = 2;
+pub(crate) const EINTR: u32 = 4;
 pub(crate) const EIO: u32 = 5;
 pub(crate) const EBADF: u32 = 9;
 pub(crate) const EAGAIN: u32 = 11;

@@ -132,7 +132,8 @@ fn is_terminal_dedup_error(error: P9Error) -> bool {
                 | FsError::InvalidData
                 | FsError::LeaderLeaseExpired
                 | FsError::LeaderRejectedBeforeApply
-                | FsError::ShuttingDown,
+                | FsError::ShuttingDown
+                | FsError::Abandoned,
         )
     )
 }
@@ -491,6 +492,15 @@ impl NinePHandler {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Session table for a change the client will observe. Passing here ends
+    /// the request's abandonable phase (`crate::abandonment`): a fid installed
+    /// or released by a request that then went unanswered would contradict
+    /// the client's view after `Rflush`.
+    fn session_for_update(&self) -> P9Result<MutexGuard<'_, SessionState>> {
+        crate::abandonment::pass_point_of_no_return().map_err(FsError::from)?;
+        self.connected_session()
+    }
+
     fn connected_session(&self) -> P9Result<MutexGuard<'_, SessionState>> {
         let guard = self.session_state();
         if guard.disconnected {
@@ -585,7 +595,7 @@ impl NinePHandler {
         directory_pin: Option<OpenHandle>,
     ) -> P9Result<()> {
         let replaced = {
-            let mut state = self.connected_session()?;
+            let mut state = self.session_for_update()?;
             if source != newfid && state.fids.contains_key(&newfid) {
                 return Err(P9Error::FidInUse);
             }
@@ -1124,6 +1134,7 @@ impl NinePHandler {
         let qid = inode_to_qid(&root_inode, root_id);
         let directory_pin = self.pin_walked_directory(root_id).await?;
 
+        crate::abandonment::pass_point_of_no_return().map_err(FsError::from)?;
         let mut state = self.session_state();
         if state.fids.contains_key(&ta.fid) {
             return Err(P9Error::FidInUse);
@@ -1261,7 +1272,7 @@ impl NinePHandler {
         // OPENED records only that reconnect expects an in-place reopen next.
         // The client-supplied replay flag grants no access or opened-file pin;
         // the actual open still performs DAC checks and installs that handle.
-        let mut state = self.connected_session()?;
+        let mut state = self.session_for_update()?;
         if state.fids.contains_key(&tr.fid) {
             return Err(P9Error::FidInUse);
         }
@@ -1562,7 +1573,7 @@ impl NinePHandler {
             check_open_access(&inode, &creds, tl.flags)
                 .map_err(|error| Self::map_replay_open_error(replay_reopen, error))?;
             let qid = inode_to_qid(&inode, inode_id);
-            let mut state = self.connected_session()?;
+            let mut state = self.session_for_update()?;
             match state.fids.get_mut(&tl.fid) {
                 Some(slot) => {
                     // Publish the exact fid snapshot whose inode and
@@ -1617,7 +1628,7 @@ impl NinePHandler {
             check_open_access(&inode, &src_fid.creds, tl.flags)
                 .map_err(|error| Self::map_replay_open_error(replay_reopen, error))?;
             let qid = inode_to_qid(&inode, src_fid.inode_id);
-            let mut state = self.connected_session()?;
+            let mut state = self.session_for_update()?;
             let new_fid = Fid {
                 path: src_fid.path.clone(),
                 inode_id: src_fid.inode_id,
@@ -1898,7 +1909,7 @@ impl NinePHandler {
                 Err(FsError::NotFound) => return Err(FsError::StaleHandle.into()),
                 Err(error) => return Err(error.into()),
             }
-            let mut state = self.connected_session()?;
+            let mut state = self.session_for_update()?;
             let slot = state.fids.get_mut(&tc.fid).ok_or(P9Error::BadFid)?;
             // Serialize racing creates under the session lock.
             if slot.fid.opened {
@@ -1946,7 +1957,7 @@ impl NinePHandler {
                 Err(FsError::NotFound) => return Err(FsError::StaleHandle.into()),
                 Err(error) => return Err(error.into()),
             }
-            let mut state = self.connected_session()?;
+            let mut state = self.session_for_update()?;
             let new_fid = Fid {
                 path,
                 inode_id: child_id,
@@ -2598,6 +2609,7 @@ impl NinePHandler {
         let fid = self.get_fid(tl.fid)?;
 
         if matches!(tl.lock_type, LockType::Unlock) {
+            crate::abandonment::pass_point_of_no_return().map_err(FsError::from)?;
             self.lock_manager.unlock_range(
                 fid.inode_id,
                 tl.fid,
@@ -2612,7 +2624,7 @@ impl NinePHandler {
         }
 
         // Publish lock state and its guard under the session lock.
-        let mut state = self.connected_session()?;
+        let mut state = self.session_for_update()?;
         let slot = match state.fids.get_mut(&tl.fid) {
             Some(slot) => slot,
             None => return Err(P9Error::BadFid),
