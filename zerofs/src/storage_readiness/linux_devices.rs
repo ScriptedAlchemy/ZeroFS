@@ -99,13 +99,8 @@ fn block_serial(path: &Path, allow_partition: bool) -> Result<Serial> {
 }
 
 #[cfg(target_os = "linux")]
-pub(in crate::storage_readiness) fn observe_device(
-    by_id: &Path,
-) -> Result<super::super::DeviceObservation> {
-    Ok(super::super::DeviceObservation {
-        block_device: true,
-        serial: Some(block_serial(by_id, false)?),
-    })
+pub(in crate::storage_readiness) fn observe_device(by_id: &Path) -> Result<Serial> {
+    block_serial(by_id, false)
 }
 
 #[cfg(target_os = "linux")]

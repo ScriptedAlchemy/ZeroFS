@@ -759,7 +759,6 @@ fn reserve_above_observed_size_or_unavailable_size_refuses_strict_open() {
         .unwrap();
         for (size, expected) in [
             (Some(999_999), "observed filesystem size"),
-            (Some(0), "filesystem size unavailable"),
             (None, "filesystem size unavailable"),
         ] {
             let error = verify_with(

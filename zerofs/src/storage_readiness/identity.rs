@@ -53,9 +53,3 @@ impl From<Serial> for String {
         value.0
     }
 }
-
-#[derive(Debug, Clone)]
-pub(crate) struct DeviceObservation {
-    pub(super) block_device: bool,
-    pub(super) serial: Option<Serial>,
-}

@@ -284,7 +284,7 @@ fn declared_reserve_compares_against_the_existing_pool_default() {
 }
 struct HardwareProvider<'a> {
     fixture: &'a Fixture,
-    devices: BTreeMap<PathBuf, DeviceObservation>,
+    devices: BTreeMap<PathBuf, Serial>,
     backing: BTreeMap<PathBuf, std::collections::HashSet<Serial>>,
 }
 
@@ -295,15 +295,7 @@ impl<'a> HardwareProvider<'a> {
         let devices = config
             .devices
             .iter()
-            .map(|device| {
-                (
-                    device.by_id.clone(),
-                    DeviceObservation {
-                        block_device: true,
-                        serial: Some(device.serial.clone()),
-                    },
-                )
-            })
+            .map(|device| (device.by_id.clone(), device.serial.clone()))
             .collect();
         let backing = config
             .validated_roots(&settings)
@@ -337,7 +329,7 @@ impl IdentityProvider for HardwareProvider<'_> {
     fn observe(&self, root: &Path) -> Result<MountedFilesystem> {
         self.fixture.observe(root)
     }
-    fn observe_device(&self, by_id: &Path) -> Result<DeviceObservation> {
+    fn observe_device(&self, by_id: &Path) -> Result<Serial> {
         self.devices
             .get(by_id)
             .cloned()
@@ -371,8 +363,6 @@ fn non_strict_device_declarations_do_not_probe_the_host() {
 fn strict_device_refusals_leave_every_role_directory_empty() {
     for (failure, expected) in [
         ("missing", "device evidence unavailable"),
-        ("not-block", "block device"),
-        ("no-serial", "serial unavailable"),
         ("wrong-serial", "serial does not match"),
         ("backing-unavailable", "backing serials unavailable"),
         ("backing-different", "backing device set"),
@@ -388,11 +378,11 @@ fn strict_device_refusals_leave_every_role_directory_empty() {
             "missing" => {
                 provider.devices.remove(&path);
             }
-            "not-block" => provider.devices.get_mut(&path).unwrap().block_device = false,
-            "no-serial" => provider.devices.get_mut(&path).unwrap().serial = None,
             "wrong-serial" => {
-                provider.devices.get_mut(&path).unwrap().serial =
-                    Some(Serial::try_from("EXAMPLE-WRONG-0001".to_owned()).unwrap())
+                provider.devices.insert(
+                    path,
+                    Serial::try_from("EXAMPLE-WRONG-0001".to_owned()).unwrap(),
+                );
             }
             "backing-unavailable" => {
                 provider.backing.remove(&root);

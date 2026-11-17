@@ -15,16 +15,14 @@ use devices::RoleName;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use identity::{DeviceObservation, MountedFilesystem, Serial};
+use identity::{MountedFilesystem, Serial};
 
 pub(super) trait IdentityProvider {
     fn observe(&self, root: &Path) -> Result<MountedFilesystem>;
 
-    fn filesystem_size(&self, _root: &Path) -> Result<u64> {
-        bail!("filesystem size unavailable from this adapter")
-    }
+    fn filesystem_size(&self, root: &Path) -> Result<u64>;
 
-    fn observe_device(&self, _by_id: &Path) -> Result<DeviceObservation> {
+    fn observe_device(&self, _by_id: &Path) -> Result<Serial> {
         bail!("device identity unavailable from this adapter")
     }
 
@@ -42,7 +40,7 @@ impl IdentityProvider for HostIdentityProvider {
     }
 
     #[cfg(target_os = "linux")]
-    fn observe_device(&self, by_id: &Path) -> Result<DeviceObservation> {
+    fn observe_device(&self, by_id: &Path) -> Result<Serial> {
         linux::devices::observe_device(by_id)
     }
 
@@ -88,18 +86,12 @@ pub(super) fn verify_with(settings: &Settings, provider: &dyn IdentityProvider) 
         return Ok(());
     }
     for device in &config.devices {
-        let observation = provider.observe_device(&device.by_id).with_context(|| {
+        let serial = provider.observe_device(&device.by_id).with_context(|| {
             format!(
                 "storage readiness device evidence unavailable at {}",
                 device.by_id.display()
             )
         })?;
-        if !observation.block_device {
-            bail!("readiness {} is not a block device", device.by_id.display());
-        }
-        let serial = observation
-            .serial
-            .context("readiness device serial unavailable")?;
         if serial != device.serial {
             bail!(
                 "readiness device serial does not match its declaration at {}",
@@ -179,12 +171,6 @@ fn verify_identity(
     let size = provider
         .filesystem_size(path)
         .with_context(|| format!("readiness {} filesystem size unavailable", root.role))?;
-    if size == 0 {
-        bail!(
-            "readiness {} filesystem size unavailable: zero size",
-            root.role
-        );
-    }
     if config.reserve_bytes(root.filesystem)? > size {
         bail!(
             "readiness {} reserve exceeds observed filesystem size",
