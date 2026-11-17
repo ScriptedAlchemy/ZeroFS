@@ -270,7 +270,9 @@ jobs:
           EOF
 
           # Start ZeroFS in the background with 9P enabled
-          ./target/ci/zerofs run -c zerofs-ci.toml &
+          # Keep the log: when a stress run fails, it is the only record of what the
+          # server did, and this step's output ends before the stress run starts.
+          ./target/ci/zerofs run -c zerofs-ci.toml > /tmp/zerofs-ci.log 2>&1 &
 
           # Wait for ZeroFS to start (9P runs on port 5564)
           echo "Waiting for ZeroFS 9P server to start..."
@@ -313,6 +315,12 @@ jobs:
         run: |
           cd /mnt/zerofs-9p
           sudo stress-ng --job "$GITHUB_WORKSPACE/.github/stress-ng-filesystem.job"
+
+      - name: Show the server log and kernel messages after a failure
+        if: failure()
+        run: |
+          tail -n 300 /tmp/zerofs-ci.log || true
+          sudo dmesg | tail -n 150 || true
 
       - name: Cleanup
         if: always()
