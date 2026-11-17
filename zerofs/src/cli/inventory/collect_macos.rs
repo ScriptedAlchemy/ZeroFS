@@ -1,6 +1,7 @@
 use super::record::{
     Field, Filesystem, RawAcl, RawBytes, Reason, Timestamp, TrustedXattrNamespace,
 };
+use super::walk::MountIdentity;
 use rustix::fd::{AsRawFd, BorrowedFd};
 use rustix::fs::{Stat, StatFs};
 use rustix::io::Errno;
@@ -98,6 +99,23 @@ pub(super) fn filesystem(stat: &StatFs) -> Filesystem {
         type_name: Some(name),
         type_magic: stat.f_type as u64,
         network,
+    }
+}
+
+pub(super) fn mount_identity(fd: BorrowedFd<'_>) -> Field<MountIdentity> {
+    match rustix::fs::fstatfs(fd) {
+        Ok(stat) => Field::Observed(MountIdentity {
+            // SAFETY: fsid_t is the C struct { int32_t val[2]; } with a private field in libc.
+            fsid: unsafe { std::mem::transmute::<libc::fsid_t, [i32; 2]>(stat.f_fsid) },
+            // SAFETY: f_mntonname is a NUL-terminated kernel-provided fixed buffer.
+            mount_point: unsafe { CStr::from_ptr(stat.f_mntonname.as_ptr()) }
+                .to_bytes()
+                .to_vec(),
+        }),
+        Err(error) => Field::Unavailable {
+            reason: Reason::MountIdUnavailable,
+            errno: Some(error.raw_os_error()),
+        },
     }
 }
 
