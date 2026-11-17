@@ -17,7 +17,7 @@ jobs:
       - name: Install fuse3
         run: |
           sudo apt-get update
-          sudo apt-get install -y fuse3
+          sudo apt-get install -y fuse3 attr
           # Runner image 20260804.265.1 ships a non-setuid helper in
           # /usr/local/bin that shadows the distro's setuid helper.
           sudo rm -f /usr/local/bin/fusermount3
@@ -37,3 +37,10 @@ jobs:
       - name: Run the mounted case-insensitive name checks
         timeout-minutes: 5
         run: python3 scripts/test-case-insensitive-fuse.py --binary zerofs/target/ci/zerofs
+
+      # The xattr script is the only end-to-end check of empty replacement and
+      # explicit removal through a real mount. It runs once with sensitive names
+      # and once with insensitive names.
+      - name: Run the mounted extended-attribute checks
+        timeout-minutes: 5
+        run: python3 scripts/test-xattrs-fuse.py --binary zerofs/target/ci/zerofs
