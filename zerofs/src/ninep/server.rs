@@ -1593,71 +1593,230 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn process_shutdown_cancels_dispatched_request_before_settlement_wait() {
-        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
-        let handler = Arc::new(NinePHandler::new(
-            Arc::clone(&filesystem),
-            Arc::new(FileLockManager::new()),
-        ));
-        establish_session(&handler, 1, b"root", 0, None).await;
+    /// A connection whose requests run under an explicit process shutdown
+    /// token and a process-level accepted-work tracker.
+    struct ProcessShutdownFixture {
+        filesystem: Arc<ZeroFS>,
+        handler: Arc<NinePHandler>,
+        accepted_work: P9AcceptedWorkTracker,
+        admission: P9ConnectionAdmission,
+        requests: TaskTracker,
+        tx: mpsc::Sender<P9Response>,
+        rx: mpsc::Receiver<P9Response>,
+        connection_shutdown: CancellationToken,
+        process_shutdown: CancellationToken,
+    }
 
-        let accepted_work = P9AcceptedWorkTracker::new();
-        let byte_limit = P9_MAX_MSIZE as usize * 2;
-        let global = P9GlobalAdmission::for_test(byte_limit, 2);
-        let admission = global.connection_with_accepted_work(accepted_work.clone());
-        let requests = TaskTracker::new();
-        let (tx, _rx) = mpsc::channel(1);
-        let connection_shutdown = CancellationToken::new();
-        let process_shutdown = CancellationToken::new();
+    impl ProcessShutdownFixture {
+        async fn new() -> Self {
+            let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+            let handler = Arc::new(NinePHandler::new(
+                Arc::clone(&filesystem),
+                Arc::new(FileLockManager::new()),
+            ));
+            establish_session(&handler, 1, b"root", 0, None).await;
+            let accepted_work = P9AcceptedWorkTracker::new();
+            let byte_limit = P9_MAX_MSIZE as usize * 2;
+            let global = P9GlobalAdmission::for_test(byte_limit, 2);
+            let admission = global.connection_with_accepted_work(accepted_work.clone());
+            let (tx, rx) = mpsc::channel(1);
+            Self {
+                filesystem,
+                handler,
+                accepted_work,
+                admission,
+                requests: TaskTracker::new(),
+                tx,
+                rx,
+                connection_shutdown: CancellationToken::new(),
+                process_shutdown: CancellationToken::new(),
+            }
+        }
+
+        /// Dispatch a `Tmkdir` of `name` under the attach root (inode 0).
+        async fn dispatch_mkdir(&self, tag: u16, op_id: [u8; 16], name: &[u8]) {
+            let request = P9Message::new_with_op_id(
+                tag,
+                op_id,
+                Message::Tmkdir(Tmkdir {
+                    dfid: 1,
+                    name: P9String::new(name.to_vec()),
+                    mode: 0o755,
+                    gid: 0,
+                }),
+            )
+            .to_bytes_ctx(true)
+            .unwrap();
+            dispatch_9p_frame(
+                Bytes::from(request),
+                &self.handler,
+                &self.tx,
+                &InflightRegistry::default(),
+                &self.admission,
+                &self.requests,
+                &self.connection_shutdown,
+                &self.process_shutdown,
+            )
+            .await
+            .unwrap();
+        }
+
+        /// Begin process shutdown and stop tracking new request tasks.
+        fn shut_down(&self) {
+            self.process_shutdown.cancel();
+            self.requests.close();
+        }
+
+        async fn entry_exists(&self, name: &[u8]) -> bool {
+            self.filesystem
+                .directory_store
+                .exists(0, name)
+                .await
+                .unwrap()
+        }
+    }
+
+    /// The request below has applied its mkdir and is paused before it
+    /// publishes its terminal ledger result and replies. That is past its point
+    /// of no return: flush(5) and `crate::abandonment` both say it now runs to
+    /// completion. This test used to assert that process shutdown drops it
+    /// anyway. Shutdown now lets it finish, and bounds the wait separately
+    /// (`process_shutdown_settlement_is_bounded_when_a_commit_never_applies`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_shutdown_settles_a_request_past_its_point_of_no_return() {
+        let mut fixture = ProcessShutdownFixture::new().await;
         let op_id = [0x92; 16];
         let (request_reached, release_request) = pause_success_terminal_dedup(op_id);
-        let request = P9Message::new_with_op_id(
-            10,
-            op_id,
-            Message::Tmkdir(Tmkdir {
-                dfid: 1,
-                name: P9String::new(b"process-shutdown-first".to_vec()),
-                mode: 0o755,
-                gid: 0,
-            }),
-        )
-        .to_bytes_ctx(true)
-        .unwrap();
-
-        dispatch_9p_frame(
-            Bytes::from(request),
-            &handler,
-            &tx,
-            &InflightRegistry::default(),
-            &admission,
-            &requests,
-            &connection_shutdown,
-            &process_shutdown,
-        )
-        .await
-        .unwrap();
+        fixture
+            .dispatch_mkdir(10, op_id, b"process-shutdown-first")
+            .await;
         tokio::time::timeout(TEST_TIMEOUT, request_reached)
             .await
             .expect("dispatched request must reach its controlled pause")
             .unwrap();
-        assert_eq!(accepted_work.len(), 1);
+        assert_eq!(fixture.accepted_work.len(), 1);
 
-        process_shutdown.cancel();
-        requests.close();
-        let settlement = tokio::time::timeout(QUIET_TIMEOUT, requests.wait()).await;
-        if settlement.is_err() {
-            let _ = release_request.send(());
-            requests.wait().await;
-        }
-        accepted_work.stop_accepting();
-        let process_settlement = tokio::time::timeout(TEST_TIMEOUT, accepted_work.wait()).await;
-
+        fixture.shut_down();
+        let mut settlement = Box::pin(fixture.requests.wait());
         assert!(
-            settlement.is_ok(),
-            "process shutdown must cancel a dispatched request before waiting for its ownership token"
+            tokio::time::timeout(QUIET_TIMEOUT, &mut settlement)
+                .await
+                .is_err(),
+            "process shutdown dropped a request whose mkdir had already applied"
         );
-        process_settlement.expect("process ownership must drain after request cancellation");
+        assert_eq!(fixture.accepted_work.len(), 1);
+
+        release_request.send(()).unwrap();
+        tokio::time::timeout(TEST_TIMEOUT, settlement)
+            .await
+            .expect("the request must finish once its pause is released");
+        let response = tokio::time::timeout(TEST_TIMEOUT, fixture.rx.recv())
+            .await
+            .expect("the settled request must still reply")
+            .expect("response channel");
+        let (tag, bytes) = response.into_parts();
+        assert_eq!(tag, 10);
+        assert!(matches!(decode(&bytes).body, Message::Rmkdir(_)));
+        fixture.accepted_work.stop_accepting();
+        tokio::time::timeout(TEST_TIMEOUT, fixture.accepted_work.wait())
+            .await
+            .expect("process ownership must drain after the request settles");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_shutdown_keeps_a_queued_mkdir_locked_until_it_applies() {
+        let mut fixture = ProcessShutdownFixture::new().await;
+        let block_apply = fixture.filesystem.db.flush_barrier().write_owned().await;
+        let queued = fixture.filesystem.write_coordinator.probe_next_apply();
+        fixture.dispatch_mkdir(10, [0x93; 16], b"queued").await;
+        tokio::time::timeout(TEST_TIMEOUT, queued)
+            .await
+            .expect("the mkdir must queue its commit")
+            .unwrap();
+
+        fixture.shut_down();
+        let mut settlement = Box::pin(fixture.requests.wait());
+        assert!(
+            tokio::time::timeout(QUIET_TIMEOUT, &mut settlement)
+                .await
+                .is_err(),
+            "process shutdown dropped a mkdir whose commit was queued"
+        );
+        assert!(
+            fixture.filesystem.lock_manager.is_locked_for_test(0),
+            "the directory lock was released before the queued mkdir applied"
+        );
+
+        // A second actor that takes the directory lock during shutdown, as NFS,
+        // the web UI or a background reclaim could, must see the applied entry.
+        let observer = tokio::spawn({
+            let filesystem = Arc::clone(&fixture.filesystem);
+            async move {
+                let _lock = filesystem.lock_manager.acquire(0).await;
+                filesystem
+                    .directory_store
+                    .exists(0, b"queued")
+                    .await
+                    .unwrap()
+            }
+        });
+        drop(block_apply);
+        assert!(
+            tokio::time::timeout(TEST_TIMEOUT, observer)
+                .await
+                .expect("the lock must be released once the mkdir applies")
+                .unwrap(),
+            "the next holder of the directory lock did not see the queued mkdir"
+        );
+        tokio::time::timeout(TEST_TIMEOUT, settlement)
+            .await
+            .expect("the request must finish once its commit applies");
+        let response = tokio::time::timeout(TEST_TIMEOUT, fixture.rx.recv())
+            .await
+            .expect("the settled mkdir must still reply")
+            .expect("response channel");
+        let (tag, bytes) = response.into_parts();
+        assert_eq!(tag, 10);
+        assert!(matches!(decode(&bytes).body, Message::Rmkdir(_)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_shutdown_drops_a_request_before_its_point_of_no_return() {
+        let mut fixture = ProcessShutdownFixture::new().await;
+        // The mkdir waits for the directory lock, before anything is queued.
+        let directory_lock = fixture.filesystem.lock_manager.acquire(0).await;
+        fixture.dispatch_mkdir(10, [0x94; 16], b"never").await;
+        fixture.requests.close();
+        let mut settlement = Box::pin(fixture.requests.wait());
+        assert!(
+            tokio::time::timeout(QUIET_TIMEOUT, &mut settlement)
+                .await
+                .is_err(),
+            "the mkdir must still be waiting for the directory lock"
+        );
+
+        fixture.process_shutdown.cancel();
+        tokio::time::timeout(TEST_TIMEOUT, settlement)
+            .await
+            .expect("process shutdown must drop a request that changed nothing");
+        fixture.accepted_work.stop_accepting();
+        tokio::time::timeout(TEST_TIMEOUT, fixture.accepted_work.wait())
+            .await
+            .expect("process ownership must drain after the request is dropped");
+
+        drop(directory_lock);
+        fixture
+            .filesystem
+            .write_coordinator
+            .barrier()
+            .await
+            .unwrap();
+        assert!(!fixture.entry_exists(b"never").await);
+        assert!(!fixture.filesystem.lock_manager.is_locked_for_test(0));
+        assert!(
+            fixture.rx.try_recv().is_err(),
+            "a dropped request must not reply"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
