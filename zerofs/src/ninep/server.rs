@@ -647,6 +647,95 @@ mod tests {
         assert_eq!(global.snapshot().reserved_bytes, 0);
     }
 
+    /// A Samba share served through one 9P mount shares one connection, so
+    /// the number of metadata requests that connection can hold is the
+    /// share's metadata concurrency. Offer more paused `Tmkdir` requests than
+    /// the request limit and count how many reach the handler.
+    #[tokio::test]
+    async fn one_connection_holds_metadata_requests_up_to_its_request_limit() {
+        const OFFERED: usize = CONNECTION_INFLIGHT_REQUESTS + 4;
+        let (_, handler) = in_memory_handler().await;
+        establish_session(&handler, 1, b"root", 0, None).await;
+        let global = P9GlobalAdmission::for_test(GLOBAL_INFLIGHT_MEMORY, GLOBAL_INFLIGHT_REQUESTS);
+        let admission =
+            global.connection_for_test(CONNECTION_INFLIGHT_MEMORY, CONNECTION_INFLIGHT_REQUESTS);
+        let requests = TaskTracker::new();
+        let (tx, mut rx) = mpsc::channel(OFFERED + 1);
+        let (mut client, server) = tokio::io::duplex(1024 * 1024);
+        let shutdown = CancellationToken::new();
+
+        let mut reached = Vec::new();
+        let mut releases = Vec::new();
+        let mut frames = Vec::new();
+        for index in 0..OFFERED {
+            let mut op_id = [0xb7; P9_OP_ID_LEN];
+            op_id[0] = index as u8;
+            let (request_reached, release) = pause_success_terminal_dedup(op_id);
+            reached.push(request_reached);
+            releases.push(release);
+            frames.extend(
+                P9Message::new_with_op_id(
+                    10 + index as u16,
+                    op_id,
+                    Message::Tmkdir(Tmkdir {
+                        dfid: 1,
+                        name: P9String::new(format!("held-{index}").into_bytes()),
+                        mode: 0o755,
+                        gid: 0,
+                    }),
+                )
+                .to_bytes_ctx(true)
+                .unwrap(),
+            );
+        }
+        client.write_all(&frames).await.unwrap();
+
+        let reader = handle_client_loop(
+            Arc::clone(&handler),
+            server,
+            tx,
+            shutdown.clone(),
+            CancellationToken::new(),
+            &admission,
+            &requests,
+        );
+        let observe = async {
+            // Admission is in receive order, so the first request that does
+            // not reach its pause marks where the reader stopped.
+            let mut held = 0;
+            for request_reached in &mut reached {
+                if tokio::time::timeout(TEST_TIMEOUT, request_reached)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                held += 1;
+            }
+            for release in releases.drain(..) {
+                let _ = release.send(());
+            }
+            for _ in 0..OFFERED {
+                tokio::time::timeout(TEST_TIMEOUT, rx.recv())
+                    .await
+                    .expect("released requests must reply")
+                    .expect("response channel");
+            }
+            shutdown.cancel();
+            held
+        };
+        let (reader_result, held) = tokio::join!(reader, observe);
+        reader_result.unwrap();
+        requests.close();
+        requests.wait().await;
+
+        assert_eq!(
+            held, CONNECTION_INFLIGHT_REQUESTS,
+            "one connection held {held} paused metadata requests; small replies must not \
+             each reserve a maximum-msize reply"
+        );
+    }
+
     #[tokio::test]
     async fn connection_request_bytes_apply_backpressure_before_dispatch() {
         let global = P9GlobalAdmission::for_test(16, 4);
