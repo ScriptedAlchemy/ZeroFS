@@ -994,6 +994,13 @@ async fn recover_publication_result(
 }
 
 fn is_terminal_remote_error(error: &object_store::Error) -> bool {
+    // Pool capacity refusals end a foreground attempt immediately, but the
+    // durable journal still owns its payload and may retry after space returns.
+    // Do not exempt arbitrary ENOSPC causes: a permanent cleanup failure can
+    // contain one while still requiring the scheduler to stop.
+    if crate::retrying_object_store::has_capacity_source(error) {
+        return false;
+    }
     if crate::retrying_object_store::has_permanent_source(error) {
         return true;
     }
@@ -1884,6 +1891,9 @@ fn missing_remote_predecessor(
         }),
     }
 }
+
+#[cfg(test)]
+mod capacity_tests;
 
 #[cfg(test)]
 mod tests {

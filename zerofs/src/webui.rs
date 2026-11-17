@@ -7,8 +7,8 @@ use crate::fs::{VerifiedFileContent, VerifiedFileExpectation, VerifiedRenameOutc
 use crate::ninep::handler::{NinePHandler, SessionReleaseGuard};
 use crate::ninep::lock_manager::FileLockManager;
 use crate::ninep::server::{
-    InflightRegistry, P9AcceptedWorkTracker, P9GlobalAdmission, P9Response, P9TransportPermit,
-    dispatch_9p_frame, response_may_be_emitted, settle_request_tasks,
+    ConnectionContext, InflightRegistry, P9AcceptedWorkTracker, P9GlobalAdmission, P9PendingFrames,
+    P9Response, P9TransportPermit, response_may_be_emitted, settle_request_tasks,
 };
 use crate::rpc::proto;
 use crate::rpc::server::AdminRpcServer;
@@ -266,6 +266,7 @@ async fn handle_9p_ws(
     // Abort on early exit; normal teardown drains responses for a bounded interval.
     let mut writer = AbortOnDropHandle::new(spawn_named("9p-ws-writer", async move {
         use futures::SinkExt;
+        let _cancel_connection_on_exit = writer_authority_lost.clone().drop_guard();
         while let Some(response) = rx.recv().await {
             let (tag, response_bytes, admission) = response.into_guarded_parts();
             if !response_may_be_emitted(&response_db, &response_bytes) {
@@ -289,24 +290,38 @@ async fn handle_9p_ws(
     }));
 
     use futures::StreamExt;
+    let context = ConnectionContext {
+        handler: &handler,
+        tx: &tx,
+        inflight: &inflight,
+        admission: &admission,
+        requests: &requests,
+        connection_shutdown: &response_authority_lost,
+        process_shutdown: &state.shutdown,
+    };
+    let mut pending = None;
     loop {
-        let admit = P9GlobalAdmission::shared().admit_websocket_receive(&state.shutdown);
-        let receive = tokio::select! {
-            biased;
-            _ = wait_for_idle_expiry(&last_activity, idle_timeout.unwrap_or_default()),
-                if idle_timeout.is_some() =>
-            {
-                reaped_idle = true;
-                break;
-            }
-            receive = admit => match receive {
-                Ok(receive) => receive,
-                Err(error) => {
-                    debug!("9P WebSocket receive admission ended: {error}");
+        if pending.is_none() {
+            let admit = P9GlobalAdmission::shared().admit_websocket_receive(&state.shutdown);
+            let receive = tokio::select! {
+                biased;
+                _ = response_authority_lost.cancelled() => break,
+                _ = wait_for_idle_expiry(&last_activity, idle_timeout.unwrap_or_default()),
+                    if idle_timeout.is_some() =>
+                {
+                    reaped_idle = true;
                     break;
                 }
-            },
-        };
+                receive = admit => match receive {
+                    Ok(receive) => receive,
+                    Err(error) => {
+                        debug!("9P WebSocket receive admission ended: {error}");
+                        break;
+                    }
+                },
+            };
+            pending = Some(P9PendingFrames::new(receive));
+        }
         let next = tokio::select! {
             biased;
             _ = state.shutdown.cancelled() => {
@@ -314,7 +329,7 @@ async fn handle_9p_ws(
                 break;
             }
             _ = response_authority_lost.cancelled() => {
-                debug!("9P WebSocket handler closing after serving authority loss");
+                debug!("9P WebSocket handler closing after its response writer ended");
                 break;
             }
             _ = wait_for_idle_expiry(&last_activity, idle_timeout.unwrap_or_default()),
@@ -330,18 +345,21 @@ async fn handle_9p_ws(
         }
         match next {
             Some(Ok(WsMessage::Binary(data))) => {
-                if let Err(e) = dispatch_9p_frame(
-                    data,
-                    &handler,
-                    &tx,
-                    &inflight,
-                    &admission,
-                    &requests,
-                    &state.shutdown,
-                    &state.shutdown,
-                )
-                .await
-                {
+                let dispatch = pending
+                    .as_ref()
+                    .expect("receive credit acquired")
+                    .dispatch(data, &context);
+                let result = tokio::select! {
+                    biased;
+                    _ = wait_for_idle_expiry(&last_activity, idle_timeout.unwrap_or_default()),
+                        if idle_timeout.is_some() =>
+                    {
+                        reaped_idle = true;
+                        break;
+                    }
+                    result = dispatch => result,
+                };
+                if let Err(e) = result {
                     error!("9P WebSocket dispatch error: {}", e);
                     break;
                 }
@@ -356,8 +374,8 @@ async fn handle_9p_ws(
             }
             _ => {} // ping/pong/text ignored
         }
-        drop(receive);
     }
+    drop(pending);
 
     if reaped_idle {
         metrics::counter!("zerofs_p9_ws_idle_sessions_reaped_total").increment(1);

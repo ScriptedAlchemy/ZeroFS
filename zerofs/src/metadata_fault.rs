@@ -513,6 +513,7 @@ mod tests {
             (libc::ENXIO, "ENXIO"),
             (libc::EROFS, "EROFS"),
             (libc::EACCES, "EACCES"),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             (libc::ENODATA, "ENODATA"),
             (libc::EBADMSG, "EBADMSG"),
         ] {

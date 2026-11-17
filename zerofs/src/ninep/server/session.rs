@@ -1,5 +1,6 @@
 use super::admission::{
-    P9AcceptedWorkTracker, P9ConnectionAdmission, P9GlobalAdmission, P9TransportPermit,
+    P9AcceptedWorkTracker, P9ConnectionAdmission, P9GlobalAdmission, P9ReceivePermit,
+    P9TransportPermit,
 };
 use super::frame_codec::{
     FidFootprint, FrameHeader, TCLUNK_TYPE, TFLUSH_TYPE, TVERSION_TYPE, inspect_frame_metadata,
@@ -445,12 +446,57 @@ pub(crate) struct ConnectionContext<'a> {
 
 /// Memory that covers a received frame until its request is admitted.
 enum ReceiveCharge {
-    /// The caller holds receive credit until admission (WebSocket, tests).
+    /// A test holds receive credit until admission.
+    #[cfg(test)]
     Caller,
     /// The connection reader's pending-frame envelope.
-    Pending(#[allow(dead_code, reason = "held for its Drop")] OwnedSemaphorePermit),
+    Pending {
+        _bytes: OwnedSemaphorePermit,
+        // Accepted FIRST requests can outlive their disconnected reader.
+        _receive: Arc<P9ReceivePermit>,
+    },
     /// A `Tflush` reply slot.
     Flush(OwnedSemaphorePermit),
+}
+
+/// The bounded receive envelope shared by a reader and its unadmitted frames.
+pub(crate) struct P9PendingFrames {
+    bytes: Arc<Semaphore>,
+    receive: Arc<P9ReceivePermit>,
+}
+
+impl P9PendingFrames {
+    pub(crate) fn new(receive: P9ReceivePermit) -> Self {
+        Self {
+            bytes: Arc::new(Semaphore::new(P9_MAX_MSIZE as usize)),
+            receive: Arc::new(receive),
+        }
+    }
+
+    /// Dispatch one complete WebSocket frame while retaining bounded receive
+    /// credit for frames that still wait for request admission.
+    #[cfg(any(feature = "webui", test))]
+    pub(crate) async fn dispatch(
+        &self,
+        frame: Bytes,
+        context: &ConnectionContext<'_>,
+    ) -> anyhow::Result<()> {
+        if frame.len() < P9_MIN_MESSAGE_SIZE as usize || frame.len() > P9_MAX_MSIZE as usize {
+            anyhow::bail!("invalid 9P frame length {}", frame.len());
+        }
+        let header = FrameHeader {
+            len: frame.len(),
+            type_byte: frame[4],
+        };
+        let charge = tokio::select! {
+            biased;
+            _ = context.connection_shutdown.cancelled() => anyhow::bail!("9P connection closed"),
+            _ = context.process_shutdown.cancelled() => anyhow::bail!("9P request admission is sealed for shutdown"),
+            charge = charge_received_frame(header, self, context.inflight) => charge?,
+        };
+        drop(start_9p_request(frame, context, charge)?);
+        Ok(())
+    }
 }
 
 /// Upper bound on one spawned request task, charged with its frame against the
@@ -459,17 +505,12 @@ enum ReceiveCharge {
 pub(super) const PENDING_REQUEST_TASK_BYTES: usize = 16 * 1024;
 
 /// A request whose task has started and is waiting for request admission.
-struct StartedRequest {
-    admitted: oneshot::Receiver<anyhow::Result<()>>,
-}
+type StartedRequest = oneshot::Receiver<anyhow::Result<()>>;
 
-/// Dispatch a frame from a bounded WebSocket or a test. Returns once the
+/// Dispatch a frame from a test. Returns once the
 /// request is admitted, so the caller's receive credit stays charged until
 /// request admission covers the frame.
-#[cfg_attr(
-    not(any(feature = "webui", test)),
-    allow(dead_code, reason = "the TCP reader starts requests without waiting")
-)]
+#[cfg(test)]
 #[allow(
     clippy::too_many_arguments,
     reason = "dispatch keeps connection and process ownership explicit"
@@ -499,7 +540,7 @@ pub(crate) async fn dispatch_9p_frame(
         ReceiveCharge::Caller
     };
     let started = start_9p_request(frame, &context, charge)?;
-    match started.admitted.await {
+    match started.await {
         Ok(result) => result,
         // The request ended before admission: a Tflush cancelled it, or
         // process shutdown dropped it.
@@ -740,7 +781,7 @@ fn start_9p_request(
         std::mem::size_of_val(&request)
     );
     drop(spawn_named("9p-request", request));
-    Ok(StartedRequest { admitted })
+    Ok(admitted)
 }
 
 /// Resolves once `abandonment` is abandoned: by a `Tflush`, or by process
@@ -764,10 +805,11 @@ async fn abandoned(shutdown: &CancellationToken, abandonment: &Abandonment) {
 /// envelope, so the reader keeps reading while the connection's request
 /// slots are full. A `Tflush` takes a flush slot instead: it must stay
 /// readable when the envelope is full, because cancelling is how a client
-/// frees the capacity it is waiting for.
+/// frees the capacity it is waiting for. An ordinary frame that cannot fit
+/// closes the connection, rather than blocking a later Tflush behind it.
 async fn charge_received_frame(
     header: FrameHeader,
-    pending: &Arc<Semaphore>,
+    pending: &P9PendingFrames,
     inflight: &InflightRegistry,
 ) -> anyhow::Result<ReceiveCharge> {
     if header.type_byte == TFLUSH_TYPE {
@@ -778,9 +820,12 @@ async fn charge_received_frame(
         .saturating_add(PENDING_REQUEST_TASK_BYTES)
         .min(P9_MAX_MSIZE as usize);
     let permits = u32::try_from(bytes).expect("a 9P frame charge fits in u32");
-    Ok(ReceiveCharge::Pending(
-        Arc::clone(pending).acquire_many_owned(permits).await?,
-    ))
+    Ok(ReceiveCharge::Pending {
+        _bytes: Arc::clone(&pending.bytes)
+            .try_acquire_many_owned(permits)
+            .map_err(|_| anyhow::anyhow!("9P pending-frame envelope exhausted"))?,
+        _receive: Arc::clone(&pending.receive),
+    })
 }
 
 pub(super) async fn handle_client_loop<R>(
@@ -806,11 +851,11 @@ where
         process_shutdown: &process_shutdown,
     };
 
-    // Hold one maximum-frame receive credit for the reader's life. It covers
+    // Hold one maximum-frame receive credit for the reader and its pending
+    // requests, including requests that outlive a disconnected reader. It covers
     // the frame being read plus every frame still waiting for request
     // admission; the exact reader never allocates a replacement buffer.
-    let _receive = admission.global.admit_receive(&connection_shutdown).await?;
-    let pending = Arc::new(Semaphore::new(P9_MAX_MSIZE as usize));
+    let pending = P9PendingFrames::new(admission.global.admit_receive(&connection_shutdown).await?);
 
     loop {
         let Some((frame, charge)) =
@@ -823,5 +868,61 @@ where
             return Ok(());
         };
         drop(start_9p_request(frame, &context, charge)?);
+    }
+}
+
+#[cfg(test)]
+mod pending_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn full_pending_envelope_rejects_ordinary_frames_but_admits_flush() {
+        let global = P9GlobalAdmission::for_test(P9_MAX_MSIZE as usize, 1);
+        let shutdown = CancellationToken::new();
+        let pending = P9PendingFrames::new(global.admit_receive(&shutdown).await.unwrap());
+        let inflight = InflightRegistry::default();
+        let full = charge_received_frame(
+            FrameHeader {
+                len: P9_MAX_MSIZE as usize,
+                type_byte: T_WRITE,
+            },
+            &pending,
+            &inflight,
+        )
+        .await
+        .unwrap();
+        let overflow = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            charge_received_frame(
+                FrameHeader {
+                    len: 23,
+                    type_byte: ninep_proto::message_type::TGETATTR,
+                },
+                &pending,
+                &inflight,
+            ),
+        )
+        .await
+        .expect("overflow must close the reader without waiting for an ordinary frame");
+        assert!(overflow.is_err());
+        let flush = charge_received_frame(
+            FrameHeader {
+                len: P9_HEADER_SIZE + 2,
+                type_byte: TFLUSH_TYPE,
+            },
+            &pending,
+            &inflight,
+        )
+        .await
+        .unwrap();
+        drop(pending);
+        assert_eq!(
+            global.snapshot().receive_reserved_bytes,
+            P9_MAX_MSIZE as usize,
+            "a pending frame must retain receive credit after its reader ends"
+        );
+        drop(full);
+        assert_eq!(global.snapshot().receive_reserved_bytes, 0);
+        drop(flush);
     }
 }

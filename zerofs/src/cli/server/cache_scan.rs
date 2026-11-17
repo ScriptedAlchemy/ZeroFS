@@ -10,6 +10,8 @@
 
 use anyhow::{Context, Result};
 use serde::Serialize;
+use std::fs::{File, OpenOptions};
+use std::io::Read;
 use std::ops::Range;
 use std::path::Path;
 
@@ -45,43 +47,72 @@ fn be_u32(bytes: &[u8], at: usize) -> usize {
 /// Walk one block's blobs the way foyer's recovery scanner does: from the
 /// start, one blob after another, until an index does not describe entries
 /// with valid headers.
+#[cfg(test)]
 pub(crate) fn blobs(block: &[u8]) -> Vec<BlobLayout> {
+    inspect_blobs(block).0
+}
+
+/// Also report a recognizable index whose entries cannot be inspected. A
+/// valid prefix of a torn blob chain is not evidence for the whole block.
+fn inspect_blobs(block: &[u8]) -> (Vec<BlobLayout>, bool) {
     let mut found = Vec::new();
     let mut blob = 0;
     while blob + BLOB_INDEX <= block.len() {
         let index = &block[blob..blob + BLOB_INDEX];
         let count = be_u32(index, 8);
         let capacity = (BLOB_INDEX - BLOB_INDEX_HEAD) / BLOB_INDEX_RECORD;
-        if count == 0 || count > capacity {
-            break;
+        if count == 0 {
+            // Fresh or explicitly cleaned blocks end at a zero index page.
+            // Reused/torn bytes that merely decode a zero count do not prove
+            // that everything after the valid prefix was inspected.
+            return (found, index.iter().any(|byte| *byte != 0));
+        }
+        if count > capacity {
+            return (found, true);
         }
         let records = BLOB_INDEX_HEAD + count * BLOB_INDEX_RECORD;
         let (index_records, _) = index[BLOB_INDEX_HEAD..records].as_chunks::<BLOB_INDEX_RECORD>();
         let mut entries = Vec::with_capacity(count);
+        let mut next = blob + BLOB_INDEX;
         for record in index_records {
-            let start = blob + be_u32(record, 16);
+            let Some(start) = blob.checked_add(be_u32(record, 16)) else {
+                return (found, true);
+            };
             let len = be_u32(record, 20);
-            let end = start + len.next_multiple_of(PAGE);
-            if len < ENTRY_HEADER
-                || end > block.len()
-                || be_u32(block, start + 32) as u32 & ENTRY_MAGIC_MASK != ENTRY_MAGIC
+            // Foyer packs aligned entries consecutively after their index.
+            // Refuse overlapping, out-of-order, and out-of-bounds records
+            // before using any file-controlled value as a slice boundary.
+            if start != next || len < ENTRY_HEADER || len > block.len().saturating_sub(start) {
+                return (found, true);
+            }
+            let data_end = start + len;
+            let Some(end) = data_end.checked_add(PAGE - 1).map(|end| end / PAGE * PAGE) else {
+                return (found, true);
+            };
+            let header = &block[start..start + ENTRY_HEADER];
+            let header_len = be_u32(header, 0)
+                .checked_add(be_u32(header, 4))
+                .and_then(|len| len.checked_add(ENTRY_HEADER));
+            if end > block.len()
+                || be_u32(header, 32) as u32 & ENTRY_MAGIC_MASK != ENTRY_MAGIC
+                || header_len != Some(len)
+                || header[8..24] != record[..16]
             {
-                // Not a blob foyer wrote.
-                return found;
+                return (found, true);
             }
             entries.push(EntryLayout {
-                data: start..start + len,
-                padding: start + len..end,
+                data: start..data_end,
+                padding: data_end..end,
             });
+            next = end;
         }
-        let next = entries.last().map_or(blob, |entry| entry.padding.end);
         found.push(BlobLayout {
             index_tail: blob + records..blob + BLOB_INDEX,
             entries,
         });
         blob = next;
     }
-    found
+    (found, false)
 }
 
 /// Counts of undefined bytes in one cache directory's partitions.
@@ -91,6 +122,8 @@ pub(crate) struct UndefinedBytes {
     pub(crate) partitions: usize,
     /// Partition files of another size, which hold no data blocks.
     pub(crate) other_partitions: usize,
+    /// Blocks with an index whose entries could not all be inspected.
+    pub(crate) incomplete_partitions: usize,
     pub(crate) blobs: usize,
     pub(crate) entries: usize,
     pub(crate) index_tail_bytes: usize,
@@ -107,6 +140,25 @@ impl UndefinedBytes {
 
 fn count_nonzero(bytes: &[u8]) -> usize {
     bytes.iter().filter(|b| **b != 0).count()
+}
+
+fn open_regular_read_only(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // NOFOLLOW checks the file actually opened; NONBLOCK keeps a raced
+        // replacement with a FIFO from hanging before the type check below.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    if !file.metadata()?.file_type().is_file() {
+        anyhow::bail!("{} is not a regular file", path.display());
+    }
+    Ok(file)
 }
 
 /// Read every foyer partition file directly in `dir`, read-only, and count
@@ -139,14 +191,19 @@ pub(crate) fn scan_partitions(
     }
     partitions.sort();
     for path in partitions {
-        let block = std::fs::read(&path)
-            .with_context(|| format!("reading cache partition {}", path.display()))?;
-        if block.len() != block_size {
+        let mut file = open_regular_read_only(&path)?;
+        // Inspect geometry before allocating. A damaged or sparse partition
+        // can report a size vastly larger than the cache's fixed block size.
+        if file.metadata()?.len() != block_size as u64 {
             counts.other_partitions += 1;
             continue;
         }
+        let mut block = vec![0; block_size];
+        file.read_exact(&mut block)
+            .with_context(|| format!("reading cache partition {}", path.display()))?;
         counts.partitions += 1;
-        let found = blobs(&block);
+        let (found, incomplete) = inspect_blobs(&block);
+        counts.incomplete_partitions += usize::from(incomplete);
         for blob in &found {
             counts.blobs += 1;
             let tail = &block[blob.index_tail.clone()];
@@ -224,11 +281,13 @@ pub(crate) struct CacheReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum ScanStatus {
-    /// Every scanned byte is zero and every cache had entries to scan.
+    /// Every inspected byte is zero, every cache had entries, and no
+    /// recognizable blob index was left incompletely inspected.
     Clean,
     /// Some index tail or padding byte is non-zero.
     UndefinedBytes,
-    /// A cache had no entries on disk, or was not scanned.
+    /// A cache had no entries on disk, was not scanned, or had an
+    /// incomplete blob that could not be fully inspected.
     NothingScanned,
 }
 
@@ -296,9 +355,11 @@ fn find_cache_dirs(path: &Path) -> Result<Vec<(CacheKind, std::path::PathBuf)>> 
             .filter_map(|child| named(&child).map(|kind| (kind, child)))
             .collect())
     };
-    let mut found = caches_in(path)?;
-    if found.is_empty() {
-        for namespace in children(path)? {
+    let mut found = Vec::new();
+    for namespace in children(path)? {
+        if let Some(kind) = named(&namespace) {
+            found.push((kind, namespace));
+        } else {
             found.extend(caches_in(&namespace)?);
         }
     }
@@ -342,8 +403,14 @@ fn layout_of(kind: CacheKind, dir: &Path) -> Result<CacheLayout> {
                 Ok(metadata) if !metadata.file_type().is_file() => {
                     anyhow::bail!("layout marker {} is not a regular file", marker.display());
                 }
-                Ok(_) => std::fs::read_to_string(&marker)
-                    .with_context(|| format!("reading layout marker {}", marker.display()))?,
+                Ok(_) => {
+                    let mut text = String::new();
+                    open_regular_read_only(&marker)?
+                        .take(super::parts_cache_layout(usize::MAX).len() as u64 + 1)
+                        .read_to_string(&mut text)
+                        .with_context(|| format!("reading layout marker {}", marker.display()))?;
+                    text
+                }
             };
             let disk_bytes = text
                 .lines()
@@ -363,10 +430,18 @@ fn layout_of(kind: CacheKind, dir: &Path) -> Result<CacheLayout> {
     }
 }
 
-/// Refuse a namespace whose ownership lock a server holds: it may be
-/// appending a blob, which can read as torn. Probes with a shared lock and
-/// releases it at once, so it never holds a lock a server needs.
-fn refuse_if_in_use(namespace: &Path) -> Result<()> {
+struct ScanLock(File);
+
+impl Drop for ScanLock {
+    fn drop(&mut self) {
+        // Release explicitly even if a forked child inherited this file.
+        let _ = fs4::fs_std::FileExt::unlock(&self.0);
+    }
+}
+
+/// Keep the namespace's existing lock shared for the entire scan, so a
+/// server cannot start changing the files between the probe and the reads.
+fn lock_namespace_for_scan(namespace: &Path) -> Result<ScanLock> {
     use fs4::fs_std::FileExt;
     let lock = namespace.join(super::CLEAN_CACHE_LOCK_FILE);
     let mut options = std::fs::OpenOptions::new();
@@ -374,15 +449,26 @@ fn refuse_if_in_use(namespace: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = match options.open(&lock) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!(
+                "{} has no cache ownership lock {}; an offline scan cannot prevent a server \
+                 from starting there. Pass --live to scan this unlocked or copied cache as a \
+                 snapshot",
+                namespace.display(),
+                lock.display()
+            );
+        }
         Err(error) => {
             return Err(error).with_context(|| format!("opening {}", lock.display()));
         }
     };
+    if !file.metadata()?.file_type().is_file() {
+        anyhow::bail!("{} is not a regular file", lock.display());
+    }
     if !FileExt::try_lock_shared(&file).with_context(|| format!("probing {}", lock.display()))? {
         anyhow::bail!(
             "a running ZeroFS server is using {} (it holds {}); stop the server and scan \
@@ -392,8 +478,7 @@ fn refuse_if_in_use(namespace: &Path) -> Result<()> {
             lock.display()
         );
     }
-    FileExt::unlock(&file).with_context(|| format!("releasing {}", lock.display()))?;
-    Ok(())
+    Ok(ScanLock(file))
 }
 
 fn has_partitions(dir: &Path) -> Result<bool> {
@@ -416,7 +501,16 @@ fn has_partitions(dir: &Path) -> Result<bool> {
 /// changes nothing, and needs no password or key: the check is that bytes
 /// carrying no data are zero, which needs no decryption.
 pub(crate) fn scan_cache_files(path: &Path, options: ScanOptions) -> Result<ScanReport> {
+    scan_cache_files_with_hook(path, options, || {})
+}
+
+fn scan_cache_files_with_hook(
+    path: &Path,
+    options: ScanOptions,
+    before_read: impl FnOnce(),
+) -> Result<ScanReport> {
     let found = find_cache_dirs(path)?;
+    let mut locks = Vec::new();
     if !options.live {
         let mut namespaces: Vec<_> = found
             .iter()
@@ -425,9 +519,10 @@ pub(crate) fn scan_cache_files(path: &Path, options: ScanOptions) -> Result<Scan
         namespaces.sort();
         namespaces.dedup();
         for namespace in namespaces {
-            refuse_if_in_use(&namespace)?;
+            locks.push(lock_namespace_for_scan(&namespace)?);
         }
     }
+    before_read();
     let mut caches = Vec::new();
     for (kind, dir) in found {
         let layout = layout_of(kind, &dir)?;
@@ -455,9 +550,12 @@ pub(crate) fn scan_cache_files(path: &Path, options: ScanOptions) -> Result<Scan
     {
         ScanStatus::UndefinedBytes
     } else if caches.is_empty()
-        || caches
-            .iter()
-            .any(|cache| cache.scanned.as_ref().is_none_or(|c| c.entries == 0))
+        || caches.iter().any(|cache| {
+            cache
+                .scanned
+                .as_ref()
+                .is_none_or(|c| c.entries == 0 || c.incomplete_partitions > 0)
+        })
     {
         ScanStatus::NothingScanned
     } else {
@@ -530,17 +628,25 @@ pub(crate) fn render(report: &ScanReport) -> String {
                  the cache is clean"
             );
         }
+        if counts.incomplete_partitions > 0 {
+            let _ = writeln!(
+                out,
+                "  {} partitions have a damaged or incomplete blob; their remaining entries \
+                 could not be scanned, so this is not evidence that the cache is clean",
+                counts.incomplete_partitions
+            );
+        }
     }
     let verdict = match report.status {
         ScanStatus::Clean => {
             "clean: every scanned index-tail and padding byte is zero, and every cache had \
-             entries to scan"
+             entries to scan with no incomplete blobs"
         }
         ScanStatus::UndefinedBytes => {
             "undefined bytes found: some index-tail or padding bytes are not zero"
         }
         ScanStatus::NothingScanned => {
-            "not proven clean: a cache had no entries on disk or was not scanned"
+            "not proven clean: a cache had no entries on disk or was not completely scanned"
         }
     };
     let _ = writeln!(
@@ -553,3 +659,6 @@ pub(crate) fn render(report: &ScanReport) -> String {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod safety_tests;

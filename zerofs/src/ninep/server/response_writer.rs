@@ -184,7 +184,6 @@ where
             }
 
             let mut buffered_authority_gated_success = false;
-            let mut dropped_authority_gated_success = false;
             let mut admissions = Vec::with_capacity(batch.len());
             for response in batch {
                 let (tag, response_bytes, admission) = response.into_guarded_parts();
@@ -195,8 +194,11 @@ where
                         "Dropping successful 9P response for tag {tag} after serving authority \
                          was lost; closing the connection"
                     );
-                    dropped_authority_gated_success = true;
-                    continue;
+                    // A later Rflush may have waited for this committed
+                    // request's reply. It must not reach the wire after that
+                    // reply was suppressed, so close at the first dropped
+                    // success just as the single-response path does.
+                    return;
                 }
                 // `write_all` may flush buffered frames; recheck authority first.
                 if buffered_authority_gated_success && !authority.permits_successful_response() {
@@ -226,9 +228,6 @@ where
                 return;
             }
             drop(admissions);
-            if dropped_authority_gated_success {
-                return;
-            }
         }
     }))
 }

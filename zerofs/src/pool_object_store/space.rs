@@ -95,10 +95,10 @@ pub(super) fn room(declared_remaining: u64, physical: Option<Option<u64>>) -> Op
     }
 }
 
-/// How long a remote member that reported no space stays out of placement
-/// before one write may try it again. Remote stores have no free-space figure
-/// to watch, so time is the only signal that space may have returned.
-pub(super) const REMOTE_FULL_RECHECK: Duration = Duration::from_secs(30);
+/// How long a member that reported no space stays out of placement before
+/// writes may try it again. A remote store has no free-space figure to watch;
+/// a local quota or inode limit can clear without changing free bytes either.
+pub(super) const FULL_RECHECK: Duration = Duration::from_secs(30);
 
 /// Why placement currently skips a member for lack of room. Full is not a
 /// media fault: the member stays readable, healthy and unquarantined.
@@ -136,7 +136,7 @@ impl NoSpaceMarks {
         tracing::warn!(
             member = %member.id,
             free_bytes = ?free_at_failure,
-            "pool member is full: a write returned no space; placing new data on other members until its free space grows"
+            "pool member is full: a write returned no space; placing new data on other members until free space grows or the retry interval expires"
         );
         self.0.lock().unwrap().insert(
             member.id.clone(),
@@ -150,8 +150,9 @@ impl NoSpaceMarks {
 
     /// Members that are still full, keyed by id with the time they filled.
     /// A local member leaves the set once its filesystem reports more free
-    /// bytes than it had when the write failed; a remote member leaves it
-    /// after [`REMOTE_FULL_RECHECK`].
+    /// bytes than it had when the write failed, or after [`FULL_RECHECK`].
+    /// A remote member leaves after the same interval. Placement still checks
+    /// the current quota and free-space reserve before trying another write.
     pub(super) fn current(&self, members: &[PoolMember]) -> BTreeMap<String, i64> {
         let mut marks = self.0.lock().unwrap();
         marks.retain(|id, mark| {
@@ -159,13 +160,15 @@ impl NoSpaceMarks {
                 return false;
             };
             let recovered = match (member.filesystem_space(), mark.free_at_failure) {
-                (Some(Ok(space)), Some(before)) => space.available > before,
+                (Some(Ok(space)), Some(before)) => {
+                    space.available > before || mark.at.elapsed() >= FULL_RECHECK
+                }
                 (Some(Ok(_)), None) => true,
                 (Some(Err(_)), _) => false,
-                (None, _) => mark.at.elapsed() >= REMOTE_FULL_RECHECK,
+                (None, _) => mark.at.elapsed() >= FULL_RECHECK,
             };
             if recovered {
-                tracing::info!(member = %id, "pool member has free space again; placement may use it");
+                tracing::info!(member = %id, "pool member free space grew or its retry interval elapsed; placement may try it again");
             }
             !recovered
         });
@@ -179,6 +182,73 @@ impl NoSpaceMarks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct FixedSpace(u64);
+
+    impl FreeSpace for FixedSpace {
+        fn observe(&self) -> std::io::Result<FilesystemSpace> {
+            Ok(space(self.0))
+        }
+    }
+
+    fn member(available: Option<u64>) -> PoolMember {
+        PoolMember {
+            id: "member".into(),
+            identity: "test-member".into(),
+            store: std::sync::Arc::new(object_store::memory::InMemory::new()),
+            capacity_bytes: 1000,
+            local_path: available.map(|_| "/member".into()),
+            min_free_bytes: 10,
+            health_device: None,
+            free_space: available.map(|available| std::sync::Arc::new(FixedSpace(available)) as _),
+        }
+    }
+
+    #[test]
+    fn a_local_no_space_mark_expires_without_a_free_byte_increase() {
+        // EDQUOT and inode exhaustion can clear without increasing f_bavail.
+        // That byte counter cannot be the only way to retry the member.
+        let member = member(Some(100));
+        let marks = NoSpaceMarks::default();
+        marks.mark(&member);
+        assert!(
+            marks
+                .current(std::slice::from_ref(&member))
+                .contains_key(&member.id)
+        );
+
+        marks.0.lock().unwrap().get_mut(&member.id).unwrap().at =
+            Instant::now() - Duration::from_secs(31);
+        assert!(
+            marks.current(std::slice::from_ref(&member)).is_empty(),
+            "a recovered quota must not require a process restart"
+        );
+    }
+
+    #[test]
+    fn local_free_space_growth_allows_a_retry_before_the_recheck_interval() {
+        let mut member = member(Some(100));
+        let marks = NoSpaceMarks::default();
+        marks.mark(&member);
+        member.free_space = Some(std::sync::Arc::new(FixedSpace(101)));
+        assert!(marks.current(std::slice::from_ref(&member)).is_empty());
+    }
+
+    #[test]
+    fn remote_no_space_marks_also_wait_before_retrying() {
+        let member = member(None);
+        let marks = NoSpaceMarks::default();
+        marks.mark(&member);
+        assert!(
+            marks
+                .current(std::slice::from_ref(&member))
+                .contains_key(&member.id)
+        );
+        marks.0.lock().unwrap().get_mut(&member.id).unwrap().at =
+            Instant::now() - Duration::from_secs(31);
+        assert!(marks.current(std::slice::from_ref(&member)).is_empty());
+    }
 
     fn space(available: u64) -> FilesystemSpace {
         FilesystemSpace {
