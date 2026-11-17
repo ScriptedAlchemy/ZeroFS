@@ -125,10 +125,7 @@ pub(in crate::storage_readiness) fn backing_serials(
                 }
                 other => bail!("backing serials unavailable for filesystem {other}"),
             };
-            paths
-                .iter()
-                .map(|path| block_serial(path, true))
-                .collect()
+            paths.iter().map(|path| block_serial(path, true)).collect()
         },
     )
 }

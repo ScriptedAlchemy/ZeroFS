@@ -541,12 +541,7 @@ fn real_open_paths_are_verified_without_creating_missing_children() {
     let settings = fixture.parse().unwrap();
     let paths = ["authority", "catalog", "member data", "cache", "journal"]
         .into_iter()
-        .map(|role| {
-            (
-                open_role(role),
-                fixture.path(role).join("actual-child"),
-            )
-        })
+        .map(|role| (open_role(role), fixture.path(role).join("actual-child")))
         .collect::<Vec<_>>();
     verify_open_paths_with(&settings, &fixture, &paths).unwrap();
     for (_, path) in paths {
@@ -653,11 +648,7 @@ async fn readiness_symlinks_refuse_pool_init_and_server_backend_open_before_writ
             let mut strict_settings = settings.clone();
             strict_settings.storage.readiness.as_mut().unwrap().strict = true;
             error_contains(
-                verify_open_paths_with(
-                    &strict_settings,
-                    &fixture,
-                    &[(open_role(role), child)],
-                ),
+                verify_open_paths_with(&strict_settings, &fixture, &[(open_role(role), child)]),
                 "symlink",
             );
         }
