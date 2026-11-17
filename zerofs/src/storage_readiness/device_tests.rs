@@ -302,13 +302,16 @@ impl<'a> HardwareProvider<'a> {
             .unwrap()
             .iter()
             .map(|root| {
+                let serial = match &root.role {
+                    RoleName::Cache | RoleName::Journal => "EXAMPLE-NVME-0001",
+                    RoleName::Authority | RoleName::Catalog | RoleName::Member(_) => {
+                        "EXAMPLE-HDD-0001"
+                    }
+                };
                 (
                     root.path.clone(),
-                    config
-                        .devices
-                        .iter()
-                        .filter(|device| device.roles.contains(&root.role))
-                        .map(|device| device.serial.clone())
+                    [Serial::try_from(serial.to_owned()).unwrap()]
+                        .into_iter()
                         .collect(),
                 )
             })
