@@ -1,4 +1,4 @@
-use super::{MemoryBudgetReceipt, validate_server_startup};
+use super::{CgroupMemoryLimits, MemoryBudgetReceipt, validate_server_startup_with_limits};
 use crate::config::Settings;
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -19,7 +19,7 @@ fn admission(root: &Path, text: &str) -> Result<MemoryBudgetReceipt> {
     let path = root.join("config.toml");
     std::fs::write(&path, text)?;
     let settings = Settings::from_file(path)?;
-    validate_server_startup(&settings)?.context("test requires a dedicated memory envelope")
+    validate_server_startup_with_limits(&settings, CgroupMemoryLimits::default())?.context("test requires a dedicated memory envelope")
 }
 
 #[test]

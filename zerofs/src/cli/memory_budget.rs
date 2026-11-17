@@ -209,10 +209,16 @@ pub(crate) struct MemoryBudgetReceipt {
 }
 
 pub(crate) fn validate_server_startup(settings: &Settings) -> Result<Option<MemoryBudgetReceipt>> {
+    validate_server_startup_with_limits(settings, detect_process_cgroup_v2_memory_limit()?)
+}
+
+fn validate_server_startup_with_limits(
+    settings: &Settings,
+    detected: CgroupMemoryLimits,
+) -> Result<Option<MemoryBudgetReceipt>> {
     let write_ack = settings.filesystem_write_ack_settings(WritebackAccessMode::ReadWrite)?;
     let tiers = StartupMemoryTiers::from_settings(settings, write_ack.volatile_memory_bytes)?;
     let policy = MemoryPolicy::from_settings(settings, tiers)?;
-    let detected = detect_process_cgroup_v2_memory_limit()?;
     let configured = settings.runtime_memory_limit_bytes()?;
     let Some(envelope) = select_memory_limit(detected, configured)? else {
         tracing::warn!(
