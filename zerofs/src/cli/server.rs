@@ -2327,7 +2327,8 @@ min_free_gb = 1.0
         )
         .unwrap_err();
         let message = format!("{error:#}");
-        assert!(message.contains("2.00 GB volatile writes"), "{message}");
+        // The configured 2 GB is charged once for each of the two ownership stages.
+        assert!(message.contains("4.00 GB volatile writes"), "{message}");
         for mode in [
             crate::writeback::config::WritebackAccessMode::ReadOnly,
             crate::writeback::config::WritebackAccessMode::Checkpoint,
