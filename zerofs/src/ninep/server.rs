@@ -4543,12 +4543,12 @@ mod tests {
                 // same worker that will replicate and publish the refusal.
                 let barrier = fs.db.flush_barrier().write_owned().await;
                 let reached = fs.write_coordinator.probe_next_apply();
-                let mut preceding = fs.db.new_transaction().unwrap();
-                preceding.put_bytes(
-                    &Bytes::from_static(b"test/refusal-gate"),
-                    Bytes::from_static(b"held"),
-                );
-                let commit = fs.write_coordinator.submit(preceding).unwrap();
+                let marker_handler = Arc::clone(&handler);
+                let commit = tokio::spawn(async move {
+                    marker_handler
+                        .handle_message_with_op_id(8, [0x94; 16], plain_mkdir(b"queued-marker"))
+                        .await
+                });
                 tokio::time::timeout(TEST_TIMEOUT, reached)
                     .await
                     .unwrap()
@@ -4595,7 +4595,7 @@ mod tests {
                     "a refusal must not be visible before commit"
                 );
                 drop(barrier);
-                commit.wait().await.unwrap();
+                assert!(matches!(commit.await.unwrap().body, Message::Rmkdir(_)));
             }
             replies.push(
                 connection
