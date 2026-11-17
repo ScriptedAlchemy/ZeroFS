@@ -1,4 +1,3 @@
-use crate::dedup::{DedupResult, OpId};
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId};
 use crate::fs::mutation::types::{ConflictKey, ConflictScope};
@@ -107,33 +106,20 @@ impl XattrSetMode {
     }
 }
 
-fn check_buffer(value: Bytes, size: Option<usize>) -> Result<Bytes, FsError> {
-    if size.is_some_and(|size| size != 0 && size < value.len()) {
-        return Err(FsError::Range);
-    }
-    Ok(value)
-}
-
 impl ZeroFS {
     pub async fn get_xattr(
         &self,
         creds: &Credentials,
         id: InodeId,
         name: &XattrName,
-        size: Option<usize>,
     ) -> Result<Bytes, FsError> {
         let _guard = self.lock_manager.acquire(id).await;
         let inode = self.inode_store.get(id).await?;
         name.check(&inode, creds, false)?;
-        check_buffer(self.xattr_store.get(id, name.as_bytes()).await?, size)
+        self.xattr_store.get(id, name.as_bytes()).await
     }
 
-    pub async fn list_xattrs(
-        &self,
-        creds: &Credentials,
-        id: InodeId,
-        size: Option<usize>,
-    ) -> Result<Bytes, FsError> {
+    pub async fn list_xattrs(&self, creds: &Credentials, id: InodeId) -> Result<Bytes, FsError> {
         let _guard = self.lock_manager.acquire(id).await;
         let inode = self.inode_store.get(id).await?;
         let mut list = Vec::new();
@@ -144,7 +130,7 @@ impl ZeroFS {
                 list.push(0);
             }
         }
-        check_buffer(Bytes::from(list), size)
+        Ok(Bytes::from(list))
     }
 
     pub async fn set_xattr(
@@ -155,7 +141,7 @@ impl ZeroFS {
         value: XattrValue,
         mode: XattrSetMode,
     ) -> Result<(), FsError> {
-        self.mutate_xattr(creds, id, name, Some((value, mode)), [0; 16])
+        self.mutate_xattr(creds, id, name, Some((value, mode)))
             .await
     }
 
@@ -165,7 +151,7 @@ impl ZeroFS {
         id: InodeId,
         name: &XattrName,
     ) -> Result<(), FsError> {
-        self.mutate_xattr(creds, id, name, None, [0; 16]).await
+        self.mutate_xattr(creds, id, name, None).await
     }
 
     async fn mutate_xattr(
@@ -174,22 +160,11 @@ impl ZeroFS {
         id: InodeId,
         name: &XattrName,
         value: Option<(XattrValue, XattrSetMode)>,
-        op_id: OpId,
     ) -> Result<(), FsError> {
-        let applied = |result| match result {
-            DedupResult::Applied => Some(()),
-            _ => None,
-        };
-        if self.replay_dedup_result(&op_id, applied)?.is_some() {
-            return Ok(());
-        }
         let fence = self
             .fence_metadata(ConflictScope::single(ConflictKey::Inode(id)))
             .await?;
         let guard = self.lock_manager.acquire(id).await;
-        if self.replay_dedup_result(&op_id, applied)?.is_some() {
-            return Ok(());
-        }
         let mut inode = self.inode_store.get(id).await?;
         name.check(&inode, creds, true)?;
         let exists = match self.xattr_store.get(id, name.as_bytes()).await {
@@ -241,7 +216,6 @@ impl ZeroFS {
                 .update_inode_in_entry(&mut txn, parent, filename, id, &inode)
                 .await?;
         }
-        txn.set_dedup_result(op_id, DedupResult::Applied);
         let pending = self.write_coordinator.submit(txn)?;
         // Keep the lock through apply even if the request stops awaiting us.
         crate::task::spawn_named("xattr-commit", async move {

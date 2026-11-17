@@ -27,16 +27,11 @@ impl NinePHandler {
         let fid = self.get_fid(tx.fid)?;
         let data = if tx.name.is_empty() {
             self.filesystem
-                .list_xattrs(&fid.creds, fid.inode_id, None)
+                .list_xattrs(&fid.creds, fid.inode_id)
                 .await?
         } else {
             self.filesystem
-                .get_xattr(
-                    &fid.creds,
-                    fid.inode_id,
-                    &XattrName::new(tx.name.as_ref())?,
-                    None,
-                )
+                .get_xattr(&fid.creds, fid.inode_id, &XattrName::new(tx.name.as_ref())?)
                 .await?
         };
         let memory =

@@ -34,15 +34,12 @@ async fn rows(fs: &ZeroFS, id: InodeId) -> usize {
 }
 
 #[tokio::test]
-async fn create_replace_remove_list_and_buffer_errors() {
+async fn create_replace_remove_list_and_errors() {
     let fs = ZeroFS::new_in_memory().await.unwrap();
     let id = file(&fs, b"file").await;
     let creds = test_creds();
     let a = name(b"user.A");
-    assert_eq!(
-        fs.get_xattr(&creds, id, &a, None).await,
-        Err(FsError::NoData)
-    );
+    assert_eq!(fs.get_xattr(&creds, id, &a).await, Err(FsError::NoData));
     assert_eq!(
         fs.set_xattr(&creds, id, &a, value(b"x"), XattrSetMode::Replace)
             .await,
@@ -60,11 +57,7 @@ async fn create_replace_remove_list_and_buffer_errors() {
         .await
         .unwrap();
     assert_eq!(
-        fs.get_xattr(&creds, id, &a, Some(1)).await,
-        Err(FsError::Range)
-    );
-    assert_eq!(
-        fs.get_xattr(&creds, id, &a, Some(0)).await.unwrap(),
+        fs.get_xattr(&creds, id, &a).await.unwrap(),
         b"second".as_slice()
     );
     for n in [b"user.z".as_slice(), b"user.\xff", b"user.a"] {
@@ -73,12 +66,8 @@ async fn create_replace_remove_list_and_buffer_errors() {
             .unwrap();
     }
     assert_eq!(
-        fs.list_xattrs(&creds, id, None).await.unwrap(),
+        fs.list_xattrs(&creds, id).await.unwrap(),
         b"user.A\0user.a\0user.z\0user.\xff\0".as_slice()
-    );
-    assert_eq!(
-        fs.list_xattrs(&creds, id, Some(1)).await,
-        Err(FsError::Range)
     );
     fs.remove_xattr(&creds, id, &a).await.unwrap();
     assert_eq!(fs.remove_xattr(&creds, id, &a).await, Err(FsError::NoData));
@@ -128,10 +117,7 @@ async fn two_mib_roundtrip_and_ctime_changes() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        fs.get_xattr(&test_creds(), id, &n, None).await.unwrap(),
-        payload
-    );
+    assert_eq!(fs.get_xattr(&test_creds(), id, &n).await.unwrap(), payload);
     let after = fs.inode_store.get(id).await.unwrap();
     assert!((after.ctime(), after.ctime_nsec()) > (before.ctime(), before.ctime_nsec()));
     fs.remove_xattr(&test_creds(), id, &n).await.unwrap();
@@ -178,7 +164,7 @@ async fn namespace_permissions_and_list_visibility() {
         .await
         .unwrap();
     assert_eq!(
-        fs.get_xattr(&other, id, &user, None).await,
+        fs.get_xattr(&other, id, &user).await,
         Err(FsError::PermissionDenied)
     );
     assert_eq!(
@@ -206,11 +192,11 @@ async fn namespace_permissions_and_list_visibility() {
             .unwrap();
     }
     assert_eq!(
-        fs.get_xattr(&owner, id, &trusted, None).await,
+        fs.get_xattr(&owner, id, &trusted).await,
         Err(FsError::OperationNotPermitted)
     );
     assert_eq!(
-        fs.get_xattr(&other, id, &security, None).await.unwrap(),
+        fs.get_xattr(&other, id, &security).await.unwrap(),
         b"root".as_slice()
     );
     assert_eq!(
@@ -218,11 +204,11 @@ async fn namespace_permissions_and_list_visibility() {
         Err(FsError::OperationNotPermitted)
     );
     assert_eq!(
-        fs.list_xattrs(&other, id, None).await.unwrap(),
+        fs.list_xattrs(&other, id).await.unwrap(),
         b"security.key\0".as_slice()
     );
     assert_eq!(
-        fs.list_xattrs(&root, id, None).await.unwrap(),
+        fs.list_xattrs(&root, id).await.unwrap(),
         b"security.key\0trusted.key\0user.key\0".as_slice()
     );
     fs.remove_xattr(&root, id, &trusted).await.unwrap();
@@ -262,7 +248,7 @@ async fn symlinks_and_fifos_reject_user_attributes() {
             Err(FsError::OperationNotPermitted)
         );
         assert_eq!(
-            fs.get_xattr(&creds, id, &name(b"user.key"), None).await,
+            fs.get_xattr(&creds, id, &name(b"user.key")).await,
             Err(FsError::OperationNotPermitted)
         );
         fs.set_xattr(
@@ -307,7 +293,7 @@ async fn hardlinks_share_attributes_until_last_unlink() {
     fs.link(&test_auth(), id, 0, b"second").await.unwrap();
     let second = fs.lookup(&test_creds(), 0, b"second").await.unwrap();
     assert_eq!(
-        fs.get_xattr(&test_creds(), second, &name(b"user.key"), None)
+        fs.get_xattr(&test_creds(), second, &name(b"user.key"))
             .await
             .unwrap(),
         b"shared".as_slice()
@@ -364,7 +350,7 @@ async fn open_unlinked_attributes_survive_until_reclaim() {
     .await
     .unwrap();
     assert_eq!(
-        fs.get_xattr(&test_creds(), id, &name(b"user.key"), None)
+        fs.get_xattr(&test_creds(), id, &name(b"user.key"))
             .await
             .unwrap(),
         b"after".as_slice()
@@ -388,11 +374,11 @@ async fn insensitive_filenames_leave_xattr_names_byte_exact() {
     let id2 = fs.lookup(&test_creds(), 0, b"FILE").await.unwrap();
     assert_eq!(id, id2);
     assert_eq!(
-        fs.list_xattrs(&test_creds(), id2, None).await.unwrap(),
+        fs.list_xattrs(&test_creds(), id2).await.unwrap(),
         b"user.A\0user.a\0".as_slice()
     );
     assert_eq!(
-        fs.get_xattr(&test_creds(), id, &name(b"user.A"), None)
+        fs.get_xattr(&test_creds(), id, &name(b"user.A"))
             .await
             .unwrap(),
         b"user.A".as_slice()
@@ -454,13 +440,13 @@ async fn xattrs_survive_database_reopen() {
     let reopened = ZeroFS::new_in_memory_read_only(object_store).await.unwrap();
     assert_eq!(
         reopened
-            .get_xattr(&test_creds(), id, &name(b"user.bytes"), None)
+            .get_xattr(&test_creds(), id, &name(b"user.bytes"))
             .await
             .unwrap(),
         b"\0\xffpersisted".as_slice()
     );
     assert_eq!(
-        reopened.list_xattrs(&test_creds(), id, None).await.unwrap(),
+        reopened.list_xattrs(&test_creds(), id).await.unwrap(),
         b"user.bytes\0".as_slice()
     );
 }
@@ -600,7 +586,7 @@ async fn cancelled_queued_remove_holds_lock_until_next_create_can_see_apply() {
     drop(block_apply);
     setting.await.unwrap().unwrap();
     assert_eq!(
-        fs.get_xattr(&test_creds(), id, &name(b"user.key"), None)
+        fs.get_xattr(&test_creds(), id, &name(b"user.key"))
             .await
             .unwrap(),
         b"new".as_slice()
@@ -645,7 +631,7 @@ async fn sticky_directory_user_xattrs_require_owner_or_root() {
             .await
             .unwrap();
         assert_eq!(
-            fs.get_xattr(&other, id, &key, None).await.unwrap(),
+            fs.get_xattr(&other, id, &key).await.unwrap(),
             b"allowed".as_slice()
         );
         assert_eq!(
@@ -781,7 +767,7 @@ async fn over_cap_attributes_do_not_block_unlink_or_open_inode_reclaim() {
             Err(FsError::NotFound)
         ));
         assert_eq!(
-            fs.get_xattr(&test_creds(), neighbor, &name(b"user.keep"), None)
+            fs.get_xattr(&test_creds(), neighbor, &name(b"user.keep"))
                 .await
                 .unwrap(),
             b"neighbor".as_slice()
@@ -830,7 +816,7 @@ async fn rename_overwrite_deletes_xattrs_beyond_cap() {
     assert_eq!(fs.lookup(&test_creds(), 0, b"dst").await.unwrap(), src);
     assert_eq!(rows(&fs, src).await, 1);
     assert_eq!(
-        fs.get_xattr(&test_creds(), src, &name(b"user.keep"), None)
+        fs.get_xattr(&test_creds(), src, &name(b"user.keep"))
             .await
             .unwrap(),
         b"source".as_slice()
