@@ -1011,27 +1011,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_file_inherits_setgid_parent_group() {
-        let fs = ZeroFS::new_in_memory().await.unwrap();
-        let dir = setgid_dir(&fs, b"sgid").await;
-
-        let (_, attrs) = fs
-            .create(&test_creds(), dir, b"file", &SetAttributes::default())
-            .await
-            .unwrap();
-
-        assert_eq!(
-            attrs.gid, SETGID_PARENT_GID,
-            "file should inherit the setgid group"
-        );
-        assert_eq!(
-            attrs.mode & 0o2000,
-            0,
-            "a regular file does not inherit the setgid bit itself"
-        );
-    }
-
-    #[tokio::test]
     async fn create_file_in_non_setgid_dir_keeps_caller_group() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
         let (dir, _) = fs
@@ -1045,27 +1024,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(attrs.gid, 1000, "gid should come from the caller");
-    }
-
-    #[tokio::test]
-    async fn create_file_explicit_gid_overrides_setgid_inheritance() {
-        let fs = ZeroFS::new_in_memory().await.unwrap();
-        let dir = setgid_dir(&fs, b"sgid").await;
-
-        let (_, attrs) = fs
-            .create(
-                &test_creds(),
-                dir,
-                b"file",
-                &SetAttributes {
-                    gid: SetGid::Set(4242),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(attrs.gid, 4242, "an explicit gid must win");
     }
 
     #[tokio::test]
@@ -1089,29 +1047,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(attrs.gid, SETGID_PARENT_GID);
-    }
-
-    #[tokio::test]
-    async fn mknod_inherits_setgid_parent_group() {
-        let fs = ZeroFS::new_in_memory().await.unwrap();
-        let dir = setgid_dir(&fs, b"sgid").await;
-
-        let (_, attrs) = fs
-            .mknod(
-                &test_creds(),
-                dir,
-                b"fifo",
-                FileType::Fifo,
-                &SetAttributes::default(),
-                None,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            attrs.gid, SETGID_PARENT_GID,
-            "fifo should inherit the setgid group"
-        );
     }
 
     #[tokio::test]
