@@ -187,6 +187,131 @@ pub struct Journal {
 
 struct JournalLock(File);
 
+/// The fields of a redb 4.1 database header that decide how redb treats the
+/// file when it opens it. Offsets and the layout arithmetic follow
+/// `redb-4.1.0/src/tree_store/page_store/header.rs` and `layout.rs`.
+#[derive(Debug, PartialEq, Eq)]
+struct RedbHeader {
+    page_size: u64,
+    /// Bytes the layout of the header's durable commit covers.
+    layout_len: u64,
+    /// Set while a writer has the file open and cleared when it closes.
+    recovery_required: bool,
+}
+
+impl RedbHeader {
+    const MAGIC: [u8; 9] = [b'r', b'e', b'd', b'b', 0x1A, 0x0A, 0xA9, 0x0D, 0x0A];
+    const LEN: usize = 32;
+    /// The page size `Builder::new()` gives every journal database.
+    const PAGE_SIZE: u64 = 4096;
+
+    /// `None` when the bytes hold no redb header yet.
+    fn parse(bytes: &[u8]) -> Option<Self> {
+        let header = bytes.get(..Self::LEN)?;
+        if header[..Self::MAGIC.len()] != Self::MAGIC {
+            return None;
+        }
+        let field = |offset: usize| {
+            u64::from(u32::from_le_bytes(
+                header[offset..offset + 4].try_into().expect("four bytes"),
+            ))
+        };
+        let page_size = field(12);
+        let region_header_pages = field(16);
+        let region_data_pages = field(20);
+        let full_regions = field(24);
+        let trailing_data_pages = field(28);
+        let full_region = (region_header_pages + region_data_pages).saturating_mul(page_size);
+        let trailing_region = if trailing_data_pages == 0 {
+            0
+        } else {
+            (region_header_pages + trailing_data_pages).saturating_mul(page_size)
+        };
+        Some(Self {
+            page_size,
+            layout_len: page_size
+                .saturating_add(full_regions.saturating_mul(full_region))
+                .saturating_add(trailing_region),
+            recovery_required: header[Self::MAGIC.len()] & 2 != 0,
+        })
+    }
+
+    fn read(file: &File) -> Result<Option<Self>> {
+        if file.metadata()?.len() < Self::LEN as u64 {
+            return Ok(None);
+        }
+        let mut bytes = [0; Self::LEN];
+        std::os::unix::fs::FileExt::read_exact_at(file, &mut bytes, 0)?;
+        Ok(Self::parse(&bytes))
+    }
+
+    /// Refuse the two header states redb 4.1 asserts on before it reads
+    /// anything else (page_manager.rs:230-231), with the reason.
+    ///
+    /// A file that ends before the end its header describes needs a device
+    /// that lied: redb makes a commit's header durable before it truncates the
+    /// file, so a crash on an honest device never leaves this, and a device
+    /// that dropped the header write but kept the truncation does.
+    fn ensure_openable(&self, found: u64, path: &Path) -> Result<()> {
+        if self.page_size != Self::PAGE_SIZE {
+            bail!(
+                "writeback journal database {} is damaged: its header records a page size of {} \
+                 bytes, and the journal writes {}-byte pages",
+                path.display(),
+                self.page_size,
+                Self::PAGE_SIZE
+            );
+        }
+        if found < self.layout_len {
+            bail!(
+                "writeback journal database {} is {found} bytes, shorter than the {} bytes \
+                 its last durable commit describes: the device holding the journal lost writes \
+                 after acknowledging them, so the journal is older than what was acknowledged. \
+                 Writes it had not drained to the backend are lost. Restore the journal device, \
+                 or move the journal directory aside to start from what the backend holds",
+                path.display(),
+                self.layout_len
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Run one redb open of the journal database, turning a panic inside it into
+/// an error that names the file.
+///
+/// redb 4.1 asserts instead of returning an error on some damaged files: the
+/// header checks at page_manager.rs:230-231 (also refused before this call
+/// with a precise reason), the region arithmetic of layout.rs:23 and
+/// layout.rs:114-132, and whatever its repair meets in damaged pages. A device
+/// that tears or drops writes can leave any of these, and a startup panic
+/// names neither the file nor the cause. The open owns the file it was given
+/// and shares no state with the caller, so nothing is left half-updated when
+/// it unwinds. The default panic hook still prints redb's message, which this
+/// error carries too. Builds with `panic = "abort"` would not reach here.
+fn open_journal_database<T>(
+    path: &Path,
+    open: impl FnOnce() -> Result<T, redb::DatabaseError>,
+) -> Result<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(open)) {
+        Ok(opened) => {
+            opened.with_context(|| format!("failed to open journal database {}", path.display()))
+        }
+        Err(panic) => {
+            let reason = panic
+                .downcast_ref::<&str>()
+                .map(|reason| (*reason).to_owned())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "no message".to_owned());
+            bail!(
+                "writeback journal database {} is damaged: redb failed an internal check while \
+                 opening it ({reason})",
+                path.display()
+            )
+        }
+    }
+}
+
 impl JournalLock {
     fn acquire(file: File) -> Result<Self> {
         if !FileExt::try_lock_exclusive(&file).context("failed to acquire journal lock")? {
@@ -551,28 +676,38 @@ impl Journal {
         // and never releases it explicitly, so a child forked while it is open
         // keeps the file locked until that child execs, and the exclusive open
         // that follows fails. The copy holds no lock, and the writes its
-        // handle makes on close stay in memory. Repair stays refused, as the
-        // read-only open refused it: an unclean journal is repaired by `open`.
+        // handle makes on close stay in memory. The copy is opened writable,
+        // which would repair an unclean header in memory, so the checks below
+        // refuse what redb's read-only open refused: a file that needs
+        // recovery is recovered by the journal's own open, not by this read.
+        let path = root_dir.display().join("journal.redb");
         let mut image = Vec::new();
         database_file.read_to_end(&mut image).with_context(|| {
             format!(
                 "failed to read existing journal database {}",
-                root_dir.display().join("journal.redb").display()
+                path.display()
             )
         })?;
+        if let Some(header) = RedbHeader::parse(&image) {
+            header.ensure_openable(image.len() as u64, &path)?;
+            if header.recovery_required || header.layout_len != image.len() as u64 {
+                bail!(
+                    "writeback journal database {} was not closed cleanly and needs recovery, \
+                     which reading its identity does not perform",
+                    path.display()
+                );
+            }
+        }
         let copy = InMemoryBackend::new();
         copy.set_len(image.len() as u64)?;
         copy.write(0, &image)?;
         drop(image);
-        let database = Builder::new()
-            .set_repair_callback(|session| session.abort())
-            .create_with_backend(copy)
-            .with_context(|| {
-                format!(
-                    "failed to open a copy of existing journal database {}",
-                    root_dir.display().join("journal.redb").display()
-                )
-            })?;
+        let database = open_journal_database(&path, || {
+            Builder::new()
+                .set_repair_callback(|session| session.abort())
+                .create_with_backend(copy)
+        })
+        .context("failed to read the identity from a copy of the journal database")?;
         during_read();
         let read = database
             .begin_read()
@@ -642,12 +777,12 @@ impl Journal {
         root_dir.open_or_create_child("tmp".as_ref(), 0o700)?;
         let (database_file, database_existed) =
             root_dir.open_owner_file("journal.redb".as_ref(), true)?;
-        let database = Builder::new().create_file(database_file).with_context(|| {
-            format!(
-                "failed to open journal database {}",
-                root.join("journal.redb").display()
-            )
-        })?;
+        let database_path = root.join("journal.redb");
+        if let Some(header) = RedbHeader::read(&database_file)? {
+            header.ensure_openable(database_file.metadata()?.len(), &database_path)?;
+        }
+        let database =
+            open_journal_database(&database_path, || Builder::new().create_file(database_file))?;
         if !database_existed {
             root_dir.sync()?;
         }
@@ -4021,6 +4156,253 @@ mod tests {
         drop(inherited_lock);
         // The previous generation's descriptor cannot unlock the new owner.
         assert_locked();
+    }
+
+    /// A redb commit that trims surplus space makes its new header durable and
+    /// then truncates the file. A device that drops the header write while the
+    /// truncation reaches it as file metadata, as the storage-union fault lane's
+    /// drop_writes test does to the journal device, leaves a file that ends
+    /// before the end its surviving header describes. An honest device never
+    /// leaves that after a crash, so it proves acknowledged journal writes were
+    /// lost. Both opens must refuse it with an error naming the file, not panic.
+    #[test]
+    fn a_journal_database_shorter_than_its_last_commit_is_refused_with_its_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let journal = open_temp_journal(&temp, "bucket-a");
+        journal
+            .commit_put(put_record(1, "segments/1", b"pending"), b"pending")
+            .unwrap();
+        drop(journal);
+        let database = root.join("journal.redb");
+        let described = fs::metadata(&database).unwrap().len();
+        let found = described - 4096;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&database)
+            .unwrap()
+            .set_len(found)
+            .unwrap();
+        let damaged = fs::read(&database).unwrap();
+
+        for (open, result) in [
+            ("open", Journal::open(&root, identity("bucket-a")).map(drop)),
+            ("open_existing", Journal::open_existing(&root).map(drop)),
+        ] {
+            let message = format!("{:#}", result.unwrap_err());
+            assert!(
+                message.contains(&database.display().to_string()),
+                "{open}: {message}"
+            );
+            assert!(
+                message.contains(&format!("{found} bytes"))
+                    && message.contains(&format!("{described} bytes")),
+                "{open}: {message}"
+            );
+            assert!(message.contains("lost writes"), "{open}: {message}");
+        }
+        assert_eq!(
+            fs::read(&database).unwrap(),
+            damaged,
+            "a refused journal must stay as found"
+        );
+    }
+
+    /// Damaged journal headers on which redb 4.1 asserts instead of returning
+    /// an error. A torn header page can carry a wrong page size, which redb
+    /// asserts on at page_manager.rs:230, and a zero region size, which
+    /// redb's layout arithmetic asserts on at layout.rs:23. Both opens must
+    /// return an error naming the file and leave it untouched.
+    #[test]
+    fn a_journal_database_with_a_damaged_header_is_refused_with_its_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let database = root.join("journal.redb");
+        let journal = open_temp_journal(&temp, "bucket-a");
+        journal
+            .commit_put(put_record(1, "segments/1", b"pending"), b"pending")
+            .unwrap();
+        drop(journal);
+        let clean = fs::read(&database).unwrap();
+
+        let mut wrong_page_size = clean.clone();
+        wrong_page_size[12..16].copy_from_slice(&8192_u32.to_le_bytes());
+        let mut zero_region = clean;
+        zero_region[20..24].copy_from_slice(&0_u32.to_le_bytes());
+        for (case, damaged) in [
+            ("wrong page size", wrong_page_size),
+            ("zero region size", zero_region),
+        ] {
+            fs::write(&database, &damaged).unwrap();
+            for (open, result) in [
+                ("open", Journal::open(&root, identity("bucket-a")).map(drop)),
+                ("open_existing", Journal::open_existing(&root).map(drop)),
+            ] {
+                let message = format!("{:#}", result.unwrap_err());
+                assert!(
+                    message.contains(&database.display().to_string()),
+                    "{case}, {open}: {message}"
+                );
+            }
+            assert_eq!(fs::read(&database).unwrap(), damaged, "{case}");
+        }
+    }
+
+    /// The silent outcome of the storage-union fault lane's test_34: the
+    /// journal device dropped the writes of later commits while the file kept
+    /// its size, so redb opens the older commit cleanly and the later
+    /// acknowledged records are gone. Nothing outside the journal records how
+    /// far it had got, so this open cannot tell; see "Named gap: a writeback
+    /// journal that lost acknowledged writes" in
+    /// docs/metadata-survival-design.md. Change this test when that record
+    /// exists and startup compares against it.
+    #[test]
+    fn a_journal_rolled_back_to_an_older_commit_opens_at_that_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let database = root.join("journal.redb");
+        let journal = open_temp_journal(&temp, "bucket-a");
+        journal
+            .commit_put(put_record(1, "segments/1", b"kept"), b"kept")
+            .unwrap();
+        // A fresh database starts with surplus space that its first commits
+        // trim. Closing trims it to the minimum, so the reopened journal is
+        // settled, as a journal that has been running is.
+        drop(journal);
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let window_opened = fs::read(&database).unwrap();
+        let blobs = journal.root().join("blobs");
+        let blobs_when_the_window_opened = walk_files(&blobs);
+        for sequence in 2..=4 {
+            let path = format!("segments/{sequence}");
+            journal
+                .commit_put(put_record(sequence, &path, b"lost"), b"lost")
+                .unwrap();
+        }
+        // The server is killed here, so no close commit trims the file. What
+        // the restored device holds: every byte written after the window
+        // opened is gone, and file sizes and names survive.
+        let size = fs::metadata(&database).unwrap().len() as usize;
+        assert!(size >= window_opened.len(), "this case keeps the file size");
+        drop(journal);
+        let mut rolled_back = window_opened;
+        rolled_back.resize(size, 0);
+        fs::write(&database, &rolled_back).unwrap();
+        for blob in walk_files(&blobs) {
+            if !blobs_when_the_window_opened.contains(&blob) {
+                let length = fs::metadata(&blob).unwrap().len() as usize;
+                fs::write(&blob, vec![0; length]).unwrap();
+            }
+        }
+
+        let reopened = Journal::open(&root, identity("bucket-a")).unwrap();
+        let snapshot = reopened.snapshot().unwrap();
+        assert_eq!(snapshot.local_seq, 1, "the lost commits are not visible");
+        assert_eq!(reopened.read_blob(1).unwrap(), b"kept");
+        drop(reopened);
+        let reopened = Journal::open_existing(&root).unwrap();
+        assert_eq!(reopened.snapshot().unwrap().local_seq, 1);
+    }
+
+    fn walk_files(directory: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files.extend(walk_files(&path));
+            } else {
+                files.push(path);
+            }
+        }
+        files
+    }
+
+    /// redb marks its file recovery-required when a writer opens it and clears
+    /// the mark when the writer closes it, so a killed server leaves the mark.
+    /// The identity read refused such a file through redb's read-only open; it
+    /// must refuse it and leave it untouched whether or not the server had
+    /// committed since opening, while the server's own open recovers it.
+    #[test]
+    fn existing_open_refuses_a_journal_left_by_a_killed_server() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let database = root.join("journal.redb");
+        let journal = open_temp_journal(&temp, "bucket-a");
+        journal
+            .commit_put(put_record(1, "segments/1", b"pending"), b"pending")
+            .unwrap();
+        let killed_after_commit = fs::read(&database).unwrap();
+        drop(journal);
+        // What redb writes when a writer opens this cleanly closed file: the
+        // same header with the recovery-required bit set.
+        let mut killed_after_open = fs::read(&database).unwrap();
+        killed_after_open[9] |= 2;
+
+        for (case, killed) in [
+            ("killed after it opened", killed_after_open),
+            ("killed after it committed", killed_after_commit),
+        ] {
+            fs::write(&database, &killed).unwrap();
+            let message = format!("{:#}", Journal::open_existing(&root).map(drop).unwrap_err());
+            assert!(
+                message.contains(&database.display().to_string())
+                    && message.contains("needs recovery"),
+                "{case}: {message}"
+            );
+            assert_eq!(fs::read(&database).unwrap(), killed, "{case}");
+
+            let recovered = Journal::open(&root, identity("bucket-a")).unwrap();
+            assert_eq!(recovered.snapshot().unwrap().local_seq, 1, "{case}");
+            assert_eq!(recovered.read_blob(1).unwrap(), b"pending", "{case}");
+        }
+    }
+
+    /// Pins the header reader to the files redb writes: a mismatch here means
+    /// the redb file format changed under the checks in the journal's opens.
+    #[test]
+    fn redb_header_reading_matches_the_files_redb_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let database = root.join("journal.redb");
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let open = super::RedbHeader::parse(&fs::read(&database).unwrap()).unwrap();
+        assert!(
+            open.recovery_required,
+            "an open database is recovery-required"
+        );
+        for sequence in 1..=64 {
+            let path = format!("segments/{sequence}");
+            journal
+                .commit_put(put_record(sequence, &path, b"pending"), b"pending")
+                .unwrap();
+        }
+        drop(journal);
+        let closed = fs::read(&database).unwrap();
+        assert_eq!(
+            super::RedbHeader::parse(&closed),
+            Some(super::RedbHeader {
+                page_size: 4096,
+                layout_len: closed.len() as u64,
+                recovery_required: false,
+            })
+        );
+
+        let raw = temp.path().join("raw.redb");
+        drop(redb::Database::create(&raw).unwrap());
+        let raw = fs::read(&raw).unwrap();
+        assert_eq!(
+            super::RedbHeader::parse(&raw),
+            Some(super::RedbHeader {
+                page_size: 4096,
+                layout_len: raw.len() as u64,
+                recovery_required: false,
+            })
+        );
+        assert_eq!(
+            super::RedbHeader::parse(b"not a redb database file at all."),
+            None
+        );
+        assert_eq!(super::RedbHeader::parse(&[]), None);
     }
 
     #[test]

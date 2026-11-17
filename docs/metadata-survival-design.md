@@ -661,6 +661,74 @@ Ignored failures describe missing mechanisms and are not survival evidence.
 Physical power loss, real hardware independence, NAS behavior and performance
 require separate deployment tests. No NAS access or benchmarks belong here.
 
+### Named gap: a writeback journal that lost acknowledged writes
+
+The evidence is the storage-union fault lane's
+`test_34_observed_drop_writes_journal_data_only` in
+`evaluation/faults/vm/test_faults.py` on the `feat/fault-injection` branch of
+ScriptedAlchemy/truenas-storage-union. Its transcripts are
+`docs/evidence/faults-vm-69fd8259.txt` and `docs/evidence/faults-vm-f6b38100.txt`.
+The test puts the writeback journal on its own device and makes that device
+acknowledge writes and drop them. Three files are written and fsynced while the
+drain to a member is held, and then the server is killed.
+
+With writeback enabled, every object the server writes, metadata store objects
+and pool payload alike, is acknowledged once it is durable in the journal and
+reaches the backend later. A journal that lost writes reopens at an older redb
+commit. The metadata store, the pool catalog and the members hold only what was
+drained, which is older still. Every record the server keeps therefore agrees
+with the older journal, and startup cannot tell that anything was acknowledged
+after it. Nothing outside the journal device records the journal's position.
+
+ZeroFS refuses the one shape that proves the loss by itself. A redb commit that
+trims surplus space makes its new header durable and then truncates the file.
+When that commit falls inside the lost window, the header write is lost but the
+truncation reaches the device as file metadata. The file then ends before the
+end its surviving header describes, which a crash on an honest device never
+leaves. Both journal opens refuse that file with an error naming it and both
+lengths (`a_journal_database_shorter_than_its_last_commit_is_refused_with_its_path`
+in `zerofs/src/writeback/journal.rs`). Whether a trim falls inside the window is
+a matter of timing. That is why the lane's run at 69fd8259 stopped at startup,
+where redb's own assertion panicked, and its run at f6b38100 served the older
+state with the three files missing and `status.unreadable` empty. The server's
+journal open is the same at both commits. A userspace model of the test keeps
+each journal file's bytes from when the window opened at its size after the
+kill. Across 16 fault images started by both commits, the 3 with a trim in the
+window panicked at both and the other 13 started at both with the three files
+missing. At the commit that adds the refusal, all 8 trimmed images of 18 were
+refused, and each started after its journal directory was moved aside, with
+the drained file intact and the three files missing. The other 10 started
+silently. The model script is kept with the fault-fix logs, not in the
+repository.
+
+Closing the gap needs a journal high-water mark that lives on a device
+independent of the journal.
+
+- The value is the journal incarnation and the highest local sequence whose
+  acknowledgement has been returned.
+- It must be durable on the independent device before an acknowledgement that
+  depends on the journal returns. One write can cover every acknowledgement of
+  one journal commit. A mark written on a timer would leave everything since
+  the last mark undetectable.
+- Startup compares it after the journal opens and before the overlay serves a
+  read. A journal with the same incarnation and a lower local sequence is
+  behind. Startup then refuses with an error naming the journal directory and
+  the recorded and found sequences. An explicit operator override accepts the
+  rollback and reports the lost range in status. A different incarnation means
+  the journal was replaced and needs the same refusal.
+- The pool catalog on the metadata device is a candidate home, because the
+  server already writes it durably and it does not live on the journal device.
+
+The blob files that a lost window leaves in the journal directory are not a
+substitute. Their names survive and their contents read as zeros, but a crash
+between a blob write and its journal commit also leaves blob files the journal
+does not reference, so their presence proves nothing.
+
+- Not verified: the latency of one more durable write on a second device per
+  journal commit, which is the cost the journal exists to avoid.
+- Not verified: the refusal on the lane itself. It was exercised with a
+  constructed file and with the userspace model, not with dm-flakey.
+
 ## Changes after independent review
 
 | Finding | Decision and section |
