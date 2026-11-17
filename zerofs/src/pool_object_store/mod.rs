@@ -45,6 +45,7 @@ use tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock};
 use uuid::Uuid;
 
 use crate::local_object_store::pool::{GenerationState, PoolObjectCreate};
+use crate::operator_required::{OperatorRequired, requires_operator};
 use crate::segment::Segid;
 use crate::segment_store::ConditionalMultipartCreate;
 
@@ -359,6 +360,21 @@ fn error(message: impl Into<String>) -> object_store::Error {
     permanent(std::io::Error::other(message.into()))
 }
 
+/// A refusal that needs an operator: the pool found storage that is not the
+/// storage it was created on, or state it must not recreate on its own.
+fn refusal(message: impl Into<String>) -> object_store::Error {
+    permanent(OperatorRequired::new(std::io::Error::other(message.into())))
+}
+
+/// [`error`] for a message that embeds `cause`, keeping the cause's class.
+fn flattened(message: String, cause: &anyhow::Error) -> object_store::Error {
+    if requires_operator(cause.as_ref()) {
+        refusal(message)
+    } else {
+        error(message)
+    }
+}
+
 fn permanent(cause: impl std::error::Error + Send + Sync + 'static) -> object_store::Error {
     object_store::Error::Generic {
         store: "PoolObjectStore",
@@ -557,11 +573,12 @@ impl PoolObjectStore {
         })
         .await
         .map_err(|e| error(format!("pool catalog open task failed: {e}")))?
-        .map_err(|e| error(format!("pool catalog open failed: {e:#}")))?;
+        .map_err(|e| flattened(format!("pool catalog open failed: {e:#}"), &e))?;
         // The catalog supplies the active pool UUID. Check its fixed member
         // paths before marker creation or recovery can write member objects.
-        preflight(&catalog.identity.pool_id)
-            .map_err(|issue| error(format!("pool storage preflight failed: {issue:#}")))?;
+        preflight(&catalog.identity.pool_id).map_err(|issue| {
+            flattened(format!("pool storage preflight failed: {issue:#}"), &issue)
+        })?;
         let member_indices = members
             .iter()
             .enumerate()
@@ -610,7 +627,7 @@ impl PoolObjectStore {
             .map_err(|e| error(e.to_string()))?;
         if marker.is_none() {
             if !initialize {
-                return Err(error("pool authority marker is missing"));
+                return Err(refusal("pool authority marker is missing"));
             }
             match pool
                 .inner
@@ -631,7 +648,9 @@ impl PoolObjectStore {
             .as_deref()
             != Some(expected.as_slice())
         {
-            return Err(error("pool authority identity does not match its catalog"));
+            return Err(refusal(
+                "pool authority identity does not match its catalog",
+            ));
         }
         for member in pool
             .inner
@@ -797,7 +816,7 @@ impl PoolObjectStore {
             Some(_) => {
                 self.quarantine(id, "member identity marker changed")
                     .await?;
-                return Err(error(format!(
+                return Err(refusal(format!(
                     "pool member {id} has a different identity marker"
                 )));
             }
@@ -825,7 +844,7 @@ impl PoolObjectStore {
             None => {
                 self.quarantine(id, "member identity marker missing")
                     .await?;
-                return Err(error(format!(
+                return Err(refusal(format!(
                     "pool member {id} identity marker is missing; the disk or backend may have been replaced"
                 )));
             }
@@ -1971,7 +1990,7 @@ async fn read_marker(
     match store.get(path).await {
         Ok(result) => {
             if result.meta.size > MAX_MARKER_BYTES {
-                return Err(error("pool identity marker is oversized"));
+                return Err(refusal("pool identity marker is oversized"));
             }
             Ok(Some(result.bytes().await?.to_vec()))
         }

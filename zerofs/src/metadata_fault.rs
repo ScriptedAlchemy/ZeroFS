@@ -20,6 +20,7 @@
 //! call, a full disk or quota, and exhausted memory or descriptors. A full
 //! metadata disk keeps waiting for space, as it did before this wrapper.
 
+use crate::operator_required::{OperatorRequired, ServerExit, operator_required};
 use crate::retrying_object_store::PermanentError;
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
@@ -142,16 +143,18 @@ impl MetadataFault {
         }
     }
 
-    /// Resolves with the recorded failure once one is recorded.
+    /// Resolves with the recorded failure once one is recorded. The failure
+    /// needs an operator: the local filesystem refused the metadata store, and
+    /// a restart reads the same files from the same device.
     pub(crate) async fn tripped(&self) -> anyhow::Error {
         self.0.tripped.cancelled().await;
-        anyhow::anyhow!(
+        operator_required(anyhow::anyhow!(
             "{}",
             self.0
                 .failure
                 .get()
                 .expect("a fault records its failure before it trips")
-        )
+        ))
     }
 
     /// Run `operation` until it finishes or the metadata store fails.
@@ -168,11 +171,12 @@ impl MetadataFault {
 
     /// Exit the process with the recorded failure. A serving process cannot
     /// unwind SlateDB's retry loops, and every final flush would write to the
-    /// failed store, so this stops the way `exit_on_write_error` does.
+    /// failed store, so this stops the way `exit_on_write_error` does, with
+    /// the status `main` gives the same failure at startup.
     pub(crate) async fn exit_when_tripped(self) {
         let error = self.tripped().await;
         tracing::error!("Fatal metadata store failure, exiting: {error}");
-        std::process::exit(1);
+        ServerExit::exit_now(error.as_ref());
     }
 
     fn classify(
@@ -197,7 +201,7 @@ impl MetadataFault {
         self.record(&failure);
         Error::Generic {
             store: STORE,
-            source: Box::new(PermanentError::new(failure)),
+            source: Box::new(PermanentError::new(OperatorRequired::new(failure))),
         }
     }
 }
@@ -454,6 +458,7 @@ impl MultipartUpload for LocalMetadataUpload {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operator_required::exit_probe;
     use crate::retrying_object_store::has_permanent_source;
 
     fn native(errno: i32) -> Error {
@@ -531,6 +536,64 @@ mod tests {
         );
         assert!(!has_permanent_source(&short));
         assert!(!fault.0.tripped.is_cancelled());
+    }
+
+    fn tripped_by_eio() -> (MetadataFault, Error) {
+        let fault = MetadataFault::default();
+        let error = fault.classify("read", || "/metadata/a.sst".to_owned(), native(libc::EIO));
+        (fault, error)
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// A serving process that trips the fault exits with the status `main`
+    /// gives the same failure when it ends startup.
+    #[test]
+    fn a_tripped_fault_exits_with_the_status_main_gives_it() {
+        if exit_probe::is_child() {
+            runtime().block_on(tripped_by_eio().0.exit_when_tripped());
+            unreachable!("exit_when_tripped returned");
+        }
+        let at_startup = ServerExit::of(runtime().block_on(tripped_by_eio().0.tripped()).as_ref());
+        assert_eq!(at_startup, ServerExit::OperatorRequired);
+        let serving = exit_probe::run(
+            "metadata_fault::tests::a_tripped_fault_exits_with_the_status_main_gives_it",
+        );
+        exit_probe::assert_exited_as(&serving, at_startup);
+    }
+
+    /// A metadata write that fails because the local store refused it exits
+    /// through `exit_on_write_error` with the same status.
+    #[test]
+    fn a_write_error_caused_by_the_fault_exits_with_the_same_status() {
+        if exit_probe::is_child() {
+            crate::db::exit_on_write_error(tripped_by_eio().1);
+        }
+        let at_startup = ServerExit::of(runtime().block_on(tripped_by_eio().0.tripped()).as_ref());
+        let serving = exit_probe::run(
+            "metadata_fault::tests::a_write_error_caused_by_the_fault_exits_with_the_same_status",
+        );
+        exit_probe::assert_exited_as(&serving, at_startup);
+    }
+
+    /// A write error with no local refusal in its causes keeps status 1, so a
+    /// supervisor restarts the server.
+    #[test]
+    fn an_ordinary_write_error_still_exits_with_status_one() {
+        if exit_probe::is_child() {
+            crate::db::exit_on_write_error(
+                "HA replication sequencer is poisoned by an unresolved peer copy",
+            );
+        }
+        let serving = exit_probe::run(
+            "metadata_fault::tests::an_ordinary_write_error_still_exits_with_status_one",
+        );
+        exit_probe::assert_exited_as(&serving, ServerExit::Failed);
     }
 
     #[tokio::test]

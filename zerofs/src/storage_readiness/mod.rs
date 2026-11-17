@@ -6,7 +6,8 @@ mod linux;
 pub(crate) mod paths;
 
 use crate::config::Settings;
-use anyhow::{Context, Result, bail};
+use crate::operator_required::operator_required;
+use anyhow::{Context, Result, anyhow, bail};
 #[cfg(any(target_os = "linux", test))]
 use config::FilesystemIdentity;
 pub(crate) use config::ReadinessConfig;
@@ -93,10 +94,10 @@ pub(super) fn verify_with(settings: &Settings, provider: &dyn IdentityProvider) 
             )
         })?;
         if serial != device.serial {
-            bail!(
+            return Err(operator_required(anyhow!(
                 "readiness device serial does not match its declaration at {}",
                 device.by_id.display()
-            );
+            )));
         }
     }
     let mut verified = Vec::new();
@@ -156,10 +157,10 @@ fn verify_identity(
         );
     }
     if facts.identity != root.filesystem.identity {
-        bail!(
+        return Err(operator_required(anyhow!(
             "readiness {} filesystem identity changed or does not match the declaration",
             root.role
-        );
+        )));
     }
     if !facts.writable || !facts.unlocked {
         bail!(
@@ -188,10 +189,10 @@ fn verify_identity(
             .iter()
             .any(|device| device.boot && serials.contains(&device.serial))
         {
-            bail!(
+            return Err(operator_required(anyhow!(
                 "readiness {} is backed by a declared boot device",
                 root.role
-            );
+            )));
         }
         let declared = config
             .devices
@@ -200,10 +201,10 @@ fn verify_identity(
             .map(|device| device.serial.clone())
             .collect::<HashSet<_>>();
         if serials.is_empty() || serials != declared {
-            bail!(
+            return Err(operator_required(anyhow!(
                 "readiness {} backing device set does not match declared roles",
                 root.role
-            );
+            )));
         }
     }
     Ok(())

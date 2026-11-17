@@ -2,6 +2,7 @@
 
 use crate::config::Settings;
 use crate::metadata_fault::{LocalMetadataStore, MetadataFault};
+use crate::operator_required::operator_required;
 use crate::parse_object_store::{ObjectStoreScheme, ParsedStore, parse_url_opts};
 use crate::pool_object_store::{CATALOG_FILE_NAME, PoolMember, PoolObjectStore};
 use crate::sftp_transport::SftpSessionPool;
@@ -112,9 +113,11 @@ pub(crate) async fn open_storage(settings: &Settings) -> Result<OpenedStorage> {
     if url.scheme() == "file" {
         let marker = path.clone().join(".zerofs-pool").join("identity");
         match store.head(&marker).await {
-            Ok(_) => anyhow::bail!(
-                "this volume has a permanent storage pool; restore [storage.pool] and its original catalog instead of opening the metadata directory alone"
-            ),
+            Ok(_) => {
+                return Err(operator_required(anyhow::anyhow!(
+                    "this volume has a permanent storage pool; restore [storage.pool] and its original catalog instead of opening the metadata directory alone"
+                )));
+            }
             Err(object_store::Error::NotFound { .. }) => {}
             Err(error) => return Err(error.into()),
         }
@@ -156,9 +159,9 @@ pub(crate) async fn open_pool_storage(
     )?;
     validate_directories(settings)?;
     if !initialize && !config.catalog_dir.join(CATALOG_FILE_NAME).is_file() {
-        anyhow::bail!(
+        return Err(operator_required(anyhow::anyhow!(
             "pool catalog is missing: initialize a new pool with `zerofs pool init`, or restore an existing pool's catalog; normal startup never recreates it"
-        );
+        )));
     }
     let authority_url = settings.storage.url.parse()?;
     let authority =

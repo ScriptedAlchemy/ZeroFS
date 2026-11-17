@@ -6,7 +6,8 @@
 
 use super::health::{MemberHealth, SegmentFault, SmartSample};
 use super::{EvacuationCapacity, PoolMember, PoolMemberStatus, PoolPlacement, PoolStatus};
-use anyhow::{Context, Result, bail};
+use crate::operator_required::operator_required;
+use anyhow::{Context, Result, anyhow, bail};
 use fs4::fs_std::FileExt;
 use object_store::path::Path;
 use redb::{
@@ -230,14 +231,14 @@ impl Catalog {
     ) -> Result<Self> {
         let existed = root.join(CATALOG_FILE_NAME).try_exists()?;
         if !existed && !initialize {
-            bail!(
+            return Err(operator_required(anyhow!(
                 "pool catalog is missing; use `zerofs pool init` for a new pool, or restore the existing catalog"
-            );
+            )));
         }
         if !existed && marker.is_some() {
-            bail!(
+            return Err(operator_required(anyhow!(
                 "authority belongs to an existing pool but its catalog is missing; restore that catalog instead of initializing a new pool"
-            );
+            )));
         }
         let anchored = if initialize {
             AnchoredDir::open_or_create_absolute(root, 0o700)?
@@ -263,7 +264,9 @@ impl Catalog {
         let (file, database_existed) =
             anchored.open_owner_file(CATALOG_FILE_NAME.as_ref(), true)?;
         if !database_existed && marker.is_some() {
-            bail!("existing pool catalog disappeared while opening it");
+            return Err(operator_required(anyhow!(
+                "existing pool catalog disappeared while opening it"
+            )));
         }
         let database = Builder::new()
             .create_file(file)
@@ -288,35 +291,39 @@ impl Catalog {
                     catalog_directory: catalog_directory.clone(),
                     initialized: false,
                 },
-                None => bail!(
-                    "pool catalog has no identity; explicit initialization or recovery is required"
-                ),
+                None => {
+                    return Err(operator_required(anyhow!(
+                        "pool catalog has no identity; explicit initialization or recovery is required"
+                    )));
+                }
             };
             if identity.format != 1 || identity.authority_prefix != prefix {
-                bail!("pool catalog format or authority prefix does not match this configuration");
+                return Err(operator_required(anyhow!(
+                    "pool catalog format or authority prefix does not match this configuration"
+                )));
             }
             if identity.catalog_directory != catalog_directory {
-                bail!(
+                return Err(operator_required(anyhow!(
                     "pool is bound to a different catalog directory; restore the catalog at {} instead of opening a moved or copied catalog at {}",
                     identity.catalog_directory,
                     catalog_directory,
-                );
+                )));
             }
             if let Some(marker) = marker {
                 if marker != identity.marker()? {
-                    bail!(
+                    return Err(operator_required(anyhow!(
                         "pool catalog does not belong to this authority (pool identity mismatch)"
-                    );
+                    )));
                 }
             } else if identity.initialized {
-                bail!(
+                return Err(operator_required(anyhow!(
                     "pool authority identity marker is missing; refusing to recreate an existing pool"
-                );
+                )));
             }
             if !initialize && !identity.initialized {
-                bail!(
+                return Err(operator_required(anyhow!(
                     "pool initialization did not finish; rerun `zerofs pool init` with the original configuration"
-                );
+                )));
             }
             table.insert("identity", bincode::serialize(&identity)?.as_slice())?;
             identity
@@ -328,7 +335,9 @@ impl Catalog {
                 .map(|v| bincode::deserialize(v.value()))
                 .transpose()?;
             if version.is_some_and(|v| v != 1) {
-                bail!("unsupported pool health version");
+                return Err(operator_required(anyhow!(
+                    "unsupported pool health version"
+                )));
             }
             meta.insert("health_format", bincode::serialize(&1_u32)?.as_slice())?;
         }
