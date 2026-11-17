@@ -27,10 +27,23 @@ class CleanupTests(unittest.TestCase):
                 fixtures.append(Path(command[-1]).parent)
             return processes.pop(0)
 
+        stat_path = Path.stat
+
         def exclusive_open(path, flags, *args, **kwargs):
             if Path(path).name == "FOO" and flags & smoke.os.O_EXCL:
                 raise FileExistsError(errno.EEXIST, "fold-equal create")
             return open_file(path, flags, *args, **kwargs)
+
+        def exact_stat(path, *args, **kwargs):
+            # The mount looks names up by exact spelling. The local directory standing in for it
+            # may fold case (APFS does), so a lookup must match a listed name byte for byte.
+            if (
+                fixtures
+                and path.parent == fixtures[0] / "mount"
+                and path.name not in smoke.os.listdir(path.parent)
+            ):
+                raise FileNotFoundError(errno.ENOENT, "no exact spelling", str(path))
+            return stat_path(path, *args, **kwargs)
 
         # Use a local directory for the successful body and inject cleanup faults.
         try:
@@ -39,6 +52,7 @@ class CleanupTests(unittest.TestCase):
                 patch.object(smoke, "wait_for"),
                 patch.object(smoke.os.path, "ismount", return_value=False),
                 patch.object(smoke.os, "open", side_effect=exclusive_open),
+                patch.object(smoke.Path, "stat", exact_stat),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 smoke.check("/unused/zerofs", False)

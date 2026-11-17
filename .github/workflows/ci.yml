@@ -76,6 +76,9 @@ jobs:
   pjdfstest-fuse:
     needs: build
     uses: ./.github/workflows/pjdfstest-fuse.yml
+  case-insensitive-fuse:
+    needs: build
+    uses: ./.github/workflows/case-insensitive-fuse.yml
 
   stress-ng:
     needs: build

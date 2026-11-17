@@ -1,0 +1,38 @@
+name: case-insensitive-fuse
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  case-insensitive-fuse:
+    name: Case-only rename and exact lookup over FUSE
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install fuse3
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3
+          # Runner image 20260804.265.1 ships a non-setuid helper in
+          # /usr/local/bin that shadows the distro's setuid helper.
+          sudo rm -f /usr/local/bin/fusermount3
+          test "$(command -v fusermount3)" = /usr/bin/fusermount3
+
+      - name: Fetch the prebuilt ZeroFS binary
+        uses: actions/download-artifact@v4
+        with:
+          name: zerofs-ci-bin
+          path: zerofs/target/ci
+      - run: chmod +x zerofs/target/ci/zerofs
+
+      # The script mounts an insensitive export, renames Foo to foo through the
+      # mount and fails unless the listing then shows only foo, Foo and FOO miss,
+      # and a fold-equal create is refused. It runs once strict and once relaxed.
+      - name: Run the mounted case-insensitive name checks
+        timeout-minutes: 5
+        run: python3 scripts/test-case-insensitive-fuse.py --binary zerofs/target/ci/zerofs

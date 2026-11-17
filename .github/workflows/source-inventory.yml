@@ -42,3 +42,26 @@ jobs:
           binary="$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "zerofs" and .target.kind == ["lib"] and .profile.test and .executable != null) | .executable' inventory-build.jsonl)"
           test -x "$binary"
           sudo env ZEROFS_INVENTORY_BIND_MOUNT_TEST=1 unshare --mount --propagation private "$binary" cli::inventory::tests::review_same_device_bind_mount_is_not_traversed --exact --ignored --nocapture
+
+  inventory-macos:
+    name: Inventory on macOS
+    runs-on: macos-latest
+    # Running these fixture tests in parallel panicked the macOS 27.2 kernel twice on a
+    # many-core developer Mac. The tests serialize on a shared fixture lock, and this job
+    # also runs one test thread. The timeout ends a wedged runner instead of letting it
+    # hold the six-hour default.
+    timeout-minutes: 45
+    env:
+      # Apple silicon uses 16 KiB pages, as in the aarch64-apple-darwin cross-compile build.
+      JEMALLOC_SYS_WITH_LG_PAGE: "16"
+    defaults:
+      run:
+        working-directory: zerofs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build inventory tests
+        run: cargo test --locked -p zerofs --lib --no-run
+      - name: Run inventory tests on one thread
+        timeout-minutes: 20
+        run: cargo test --locked -p zerofs --lib cli::inventory -- --test-threads=1 --nocapture

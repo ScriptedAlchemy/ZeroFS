@@ -18,9 +18,15 @@ sorts names by raw bytes, and checks opened entries against their preceding
 boundaries. Linux also compares statx mount IDs to reject bind mounts within the
 same filesystem, including bind mounts of individual files. If the kernel omits
 `STATX_MNT_ID` or the query fails, `mount_id_unavailable` makes the entry
-incomplete and the collector skips its reads and descendants. macOS detects
-different-device mounts through `st_dev`. It cannot identify a mount that keeps
-the same device number. The command is available only on Linux and macOS.
+incomplete and the collector skips its reads and descendants. macOS reports a
+mount only for an open descriptor. After `st_dev` matches, the collector opens
+each directory, regular file and symlink, then compares its `fstatfs` filesystem
+ID (`f_fsid`) and mount point (`f_mntonname`) with the root's before reading
+through it. A difference is a `mount_boundary`, and a failed `fstatfs` reports
+`mount_id_unavailable`. Either one skips the entry's reads and descendants. FIFOs,
+sockets and devices are not opened. macOS mounts only on directories, so they
+share the mount of the directory that lists them. The command is available only
+on Linux and macOS.
 
 Linux pins a candidate regular file with `O_PATH` before opening it for I/O,
 checks the pinned type, identity, metadata version and mount ID, then opens the

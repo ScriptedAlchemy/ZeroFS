@@ -43,6 +43,8 @@ struct Walker<'a, W> {
     root_dev: u64,
     #[cfg(target_os = "linux")]
     root_mount_id: Field<u64>,
+    #[cfg(target_os = "macos")]
+    root_mount: Field<MountIdentity>,
     trusted_namespace: Field<()>,
     hash: bool,
     tree_complete: bool,
@@ -120,7 +122,7 @@ pub(super) fn inventory_with_options(
         mount_boundary_detection: if cfg!(target_os = "linux") {
             "Device number and STATX_MNT_ID. Missing mount IDs prevent reads and descent."
         } else {
-            "Device number only. Mounts retaining the same device number cannot be identified."
+            "Device number, then the fstatfs filesystem ID and mount point of each opened entry. Missing mount identities prevent reads and descent."
         },
         hashing: if hash { "sha256" } else { "not_requested" },
         collision_rules: super::collision::RULES,
@@ -141,6 +143,8 @@ pub(super) fn inventory_with_options(
         root_dev: identity(&before).dev,
         #[cfg(target_os = "linux")]
         root_mount_id: entry.mount_id.clone(),
+        #[cfg(target_os = "macos")]
+        root_mount: platform::mount_identity(root_fd.as_fd()),
         trusted_namespace: entry.xattrs.trusted_namespace.clone(),
         hash,
         tree_complete: true,
@@ -180,7 +184,10 @@ pub(super) fn inventory_with_options(
         }
     } else {
         walker.pacer.wait();
-        if let Some(reason) = walker.boundary_reason(&entry) {
+        if let Some(reason) = walker
+            .boundary_reason(&entry)
+            .or_else(|| walker.descriptor_boundary(root_fd.as_fd()))
+        {
             walker.skip_boundary(entry, reason)?;
         } else {
             walker.collect_fd(&mut entry, root_fd.as_fd(), EntryKind::Directory);
@@ -199,14 +206,24 @@ impl<W: Write> Walker<'_, W> {
         }
         #[cfg(target_os = "linux")]
         {
-            match (&self.root_mount_id, &entry.mount_id) {
-                (Field::Observed(root), Field::Observed(child)) if root == child => None,
-                (Field::Observed(_), Field::Observed(_)) => Some(Reason::MountBoundary),
-                _ => Some(Reason::MountIdUnavailable),
-            }
+            mount_boundary(&self.root_mount_id, &entry.mount_id)
         }
         #[cfg(target_os = "macos")]
         None
+    }
+
+    /// Checks an opened entry before any read through it. macOS reports a mount identity only
+    /// for an open descriptor. Linux has already compared statx mount IDs before opening.
+    fn descriptor_boundary(&self, fd: BorrowedFd<'_>) -> Option<Reason> {
+        #[cfg(target_os = "macos")]
+        {
+            mount_boundary(&self.root_mount, &platform::mount_identity(fd))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = fd;
+            None
+        }
     }
 
     fn skip_boundary(&mut self, mut entry: Entry, reason: Reason) -> Result<()> {
@@ -396,6 +413,13 @@ impl<W: Write> Walker<'_, W> {
             }
             None => None,
         };
+        // Entries without a descriptor are FIFOs, sockets and devices. macOS mounts only on
+        // directories, so these share the mount of the directory that was already checked.
+        if let Some(fd) = &fd
+            && let Some(reason) = self.descriptor_boundary(fd.as_fd())
+        {
+            return self.skip_boundary(entry, reason);
+        }
         if let Some(fd) = &fd {
             self.collect_fd(&mut entry, fd.as_fd(), entry_kind);
         }
@@ -879,6 +903,7 @@ fn same_mount(entry: &Entry, parent: BorrowedFd<'_>, name: &OsStr, stat: &Stat) 
     platform::mount_id(parent, name, stat) == entry.mount_id
 }
 
+// macOS names a mount only from a descriptor. `descriptor_boundary` checks it before any read.
 #[cfg(target_os = "macos")]
 fn same_mount(_entry: &Entry, _parent: BorrowedFd<'_>, _name: &OsStr, _stat: &Stat) -> bool {
     true
@@ -951,6 +976,84 @@ fn content_hash(fd: BorrowedFd<'_>) -> Field<String> {
         Err(error) => Field::error(Errno::from_raw_os_error(
             error.raw_os_error().unwrap_or(libc::EIO),
         )),
+    }
+}
+
+/// The filesystem identity that macOS `fstatfs` reports for an open descriptor.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct MountIdentity {
+    pub fsid: [i32; 2],
+    pub mount_point: Vec<u8>,
+}
+
+/// Compares an entry's mount identity with the root's. Linux passes statx mount IDs and macOS
+/// passes `fstatfs` identities. A missing identity on either side prevents reads and descent.
+fn mount_boundary<T: PartialEq>(root: &Field<T>, entry: &Field<T>) -> Option<Reason> {
+    match (root, entry) {
+        (Field::Observed(root), Field::Observed(entry)) if root == entry => None,
+        (Field::Observed(_), Field::Observed(_)) => Some(Reason::MountBoundary),
+        _ => Some(Reason::MountIdUnavailable),
+    }
+}
+
+#[cfg(test)]
+mod mount_boundary_tests {
+    use super::*;
+
+    fn mount(fsid: [i32; 2], mount_point: &str) -> Field<MountIdentity> {
+        Field::Observed(MountIdentity {
+            fsid,
+            mount_point: mount_point.as_bytes().to_vec(),
+        })
+    }
+
+    fn unreadable() -> Field<MountIdentity> {
+        Field::Unavailable {
+            reason: Reason::MountIdUnavailable,
+            errno: Some(libc::EIO),
+        }
+    }
+
+    #[test]
+    fn identical_mount_identity_is_the_same_mount() {
+        let root = mount([7, 26], "/Volumes/source");
+        assert_eq!(
+            mount_boundary(&root, &mount([7, 26], "/Volumes/source")),
+            None
+        );
+    }
+
+    #[test]
+    fn another_mount_point_with_the_same_filesystem_id_is_a_boundary() {
+        // The walker reaches this comparison only when the device numbers are equal.
+        let root = mount([7, 26], "/Volumes/source");
+        assert_eq!(
+            mount_boundary(&root, &mount([7, 26], "/Volumes/source/nested")),
+            Some(Reason::MountBoundary)
+        );
+    }
+
+    #[test]
+    fn another_filesystem_id_on_the_same_mount_point_is_a_boundary() {
+        let root = mount([7, 26], "/Volumes/source");
+        assert_eq!(
+            mount_boundary(&root, &mount([8, 26], "/Volumes/source")),
+            Some(Reason::MountBoundary)
+        );
+    }
+
+    #[test]
+    fn unreadable_mount_identity_prevents_reads_and_descent() {
+        let root = mount([7, 26], "/Volumes/source");
+        assert_eq!(
+            mount_boundary(&root, &unreadable()),
+            Some(Reason::MountIdUnavailable)
+        );
+        assert_eq!(
+            mount_boundary(&unreadable(), &root),
+            Some(Reason::MountIdUnavailable)
+        );
     }
 }
 
