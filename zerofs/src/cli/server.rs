@@ -916,6 +916,19 @@ async fn build_block_hybrid(
 /// max cacheable entry size.
 const PARTS_BLOCK_SIZE: usize = 64 * 1024 * 1024;
 
+/// Before the patched foyer-storage in `vendor/`, foyer wrote each entry's
+/// page padding and each blob index tail as it found them in its I/O
+/// buffers: freed heap memory of this process, or bytes of earlier entries.
+/// Layouts that do not record this policy were written that way and are
+/// reset, so those bytes leave the cache disk.
+const CACHE_PADDING_POLICY: &str = "padding=zeroed\n";
+
+/// The decoded-block cache directory. Binaries whose foyer wrote undefined
+/// padding used [`LEGACY_BLOCK_CACHE_DIR`] and record no layout, so a
+/// separate directory keeps a rollback from writing into this one.
+pub(crate) const BLOCK_CACHE_DIR: &str = "hybrid_cache_v1";
+pub(crate) const LEGACY_BLOCK_CACHE_DIR: &str = "hybrid_cache";
+
 /// Foyer's partition layout depends on the tombstone setting and capacity.
 /// Record both the geometry and recovery policy before opening its files, so
 /// older tombstone-enabled layouts cannot be mistaken for current data blocks.
@@ -938,7 +951,7 @@ fn prepare_parts_cache_layout(parts_root: &StdPath, disk_bytes: usize) -> Result
         );
     }
     let expected = format!(
-        "zerofs-parts-cache-v1\nrecover=none\ntombstones=0\nblock_bytes={PARTS_BLOCK_SIZE}\ndisk_bytes={disk_bytes}\n"
+        "zerofs-parts-cache-v1\nrecover=none\ntombstones=0\nblock_bytes={PARTS_BLOCK_SIZE}\ndisk_bytes={disk_bytes}\n{CACHE_PADDING_POLICY}"
     );
     let marker = parts_root.join(PARTS_CACHE_LAYOUT_FILE);
     match std::fs::symlink_metadata(&marker) {
@@ -1223,8 +1236,13 @@ pub async fn build_slatedb(
     let cache_owner = Arc::new(acquire_clean_cache_owner(&cache_config.root_folder)?);
     for (name, root, capacity) in [
         (
+            "legacy-decoded-blocks",
+            cache_config.root_folder.join(LEGACY_BLOCK_CACHE_DIR),
+            0,
+        ),
+        (
             "decoded-blocks",
-            cache_config.root_folder.join("hybrid_cache"),
+            cache_config.root_folder.join(BLOCK_CACHE_DIR),
             hybrid_disk_bytes,
         ),
         (
@@ -1354,7 +1372,7 @@ pub async fn build_slatedb(
     // HA startup retries share the process-wide maintenance runtime.
     let maintenance_runtime = shared_maintenance_runtime().clone();
 
-    let hybrid_cache_root = cache_config.root_folder.join("hybrid_cache");
+    let hybrid_cache_root = cache_config.root_folder.join(BLOCK_CACHE_DIR);
     let foyer_metrics = FoyerMetricsRegistry::default();
     let (cache, block_cache_metrics) = build_block_hybrid(
         &hybrid_cache_root,
@@ -2248,6 +2266,56 @@ mod tests {
         db.close().await.expect("close seed database");
 
         (store, transformer, checkpoint.id)
+    }
+
+    /// The decoded-block cache moved directories when foyer's padding became
+    /// defined. Opening reclaims the old directory's partitions and leaves
+    /// other files there alone.
+    #[tokio::test]
+    async fn opening_reclaims_the_legacy_decoded_block_cache() {
+        let (store, transformer, _) = seeded_mode_cache_store().await;
+        let cache_root = tempfile::tempdir().expect("cache root");
+        let legacy = cache_root.path().join(LEGACY_BLOCK_CACHE_DIR);
+        std::fs::create_dir_all(&legacy).unwrap();
+        let partition = legacy.join(format!("{FOYER_PARTITION_PREFIX}00000000"));
+        std::fs::write(&partition, b"undefined padding").unwrap();
+        let foreign = legacy.join("operator-notes");
+        std::fs::write(&foreign, b"keep").unwrap();
+
+        let opened = build_slatedb(
+            store,
+            &crate::fs::CacheConfig {
+                root_folder: cache_root.path().to_owned(),
+                max_cache_size_gb: 0.0,
+                memory_cache_size_gb: Some(0.064),
+            },
+            "mode-cache-test".to_owned(),
+            DatabaseMode::ReadOnly,
+            None,
+            transformer,
+            None,
+            None,
+        )
+        .await
+        .expect("open reader");
+
+        assert!(!partition.exists());
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"keep");
+        assert!(
+            std::fs::read_dir(cache_root.path().join(BLOCK_CACHE_DIR))
+                .unwrap()
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| foyer_partition_id(name).is_some())),
+            "the decoded-block cache did not open in its new directory"
+        );
+        match &opened.data {
+            SlateDbHandle::ReadOnly(reader) => reader.load_full().close().await.unwrap(),
+            SlateDbHandle::ReadWrite(_) => panic!("reader mode opened a writer"),
+        }
+        opened.parts_cache.close().await.unwrap();
     }
 
     async fn assert_mode_exports_attached_decoded_cache(mode: ReaderModeUnderTest) {
@@ -3270,6 +3338,34 @@ min_free_gb = 256.0
         .unwrap();
         prepare_parts_cache_layout(&parts, 128 * 1024 * 1024).unwrap();
         assert!(!partition.exists());
+    }
+
+    /// A parts cache written while foyer left its padding undefined carries
+    /// freed heap memory, so it is reset even at the same geometry.
+    #[test]
+    fn parts_cache_written_with_undefined_padding_is_reset() {
+        let root = tempfile::tempdir().unwrap();
+        let _owner = acquire_clean_cache_owner(root.path()).unwrap();
+        let parts = root.path().join(PARTS_CACHE_DIR);
+        std::fs::create_dir_all(&parts).unwrap();
+        let disk_bytes = 256 * 1024 * 1024;
+        std::fs::write(
+            parts.join(PARTS_CACHE_LAYOUT_FILE),
+            format!(
+                "zerofs-parts-cache-v1\nrecover=none\ntombstones=0\nblock_bytes={PARTS_BLOCK_SIZE}\ndisk_bytes={disk_bytes}\n"
+            ),
+        )
+        .unwrap();
+        let partition = parts.join(format!("{FOYER_PARTITION_PREFIX}00000000"));
+        std::fs::write(&partition, b"undefined padding").unwrap();
+
+        prepare_parts_cache_layout(&parts, disk_bytes).unwrap();
+        assert!(!partition.exists());
+        assert!(
+            std::fs::read_to_string(parts.join(PARTS_CACHE_LAYOUT_FILE))
+                .unwrap()
+                .ends_with(CACHE_PADDING_POLICY)
+        );
     }
 
     #[cfg(unix)]

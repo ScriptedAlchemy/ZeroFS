@@ -69,7 +69,8 @@ pub(super) fn verify_role(root: &super::config::StorageRoot<'_>) -> Result<()> {
 
 pub(super) fn verify_cache_partitions(cache: &Path) -> Result<()> {
     for directory in [
-        cache.join("hybrid_cache"),
+        cache.join(crate::cli::server::LEGACY_BLOCK_CACHE_DIR),
+        cache.join(crate::cli::server::BLOCK_CACHE_DIR),
         cache.join(crate::object_store_prefetch::LEGACY_PARTS_CACHE_DIR),
         cache.join(crate::object_store_prefetch::PARTS_CACHE_DIR),
     ] {

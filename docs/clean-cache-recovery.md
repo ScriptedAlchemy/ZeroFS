@@ -49,6 +49,29 @@ marker. Startup therefore retries an interrupted reset even if configuration
 rolls back to the earlier geometry. It rejects symlinked or nonregular markers. No manual
 cache migration is required.
 
+## Defined padding
+
+foyer pads every cache entry to a 4 KiB page and writes each blob index as a
+whole page. foyer-storage 0.22.3 cleared neither the padding nor the index tail
+past its last record, so they reached the cache disk holding whatever their
+I/O buffers held before: freed heap memory of the server process on first use,
+and bytes of earlier entries after that. The patched foyer-storage in
+`zerofs/vendor/` writes zeros there.
+
+In a run of the shipped server, about one padding byte in six was non-zero,
+and nearly all of those bytes were copies of earlier cache entries. jemalloc
+hands freed memory back without clearing it, so heap contents such as
+decrypted data could also land there; that run found no plaintext, password,
+credential or key-derivation memory, but it does not rule them out.
+
+Caches written before the patch are removed at startup. The parts-cache layout
+marker records `padding=zeroed`, so a `parts_cache_v1` directory without it is
+reset like any other incompatible layout. The decoded-block cache moved from
+`hybrid_cache` to `hybrid_cache_v1`, because older binaries record no layout
+there; startup removes the partitions left in `hybrid_cache`. Removing a file
+does not overwrite its blocks on the device, so a disk that held an older cache
+can still carry those bytes until they are reused or the disk is wiped.
+
 ## Operational and benchmark impact
 
 After a restart, initial reads can generate additional backend traffic and take
