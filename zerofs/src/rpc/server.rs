@@ -156,6 +156,11 @@ impl AdminRpcServer {
         self
     }
 
+    fn is_reserved(&self, name: &[u8], reserved: &[u8]) -> bool {
+        let mode = self.fs.name_mode();
+        mode.key(name) == mode.key(reserved)
+    }
+
     /// Construct a successful response only with current serving authority.
     fn success_response<T>(&self, message: T) -> Result<Response<T>, Status> {
         if !self.fs.db.permits_successful_response() {
@@ -551,9 +556,10 @@ impl AdminService for AdminRpcServer {
         // Anything under /.zerofs_trash would be deleted by the next sweep
         // with no error returned to anyone; refuse upfront, mirroring the
         // RemoveDirectory guard.
-        if components.first().is_some_and(|name| {
-            self.fs.name_mode().key(name) == self.fs.name_mode().key(TRASH_DIR_NAME)
-        }) {
+        if components
+            .first()
+            .is_some_and(|name| self.is_reserved(name, TRASH_DIR_NAME))
+        {
             return Err(Status::invalid_argument(format!(
                 "refusing to create {:?}: /{} is reserved",
                 req.path,
@@ -642,15 +648,13 @@ impl AdminService for AdminRpcServer {
                 "refusing to remove the filesystem root",
             ));
         };
-        if self.fs.name_mode().key(components[0]) == self.fs.name_mode().key(TRASH_DIR_NAME) {
+        if self.is_reserved(components[0], TRASH_DIR_NAME) {
             return Err(Status::invalid_argument(format!(
                 "refusing to remove {path:?}: /{} is reserved",
                 String::from_utf8_lossy(TRASH_DIR_NAME)
             )));
         }
-        if self.protect_nbd_exports
-            && self.fs.name_mode().key(components[0]) == self.fs.name_mode().key(NBD_DIR_NAME)
-        {
+        if self.protect_nbd_exports && self.is_reserved(components[0], NBD_DIR_NAME) {
             return Err(Status::invalid_argument(format!(
                 "refusing to remove {path:?}: /.nbd is reserved while volatile NBD acknowledgement is active"
             )));
