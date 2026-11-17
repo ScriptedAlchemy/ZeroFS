@@ -1424,6 +1424,15 @@ pub struct NinePConfig {
     /// Optional all-client identity for a shared writable namespace.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) shared_identity: Option<NfsSharedIdentity>,
+    /// Name matching for standard `9P2000.L` sessions on an insensitive
+    /// filesystem. ZeroFS-dialect clients choose per request. A sensitive
+    /// filesystem accepts either value and matches exact bytes.
+    #[serde(default, skip_serializing_if = "is_default_name_match")]
+    pub(crate) standard_lookup: crate::fs::name_mode::NameMatch,
+}
+
+fn is_default_name_match(value: &crate::fs::name_mode::NameMatch) -> bool {
+    *value == crate::fs::name_mode::NameMatch::default()
 }
 
 /// Shared endpoint check for the server configs that expose an optional
@@ -2306,6 +2315,7 @@ impl Settings {
                     addresses: Some(default_9p_addresses()),
                     unix_socket: Some(PathBuf::from("/tmp/zerofs.9p.sock")),
                     shared_identity: None,
+                    standard_lookup: Default::default(),
                 }),
                 nbd: Some(NbdConfig {
                     addresses: Some(default_nbd_addresses()),
@@ -4205,6 +4215,28 @@ sync_writes = true"#,
         let config: FilesystemConfig = toml::from_str("name_mode = 'insensitive'").unwrap();
         assert_eq!(config.name_mode, NameMode::Insensitive);
         assert!(toml::from_str::<FilesystemConfig>("name_mode = 'fold'").is_err());
+    }
+
+    #[test]
+    fn ninep_standard_lookup_defaults_to_folded_and_rejects_unknown_values() {
+        use crate::fs::name_mode::NameMatch;
+        let endpoint = "unix_socket = '/tmp/9p.sock'\n";
+        let config: NinePConfig = toml::from_str(endpoint).unwrap();
+        assert_eq!(config.standard_lookup, NameMatch::Folded);
+        assert!(
+            !toml::to_string(&config)
+                .unwrap()
+                .contains("standard_lookup")
+        );
+        for (value, expected) in [("folded", NameMatch::Folded), ("exact", NameMatch::Exact)] {
+            let config: NinePConfig =
+                toml::from_str(&format!("{endpoint}standard_lookup = '{value}'")).unwrap();
+            assert_eq!(config.standard_lookup, expected);
+        }
+        assert!(
+            toml::from_str::<NinePConfig>(&format!("{endpoint}standard_lookup = 'insensitive'"))
+                .is_err()
+        );
     }
 
     #[test]

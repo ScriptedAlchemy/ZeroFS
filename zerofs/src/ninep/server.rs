@@ -2,6 +2,7 @@
 pub(crate) use super::handler::NinePHandler;
 pub(crate) use super::lock_manager::FileLockManager;
 use crate::fs::ZeroFS;
+use crate::fs::name_mode::NameMatch;
 use crate::task::spawn_named;
 #[cfg(test)]
 use bytes::Bytes;
@@ -104,6 +105,7 @@ pub struct NinePServer {
     transport: Transport,
     lock_manager: Arc<FileLockManager>,
     credential_override: Option<(u32, u32)>,
+    standard_lookup: NameMatch,
 }
 
 impl NinePServer {
@@ -113,6 +115,7 @@ impl NinePServer {
             transport: Transport::Tcp(addr),
             lock_manager: Arc::new(FileLockManager::new()),
             credential_override: None,
+            standard_lookup: NameMatch::Folded,
         }
     }
 
@@ -122,12 +125,19 @@ impl NinePServer {
             transport: Transport::Unix(path),
             lock_manager: Arc::new(FileLockManager::new()),
             credential_override: None,
+            standard_lookup: NameMatch::Folded,
         }
     }
 
     /// Override client-provided credentials for a shared writable namespace.
     pub fn with_credential_override(mut self, uid: u32, gid: u32) -> Self {
         self.credential_override = Some((uid, gid));
+        self
+    }
+
+    /// Name matching for standard `9P2000.L` sessions on this listener.
+    pub fn with_standard_lookup(mut self, standard_lookup: NameMatch) -> Self {
+        self.standard_lookup = standard_lookup;
         self
     }
 
@@ -146,6 +156,7 @@ impl NinePServer {
         let filesystem = Arc::clone(&self.filesystem);
         let lock_manager = Arc::clone(&self.lock_manager);
         let credential_override = self.credential_override;
+        let standard_lookup = self.standard_lookup;
         let client_shutdown = shutdown.child_token();
 
         AbortOnDropHandle::new(spawn_named("9p-client", async move {
@@ -155,6 +166,7 @@ impl NinePServer {
                 filesystem,
                 lock_manager,
                 credential_override,
+                standard_lookup,
                 client_shutdown,
                 session,
             )

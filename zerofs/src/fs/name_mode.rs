@@ -25,6 +25,20 @@ impl NameMode {
     }
 }
 
+/// How one request matches a client-supplied name against a stored entry.
+///
+/// `Folded` finds the entry whose folded key equals the name's. `Exact` also
+/// requires the stored spelling to equal the name byte for byte. On a
+/// sensitive filesystem the key is the stored spelling, so both agree.
+/// Creation never uses this choice: fold-equal names always collide.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NameMatch {
+    #[default]
+    Folded,
+    Exact,
+}
+
 /// Apply OpenZFS Unicode 5.0.0 simple uppercase without normalization.
 /// Invalid spans consume the lead byte's full width, including any ASCII tail.
 /// Illegal lead bytes consume one byte. Truncated spans consume the remainder.

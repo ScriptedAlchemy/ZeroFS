@@ -9,6 +9,7 @@ use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId, MAX_DEVICE_MAJOR, MAX_DEVICE_MINOR};
 use crate::fs::mutation::overlay::IdentifiedWrite;
 use crate::fs::mutation::types::{RequestIdentity, RequestLifetime};
+use crate::fs::name_mode::NameMatch;
 use crate::fs::permissions::{AccessMode, Credentials, check_access};
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{
@@ -423,6 +424,8 @@ pub struct NinePHandler {
     handler_id: u64,
     /// If set, overrides the client-provided credentials on attach.
     credential_override: Option<(u32, u32)>,
+    /// Name matching for standard `9P2000.L` sessions.
+    standard_lookup: NameMatch,
     #[cfg(test)]
     exact_lookup_pause: Arc<Mutex<Option<SuccessTerminalPause>>>,
     #[cfg(test)]
@@ -466,6 +469,7 @@ impl NinePHandler {
             lock_manager,
             handler_id: HANDLER_COUNTER.fetch_add(1, AtomicOrdering::SeqCst),
             credential_override: None,
+            standard_lookup: NameMatch::Folded,
             #[cfg(test)]
             exact_lookup_pause: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -477,6 +481,13 @@ impl NinePHandler {
     /// trusting the client-provided credentials in Tattach.
     pub fn with_credential_override(mut self, uid: u32, gid: u32) -> Self {
         self.credential_override = Some((uid, gid));
+        self
+    }
+
+    /// Set how standard `9P2000.L` sessions match names. The private ZeroFS
+    /// dialects ignore it because their clients choose per request.
+    pub fn with_standard_lookup(mut self, standard_lookup: NameMatch) -> Self {
+        self.standard_lookup = standard_lookup;
         self
     }
 
