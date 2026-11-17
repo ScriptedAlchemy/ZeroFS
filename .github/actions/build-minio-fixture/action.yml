@@ -21,8 +21,20 @@ runs:
         GOBIN: ${{ runner.temp }}/minio-bin
       run: |
         # Keep the same source commits validated by release-pgo.yml.
-        go install github.com/minio/minio@7aac2a2c5b7c882e68c1ce017d8256be2feea27f
-        go install github.com/minio/mc@77f82e18b5401a65958f1619df6ebb994634bd88
+        # The module proxy and checksum database sometimes drop a stream. Go keeps
+        # what it already fetched, so a second attempt only repeats the lost part.
+        install() {
+          for attempt in 1 2 3; do
+            if go install "$1"; then
+              return 0
+            fi
+            echo "go install $1 failed on attempt $attempt" >&2
+            sleep $((attempt * 10))
+          done
+          return 1
+        }
+        install github.com/minio/minio@7aac2a2c5b7c882e68c1ce017d8256be2feea27f
+        install github.com/minio/mc@77f82e18b5401a65958f1619df6ebb994634bd88
         cp "$GOBIN/minio" "$GITHUB_WORKSPACE/minio"
         cp "$GOBIN/mc" "$GITHUB_WORKSPACE/mc"
         echo "$GOBIN" >> "$GITHUB_PATH"
