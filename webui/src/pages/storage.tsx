@@ -7,6 +7,7 @@ import { adminClient } from "../lib/grpc/client";
 import { binaryBytesParts } from "../lib/format";
 import {
   capacityBreakdown,
+  formatAge,
   known,
   memberHealth,
   parseAffectedStatus,
@@ -235,7 +236,10 @@ function HealthSummary({ member }: { member: MemberStatus }) {
       ))}
       {member.observedMs.state === "known" && (
         <p className="pl-6 text-xs text-muted-foreground">
-          Last health observation {new Date(member.observedMs.value).toLocaleString()}
+          Last health observation {serverTime(member.observedMs.value)}
+          {member.observationAgeMs.state === "known" &&
+            member.observationAgeMs.value >= 0 &&
+            `, ${formatAge(member.observationAgeMs.value)} before this status`}
         </p>
       )}
     </div>

@@ -104,17 +104,25 @@ export interface MemberStatus {
   /** Members whose binding or free-space check failed when the server computed evacuation capacity. */
   unavailableMembers: Value<string[]>;
   observedMs: Value<number>;
+  /** How long before the status was assembled the health observation was made, on the server's clock. */
+  observationAgeMs: Value<number>;
   /** This member's unreadable segment records, taken from the pool's fault list. */
   faults: Value<SegmentFault[]>;
 }
 
 const nullableCount = (value: unknown): value is number | null => value === null || count(value);
 
-function member(raw: unknown, poolFaults: Value<SegmentFault[]>): Value<MemberStatus> {
+function member(raw: unknown, poolFaults: Value<SegmentFault[]>, generatedMs: Value<number>): Value<MemberStatus> {
   const row = object(raw);
   if (!row) return unavailable("invalid member record");
   const id = field(row, "id", text);
   const health = object(row.health);
+  const observedMs: Value<number> =
+    health?.observed_ms === null
+      ? unavailable("No health observation has been reported")
+      : health
+        ? field(health, "observed_ms", count)
+        : unavailable("health was not reported");
   const healthText = (key: string) =>
     health ? field(health, key, nullableText) : unavailable("health was not reported");
   return known({
@@ -150,12 +158,13 @@ function member(raw: unknown, poolFaults: Value<SegmentFault[]>): Value<MemberSt
     unavailableMembers: object(row.evacuation_capacity)
       ? list(object(row.evacuation_capacity)!, "unavailable_members", stringValue)
       : unavailable("evacuation_capacity was not reported by the server"),
-    observedMs:
-      health?.observed_ms === null
-        ? unavailable("No health observation has been reported")
-        : health
-          ? field(health, "observed_ms", count)
-          : unavailable("health was not reported"),
+    observedMs,
+    observationAgeMs:
+      observedMs.state === "unavailable"
+        ? observedMs
+        : generatedMs.state === "unavailable"
+          ? generatedMs
+          : known(generatedMs.value - observedMs.value),
     faults:
       poolFaults.state === "unavailable"
         ? poolFaults
@@ -167,6 +176,8 @@ function member(raw: unknown, poolFaults: Value<SegmentFault[]>): Value<MemberSt
 
 export interface PoolStatus {
   id: Value<string>;
+  /** Server wall-clock milliseconds when the status was assembled. */
+  generatedMs: Value<number>;
   members: Value<MemberStatus[]>;
   pendingOperations: Value<number>;
   mappedObjects: Value<number>;
@@ -190,12 +201,14 @@ export function parsePoolStatus(json: string): Value<PoolStatus> {
   const row = object(raw);
   if (!row) return unavailable("Pool status is not an object");
   const faults = list(row, "unreadable", segmentFault);
-  const members = list(row, "members", (raw) => member(raw, faults));
+  const generatedMs = field(row, "generated_ms", count);
+  const members = list(row, "members", (raw) => member(raw, faults, generatedMs));
   const ids = new Set(
     members.state === "known" ? members.value.flatMap((m) => (m.id.state === "known" ? [m.id.value] : [])) : [],
   );
   return known({
     id: field(row, "pool_id", text),
+    generatedMs,
     members,
     pendingOperations: field(row, "pending_operations", count),
     mappedObjects: field(row, "mapped_objects", count),
@@ -377,6 +390,23 @@ export function capacityBreakdown(member: MemberStatus): Value<CapacityBreakdown
   });
 }
 
+// The disk monitor sleeps 60 s between passes (poll_interval in zerofs/src/disk_health.rs) and each pass
+// runs smartctl on every monitored member in turn under a 10 s limit before recording the observation.
+// A pass therefore ends within 60 s plus 10 s per member, so a pool of up to 24 monitored members
+// refreshes every observation within five minutes even when every smartctl run hits its limit. An older
+// observation was not refreshed, for example because the member is no longer monitored but its last
+// observation is still in the catalog.
+export const STALE_OBSERVATION_MS = 5 * 60_000;
+
+export function formatAge(ms: number): string {
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) return `${seconds} s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  return hours < 24 ? `${hours} h` : `${Math.floor(hours / 24)} d`;
+}
+
 // The kernel watcher reports this text while it is reading the current boot's kernel ring.
 // Any other text means the watcher is missing, behind or broken.
 const KERNEL_WATCHER_RUNNING = "current boot kernel ring";
@@ -423,6 +453,19 @@ export function memberHealth(member: MemberStatus): MemberHealth {
   else if (kernel.value === null) health.limits.push({ label: "Kernel error monitoring", text: "has not reported" });
   else if (!kernel.value.startsWith(KERNEL_WATCHER_RUNNING))
     health.limits.push({ label: "Kernel error monitoring", text: kernel.value });
+  const age = member.observationAgeMs;
+  if (age.state === "unavailable") {
+    if (member.observedMs.state === "known") health.unavailable.push({ label: "Observation age", reason: age.reason });
+  } else if (age.value < 0)
+    health.limits.push({
+      label: "Health observation",
+      text: "is dated after the status was assembled, so the server clock moved back",
+    });
+  else if (age.value > STALE_OBSERVATION_MS)
+    health.limits.push({
+      label: "Health observation",
+      text: `last made ${formatAge(age.value)} before this status; the disk monitor normally refreshes it about once a minute`,
+    });
   const smart = member.smartSampled;
   if (smart.state === "unavailable") health.unavailable.push({ label: "SMART sample", reason: smart.reason });
   else if (!smart.value) health.limits.push({ label: "SMART", text: "no sample recorded" });
