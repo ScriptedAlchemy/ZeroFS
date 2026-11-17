@@ -9,6 +9,7 @@ use crate::dedup::DedupResult;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId};
 use crate::fs::mutation::types::{ConflictKey, ConflictScope};
+use crate::fs::name_mode::NameMatch;
 use crate::fs::permissions::{AccessMode, Credentials, check_access, check_sticky_bit_delete};
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::AuthContext;
@@ -195,6 +196,7 @@ impl ZeroFS {
             auth,
             from_dirid,
             from_name,
+            NameMatch::Folded,
             to_dirid,
             to_name,
             [0; 16],
@@ -292,8 +294,43 @@ impl ZeroFS {
         to_name: &[u8],
         op_id: crate::dedup::OpId,
     ) -> Result<(), FsError> {
+        self.rename_idempotent_matching(
+            auth,
+            from_dirid,
+            from_name,
+            NameMatch::Folded,
+            to_dirid,
+            to_name,
+            op_id,
+        )
+        .await
+    }
+
+    /// [`Self::rename_idempotent`] with `source_match` applied to the source
+    /// name while the rename holds its directory locks. The destination is
+    /// always resolved by the folded key, so a fold-equal destination is the
+    /// source itself (a case-only rename) or an entry to replace.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn rename_idempotent_matching(
+        &self,
+        auth: &AuthContext,
+        from_dirid: u64,
+        from_name: &[u8],
+        source_match: NameMatch,
+        to_dirid: u64,
+        to_name: &[u8],
+        op_id: crate::dedup::OpId,
+    ) -> Result<(), FsError> {
         self.rename_with_options(
-            auth, from_dirid, from_name, to_dirid, to_name, op_id, true, None,
+            auth,
+            from_dirid,
+            from_name,
+            source_match,
+            to_dirid,
+            to_name,
+            op_id,
+            true,
+            None,
         )
         .await
         .map(|_| ())
@@ -310,7 +347,15 @@ impl ZeroFS {
         op_id: crate::dedup::OpId,
     ) -> Result<(), FsError> {
         self.rename_with_options(
-            auth, from_dirid, from_name, to_dirid, to_name, op_id, false, None,
+            auth,
+            from_dirid,
+            from_name,
+            NameMatch::Folded,
+            to_dirid,
+            to_name,
+            op_id,
+            false,
+            None,
         )
         .await
         .map(|_| ())
@@ -322,6 +367,7 @@ impl ZeroFS {
         auth: &AuthContext,
         from_dirid: u64,
         from_name: &[u8],
+        source_match: NameMatch,
         to_dirid: u64,
         to_name: &[u8],
         op_id: crate::dedup::OpId,
@@ -438,10 +484,12 @@ impl ZeroFS {
             return Ok(None);
         }
 
-        // Re-verify inside lock that entries still point to same inodes
+        // Re-verify inside lock that entries still point to same inodes. An
+        // exact-spelling source rule is checked here, where no other rename
+        // can split the folded entry from its stored spelling.
         let (verified_source_id, verified_source_cookie) = self
             .directory_store
-            .get_entry_with_cookie(from_dirid, from_name)
+            .get_entry_matching(from_dirid, from_name, source_match)
             .await?;
         if verified_source_id != source_inode_id || verified_source_cookie != source_cookie {
             return Err(FsError::StaleHandle);
