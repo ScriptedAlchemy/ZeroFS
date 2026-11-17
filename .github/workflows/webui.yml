@@ -53,7 +53,6 @@ jobs:
           targets: wasm32-unknown-unknown
       - run: npm ci
       - run: npm test
-      - run: npx buf generate
       - run: cargo check --target wasm32-unknown-unknown -p zerofs-client
         working-directory: zerofs
       - run: npm run lint

@@ -73,7 +73,8 @@ interface TimedEvent {
 
 export function FileAccessTracer() {
   const [events, setEvents] = useState<TimedEvent[]>([]);
-  const [error, setError] = useState<Error | null>(null);
+  const [disconnect, setDisconnect] = useState<string | null>(null);
+  const [attempt, setAttempt] = useState(0);
   const [paused, setPaused] = useState(false);
   const pausedRef = useRef(false);
   useEffect(() => { pausedRef.current = paused; }, [paused]);
@@ -84,6 +85,7 @@ export function FileAccessTracer() {
     (async () => {
       try {
         for await (const event of adminClient.watchFileAccess({}, { signal: abort.signal })) {
+          if (abort.signal.aborted) return;
           if (pausedRef.current) continue;
           setEvents((prev) => {
             const next = [...prev, { event, receivedAt: new Date() }];
@@ -91,12 +93,13 @@ export function FileAccessTracer() {
             return next;
           });
         }
+        if (!abort.signal.aborted) setDisconnect("File access stream ended.");
       } catch (e) {
-        if (!abort.signal.aborted) setError(e instanceof Error ? e : new Error(String(e)));
+        if (!abort.signal.aborted) setDisconnect(`File access stream failed: ${e instanceof Error ? e.message : String(e)}`);
       }
     })();
     return () => abort.abort();
-  }, []);
+  }, [attempt]);
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
@@ -121,10 +124,18 @@ export function FileAccessTracer() {
           </div>
         </Tooltip.Provider>
       </div>
-      {error && <p className="text-xs text-destructive mb-2 font-mono">{error.message}</p>}
+      {disconnect && (
+        <div className="mb-2 flex items-center gap-3 text-sm">
+          <p role="status">{disconnect}</p>
+          <Button variant="outline" onClick={() => {
+            setDisconnect(null);
+            setAttempt((current) => current + 1);
+          }}>Reconnect trace</Button>
+        </div>
+      )}
       <div ref={scrollRef} className="h-64 overflow-y-auto overflow-x-hidden font-mono text-[13px] leading-relaxed">
         {events.length === 0 ? (
-          <p className="text-muted-foreground">Waiting for events...</p>
+          !disconnect && <p className="text-muted-foreground">Waiting for events...</p>
         ) : (
           events.map(({ event, receivedAt }, i) => {
             const opName = FileOperation[event.operation] ?? "?";

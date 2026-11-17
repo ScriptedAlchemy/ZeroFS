@@ -1,34 +1,27 @@
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
-import { Loader2 } from "lucide-react";
+import { statsRates, type RateMetric } from "../../lib/stats-rates";
 import type { StatsSnapshot } from "../../lib/grpc/gen/admin_pb";
 import { formatSize } from "../../lib/format";
 
 interface IOChartProps {
   history: StatsSnapshot[];
+  metric: RateMetric;
 }
 
-export function IOChart({ history }: IOChartProps) {
+export function IOChart({ history, metric }: IOChartProps) {
   const fontFamily = "'Geist Mono', 'SF Mono', ui-monospace, monospace";
-  if (history.length < 2) return (
-    <div className="card-surface rounded-lg p-5 h-[260px] flex items-center justify-center">
-      <Loader2 size={18} className="animate-spin text-muted-foreground" />
-    </div>
-  );
-  const data = history.slice(1).map((snap, i) => {
-    const prev = history[i];
-    const dtSec = deltaSeconds(prev, snap);
-    if (dtSec <= 0) return { t: i, readBps: 0, writeBps: 0 };
-    return {
-      t: i,
-      readBps: Number(snap.bytesRead - prev.bytesRead) / dtSec,
-      writeBps: Number(snap.bytesWritten - prev.bytesWritten) / dtSec,
-    };
-  });
+  const data = statsRates(history, metric);
+  const title = metric === "throughput" ? "Throughput" : "IOPS";
+  const formatRate = (rate: number) => {
+    if (metric === "iops") return `${Number(rate.toFixed(2))} ops/s`;
+    return rate > 0 && rate < 1 ? `${Number(rate.toPrecision(2))} B/s` : `${formatSize(rate)}/s`;
+  };
+  const formatTime = (time: number) => new Date(time).toLocaleTimeString();
 
   return (
     <div className="card-surface rounded-lg p-5">
       <div className="flex items-center justify-between mb-4">
-        <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">Throughput</p>
+        <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">{title}</p>
         <div className="flex items-center gap-4 text-xs">
           <span className="flex items-center gap-1.5">
             <span className="w-2.5 h-0.5 rounded-full bg-blue-400 inline-block" />
@@ -40,75 +33,76 @@ export function IOChart({ history }: IOChartProps) {
           </span>
         </div>
       </div>
-      <ResponsiveContainer width="100%" height={200} style={{ marginLeft: -10 }}>
-        <AreaChart data={data} margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
-          <defs>
-            <linearGradient id="readGrad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="#60a5fa" stopOpacity={0.15} />
-              <stop offset="100%" stopColor="#60a5fa" stopOpacity={0} />
-            </linearGradient>
-            <linearGradient id="writeGrad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="#34d399" stopOpacity={0.15} />
-              <stop offset="100%" stopColor="#34d399" stopOpacity={0} />
-            </linearGradient>
-          </defs>
-          <CartesianGrid strokeDasharray="3 3" stroke="#3d444d" vertical={false} />
-          <XAxis
-            dataKey="t"
-            tick={{ fontSize: 10, fill: "#656c76", fontFamily }}
-            axisLine={false}
-            tickLine={false}
-            interval={Math.max(0, Math.floor(data.length / 6) - 1)}
-            tickFormatter={(v) => `${v - data.length + 1}s`}
-          />
-          <YAxis
-            tickFormatter={(v) => formatSize(v) + "/s"}
-            width={70}
-            tick={{ fontSize: 10, fill: "#656c76", fontFamily }}
-            axisLine={false}
-            tickLine={false}
-          />
-          <Tooltip
-            contentStyle={{
-              backgroundColor: "#2a313c",
-              border: "1px solid #3d444d",
-              borderRadius: 6,
-              fontSize: 11,
-              fontFamily,
-              boxShadow: "0 4px 24px rgba(0,0,0,0.3)",
-            }}
-            formatter={(value) => formatSize(Number(value)) + "/s"}
-            labelFormatter={() => ""}
-          />
-          <Area
-            type="monotone"
-            dataKey="readBps"
-            name="Read"
-            stroke="#60a5fa"
-            fill="url(#readGrad)"
-            strokeWidth={1.5}
-            dot={false}
-            isAnimationActive={false}
-          />
-          <Area
-            type="monotone"
-            dataKey="writeBps"
-            name="Write"
-            stroke="#34d399"
-            fill="url(#writeGrad)"
-            strokeWidth={1.5}
-            dot={false}
-            isAnimationActive={false}
-          />
-        </AreaChart>
-      </ResponsiveContainer>
+      {data.some((p) => p.read !== null || p.write !== null) ? (
+        <ResponsiveContainer width="100%" height={200} style={{ marginLeft: -10 }}>
+          <AreaChart data={data} margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
+            <defs>
+              <linearGradient id={`read-${metric}`} x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor="#60a5fa" stopOpacity={0.15} />
+                <stop offset="100%" stopColor="#60a5fa" stopOpacity={0} />
+              </linearGradient>
+              <linearGradient id={`write-${metric}`} x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor="#34d399" stopOpacity={0.15} />
+                <stop offset="100%" stopColor="#34d399" stopOpacity={0} />
+              </linearGradient>
+            </defs>
+            <CartesianGrid strokeDasharray="3 3" stroke="#3d444d" vertical={false} />
+            <XAxis
+              dataKey="time"
+              type="number"
+              domain={["dataMin", "dataMax"]}
+              tick={{ fontSize: 10, fill: "#656c76", fontFamily }}
+              axisLine={false}
+              tickLine={false}
+              tickCount={5}
+              tickFormatter={formatTime}
+            />
+            <YAxis
+              tickFormatter={formatRate}
+              width={70}
+              tick={{ fontSize: 10, fill: "#656c76", fontFamily }}
+              axisLine={false}
+              tickLine={false}
+            />
+            <Tooltip
+              contentStyle={{
+                backgroundColor: "#2a313c",
+                border: "1px solid #3d444d",
+                borderRadius: 6,
+                fontSize: 11,
+                fontFamily,
+                boxShadow: "0 4px 24px rgba(0,0,0,0.3)",
+              }}
+              formatter={(value) => formatRate(Number(value))}
+              labelFormatter={(value) => formatTime(Number(value))}
+            />
+            <Area
+              type="monotone"
+              dataKey="read"
+              name="Read"
+              stroke="#60a5fa"
+              fill={`url(#read-${metric})`}
+              strokeWidth={1.5}
+              dot={data.length === 2}
+              isAnimationActive={false}
+            />
+            <Area
+              type="monotone"
+              dataKey="write"
+              name="Write"
+              stroke="#34d399"
+              fill={`url(#write-${metric})`}
+              strokeWidth={1.5}
+              dot={data.length === 2}
+              isAnimationActive={false}
+            />
+          </AreaChart>
+        </ResponsiveContainer>
+      ) : (
+        <p className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
+          Waiting for two timestamped samples.
+        </p>
+      )}
     </div>
   );
-}
-
-function deltaSeconds(a: StatsSnapshot, b: StatsSnapshot): number {
-  if (!a.timestamp || !b.timestamp) return 1;
-  const aSec = Number(a.timestamp.seconds) + Number(a.timestamp.nanos) / 1e9;
-  const bSec = Number(b.timestamp.seconds) + Number(b.timestamp.nanos) / 1e9;
-  return bSec - aSec;
 }
