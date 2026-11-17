@@ -239,20 +239,34 @@ impl FlushCoordinator {
         })
     }
 
+    /// Seal, flush and capture under the database flush barrier.
+    ///
+    /// Waiting for the barrier is abandonable. The work under it is not: a
+    /// caller that stops waiting (a 9P `Tflush`, a closed connection) must not
+    /// stop a seal between rotating a segment and publishing it. Once the
+    /// barrier is held, the work runs in its own task, which owns the barrier
+    /// and releases it when the flush ends.
     async fn capture_under_barrier(&self) -> Result<ObjectCoverage, DurabilityError> {
-        let _barrier = self.db.flush_barrier().write_owned().await;
-        if let Some(seal) = self.seal_hook.get() {
-            seal().await.map_err(DurabilityError::from_flush)?;
-        }
-        self.db
-            .flush()
-            .await
-            .map_err(DurabilityError::FilesystemFlush)?;
-        Ok(self
-            .object_capture
-            .get()
-            .map(|capture| capture())
-            .unwrap_or(ObjectCoverage::DirectRemote))
+        let barrier = self.db.flush_barrier().write_owned().await;
+        let seal = self.seal_hook.get().cloned();
+        let capture = self.object_capture.get().cloned();
+        let db = Arc::clone(&self.db);
+        spawn_named("durability-barrier", async move {
+            let _barrier = barrier;
+            if let Some(seal) = seal {
+                seal().await.map_err(DurabilityError::from_flush)?;
+            }
+            db.flush().await.map_err(DurabilityError::FilesystemFlush)?;
+            Ok(capture
+                .map(|capture| capture())
+                .unwrap_or(ObjectCoverage::DirectRemote))
+        })
+        .await
+        .map_err(|error| {
+            DurabilityError::FilesystemFlush(anyhow::anyhow!(
+                "durability barrier task failed: {error}"
+            ))
+        })?
     }
 
     async fn wait_object(
