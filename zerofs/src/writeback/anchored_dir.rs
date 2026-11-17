@@ -289,6 +289,22 @@ impl AnchoredDir {
         Ok((file, existed))
     }
 
+    /// Open an existing owner file read-write, or return `None` if it does
+    /// not exist. Never creates the file.
+    pub(crate) fn try_open_existing_owner_file(&self, name: &OsStr) -> Result<Option<File>> {
+        validate_component(name)?;
+        let flags = OFlags::RDWR.union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
+        let file = match openat(self.fd.as_ref(), name, flags, Mode::empty()) {
+            Ok(fd) => File::from(fd),
+            Err(Errno::NOENT) => return Ok(None),
+            Err(error) => {
+                return Err(anyhow::Error::new(error)).context("open anchored owner file");
+            }
+        };
+        self.validate_owner_file(name, &file)?;
+        Ok(Some(file))
+    }
+
     pub(crate) fn open_existing_owner_file_read_only(&self, name: &OsStr) -> Result<File> {
         validate_component(name)?;
         let fd = openat(
@@ -454,18 +470,6 @@ impl AnchoredDir {
         .set_permissions(std::fs::Permissions::from_mode(mode))
         .with_context(|| format!("set anchored directory mode for {}", self.display.display()))
     }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn descriptor_path(file: &File) -> PathBuf {
-        use std::os::fd::AsRawFd;
-        Path::new("/proc/self/fd").join(file.as_raw_fd().to_string())
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-    pub(crate) fn descriptor_path(file: &File) -> PathBuf {
-        use std::os::fd::AsRawFd;
-        Path::new("/dev/fd").join(file.as_raw_fd().to_string())
-    }
 }
 
 fn rustix_mode(mode: u32) -> Result<Mode> {
@@ -490,7 +494,6 @@ fn validate_component(name: &OsStr) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{AnchoredDir, rustix_mode};
-    use redb::{Database, DatabaseError, ReadOnlyDatabase, ReadableDatabase, TableDefinition};
     use rustix::fs::{Mode, OFlags};
     use std::os::unix::fs::PermissionsExt;
 
@@ -598,57 +601,6 @@ mod tests {
                     .is_err()
             );
         }
-    }
-
-    #[test]
-    fn descriptor_read_only_open_retains_identity_and_exact_writer_lock() {
-        const IDENTITY: TableDefinition<u64, &str> = TableDefinition::new("identity");
-        let root = tempfile::tempdir().unwrap();
-        let anchored = anchored_temp(&root);
-        let database_path = root.path().join("journal.redb");
-        let retained_path = root.path().join("retained.redb");
-        let original = Database::create(&database_path).unwrap();
-        let write = original.begin_write().unwrap();
-        write
-            .open_table(IDENTITY)
-            .unwrap()
-            .insert(0, "original")
-            .unwrap();
-        write.commit().unwrap();
-        drop(original);
-        let pinned = anchored
-            .open_file("journal.redb".as_ref(), OFlags::RDONLY, 0)
-            .unwrap();
-        std::fs::rename(&database_path, &retained_path).unwrap();
-        let replacement = Database::create(&database_path).unwrap();
-        let write = replacement.begin_write().unwrap();
-        write
-            .open_table(IDENTITY)
-            .unwrap()
-            .insert(0, "replacement")
-            .unwrap();
-        write.commit().unwrap();
-        drop(replacement);
-
-        let read_only = ReadOnlyDatabase::open(AnchoredDir::descriptor_path(&pinned)).unwrap();
-        drop(pinned);
-        let read = read_only.begin_read().unwrap();
-        let table = read.open_table(IDENTITY).unwrap();
-        assert_eq!(table.get(0).unwrap().unwrap().value(), "original");
-        drop(table);
-        drop(read);
-
-        assert!(matches!(
-            Database::create(&retained_path),
-            Err(DatabaseError::DatabaseAlreadyOpen)
-        ));
-        drop(read_only);
-        Database::create(retained_path).unwrap();
-
-        let replacement = ReadOnlyDatabase::open(database_path).unwrap();
-        let read = replacement.begin_read().unwrap();
-        let table = read.open_table(IDENTITY).unwrap();
-        assert_eq!(table.get(0).unwrap().unwrap().value(), "replacement");
     }
 
     #[test]
