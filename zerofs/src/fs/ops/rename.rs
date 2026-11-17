@@ -2228,4 +2228,37 @@ mod tests {
             before
         );
     }
+
+    #[tokio::test]
+    async fn rename_updates_the_ctime_of_the_renamed_inode() {
+        use crate::fs::inode::InodeAttrs;
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let creds = test_creds();
+        let auth = AuthContext::from(&creds);
+        let attrs = SetAttributes::default();
+        let (dir, _) = fs.mkdir(&creds, 0, b"dir", &attrs).await.unwrap();
+        let (file, _) = fs.create(&creds, 0, b"a", &attrs).await.unwrap();
+        for (from_dir, from, to_dir, to) in [(0, b"a", 0, b"b"), (0, b"b", dir, b"c")] {
+            let before = fs.inode_store.get(file).await.unwrap();
+            fs.rename(&auth, from_dir, from, to_dir, to).await.unwrap();
+            let after = fs.inode_store.get(file).await.unwrap();
+            assert!((after.ctime(), after.ctime_nsec()) > (before.ctime(), before.ctime_nsec()));
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_keeps_the_embedded_copy_of_a_moved_directory() {
+        use crate::fs::name_mode_tests::assert_preserved;
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let creds = test_creds();
+        let auth = AuthContext::from(&creds);
+        let attrs = SetAttributes::default();
+        let (dest, _) = fs.mkdir(&creds, 0, b"dest", &attrs).await.unwrap();
+        let (moved, _) = fs.mkdir(&creds, 0, b"a", &attrs).await.unwrap();
+        assert_preserved(&fs, 0, b"a", moved).await;
+        fs.rename(&auth, 0, b"a", 0, b"b").await.unwrap();
+        assert_preserved(&fs, 0, b"b", moved).await;
+        fs.rename(&auth, 0, b"b", dest, b"c").await.unwrap();
+        assert_preserved(&fs, dest, b"c", moved).await;
+    }
 }
