@@ -2,6 +2,7 @@ use crate::db::{Db, Transaction};
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
 use crate::fs::key_codec::{KeyCodec, ParsedKey};
+use crate::fs::name_mode::NameMatch;
 use crate::fs::store::read_cache::{InvalidationGuard, MetadataCache};
 use bytes::Bytes;
 use futures::Stream;
@@ -133,7 +134,24 @@ impl DirectoryStore {
     /// The caller holds the directory's namespace lock through this check and
     /// any preceding folded lookup so a replacement cannot split the reads.
     pub(crate) async fn get_exact(&self, dir_id: InodeId, name: &[u8]) -> Result<InodeId, FsError> {
+        self.get_entry_matching(dir_id, name, NameMatch::Exact)
+            .await
+            .map(|(inode_id, _)| inode_id)
+    }
+
+    /// Resolve `name` to its entry under `rule`. `Exact` adds the stored
+    /// spelling check that [`Self::get_exact`] describes, under the same lock
+    /// requirement.
+    pub(crate) async fn get_entry_matching(
+        &self,
+        dir_id: InodeId,
+        name: &[u8],
+        rule: NameMatch,
+    ) -> Result<(InodeId, u64), FsError> {
         let (inode_id, cookie) = self.get_entry_with_cookie(dir_id, name).await?;
+        if rule == NameMatch::Folded {
+            return Ok((inode_id, cookie));
+        }
         let scan = self
             .db
             .get_bytes(&self.key_codec.dir_scan_key(dir_id, cookie))
@@ -144,7 +162,7 @@ impl DirectoryStore {
         if stored != name || value.inode_id() != inode_id {
             return Err(FsError::NotFound);
         }
-        Ok(inode_id)
+        Ok((inode_id, cookie))
     }
 
     async fn load_entry(&self, dir_id: InodeId, name: &[u8]) -> Result<EntryCacheValue, FsError> {

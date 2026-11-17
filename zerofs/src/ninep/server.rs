@@ -1,3 +1,4 @@
+use super::handler::ListenerPolicy;
 #[cfg(test)]
 pub(crate) use super::handler::NinePHandler;
 pub(crate) use super::lock_manager::FileLockManager;
@@ -103,7 +104,7 @@ pub struct NinePServer {
     filesystem: Arc<ZeroFS>,
     transport: Transport,
     lock_manager: Arc<FileLockManager>,
-    credential_override: Option<(u32, u32)>,
+    policy: ListenerPolicy,
 }
 
 impl NinePServer {
@@ -112,7 +113,7 @@ impl NinePServer {
             filesystem,
             transport: Transport::Tcp(addr),
             lock_manager: Arc::new(FileLockManager::new()),
-            credential_override: None,
+            policy: ListenerPolicy::default(),
         }
     }
 
@@ -121,13 +122,22 @@ impl NinePServer {
             filesystem,
             transport: Transport::Unix(path),
             lock_manager: Arc::new(FileLockManager::new()),
-            credential_override: None,
+            policy: ListenerPolicy::default(),
         }
     }
 
     /// Override client-provided credentials for a shared writable namespace.
     pub fn with_credential_override(mut self, uid: u32, gid: u32) -> Self {
-        self.credential_override = Some((uid, gid));
+        self.policy.credential_override = Some((uid, gid));
+        self
+    }
+
+    /// Name matching for standard `9P2000.L` sessions on this listener.
+    pub fn with_standard_lookup(
+        mut self,
+        standard_lookup: crate::fs::name_mode::NameMatch,
+    ) -> Self {
+        self.policy.standard_lookup = standard_lookup;
         self
     }
 
@@ -145,7 +155,7 @@ impl NinePServer {
     {
         let filesystem = Arc::clone(&self.filesystem);
         let lock_manager = Arc::clone(&self.lock_manager);
-        let credential_override = self.credential_override;
+        let policy = self.policy;
         let client_shutdown = shutdown.child_token();
 
         AbortOnDropHandle::new(spawn_named("9p-client", async move {
@@ -154,7 +164,7 @@ impl NinePServer {
                 write_stream,
                 filesystem,
                 lock_manager,
-                credential_override,
+                policy,
                 client_shutdown,
                 session,
             )
@@ -316,7 +326,8 @@ mod tests {
     use crate::ninep::lock_manager::FileLock;
     use ninep_proto::{
         DekuBytes, GETATTR_ALL, LockType, P9String, Rclunk, Rflush, Rlopenat, Rread, Tattach,
-        Tclunk, Tflush, Tgetattr, Tlopenat, Tmkdir, Tversion, Twrite, VERSION_9P2000L_ZEROFS,
+        Tclunk, Tflush, Tgetattr, Tlopenat, Tmkdir, Trenameat, Tversion, Twalk, Twrite,
+        VERSION_9P2000L, VERSION_9P2000L_ZEROFS,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -1291,7 +1302,7 @@ mod tests {
         let server = NinePServer::new(filesystem, "127.0.0.1:0".parse().unwrap())
             .with_credential_override(501, 20);
 
-        assert_eq!(server.credential_override, Some((501, 20)));
+        assert_eq!(server.policy.credential_override, Some((501, 20)));
     }
 
     async fn exchange_client_frame(
@@ -1318,6 +1329,117 @@ mod tests {
         body: Message,
     ) -> P9Message {
         exchange_client_frame(client, P9Message::new(tag, body).to_bytes().unwrap()).await
+    }
+
+    #[tokio::test]
+    async fn spawned_standard_session_uses_the_listener_lookup_rule() {
+        use crate::fs::name_mode::{NameMatch, NameMode};
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory_with_name_mode(NameMode::Insensitive)
+                .await
+                .unwrap(),
+        );
+        let root = Credentials {
+            uid: 0,
+            gid: 0,
+            gid_known: true,
+            groups: [0; 16],
+            groups_count: 0,
+            groups_complete: true,
+        };
+        let (id, _) = filesystem
+            .create(&root, 0, b"Foo", &Default::default())
+            .await
+            .unwrap();
+        let server = NinePServer::new_unix(Arc::clone(&filesystem), "/unused".into())
+            .with_standard_lookup(NameMatch::Exact);
+        let (mut client, server_stream) = tokio::io::duplex(4096);
+        let (read_stream, write_stream) = tokio::io::split(server_stream);
+        let shutdown = CancellationToken::new();
+        let task = server.spawn_client_handler(
+            read_stream,
+            write_stream,
+            &shutdown,
+            "standard-lookup-test".to_string(),
+            P9SessionAdmission {
+                transport: P9GlobalAdmission::shared().try_admit_transport().unwrap(),
+                transport_label: "test",
+                accepted_work: P9AcceptedWorkTracker::new(),
+            },
+        );
+
+        let version = exchange_client_message(
+            &mut client,
+            0,
+            Message::Tversion(Tversion {
+                msize: super::super::handler::DEFAULT_MSIZE,
+                version: P9String::new(VERSION_9P2000L.to_vec()),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(version.body, Message::Rversion(ref reply) if reply.version.data == VERSION_9P2000L)
+        );
+        let attach = exchange_client_message(
+            &mut client,
+            1,
+            Message::Tattach(Tattach {
+                fid: 1,
+                afid: u32::MAX,
+                uname: P9String::new(b"root".to_vec()),
+                aname: P9String::new(Vec::new()),
+                n_uname: 0,
+            }),
+        )
+        .await;
+        assert!(matches!(attach.body, Message::Rattach(_)));
+        let walk = exchange_client_message(
+            &mut client,
+            2,
+            Message::Twalk(Twalk {
+                fid: 1,
+                newfid: 2,
+                nwname: 1,
+                wnames: vec![P9String::new(b"foo".to_vec())],
+            }),
+        )
+        .await;
+        assert!(
+            matches!(walk.body, Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::ENOENT),
+            "{:?}",
+            walk.body
+        );
+        let rename = exchange_client_message(
+            &mut client,
+            3,
+            Message::Trenameat(Trenameat {
+                olddirfid: 1,
+                oldname: P9String::new(b"Foo".to_vec()),
+                newdirfid: 1,
+                newname: P9String::new(b"foo".to_vec()),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(rename.body, Message::Rrenameat(_)),
+            "{:?}",
+            rename.body
+        );
+        assert_eq!(
+            filesystem
+                .directory_store
+                .get_exact(0, b"foo")
+                .await
+                .unwrap(),
+            id
+        );
+
+        shutdown.cancel();
+        drop(client);
+        tokio::time::timeout(TEST_TIMEOUT, task)
+            .await
+            .expect("client handler shutdown")
+            .unwrap();
     }
 
     #[tokio::test]

@@ -383,6 +383,20 @@ fn equivalent_cache_floor_and_explicit_gc_defaults_match_the_package() {
     assert!(format!("{receipt:?}").contains("small-nas-package-v1"));
 }
 
+#[test]
+#[cfg(feature = "webui")]
+fn exact_standard_ninep_lookup_keeps_the_package_policy() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = package_config(temp.path(), 8 * GIB);
+    let original = admission(temp.path(), &base).unwrap();
+    let socket = "unix_socket = \"/run/zerofs-app/9p.sock\"\n";
+    assert!(base.contains(socket));
+    let exact = base.replace(socket, &format!("{socket}standard_lookup = \"exact\"\n"));
+    let receipt = admission(temp.path(), &exact).unwrap();
+    assert_eq!(receipt.required_bytes, original.required_bytes);
+    assert!(format!("{receipt:?}").contains("small-nas-package-v1"));
+}
+
 #[cfg(feature = "webui")]
 fn extra_members(count: usize) -> String {
     (0..count).map(|index| format!(

@@ -56,8 +56,59 @@ For example, a stored `Foo` is visible as `Foo`, while looking up `foo` returns
 fold-equal collisions. This lets Linux call the filesystem for a case-only
 rename instead of treating two spellings of the same inode as a no-op.
 The bridge uses a private exact-spelling walk and disables negative-entry
-caching, including on relaxed mounts. Ordinary 9P walks retain folded lookup.
-Plain `9P2000.L` still passes names as bytes. This change does not alter the
-HA replication protocol.
+caching, including on relaxed mounts. Ordinary 9P walks retain folded lookup
+unless the listener sets `standard_lookup`, described below. Plain `9P2000.L`
+still passes names as bytes. This change does not alter the HA replication
+protocol.
 
+## Standard 9P clients
+
+A stock Linux v9fs mount speaks only plain `9P2000.L` and has no exact-spelling
+walk. By default the server folds every name such a session sends, so Linux
+treats `Foo` and `foo` as one inode and never sends `mv Foo foo` to the server.
+The case-only rename silently does nothing.
+
+`standard_lookup` under `[servers.ninep]` takes `"folded"`, the default, or
+`"exact"`. With `"exact"`, standard sessions on that listener use the same
+stored-spelling check as the private exact walk.
+
+- `Twalk` checks every component. A wrong-case first component returns
+  `ENOENT`. A wrong-case later component returns the walked prefix and creates
+  no fid, which Linux reports as `ENOENT`.
+- `Tunlinkat` and the source name of `Trenameat` match the stored spelling.
+  A wrong-case name returns `ENOENT`.
+- `Tlcreate`, `Tmkdir`, `Tmknod`, `Tsymlink` and `Tlink` still return `EEXIST`
+  for a fold-equal name. The filesystem enforces that rule, not the listener.
+- The `Trenameat` destination still resolves by the folded key. A destination
+  that is another spelling of the source's own entry performs a case-only
+  rename. A destination that is another spelling of a different entry replaces
+  that entry under the normal rename rules.
+- Directory listings return stored spellings.
+
+Files and directories follow the same rules. The handler holds the directory's
+namespace lock across the folded lookup and the spelling check, so an atomic
+replacement cannot make a continuously present name return `ENOENT`. Unlink and
+rename apply the check during the revalidation they already perform under
+their directory locks.
+
+The legacy path-based `Trename` names its source by fid, so its only
+client-supplied name is the destination, which follows the destination rule.
+The server does not implement `Tremove`. The attach name (`aname`) resolves by
+the folded rule in every dialect.
+
+The setting has a cost. A program that opens `movie.mkv` does not find
+`Movie.mkv` through that mount, and creating `movie.mkv` beside it returns
+`EEXIST` even without `O_EXCL`. A server such as Samba on top of the mount must
+match case itself by scanning directories.
+
+The ZeroFS dialects ignore the setting because their clients choose per
+request. The web UI connects over WebSocket with the ZeroFS dialect and builds
+its handler without the setting. A sensitive filesystem accepts either value
+and behaves the same, because its lookup key is the stored spelling. The
+setting does not change memory use, and the small NAS package memory policy
+admits it.
+
+- Not verified: a stock Linux v9fs mount and Samba with `standard_lookup =
+  "exact"`. The tests drive the 9P handler through plain `9P2000.L` sessions
+  without a kernel mount.
 - Not verified: Samba end to end, Linux v9fs client caching, native kernel mount refusal, and equivalence with a running ZFS filesystem require separate acceptance tests.
