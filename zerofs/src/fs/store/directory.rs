@@ -119,6 +119,10 @@ impl DirectoryStore {
         }
     }
 
+    fn cache_name(&self, name: &[u8]) -> Bytes {
+        Bytes::from(self.key_codec.name_key(name).into_owned())
+    }
+
     pub(crate) async fn get(&self, dir_id: InodeId, name: &[u8]) -> Result<InodeId, FsError> {
         self.get_entry_with_cookie(dir_id, name)
             .await
@@ -193,10 +197,7 @@ impl DirectoryStore {
     }
 
     pub(crate) async fn exists(&self, dir_id: InodeId, name: &[u8]) -> Result<bool, FsError> {
-        let cache_key = (
-            dir_id,
-            Bytes::from(self.key_codec.name_key(name).into_owned()),
-        );
+        let cache_key = (dir_id, self.cache_name(name));
         if self.entry_cache.get(&cache_key)?.is_some() {
             return Ok(true);
         }
@@ -323,7 +324,7 @@ impl DirectoryStore {
     ) {
         let entry_key = self.key_codec.dir_entry_key(dir_id, name);
         txn.put_bytes(&entry_key, KeyCodec::encode_dir_entry(entry_id, cookie));
-        let cache_name = Bytes::from(self.key_codec.name_key(name).into_owned());
+        let cache_name = self.cache_name(name);
         txn.update_cached_directory_entry(dir_id, cache_name, Some((entry_id, cookie)));
 
         let scan_value = match inode {
@@ -347,7 +348,7 @@ impl DirectoryStore {
     ) {
         let entry_key = self.key_codec.dir_entry_key(dir_id, name);
         txn.delete_bytes(&entry_key);
-        let cache_name = Bytes::from(self.key_codec.name_key(name).into_owned());
+        let cache_name = self.cache_name(name);
         txn.update_cached_directory_entry(dir_id, cache_name, None);
 
         let scan_key = self.key_codec.dir_scan_key(dir_id, cookie);
@@ -364,10 +365,7 @@ impl DirectoryStore {
         dir_id: InodeId,
         name: &[u8],
     ) -> Result<(InodeId, u64), FsError> {
-        let key = (
-            dir_id,
-            Bytes::from(self.key_codec.name_key(name).into_owned()),
-        );
+        let key = (dir_id, self.cache_name(name));
         self.entry_cache
             .get_or_load(key, || self.load_entry(dir_id, name))
             .await
@@ -382,10 +380,7 @@ impl DirectoryStore {
 
     #[cfg(test)]
     fn cached_entry(&self, dir_id: InodeId, name: &[u8]) -> Option<(InodeId, u64)> {
-        self.entry_cache.peek(&(
-            dir_id,
-            Bytes::from(self.key_codec.name_key(name).into_owned()),
-        ))
+        self.entry_cache.peek(&(dir_id, self.cache_name(name)))
     }
 
     #[cfg(test)]
