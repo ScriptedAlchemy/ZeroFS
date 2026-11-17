@@ -5774,6 +5774,237 @@ mod session_transition_tests {
         assert_eq!(second.await.unwrap().unwrap(), 1);
     }
 
+    async fn assert_no_request(requests: &mut TestRequests, why: &str) {
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        if let Ok(frame) = requests.try_recv() {
+            let request = P9Message::from_bytes_ctx(&frame.acknowledge(), true).unwrap();
+            panic!("{why}: {:?}", request.body);
+        }
+    }
+
+    /// Answers one step of an xattr exchange or an ordinary write as a server would.
+    fn answer(conn: &Conn, request: &P9Message) {
+        let body = match &request.body {
+            Message::Twalk(_) => Message::Rwalk(Rwalk {
+                nwqid: 0,
+                wqids: vec![],
+            }),
+            Message::Txattrwalk(_) => Message::Rxattrwalk(Rxattrwalk { size: 0 }),
+            Message::Txattrcreate(_) => Message::Rxattrcreate(Rxattrcreate),
+            Message::Twrite(write) => Message::Rwrite(Rwrite { count: write.count }),
+            Message::Tclunk(_) => Message::Rclunk(Rclunk),
+            other => panic!("unexpected request {other:?}"),
+        };
+        reply(conn, request.tag, body);
+    }
+
+    #[tokio::test]
+    async fn xattr_requests_wait_for_the_client_request_admission_bound() {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let client = test_client_with_limit(Arc::clone(&conn), 1);
+
+        let first_client = Arc::clone(&client);
+        let first = tokio::spawn(async move { first_client.write(7, 0, b"a").await });
+        let first_request = recv_op_request(&mut requests, "first admitted request").await;
+
+        let xattr_client = Arc::clone(&client);
+        let xattr = tokio::spawn(async move { xattr_client.get_xattr(7, b"user.key").await });
+        assert_no_request(
+            &mut requests,
+            "an xattr request left while another request held the only permit",
+        )
+        .await;
+
+        answer(&conn, &first_request);
+        assert_eq!(first.await.unwrap().unwrap(), 1);
+
+        let walk = recv_op_request(&mut requests, "xattrwalk after admission").await;
+        assert!(matches!(walk.body, Message::Txattrwalk(_)));
+        answer(&conn, &walk);
+        let clunk = recv_op_request(&mut requests, "xattr clunk").await;
+        assert!(matches!(clunk.body, Message::Tclunk(_)));
+        answer(&conn, &clunk);
+        assert_eq!(xattr.await.unwrap().unwrap(), Bytes::new());
+        assert_eq!(client.request_admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn xattr_exchange_holds_its_permit_from_walk_to_clunk() {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let client = test_client_with_limit(Arc::clone(&conn), 1);
+
+        let attr_client = Arc::clone(&client);
+        let set = tokio::spawn(async move { attr_client.set_xattr(7, b"user.key", b"v", 0).await });
+        let walk = recv_op_request(&mut requests, "xattr clone walk").await;
+        assert!(matches!(walk.body, Message::Twalk(_)));
+
+        let ordinary_client = Arc::clone(&client);
+        let ordinary = tokio::spawn(async move { ordinary_client.write(7, 0, b"a").await });
+        let mut step = walk;
+        for expected in ["xattrcreate", "xattr write", "xattr clunk"] {
+            assert_no_request(
+                &mut requests,
+                "an ordinary request left inside an xattr exchange that holds the only permit",
+            )
+            .await;
+            answer(&conn, &step);
+            step = recv_op_request(&mut requests, expected).await;
+        }
+        assert!(matches!(step.body, Message::Tclunk(_)));
+        assert_no_request(
+            &mut requests,
+            "an ordinary request left before the xattr clunk settled",
+        )
+        .await;
+        answer(&conn, &step);
+        set.await.unwrap().unwrap();
+
+        let write = recv_op_request(&mut requests, "ordinary write after the exchange").await;
+        assert!(matches!(write.body, Message::Twrite(_)));
+        answer(&conn, &write);
+        assert_eq!(ordinary.await.unwrap().unwrap(), 1);
+        assert_eq!(client.request_admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn part_way_xattr_exchanges_filling_the_bound_still_complete() {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let client = test_client_with_limit(Arc::clone(&conn), 2);
+
+        let mut exchanges = Vec::new();
+        for (fid, name) in [(7, b"user.a"), (8, b"user.b")] {
+            let c = Arc::clone(&client);
+            exchanges.push(tokio::spawn(async move {
+                c.set_xattr(fid, name, b"v", 0).await
+            }));
+        }
+        for _ in 0..2 {
+            let walk = recv_op_request(&mut requests, "xattr clone walk").await;
+            answer(&conn, &walk);
+        }
+        // Both exchanges now have a server-side xattr fid and wait on their
+        // unanswered Txattrcreate.
+        let mut creates = Vec::new();
+        for _ in 0..2 {
+            let create = recv_op_request(&mut requests, "xattrcreate").await;
+            assert!(matches!(create.body, Message::Txattrcreate(_)));
+            creates.push(create);
+        }
+        assert_eq!(client.request_admission.available_permits(), 0);
+
+        let list_client = Arc::clone(&client);
+        let list = tokio::spawn(async move { list_client.list_xattrs(9).await });
+        let ordinary_client = Arc::clone(&client);
+        let ordinary = tokio::spawn(async move { ordinary_client.write(7, 0, b"a").await });
+        assert_no_request(&mut requests, "a request left while the bound was full").await;
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            for create in &creates {
+                answer(&conn, create);
+            }
+            // Each exchange still sends its write and clunk on its own permit.
+            for _ in 0..4 {
+                let step = recv_op_request(&mut requests, "remaining exchange step").await;
+                answer(&conn, &step);
+            }
+            for exchange in exchanges {
+                exchange.await.unwrap().unwrap();
+            }
+            // The waiting xattrwalk, its clunk and the ordinary write.
+            for _ in 0..3 {
+                let step = recv_op_request(&mut requests, "admitted waiter").await;
+                answer(&conn, &step);
+            }
+            assert_eq!(list.await.unwrap().unwrap(), Bytes::new());
+            assert_eq!(ordinary.await.unwrap().unwrap(), 1);
+        })
+        .await
+        .expect("xattr exchanges deadlocked on a full admission bound");
+        assert_eq!(client.request_admission.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn xattr_errors_return_the_permit() {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let client = test_client_with_limit(Arc::clone(&conn), 1);
+
+        let get_client = Arc::clone(&client);
+        let get = tokio::spawn(async move { get_client.get_xattr(7, b"user.missing").await });
+        let walk = recv_op_request(&mut requests, "xattrwalk").await;
+        reply(&conn, walk.tag, Message::Rlerror(Rlerror { ecode: 61 }));
+        let clunk = recv_op_request(&mut requests, "xattr clunk after the error").await;
+        answer(&conn, &clunk);
+        assert!(matches!(get.await.unwrap(), Err(ClientError::Errno(61))));
+        assert_eq!(client.request_admission.available_permits(), 1);
+
+        let set_client = Arc::clone(&client);
+        let set = tokio::spawn(async move { set_client.set_xattr(7, b"user.key", b"v", 1).await });
+        let walk = recv_op_request(&mut requests, "xattr clone walk").await;
+        answer(&conn, &walk);
+        let create = recv_op_request(&mut requests, "xattrcreate").await;
+        reply(&conn, create.tag, Message::Rlerror(Rlerror { ecode: 17 }));
+        let clunk = recv_op_request(&mut requests, "xattr clunk after the error").await;
+        reply(&conn, clunk.tag, Message::Rlerror(Rlerror { ecode: 22 }));
+        assert!(matches!(set.await.unwrap(), Err(ClientError::Errno(17))));
+        assert_eq!(client.request_admission.available_permits(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn xattr_timeout_returns_the_permit() {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let client = test_client_with_limit(Arc::clone(&conn), 1);
+
+        let get_client = Arc::clone(&client);
+        let get = tokio::spawn(async move { get_client.get_xattr(7, b"user.key").await });
+        let _walk = recv_op_request(&mut requests, "unanswered xattrwalk").await;
+        assert!(matches!(get.await.unwrap(), Err(ClientError::Disconnected)));
+        assert!(conn.dead.load(Ordering::Acquire));
+        assert_eq!(client.request_admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn xattr_reconnect_abort_returns_the_permit() {
+        let (old_conn, mut old_requests) = test_conn_with_receiver();
+        let client = test_client_with_limit(Arc::clone(&old_conn), 1);
+
+        let get_client = Arc::clone(&client);
+        let get = tokio::spawn(async move { get_client.get_xattr(7, b"user.key").await });
+        let _walk = recv_op_request(&mut old_requests, "xattrwalk on the old connection").await;
+
+        client.live.store(false, Ordering::Release);
+        old_conn.connection_lost(&client.reconnect_notify);
+        assert!(matches!(get.await.unwrap(), Err(ClientError::Disconnected)));
+
+        let (new_conn, mut new_requests) = test_conn_with_receiver();
+        client.conn.store(Arc::clone(&new_conn));
+        client.live.store(true, Ordering::Release);
+        client.live_notify.notify_waiters();
+        let write_client = Arc::clone(&client);
+        let write = tokio::spawn(async move { write_client.write(7, 0, b"a").await });
+        let request = recv_op_request(&mut new_requests, "write after the aborted exchange").await;
+        answer(&new_conn, &request);
+        assert_eq!(write.await.unwrap().unwrap(), 1);
+        assert_eq!(client.request_admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_xattr_exchange_returns_the_permit() {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let client = test_client_with_limit(Arc::clone(&conn), 1);
+
+        let get_client = Arc::clone(&client);
+        let get = tokio::spawn(async move { get_client.get_xattr(7, b"user.key").await });
+        let _walk = recv_op_request(&mut requests, "xattrwalk").await;
+        get.abort();
+        assert!(get.await.unwrap_err().is_cancelled());
+        // The xattr fid cannot be recovered on this connection, so the
+        // cancelled exchange closes it and frees its slot.
+        assert!(conn.dead.load(Ordering::Acquire));
+        assert_eq!(client.request_admission.available_permits(), 1);
+    }
+
     #[test]
     fn undispatched_guard_releases_its_tag() {
         let conn = test_conn();
