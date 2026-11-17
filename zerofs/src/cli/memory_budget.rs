@@ -475,6 +475,13 @@ fn gib(bytes: u64) -> f64 {
     bytes as f64 / GIB as f64
 }
 
+pub(crate) fn print_status(config: &Path) -> Result<()> {
+    let settings = Settings::from_file(config)?;
+    let receipt = validate_server_startup(&settings)?;
+    println!("{}", serde_json::to_string_pretty(&receipt)?);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -913,11 +920,4 @@ mod tests {
         assert_eq!(tiers.object_writeback_bytes, 4_000_000_000);
         assert_eq!(tiers.volatile_write_bytes, 14_000_000_000);
     }
-}
-
-pub(crate) fn print_status(config: &Path) -> Result<()> {
-    let settings = Settings::from_file(config)?;
-    let receipt = validate_server_startup(&settings)?;
-    println!("{}", serde_json::to_string_pretty(&receipt)?);
-    Ok(())
 }
