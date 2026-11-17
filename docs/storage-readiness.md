@@ -5,19 +5,19 @@ opened. Omitting the section preserves ordinary local and cloud deployments.
 Setting `strict = false` skips host identity and filesystem-size observations.
 Config loading still checks the declarations. With either value of `strict`,
 checks reject existing symlinks below the declared role root on structural paths
-before storage opens and on requested object paths before I/O. `strict` must be
-written explicitly when this section is present.
+before storage opens and on requested object paths before I/O. When this
+section is present, it must set `strict` explicitly.
 
 This completes the declarations and startup preflight for storage readiness.
 The schema binds storage paths to filesystems and declares device roles, lifetime
-host-write ratings, and capacity-domain reserves. Workload routing still requires
-the storage-readiness changes to land before its implementation can proceed.
+host-write ratings, and capacity-domain reserves. Workload routing cannot be
+implemented until these storage-readiness changes land.
 
 A successful preflight does not enable strict placement. Policy configuration,
 segment routing, relocation,
 retention, profile-specific I/O tuning, and metadata survival are not implemented
-here. `[placement]` and `placement_enabled` are rejected as unknown fields.
-Existing first-fit segment placement retains its existing semantics.
+here. Config loading rejects `[placement]` and `placement_enabled` as unknown
+fields. First-fit segment placement is unchanged.
 
 ## Hardware declarations do not activate a route
 
@@ -54,8 +54,8 @@ promise SMR performance.
 Bind authority, catalog, cache, and every pool member to those IDs. Bind `journal`
 when writeback is enabled; omit it otherwise. Authority, catalog, and data members
 must declare an HDD profile. Cache accepts any profile, and journal must declare
-`nvme`. These are
-validated declarations, not hardware detection. The strict graph supports local
+`nvme`. Config loading
+validates these declarations. It does not detect hardware. The strict graph supports local
 `file://` pool roots only and rejects a separate WAL store rather than leaving a
 storage role unchecked.
 
@@ -68,7 +68,7 @@ against the declaration. Before opening storage, preflight checks fixed
 structural paths, including `.zerofs-pool`, the active pool directory, member
 markers, object directory roots, catalog files, and the active bucket's cache
 and journal directories. It also checks existing cache partitions before the
-cache engine opens them. Their count is bounded by cache configuration.
+cache engine opens them. Cache configuration bounds their count.
 Readiness preflight does not enumerate authority objects, member payloads, or
 journal blobs. Normal storage engine recovery still reads the data it needs.
 Object operations check each existing path component when they use it. Listings
@@ -83,19 +83,19 @@ Authority, catalog, and one member may share a filesystem through disjoint
 directories. Journal and cache may likewise share the NVMe filesystem. Multiple
 data members cannot use the same capacity domain. For ext4/XFS, that domain is
 the filesystem UUID; for ZFS, it is the pool GUID, even across distinct dataset
-GUIDs. This conservatively rejects shared-pool member quotas that could
-otherwise count pool free space twice. Aliased declarations and conflicting
+GUIDs. This rule rejects member quotas in a shared ZFS pool, which could
+otherwise count the pool's free space twice. Aliased declarations and conflicting
 profiles in one capacity domain are rejected. Config loading sums configured
 member capacities per domain to reject impossible reserves. Storage readiness
-adds no new admission accounting. Shared control/data space still needs the
-existing reserves.
+adds no new admission accounting. Space that control metadata and data share
+still needs the existing reserves.
 
 ZFS GUIDs are canonical nonzero decimal strings, preserving the full unsigned
 64-bit range through TOML. UUIDs are nonzero lowercase hyphenated UUID strings.
 Dataset names alone and directory existence alone cannot establish readiness.
 
-The complete [synthetic configuration](examples/storage-readiness.toml) is parser
-tested. Its paths, IDs, GUIDs, UUID, and serials are fixtures, not discovered operator values
+A parser test loads the complete
+[synthetic configuration](examples/storage-readiness.toml). Its paths, IDs, GUIDs, UUID, and serials are fixtures, not discovered operator values
 or evidence of an installed disk. Use independently obtained real identities for
 an actual deployment; do not substitute those fixture values.
 
@@ -174,7 +174,7 @@ unavailable and fail strict verification. The adapter includes the ZFS pool's
 listed device classes conservatively and requires online device paths.
 
 Both mount and superblock options must say writable. Mount-table or path-device
-changes during an observation reject it. Probe errors, missing tools/devices,
+changes during an observation reject it. Probe errors, missing tools or devices,
 permission errors, unavailable keys, unknown properties, ambiguous overmounts,
 unsupported filesystems, and mismatched identities fail closed. The adapter only
 reads; it never mounts, unlocks, imports a pool, formats, or repairs storage.
@@ -238,7 +238,7 @@ data, such as object files or journal blobs. Per-object operations check
 components before I/O, and a listing checks directories as it walks its
 requested subtree.
 
-Storage roots must be owned and controlled by the operator and service.
+The operator and the service must own and control the storage roots.
 Readiness does not protect against a process that can change entries inside a
 storage root while the server runs. That process can already delete pool data.
 These runtime races remain:
@@ -275,8 +275,8 @@ pinned `object_store` 0.14.1 and `foyer-storage` 0.22.3 sources.
 Catalog and journal storage already use descriptor-anchored no-follow handles.
 Native pool-generation recovery cleanup also uses an anchored no-follow walker
 at `zerofs/src/local_object_store/pool.rs:101`.
-Moving authority objects, member objects, and cache partitions onto that pattern
-is tracked in [the anchored I/O follow-up](storage-readiness-anchored-io.md),
+[The anchored I/O follow-up](storage-readiness-anchored-io.md) tracks moving
+authority objects, member objects, and cache partitions onto that pattern,
 including replacement-race and cleanup tests. Readiness does not retain mount
 handles for the lifetime of the server, so a later mount replacement also
 remains outside this contract.
@@ -309,8 +309,8 @@ Recovery without readiness retains its existing behavior.
 Root and catalog-path preflight runs before backend creation and catalog
 opening. The catalog then supplies the active pool UUID for fixed member-path
 checks before marker creation or recovery writes. Bucket-path and cache
-partition checks precede cache initialization and journal replay. Existing
-pool/catalog/member identity markers remain in force. An absent catalog is
+partition checks precede cache initialization and journal replay. The existing
+pool, catalog, and member identity markers still apply. An absent catalog is
 still rejected on ordinary reopen; readiness never rebuilds it. Expected
 filesystem bindings are operator-owned configuration, not new catalog records
 or a migration of existing volume formats.
@@ -323,14 +323,15 @@ The object store checks each requested path and its mutation lock before I/O.
 Catalog and journal opens retain their existing descriptor-anchored no-follow
 walkers. A symlink created after a check can still redirect a later path-based
 open, including an object-store operation or a cache open. The preflight does not
-close that window. The placement track must provide its continuing
-mutation/publication readiness contract before strict placement can be enabled.
+close that window. The placement track must provide a continuing readiness
+contract for mutation and publication before strict placement can be enabled.
 Passing this startup check is not a runtime loss-of-mount guarantee, a
 durability receipt, or a migration gate.
 
-Local tests cover injected missing/wrong/locked/read-only/unknown identities for
-every role, ordinary fallback directories, aliases, shared ZFS capacity,
-independent members, config round-trips, and Mac rejection before mutation.
+Local tests inject missing, wrong, locked, read-only, and unknown identities for
+every role. They also cover ordinary fallback directories, aliases, shared ZFS
+capacity, independent members, config round-trips, and Mac rejection before
+mutation.
 Device fixtures exercise both strict modes, missing ratings, reserve minimums,
 activation refusal, serial and block-device failures, mismatched backing sets,
 and declared boot-device exclusion. Parser fixtures exercise sysfs serial text
@@ -357,8 +358,8 @@ survival gate.
 ## Runtime and migration preconditions remain separate
 
 The current startup memory admission adds fixed reserves of 32 GiB and 8 GiB
-before the configured cache and dirty-write budgets. A local run with an explicit
-8 GiB application limit was rejected before storage creation. This is a
+before the configured cache and dirty-write budgets. Startup admission rejected a
+local run with an explicit 8 GiB application limit before it created storage. This is a
 reproduction budget, not a NAS sizing recommendation. The existing unit test
 `small_envelope_does_not_shrink_policy_reserves_into_acceptance` also exercises
 that floor. A passing filesystem preflight cannot make this runtime model fit
