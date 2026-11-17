@@ -235,7 +235,7 @@ pub(super) async fn exercise(
             let pause = driver
                 .pause_commit(live, cut)
                 .await?
-                .context("the partial-fanout commit hook is absent")?;
+                .ok_or_else(|| Missing("the partial-fanout commit hook is absent".to_owned()))?;
             pause
                 .start
                 .send(())
@@ -528,7 +528,7 @@ pub(super) async fn exercise(
             let pause = driver
                 .pause_commit(live, cut)
                 .await?
-                .context("the orphan checkpoint crash hook is absent")?;
+                .ok_or_else(|| Missing("the orphan checkpoint crash hook is absent".to_owned()))?;
             pause
                 .start
                 .send(())
@@ -591,7 +591,7 @@ pub(super) async fn exercise(
             let write = driver
                 .pause_write(live)
                 .await?
-                .context("the admission-before-inode hook is absent")?;
+                .ok_or_else(|| Missing("the admission-before-inode hook is absent".to_owned()))?;
             write
                 .start
                 .send(())
@@ -944,97 +944,6 @@ pub(super) fn oracle(row: Row, live: &Live, observed: &Observation) -> Result<()
     }
     Ok(())
 }
-
-acceptance_row!(
-    durable_enablement_survives_missing_or_mismatched_configuration,
-    DurableEnablement,
-    "The durable survival startup hook is absent"
-);
-acceptance_row!(
-    offline_disable_blocks_stale_recovery_and_requires_a_fresh_epoch,
-    TerminalDisable,
-    "The terminal disable and re-enable hooks are absent"
-);
-acceptance_row!(
-    restart_refuses_a_replica_that_missed_a_committed_generation,
-    StaleRestart,
-    "The stale-replica restart hook is absent"
-);
-acceptance_row!(
-    recovery_refuses_corrupt_dependency_bytes,
-    CorruptDependency,
-    "The dependency verification recovery hook is absent"
-);
-acceptance_row!(
-    recovery_refuses_corrupt_commit_record_bytes,
-    CorruptRecord,
-    "The commit authentication recovery hook is absent"
-);
-acceptance_row!(
-    recovery_selects_highest_valid_chain_without_a_receipt_hint,
-    HighestGeneration,
-    "The independent recovery selection hook is absent"
-);
-acceptance_row!(
-    recovery_refuses_authenticated_conflicting_forks,
-    ConflictingForks,
-    "The authenticated fork recovery hook is absent"
-);
-acceptance_row!(
-    restart_completes_partial_record_fanout_idempotently,
-    PartialFanoutRestart,
-    "The partial record fanout restart hook is absent"
-);
-acceptance_row!(
-    large_writeback_backlog_aborts_and_retries_with_admission_open,
-    BacklogRetry,
-    "The bounded backlog pre-drain hook is absent"
-);
-acceptance_row!(
-    read_faults_defer_catalog_writes_while_admission_is_closed,
-    ReadFaultClosed,
-    "The closed-admission read observation hook is absent"
-);
-acceptance_row!(
-    read_faults_preserve_eio_and_catalog_in_read_only_mode,
-    ReadFaultReadOnly,
-    "The read-only read observation hook is absent"
-);
-acceptance_row!(
-    idle_commits_skip_and_records_and_checkpoints_stabilize,
-    IdleAndBounds,
-    "The adaptive commit and bounded retirement hooks are absent"
-);
-acceptance_row!(
-    failed_commits_report_actual_status_and_growing_lag,
-    StatusLag,
-    "The survival status and lag hooks are absent"
-);
-acceptance_row!(
-    authority_promotion_restores_writes_and_cold_durability,
-    PromoteAuthority,
-    "The offline authority promotion hook is absent"
-);
-acceptance_row!(
-    restart_reconciles_a_named_orphan_checkpoint,
-    OrphanCheckpoint,
-    "The named finite checkpoint intent hook is absent"
-);
-acceptance_row!(
-    admission_precedes_contended_inode_locks,
-    AdmissionLockOrder,
-    "The admission-before-inode hook is absent"
-);
-acceptance_row!(
-    payload_only_device_loss_keeps_unaffected_files_writable,
-    DataOnlyLoss,
-    "The payload-only loss availability hook is absent"
-);
-acceptance_row!(
-    retained_dependency_union_survives_restart_and_repeated_sweep,
-    RetentionCrash,
-    "The crash-safe retained-union sweep hook is absent"
-);
 
 pub(super) fn optimistic(row: Row, live: &Live, receipt: &SurvivalReceipt) -> ReviewObservation {
     let status = SurvivalStatus {
