@@ -331,7 +331,7 @@ pub async fn load_or_init_encryption_key(
     .await
 }
 
-/// Load or initialize encryption key from object store with an explicit name mode.
+/// Load or initialize the encryption key from the object store with an explicit name mode.
 ///
 /// This loads the wrapped encryption key from the object store and unwraps it
 /// using the provided password. If no key exists, a new one is generated and

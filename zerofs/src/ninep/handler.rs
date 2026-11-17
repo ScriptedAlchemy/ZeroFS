@@ -1448,9 +1448,9 @@ impl NinePHandler {
                 && self.filesystem.name_mode() == crate::fs::name_mode::NameMode::Insensitive
                 && !matches!(name_bytes.as_ref(), b"." | b"..");
             // Keep the entry, its preserved spelling, and its inode in one
-            // namespace view. An atomic replacement/recase must not land
-            // between the folded lookup and the exact-spelling check and make
-            // a continuously present name spuriously return ENOENT.
+            // namespace view. An atomic replacement or case-only rename must
+            // not land between the folded lookup and the exact-spelling check.
+            // That race would make a continuously present name return ENOENT.
             let _directory_guard = if check_spelling {
                 Some(self.filesystem.lock_manager.acquire(current_id).await)
             } else {

@@ -30,9 +30,10 @@ jobs:
           path: zerofs/target/ci
       - run: chmod +x zerofs/target/ci/zerofs
 
-      # The script mounts an insensitive export, renames Foo to foo through the
-      # mount and fails unless the listing then shows only foo, Foo and FOO miss,
-      # and a fold-equal create is refused. It runs once strict and once relaxed.
+      # The script mounts an insensitive export and renames Foo to foo through
+      # the mount. It fails unless the listing then shows only foo, lookups of Foo
+      # and FOO miss, and creating FOO fails with EEXIST. It runs once strict and
+      # once relaxed.
       - name: Run the mounted case-insensitive name checks
         timeout-minutes: 5
         run: python3 scripts/test-case-insensitive-fuse.py --binary zerofs/target/ci/zerofs

@@ -88,7 +88,7 @@ impl AuthenticatedRefetch {
                 if !whole || start < admission.verified.start || end > admission.verified.end {
                     continue;
                 }
-                // Owned copy, so a cached part never pins the whole response.
+                // Copy the part, so a cached part never pins the whole response.
                 ctx.admit_part(
                     &admission.location,
                     &admission.generation,
@@ -1127,8 +1127,8 @@ impl PrefetchingObjectStore {
             .try_into()
             .expect("part id exceeds usize");
 
-        // The lease is taken at eviction, before the backend read, so an
-        // overwrite or delete that lands during the read fences admission.
+        // Eviction takes the lease before the backend read, so an overwrite
+        // or delete that lands during the read fences admission.
         let (read, expected) = self.evict_corrupt_parts(location, start_part..end_part);
 
         let result = self
@@ -1155,8 +1155,8 @@ impl PrefetchingObjectStore {
             });
         }
         let bytes = result.bytes().await?;
-        // A length check, as on every ranged read. The authenticity check
-        // belongs to the caller, which owns the frame keys.
+        // Check only the length, as on every ranged read. The caller owns the
+        // frame keys and checks authenticity.
         let fetched_len = fetched.end.saturating_sub(fetched.start);
         if fetched.start != aligned.start || bytes.len() as u64 != fetched_len {
             return Err(object_store::Error::Generic {
@@ -3605,8 +3605,9 @@ mod tests {
         parts.storage().wait().await;
         parts.memory().clear();
 
-        // Verify actual poisoned disk bytes, then evict RAM only. Hybrid
-        // remove would also delete disk entries and bypass the repair path.
+        // Verify that the disk holds the poisoned bytes, then evict only the
+        // memory tier. A hybrid `remove` would also delete the disk entries
+        // and bypass the repair path.
         let mut poisoned_parts = 0;
         for key in &keys {
             assert!(!parts.memory().contains(key), "{key:?} is in memory");

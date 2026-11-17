@@ -907,7 +907,7 @@ const PARTS_BLOCK_SIZE: usize = 64 * 1024 * 1024;
 /// Foyer's partition layout depends on the tombstone setting and capacity.
 /// Record both the geometry and recovery policy before opening its files, so
 /// older tombstone-enabled layouts cannot be mistaken for current data blocks.
-/// Unmarked/incompatible clean-cache data is disposable, not migratable.
+/// Clean-cache data that is unmarked or incompatible is disposable, not migratable.
 ///
 /// The server holds its exclusive CleanCacheOwner before calling this helper
 /// and throughout the cache's lifetime. Test callers use owned temp directories.
@@ -975,9 +975,9 @@ fn prepare_parts_cache_layout(parts_root: &StdPath, disk_bytes: usize) -> Result
     #[cfg(unix)]
     File::open(parts_root)?.sync_all()?;
 
-    // Reuse the ownership/type checks in pruning: foreign names remain intact,
-    // and a symlink or other non-file at a native partition name aborts the
-    // migration before the marker can be published.
+    // Pruning reuses the ownership and type checks. Foreign names remain
+    // intact, and a symlink or other non-file at a native partition name aborts
+    // the migration before the marker can be published.
     let pruned = prune_foyer_partitions(parts_root, 0)?;
     #[cfg(unix)]
     File::open(parts_root)?.sync_all()?;

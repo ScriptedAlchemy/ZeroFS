@@ -60,9 +60,9 @@ impl XattrStore {
     ) -> Result<(), FsError> {
         // Stream rows instead of using the capped public listing. The cap is
         // an admission rule for new attributes, not a reason to strand an
-        // inode written by an earlier development build. Only keys remain in
-        // the caller's transaction, keeping cleanup atomic with inode deletion
-        // without retaining all names or any attribute values separately.
+        // inode written by an earlier development build. Only the keys stay in
+        // the caller's transaction. Cleanup stays atomic with inode deletion,
+        // and no separate copy of the names or attribute values is retained.
         let mut rows = self
             .db
             .scan_prefix(self.key_codec.xattr_prefix(id), None, 64 * 1024)

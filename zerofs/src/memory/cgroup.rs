@@ -72,8 +72,8 @@ fn matching_cgroup2_mounts(
 ) -> Vec<(PathBuf, PathBuf)> {
     // A nested bind can expose the current cgroup without exposing a tighter
     // ancestor. Inspect all matching mounts instead of allowing that bind to
-    // hide ceilings visible through a broader mount. Retain aliases as well:
-    // a limit can be readable through one mount and unavailable through another.
+    // hide ceilings visible through a broader mount. Retain aliases as well,
+    // because a limit can be readable through one mount and not another.
     mounts
         .iter()
         .filter_map(|(root, mountpoint)| {

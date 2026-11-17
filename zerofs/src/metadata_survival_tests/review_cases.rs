@@ -538,7 +538,7 @@ pub(super) async fn exercise(
                     std::fs::remove_file(path)?;
                 }
             }
-            // The binding takes only surviving identity plus PASSWORD, builds
+            // The binding takes only the surviving identity and PASSWORD, builds
             // new authority roots and updates this owned fixture's handles.
             driver.review_action(live, Action::PromoteOffline).await?;
             result.active_roots = live
@@ -759,8 +759,8 @@ pub(super) async fn exercise(
                 .retained
                 .push((retention.old_object, retention.old_object_digest));
             result.dead = retention.unretained_dead_object;
-            // Exercise repeatable mark/sweep after restart. The cut matrix
-            // supplies before/after cuts for retirement and deletion itself.
+            // Exercise a repeatable mark and sweep after a restart. The cut
+            // matrix supplies the cuts before and after retirement and deletion.
             driver.crash_writer(live).await?;
             driver.review_action(live, Action::Restart).await?;
             for _ in 0..2 {

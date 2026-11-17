@@ -2716,7 +2716,8 @@ mod tests {
             ));
             establish_session(&handler, 0, b"test", 1000, Some([0; 16])).await;
             // Stop the exact walk while it pins the directory, before it can
-            // install newfid. Clunk of either source or destination must wait.
+            // install newfid. A clunk of either the source or the destination
+            // must wait.
             let inode_lock = filesystem.lock_manager.acquire(directory).await;
             let mut io = DispatchFixture::new(handler, 4);
             io.dispatch(
