@@ -188,6 +188,14 @@ pub(super) fn possible_frame_response_bytes(frame: &[u8]) -> usize {
     possible_response_bytes(type_byte)
 }
 
+/// The fixed fields a reader needs before it commits memory to a frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct FrameHeader {
+    pub(super) len: usize,
+    pub(super) type_byte: u8,
+}
+
+#[cfg(test)]
 pub(super) async fn read_9p_frame<R>(
     reader: &mut R,
     shutdown: &CancellationToken,
@@ -195,11 +203,27 @@ pub(super) async fn read_9p_frame<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let mut header = [0u8; P9_SIZE_FIELD_LEN];
+    Ok(read_9p_frame_charged(reader, shutdown, async |_| Ok(()))
+        .await?
+        .map(|(frame, ())| frame))
+}
+
+/// Read one frame, calling `charge` with its header before allocating the
+/// body. `charge` decides what memory credit covers the frame; shutdown
+/// during the header, the charge or the body ends the read cleanly.
+pub(super) async fn read_9p_frame_charged<R, C>(
+    reader: &mut R,
+    shutdown: &CancellationToken,
+    charge: impl AsyncFnOnce(FrameHeader) -> anyhow::Result<C>,
+) -> anyhow::Result<Option<(Bytes, C)>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut header = [0u8; P9_HEADER_SIZE];
     let header_result = tokio::select! {
         biased;
         _ = shutdown.cancelled() => return Ok(None),
-        result = reader.read_exact(&mut header) => result,
+        result = reader.read_exact(&mut header[..P9_SIZE_FIELD_LEN]) => result,
     };
     if let Err(error) = header_result {
         return if error.kind() == std::io::ErrorKind::UnexpectedEof {
@@ -209,17 +233,35 @@ where
         };
     }
 
-    let frame_len = u32::from_le_bytes(header) as usize;
+    let frame_len = u32::from_le_bytes(
+        header[..P9_SIZE_FIELD_LEN]
+            .try_into()
+            .expect("size field is four bytes"),
+    ) as usize;
     if frame_len < P9_MIN_MESSAGE_SIZE as usize || frame_len > P9_MAX_MSIZE as usize {
         anyhow::bail!("invalid 9P frame length {frame_len}");
     }
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => return Ok(None),
+        result = reader.read_exact(&mut header[P9_SIZE_FIELD_LEN..]) => { result?; }
+    }
+    let charged = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => return Ok(None),
+        charged = charge(FrameHeader {
+            len: frame_len,
+            type_byte: header[P9_SIZE_FIELD_LEN],
+        }) => charged?,
+    };
+
     let mut frame = Vec::with_capacity(frame_len);
     frame.extend_from_slice(&header);
     frame.resize(frame_len, 0);
     tokio::select! {
         biased;
         _ = shutdown.cancelled() => return Ok(None),
-        result = reader.read_exact(&mut frame[P9_SIZE_FIELD_LEN..]) => { result?; }
+        result = reader.read_exact(&mut frame[P9_HEADER_SIZE..]) => { result?; }
     }
-    Ok(Some(Bytes::from(frame)))
+    Ok(Some((Bytes::from(frame), charged)))
 }

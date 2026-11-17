@@ -1,12 +1,14 @@
 use super::admission::{
-    P9AcceptedWorkTracker, P9AdmissionPermit, P9ConnectionAdmission, P9GlobalAdmission,
-    P9TransportPermit,
+    P9AcceptedWorkTracker, P9ConnectionAdmission, P9GlobalAdmission, P9TransportPermit,
 };
 use super::frame_codec::{
-    FidFootprint, TCLUNK_TYPE, TFLUSH_TYPE, TVERSION_TYPE, inspect_frame_metadata,
-    possible_frame_response_bytes, read_9p_frame, shallow_epoch_zero_retry_write,
+    FidFootprint, FrameHeader, TCLUNK_TYPE, TFLUSH_TYPE, TVERSION_TYPE, inspect_frame_metadata,
+    possible_frame_response_bytes, read_9p_frame_charged, shallow_epoch_zero_retry_write,
 };
-use super::response_writer::{P9Response, ResponseAuthority, spawn_response_writer};
+use super::response_writer::{
+    P9Response, ResponseAuthority, ResponseCredit, spawn_response_writer,
+};
+use crate::abandonment::Abandonment;
 use crate::fs::ZeroFS;
 use crate::ninep::errors::P9Error;
 use crate::ninep::handler::{NinePHandler, SessionReleaseGuard};
@@ -21,7 +23,7 @@ use ninep_proto::{
 };
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 use tracing::{debug, error, warn};
@@ -157,18 +159,63 @@ where
     result
 }
 
-/// Fid footprint used by receive-order barriers.
-/// Request completion signal and fid footprint.
+/// What a `Tflush` may do to a request, by message type.
+///
+/// flush(5) lets a server answer `Rflush` without the original reply only if
+/// the request can be treated as never sent. Each class says when that holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Cancellation {
+    /// The request runs to completion and answers; a `Tflush` naming it
+    /// waits for that answer. `Tversion` resets the session and `Tclunk`
+    /// retires a fid (and commits a pending xattr), both promptly. A `Tflush`
+    /// is never itself abandoned, so flushes are answered in order.
+    RunToCompletion,
+    /// The request is dropped by a `Tflush` until it passes its point of no
+    /// return (`crate::abandonment`), and runs to completion afterward:
+    /// - Reads, lookups, getattr, readdir, readlink, statfs, getlock and the
+    ///   durability waits (`Tfsync`, `Tfsyncdur`) never pass one. Dropping
+    ///   them ends the wait and returns their admission. A cancelled fsync
+    ///   reports nothing, so its caller may assume nothing about durability;
+    ///   the flush coordinator finishes any barrier the wait had started.
+    /// - Fid-binding requests (attach, walk, open, rebind, xattr walk and
+    ///   create) pass it when they change the session's fid table.
+    /// - Mutations pass it when they queue a commit or stage a write. Before
+    ///   that nothing has been applied; after it the reply precedes `Rflush`
+    ///   and the operation ledger replays the applied result to a retry.
+    /// - Waiting for request admission, and for earlier same-fid requests,
+    ///   is always abandonable.
+    UntilPointOfNoReturn,
+}
+
+pub(super) fn cancellation(type_byte: u8) -> Cancellation {
+    match type_byte {
+        TVERSION_TYPE | TCLUNK_TYPE | TFLUSH_TYPE => Cancellation::RunToCompletion,
+        _ => Cancellation::UntilPointOfNoReturn,
+    }
+}
+
+impl Cancellation {
+    fn abandonment(self) -> Arc<Abandonment> {
+        match self {
+            Self::RunToCompletion => Abandonment::committed(),
+            Self::UntilPointOfNoReturn => Abandonment::abandonable(),
+        }
+    }
+}
+
+/// Request completion signal, fid footprint and cancellation state.
 pub(super) struct RequestState {
     completed: CancellationToken,
     fids: FidFootprint,
+    abandonment: Arc<Abandonment>,
 }
 
 impl RequestState {
-    fn new(fids: FidFootprint) -> Self {
+    fn new(fids: FidFootprint, abandonment: Arc<Abandonment>) -> Self {
         Self {
             completed: CancellationToken::new(),
             fids,
+            abandonment,
         }
     }
 
@@ -183,13 +230,28 @@ impl RequestState {
 
 pub(super) type CompletionWaiter = Arc<RequestState>;
 
+/// `Tflush` replies a connection may have outstanding. Each holds one tag
+/// and a 7-byte reply, and needs no request admission.
+pub(super) const CONNECTION_FLUSH_SLOTS: usize = 16;
+
 /// Per-connection request registry.
-#[derive(Default)]
 pub(super) struct InflightRegistryInner {
     /// One active request per wire tag, as required by 9P.
     pub(super) entries: DashMap<u16, Arc<RequestState>>,
     /// Tail request of the receive-ordered Tflush chain for each oldtag.
     flush_tails: DashMap<u16, Arc<RequestState>>,
+    /// Reply credit for outstanding `Tflush` requests.
+    flush_slots: Arc<Semaphore>,
+}
+
+impl Default for InflightRegistryInner {
+    fn default() -> Self {
+        Self {
+            entries: DashMap::new(),
+            flush_tails: DashMap::new(),
+            flush_slots: Arc::new(Semaphore::new(CONNECTION_FLUSH_SLOTS)),
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -198,11 +260,22 @@ pub(crate) struct InflightRegistry {
 }
 
 impl InflightRegistry {
+    /// Register a request that runs to completion.
+    #[cfg(test)]
     pub(super) fn register(&self, tag: u16, fids: FidFootprint) -> anyhow::Result<RequestLease> {
+        self.register_with(tag, fids, Abandonment::committed())
+    }
+
+    fn register_with(
+        &self,
+        tag: u16,
+        fids: FidFootprint,
+        abandonment: Arc<Abandonment>,
+    ) -> anyhow::Result<RequestLease> {
         let Entry::Vacant(entry) = self.inner.entries.entry(tag) else {
             anyhow::bail!("client reused in-flight 9P tag {tag}");
         };
-        let state = Arc::new(RequestState::new(fids));
+        let state = Arc::new(RequestState::new(fids, abandonment));
         entry.insert(Arc::clone(&state));
         Ok(RequestLease {
             registry: self.clone(),
@@ -230,7 +303,10 @@ impl InflightRegistry {
             .iter()
             .map(|entry| Arc::clone(entry.value()))
             .collect();
-        Ok((self.register(tag, FidFootprint::All)?, waiters))
+        Ok((
+            self.register_with(tag, FidFootprint::All, Abandonment::committed())?,
+            waiters,
+        ))
     }
 
     /// Register a fid barrier after snapshotting earlier requests for that fid.
@@ -246,17 +322,31 @@ impl InflightRegistry {
             .filter(|entry| entry.value().fids.contains(fid))
             .map(|entry| Arc::clone(entry.value()))
             .collect();
-        Ok((self.register(tag, FidFootprint::One(fid))?, waiters))
+        Ok((
+            self.register_with(tag, FidFootprint::One(fid), Abandonment::committed())?,
+            waiters,
+        ))
     }
 
-    /// Append `Tflush` to the target tag's response-order chain.
+    /// Append `Tflush` to the target tag's response-order chain, cancelling
+    /// the target if it has made no observable change.
+    ///
+    /// A cancelled target never answers, so its tag is retired and its
+    /// barrier waiters released here, before `Rflush` lets the client reuse
+    /// the tag. Otherwise `Rflush` waits for the target's reply.
     pub(super) fn register_flush(
         &self,
         tag: u16,
         oldtag: u16,
     ) -> anyhow::Result<FlushRegistration> {
-        let target = self.waiter(oldtag);
-        let mut lease = self.register(tag, FidFootprint::None)?;
+        let mut target = self.waiter(oldtag);
+        let mut lease = self.register_with(tag, FidFootprint::None, Abandonment::committed())?;
+        if let Some(abandoned) = target.take_if(|target| target.abandonment.abandon()) {
+            self.inner
+                .entries
+                .remove_if(&oldtag, |_, current| Arc::ptr_eq(current, &abandoned));
+            abandoned.complete();
+        }
         let predecessor = self
             .inner
             .flush_tails
@@ -267,6 +357,10 @@ impl InflightRegistry {
             target,
             predecessor,
         })
+    }
+
+    async fn flush_slot(&self) -> anyhow::Result<OwnedSemaphorePermit> {
+        Ok(Arc::clone(&self.inner.flush_slots).acquire_owned().await?)
     }
 }
 
@@ -329,21 +423,53 @@ pub(super) async fn enqueue_terminal_response(
     tx: &mpsc::Sender<P9Response>,
     response_bytes: Vec<u8>,
     request_lease: &RequestLease,
-    admission: P9AdmissionPermit,
+    credit: impl Into<ResponseCredit>,
 ) -> Result<(), mpsc::error::SendError<()>> {
     let permit = tx.reserve().await?;
     request_lease.publish_terminal_response(|| {
-        permit.send(P9Response::new(
-            request_lease.tag,
-            response_bytes,
-            admission,
-        ))
+        permit.send(P9Response::new(request_lease.tag, response_bytes, credit))
     });
     Ok(())
 }
 
-/// Dispatch a frame from the exact-size TCP reader or bounded WebSocket.
-/// Receive-time dedup and process ownership are reserved before task spawn.
+/// Connection state every received request needs.
+pub(crate) struct ConnectionContext<'a> {
+    pub(crate) handler: &'a Arc<NinePHandler>,
+    pub(crate) tx: &'a mpsc::Sender<P9Response>,
+    pub(crate) inflight: &'a InflightRegistry,
+    pub(crate) admission: &'a P9ConnectionAdmission,
+    pub(crate) requests: &'a TaskTracker,
+    pub(crate) connection_shutdown: &'a CancellationToken,
+    pub(crate) process_shutdown: &'a CancellationToken,
+}
+
+/// Memory that covers a received frame until its request is admitted.
+enum ReceiveCharge {
+    /// The caller holds receive credit until admission (WebSocket, tests).
+    Caller,
+    /// The connection reader's pending-frame envelope.
+    Pending(#[allow(dead_code, reason = "held for its Drop")] OwnedSemaphorePermit),
+    /// A `Tflush` reply slot.
+    Flush(OwnedSemaphorePermit),
+}
+
+/// Upper bound on one spawned request task, charged with its frame against the
+/// reader's pending envelope. A debug assertion at spawn keeps it honest in
+/// every test that dispatches a request.
+pub(super) const PENDING_REQUEST_TASK_BYTES: usize = 16 * 1024;
+
+/// A request whose task has started and is waiting for request admission.
+struct StartedRequest {
+    admitted: oneshot::Receiver<anyhow::Result<()>>,
+}
+
+/// Dispatch a frame from a bounded WebSocket or a test. Returns once the
+/// request is admitted, so the caller's receive credit stays charged until
+/// request admission covers the frame.
+#[cfg_attr(
+    not(any(feature = "webui", test)),
+    allow(dead_code, reason = "the TCP reader starts requests without waiting")
+)]
 #[allow(
     clippy::too_many_arguments,
     reason = "dispatch keeps connection and process ownership explicit"
@@ -358,6 +484,43 @@ pub(crate) async fn dispatch_9p_frame(
     connection_shutdown: &CancellationToken,
     process_shutdown: &CancellationToken,
 ) -> anyhow::Result<()> {
+    let context = ConnectionContext {
+        handler,
+        tx,
+        inflight,
+        admission,
+        requests,
+        connection_shutdown,
+        process_shutdown,
+    };
+    let charge = if frame.get(4) == Some(&TFLUSH_TYPE) {
+        ReceiveCharge::Flush(inflight.flush_slot().await?)
+    } else {
+        ReceiveCharge::Caller
+    };
+    let started = start_9p_request(frame, &context, charge)?;
+    match started.admitted.await {
+        Ok(result) => result,
+        // The request ended before admission: a Tflush cancelled it, or
+        // process shutdown dropped it.
+        Err(_) if process_shutdown.is_cancelled() => {
+            anyhow::bail!("9P request admission is sealed for shutdown")
+        }
+        Err(_) => Ok(()),
+    }
+}
+
+/// Register a received frame in receive order and spawn its request task.
+///
+/// Registration, the Tflush target capture, receive-order barrier snapshots
+/// and the FIRST dedup reservation all happen here, synchronously. Request
+/// admission happens inside the task, so the reader can keep reading while a
+/// request waits for capacity. Only `Tflush` skips admission.
+fn start_9p_request(
+    frame: Bytes,
+    context: &ConnectionContext<'_>,
+    charge: ReceiveCharge,
+) -> anyhow::Result<StartedRequest> {
     if frame.len() < P9_MIN_MESSAGE_SIZE as usize {
         error!("Message too short: {} bytes", frame.len());
         return Err(anyhow::anyhow!("Message too short"));
@@ -368,10 +531,11 @@ pub(crate) async fn dispatch_9p_frame(
 
     let type_byte = frame[4];
     let tag = u16::from_le_bytes([frame[5], frame[6]]);
-    let zerofs_protocol = handler.zerofs_protocol_enabled();
+    let zerofs_protocol = context.handler.zerofs_protocol_enabled();
     let metadata = inspect_frame_metadata(&frame, zerofs_protocol);
     let shallow_retry = shallow_epoch_zero_retry_write(&frame, metadata);
-    let accepted_work = admission
+    let accepted_work = context
+        .admission
         .accepted_work
         .try_accept()
         .ok_or_else(|| anyhow::anyhow!("9P request admission is sealed for shutdown"))?;
@@ -379,58 +543,92 @@ pub(crate) async fn dispatch_9p_frame(
     // A replacement connection can deliver RETRY while this fully received
     // FIRST is waiting for request/response capacity. Reserve its identity
     // before that first await, and retain process ownership if the old
-    // connection closes. The reader still holds the bounded receive credit;
-    // no task or request-byte admission is bypassed while capacity is full.
+    // connection closes. The received frame stays charged to receive credit
+    // until request admission covers it.
     let received_guard = metadata
         .received_op
         .and_then(|(op_id, op_flags, _origin_epoch)| {
-            handler.try_reserve_received_first(op_id, op_flags, type_byte)
+            context
+                .handler
+                .try_reserve_received_first(op_id, op_flags, type_byte)
         });
     let admission_shutdown = if received_guard.is_some() {
-        process_shutdown
+        context.process_shutdown.clone()
     } else {
-        connection_shutdown
+        context.connection_shutdown.clone()
     };
-    let admission = admission
-        .admit_request_or_shutdown(
-            frame.len(),
-            possible_frame_response_bytes(&frame),
-            admission_shutdown,
-        )
-        .await?;
 
-    // Capture `oldtag` before any yield or tag reuse.
+    // Capture `oldtag` and barrier snapshots before any yield or tag reuse.
     let (flush_oldtag, flush_waiters, request_lease, prior_waiters) = if type_byte == TFLUSH_TYPE {
-        if frame.len() < P9_HEADER_SIZE + 2 {
-            error!("Tflush message too short: {} bytes", frame.len());
-            return Err(anyhow::anyhow!("Tflush message too short"));
+        if frame.len() != P9_HEADER_SIZE + 2 {
+            error!("Tflush message has {} bytes", frame.len());
+            anyhow::bail!("Tflush message must carry exactly one oldtag");
         }
         let oldtag = u16::from_le_bytes([frame[P9_HEADER_SIZE], frame[P9_HEADER_SIZE + 1]]);
         let FlushRegistration {
             lease,
             target,
             predecessor,
-        } = inflight.register_flush(tag, oldtag)?;
+        } = context.inflight.register_flush(tag, oldtag)?;
         let waiters = target.into_iter().chain(predecessor).collect();
         (Some(oldtag), waiters, lease, Vec::new())
     } else {
         // `Tclunk` waits on its fid; `Tversion` waits on the whole session.
         let (request_lease, prior_waiters) = match (type_byte, metadata.fids) {
-            (TVERSION_TYPE, _) => inflight.register_after_prior_snapshot(tag)?,
+            (TVERSION_TYPE, _) => context.inflight.register_after_prior_snapshot(tag)?,
             (TCLUNK_TYPE, FidFootprint::One(fid)) => {
-                inflight.register_after_fid_snapshot(tag, fid)?
+                context.inflight.register_after_fid_snapshot(tag, fid)?
             }
-            _ => (inflight.register(tag, metadata.fids)?, Vec::new()),
+            _ => (
+                context.inflight.register_with(
+                    tag,
+                    metadata.fids,
+                    cancellation(type_byte).abandonment(),
+                )?,
+                Vec::new(),
+            ),
         };
         (None, Vec::new(), request_lease, prior_waiters)
     };
+    let abandonment = Arc::clone(&request_lease.state.abandonment);
 
-    let handler = Arc::clone(handler);
-    let tx = tx.clone();
-    let request_shutdown = process_shutdown.clone();
+    let handler = Arc::clone(context.handler);
+    let tx = context.tx.clone();
+    let admission = context.admission.clone();
+    let request_shutdown = context.process_shutdown.clone();
+    let (admitted_tx, admitted) = oneshot::channel();
 
     let request = async move {
         let _accepted_work = accepted_work;
+        let credit = match charge {
+            ReceiveCharge::Flush(slot) => {
+                let _ = admitted_tx.send(Ok(()));
+                ResponseCredit::Flush(slot)
+            }
+            pending => {
+                match admission
+                    .admit_request_or_shutdown(
+                        frame.len(),
+                        possible_frame_response_bytes(&frame),
+                        &admission_shutdown,
+                    )
+                    .await
+                {
+                    Ok(admitted) => {
+                        // Request admission now covers the frame.
+                        drop(pending);
+                        let _ = admitted_tx.send(Ok(()));
+                        ResponseCredit::from(admitted)
+                    }
+                    Err(error) => {
+                        debug!("9P request {tag} ended before admission: {error}");
+                        let _ = admitted_tx.send(Err(error));
+                        return;
+                    }
+                }
+            }
+        };
+
         // Only Twrite has an inbound bulk payload worth retaining. Other
         // requests keep the regular decoder and the original error diagnostics.
         let parsed = if let Some(parsed) = shallow_retry {
@@ -454,15 +652,15 @@ pub(crate) async fn dispatch_9p_frame(
                     "Received message type {} tag {}: {:?}",
                     parsed.type_, parsed.tag, parsed.body
                 );
-                let response = handler
-                    .handle_message_with_received_admission(
+                let response = Arc::clone(&request_lease.state.abandonment)
+                    .scope(handler.handle_message_with_received_admission(
                         tag,
                         parsed.op_id,
                         parsed.op_flags,
                         parsed.op_origin_epoch,
                         parsed.body,
                         received_guard,
-                    )
+                    ))
                     .await;
                 response.to_bytes().ok()
             }
@@ -488,6 +686,12 @@ pub(crate) async fn dispatch_9p_frame(
             }
         };
 
+        // A reply commits the request: from here a Tflush waits for it. If a
+        // Tflush won instead, the client already treats it as never sent.
+        if request_lease.state.abandonment.commit().is_err() {
+            return;
+        }
+
         if let Some(oldtag) = flush_oldtag {
             debug!("Tflush: waiting for oldtag {} to complete", oldtag);
             for waiter in flush_waiters {
@@ -499,7 +703,7 @@ pub(crate) async fn dispatch_9p_frame(
         match response_bytes {
             Some(response_bytes) => {
                 if let Err(e) =
-                    enqueue_terminal_response(&tx, response_bytes, &request_lease, admission).await
+                    enqueue_terminal_response(&tx, response_bytes, &request_lease, credit).await
                 {
                     warn!("Failed to send response for tag {}: {}", tag, e);
                 }
@@ -511,21 +715,53 @@ pub(crate) async fn dispatch_9p_frame(
 
         drop(request_lease);
     };
+    debug_assert!(
+        std::mem::size_of_val(&request) <= PENDING_REQUEST_TASK_BYTES,
+        "a 9P request task outgrew its pending charge: {} bytes",
+        std::mem::size_of_val(&request)
+    );
 
-    let request = requests.track_future(async move {
+    let request = context.requests.track_future(async move {
         // A disconnected client retains process ownership during its bounded
         // settlement grace. Process shutdown is different: no response can be
         // delivered, and the mutation layer owns work after submission, so
         // dropping the protocol future releases its request and accepted-work
-        // guards without abandoning committed work.
+        // guards without abandoning committed work. A Tflush drops only a
+        // request that has made no observable change.
         tokio::select! {
             biased;
             _ = request_shutdown.cancelled() => {}
+            _ = abandonment.abandoned() => {}
             _ = request => {}
         }
     });
     drop(spawn_named("9p-request", request));
-    Ok(())
+    Ok(StartedRequest { admitted })
+}
+
+/// Charge for one frame read by the connection reader.
+///
+/// Frames that wait for request admission share one maximum frame of pending
+/// envelope, so the reader keeps reading while the connection's request
+/// slots are full. A `Tflush` takes a flush slot instead: it must stay
+/// readable when the envelope is full, because cancelling is how a client
+/// frees the capacity it is waiting for.
+async fn charge_received_frame(
+    header: FrameHeader,
+    pending: &Arc<Semaphore>,
+    inflight: &InflightRegistry,
+) -> anyhow::Result<ReceiveCharge> {
+    if header.type_byte == TFLUSH_TYPE {
+        return Ok(ReceiveCharge::Flush(inflight.flush_slot().await?));
+    }
+    let bytes = header
+        .len
+        .saturating_add(PENDING_REQUEST_TASK_BYTES)
+        .min(P9_MAX_MSIZE as usize);
+    let permits = u32::try_from(bytes).expect("a 9P frame charge fits in u32");
+    Ok(ReceiveCharge::Pending(
+        Arc::clone(pending).acquire_many_owned(permits).await?,
+    ))
 }
 
 pub(super) async fn handle_client_loop<R>(
@@ -541,27 +777,32 @@ where
     R: AsyncRead + Unpin,
 {
     let inflight = InflightRegistry::default();
+    let context = ConnectionContext {
+        handler: &handler,
+        tx: &tx,
+        inflight: &inflight,
+        admission,
+        requests,
+        connection_shutdown: &connection_shutdown,
+        process_shutdown: &process_shutdown,
+    };
+
+    // Hold one maximum-frame receive credit for the reader's life. It covers
+    // the frame being read plus every frame still waiting for request
+    // admission; the exact reader never allocates a replacement buffer.
+    let _receive = admission.global.admit_receive(&connection_shutdown).await?;
+    let pending = Arc::new(Semaphore::new(P9_MAX_MSIZE as usize));
 
     loop {
-        // Hold a maximum-frame receive credit before polling the transport.
-        // The exact reader below never allocates a replacement decode buffer.
-        let receive = admission.global.admit_receive(&connection_shutdown).await?;
-        let Some(full_buf) = read_9p_frame(&mut read_stream, &connection_shutdown).await? else {
+        let Some((frame, charge)) =
+            read_9p_frame_charged(&mut read_stream, &connection_shutdown, async |header| {
+                charge_received_frame(header, &pending, &inflight).await
+            })
+            .await?
+        else {
             debug!("Client disconnected");
             return Ok(());
         };
-
-        dispatch_9p_frame(
-            full_buf,
-            &handler,
-            &tx,
-            &inflight,
-            admission,
-            requests,
-            &connection_shutdown,
-            &process_shutdown,
-        )
-        .await?;
-        drop(receive);
+        drop(start_9p_request(frame, &context, charge)?);
     }
 }
