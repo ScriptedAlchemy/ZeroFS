@@ -1,6 +1,7 @@
 //! Build the configured storage graph and retain every transport's lifecycle.
 
 use crate::config::Settings;
+use crate::metadata_fault::{LocalMetadataStore, MetadataFault};
 use crate::parse_object_store::{ObjectStoreScheme, ParsedStore, parse_url_opts};
 use crate::pool_object_store::{CATALOG_FILE_NAME, PoolMember, PoolObjectStore};
 use crate::sftp_transport::SftpSessionPool;
@@ -69,6 +70,24 @@ pub(crate) struct OpenedStorage {
     pub(crate) path: Path,
     pub(crate) sftp_pool: Option<BackendSessions>,
     pub(crate) pool: Option<PoolObjectStore>,
+    /// Trips on the first non-transient local I/O error of the metadata
+    /// store. It never trips for a remote metadata store.
+    pub(crate) metadata_fault: MetadataFault,
+}
+
+/// A `file://` metadata store reports its local I/O failures through
+/// [`LocalMetadataStore`]; remote metadata stores keep their own classification.
+fn guard_local_metadata(
+    url: &url::Url,
+    store: Box<dyn ObjectStore>,
+    fault: &MetadataFault,
+) -> Box<dyn ObjectStore> {
+    if url.scheme() != "file" {
+        return store;
+    }
+    #[cfg(test)]
+    let store = crate::fault_store::native_errno::wrap(store);
+    Box::new(LocalMetadataStore::new(Arc::from(store), fault.clone()))
 }
 
 pub(crate) async fn open_storage(settings: &Settings) -> Result<OpenedStorage> {
@@ -89,12 +108,8 @@ pub(crate) async fn open_storage(settings: &Settings) -> Result<OpenedStorage> {
         settings.sftp.as_ref(),
     )
     .await?;
-    #[cfg(test)]
-    let store = if url.scheme() == "file" {
-        crate::fault_store::native_errno::wrap(store)
-    } else {
-        store
-    };
+    let metadata_fault = MetadataFault::default();
+    let store = guard_local_metadata(&url, store, &metadata_fault);
     if url.scheme() == "file" {
         let marker = path.clone().join(".zerofs-pool").join("identity");
         match store.head(&marker).await {
@@ -110,6 +125,7 @@ pub(crate) async fn open_storage(settings: &Settings) -> Result<OpenedStorage> {
         path,
         sftp_pool: sftp_pool.map(BackendSessions::single),
         pool: None,
+        metadata_fault,
     })
 }
 
@@ -146,8 +162,8 @@ pub(crate) async fn open_pool_storage(
         path,
         sftp_pool: authority_sessions,
     } = bind_readiness_root(settings, &authority_url, authority)?;
-    #[cfg(test)]
-    let authority = crate::fault_store::native_errno::wrap(authority);
+    let metadata_fault = MetadataFault::default();
+    let authority = guard_local_metadata(&authority_url, authority, &metadata_fault);
     debug_assert!(authority_sessions.is_none(), "pool metadata must be local");
     let mut sessions = BackendSessions {
         pools: Vec::new(),
@@ -218,6 +234,7 @@ pub(crate) async fn open_pool_storage(
                 store: Box::new(pool.clone()),
                 path,
                 sftp_pool: (!sessions.pools.is_empty()).then_some(sessions),
+                metadata_fault,
             },
             pool,
         )),

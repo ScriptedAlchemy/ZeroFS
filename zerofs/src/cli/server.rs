@@ -110,6 +110,7 @@ async fn resolve_checkpoint_name(settings: &Settings, name: &str) -> Result<uuid
         path: path_from_url,
         sftp_pool,
         pool: _,
+        metadata_fault,
     } = open_storage(settings).await?;
     let object_store = with_storage_class(
         Arc::from(object_store),
@@ -134,12 +135,19 @@ async fn resolve_checkpoint_name(settings: &Settings, name: &str) -> Result<uuid
     }
     let admin = admin_builder.build();
 
-    let checkpoints = admin.list_checkpoints(Some(name)).await;
+    let checkpoints = metadata_fault
+        .bound(async {
+            admin
+                .list_checkpoints(Some(name))
+                .await
+                .context("Failed to list checkpoints")
+        })
+        .await;
     drop(admin);
     let checkpoints = finish_with_sftp_cleanup(
         sftp_pool.as_ref(),
         SFTP_CHECKPOINT_POOL_CLEANUP,
-        checkpoints.context("Failed to list checkpoints"),
+        checkpoints,
     )
     .await?;
 
@@ -1412,6 +1420,8 @@ pub struct InitResult {
     pub db_handle: SlateDbHandle,
     /// HA authority monitors retained through database close.
     pub authority: Option<crate::replication::AuthoritySupervisor>,
+    /// Trips on the first non-transient local I/O error of the metadata store.
+    pub(crate) metadata_fault: crate::metadata_fault::MetadataFault,
     pub(super) _cache_owner: Arc<CleanCacheOwner>,
 }
 
@@ -1512,6 +1522,7 @@ pub async fn run_server(
         crate::cli::init::initialize_filesystem_with_write_ack(&settings, db_mode, write_ack)
             .await?;
     let cache_owner = init_result._cache_owner.clone();
+    tokio::spawn(init_result.metadata_fault.clone().exit_when_tripped());
     let writeback_for_shutdown = init_result.writeback.clone();
     let writeback_for_metrics = init_result.writeback.clone();
     let writeback_for_checkpoints = init_result.writeback.clone();

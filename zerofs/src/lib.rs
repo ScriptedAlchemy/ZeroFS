@@ -21,6 +21,7 @@ mod linux_errno;
 mod local_object_store;
 pub mod memory;
 pub(crate) mod metadata_digest;
+mod metadata_fault;
 #[cfg(test)]
 mod metadata_survival_tests;
 #[cfg(target_os = "linux")]
