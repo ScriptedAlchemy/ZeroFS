@@ -765,8 +765,27 @@ fn review_same_device_bind_mount_is_not_traversed() {
                 .success()
         );
     }
-    let mut mounts = Vec::new();
+    let scratch = root.join("scratch");
+    let alias = temp.path().join("scratch-alias");
+    fs::create_dir_all(scratch.join("child")).unwrap();
+    fs::create_dir(&alias).unwrap();
+    let separate = temp.path().join("separate-filesystem");
+    let mounted = root.join("nested-filesystem");
+    fs::create_dir(&separate).unwrap();
+    fs::create_dir(&mounted).unwrap();
+    assert!(
+        std::process::Command::new("mount")
+            .args(["-t", "tmpfs", "-o", "size=1m", "tmpfs"])
+            .arg(&separate)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut mounts = vec![Unmount(separate.clone())];
+    fs::create_dir(separate.join("child")).unwrap();
     for (source, target) in [
+        (separate.clone(), mounted),
+        (scratch.clone(), alias.clone()),
         (outside.clone(), root.join("mounted")),
         (outside.join("secret"), root.join("mounted-file")),
     ] {
@@ -784,6 +803,28 @@ fn review_same_device_bind_mount_is_not_traversed() {
     assert_eq!(
         fs::metadata(&root).unwrap().dev(),
         fs::metadata(root.join("mounted")).unwrap().dev()
+    );
+    assert_ne!(
+        fs::metadata(&root).unwrap().dev(),
+        fs::metadata(&separate).unwrap().dev()
+    );
+    for work in [
+        &alias,
+        &alias.join("child"),
+        &outside,
+        &separate.join("child"),
+    ] {
+        let error = scan(&root, Some(work), None, 200, false).unwrap_err();
+        assert!(
+            error.to_string().contains("outside the source root"),
+            "{error:#}"
+        );
+    }
+    assert!(
+        fs::read_dir(scratch.join("child"))
+            .unwrap()
+            .next()
+            .is_none()
     );
     let (complete, _, records) = scan_records(&root, true);
     assert!(
@@ -810,6 +851,36 @@ fn review_same_device_bind_mount_is_not_traversed() {
         assert_eq!(node["content_sha256"]["reason"], "not_collected_for_kind");
     }
     drop(mounts);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn inventory_spill_cleanup_uses_the_original_scratch_directory() {
+    let _guard = FIXTURE_LOCK.lock().unwrap();
+    let temp = fixture();
+    let root = temp.path().join("source");
+    let parent = temp.path().join("scratch");
+    let moved = temp.path().join("moved");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&parent).unwrap();
+    let work = spill::Workspace::new(&root, Some(&parent), 1).unwrap();
+    fs::rename(&parent, &moved).unwrap();
+    symlink(&root, &parent).unwrap();
+    let mut sorter = spill::Sorter::new(work);
+    sorter.push(vec![1, 2, 3]).unwrap();
+    let rows = sorter.finish().unwrap();
+    let child = fs::read_dir(&moved)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert_eq!(fs::metadata(child).unwrap().permissions().mode() & 0o077, 0);
+    assert!(fs::read_dir(&root).unwrap().next().is_none());
+    assert_eq!(rows.iter().unwrap().next().unwrap().unwrap(), [1, 2, 3]);
+    drop(rows);
+    assert!(fs::read_dir(&moved).unwrap().next().is_none());
+    assert!(fs::read_dir(&root).unwrap().next().is_none());
 }
 
 #[test]

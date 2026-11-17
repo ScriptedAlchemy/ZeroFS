@@ -7,6 +7,75 @@ use rustix::fs::{AtFlags, Stat, StatFs, StatxFlags, statx};
 use std::ffi::OsStr;
 use std::path::Path;
 
+pub(super) fn proc_fd_path(file: &impl AsRawFd) -> std::path::PathBuf {
+    format!("/proc/self/fd/{}", file.as_raw_fd()).into()
+}
+
+/// Map the source and scratch directories to paths within their backing filesystems.
+/// A bind mount can give a descendant of the source an unrelated namespace path.
+pub(super) fn open_scratch_parent(root: &Path, parent: &Path) -> anyhow::Result<std::fs::File> {
+    use crate::memory::cgroup::unescape_mountinfo;
+    use anyhow::{Context, ensure};
+    use rustix::fs::{Mode, OFlags};
+    use std::os::fd::AsFd;
+
+    let directory = |path: &Path| -> std::io::Result<std::fs::File> {
+        Ok(rustix::fs::open(
+            path,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?
+        .into())
+    };
+    let root = directory(root)?;
+    let parent = directory(parent)?;
+    let mountinfo = std::fs::read("/proc/self/mountinfo")?;
+    let mut mounts = Vec::new();
+    for line in mountinfo
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let mut fields = line.split(|b| *b == b' ');
+        let id = fields.next().context("missing mount ID")?;
+        let device = fields.nth(1).context("missing mount device")?;
+        let fs_root = unescape_mountinfo(fields.next().context("missing mount root")?)?;
+        let mountpoint = unescape_mountinfo(fields.next().context("missing mount point")?)?;
+        mounts.push((
+            id,
+            device,
+            std::path::PathBuf::from(fs_root),
+            std::path::PathBuf::from(mountpoint),
+        ));
+    }
+    let location = |fd: &std::fs::File| -> anyhow::Result<_> {
+        let mount = statx(fd.as_fd(), "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)?;
+        ensure!(
+            mount.stx_mask & StatxFlags::MNT_ID.bits() != 0,
+            "mount ID unavailable for inventory scratch check"
+        );
+        let id = mount.stx_mnt_id.to_string();
+        let (_, device, fs_root, mountpoint) = mounts
+            .iter()
+            .find(|m| m.0 == id.as_bytes())
+            .context("inventory directory mount is absent from mountinfo")?;
+        let name = std::fs::read_link(proc_fd_path(fd))?;
+        Ok((*device, fs_root.join(name.strip_prefix(mountpoint)?), name))
+    };
+    let (root_device, root_path, root_name) = location(&root)?;
+    let (parent_device, parent_path, parent_name) = location(&parent)?;
+    let inside_root = parent_device == root_device && parent_path.starts_with(root_path);
+    let inside_child_mount = mounts.iter().any(|(_, device, fs_root, mountpoint)| {
+        *device == parent_device
+            && mountpoint.starts_with(&root_name)
+            && parent_path.starts_with(fs_root)
+    });
+    ensure!(
+        !parent_name.starts_with(&root_name) && !inside_root && !inside_child_mount,
+        "--work-dir must be outside the source root, including through bind mounts"
+    );
+    Ok(parent)
+}
+
 pub(super) fn trusted_xattr_namespace() -> TrustedXattrNamespace {
     let status = std::fs::read_to_string("/proc/self/status").ok();
     let namespace = std::fs::read_link("/proc/self/ns/user").ok();

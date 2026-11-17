@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use tempfile::{NamedTempFile, TempDir};
@@ -12,6 +13,9 @@ pub(super) const GROUP_ROWS: usize = 256;
 pub(super) struct Workspace {
     parent: Option<PathBuf>,
     private: std::cell::OnceCell<TempDir>,
+    // TempDir cleanup uses the descriptor path, so keep it open until after private drops.
+    #[cfg(target_os = "linux")]
+    _parent_fd: Option<File>,
     pub cap: usize,
 }
 
@@ -19,15 +23,25 @@ impl Workspace {
     pub fn new(root: &Path, parent: Option<&Path>, cap: usize) -> Result<Rc<Self>> {
         ensure!(cap > 0, "inventory memory cap must be positive");
         let parent = parent.map(std::fs::canonicalize).transpose()?;
+        #[cfg(target_os = "linux")]
+        let mut parent_fd = None;
         if let Some(parent) = &parent {
             ensure!(
                 !parent.starts_with(std::fs::canonicalize(root)?),
                 "--work-dir must be outside the source root"
             );
             ensure!(parent.is_dir(), "--work-dir must be an existing directory");
+            #[cfg(target_os = "linux")]
+            {
+                parent_fd = Some(super::platform::open_scratch_parent(root, parent)?);
+            }
         }
+        #[cfg(target_os = "linux")]
+        let parent = parent_fd.as_ref().map(super::platform::proc_fd_path);
         Ok(Rc::new(Self {
             parent,
+            #[cfg(target_os = "linux")]
+            _parent_fd: parent_fd,
             private: std::cell::OnceCell::new(),
             cap,
         }))
@@ -40,6 +54,7 @@ impl Workspace {
             )?;
             let directory = tempfile::Builder::new()
                 .prefix("zerofs-inventory-")
+                .permissions(std::fs::Permissions::from_mode(0o700))
                 .tempdir_in(parent)?;
             self.private
                 .set(directory)

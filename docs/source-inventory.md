@@ -180,8 +180,10 @@ visiting children. The hardlink sorter uses the same caps and stores observation
 Large groups stream in chunks of 256 rows, so one inode cannot retain all its
 paths in memory.
 
-`--work-dir` names an existing scratch parent. It must resolve outside the source
-root, including through symlinks. The collector creates a private temporary child
+`--work-dir` names an existing scratch parent outside the source root. Linux
+checks the pinned root and the mounts beneath it for aliases of the scratch
+directory, and pins the scratch parent for spill creation and cleanup.
+The collector creates an owner-only temporary child
 there only when a sorter exceeds a cap. Without this option, exceeding either
 cap stops the walk with an error. Sorted runs merge two at a time in binary
 levels, with at most one run per level. This limits merge buffers to two input
