@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import tarfile
 import tempfile
 import textwrap
 import unittest
@@ -15,64 +16,73 @@ WORKFLOW = ROOT / ".github/workflows/jepsen-ha.yml"
 
 
 class NativeJepsenDepsTests(unittest.TestCase):
-    def test_fuse_bootstraps_lein_in_the_runtime_home(self):
+    def test_dependency_bundle_works_in_both_runtime_homes(self):
         workflow = WORKFLOW.read_text()
-        setup = re.findall(
-            r"      - name: Install Leiningen \+ FUSE \+ gnuplot\n"
-            r"(?:        [^\n]*\n)*?        run: \|\n((?:          [^\n]*\n|\n)+)",
-            workflow,
+        install = re.findall(
+            r"      - name: Install the resolved Jepsen dependencies\n"
+            r"        run: \|\n((?:          [^\n]*\n|\n)+)", workflow,
         )
-        resolve = re.findall(
-            r"      - name: Resolve Jepsen dependencies with bounded retries\n"
-            r"(?:        [^\n]*\n)*?        run: \|\n((?:          [^\n]*\n|\n)+)",
-            workflow,
-        )
-        self.assertEqual(len(setup), 2)
-        self.assertEqual(len(resolve), 2)
-        for install, dependencies in zip(setup, resolve):
-            with self.subTest(install=install), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                log = root / "commands.jsonl"
-                for name in ("sudo", "apt-get", "curl", "chmod", "lein"):
-                    tool = root / name
-                    tool.write_text('''#!/usr/bin/env python3
-import json
-import os
-from pathlib import Path
-import sys
-
-name = Path(sys.argv[0]).name
-if name == "sudo":
-    args = ["lein" if arg == "/usr/local/bin/lein" else arg for arg in sys.argv[1:]]
-    os.execvp(args[0], args)
-if name == "lein":
-    with open(os.environ["COMMAND_LOG"], "a") as log:
-        log.write(json.dumps([sys.argv[1:], os.environ["HOME"],
-                              os.environ.get("LEIN_ROOT"), os.environ["JAVA_HOME"]]) + "\\n")
-''')
-                    tool.chmod(0o755)
-                environment = dict(
-                    os.environ, PATH=f"{root}:{os.environ['PATH']}",
-                    HOME="/home/runner", JAVA_HOME="/test/jdk17",
-                    GITHUB_WORKSPACE=str(ROOT), COMMAND_LOG=str(log),
-                )
-                script = textwrap.dedent(install) + textwrap.dedent(dependencies)
-                script = script.replace("${{ matrix.mount-client }}", "fuse")
-                result = subprocess.run(
-                    ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script],
-                    env=environment, capture_output=True, text=True, timeout=10,
-                    check=False,
-                )
-                self.assertEqual(result.returncode, 0, result.stderr)
-                commands = [json.loads(line) for line in log.read_text().splitlines()]
-                self.assertEqual(commands, [
-                    [["version"], "/root", "1", "/test/jdk17"],
-                    [["deps"], "/root", "1", "/test/jdk17"],
-                ])
+        self.assertEqual(len(install), 2)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            launcher = root / "mock-launcher"
+            launcher.write_text(r"""#!/usr/bin/env bash
+set -eu
+case "$*" in
+  version)
+    mkdir -p "$LEIN_HOME/self-installs"
+    touch "$LEIN_HOME/self-installs/lein.jar";;
+  deps)
+    repo=$(sed -n 's/.*:local-repo "\([^"]*\)".*/\1/p' "$LEIN_HOME/profiles.clj")
+    mkdir -p "$repo"
+    touch "$repo/dependency.jar";;
+  '-o deps')
+    test -e "${LEIN_HOME%/*}/.m2/repository/dependency.jar";;
+  *) exit 1;;
+esac
+""")
+            curl = root / "curl"
+            curl.write_text(r"""#!/usr/bin/env bash
+printf '%s\n' "$@" > "$RUNNER_TEMP/curl-args"
+cp "$MOCK_LAUNCHER" "${!#}"
+""")
+            curl.chmod(0o755)
+            sudo = root / "sudo"
+            sudo.write_text('#!/usr/bin/env bash\nexec "$@"\n')
+            sudo.chmod(0o755)
+            env = dict(os.environ, COPYFILE_DISABLE="1", PATH=f"{root}:{os.environ['PATH']}",
+                       GITHUB_WORKSPACE=str(ROOT), RUNNER_TEMP=directory, MOCK_LAUNCHER=str(launcher))
+            subprocess.run(["bash", str(ROOT / "scripts/ci/prepare-jepsen-deps.sh")],
+                           env=env, check=True)
+            download = (root / "curl-args").read_text().splitlines()
+            for option in ("--fail", "--retry-all-errors"):
+                self.assertIn(option, download)
+            for option, value in (("--connect-timeout", "15"), ("--max-time", "60"),
+                                  ("--retry-max-time", "180"), ("--retry", "3")):
+                self.assertEqual(download[download.index(option) + 1], value)
+            with tarfile.open(root / "jepsen-ha-deps.tar") as bundle:
+                self.assertEqual(set(bundle.getnames()), {
+                    "lein", ".lein/self-installs", ".lein/self-installs/lein.jar",
+                    ".m2/repository", ".m2/repository/dependency.jar",
+                })
+            for index, step in enumerate(install):
+                for client in ("native", "fuse"):
+                    with self.subTest(matrix=index, client=client):
+                        home = root / f"runner-{index}-{client}"
+                        root_home = root / f"root-{index}-{client}"
+                        home.mkdir()
+                        root_home.mkdir()
+                        step_cmd = step.replace("${{ matrix.mount-client }}", client)
+                        step_cmd = step_cmd.replace("-C /root", f'-C "{root_home}"')
+                        subprocess.run(["bash", "-ec", textwrap.dedent(step_cmd)],
+                                       env=dict(env, HOME=str(home)), check=True)
+                        runtime = home if client == "native" else root_home
+                        self.assertTrue(os.access(runtime / "lein", os.X_OK))
+                        self.assertTrue((runtime / ".m2/repository/dependency.jar").is_file())
 
     def setup_steps(self):
         blocks = re.findall(
-            r"      - name: Install guest JDK, Leiningen, and gnuplot\n"
+            r"      - name: Install guest JDK and gnuplot\n"
             r"(?:        [^\n]*\n)*?        run: \|\n((?:          [^\n]*\n|\n)+)",
             WORKFLOW.read_text(),
         )
@@ -86,9 +96,8 @@ if name == "lein":
             sudo = root / "sudo"
             sudo.write_text('#!/usr/bin/env bash\nexec "$@"\n')
             sudo.chmod(0o755)
-            for name in ("apt-get", "curl", "chmod", "lein"):
-                tool = root / name
-                tool.write_text('''#!/usr/bin/env python3
+            tool = root / "apt-get"
+            tool.write_text('''#!/usr/bin/env python3
 import json
 import os
 from pathlib import Path
@@ -105,10 +114,8 @@ if name == "apt-get":
         # Strict refresh must turn that warning into a failure before install.
         if phase == "install" or "APT::Update::Error-Mode=any" in args:
             sys.exit(100)
-if name == "curl" and os.environ.get("FAIL_PHASE") == "download":
-    sys.exit(22)
 ''')
-                tool.chmod(0o755)
+            tool.chmod(0o755)
             environment = dict(
                 os.environ,
                 PATH=f"{root}:{os.environ['PATH']}",
@@ -133,7 +140,7 @@ if name == "curl" and os.environ.get("FAIL_PHASE") == "download":
                 result, commands = self.run_setup(step)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual([name for name, _, _ in commands],
-                                 ["apt-get", "apt-get", "curl", "chmod", "lein"])
+                                 ["apt-get", "apt-get"])
                 for _, arguments, frontend in commands[:2]:
                     self.assertEqual(frontend, "noninteractive")
                     for option in ("Acquire::Retries=3", "Acquire::http::Timeout=30",
@@ -144,12 +151,6 @@ if name == "curl" and os.environ.get("FAIL_PHASE") == "download":
                     self.assertIn(package, packages)
                 self.assertNotIn("gnuplot", packages)
                 self.assertIn("--no-install-recommends", packages)
-                download = commands[2][1]
-                for option in ("--fail", "--retry-all-errors"):
-                    self.assertIn(option, download)
-                for option, value in (("--connect-timeout", "15"), ("--max-time", "60"),
-                                      ("--retry-max-time", "180"), ("--retry", "3")):
-                    self.assertEqual(download[download.index(option) + 1], value)
 
     def test_failed_index_refresh_stops_before_installing_or_downloading_lein(self):
         for step in self.setup_steps():
@@ -166,11 +167,18 @@ if name == "curl" and os.environ.get("FAIL_PHASE") == "download":
                 self.assertEqual([name for name, _, _ in commands], ["apt-get", "apt-get"])
 
     def test_failed_launcher_download_stops_before_bootstrap(self):
-        for step in self.setup_steps():
-            with self.subTest(step=step):
-                result, commands = self.run_setup(step, fail_phase="download")
-                self.assertEqual(result.returncode, 22, result.stderr)
-                self.assertEqual([name for name, _, _ in commands], ["apt-get", "apt-get", "curl"])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            curl = root / "curl"
+            curl.write_text("#!/usr/bin/env bash\nexit 22\n")
+            curl.chmod(0o755)
+            result = subprocess.run(
+                ["bash", str(ROOT / "scripts/ci/prepare-jepsen-deps.sh")],
+                env=dict(os.environ, GITHUB_WORKSPACE=str(ROOT), RUNNER_TEMP=directory,
+                         PATH=f"{root}:{os.environ['PATH']}"), check=False,
+            )
+            self.assertEqual(result.returncode, 22)
+            self.assertFalse((root / "jepsen-ha-deps.tar").exists())
 
 
 if __name__ == "__main__":
