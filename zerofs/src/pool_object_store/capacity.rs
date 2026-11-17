@@ -1,7 +1,7 @@
 //! Conservative evacuation snapshots using the allocator's capacity budgets.
 //!
 //! Room per member comes from [`super::space`], the same rule placement uses.
-use super::space::{self, FilesystemSpace};
+use super::space::{self, FilesystemSpace, Full};
 use super::{PoolMember, PoolMemberStatus};
 use std::collections::BTreeMap;
 
@@ -17,12 +17,15 @@ struct Destination {
     filesystem: Option<u64>,
 }
 
+/// `full` holds members whose last write returned no space, with the time it
+/// failed; placement skips them, so they offer no room here either.
 pub(super) fn assess(
     config: &[PoolMember],
     members: &mut [PoolMemberStatus],
     segments: &BTreeMap<String, Vec<u64>>,
+    full: &BTreeMap<String, i64>,
 ) {
-    assess_with(config, members, segments, |member| {
+    assess_with(config, members, segments, full, |member| {
         member.validate_binding()?;
         member
             .filesystem_space()
@@ -34,6 +37,7 @@ fn assess_with(
     config: &[PoolMember],
     members: &mut [PoolMemberStatus],
     segments: &BTreeMap<String, Vec<u64>>,
+    full: &BTreeMap<String, i64>,
     mut space: impl FnMut(&PoolMember) -> std::io::Result<FilesystemSpace>,
 ) {
     // Match reserve(): unpublished local bytes may not yet appear in statvfs.
@@ -48,10 +52,12 @@ fn assess_with(
     let mut destinations = Vec::new();
     for (config, member) in config.iter().zip(members.iter_mut()) {
         member.available_bytes = 0;
-        if member.health.quarantine.is_some() || member.health.monitoring_error.is_some() {
-            continue;
-        }
         let observed = config.local_path.is_some().then(|| space(config));
+        if let Some(Ok(observed)) = &observed {
+            member.space.filesystem_free_bytes = Some(observed.available);
+            member.space.filesystem_total_bytes = Some(observed.total);
+            member.space.declared_exceeds_filesystem = member.capacity_bytes > observed.total;
+        }
         let physical = match &observed {
             None => None,
             Some(Ok(observed)) => Some(space::physical_room(
@@ -61,6 +67,19 @@ fn assess_with(
             )),
             Some(Err(_)) => None,
         };
+        member.space.full = match full.get(&member.id) {
+            Some(&since_ms) => Some(Full::WriteReturnedNoSpace { since_ms }),
+            None if physical.is_some_and(|room| room.is_none_or(|bytes| bytes == 0)) => {
+                Some(Full::BelowFreeSpaceReserve)
+            }
+            None => None,
+        };
+        if member.health.quarantine.is_some()
+            || member.health.monitoring_error.is_some()
+            || full.contains_key(&member.id)
+        {
+            continue;
+        }
         let quota = member
             .capacity_bytes
             .saturating_sub(member.used_bytes)
@@ -180,6 +199,7 @@ mod tests {
                 cleanup_debts: 0,
                 evacuation: "incomplete".into(),
                 available_bytes: 0,
+                space: Default::default(),
                 evacuation_capacity: EvacuationCapacity {
                     required_bytes: 100,
                     ..Default::default()
@@ -193,13 +213,19 @@ mod tests {
         let (a, sa) = member("a", 1000, 0, 20);
         let (b, sb) = member("b", 1000, 0, 30);
         let mut statuses = vec![sa, sb];
-        assess_with(&[a, b], &mut statuses, &BTreeMap::new(), |_| {
-            Ok(FilesystemSpace {
-                filesystem: 1,
-                available: 150,
-                total: 1000,
-            })
-        });
+        assess_with(
+            &[a, b],
+            &mut statuses,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            |_| {
+                Ok(FilesystemSpace {
+                    filesystem: 1,
+                    available: 150,
+                    total: 1000,
+                })
+            },
+        );
         assert_eq!(statuses[0].available_bytes, 90);
         assert_eq!(statuses[1].available_bytes, 90);
         assert_eq!(statuses[0].evacuation_capacity.available_bytes, 90);
@@ -212,13 +238,19 @@ mod tests {
         let (b, mut sb) = member("b", 1000, 0, 0);
         sb.health.quarantine = Some("media failure".into());
         let mut statuses = vec![sa, sb];
-        assess_with(&[a, b], &mut statuses, &BTreeMap::new(), |_| {
-            Ok(FilesystemSpace {
-                filesystem: 1,
-                available: 1000,
-                total: 1000,
-            })
-        });
+        assess_with(
+            &[a, b],
+            &mut statuses,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            |_| {
+                Ok(FilesystemSpace {
+                    filesystem: 1,
+                    available: 1000,
+                    total: 1000,
+                })
+            },
+        );
         assert_eq!(statuses[0].evacuation_capacity.available_bytes, 40);
         assert_eq!(statuses[1].available_bytes, 0);
         assert!(!statuses[1].evacuation_capacity.sufficient);
@@ -228,9 +260,13 @@ mod tests {
     fn evacuation_capacity_does_not_invent_space_when_a_root_is_unavailable() {
         let (a, sa) = member("a", 1000, 0, 0);
         let mut statuses = vec![sa];
-        assess_with(&[a], &mut statuses, &BTreeMap::new(), |_| {
-            Err(std::io::Error::other("unmounted"))
-        });
+        assess_with(
+            &[a],
+            &mut statuses,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            |_| Err(std::io::Error::other("unmounted")),
+        );
         assert_eq!(statuses[0].evacuation_capacity.available_bytes, 0);
         assert!(!statuses[0].evacuation_capacity.sufficient);
         assert_eq!(statuses[0].evacuation_capacity.unavailable_members, ["a"]);
@@ -241,13 +277,19 @@ mod tests {
         let (a, sa) = member("a", 1000, 0, 0);
         let (b, sb) = member("b", 1000, 0, 0);
         let mut statuses = vec![sa, sb];
-        assess_with(&[a, b], &mut statuses, &BTreeMap::new(), |member| {
-            Ok(FilesystemSpace {
-                filesystem: if member.id == "a" { 1 } else { 2 },
-                available: 60,
-                total: 1000,
-            })
-        });
+        assess_with(
+            &[a, b],
+            &mut statuses,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            |member| {
+                Ok(FilesystemSpace {
+                    filesystem: if member.id == "a" { 1 } else { 2 },
+                    available: 60,
+                    total: 1000,
+                })
+            },
+        );
         assert_eq!(statuses[0].evacuation_capacity.available_bytes, 100);
         assert!(statuses[0].evacuation_capacity.sufficient);
     }
@@ -263,13 +305,19 @@ mod tests {
             let (c, sc) = member("c", 4, 0, 0);
             let mut statuses = vec![source_status, sa, sb, sc];
             let segments = BTreeMap::from([("source".into(), vec![6, 6])]);
-            assess_with(&[source, a, b, c], &mut statuses, &segments, |member| {
-                Ok(FilesystemSpace {
-                    filesystem: if member.id == "c" { 2 } else { 1 },
-                    available: if member.id == "c" { 14 } else { shared_free },
-                    total: 1000,
-                })
-            });
+            assess_with(
+                &[source, a, b, c],
+                &mut statuses,
+                &segments,
+                &BTreeMap::new(),
+                |member| {
+                    Ok(FilesystemSpace {
+                        filesystem: if member.id == "c" { 2 } else { 1 },
+                        available: if member.id == "c" { 14 } else { shared_free },
+                        total: 1000,
+                    })
+                },
+            );
             assert!(statuses[0].evacuation_capacity.available_bytes >= 12);
             assert_eq!(statuses[0].evacuation_capacity.sufficient, sufficient);
         }
@@ -284,13 +332,19 @@ mod tests {
             let (target, target_status) = member("target", 1, 0, 0);
             let mut statuses = vec![source_status, target_status];
             let segments = BTreeMap::from([("source".into(), vec![0])]);
-            assess_with(&[source, target], &mut statuses, &segments, |_| {
-                Ok(FilesystemSpace {
-                    filesystem: 1,
-                    available,
-                    total: 1000,
-                })
-            });
+            assess_with(
+                &[source, target],
+                &mut statuses,
+                &segments,
+                &BTreeMap::new(),
+                |_| {
+                    Ok(FilesystemSpace {
+                        filesystem: 1,
+                        available,
+                        total: 1000,
+                    })
+                },
+            );
             assert_eq!(statuses[0].evacuation_capacity.sufficient, sufficient);
         }
     }

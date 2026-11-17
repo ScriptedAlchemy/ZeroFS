@@ -11,11 +11,15 @@
 //! transaction. It can still be wrong by the time the bytes land, because
 //! something outside the pool may fill the filesystem between the check and the
 //! write, and some filesystems (ZFS, for one) refuse writes before `f_bavail`
-//! reaches zero.
+//! reaches zero. That race is handled after the fact: a member write that
+//! returns ENOSPC marks the member full and the write moves to another member.
 use super::PoolMember;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
+use std::sync::Mutex as StdMutex;
+use std::time::{Duration, Instant};
 
 /// One reading of a member's backing filesystem.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,6 +92,87 @@ pub(super) fn room(declared_remaining: u64, physical: Option<Option<u64>>) -> Op
     match physical {
         None => Some(declared_remaining),
         Some(physical) => physical.map(|bytes| bytes.min(declared_remaining)),
+    }
+}
+
+/// How long a remote member that reported no space stays out of placement
+/// before one write may try it again. Remote stores have no free-space figure
+/// to watch, so time is the only signal that space may have returned.
+pub(super) const REMOTE_FULL_RECHECK: Duration = Duration::from_secs(30);
+
+/// Why placement currently skips a member for lack of room. Full is not a
+/// media fault: the member stays readable, healthy and unquarantined.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum Full {
+    /// A write to the member returned ENOSPC or EDQUOT.
+    WriteReturnedNoSpace {
+        /// Server wall-clock milliseconds of the failed write.
+        since_ms: i64,
+    },
+    /// The filesystem's free bytes are at or below `reserve_free_gb` plus the
+    /// pool's outstanding local reservations.
+    BelowFreeSpaceReserve,
+}
+
+#[derive(Clone, Debug)]
+struct NoSpaceMark {
+    since_ms: i64,
+    at: Instant,
+    free_at_failure: Option<u64>,
+}
+
+/// Members whose last write returned no-space. Process memory only: after a
+/// restart the first write to such a member simply fails over again.
+#[derive(Debug, Default)]
+pub(super) struct NoSpaceMarks(StdMutex<HashMap<String, NoSpaceMark>>);
+
+impl NoSpaceMarks {
+    pub(super) fn mark(&self, member: &PoolMember) {
+        let free_at_failure = match member.filesystem_space() {
+            Some(Ok(space)) => Some(space.available),
+            _ => None,
+        };
+        tracing::warn!(
+            member = %member.id,
+            free_bytes = ?free_at_failure,
+            "pool member is full: a write returned no space; placing new data on other members until its free space grows"
+        );
+        self.0.lock().unwrap().insert(
+            member.id.clone(),
+            NoSpaceMark {
+                since_ms: chrono::Utc::now().timestamp_millis(),
+                at: Instant::now(),
+                free_at_failure,
+            },
+        );
+    }
+
+    /// Members that are still full, keyed by id with the time they filled.
+    /// A local member leaves the set once its filesystem reports more free
+    /// bytes than it had when the write failed; a remote member leaves it
+    /// after [`REMOTE_FULL_RECHECK`].
+    pub(super) fn current(&self, members: &[PoolMember]) -> BTreeMap<String, i64> {
+        let mut marks = self.0.lock().unwrap();
+        marks.retain(|id, mark| {
+            let Some(member) = members.iter().find(|member| &member.id == id) else {
+                return false;
+            };
+            let recovered = match (member.filesystem_space(), mark.free_at_failure) {
+                (Some(Ok(space)), Some(before)) => space.available > before,
+                (Some(Ok(_)), None) => true,
+                (Some(Err(_)), _) => false,
+                (None, _) => mark.at.elapsed() >= REMOTE_FULL_RECHECK,
+            };
+            if recovered {
+                tracing::info!(member = %id, "pool member has free space again; placement may use it");
+            }
+            !recovered
+        });
+        marks
+            .iter()
+            .map(|(id, mark)| (id.clone(), mark.since_ms))
+            .collect()
     }
 }
 

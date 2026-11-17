@@ -639,6 +639,20 @@ async fn a_declared_capacity_beyond_the_filesystem_warns_at_startup_and_in_statu
             StoreProfile::default(),
         )
         .await;
+        // The exact lines the server logs at WARN when the pool opens.
+        let warnings = f.pool.declared_beyond_filesystem();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        for ((id, declared), line) in [("member-a", DECLARED_A), ("member-b", DECLARED_B)]
+            .into_iter()
+            .zip(&warnings)
+        {
+            assert!(
+                line.contains(&format!("pool member {id} declares")),
+                "{line}"
+            );
+            assert!(line.contains(&declared.to_string()), "{line}");
+            assert!(line.contains(&(8 * MIB).to_string()), "{line}");
+        }
         let report = status(&f.pool).await;
         for member in report["members"].as_array().unwrap() {
             assert_eq!(member["space"]["declared_exceeds_filesystem"], true);
