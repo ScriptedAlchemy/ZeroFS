@@ -818,13 +818,21 @@ mod tests {
         lease: Option<Arc<crate::replication::Lease>>,
         write_ack: Option<crate::fs::mutation::config::FilesystemWriteAckSettings>,
     ) -> (Arc<ZeroFS>, Arc<CheckpointManager>) {
-        make_fs_with_options(lease, write_ack, crate::fs::name_mode::NameMode::Sensitive).await
+        make_fs_with_options(
+            lease,
+            write_ack,
+            crate::fs::name_mode::NameMode::Sensitive,
+            &[],
+        )
+        .await
     }
 
     async fn make_fs_with_options(
         lease: Option<Arc<crate::replication::Lease>>,
         write_ack: Option<crate::fs::mutation::config::FilesystemWriteAckSettings>,
         name_mode: crate::fs::name_mode::NameMode,
+        // Raw records written to the database before the filesystem boots from it.
+        preexisting: &[(bytes::Bytes, &[u8])],
     ) -> (Arc<ZeroFS>, Arc<CheckpointManager>) {
         let test_key = [0u8; 32];
         let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
@@ -841,6 +849,9 @@ mod tests {
                 .await
                 .unwrap(),
         );
+        for (key, value) in preexisting {
+            slatedb.put(key, value).await.unwrap();
+        }
         let db_handle = SlateDbHandle::ReadWrite(slatedb);
         let mut fs = ZeroFS::new_with_slatedb_and_lease(
             db_handle.clone(),
@@ -974,6 +985,93 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("trash directory was not drained");
+    }
+
+    /// The first sample from the real StreamStats RPC, decoded by the real client.
+    async fn first_stats_sample(client: &RpcClient) -> proto::StatsSnapshot {
+        client
+            .stream_stats(250)
+            .await
+            .unwrap()
+            .message()
+            .await
+            .unwrap()
+            .expect("StreamStats ended before its first sample")
+    }
+
+    #[tokio::test]
+    async fn stream_stats_sends_a_known_zero_counter_as_present() {
+        let (_fs, client, shutdown, _dir) = setup().await;
+        let sample = first_stats_sample(&client).await;
+        // Nothing has read file data yet, so the read counter is a known zero. With
+        // explicit presence a zero is on the wire, so the client decodes Some(0).
+        assert_eq!(sample.bytes_read, Some(0));
+        assert!(sample.bytes_written.is_some());
+        assert!(sample.used_bytes.is_some());
+        assert!(sample.used_inodes.is_some());
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn stream_stats_omits_usage_when_a_stats_shard_is_unreadable() {
+        // Three bytes cannot decode as a stats shard, so the filesystem boots without
+        // knowing that shard's share of the usage totals.
+        let shard = crate::fs::key_codec::KeyCodec::new().stats_shard_key(3);
+        let (fs, checkpoint_manager) = make_fs_with_options(
+            None,
+            None,
+            crate::fs::name_mode::NameMode::Sensitive,
+            &[(shard, b"bad".as_slice())],
+        )
+        .await;
+        let (client, shutdown, _dir) = setup_fs(fs, checkpoint_manager, false).await;
+        let sample = first_stats_sample(&client).await;
+        // Absent on the wire: prost decodes an optional field to None only when the
+        // field was not sent.
+        assert_eq!(sample.used_bytes, None);
+        assert_eq!(sample.used_inodes, None);
+        // The process-lifetime I/O counters do not depend on the shards.
+        assert_eq!(sample.bytes_read, Some(0));
+        assert!(sample.bytes_written.is_some());
+        shutdown.cancel();
+    }
+
+    /// Two StatsSnapshot fields as they were declared before they gained presence.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct ImplicitPresenceStats {
+        #[prost(uint64, tag = "13")]
+        bytes_read: u64,
+        #[prost(uint64, tag = "20")]
+        used_bytes: u64,
+    }
+
+    #[test]
+    fn stats_presence_decodes_both_ways_with_implicit_presence_peers() {
+        use prost::Message;
+        // An old client reading a new server sees a sent value as itself and an
+        // omitted one as 0, which is what it saw before.
+        let new = proto::StatsSnapshot {
+            bytes_read: Some(7),
+            used_bytes: None,
+            ..Default::default()
+        };
+        let old = ImplicitPresenceStats::decode(new.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(
+            old,
+            ImplicitPresenceStats {
+                bytes_read: 7,
+                used_bytes: 0
+            }
+        );
+        // A new client reading an old server sees a nonzero value as itself. The old
+        // server never sends a zero, so a zero arrives as absent, never as Some(0).
+        let old = ImplicitPresenceStats {
+            bytes_read: 0,
+            used_bytes: 5,
+        };
+        let new = proto::StatsSnapshot::decode(old.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(new.bytes_read, None);
+        assert_eq!(new.used_bytes, Some(5));
     }
 
     #[tokio::test]
@@ -1285,7 +1383,8 @@ mod tests {
     #[tokio::test]
     async fn insensitive_reserved_name_aliases_are_refused() {
         let (fs, checkpoints) =
-            make_fs_with_options(None, None, crate::fs::name_mode::NameMode::Insensitive).await;
+            make_fs_with_options(None, None, crate::fs::name_mode::NameMode::Insensitive, &[])
+                .await;
         let (client, shutdown, _dir) = setup_fs(Arc::clone(&fs), checkpoints, true).await;
         for path in ["/.ZEROFS_TRASH", "/.ZeroFS_Trash/child"] {
             let error = client
