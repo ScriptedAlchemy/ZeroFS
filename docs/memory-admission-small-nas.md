@@ -1,74 +1,91 @@
 # Measured package memory admission
 
-The `small-nas-package-v1` policy changes startup arithmetic for one local-pool configuration. It does not bound queues, memtables, sessions, replay state or allocator growth. Configurations outside its explicit checks retain the fork's legacy 32 GiB residency and 8 GiB mixed process/companion reserves. The startup receipt and rejection identify the first failed configuration check.
+The `small-nas-package-v1` policy changes admission for a bounded local-pool package configuration. Other configurations retain the fork's 32 GiB residency and 8 GiB mixed process and companion reserves. The receipt and rejection name the first failed configuration check. No setting disables admission.
 
-Those fixed reserves came from fork commits `ad6835d5` and `4b2b645d`. They are absent from upstream Barre/ZeroFS main at `330ab236`. There is no upstream reserve fix to adopt. This branch changes admission arithmetic and the resulting resident-memory brake cap. PR 81 covers the planner, detector and leases without changing admission.
+The reserves originated in fork commits `ad6835d5` and `4b2b645d`, and are absent upstream at Barre/ZeroFS `330ab236`. This branch changes admission arithmetic and its allocator brake. PR 81 changes the planner, detector and leases without changing admission.
 
-## Configuration and workload
+## Admitted configuration
 
-The primary source is the read-only TrueNAS safety-fix template at `truenas-storage-union-safety`, revision `63d7a22`. Its ZeroFS configuration matches the main package template. The package pins ZeroFS `d498c120`. This branch uses that revision as its base.
+The package configuration comes from the read-only safety template at `truenas-storage-union-safety 63d7a22`. The package owner now pins PR 84 head `734a4a7e`, with `80d1b1cf` as fallback. This widening builds on that fallback. Qualification applies to the exact tested branch binary, not automatically to the package's other pinned revision.
 
-The policy requires all of the following.
+The configuration checks require the following.
 
-- The resolved clean caches total at most 100,663,296 bytes, or 96 MiB. Both 0.001 and 0.1 decimal GB requests resolve to that floor. The clean disk-cache request is positive and at most 0.064 decimal GB, which resolves to two existing 1 GiB disk-engine floors. Metadata warming is off.
-- Writeback is disabled, so there are no writeback RAM, journal or worker allowances in this profile. Shared volatile acknowledgement is disabled. Materialized writes still use four open segment lanes and four retained seals of 256 MiB each. Admission explicitly charges their nominal 2 GiB geometry.
-- There are exactly two local directory pool members, each with declared capacity at most 32 decimal GB. The metadata backend is a local directory. Member health-device monitors are absent. HA replication, NFS and NBD are off.
-- 9P and RPC each use only a Unix socket. The Web UI is compiled in and has one listener at `0.0.0.0:8080`, with UID and GID 1000 and the default session timeout. The filesystem uses insensitive names, LZ4 and real fsync. LSM settings match the package defaults, GC settings match the package defaults and telemetry is off. One loopback Prometheus listener is permitted for diagnostics.
+- Clean caches resolve to at most 100,663,296 bytes. Requests of 0.001 or 0.1 decimal GB resolve to the same 96 MiB floor. The clean disk-cache request is positive and at most 0.064 decimal GB. Its two existing disk-engine floors are 1 GiB each. Metadata warming is off.
+- Writeback and shared volatile acknowledgement are off. Materialized writes retain four open segment lanes and up to four in-flight seals. Admission charges their nominal eight times 256 MiB geometry separately from the observed whole-engine peak.
+- Two through four local directory members each declare at most 18,000 decimal GB, or 18,000,000,000,000 bytes. Metadata is local. Member health monitors and SFTP overrides are absent. Replication, NFS and NBD are off.
+- 9P and RPC use private Unix sockets. Web UI support is compiled in, with one listener and the measured 120-second session timeout. Names are insensitive, compression is LZ4 and fsync is enabled. LSM and GC use package defaults. Telemetry is off. Prometheus has at most one diagnostic listener.
 
-Operational qualification uses one SMB client through the ZeroFS FUSE mount, with FUSE writeback and relaxed consistency disabled. CLI jobs are at most eight. Startup cannot discover or enforce the client/job count. Increasing it leaves this workload qualification. The writeback-enabled secondary profile remains on legacy reserves.
+UID and GID checks were removed because these numeric authorization identities allocate no additional server or queue. Web UI bind address and port checks were removed because the same single listener serves them. The Prometheus bind address check was removed for the same reason. Listener counts and session timeout remain checked because they can change service and retained-session memory. The compiled Web UI check remains because it determines whether HTTP, RPC and 9P services are actually started.
 
-The workload writes one 12 GiB file and 5,000 distinct 1 KiB files, reads all files back, checks every size and SHA-256, flushes and observes one additional segment GC pass. The source template declares only 1 GB per member. The fixture increases each member to 32 GB so the required 12 GiB file fits. This is a capacity deviation, not a claim that the shipped 2 GB pool can hold it. The initial baseline's intended idle command returned immediately; its raw error is retained and that idle phase is incomplete.
+One SMB client uses the FUSE mount with FUSE writeback and relaxed consistency off. CLI jobs are limited operationally to eight. Admission cannot discover either client count or CLI job count. Concurrent clients, CLI transfers and active browser or terminal sessions are outside the measured workload.
 
-## Evidence and arithmetic
+## Stored-state coverage
 
-The baseline was built from the retained `package-baseline-source` snapshot of `bdc2f331d592a4aea9c1ae55d0b514e25e961fab`. Its source manifest is retained beside the binary as `package-baseline-ci/source-provenance.json`. All measurements run in Linux Docker on Docker Desktop, with the optimized `ci` profile and the `webui` feature. The baseline binary's SHA-256 is `7e413bc693a7edba511145fbf8eea096f97453b9ba17493dfb29dcdcedfd74f5`. Engine, FUSE and stock Debian Samba share one cgroup. The transfer client is outside it.
+The current receipt and `zerofs memory-status -c config.toml` expose `stored_state_qualification` with 12,890,021,888 logical bytes and 5,001 regular files. They also expose `enforcement = "empirical_not_enforced"`. This is the completed 12 GiB sequential file plus 5,000 distinct 1 KiB files. It is an empirical coverage statement, not a runtime growth limit. Queues, memtables, sessions, replay and allocator growth have no new hard bound.
 
-The completed baseline cell is `package-baseline-ci-limit64g-cache0.001-wb0-jobs8-primary`. Its raw engine samples are `b1-design/measure/package-baseline-ci-limit64g-cache0.001-wb0-jobs8-primary/samples.jsonl`. Companion samples are the adjacent `companion-samples.jsonl`. These files are retained under `/Users/zackjackson/.t3/userdata/pstack/orch/ZeroFS/`. The workload completed all integrity checks with no swap or OOM event.
+Widened runtime qualification is in progress. A configuration admitted by the widened checks is not yet an 8 GiB runtime pass. The retained report under `b1-design/widen/report.md` records each completed, failed or incomplete rung. Capacity declarations do not establish coverage for 18 TB of stored data.
 
-| Input | Bytes | Source and profile |
+The predeclared ladder is 12 GiB with 5,000 small files, 50 GiB with 50,000, and 150 GiB with 200,000. Each completed rung requires full SHA-256 verification, flush and a subsequent GC pass. The top completed rung gets restart and full verification. A separate SIGKILL check verifies every file flushed before the kill. A rung stops after two hours or before starting if less than 80 GiB of backing disk remains.
+
+Three independent clean smallest-rung runs of the same committed optimized binary under 8 GiB determine repeat spread. Noise is the larger of 128 MiB or 5 percent of their median P. The report retains every maximum. Spread above that threshold prevents a stable slope or plateau claim. Growth above 128 MiB per additional 50,000 files beyond noise requires a positive-slope warning. A recomputed requirement above the 6.5 GiB engine budget fails the approved 8 GiB partition. Margins are not reduced to fit it.
+
+## Evidence and allocator accounting
+
+All ZeroFS execution and Rust checks run in Linux. The original completed optimized `ci+webui` cell is `b1-design/measure/package-baseline-ci-limit64g-cache0.001-wb0-jobs8-primary`. Its raw `samples.jsonl` and `companion-samples.jsonl` are retained under `/Users/zackjackson/.t3/userdata/pstack/orch/ZeroFS/`. The source snapshot was `bdc2f331d592a4aea9c1ae55d0b514e25e961fab`, and the binary hash was `7e413bc693a7edba511145fbf8eea096f97453b9ba17493dfb29dcdcedfd74f5`.
+
+| Completed workload observation | Bytes | Repeats, spread and limiter |
 | --- | ---: | --- |
-| P, the maximum of engine jemalloc residency and process VmHWM | 3,241,541,632 | Completed cell above, `ci+webui`, `samples.jsonl` |
-| Process VmHWM alone | 1,071,312,896 | Same cell, `ci+webui`, `samples.jsonl` |
-| K, maximum `memory.stat` kernel plus sock | 137,129,984 | Same cell, `ci+webui`, `samples.jsonl`; conservatively includes companion kernel charges |
-| FUSE peak sampled RSS | 46,616,576 | Same cell, `ci+webui`, `companion-samples.jsonl` |
-| Sum of smbd processes at its sampled RSS peak | 68,186,112 | Same cell, stock Debian optimized Samba, `companion-samples.jsonl` |
+| Original P, maximum of sampled jemalloc residency and VmHWM, `ci+webui` | 3,241,541,632 | One cell. Repeat spread unavailable. The old counters did not identify the allocation classes. This remains the conservative policy input. |
+| Original K, maximum cgroup kernel plus sock, `ci+webui` | 137,129,984 | One cell. Repeat spread unavailable. Cgroup kernel accounting includes the companions' kernel charges. |
+| Native mixed 6 TB and 18 TB bootstrap P, `ci+webui` | 2,681,294,848 | One cell with resumed readback after a driver failure. Repeat spread unavailable. At P, active pages were 2,615,820,288 bytes, large live allocations were 2,568,060,928 bytes, metadata was 51,793,024 bytes and dirty pages were 14,815,232 bytes. |
+| Native bootstrap K, `ci+webui` | 79,462,400 | Same single cell. Repeat spread unavailable. The cgroup charged kernel memory, not declared capacity, limits this observation. |
 
-RSS, jemalloc residency and cgroup usage are different observations. The reserve uses the larger engine observation. At the jemalloc peak, process VmRSS was 884,372 kB and whole-cgroup anonymous memory was 947,466,240 bytes. Jemalloc residency was about 3.4 times that anonymous memory. It is an allocator statistic that can include untouched pages, not a measurement of physical process RSS. The brake watches that same allocator statistic. The samples cannot attribute resident segment-buffer pages separately, so the engine reserve conservatively retains the entire observed engine peak in addition to the nominal configured tiers. This avoids an unsupported subtraction of nominal capacity from measured residency.
+The native raw file is `b1-design/widen/bootstrap-small-1-retry/samples.jsonl`. The adjacent outcome history retains the failed setup and driver stages. Full verification subsequently matched all 5,001 files after restart, and a GC pass completed. Raw-parts cache usage reached its 33,554,432-byte capacity, and decoded-block usage reached 32,848,357 bytes against the same capacity. The work and cache were not skipped. This cell overlapped other agents' containers and host PSI and swap activity. It is not an uncontaminated repeat.
 
-Run `python3 scripts/derive-small-nas-memory.py <completed-cell-directory>` to recompute the inputs and reserves from the retained receipt and samples.
+At the original P, whole-cgroup anonymous memory was 947,466,240 bytes, about 3.4 times smaller than P. Jemalloc residency includes active pages that need not be physically touched. It is an allocator accounting upper bound, not physical RSS. The native peak is also dominated by active large allocations, rather than dirty retention. The added aggregate-arena page and size-class counters distinguish live allocation classes, metadata and retained dirty pages. They do not by themselves identify every Rust owner or prove that future stored state cannot double demand. Each qualified rung must retain its peak decomposition and name any attribution that remains unresolved.
 
-The formula uses integer bytes and rounds each derived reserve upward to a multiple of 64 MiB.
+`python3 scripts/derive-small-nas-memory.py <completed-cell> ...` checks completion, integrity, GC, swap and OOM receipts before taking the largest P and K across supplied cells. Combining the original cell with the completed native bootstrap keeps the higher original inputs. The range between different cells is not a repeat-noise estimate.
+
+## Formula and brake
+
+All terms use integer bytes. R and H round upward to a multiple of 64 MiB.
 
 ```text
 C = resolved clean cache bytes
-D = (4 open lanes + 4 retained seals) * 256 MiB = 2 GiB
+D = (4 open lanes + 4 retained seals) * 256 MiB = 2 GiB nominal
+P = max(sampled engine jemalloc residency, process VmHWM)
+K = max(cgroup memory.stat kernel + sock)
 R = ceil64MiB(1.10 * P) = 3,623,878,656 bytes
 H = ceil64MiB(0.15 * P + 1.25 * K) = 671,088,640 bytes
 required = C + D + R + H = 6,543,114,240 bytes = 6.09375 GiB
 brake cap = selected engine limit - H
 ```
 
-R is the engine-internal residency allowance. H leaves kernel and allocator headroom below the engine limit. Their percentage margins are a policy assumption over completed workload measurements, not an observed bound. The 64 MiB rounding unit adds margin and is not a global floor. Neither reserve includes FUSE or smbd userspace RSS or file cache. Outside this configuration the legacy arithmetic and brake threshold remain unchanged.
+R retains the entire observed engine peak in addition to the charged tiers. No nominal segment capacity is subtracted from P. H leaves kernel and allocator headroom. The percentages and rounding are explicit policy margins over measured workload peaks. They are not measured bounds or global floors. FUSE and smbd userspace RSS and file cache remain outside the engine allowance.
 
-At the exact admitted engine minimum the brake cap is 5.46875 GiB. It exceeds P plus C and D. With a 6.5 GiB engine budget the cap is 5.875 GiB. Subtracting both reserves would instead place the threshold near the charged tiers alone, below normal engine residency. Runtime overrides `unmodeled_residency_reserve_gb` and `engine_headroom_gb` must be finite positive decimal GB values at least as large as the selected policy's computed minima. There is no admission-disable flag.
+At the exact engine minimum the brake cap is 5.46875 GiB. At the approved 6.5 GiB engine budget it is 5.875 GiB. Both include normal measured residency plus the configured tiers. Outside the profile, the legacy cap remains limit minus both legacy reserves. Upward overrides `unmodeled_residency_reserve_gb` and `engine_headroom_gb` cannot fall below the selected computed values.
 
-## Whole-container allocation
+## Whole-container and host allocation
 
-A finite current-cgroup `memory.max` supplies a dedicated engine envelope in the existing detector. The detector does not enumerate other processes sharing that cgroup. The app must therefore set `[runtime] memory_limit_gb` below the container limit when FUSE and Samba share it. The smaller explicit engine budget wins.
+The detector treats its current finite cgroup limit as an engine envelope without enumerating other processes. When engine, FUSE and Samba share one cgroup, the app must subtract external allowances before setting `[runtime] memory_limit_gb`. The smaller explicit budget wins.
 
-| Container limit | Engine budget | FUSE and Samba allowance | File-cache allowance | Remaining margin | Status of allocation |
+| Container limit | Engine budget, including R and H | FUSE and Samba userspace | Charged file-cache planning allowance | Planned remaining margin | Evidence label |
 | --- | ---: | ---: | ---: | ---: | --- |
-| 4 GiB | 2.5 GiB | 0.25 GiB | 1 GiB | 0.25 GiB | Assumed partition; engine admission refuses it |
-| 8 GiB | 6.5 GiB | 0.25 GiB | 1 GiB | 0.25 GiB | Assumed partition for runtime qualification |
+| 4 GiB | 2.5 GiB | 0.25 GiB | 1 GiB | 0.25 GiB | Assumed partition. Engine admission refuses it. |
+| 8 GiB | 6.5 GiB | 0.25 GiB | 1 GiB | 0.25 GiB | Assumed partition. Widened runtime qualification pending. |
 
-The 0.25 GiB companion allocation exceeds twice the separate sampled RSS peaks above. The 1 GiB file-cache allowance is an unmeasured allocation assumption and requires reclaim during the streaming workload; it is not a cap. The baseline file cache exceeded it. The engine brake observes jemalloc residency and does not observe cgroup file cache or `memory.high`. Runtime qualification must report both file and anon at the same sampled cgroup peak, plus `memory.events`. The engine budget includes H already. Do not add H or the companion processes again when summing this table.
+The native bootstrap's separate sampled peaks were 42,332,160 bytes for FUSE with `ci+webui` and 64,716,800 bytes summed across stock Debian smbd processes. Each is a single-cell observation with repeat spread unavailable. The 0.25 GiB userspace allowance exceeds twice their sum. The 1 GiB file-cache allowance requires reclaim and is not an enforced cache cap. The bootstrap retained far more file cache under 64 GiB. A successful limited run can still reach `memory.max` through reclaimable file pages. Its actual remaining cgroup margin must be reported separately from this planning table. The allocator brake does not watch file cache or `memory.high`.
 
-A 6.5 GiB engine budget is `memory_limit_gb = 6.979321856` in decimal GB. With this 1.5 GiB external allocation, the arithmetic whole-app minimum is 7.59375 GiB. This is an admission minimum, not proof that every workload fits. The final runtime report records the actual tested limits and any rejection or kill.
+Set `memory_limit_gb = 6.979321856` for the 6.5 GiB engine budget inside an 8 GiB app. The engine arithmetic minimum is 6.09375 GiB. Adding the assumed 1.5 GiB external allocation gives a whole-app planning minimum of 7.59375 GiB. No workload pass is implied by either arithmetic minimum. H already includes the observed cgroup kernel charge and is counted once.
 
-## Host assumptions and limits
+The package owner's snapshot at 2026-11-17T01:50Z reports TrueNAS 27.0.0-RC.1, kernel 6.18.52, MemTotal 30,571,416 kB, MemAvailable 20,206,776 kB, an 8 GiB full persistent ARC cap and five running apps. Total RAM is 29.155 GiB. Assume 12 GiB for the kernel, ZFS outside ARC and Plex, qBittorrent, Ultra Explorer, Tailscale and MakeMKV. This unmeasured assumption allocates 8 GiB to working sets and 4 GiB to bursts and safety. With ARC and an 8 GiB app, the arithmetic remainder is 1.155 GiB. The 7.59375 GiB planning minimum leaves 1.561 GiB. Available memory at one snapshot is not all available for ZeroFS, and neither remainder is a NAS measurement under load.
 
-The coordinator reports a persistent 8 GiB ARC cap on the 29.158 GiB NAS, with no swap. We assume a separate 12 GiB host allowance for the kernel, ZFS outside ARC and Plex, qBittorrent, Ultra Explorer, Tailscale and MakeMKV. It consists of an assumed 8 GiB of working sets and 4 GiB for burst activity and safety. Neither amount was measured. An 8 GiB app limit leaves about 1.158 GiB beyond that assumption and the ARC cap. The 7.59375 GiB arithmetic whole-app minimum leaves about 1.565 GiB. These are arithmetic remainders, not verified free memory during Plex transcodes or MakeMKV activity.
+The Linux members are plain directories with declared quotas. Metadata, catalog and cache use a different directory tree from the data members on the same physical filesystem. They do not emulate separate disks or NVMe latency. Local free-space probes see the real smaller backing filesystem. ZFS-backed members are not measured. NAS ARC is outside the engine and container accounting and must remain in host budgeting.
 
-The Web UI assets were built in Linux from this branch, including its WASM client, without the terminal VM image. The package pins `d498c120`. The embedded assets are static files served on request. Any memory difference from the package's original assets is assumed small and was not measured.
+Web UI assets were built in Linux from this branch with its WASM client and without the terminal VM image. They are static files served on request. Their memory difference from the package's pinned assets is assumed small and unmeasured.
 
-- Not verified: NAS operation, HDD-backed members, bursty co-tenants, long uptimes, more than one SMB client, increased CLI concurrency, active Web UI browsing or terminal sessions, and a bound on the remaining unbounded engine consumers. The workload receipts, final-commit checks, forced-kill recovery and cleanup inventory are reported separately under `b1-design/measure/report.md`.
+## Qualifying writeback later
+
+Writeback remains on legacy reserves. A future envelope must charge its explicit resolved RAM budget, both volatile acknowledgement stages if enabled, journal-index and replay memory, local and upload worker concurrency, queued object payloads, and allocator overhead. It must measure sustained writes larger than the container limit, a near-full bounded journal and drain, exact readback, GC and crash replay under the selected app limit. The formula can then use those completed workload peaks and keep the external FUSE, Samba and file-cache allowance separate. Merely setting a writeback RAM budget is insufficient evidence for those additional consumers.
+
+- Not verified: widened 8 GiB qualification until the rung receipts pass, full 18 TB stored state, NAS operation, ZFS backing, separate physical data disks and NVMe, bursty co-tenants, long uptime, more than one SMB client, concurrent CLI transfers, active browser or terminal sessions, and hard bounds on remaining unbounded consumers. Final Linux checks, recovery and cleanup are recorded in the widening report.

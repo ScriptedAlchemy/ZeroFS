@@ -165,14 +165,32 @@ impl MemoryPolicy {
         }
     }
 
+    fn qualification(&self) -> Option<StoredStateQualification> {
+        match self.profile {
+            MemoryPolicyProfile::Legacy { .. } => None,
+            MemoryPolicyProfile::SmallNasPackage => Some(StoredStateQualification {
+                logical_bytes: package_policy::QUALIFIED_LOGICAL_BYTES,
+                regular_files: package_policy::QUALIFIED_REGULAR_FILES,
+                enforcement: "empirical_not_enforced",
+            }),
+        }
+    }
+
     fn accounting(&self, tiers: StartupMemoryTiers, source: &str) -> String {
+        let qualification = match self.qualification() {
+            Some(state) => format!(
+                "qualification_stored_logical_bytes={} qualification_regular_files={} {}",
+                state.logical_bytes, state.regular_files, state.enforcement
+            ),
+            None => "stored_state_qualification=unavailable for legacy policy".into(),
+        };
         format!(
             "memory_policy={} reason={}; clean_cache_bytes={} source=resolved cache split with three 32 MiB floors; \
              object_writeback_bytes={} source=resolved writeback RAM or disabled; \
              volatile_write_bytes={} source=resolved shared write-ack setting times two ownership stages; \
              direct_segment_bytes={} source=generic four open plus four retained 256 MiB segments in measured policy only; \
              unmodeled_residency_reserve_bytes={} source={}; engine_headroom_bytes={} source={}; \
-             hard_limit_source={source}; external_companions=excluded from measured engine reserves, subtract FUSE/smbd and file cache from container limit before runtime.memory_limit_gb",
+             hard_limit_source={source}; external_companions=excluded from measured engine reserves, subtract FUSE/smbd and file cache from container limit before runtime.memory_limit_gb; {qualification}",
             self.name(),
             self.reason(),
             tiers.clean_cache_bytes,
@@ -199,13 +217,21 @@ pub(crate) struct CgroupMemoryLimits {
     shared_ceiling: Option<MemoryEnvelope>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct StoredStateQualification {
+    pub(crate) logical_bytes: u64,
+    pub(crate) regular_files: u64,
+    pub(crate) enforcement: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct MemoryBudgetReceipt {
     pub(crate) hard_limit_bytes: u64,
     pub(crate) required_bytes: u64,
     pub(crate) remaining_bytes: u64,
     pub(crate) rss_pressure_cap_bytes: u64,
     pub(crate) accounting: String,
+    pub(crate) stored_state_qualification: Option<StoredStateQualification>,
 }
 
 pub(crate) fn validate_server_startup(settings: &Settings) -> Result<Option<MemoryBudgetReceipt>> {
@@ -277,7 +303,7 @@ fn validate_resolved_memory_budget(
             "startup memory admission rejected: {:.2} GB clean cache + {:.2} GB object writeback + \
              {:.2} GB volatile writes + {:.2} GiB observed-unmodeled reserve + {:.2} GiB \
              {headroom_label} + {:.2} GiB direct segments require {:.2} GiB, above the {:.2} GiB hard limit \
-             from {source}; required_bytes={required_bytes}; {accounting}",
+             from {source}; required_bytes={required_bytes}; hard_limit_bytes={hard_limit_bytes}; {accounting}",
             decimal_gb(tiers.clean_cache_bytes),
             decimal_gb(tiers.object_writeback_bytes),
             decimal_gb(tiers.volatile_write_bytes),
@@ -298,6 +324,7 @@ fn validate_resolved_memory_budget(
         remaining_bytes: hard_limit_bytes - required_bytes,
         rss_pressure_cap_bytes,
         accounting,
+        stored_state_qualification: policy.qualification(),
     })
 }
 
@@ -941,4 +968,11 @@ mod tests {
         assert_eq!(tiers.object_writeback_bytes, 4_000_000_000);
         assert_eq!(tiers.volatile_write_bytes, 14_000_000_000);
     }
+}
+
+pub(crate) fn print_status(config: &Path) -> Result<()> {
+    let settings = Settings::from_file(config)?;
+    let receipt = validate_server_startup(&settings)?;
+    println!("{}", serde_json::to_string_pretty(&receipt)?);
+    Ok(())
 }

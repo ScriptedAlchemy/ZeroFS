@@ -352,6 +352,7 @@ fn equivalent_cache_floor_and_explicit_gc_defaults_match_the_package() {
     assert!(format!("{receipt:?}").contains("small-nas-package-v1"));
 }
 
+#[cfg(feature = "webui")]
 fn extra_members(count: usize) -> String {
     (0..count).map(|index| format!(
         "\n[[storage.pool.members]]\nid = \"extra-{index}\"\nurl = \"file:///tmp/extra-{index}\"\ncapacity_gb = 18000.0\nreserve_free_gb = 0.01\n"
@@ -401,4 +402,21 @@ fn startup_receipt_states_empirical_stored_state_coverage() {
     ] {
         assert!(receipt.accounting.contains(term), "{}", receipt.accounting);
     }
+}
+
+#[test]
+#[cfg(feature = "webui")]
+fn json_receipt_distinguishes_empirical_coverage_from_legacy_policy() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = package_config(temp.path(), 64 * GIB);
+    let receipt = admission(temp.path(), &base).unwrap();
+    let json = serde_json::to_value(receipt).unwrap();
+    let state = &json["stored_state_qualification"];
+    assert_eq!(state["logical_bytes"], 12 * GIB + 5000 * 1024);
+    assert_eq!(state["regular_files"], 5001);
+    assert_eq!(state["enforcement"], "empirical_not_enforced");
+    let legacy = base.replace("memory_size_gb = 0.001", "memory_size_gb = 1.0");
+    let receipt = admission(temp.path(), &legacy).unwrap();
+    let json = serde_json::to_value(receipt).unwrap();
+    assert!(json["stored_state_qualification"].is_null());
 }

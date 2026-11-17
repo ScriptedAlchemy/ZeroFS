@@ -2166,6 +2166,7 @@ mod tests {
             remaining_bytes: 8 * gib,
             rss_pressure_cap_bytes: validated_service_cap,
             accounting: "memory_policy=legacy reason=server test fixture".into(),
+            stored_state_qualification: None,
         };
 
         crate::alloc_rss::set_rss_cap_bytes(0);

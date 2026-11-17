@@ -135,6 +135,9 @@ pub async fn run_cli() -> Result<()> {
         } => {
             cli::server::run_server(config, read_only, checkpoint).await?;
         }
+        cli::Commands::MemoryStatus { config } => {
+            cli::memory_budget::print_status(&config)?;
+        }
         cli::Commands::Pool { subcommand } => {
             cli::pool::run(subcommand).await?;
         }

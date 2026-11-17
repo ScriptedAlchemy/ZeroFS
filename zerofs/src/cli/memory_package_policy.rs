@@ -26,20 +26,13 @@ pub(super) fn exclusion(
     });
     let webui = cfg!(feature = "webui")
         && settings.servers.webui.as_ref().is_some_and(|config| {
-            config.addresses.len() == 1
-                && config
-                    .addresses
-                    .iter()
-                    .all(|address| address.to_string() == "0.0.0.0:8080")
-                && config.uid == 1000
-                && config.gid == 1000
-                && config.p9_idle_timeout_secs == 120
+            config.addresses.len() == 1 && config.p9_idle_timeout_secs == 120
         });
     let local_pool = settings.storage.pool.as_ref().is_some_and(|pool| {
-        pool.members.len() == 2
+        (2..=4).contains(&pool.members.len())
             && pool.members.iter().all(|member| {
                 local_url(&member.url)
-                    && member.capacity_gb <= 32.0
+                    && member.capacity_gb <= 18000.0
                     && member.sftp.is_none()
                     && member.health_device.is_none()
             })
@@ -71,16 +64,16 @@ pub(super) fn exclusion(
         (settings.servers.nfs.is_none(), "servers.nfs is unqualified"),
         (unix_ninep, "servers.ninep must use only a Unix socket without shared_identity"),
         (unix_rpc, "servers.rpc must use only a Unix socket"),
-        (webui, "servers.webui requires the webui build and one 0.0.0.0:8080 listener with package defaults"),
+        (webui, "servers.webui requires the webui build and one listener with the measured 120s session timeout"),
         (local_url(&settings.storage.url), "storage.url must be a local directory"),
-        (local_pool, "storage.pool requires two local directory members of at most 32 GB without health devices"),
+        (local_pool, "storage.pool requires two to four local directory members of at most 18000 GB without health devices"),
         (settings.name_mode() == NameMode::Insensitive, "filesystem.name_mode must be insensitive"),
         (settings.compression() == CompressionConfig::Lz4, "filesystem.compression must be lz4"),
         (settings.filesystem.as_ref().is_none_or(|config| !config.ignore_fsync), "filesystem.ignore_fsync must be false"),
         (lsm, "lsm must use package flush and compaction defaults with sync_writes off"),
         (package_gc, "gc must use package defaults"),
         (settings.telemetry.as_ref().is_none_or(|config| !config.enabled), "telemetry must be disabled"),
-        (settings.prometheus.as_ref().is_none_or(|config| config.addresses.len() <= 1 && config.addresses.iter().all(|address| address.ip().is_loopback())), "prometheus permits at most one loopback diagnostic listener"),
+        (settings.prometheus.as_ref().is_none_or(|config| config.addresses.len() <= 1), "prometheus permits at most one diagnostic listener"),
     ].into_iter().find_map(|(within, reason)| (!within).then_some(reason))
 }
 
@@ -94,3 +87,6 @@ pub(super) const RESIDENCY_BYTES: u64 = round_up((ENGINE_PEAK_BYTES * 110).div_c
 pub(super) const HEADROOM_BYTES: u64 =
     round_up((ENGINE_PEAK_BYTES * 15).div_ceil(100) + (KERNEL_PEAK_BYTES * 125).div_ceil(100));
 pub(super) const EVIDENCE: &str = "computed from ci+webui package-baseline-ci-limit64g-cache0.001-wb0-jobs8-primary/samples.jsonl; R=ceil64MiB(1.10*3241541632); H=ceil64MiB(0.15*3241541632+1.25*137129984)";
+
+pub(super) const QUALIFIED_LOGICAL_BYTES: u64 = 12 * 1024 * 1024 * 1024 + 5000 * 1024;
+pub(super) const QUALIFIED_REGULAR_FILES: u64 = 5001;
