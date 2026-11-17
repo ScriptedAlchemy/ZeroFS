@@ -513,6 +513,8 @@ mod tests {
             (libc::ENXIO, "ENXIO"),
             (libc::EROFS, "EROFS"),
             (libc::EACCES, "EACCES"),
+            // FreeBSD has no ENODATA.
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             (libc::ENODATA, "ENODATA"),
             (libc::EBADMSG, "EBADMSG"),
         ] {
