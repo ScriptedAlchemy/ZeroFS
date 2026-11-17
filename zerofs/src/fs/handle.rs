@@ -209,7 +209,7 @@ impl ZeroFS {
         #[cfg(feature = "failpoints")]
         fail_point!(fp::RECLAIM_BEFORE_LOCK);
 
-        let _fence = match self
+        let fence = match self
             .fence_metadata(ConflictScope::single(ConflictKey::Inode(id)))
             .await
         {
@@ -219,7 +219,7 @@ impl ZeroFS {
                 return;
             }
         };
-        let _guard = self.lock_manager.acquire(id).await;
+        let guard = self.lock_manager.acquire(id).await;
 
         if self.open_handle_count(id) > 0 {
             return;
@@ -231,15 +231,20 @@ impl ZeroFS {
         #[cfg(feature = "failpoints")]
         fail_point!(fp::RECLAIM_HOLDING_LOCK_BEFORE_DELETE);
 
-        if let Err(e) = self.reclaim_orphan_inode(id).await {
+        if let Err(e) = self.reclaim_orphan_inode(id, (fence, guard)).await {
             error!("Deferred reclaim of orphan inode {} failed: {:?}", id, e);
         }
     }
 
     /// Reclaim a single deferred-orphan inode `id`: delete its inode record,
     /// its extents (small files) or add a tombstone (large files), subtract its
-    /// stats, and remove its orphan-set entry.
-    async fn reclaim_orphan_inode(&self, id: InodeId) -> Result<(), FsError> {
+    /// stats, and remove its orphan-set entry. `held` is the inode's fence and
+    /// lock, released only after the reclaim's commit applies.
+    async fn reclaim_orphan_inode(
+        &self,
+        id: InodeId,
+        held: impl Send + 'static,
+    ) -> Result<(), FsError> {
         match self.inode_store.get(id).await {
             Ok(Inode::File(file)) if file.nlink == 0 => {
                 let mut txn = self.db.new_transaction()?;
@@ -268,6 +273,7 @@ impl ZeroFS {
                             quota: std::sync::Arc::clone(&self.quota),
                             bytes: file.size,
                         }),
+                        held,
                     )
                     .await?;
                 self.stats.files_deleted.fetch_add(1, Ordering::Relaxed);
@@ -283,7 +289,7 @@ impl ZeroFS {
 
                 txn.add_inode_count_delta(id, -1);
                 self.orphan_store.remove(&mut txn, id);
-                self.write_coordinator.commit(txn).await?;
+                self.write_coordinator.commit_holding(txn, held).await?;
                 self.stats.links_deleted.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
@@ -306,7 +312,7 @@ impl ZeroFS {
 
                 txn.add_inode_count_delta(id, -1);
                 self.orphan_store.remove(&mut txn, id);
-                self.write_coordinator.commit(txn).await?;
+                self.write_coordinator.commit_holding(txn, held).await?;
                 self.stats
                     .directories_deleted
                     .fetch_add(1, Ordering::Relaxed);
@@ -327,7 +333,7 @@ impl ZeroFS {
 
                 txn.add_inode_count_delta(id, -1);
                 self.orphan_store.remove(&mut txn, id);
-                self.write_coordinator.commit(txn).await?;
+                self.write_coordinator.commit_holding(txn, held).await?;
                 Ok(())
             }
             Ok(_) | Err(FsError::NotFound) => {
@@ -338,7 +344,7 @@ impl ZeroFS {
                 if self.orphan_store.contains(id).await? {
                     let mut txn = self.db.new_transaction()?;
                     self.orphan_store.remove(&mut txn, id);
-                    self.write_coordinator.commit(txn).await?;
+                    self.write_coordinator.commit_holding(txn, held).await?;
                 }
                 Ok(())
             }

@@ -225,13 +225,13 @@ impl ZeroFS {
                 .await;
         }
 
-        let _fence = self
+        let fence = self
             .fence_metadata(ConflictScope::new([
                 ConflictKey::Directory(dirid),
                 ConflictKey::Inode(file_id),
             ]))
             .await?;
-        let _guards = self.lock_manager.acquire_multi(vec![dirid, file_id]).await;
+        let guards = self.lock_manager.acquire_multi(vec![dirid, file_id]).await;
 
         // Recheck replay state after waiting for inode locks.
         if self
@@ -515,7 +515,7 @@ impl ZeroFS {
                     )
                 };
                 self.write_coordinator
-                    .commit_with_settlement(txn, settlement)
+                    .commit_with_settlement(txn, settlement, (fence, guards))
                     .await?;
 
                 #[cfg(feature = "failpoints")]

@@ -55,10 +55,10 @@ impl ZeroFS {
             target
         );
 
-        let _fence = self
+        let fence = self
             .fence_metadata(ConflictScope::single(ConflictKey::Directory(dirid)))
             .await?;
-        let _guard = self.lock_manager.acquire(dirid).await;
+        let guard = self.lock_manager.acquire(dirid).await;
         // Direct filesystem callers do not pass through the 9P single-flight.
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_symlink)? {
             return Ok(result);
@@ -169,7 +169,9 @@ impl ZeroFS {
 
         txn.add_inode_count_delta(new_id, 1);
 
-        self.write_coordinator.commit(txn).await?;
+        self.write_coordinator
+            .commit_holding(txn, (fence, guard))
+            .await?;
 
         #[cfg(feature = "failpoints")]
         fail_point!(fp::SYMLINK_AFTER_COMMIT);
@@ -226,13 +228,13 @@ impl ZeroFS {
             fileid, linkdirid, linkname_str
         );
 
-        let _fence = self
+        let fence = self
             .fence_metadata(ConflictScope::new([
                 ConflictKey::Directory(linkdirid),
                 ConflictKey::Inode(fileid),
             ]))
             .await?;
-        let _guards = self
+        let guards = self
             .lock_manager
             .acquire_multi(vec![fileid, linkdirid])
             .await;
@@ -400,7 +402,9 @@ impl ZeroFS {
                 .ok();
         }
 
-        self.write_coordinator.commit(txn).await?;
+        self.write_coordinator
+            .commit_holding(txn, (fence, guards))
+            .await?;
 
         #[cfg(feature = "failpoints")]
         fail_point!(fp::LINK_AFTER_COMMIT);

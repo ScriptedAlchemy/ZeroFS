@@ -473,8 +473,8 @@ impl ZeroFS {
         if let Some(target_id) = target_inode_id {
             fence_keys.push(ConflictKey::Inode(target_id));
         }
-        let _fence = self.fence_metadata(ConflictScope::new(fence_keys)).await?;
-        let _guards = self.lock_manager.acquire_multi(all_inodes_to_lock).await;
+        let fence = self.fence_metadata(ConflictScope::new(fence_keys)).await?;
+        let guards = self.lock_manager.acquire_multi(all_inodes_to_lock).await;
 
         // Recheck replay state after waiting for inode locks.
         if self
@@ -955,7 +955,7 @@ impl ZeroFS {
             )
         };
         self.write_coordinator
-            .commit_with_settlement(txn, settlement)
+            .commit_with_settlement(txn, settlement, (fence, guards))
             .await?;
 
         #[cfg(feature = "failpoints")]

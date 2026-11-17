@@ -1621,11 +1621,11 @@ impl ExtentStore {
         start_extent: u64,
         total_extents: u64,
     ) -> Result<(), FsError> {
-        let _guard = self.lock_inode_settled(inode).await;
+        let guard = self.lock_inode_settled(inode).await;
         let mut txn = self.db.new_transaction()?;
         self.delete_range(&mut txn, inode, start_extent, total_extents)
             .await?;
-        self.commit_via_coordinator(txn).await?;
+        self.commit_holding_via_coordinator(txn, guard).await?;
         Ok(())
     }
 }

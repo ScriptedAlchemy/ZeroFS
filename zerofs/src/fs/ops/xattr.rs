@@ -199,15 +199,9 @@ impl ZeroFS {
                 .update_inode_in_entry(&mut txn, parent, filename, id, &inode)
                 .await?;
         }
-        let pending = self.write_coordinator.submit(txn)?;
-        // Keep the lock through apply even if the request stops awaiting us.
-        crate::task::spawn_named("xattr-commit", async move {
-            let _fence = fence;
-            let _guard = guard;
-            pending.wait().await
-        })
-        .await
-        .map_err(|_| FsError::IoError)?
+        self.write_coordinator
+            .commit_holding(txn, (fence, guard))
+            .await
     }
 }
 
