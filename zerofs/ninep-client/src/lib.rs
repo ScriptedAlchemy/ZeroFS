@@ -2362,22 +2362,31 @@ impl NinePClient {
         }
     }
 
+    /// Ends `fid`. Callers return the number to the free list afterwards, so
+    /// the fid must not survive in the replay record whatever the outcome.
     pub async fn clunk(&self, fid: u32) -> ClientResult<()> {
-        if self.stale_fids.contains(&fid) && self.clear_stale_fid(fid).await {
-            return Ok(());
-        }
-        let (resp, _transition) = match self
-            .send_stateful_request(Message::Tclunk(Tclunk { fid }))
-            .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                if matches!(&error, ClientError::Errno(errno) if *errno == linux::ESTALE)
-                    && self.clear_stale_fid(fid).await
-                {
-                    return Ok(());
+        let (resp, _transition) = loop {
+            if self.stale_fids.contains(&fid) && self.clear_stale_fid(fid).await {
+                return Ok(());
+            }
+            match self
+                .send_stateful_request(Message::Tclunk(Tclunk { fid }))
+                .await
+            {
+                Ok(result) => break result,
+                Err(ClientError::Disconnected) => {
+                    if self.forget_fid_of_lost_connection(fid).await {
+                        return Ok(());
+                    }
                 }
-                return Err(error);
+                Err(error) => {
+                    if matches!(&error, ClientError::Errno(errno) if *errno == linux::ESTALE)
+                        && self.clear_stale_fid(fid).await
+                    {
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
             }
         };
         // Remove local state before releasing the replay transition.
@@ -2390,6 +2399,21 @@ impl NinePClient {
             Message::Rlerror(e) => Err(ClientError::Errno(e.ecode)),
             _ => Err(ClientError::Unexpected("clunk")),
         }
+    }
+
+    /// Drops `fid` after a clunk failed because the connection is gone. A fid
+    /// lives on one connection, so the server's copy ended with it and only
+    /// replay could recreate it. Returns false when a replacement connection
+    /// was installed first: replay has already recreated the fid there, and
+    /// the caller must clunk it on that connection.
+    async fn forget_fid_of_lost_connection(&self, fid: u32) -> bool {
+        let _transition = self.session_transition.lock().await;
+        if !self.conn.load().dead.load(Ordering::Acquire) {
+            return false;
+        }
+        self.state.lock().unwrap().forget_fid(fid);
+        self.stale_fids.remove(&fid);
+        true
     }
 
     async fn clear_stale_fid(&self, fid: u32) -> bool {
