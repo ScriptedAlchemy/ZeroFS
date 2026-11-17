@@ -107,33 +107,20 @@ impl XattrSetMode {
     }
 }
 
-fn check_buffer(value: Bytes, size: Option<usize>) -> Result<Bytes, FsError> {
-    if size.is_some_and(|size| size != 0 && size < value.len()) {
-        return Err(FsError::Range);
-    }
-    Ok(value)
-}
-
 impl ZeroFS {
     pub async fn get_xattr(
         &self,
         creds: &Credentials,
         id: InodeId,
         name: &XattrName,
-        size: Option<usize>,
     ) -> Result<Bytes, FsError> {
         let _guard = self.lock_manager.acquire(id).await;
         let inode = self.inode_store.get(id).await?;
         name.check(&inode, creds, false)?;
-        check_buffer(self.xattr_store.get(id, name.as_bytes()).await?, size)
+        self.xattr_store.get(id, name.as_bytes()).await
     }
 
-    pub async fn list_xattrs(
-        &self,
-        creds: &Credentials,
-        id: InodeId,
-        size: Option<usize>,
-    ) -> Result<Bytes, FsError> {
+    pub async fn list_xattrs(&self, creds: &Credentials, id: InodeId) -> Result<Bytes, FsError> {
         let _guard = self.lock_manager.acquire(id).await;
         let inode = self.inode_store.get(id).await?;
         let mut list = Vec::new();
@@ -144,7 +131,7 @@ impl ZeroFS {
                 list.push(0);
             }
         }
-        check_buffer(Bytes::from(list), size)
+        Ok(Bytes::from(list))
     }
 
     pub async fn set_xattr(
