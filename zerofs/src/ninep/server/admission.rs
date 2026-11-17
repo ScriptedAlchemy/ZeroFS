@@ -319,10 +319,14 @@ impl P9ConnectionAdmission {
         let permits = u32::try_from(reserved_bytes)
             .map_err(|_| anyhow::anyhow!("9P request memory reservation exceeds u32"))?;
 
-        let global_request =
-            acquire_owned_or_shutdown(Arc::clone(&self.global.requests), 1, shutdown).await?;
+        // Take the connection's slot first. The reader starts a task for every
+        // frame it reads, so a connection can have many frames waiting; they
+        // wait on its own slots, and at most its request limit of them hold
+        // or wait for a process-wide slot.
         let local_request =
             acquire_owned_or_shutdown(Arc::clone(&self.requests), 1, shutdown).await?;
+        let global_request =
+            acquire_owned_or_shutdown(Arc::clone(&self.global.requests), 1, shutdown).await?;
         let local_bytes =
             acquire_owned_or_shutdown(Arc::clone(&self.bytes), permits, shutdown).await?;
         let global_bytes =
