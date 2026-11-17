@@ -1988,7 +1988,9 @@ pub async fn run_server(
         )
         .await;
         info!("Waiting for accepted 9P work to settle...");
-        p9_accepted_work.wait().await;
+        p9_accepted_work
+            .settle(crate::replication::RESPONSE_DRAIN_TIMEOUT)
+            .await;
 
         if stop_cause.is_leadership_lost() {
             if let Some(registry) = &nbd_runtime_registry {

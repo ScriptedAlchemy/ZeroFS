@@ -472,10 +472,22 @@ impl ExtentStore {
     /// Commit a txn that may carry seg-count deltas. In production this hands off to
     /// the commit worker (the sole segcount writer); with no coordinator (unit tests)
     /// we are the only writer, so materialize the deltas and commit directly.
-    async fn commit_via_coordinator(&self, mut txn: Transaction) -> Result<(), FsError> {
+    async fn commit_via_coordinator(&self, txn: Transaction) -> Result<(), FsError> {
+        self.commit_holding_via_coordinator(txn, ()).await
+    }
+
+    /// [`Self::commit_via_coordinator`] that releases `held` (the caller's
+    /// inode lock) only after the commit applies. See
+    /// [`crate::fs::write_coordinator::HeldUntilApplied`].
+    async fn commit_holding_via_coordinator(
+        &self,
+        mut txn: Transaction,
+        held: impl Send + 'static,
+    ) -> Result<(), FsError> {
         if let Some(coord) = self.coordinator.get() {
-            return coord.commit(txn).await;
+            return coord.commit_holding(txn, held).await;
         }
+        let _held = held;
         // Unit-test fallback: retain the same publication lifetime the real
         // coordinator carries across its merged database write.
         let extent_ref_guard = txn.take_extent_ref_guard();

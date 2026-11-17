@@ -79,12 +79,26 @@ pub(crate) enum CommitSettlement {
     DeferredReclaim(crate::fs::handle::DeferredOrphanReclaim),
 }
 
+/// Locks and fences a mutation holds until its commit has applied.
+///
+/// A mutation that reads a directory or inode under its lock and then commits
+/// must not release that lock before the commit applies: the next holder would
+/// read state the queued commit is about to change. Holding the guards in the
+/// caller's future is not enough, because cancelling the caller (process
+/// shutdown, a listener abort, a GC abort) drops them while the commit is
+/// still queued. A queued commit is owned by the commit worker, so the guards
+/// go with it: the worker drops them after the apply or its failure, before it
+/// replies, whatever happened to the caller. `Box::new(())` holds nothing and
+/// does not allocate.
+pub(crate) type HeldUntilApplied = Box<dyn Send>;
+
 struct CommitReply {
     reply: Reply,
     queued_inode: crate::fs::store::inode::PendingInodeGuard,
     settlement: CommitSettlement,
     materialized_replay:
         Option<crate::fs::mutation::materialized_replay::MaterializedReplayCompletion>,
+    held: HeldUntilApplied,
 }
 
 impl CommitReply {
@@ -95,12 +109,14 @@ impl CommitReply {
         materialized_replay: Option<
             crate::fs::mutation::materialized_replay::MaterializedReplayCompletion,
         >,
+        held: HeldUntilApplied,
     ) -> Self {
         Self {
             reply,
             queued_inode,
             settlement,
             materialized_replay,
+            held,
         }
     }
 
@@ -124,12 +140,16 @@ impl CommitReply {
             reply,
             queued_inode,
             materialized_replay,
+            held,
             ..
         } = self;
         drop(queued_inode);
         if let Some(completion) = materialized_replay {
             completion.finish(result);
         }
+        // The next holder of these locks reads the applied state, or after a
+        // failure the last committed state with the pending overlay removed.
+        drop(held);
         let _ = reply.send(result);
     }
 }
@@ -265,16 +285,29 @@ impl WriteCoordinator {
         self.submit(txn)?.wait().await
     }
 
+    /// Commit `txn` and release `held` (the caller's locks and fence) only
+    /// after it has applied; see [`HeldUntilApplied`].
+    pub(crate) async fn commit_holding(
+        &self,
+        txn: Transaction,
+        held: impl Send + 'static,
+    ) -> Result<(), FsError> {
+        self.commit_with_settlement(txn, CommitSettlement::None, held)
+            .await
+    }
+
     /// Keep metadata quota changes with the queued transaction until its
     /// canonical result, even if the request waiting for the reply is cancelled.
     pub(crate) async fn commit_with_quota(
         &self,
         txn: Transaction,
         quota: Option<crate::fs::quota::QuotaSettlement>,
+        held: impl Send + 'static,
     ) -> Result<(), FsError> {
         self.commit_with_settlement(
             txn,
             quota.map_or(CommitSettlement::None, CommitSettlement::Quota),
+            held,
         )
         .await
     }
@@ -283,8 +316,9 @@ impl WriteCoordinator {
         &self,
         txn: Transaction,
         settlement: CommitSettlement,
+        held: impl Send + 'static,
     ) -> Result<(), FsError> {
-        self.submit_owned(txn, CommitOwnership::None, settlement)?
+        self.queue(txn, CommitOwnership::None, settlement, Box::new(held))?
             .wait()
             .await
     }
@@ -310,6 +344,16 @@ impl WriteCoordinator {
         ownership: CommitOwnership,
         settlement: CommitSettlement,
     ) -> Result<PendingCommit, FsError> {
+        self.queue(txn, ownership, settlement, Box::new(()))
+    }
+
+    fn queue(
+        &self,
+        txn: Transaction,
+        ownership: CommitOwnership,
+        settlement: CommitSettlement,
+        held: HeldUntilApplied,
+    ) -> Result<PendingCommit, FsError> {
         // Once queued, the commit applies whether or not anyone awaits it.
         crate::abandonment::pass_point_of_no_return()?;
         let (pending_write_request, materialized_replay) = match ownership {
@@ -323,7 +367,13 @@ impl WriteCoordinator {
             .send(Request::Commit(
                 txn,
                 pending_write_request,
-                CommitReply::new(reply_tx, queued_inode, settlement, materialized_replay),
+                CommitReply::new(
+                    reply_tx,
+                    queued_inode,
+                    settlement,
+                    materialized_replay,
+                    held,
+                ),
             ))
             .map_err(|_| FsError::IoError)?;
         Ok(PendingCommit { reply: reply_rx })
@@ -422,7 +472,12 @@ pub struct WeakWriteCoordinator {
 }
 
 impl WeakWriteCoordinator {
-    pub(crate) async fn commit(&self, txn: Transaction) -> Result<(), FsError> {
+    /// [`WriteCoordinator::commit_holding`] for the data plane.
+    pub(crate) async fn commit_holding(
+        &self,
+        txn: Transaction,
+        held: impl Send + 'static,
+    ) -> Result<(), FsError> {
         crate::abandonment::pass_point_of_no_return()?;
         let sender = self.sender.upgrade().ok_or(FsError::IoError)?;
         // Same submit-time queueing as the strong handle; see there.
@@ -432,7 +487,13 @@ impl WeakWriteCoordinator {
             .send(Request::Commit(
                 txn,
                 None,
-                CommitReply::new(reply_tx, queued_inode, CommitSettlement::None, None),
+                CommitReply::new(
+                    reply_tx,
+                    queued_inode,
+                    CommitSettlement::None,
+                    None,
+                    Box::new(held),
+                ),
             ))
             .map_err(|_| FsError::IoError)?;
         reply_rx.await.map_err(|_| FsError::IoError)?
@@ -1616,7 +1677,13 @@ mod tests {
             .send(Request::Commit(
                 head,
                 None,
-                CommitReply::new(head_reply, head_queued, CommitSettlement::None, None),
+                CommitReply::new(
+                    head_reply,
+                    head_queued,
+                    CommitSettlement::None,
+                    None,
+                    Box::new(()),
+                ),
             ))
             .unwrap();
         replies.push(head_rx);
@@ -1632,7 +1699,7 @@ mod tests {
                 .send(Request::Commit(
                     txn,
                     None,
-                    CommitReply::new(reply_tx, queued, CommitSettlement::None, None),
+                    CommitReply::new(reply_tx, queued, CommitSettlement::None, None, Box::new(())),
                 ))
                 .unwrap();
             replies.push(reply_rx);
@@ -1742,7 +1809,7 @@ mod tests {
             .send(Request::Commit(
                 txn,
                 None,
-                CommitReply::new(reply_tx, queued, CommitSettlement::None, None),
+                CommitReply::new(reply_tx, queued, CommitSettlement::None, None, Box::new(())),
             ))
             .unwrap();
         fs.write_coordinator.barrier().await.unwrap();

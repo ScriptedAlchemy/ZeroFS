@@ -64,10 +64,10 @@ impl ZeroFS {
             String::from_utf8_lossy(name)
         );
 
-        let _fence = self
+        let fence = self
             .fence_metadata(ConflictScope::single(ConflictKey::Directory(dirid)))
             .await?;
-        let _guard = self.lock_manager.acquire(dirid).await;
+        let guard = self.lock_manager.acquire(dirid).await;
         // Direct filesystem callers do not pass through the 9P single-flight.
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_create)? {
             return Ok(result);
@@ -185,9 +185,12 @@ impl ZeroFS {
 
                 txn.add_inode_count_delta(file_id, 1);
 
-                self.write_coordinator.commit(txn).await.inspect_err(|e| {
-                    error!("Failed to write batch: {:?}", e);
-                })?;
+                self.write_coordinator
+                    .commit_holding(txn, (fence, guard))
+                    .await
+                    .inspect_err(|e| {
+                        error!("Failed to write batch: {:?}", e);
+                    })?;
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::CREATE_AFTER_COMMIT);
@@ -261,10 +264,10 @@ impl ZeroFS {
             String::from_utf8_lossy(name)
         );
 
-        let _fence = self
+        let fence = self
             .fence_metadata(ConflictScope::single(ConflictKey::Directory(dirid)))
             .await?;
-        let _guard = self.lock_manager.acquire(dirid).await;
+        let guard = self.lock_manager.acquire(dirid).await;
         // Direct filesystem callers do not pass through the 9P single-flight.
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_mkdir)? {
             return Ok(result);
@@ -392,7 +395,9 @@ impl ZeroFS {
 
                 txn.add_inode_count_delta(new_dir_id, 1);
 
-                self.write_coordinator.commit(txn).await?;
+                self.write_coordinator
+                    .commit_holding(txn, (fence, guard))
+                    .await?;
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::MKDIR_AFTER_COMMIT);
@@ -464,10 +469,10 @@ impl ZeroFS {
             ftype
         );
 
-        let _fence = self
+        let fence = self
             .fence_metadata(ConflictScope::single(ConflictKey::Directory(dirid)))
             .await?;
-        let _guard = self.lock_manager.acquire(dirid).await;
+        let guard = self.lock_manager.acquire(dirid).await;
         // Direct filesystem callers do not pass through the 9P single-flight.
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_mknod)? {
             return Ok(result);
@@ -588,7 +593,9 @@ impl ZeroFS {
 
                 txn.add_inode_count_delta(special_id, 1);
 
-                self.write_coordinator.commit(txn).await?;
+                self.write_coordinator
+                    .commit_holding(txn, (fence, guard))
+                    .await?;
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::MKNOD_AFTER_COMMIT);

@@ -39,7 +39,7 @@ impl ZeroFS {
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_setattr)? {
             return Ok(result);
         }
-        let _guard = self.lock_manager.acquire(id).await;
+        let guard = self.lock_manager.acquire(id).await;
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_setattr)? {
             return Ok(result);
         }
@@ -73,7 +73,7 @@ impl ZeroFS {
                 attrs: post_attrs.clone(),
             },
         );
-        self.write_coordinator.commit(txn).await?;
+        self.write_coordinator.commit_holding(txn, guard).await?;
         self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
         Ok(post_attrs)
     }
@@ -144,10 +144,10 @@ impl ZeroFS {
             creds.gid,
             &creds.groups[..creds.groups_count]
         );
-        let _fence = self
+        let fence = self
             .fence_metadata(ConflictScope::single(ConflictKey::Inode(id)))
             .await?;
-        let _guard = self.lock_manager.acquire(id).await;
+        let guard = self.lock_manager.acquire(id).await;
         // A same-id call may have completed while this one waited for the inode
         // lock (direct filesystem callers do not pass through the 9P single-flight).
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_setattr)? {
@@ -362,7 +362,7 @@ impl ZeroFS {
                         },
                     };
                     self.write_coordinator
-                        .commit_with_quota(txn, Some(quota))
+                        .commit_with_quota(txn, Some(quota), (fence, guard))
                         .await?;
 
                     #[cfg(feature = "failpoints")]
@@ -596,7 +596,9 @@ impl ZeroFS {
             },
         );
 
-        self.write_coordinator.commit(txn).await?;
+        self.write_coordinator
+            .commit_holding(txn, (fence, guard))
+            .await?;
 
         self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
