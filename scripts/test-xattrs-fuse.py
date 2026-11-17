@@ -14,13 +14,13 @@ def run(*args):
     return subprocess.run(args, check=True, capture_output=True, timeout=15).stdout
 
 
-def wait_for(predicate, process):
+def wait_for(predicate, process, label):
     deadline = time.monotonic() + 30
     while not predicate():
         if process.poll() is not None:
-            raise RuntimeError(f"process stopped with status {process.returncode}")
+            raise RuntimeError(f"{label} stopped with status {process.returncode}; its output is printed above")
         if time.monotonic() >= deadline:
-            raise TimeoutError("local export did not become ready")
+            raise TimeoutError(f"{label} did not become ready")
         time.sleep(0.1)
 
 
@@ -50,13 +50,16 @@ enabled = false
             try:
                 server = subprocess.Popen([binary, "run", "-c", str(config)], stdout=log, stderr=log)
                 processes.append(server)
-                wait_for(socket.exists, server)
+                wait_for(socket.exists, server, "9P server")
+                # The mounting user does every access below, so the default
+                # owner-only access is enough. `--access all` would need
+                # user_allow_other in /etc/fuse.conf, which runners lack.
                 client = subprocess.Popen(
-                    [binary, "mount", "--access", "all", "--writeback", "false",
+                    [binary, "mount", "--writeback", "false",
                      f"unix:{socket}", str(mount)], stdout=log, stderr=log,
                 )
                 processes.append(client)
-                wait_for(lambda: os.path.ismount(mount), client)
+                wait_for(lambda: os.path.ismount(mount), client, "FUSE mount")
                 target = mount / "File"
                 target.touch()
                 run("setfattr", "-n", "user.empty", "-v", "before", str(target))
