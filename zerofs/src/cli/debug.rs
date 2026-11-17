@@ -425,6 +425,24 @@ fn hex_sha256(digest: [u8; 32]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// Scan the clean-cache files at or under `path`, print the report, and
+/// return the exit status it calls for.
+pub fn scan_cache_files(
+    path: &std::path::Path,
+    json: bool,
+    live: bool,
+    legacy: bool,
+) -> Result<i32> {
+    use crate::cli::server::cache_scan;
+    let report = cache_scan::scan_cache_files(path, cache_scan::ScanOptions { live, legacy })?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", cache_scan::render(&report));
+    }
+    Ok(report.exit_status)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

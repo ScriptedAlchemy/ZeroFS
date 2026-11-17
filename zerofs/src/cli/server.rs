@@ -41,6 +41,7 @@ use tracing::{debug, info, warn};
 
 #[cfg(test)]
 mod cache_files_tests;
+pub(crate) mod cache_scan;
 mod mutation_lifecycle;
 use mutation_lifecycle::{LifecycleOwners, MutationLifecycle};
 
@@ -747,6 +748,10 @@ fn foyer_partition_id(name: &str) -> Option<u32> {
     (id == format!("{partition_id:08}")).then_some(partition_id)
 }
 
+/// The file a server locks exclusively for as long as it uses a clean-cache
+/// namespace.
+pub(crate) const CLEAN_CACHE_LOCK_FILE: &str = ".zerofs-clean-cache.lock";
+
 #[derive(Debug)]
 pub(super) struct CleanCacheOwner {
     _lock: File,
@@ -769,7 +774,7 @@ fn acquire_clean_cache_owner(root: &StdPath) -> Result<CleanCacheOwner> {
     if std::fs::symlink_metadata(root)?.file_type().is_symlink() {
         anyhow::bail!("clean cache root {} must not be a symlink", root.display());
     }
-    let lock_path = root.join(".zerofs-clean-cache.lock");
+    let lock_path = root.join(CLEAN_CACHE_LOCK_FILE);
     let mut options = OpenOptions::new();
     options.create(true).read(true).write(true);
     #[cfg(unix)]
@@ -903,7 +908,7 @@ async fn build_block_hybrid(
                     .build()
                     .map_err(|e| foyer_build_error("foyer device build failed", e))?,
             )
-            .with_block_size(64 * 1024 * 1024),
+            .with_block_size(BLOCK_CACHE_BLOCK_SIZE),
         )
         .build()
         .await
@@ -918,6 +923,9 @@ async fn build_block_hybrid(
 /// max cacheable entry size.
 const PARTS_BLOCK_SIZE: usize = 64 * 1024 * 1024;
 
+/// Block size of the decoded-block disk cache.
+const BLOCK_CACHE_BLOCK_SIZE: usize = 64 * 1024 * 1024;
+
 /// Before the patched foyer-storage in `vendor/`, foyer wrote each entry's
 /// page padding and each blob index tail as it found them in its I/O
 /// buffers: freed heap memory of this process, or bytes of earlier entries.
@@ -930,6 +938,13 @@ const CACHE_PADDING_POLICY: &str = "padding=zeroed\n";
 /// separate directory keeps a rollback from writing into this one.
 pub(crate) const BLOCK_CACHE_DIR: &str = "hybrid_cache_v1";
 pub(crate) const LEGACY_BLOCK_CACHE_DIR: &str = "hybrid_cache";
+
+/// The layout marker a current parts cache of `disk_bytes` records.
+fn parts_cache_layout(disk_bytes: usize) -> String {
+    format!(
+        "zerofs-parts-cache-v1\nrecover=none\ntombstones=0\nblock_bytes={PARTS_BLOCK_SIZE}\ndisk_bytes={disk_bytes}\n{CACHE_PADDING_POLICY}"
+    )
+}
 
 /// Foyer's partition layout depends on the tombstone setting and capacity.
 /// Record both the geometry and recovery policy before opening its files, so
@@ -952,9 +967,7 @@ fn prepare_parts_cache_layout(parts_root: &StdPath, disk_bytes: usize) -> Result
             parts_root.display()
         );
     }
-    let expected = format!(
-        "zerofs-parts-cache-v1\nrecover=none\ntombstones=0\nblock_bytes={PARTS_BLOCK_SIZE}\ndisk_bytes={disk_bytes}\n{CACHE_PADDING_POLICY}"
-    );
+    let expected = parts_cache_layout(disk_bytes);
     let marker = parts_root.join(PARTS_CACHE_LAYOUT_FILE);
     match std::fs::symlink_metadata(&marker) {
         Ok(metadata) => {

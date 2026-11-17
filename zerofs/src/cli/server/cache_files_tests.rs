@@ -1,15 +1,18 @@
 //! The clean-cache disk tiers write only bytes the cache defines.
 //!
-//! foyer lays each 64 MiB block out as blobs. A blob is a 4 KiB index
-//! (checksum, count, then one 24-byte record per entry) followed by its
-//! entries, each a 36-byte header, key and value padded up to the next 4 KiB
-//! page. The index tail past the last record and each entry's page padding
-//! carry no data. If foyer leaves them as it found them in its I/O buffers,
-//! freed heap memory of the server process reaches the cache disk in the
-//! clear. These tests fill freed memory with a marker, run both production
-//! disk caches over real workloads, and read every cache file back.
+//! The index tail past each blob's last record and each entry's page padding
+//! carry no data (see [`super::cache_scan`]). If foyer leaves them as it found
+//! them in its I/O buffers, freed heap memory of the server process reaches
+//! the cache disk in the clear. These tests fill freed memory with a marker,
+//! run both production disk caches over real workloads, and read every cache
+//! file back with the same scanner `zerofs debug scan-cache-files` uses.
 
-use super::{FoyerMetricsRegistry, build_block_hybrid, build_parts_hybrid};
+use super::cache_scan::{UndefinedBytes, scan_partitions};
+use super::{
+    BLOCK_CACHE_BLOCK_SIZE, FoyerMetricsRegistry, PARTS_BLOCK_SIZE, build_block_hybrid,
+    build_parts_hybrid,
+};
+use crate::object_store_prefetch::PARTS_CACHE_DIR;
 use bytes::Bytes;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
@@ -19,12 +22,6 @@ use std::sync::Arc;
 /// Synthetic stand-in for secret heap contents. Never a real key.
 const MARKER: &[u8; 16] = b"ZFS-PLANTED-SEC!";
 const PAGE: usize = 4096;
-const BLOCK: usize = 64 * 1024 * 1024;
-const BLOB_INDEX: usize = 4096;
-const BLOB_INDEX_HEAD: usize = 12;
-const BLOB_INDEX_RECORD: usize = 24;
-const ENTRY_HEADER: usize = 36;
-const ENTRY_MAGIC: u32 = 0x9703_2700;
 const MIB: usize = 1024 * 1024;
 
 /// Allocate `count` buffers of `size` bytes at `align`, fill them with the
@@ -65,15 +62,8 @@ fn plant_marker_in_foyer_buffer_classes() {
 
 #[derive(Debug, Default)]
 struct CacheFileAudit {
-    files: usize,
-    blocks: usize,
-    blobs: usize,
-    entries: usize,
-    /// Non-zero bytes past the last record of a blob index.
-    index_tail_nonzero: usize,
-    /// Non-zero bytes between an entry's end and its page boundary.
-    entry_padding_nonzero: usize,
-    /// Marker copies anywhere in any cache file.
+    undefined: UndefinedBytes,
+    /// Marker copies anywhere in any cache block.
     marker_hits: usize,
     /// Marker copies inside a blob index tail.
     index_tail_marker_hits: usize,
@@ -83,17 +73,15 @@ struct CacheFileAudit {
     samples: Vec<String>,
 }
 
-fn sample(audit: &mut CacheFileAudit, region: &str, bytes: &[u8]) {
+fn sample(samples: &mut Vec<String>, region: &str, bytes: &[u8]) {
     if let Some(first) = bytes.iter().position(|b| *b != 0)
-        && audit.samples.len() < 6
+        && samples.len() < 6
     {
         let hex: String = bytes[first..bytes.len().min(first + 48)]
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
-        audit
-            .samples
-            .push(format!("{region}+{first}/{}: {hex}", bytes.len()));
+        samples.push(format!("{region}+{first}/{}: {hex}", bytes.len()));
     }
 }
 
@@ -101,98 +89,52 @@ fn count_marker(bytes: &[u8]) -> usize {
     bytes.windows(MARKER.len()).filter(|w| w == MARKER).count()
 }
 
-fn count_nonzero(bytes: &[u8]) -> usize {
-    bytes.iter().filter(|b| **b != 0).count()
-}
-
-fn be_u32(bytes: &[u8], at: usize) -> usize {
-    u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize
-}
-
-/// Walk one block's blobs the way foyer's scanner does and audit the bytes
-/// each blob carries but does not define.
-fn audit_block(block: &[u8], audit: &mut CacheFileAudit) {
-    let mut blob = 0;
-    while blob + BLOB_INDEX <= block.len() {
-        let index = &block[blob..blob + BLOB_INDEX];
-        let count = be_u32(index, 8);
-        let capacity = (BLOB_INDEX - BLOB_INDEX_HEAD) / BLOB_INDEX_RECORD;
-        if count == 0 || count > capacity {
-            return;
-        }
-        let records = BLOB_INDEX_HEAD + count * BLOB_INDEX_RECORD;
-        let mut entries = Vec::with_capacity(count);
-        let (index_records, _) = index[BLOB_INDEX_HEAD..records].as_chunks::<BLOB_INDEX_RECORD>();
-        for record in index_records {
-            let offset = be_u32(record, 16);
-            let len = be_u32(record, 20);
-            let start = blob + offset;
-            if len < ENTRY_HEADER
-                || start + len.next_multiple_of(PAGE) > block.len()
-                || be_u32(block, start + 32) & 0xFFFF_FF00 != ENTRY_MAGIC as usize
-            {
-                // Not a blob this pass wrote.
-                return;
-            }
-            entries.push((start, len));
-        }
-        audit.blobs += 1;
-        let tail = &index[records..];
-        audit.index_tail_nonzero += count_nonzero(tail);
-        audit.index_tail_marker_hits += count_marker(tail);
-        sample(audit, "index tail", tail);
-        let mut end = blob;
-        for (start, len) in entries {
-            audit.entries += 1;
-            let padding = &block[start + len..start + len.next_multiple_of(PAGE)];
-            audit.entry_padding_nonzero += count_nonzero(padding);
-            audit.entry_padding_marker_hits += count_marker(padding);
-            sample(audit, "entry padding", padding);
-            end = start + len.next_multiple_of(PAGE);
-        }
-        blob = end;
-    }
-}
-
-/// Read every foyer partition file under `root` back from disk.
-fn audit_cache_files(root: &std::path::Path) -> CacheFileAudit {
-    let mut audit = CacheFileAudit::default();
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(dir) = pending.pop() {
-        for entry in std::fs::read_dir(&dir).unwrap() {
-            let entry = entry.unwrap();
-            let path = entry.path();
-            if entry.file_type().unwrap().is_dir() {
-                pending.push(path);
-                continue;
-            }
-            let name = entry.file_name();
-            if !name
-                .to_str()
-                .is_some_and(|name| name.starts_with(super::FOYER_PARTITION_PREFIX))
-            {
-                continue;
-            }
-            let bytes = std::fs::read(&path).unwrap();
-            audit.files += 1;
-            audit.marker_hits += count_marker(&bytes);
-            if bytes.len() == BLOCK {
-                audit.blocks += 1;
-                audit_block(&bytes, &mut audit);
+/// Scan one cache directory and add what it holds to `audit`.
+fn audit_cache_dir(dir: &std::path::Path, block_size: usize, audit: &mut CacheFileAudit) {
+    let mut marker_hits = 0;
+    let mut tail_hits = 0;
+    let mut padding_hits = 0;
+    let mut samples = std::mem::take(&mut audit.samples);
+    let counts = scan_partitions(dir, block_size, |block, blobs| {
+        marker_hits += count_marker(block);
+        for blob in blobs {
+            let tail = &block[blob.index_tail.clone()];
+            tail_hits += count_marker(tail);
+            sample(&mut samples, "index tail", tail);
+            for entry in &blob.entries {
+                let padding = &block[entry.padding.clone()];
+                padding_hits += count_marker(padding);
+                sample(&mut samples, "entry padding", padding);
             }
         }
-    }
-    audit
+    })
+    .unwrap();
+    let total = &mut audit.undefined;
+    total.partitions += counts.partitions;
+    total.other_partitions += counts.other_partitions;
+    total.blobs += counts.blobs;
+    total.entries += counts.entries;
+    total.index_tail_bytes += counts.index_tail_bytes;
+    total.index_tail_nonzero += counts.index_tail_nonzero;
+    total.padding_bytes += counts.padding_bytes;
+    total.padding_nonzero += counts.padding_nonzero;
+    audit.marker_hits += marker_hits;
+    audit.index_tail_marker_hits += tail_hits;
+    audit.entry_padding_marker_hits += padding_hits;
+    audit.samples = samples;
 }
 
 fn assert_clean(name: &str, audit: &CacheFileAudit) {
     println!("CACHE_FILE_AUDIT {name} {audit:?}");
-    assert!(audit.entries > 0, "{name}: the workload wrote no entries");
+    assert!(
+        audit.undefined.entries > 0,
+        "{name}: the workload wrote no entries"
+    );
     assert_eq!(
         (
             audit.marker_hits,
-            audit.index_tail_nonzero,
-            audit.entry_padding_nonzero
+            audit.undefined.index_tail_nonzero,
+            audit.undefined.padding_nonzero
         ),
         (0, 0, 0),
         "{name}: cache files carry bytes foyer did not define: {audit:?}"
@@ -237,7 +179,13 @@ async fn parts_cache_files_hold_no_undefined_bytes() {
     drop(store);
     drop(parts);
 
-    assert_clean("raw-parts", &audit_cache_files(dir.path()));
+    let mut audit = CacheFileAudit::default();
+    audit_cache_dir(
+        &dir.path().join(PARTS_CACHE_DIR),
+        PARTS_BLOCK_SIZE,
+        &mut audit,
+    );
+    assert_clean("raw-parts", &audit);
 }
 
 /// Enough rows for many 32 KiB SST blocks, so a one-MiB memory tier evicts
@@ -321,5 +269,9 @@ async fn decoded_block_cache_files_hold_no_undefined_bytes() {
     db.close().await.unwrap();
     reader_hybrid.close().await.unwrap();
 
-    assert_clean("decoded-blocks", &audit_cache_files(dir.path()));
+    let mut audit = CacheFileAudit::default();
+    for cache in ["writer", "reader"] {
+        audit_cache_dir(&dir.path().join(cache), BLOCK_CACHE_BLOCK_SIZE, &mut audit);
+    }
+    assert_clean("decoded-blocks", &audit);
 }
