@@ -192,6 +192,7 @@ struct JournalLock(File);
 /// `redb-4.1.0/src/tree_store/page_store/header.rs` and `layout.rs`.
 #[derive(Debug, PartialEq, Eq)]
 struct RedbHeader {
+    page_size: u64,
     /// Bytes the layout of the header's durable commit covers.
     layout_len: u64,
     /// Set while a writer has the file open and cleared when it closes.
@@ -201,6 +202,8 @@ struct RedbHeader {
 impl RedbHeader {
     const MAGIC: [u8; 9] = [b'r', b'e', b'd', b'b', 0x1A, 0x0A, 0xA9, 0x0D, 0x0A];
     const LEN: usize = 32;
+    /// The page size `Builder::new()` gives every journal database.
+    const PAGE_SIZE: u64 = 4096;
 
     /// `None` when the bytes hold no redb header yet.
     fn parse(bytes: &[u8]) -> Option<Self> {
@@ -225,6 +228,7 @@ impl RedbHeader {
             (region_header_pages + trailing_data_pages).saturating_mul(page_size)
         };
         Some(Self {
+            page_size,
             layout_len: page_size
                 .saturating_add(full_regions.saturating_mul(full_region))
                 .saturating_add(trailing_region),
@@ -241,11 +245,23 @@ impl RedbHeader {
         Ok(Self::parse(&bytes))
     }
 
-    /// Refuse a file that ends before the end its header describes. redb makes
-    /// a commit's header durable before it truncates the file, so a crash on an
-    /// honest device never leaves this; a device that dropped the header write
-    /// and kept the truncation does. redb itself panics on it.
-    fn ensure_not_truncated(&self, found: u64, path: &Path) -> Result<()> {
+    /// Refuse the two header states redb 4.1 asserts on before it reads
+    /// anything else (page_manager.rs:230-231), with the reason.
+    ///
+    /// A file that ends before the end its header describes needs a device
+    /// that lied: redb makes a commit's header durable before it truncates the
+    /// file, so a crash on an honest device never leaves this, and a device
+    /// that dropped the header write but kept the truncation does.
+    fn ensure_openable(&self, found: u64, path: &Path) -> Result<()> {
+        if self.page_size != Self::PAGE_SIZE {
+            bail!(
+                "writeback journal database {} is damaged: its header records a page size of {} \
+                 bytes, and the journal writes {}-byte pages",
+                path.display(),
+                self.page_size,
+                Self::PAGE_SIZE
+            );
+        }
         if found < self.layout_len {
             bail!(
                 "writeback journal database {} is {found} bytes, shorter than the {} bytes \
@@ -258,6 +274,41 @@ impl RedbHeader {
             );
         }
         Ok(())
+    }
+}
+
+/// Run one redb open of the journal database, turning a panic inside it into
+/// an error that names the file.
+///
+/// redb 4.1 asserts instead of returning an error on some damaged files: the
+/// header checks at page_manager.rs:230-231 (also refused before this call
+/// with a precise reason), the region arithmetic of layout.rs:23 and
+/// layout.rs:114-132, and whatever its repair meets in damaged pages. A device
+/// that tears or drops writes can leave any of these, and a startup panic
+/// names neither the file nor the cause. The open owns the file it was given
+/// and shares no state with the caller, so nothing is left half-updated when
+/// it unwinds. The default panic hook still prints redb's message, which this
+/// error carries too. Builds with `panic = "abort"` would not reach here.
+fn open_journal_database<T>(
+    path: &Path,
+    open: impl FnOnce() -> Result<T, redb::DatabaseError>,
+) -> Result<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(open)) {
+        Ok(opened) => {
+            opened.with_context(|| format!("failed to open journal database {}", path.display()))
+        }
+        Err(panic) => {
+            let reason = panic
+                .downcast_ref::<&str>()
+                .map(|reason| (*reason).to_owned())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "no message".to_owned());
+            bail!(
+                "writeback journal database {} is damaged: redb failed an internal check while \
+                 opening it ({reason})",
+                path.display()
+            )
+        }
     }
 }
 
@@ -638,7 +689,7 @@ impl Journal {
             )
         })?;
         if let Some(header) = RedbHeader::parse(&image) {
-            header.ensure_not_truncated(image.len() as u64, &path)?;
+            header.ensure_openable(image.len() as u64, &path)?;
             if header.recovery_required || header.layout_len != image.len() as u64 {
                 bail!(
                     "writeback journal database {} was not closed cleanly and needs recovery, \
@@ -651,15 +702,12 @@ impl Journal {
         copy.set_len(image.len() as u64)?;
         copy.write(0, &image)?;
         drop(image);
-        let database = Builder::new()
-            .set_repair_callback(|session| session.abort())
-            .create_with_backend(copy)
-            .with_context(|| {
-                format!(
-                    "failed to open a copy of existing journal database {}",
-                    path.display()
-                )
-            })?;
+        let database = open_journal_database(&path, || {
+            Builder::new()
+                .set_repair_callback(|session| session.abort())
+                .create_with_backend(copy)
+        })
+        .context("failed to read the identity from a copy of the journal database")?;
         during_read();
         let read = database
             .begin_read()
@@ -729,18 +777,12 @@ impl Journal {
         root_dir.open_or_create_child("tmp".as_ref(), 0o700)?;
         let (database_file, database_existed) =
             root_dir.open_owner_file("journal.redb".as_ref(), true)?;
+        let database_path = root.join("journal.redb");
         if let Some(header) = RedbHeader::read(&database_file)? {
-            header.ensure_not_truncated(
-                database_file.metadata()?.len(),
-                &root.join("journal.redb"),
-            )?;
+            header.ensure_openable(database_file.metadata()?.len(), &database_path)?;
         }
-        let database = Builder::new().create_file(database_file).with_context(|| {
-            format!(
-                "failed to open journal database {}",
-                root.join("journal.redb").display()
-            )
-        })?;
+        let database =
+            open_journal_database(&database_path, || Builder::new().create_file(database_file))?;
         if !database_existed {
             root_dir.sync()?;
         }
@@ -4339,6 +4381,7 @@ mod tests {
         assert_eq!(
             super::RedbHeader::parse(&closed),
             Some(super::RedbHeader {
+                page_size: 4096,
                 layout_len: closed.len() as u64,
                 recovery_required: false,
             })
@@ -4350,6 +4393,7 @@ mod tests {
         assert_eq!(
             super::RedbHeader::parse(&raw),
             Some(super::RedbHeader {
+                page_size: 4096,
                 layout_len: raw.len() as u64,
                 recovery_required: false,
             })
