@@ -656,6 +656,10 @@ fn upload_admit_request(state: &AppState) -> Result<Arc<UploadRequestGuard>, FsE
     state.upload_ingress.try_request()
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "the error is the HTTP response the handler returns as it is"
+)]
 async fn upload_next_body_data(
     state: &AppState,
     body: &mut axum::body::Body,
@@ -954,7 +958,7 @@ fn upload_parse_sha256(value: &str) -> Option<[u8; 32]> {
         return None;
     }
     let mut digest = [0u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let pair = std::str::from_utf8(pair).ok()?;
         digest[index] = u8::from_str_radix(pair, 16).ok()?;
     }
@@ -1089,6 +1093,10 @@ async fn upload_assemble_segments(
     Ok(resolved_segments)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "the error is the HTTP response the handler returns as it is"
+)]
 async fn upload_read_commit_request(
     state: &AppState,
     body: &mut axum::body::Body,
