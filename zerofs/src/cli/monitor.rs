@@ -64,10 +64,14 @@ impl MonitorApp {
         if let (Some(base), Some(base_time)) = (&self.rate_base, &self.rate_base_time) {
             let elapsed = base_time.elapsed().as_secs_f64();
             if elapsed >= CHART_INTERVAL_SECS {
-                let read_bps =
-                    (snapshot.bytes_read.saturating_sub(base.bytes_read)) as f64 / elapsed;
-                let write_bps =
-                    (snapshot.bytes_written.saturating_sub(base.bytes_written)) as f64 / elapsed;
+                // A counter the server omitted has no rate. Skip the point
+                // rather than chart an invented zero.
+                let rate = |now: Option<u64>, then: Option<u64>| {
+                    now.zip(then)
+                        .map(|(now, then)| now.saturating_sub(then) as f64 / elapsed)
+                };
+                let read_bps = rate(snapshot.bytes_read, base.bytes_read);
+                let write_bps = rate(snapshot.bytes_written, base.bytes_written);
                 let read_ops = (snapshot
                     .read_operations
                     .saturating_sub(base.read_operations)) as f64
@@ -81,8 +85,12 @@ impl MonitorApp {
                     .saturating_sub(base.total_operations)) as f64
                     / elapsed;
 
-                push_ring(&mut self.read_throughput, read_bps);
-                push_ring(&mut self.write_throughput, write_bps);
+                if let Some(read_bps) = read_bps {
+                    push_ring(&mut self.read_throughput, read_bps);
+                }
+                if let Some(write_bps) = write_bps {
+                    push_ring(&mut self.write_throughput, write_bps);
+                }
                 push_ring(&mut self.read_iops, read_ops);
                 push_ring(&mut self.write_iops, write_ops);
                 push_ring(&mut self.total_ops, total as u64);
@@ -376,20 +384,22 @@ fn render_total_ops_sparkline(f: &mut Frame, app: &MonitorApp, area: Rect) {
 fn render_storage_gauge(f: &mut Frame, app: &MonitorApp, area: Rect) {
     let (used, max) = match &app.current {
         Some(s) => (s.used_bytes, s.max_bytes),
-        None => (0, 0),
+        None => (None, 0),
     };
-    let ratio = if max > 0 {
-        (used as f64 / max as f64).min(1.0)
-    } else {
-        0.0
+    let ratio = match used {
+        Some(used) if max > 0 => (used as f64 / max as f64).min(1.0),
+        _ => 0.0,
     };
     let label = format!(
         "{} / {} ({} inodes)",
-        format_bytes_human(used),
+        used.map_or_else(|| "unavailable".to_string(), format_bytes_human),
         format_bytes_human(max),
         app.current
             .as_ref()
-            .map(|s| s.used_inodes.to_formatted_string(&Locale::en))
+            .map(|s| s.used_inodes.map_or_else(
+                || "unavailable".to_string(),
+                |n| n.to_formatted_string(&Locale::en)
+            ))
             .unwrap_or_default()
     );
     let color = if ratio > 0.9 {

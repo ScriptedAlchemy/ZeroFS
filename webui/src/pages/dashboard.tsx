@@ -9,6 +9,10 @@ import { OperationCounters } from "../components/dashboard/OperationCounters";
 import { GCStats } from "../components/dashboard/GCStats";
 import { FileAccessTracer } from "../components/dashboard/FileAccessTracer";
 
+// The server omits a counter it cannot state; show that instead of a 0.
+const reported = (value: bigint | undefined, show: (value: bigint) => string) =>
+  value === undefined ? "Unavailable" : show(value);
+
 export function DashboardPage() {
   useTitle("Monitor");
   const { snapshot, history, error } = useStatsStream(1000);
@@ -52,22 +56,22 @@ export function DashboardPage() {
         />
         <StatCard
           title="Bytes Read"
-          value={formatSize(snapshot.bytesRead)}
+          value={reported(snapshot.bytesRead, formatSize)}
           icon={<Activity size={18} strokeWidth={1.5} />}
         />
         <StatCard
           title="Bytes Written"
-          value={formatSize(snapshot.bytesWritten)}
+          value={reported(snapshot.bytesWritten, formatSize)}
           icon={<HardDrive size={18} strokeWidth={1.5} />}
         />
         <StatCard
           title="Storage Used"
-          value={formatSize(snapshot.usedBytes)}
+          value={reported(snapshot.usedBytes, formatSize)}
           icon={<Weight size={18} strokeWidth={1.5} />}
         />
         <StatCard
           title="Inodes Used"
-          value={snapshot.usedInodes.toLocaleString()}
+          value={reported(snapshot.usedInodes, (n) => n.toLocaleString())}
           icon={<Database size={18} strokeWidth={1.5} />}
         />
       </div>
