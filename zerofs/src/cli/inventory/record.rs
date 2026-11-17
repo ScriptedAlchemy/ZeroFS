@@ -36,7 +36,6 @@ pub(crate) enum Reason {
     NotImplementedOnPlatform,
     NotApplicableOnPlatform,
     TrustedNamespaceNotVisible,
-    #[cfg(target_os = "linux")]
     MountIdUnavailable,
     #[cfg(target_os = "linux")]
     ProcFdUnavailable,

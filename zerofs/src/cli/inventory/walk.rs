@@ -954,6 +954,80 @@ fn content_hash(fd: BorrowedFd<'_>) -> Field<String> {
     }
 }
 
+/// The filesystem identity that macOS `fstatfs` reports for an open descriptor.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct MountIdentity {
+    pub fsid: [i32; 2],
+    pub mount_point: Vec<u8>,
+}
+
+// Today's macOS rule: the device number decides, and the mount identity is ignored.
+#[cfg(test)]
+fn mount_boundary<T: PartialEq>(_root: &Field<T>, _entry: &Field<T>) -> Option<Reason> {
+    None
+}
+
+#[cfg(test)]
+mod mount_boundary_tests {
+    use super::*;
+
+    fn mount(fsid: [i32; 2], mount_point: &str) -> Field<MountIdentity> {
+        Field::Observed(MountIdentity {
+            fsid,
+            mount_point: mount_point.as_bytes().to_vec(),
+        })
+    }
+
+    fn unreadable() -> Field<MountIdentity> {
+        Field::Unavailable {
+            reason: Reason::MountIdUnavailable,
+            errno: Some(libc::EIO),
+        }
+    }
+
+    #[test]
+    fn identical_mount_identity_is_the_same_mount() {
+        let root = mount([7, 26], "/Volumes/source");
+        assert_eq!(
+            mount_boundary(&root, &mount([7, 26], "/Volumes/source")),
+            None
+        );
+    }
+
+    #[test]
+    fn another_mount_point_with_the_same_filesystem_id_is_a_boundary() {
+        // The walker reaches this comparison only when the device numbers are equal.
+        let root = mount([7, 26], "/Volumes/source");
+        assert_eq!(
+            mount_boundary(&root, &mount([7, 26], "/Volumes/source/nested")),
+            Some(Reason::MountBoundary)
+        );
+    }
+
+    #[test]
+    fn another_filesystem_id_on_the_same_mount_point_is_a_boundary() {
+        let root = mount([7, 26], "/Volumes/source");
+        assert_eq!(
+            mount_boundary(&root, &mount([8, 26], "/Volumes/source")),
+            Some(Reason::MountBoundary)
+        );
+    }
+
+    #[test]
+    fn unreadable_mount_identity_prevents_reads_and_descent() {
+        let root = mount([7, 26], "/Volumes/source");
+        assert_eq!(
+            mount_boundary(&root, &unreadable()),
+            Some(Reason::MountIdUnavailable)
+        );
+        assert_eq!(
+            mount_boundary(&unreadable(), &root),
+            Some(Reason::MountIdUnavailable)
+        );
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
