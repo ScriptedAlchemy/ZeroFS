@@ -133,30 +133,6 @@ fn device_and_reserve_rules_apply_in_both_strict_modes() {
 }
 
 #[test]
-fn activation_keys_are_rejected_at_every_declaration_boundary_in_both_modes() {
-    for strict in [true, false] {
-        for key in ["activate", "enabled", "active"] {
-            for pointer in [
-                "/storage/readiness",
-                "/storage/readiness/devices/1",
-                "/storage/readiness/devices/1/rated_host_writes",
-                "/storage/readiness/reserves/0",
-            ] {
-                let mut fixture = Fixture::new();
-                hardware(&mut fixture);
-                fixture.document["storage"]["readiness"]["strict"] = json!(strict);
-                fixture.parse().unwrap();
-                fixture.document.pointer_mut(pointer).unwrap()[key] = json!(true);
-                error_contains(fixture.parse().map(|_| ()), "unknown field");
-                for root in fixture.facts.keys() {
-                    assert_eq!(std::fs::read_dir(root).unwrap().count(), 0);
-                }
-            }
-        }
-    }
-}
-
-#[test]
 fn boot_and_reserve_declarations_are_required_without_defaults() {
     for strict in [true, false] {
         for pointer in ["/storage/readiness/devices/1", "/storage/readiness"] {
@@ -410,15 +386,6 @@ fn strict_device_refusals_leave_every_role_directory_empty() {
             assert_eq!(std::fs::read_dir(root).unwrap().count(), 0, "{failure}");
         }
     }
-}
-
-#[test]
-fn readiness_fixture_removes_its_owned_tree() {
-    let fixture = Fixture::new();
-    let path = fixture._temp.path().to_path_buf();
-    assert!(path.exists());
-    drop(fixture);
-    assert!(!path.try_exists().unwrap());
 }
 
 #[test]

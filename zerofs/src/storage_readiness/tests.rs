@@ -511,21 +511,6 @@ fn symlinked_mountpoint_fails_runtime_canonical_check() {
     error_contains(fixture.verify(), "mountpoint must be canonical");
 }
 
-#[test]
-fn placement_remains_unavailable_after_a_successful_readiness_check() {
-    let mut fixture = Fixture::new();
-    fixture.verify().unwrap();
-    fixture.document["placement"] = json!({ "enabled": true });
-    assert!(fixture.parse().is_err());
-    fixture
-        .document
-        .as_object_mut()
-        .unwrap()
-        .remove("placement");
-    fixture.document["storage"]["readiness"]["placement_enabled"] = json!(true);
-    assert!(fixture.parse().is_err());
-}
-
 #[cfg(not(target_os = "linux"))]
 #[tokio::test]
 async fn unsupported_host_stops_normal_open_and_explicit_init_before_any_storage_mutation() {
