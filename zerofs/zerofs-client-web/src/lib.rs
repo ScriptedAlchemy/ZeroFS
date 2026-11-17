@@ -168,6 +168,14 @@ impl WebClient {
         self.inner.rename(from, to).await.map_err(js_error)
     }
 
+    #[wasm_bindgen(js_name = renameNoReplace)]
+    pub async fn rename_no_replace(&self, from: String, to: String) -> Result<(), JsValue> {
+        self.inner
+            .rename_no_replace(from, to)
+            .await
+            .map_err(js_error)
+    }
+
     pub async fn symlink(&self, target: String, link_path: String) -> Result<JsValue, JsValue> {
         let metadata = self
             .inner
@@ -273,6 +281,11 @@ impl WebFile {
             .write_at(offset, &data)
             .await
             .map_err(js_error)
+    }
+
+    #[wasm_bindgen(js_name = setLen)]
+    pub async fn set_len(&self, size: u64) -> Result<(), JsValue> {
+        self.inner()?.set_len(size).await.map_err(js_error)
     }
 
     #[wasm_bindgen(js_name = syncAll)]

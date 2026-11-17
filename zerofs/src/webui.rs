@@ -1656,7 +1656,11 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn wasm_client_smoke() {
-        let filesystem = Arc::new(ZeroFS::new_in_memory().await.expect("in-memory filesystem"));
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory_with_name_mode(crate::fs::name_mode::NameMode::Insensitive)
+                .await
+                .expect("case-insensitive in-memory filesystem"),
+        );
         let state = SmokeState {
             app: AppState {
                 filesystem,

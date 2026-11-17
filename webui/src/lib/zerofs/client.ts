@@ -5,6 +5,7 @@ import initWasm, {
 } from "../../generated/zerofs-client/zerofs_client";
 import { pooled } from "../async";
 import { joinPath as join } from "../format";
+import { directoryListing, RawFilenameError, textPathEntries, type DirectoryListing } from "./directory-listing";
 import { readFileChunks } from "./read-pipeline";
 
 export type ConnectionState = "disconnected" | "connecting" | "connected";
@@ -16,6 +17,7 @@ export interface TrafficStats {
 }
 
 interface UploadOptions {
+  replace?: boolean;
   onProgress?: (sent: number, total: number) => void;
   signal?: AbortSignal;
   batch?: UploadBatch;
@@ -124,7 +126,7 @@ export interface SearchResult {
 const asBigInt = (value: bigint | number): bigint => BigInt(value);
 let temporaryFileSequence = 0;
 
-function isErrno(error: unknown, errno: number): boolean {
+export function isErrno(error: unknown, errno: number): boolean {
   return error instanceof Error && "ecode" in error && error.ecode === errno;
 }
 
@@ -325,14 +327,13 @@ export class ZeroFsClient {
     }
   }
 
-  private async writeAll(file: SharedFile, data: Uint8Array, signal?: AbortSignal): Promise<void> {
+  private async writeAll(file: SharedFile, data: Uint8Array): Promise<void> {
     let offset = 0;
-    while (offset < data.length && !signal?.aborted) {
+    while (offset < data.length) {
       const end = Math.min(data.length, offset + this.maxWriteChunk);
       await file.writeAt(BigInt(offset), data.subarray(offset, end));
       offset = end;
     }
-    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
   }
 
   private async readDirectoryEntries(fs: SharedClient, path: string, signal?: AbortSignal): Promise<WireDirEntry[]> {
@@ -351,11 +352,11 @@ export class ZeroFsClient {
     }
   }
 
-  async listDirectory(path: string, signal?: AbortSignal): Promise<FileEntry[]> {
+  async directoryListing(path: string, signal?: AbortSignal): Promise<DirectoryListing<FileEntry>> {
     const fs = await this.fs();
     const entries = await this.readDirectoryEntries(fs, path, signal);
     if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-    return entries.map((entry): FileEntry => {
+    return directoryListing(entries, (entry): FileEntry => {
       const metadata = entry.metadata;
       const isDir = entry.file_type === "Dir";
       return {
@@ -371,6 +372,10 @@ export class ZeroFsClient {
         nlink: asBigInt(metadata.nlink),
       };
     });
+  }
+
+  private async listDirectory(path: string, signal?: AbortSignal): Promise<FileEntry[]> {
+    return textPathEntries(await this.directoryListing(path, signal), path);
   }
 
   async stat(path: string): Promise<FileInfo> {
@@ -396,20 +401,21 @@ export class ZeroFsClient {
   ): Promise<{ applied: number; failed: number }> {
     const result = { applied: 0, failed: 0 };
     const visit = async (path: string): Promise<void> => {
+      const children = await this.listDirectory(path, signal);
       try {
         await this.setattr(path, opts);
         result.applied++;
       } catch {
         result.failed++;
       }
-      const children = await this.listDirectory(path, signal);
       await pooled(children, 8, async (entry) => {
         if (signal?.aborted) return;
         const child = join(path, entry.name);
         if (entry.isDir) {
           try {
             await visit(child);
-          } catch {
+          } catch (error) {
+            if (error instanceof RawFilenameError) throw error;
             result.failed++;
           }
         } else {
@@ -446,7 +452,8 @@ export class ZeroFsClient {
             result.files++;
             onProgress?.({ ...result });
           }
-        } catch {
+        } catch (error) {
+          if (error instanceof RawFilenameError) throw error;
           // Skip inaccessible entries.
         }
       });
@@ -487,24 +494,13 @@ export class ZeroFsClient {
     return result;
   }
 
-  async writeFile(path: string, data: Uint8Array, mode = 0o644, signal?: AbortSignal): Promise<void> {
+  async createFile(path: string): Promise<void> {
     const fs = await this.fs();
-    const temporary = await this.createTemporaryFile(fs, path, mode);
-    let renamed = false;
+    const file = await fs.openFile(path, false, true, true, true, false, 0o644);
     try {
-      await this.writeAll(temporary.file, data, signal);
-      await fs.rename(temporary.path, path);
-      renamed = true;
       await fs.sync();
     } finally {
-      await temporary.file.close();
-      if (!renamed) {
-        try {
-          await fs.removeFile(temporary.path);
-        } catch {
-          // Best-effort cleanup after a failed or cancelled write.
-        }
-      }
+      await file.close();
     }
   }
 
@@ -526,7 +522,15 @@ export class ZeroFsClient {
   }
 
   async saveFile(path: string, data: Uint8Array): Promise<void> {
-    await this.writeFile(path, data);
+    const fs = await this.fs();
+    const file = await fs.openFile(path, false, true, false, false, false, 0);
+    try {
+      await this.writeAll(file, data);
+      await file.setLen(BigInt(data.length));
+      await file.syncAll();
+    } finally {
+      await file.close();
+    }
   }
 
   async mkdir(path: string, mode = 0o755): Promise<void> {
@@ -555,33 +559,35 @@ export class ZeroFsClient {
         if (entry.isDir) {
           try {
             await visit(child);
-          } catch {
-            // It may already have disappeared or become inaccessible.
+          } catch (error) {
+            if (!isErrno(error, 2)) throw error;
           }
         } else {
           try {
             await this.remove(child);
-          } catch {
-            // It may already have disappeared.
+            onProgress?.(++deleted, child);
+          } catch (error) {
+            if (!isErrno(error, 2)) throw error;
           }
-          onProgress?.(++deleted, child);
         }
       });
       if (!signal?.aborted) {
         try {
           await this.removeDir(path);
-        } catch {
-          // It may already have disappeared.
+          onProgress?.(++deleted, path);
+        } catch (error) {
+          if (!isErrno(error, 2)) throw error;
         }
-        onProgress?.(++deleted, path);
       }
     };
     await visit(dirPath);
     return deleted;
   }
 
-  async rename(oldPath: string, newPath: string): Promise<void> {
-    await (await this.fs()).rename(oldPath, newPath);
+  async rename(oldPath: string, newPath: string, replace = false): Promise<void> {
+    const fs = await this.fs();
+    if (replace) await fs.rename(oldPath, newPath);
+    else await fs.renameNoReplace(oldPath, newPath);
   }
 
   async symlink(path: string, target: string): Promise<void> {
@@ -629,7 +635,7 @@ export class ZeroFsClient {
     URL.revokeObjectURL(url);
   }
 
-  async uploadBlob(targetPath: string, blob: Blob, { onProgress, signal, batch }: UploadOptions = {}): Promise<void> {
+  async uploadBlob(targetPath: string, blob: Blob, { onProgress, signal, batch, replace = false }: UploadOptions = {}): Promise<void> {
     if (batch?.finished) throw new Error("Upload batch has already finished");
     const fs = await this.fs();
     const temporary = await this.createTemporaryFile(fs, targetPath, 0o644);
@@ -646,7 +652,7 @@ export class ZeroFsClient {
         onProgress?.(offset, blob.size);
       }
       if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-      await fs.rename(temporary.path, targetPath);
+      await this.rename(temporary.path, targetPath, replace);
       renamed = true;
       if (batch) {
         if (batch.finished) throw new Error("Upload batch finished while a file was still uploading");
@@ -708,7 +714,8 @@ export class ZeroFsClient {
       if (signal?.aborted) return;
       try {
         await this.searchDir(path, regex, onResult, signal, depth + 1, maxDepth);
-      } catch {
+      } catch (error) {
+        if (error instanceof RawFilenameError) throw error;
         // Skip inaccessible directories.
       }
     });
@@ -735,7 +742,7 @@ export class ZeroFsClient {
           results.push({ path: relative, data: await this.readFile(child, signal) });
         }
       } catch (error) {
-        if (error instanceof DOMException && error.name === "AbortError") throw error;
+        if (error instanceof RawFilenameError || (error instanceof DOMException && error.name === "AbortError")) throw error;
       }
     });
     return results;
