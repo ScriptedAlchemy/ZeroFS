@@ -117,6 +117,10 @@ pub struct EvacuationCapacity {
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct PoolStatus {
     pub pool_id: String,
+    /// Server wall-clock milliseconds when the catalog snapshot was read. Health
+    /// `observed_ms` uses the same clock, so a reader can tell an observation's age
+    /// without trusting its own clock.
+    pub generated_ms: i64,
     pub members: Vec<PoolMemberStatus>,
     pub pending_operations: usize,
     pub mapped_objects: u64,

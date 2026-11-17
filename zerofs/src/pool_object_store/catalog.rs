@@ -1038,6 +1038,8 @@ impl Catalog {
         active: Option<&super::EvacuationProgress>,
     ) -> Result<PoolStatus> {
         let tx = self.database.begin_read()?;
+        // Read after the snapshot opens, so every observation it holds is no later.
+        let generated_ms = chrono::Utc::now().timestamp_millis();
         let mut counts = BTreeMap::<String, u64>::new();
         let mut mapped_objects = 0_u64;
         let mut quarantined_leftovers = Vec::new();
@@ -1263,6 +1265,7 @@ impl Catalog {
             .context("pending count overflow")?;
         Ok(PoolStatus {
             pool_id: self.identity.pool_id.clone(),
+            generated_ms,
             members,
             pending_operations,
             mapped_objects,
