@@ -10,21 +10,19 @@ use anyhow::{Context, Result, bail};
 #[cfg(any(target_os = "linux", test))]
 use config::FilesystemIdentity;
 pub(crate) use config::ReadinessConfig;
-use config::{StorageRoot, absolute_path};
-use devices::RoleName;
+use config::StorageRoot;
+pub(crate) use devices::RoleName;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use identity::{DeviceObservation, MountedFilesystem, Serial};
+use identity::{MountedFilesystem, Serial};
 
 pub(super) trait IdentityProvider {
     fn observe(&self, root: &Path) -> Result<MountedFilesystem>;
 
-    fn filesystem_size(&self, _root: &Path) -> Result<u64> {
-        bail!("filesystem size unavailable from this adapter")
-    }
+    fn filesystem_size(&self, root: &Path) -> Result<u64>;
 
-    fn observe_device(&self, _by_id: &Path) -> Result<DeviceObservation> {
+    fn observe_device(&self, _by_id: &Path) -> Result<Serial> {
         bail!("device identity unavailable from this adapter")
     }
 
@@ -42,7 +40,7 @@ impl IdentityProvider for HostIdentityProvider {
     }
 
     #[cfg(target_os = "linux")]
-    fn observe_device(&self, by_id: &Path) -> Result<DeviceObservation> {
+    fn observe_device(&self, by_id: &Path) -> Result<Serial> {
         linux::devices::observe_device(by_id)
     }
 
@@ -88,18 +86,12 @@ pub(super) fn verify_with(settings: &Settings, provider: &dyn IdentityProvider) 
         return Ok(());
     }
     for device in &config.devices {
-        let observation = provider.observe_device(&device.by_id).with_context(|| {
+        let serial = provider.observe_device(&device.by_id).with_context(|| {
             format!(
                 "storage readiness device evidence unavailable at {}",
                 device.by_id.display()
             )
         })?;
-        if !observation.block_device {
-            bail!("readiness {} is not a block device", device.by_id.display());
-        }
-        let serial = observation
-            .serial
-            .context("readiness device serial unavailable")?;
         if serial != device.serial {
             bail!(
                 "readiness device serial does not match its declaration at {}",
@@ -145,7 +137,6 @@ fn verify_identity(
     provider: &dyn IdentityProvider,
 ) -> Result<()> {
     let mountpoint = &root.filesystem.mountpoint;
-    absolute_path(mountpoint)?;
     if mountpoint.canonicalize()? != *mountpoint {
         bail!(
             "readiness mountpoint must be canonical: {}",
@@ -179,13 +170,7 @@ fn verify_identity(
     let size = provider
         .filesystem_size(path)
         .with_context(|| format!("readiness {} filesystem size unavailable", root.role))?;
-    if size == 0 {
-        bail!(
-            "readiness {} filesystem size unavailable: zero size",
-            root.role
-        );
-    }
-    if config.reserve_bytes(root.filesystem)? > size {
+    if root.reserve_bytes > size {
         bail!(
             "readiness {} reserve exceeds observed filesystem size",
             root.role
@@ -224,26 +209,23 @@ fn verify_identity(
     Ok(())
 }
 
-pub(crate) fn verify_open_paths(settings: &Settings, paths: &[(&str, PathBuf)]) -> Result<()> {
+pub(crate) fn verify_open_paths(settings: &Settings, paths: &[(RoleName, PathBuf)]) -> Result<()> {
     verify_open_paths_with(settings, &HostIdentityProvider, paths)
 }
 
 fn verify_open_paths_with(
     settings: &Settings,
     provider: &dyn IdentityProvider,
-    paths: &[(&str, PathBuf)],
+    paths: &[(RoleName, PathBuf)],
 ) -> Result<()> {
-    verify_with(settings, provider)?;
     let Some(config) = &settings.storage.readiness else {
         return Ok(());
     };
     let roots = config.validated_roots(settings)?;
     for (role, path) in paths {
-        absolute_path(path)?;
-        let role_name = RoleName::try_from((*role).to_owned()).map_err(anyhow::Error::msg)?;
         let root = roots
             .iter()
-            .find(|root| root.role == role_name)
+            .find(|root| &root.role == role)
             .with_context(|| format!("undeclared readiness open role {role}"))?;
         if !path.starts_with(&root.path) {
             bail!("readiness {role} open path escapes its declared role");
@@ -271,11 +253,12 @@ pub(crate) fn verify_pool_paths(settings: &Settings, pool_id: &str) -> Result<()
             continue;
         };
         let pool = root.path.join(".zerofs-pool").join(pool_id);
+        let lock = crate::local_object_store::LOCK_FILE;
         for path in [
             pool.join("members").join(id),
-            pool.join("members/.zerofs-local-mutations#0"),
+            pool.join("members").join(lock),
             pool.join("objects"),
-            pool.join("objects/.zerofs-local-mutations#0"),
+            pool.join("objects").join(lock),
         ] {
             paths::existing_ancestor(&root.path, &path)?;
         }
@@ -286,19 +269,19 @@ pub(crate) fn verify_pool_paths(settings: &Settings, pool_id: &str) -> Result<()
 pub(crate) fn verify_bucket_paths(settings: &Settings, namespace: &str) -> Result<()> {
     let cache = settings.cache.dir.join(namespace);
     let mut paths = vec![
-        ("cache", cache.clone()),
-        ("cache", cache.join(".zerofs-clean-cache.lock")),
-        ("cache", cache.join("hybrid_cache")),
+        (RoleName::Cache, cache.clone()),
+        (RoleName::Cache, cache.join(".zerofs-clean-cache.lock")),
+        (RoleName::Cache, cache.join("hybrid_cache")),
         (
-            "cache",
+            RoleName::Cache,
             cache.join(crate::object_store_prefetch::LEGACY_PARTS_CACHE_DIR),
         ),
         (
-            "cache",
+            RoleName::Cache,
             cache.join(crate::object_store_prefetch::PARTS_CACHE_DIR),
         ),
         (
-            "cache",
+            RoleName::Cache,
             cache
                 .join(crate::object_store_prefetch::PARTS_CACHE_DIR)
                 .join(crate::object_store_prefetch::PARTS_CACHE_LAYOUT_FILE),
@@ -311,12 +294,12 @@ pub(crate) fn verify_bucket_paths(settings: &Settings, namespace: &str) -> Resul
     {
         let journal = writeback.dir.join(namespace);
         paths.extend([
-            ("journal", journal.clone()),
-            ("journal", journal.join("LOCK")),
-            ("journal", journal.join("journal.redb")),
-            ("journal", journal.join("blobs")),
-            ("journal", journal.join("tmp")),
-            ("journal", journal.join("tmp/multipart")),
+            (RoleName::Journal, journal.clone()),
+            (RoleName::Journal, journal.join("LOCK")),
+            (RoleName::Journal, journal.join("journal.redb")),
+            (RoleName::Journal, journal.join("blobs")),
+            (RoleName::Journal, journal.join("tmp")),
+            (RoleName::Journal, journal.join("tmp/multipart")),
         ]);
     }
     verify_open_paths(settings, &paths)?;

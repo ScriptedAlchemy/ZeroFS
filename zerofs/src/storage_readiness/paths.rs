@@ -37,23 +37,24 @@ pub(super) fn verify_role(root: &super::config::StorageRoot<'_>) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("inspect readiness role root"),
     }
-    let children: &[&str] = match root.role {
-        RoleName::Authority => &[
+    let pool_lock = format!(".zerofs-pool/{}", crate::local_object_store::LOCK_FILE);
+    let children: Vec<&str> = match root.role {
+        RoleName::Authority => vec![
             ".zerofs-pool/identity",
-            ".zerofs-pool/.zerofs-local-mutations#0",
-            ".zerofs_bucket_id",
-            "zerofs.key",
-            ".zerofs_ha_leader",
-            ".zerofs_ha_ownership",
-            ".zerofs-local-mutations#0",
+            &pool_lock,
+            crate::bucket_identity::BUCKET_ID_MARKER,
+            crate::key_management::WRAPPED_KEY_FILENAME,
+            crate::replication::leader_record::LEADER_MARKER,
+            crate::replication::leader_record::OWNERSHIP_RECORD,
+            crate::local_object_store::LOCK_FILE,
             "manifest",
             "wal",
             "compacted",
             "segments",
         ],
-        RoleName::Catalog => &["pool.lock", "pool.redb"],
-        RoleName::Member(_) => &[".zerofs-pool"],
-        RoleName::Cache | RoleName::Journal => &[],
+        RoleName::Catalog => vec!["pool.lock", crate::pool_object_store::CATALOG_FILE_NAME],
+        RoleName::Member(_) => vec![".zerofs-pool"],
+        RoleName::Cache | RoleName::Journal => vec![],
     };
     // Startup checks fixed paths and sets bounded by configuration. Never
     // enumerate authority objects, member objects or journal blobs, whose
