@@ -1185,6 +1185,7 @@ fn resume_rejects_corrupted_checkpoint_cursor() {
     let _guard = FIXTURE_LOCK.lock().unwrap();
     let temp = fixture();
     let root = temp.path().join("root");
+    fs::create_dir(&root).unwrap();
     for name in ["a", "b", "c"] {
         fs::create_dir(root.join(name)).unwrap();
         fs::write(root.join(name).join("file"), b"data").unwrap();
