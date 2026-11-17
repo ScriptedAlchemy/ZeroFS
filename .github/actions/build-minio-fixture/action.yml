@@ -18,6 +18,8 @@ runs:
       shell: bash
       env:
         CGO_ENABLED: '0'
+        # Hosted runners saw HTTP/2 stream resets fetching modules and checksum tiles.
+        GODEBUG: http2client=0
         GOBIN: ${{ runner.temp }}/minio-bin
       run: |
         # Keep the same source commits validated by release-pgo.yml.
