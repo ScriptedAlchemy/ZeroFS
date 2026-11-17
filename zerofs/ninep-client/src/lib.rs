@@ -7278,6 +7278,9 @@ mod session_transition_tests {
             // The server returns. The first reconnect attempt must install its
             // connection instead of failing on the earlier contention.
             let (candidate, _candidate_requests) = test_conn_with_receiver();
+            // Replay stops when the supervisor holds the only reference, so
+            // keep a second one, as a mounted client's caller does.
+            let _caller = Arc::clone(&client);
             let restored = tokio::time::timeout(
                 Duration::from_secs(5),
                 client.restore_connection(Arc::clone(&candidate)),
