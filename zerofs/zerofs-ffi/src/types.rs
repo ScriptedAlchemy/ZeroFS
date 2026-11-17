@@ -206,6 +206,7 @@ impl From<ConnectOptions> for zerofs_client::ConnectOptions {
             aname: o.aname,
             msize: o.msize,
             connect_timeout_ms: o.connect_timeout_ms,
+            ..zerofs_client::ConnectOptions::default()
         }
     }
 }

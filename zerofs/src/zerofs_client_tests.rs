@@ -12,6 +12,7 @@ use zerofs_client::{
 };
 
 mod replay;
+mod server_exit;
 mod xattr;
 mod xattr_client;
 

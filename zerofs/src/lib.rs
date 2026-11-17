@@ -244,6 +244,7 @@ pub async fn run_cli() -> Result<()> {
             writeback,
             relaxed_consistency,
             aname,
+            reconnect_timeout,
         } => {
             let opts = mount::MountOptions {
                 msize,
@@ -252,6 +253,7 @@ pub async fn run_cli() -> Result<()> {
                 writeback,
                 relaxed_consistency,
                 aname: aname.unwrap_or_default(),
+                reconnect_timeout,
             };
             if let Err(e) = mount::run(target, mountpoint, opts).await {
                 eprintln!("✗ Error: {:#}", e);

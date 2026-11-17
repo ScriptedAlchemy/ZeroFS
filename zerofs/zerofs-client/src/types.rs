@@ -25,6 +25,11 @@ pub struct ConnectOptions {
     /// Bound on the initial connect+attach; expiry surfaces as
     /// [`crate::ZeroFsError::ConnectFailed`]. `None` = wait indefinitely.
     pub connect_timeout_ms: Option<u32>,
+    /// How long requests wait for a lost server to come back before they fail
+    /// with [`crate::ZeroFsError::ConnectFailed`]. Reconnection continues
+    /// after that, and later requests succeed once a server answers. Must be
+    /// in `1..=120_000`.
+    pub reconnect_timeout_ms: u32,
 }
 
 impl Default for ConnectOptions {
@@ -36,6 +41,7 @@ impl Default for ConnectOptions {
             aname: String::new(),
             msize: 1024 * 1024,
             connect_timeout_ms: Some(30_000),
+            reconnect_timeout_ms: ninep_client::ReconnectTimeout::DEFAULT.get().as_millis() as u32,
         }
     }
 }

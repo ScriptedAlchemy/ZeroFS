@@ -205,7 +205,29 @@ pub enum Commands {
         /// filesystem. The directory must already exist.
         #[arg(long)]
         aname: Option<String>,
+        /// Seconds file operations wait for a lost 9P server before they fail
+        /// with EIO (1 to 120), counted from when the mount notices the loss.
+        /// A failover or restart inside this window is invisible to
+        /// applications. After it, operations fail promptly until a server
+        /// answers again. A process blocked on the mount, even one sent
+        /// SIGKILL, is released when this window ends.
+        #[arg(long, default_value = "30", value_parser = parse_reconnect_timeout)]
+        reconnect_timeout: ninep_client::ReconnectTimeout,
     },
+}
+
+#[cfg(target_os = "linux")]
+fn parse_reconnect_timeout(
+    value: &str,
+) -> std::result::Result<ninep_client::ReconnectTimeout, String> {
+    let max = ninep_client::ReconnectTimeout::MAX.as_secs();
+    value
+        .parse::<u64>()
+        .ok()
+        .and_then(|seconds| {
+            ninep_client::ReconnectTimeout::new(std::time::Duration::from_secs(seconds))
+        })
+        .ok_or_else(|| format!("reconnect timeout must be whole seconds from 1 to {max}"))
 }
 
 fn parse_transfer_jobs(value: &str) -> std::result::Result<usize, String> {

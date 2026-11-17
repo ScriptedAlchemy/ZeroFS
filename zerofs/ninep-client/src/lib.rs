@@ -8,6 +8,14 @@
 //! across resends. Resends stop at the protocol retry horizon; expiry returns a
 //! disconnect error with an ambiguous outcome.
 //!
+//! Requests wait for a replacement connection for at most the session's
+//! [`ReconnectTimeout`], measured from the moment the client notices the loss.
+//! When it expires, every waiting request fails with
+//! [`ClientError::Disconnected`]. A request that was sent but not answered
+//! keeps an ambiguous outcome and is never resent after its caller got the
+//! error. Reconnection continues in the background, and requests issued after
+//! a successful reconnect proceed normally.
+//!
 //! An op-id is local to one public mutation future and is not reusable after the
 //! future completes or is cancelled.
 //!
@@ -239,6 +247,45 @@ async fn await_resend_bounded<T>(
             .await
             .map_err(|_| ClientError::Disconnected),
         None => Ok(future.await),
+    }
+}
+
+/// How long requests wait for a lost server before they fail with
+/// [`ClientError::Disconnected`], which a FUSE mount reports as `EIO`.
+///
+/// The clock starts when the client notices the connection is gone. While it
+/// runs, requests wait and are resent once a replacement connection is
+/// restored, so an HA failover or a quick server restart inside the bound
+/// returns no error. When it expires, every waiting request fails together.
+/// Reconnection continues in the background; until it succeeds, each new
+/// request waits for one fresh reconnect attempt and fails if that attempt
+/// does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReconnectTimeout(Duration);
+
+impl ReconnectTimeout {
+    /// Long enough to ride through an HA takeover several times over, and
+    /// shorter than the 60 second request timeout SMB clients apply, so a
+    /// Samba share over a FUSE mount answers with an error before its clients
+    /// drop the session.
+    pub const DEFAULT: Self = Self(Duration::from_secs(30));
+    /// A dispatched mutation cannot be resent after the protocol retry
+    /// horizon, so a longer bound would not hold every request alike.
+    pub const MAX: Duration = MUTATION_RETRY_HORIZON;
+
+    /// Accepts a bound in `(0, MAX]`.
+    pub fn new(timeout: Duration) -> Option<Self> {
+        (!timeout.is_zero() && timeout <= Self::MAX).then_some(Self(timeout))
+    }
+
+    pub fn get(self) -> Duration {
+        self.0
+    }
+}
+
+impl Default for ReconnectTimeout {
+    fn default() -> Self {
+        Self::DEFAULT
     }
 }
 
@@ -668,6 +715,19 @@ pub struct NinePClient {
     conn: ArcSwap<Conn>,
     /// False while a reconnect+replay is in progress; requests block until true.
     live: AtomicBool,
+    /// How long requests wait for a lost connection to be replaced.
+    reconnect_timeout: ReconnectTimeout,
+    /// Set by the supervisor once an outage outlasts `reconnect_timeout`,
+    /// cleared when a replacement connection is installed. Only meaningful
+    /// while `live` is false.
+    unavailable: AtomicBool,
+    /// Number of reconnect attempts the supervisor has started.
+    reconnect_attempts: AtomicU64,
+    /// Number of the latest reconnect attempt that failed.
+    reconnect_failed_through: AtomicU64,
+    /// Wakes the supervisor's backoff sleep for a caller that arrives during
+    /// a declared outage.
+    retry_now: Arc<Notify>,
     /// Permanent replay errno; zero while replay remains possible.
     terminal_errno: AtomicU32,
     live_notify: Notify,
@@ -737,9 +797,13 @@ impl NinePClient {
     /// Connect to a 9P server over TCP and negotiate the protocol version.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn connect_tcp(addr: SocketAddr, requested_msize: u32) -> std::io::Result<Arc<Self>> {
-        Self::connect(vec![Target::Tcp(addr)], requested_msize)
-            .await
-            .map_err(|e| std::io::Error::other(e.to_string()))
+        Self::connect(
+            vec![Target::Tcp(addr)],
+            requested_msize,
+            ReconnectTimeout::DEFAULT,
+        )
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))
     }
 
     /// Connect to a 9P server over a Unix domain socket and negotiate the version.
@@ -751,6 +815,7 @@ impl NinePClient {
         Self::connect(
             vec![Target::Unix(path.as_ref().to_path_buf())],
             requested_msize,
+            ReconnectTimeout::DEFAULT,
         )
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))
@@ -761,17 +826,37 @@ impl NinePClient {
         targets: Vec<Target>,
         requested_msize: u32,
     ) -> std::io::Result<Arc<Self>> {
-        Self::connect(targets, requested_msize)
+        Self::connect(targets, requested_msize, ReconnectTimeout::DEFAULT)
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))
     }
 
     /// Connect to 9P over a WebSocket.
     pub async fn connect_websocket(url: &str, requested_msize: u32) -> ClientResult<Arc<Self>> {
-        Self::connect(vec![Target::WebSocket(url.to_string())], requested_msize).await
+        Self::connect(
+            vec![Target::WebSocket(url.to_string())],
+            requested_msize,
+            ReconnectTimeout::DEFAULT,
+        )
+        .await
     }
 
-    async fn connect(targets: Vec<Target>, requested_msize: u32) -> ClientResult<Arc<Self>> {
+    /// Connect to a target set with an explicit reconnect timeout.
+    pub async fn connect_multi_with(
+        targets: Vec<Target>,
+        requested_msize: u32,
+        reconnect_timeout: ReconnectTimeout,
+    ) -> std::io::Result<Arc<Self>> {
+        Self::connect(targets, requested_msize, reconnect_timeout)
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
+    async fn connect(
+        targets: Vec<Target>,
+        requested_msize: u32,
+        reconnect_timeout: ReconnectTimeout,
+    ) -> ClientResult<Arc<Self>> {
         let reconnect_notify = Arc::new(Notify::new());
         let counters = Arc::new(TrafficCounters::default());
         let msize_mismatch_warned = Arc::new(AtomicBool::new(false));
@@ -790,6 +875,11 @@ impl NinePClient {
             case_insensitive: conn.case_insensitive.load(Ordering::Acquire),
             conn: ArcSwap::new(conn),
             live: AtomicBool::new(true),
+            reconnect_timeout,
+            unavailable: AtomicBool::new(false),
+            reconnect_attempts: AtomicU64::new(0),
+            reconnect_failed_through: AtomicU64::new(0),
+            retry_now: Arc::new(Notify::new()),
             terminal_errno: AtomicU32::new(0),
             live_notify: Notify::new(),
             reconnect_notify,
@@ -942,10 +1032,14 @@ impl NinePClient {
         winner.ok_or_else(|| last_err.unwrap_or(ClientError::Disconnected))
     }
 
-    /// Reconnects and replays indefinitely after transport loss.
+    /// Reconnects and replays after transport loss for as long as the client
+    /// exists. Once an outage outlasts the reconnect timeout, waiting requests
+    /// fail while reconnection continues in the background.
     fn spawn_supervisor(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
         let notify = Arc::clone(&self.reconnect_notify);
+        let retry_now = Arc::clone(&self.retry_now);
+        let bound = self.reconnect_timeout.get();
         runtime::spawn(async move {
             loop {
                 // Register before reading `dead` to prevent a lost notification.
@@ -966,33 +1060,81 @@ impl NinePClient {
                 }
 
                 warn!("9P connection lost; reconnecting and replaying session…");
-                let mut backoff = RECONNECT_BACKOFF_MIN;
-                loop {
-                    let this = match weak.upgrade() {
-                        Some(t) => t,
-                        None => return,
-                    };
-                    match this.reconnect_once().await {
-                        Ok(()) => {
-                            this.live.store(true, Ordering::Release);
-                            this.live_notify.notify_waiters();
-                            info!("9P session reconnected and restored");
-                            break;
+                let lost = runtime::Clock::now();
+                let reconnect = Self::reconnect_until_restored(&weak, &retry_now);
+                tokio::pin!(reconnect);
+                let outage = runtime::sleep(bound);
+                tokio::pin!(outage);
+                let restored = tokio::select! {
+                    restored = &mut reconnect => restored,
+                    () = &mut outage => {
+                        if let Some(this) = weak.upgrade() {
+                            this.declare_unavailable();
                         }
-                        Err(e) => {
-                            if this.terminal_errno.load(Ordering::Acquire) != 0 {
-                                warn!("9P session replay failed permanently: {e}");
-                                return;
-                            }
-                            debug!("9P reconnect failed ({e}); retrying in {backoff:?}");
-                            drop(this);
-                            runtime::sleep(backoff).await;
-                            backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
-                        }
+                        reconnect.await
                     }
+                };
+                if !restored {
+                    return;
                 }
+                info!(
+                    "9P session reconnected and restored after {} ms",
+                    lost.elapsed_millis()
+                );
             }
         });
+    }
+
+    /// Retries until a replacement connection is installed. Returns false when
+    /// the client was dropped or replay failed permanently.
+    async fn reconnect_until_restored(weak: &std::sync::Weak<Self>, retry_now: &Notify) -> bool {
+        let mut backoff = RECONNECT_BACKOFF_MIN;
+        loop {
+            let Some(this) = weak.upgrade() else {
+                return false;
+            };
+            let attempt = this.reconnect_attempts.fetch_add(1, Ordering::AcqRel) + 1;
+            match this.reconnect_once().await {
+                Ok(()) => {
+                    this.mark_reconnected();
+                    return true;
+                }
+                Err(e) => {
+                    if this.terminal_errno.load(Ordering::Acquire) != 0 {
+                        warn!("9P session replay failed permanently: {e}");
+                        return false;
+                    }
+                    debug!("9P reconnect failed ({e}); retrying in {backoff:?}");
+                    this.reconnect_failed_through
+                        .store(attempt, Ordering::Release);
+                    this.live_notify.notify_waiters();
+                    drop(this);
+                    tokio::select! {
+                        () = runtime::sleep(backoff) => {}
+                        () = retry_now.notified() => {}
+                    }
+                    backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                }
+            }
+        }
+    }
+
+    /// Fails every request waiting for this outage to end. Later requests each
+    /// wait for one fresh reconnect attempt instead of the whole bound.
+    fn declare_unavailable(&self) {
+        warn!(
+            "9P server unreachable for {:?}; failing waiting requests with EIO until a reconnect succeeds",
+            self.reconnect_timeout.get()
+        );
+        self.unavailable.store(true, Ordering::Release);
+        self.live_notify.notify_waiters();
+    }
+
+    /// Releases requests onto the connection the supervisor just installed.
+    fn mark_reconnected(&self) {
+        self.unavailable.store(false, Ordering::Release);
+        self.live.store(true, Ordering::Release);
+        self.live_notify.notify_waiters();
     }
 
     /// Dials, replays, and installs one replacement connection.
@@ -1434,14 +1576,20 @@ impl NinePClient {
     }
 
     /// Block until the connection is live (i.e. not mid-reconnect).
+    ///
+    /// Fails with [`ClientError::Disconnected`] when the supervisor declares
+    /// the outage longer than the reconnect timeout. A caller that arrives
+    /// after that declaration triggers one fresh reconnect attempt and fails
+    /// if it does.
     async fn wait_until_live(&self) -> ClientResult<()> {
-        let terminal_errno = self.terminal_errno.load(Ordering::Acquire);
-        if terminal_errno != 0 {
-            return Err(ClientError::Errno(terminal_errno));
-        }
-        if self.live.load(Ordering::Acquire) {
-            return Ok(());
-        }
+        // A caller already waiting when the outage is declared fails with it.
+        // A caller arriving after the declaration triggers a reconnect attempt
+        // and fails only if an attempt started after its arrival fails.
+        let fresh_attempt = self.unavailable.load(Ordering::Acquire).then(|| {
+            let attempt = self.reconnect_attempts.load(Ordering::Acquire) + 1;
+            self.retry_now.notify_one();
+            attempt
+        });
         loop {
             let notified = self.live_notify.notified();
             tokio::pin!(notified);
@@ -1453,6 +1601,13 @@ impl NinePClient {
             }
             if self.live.load(Ordering::Acquire) {
                 return Ok(());
+            }
+            if self.unavailable.load(Ordering::Acquire)
+                && fresh_attempt.is_none_or(|attempt| {
+                    self.reconnect_failed_through.load(Ordering::Acquire) >= attempt
+                })
+            {
+                return Err(ClientError::Disconnected);
             }
             notified.await;
         }
@@ -3670,6 +3825,11 @@ mod session_transition_tests {
             case_insensitive: conn.case_insensitive.load(Ordering::Acquire),
             conn: ArcSwap::new(conn),
             live: AtomicBool::new(true),
+            reconnect_timeout: ReconnectTimeout::default(),
+            unavailable: AtomicBool::new(false),
+            reconnect_attempts: AtomicU64::new(0),
+            reconnect_failed_through: AtomicU64::new(0),
+            retry_now: Arc::new(Notify::new()),
             terminal_errno: AtomicU32::new(0),
             live_notify: Notify::new(),
             reconnect_notify: Arc::new(Notify::new()),
@@ -6130,6 +6290,197 @@ mod session_transition_tests {
         let tag =
             NinePClient::alloc_tag(&conn, tx, None).expect("allocator missed the last usable tag");
         assert_eq!(tag, NOTAG - 1);
+    }
+
+    /// The server goes away and never returns: the client has no reconnect
+    /// target, so every reconnect attempt fails. Time is paused, so the test
+    /// clock advances only through the client's own timers.
+    mod server_gone {
+        use super::*;
+
+        /// Longer than the client's reconnect bound, so expiry means the
+        /// held request was never failed.
+        const NEVER: Duration = Duration::from_secs(60);
+
+        fn gone_client(
+            max_inflight_requests: usize,
+        ) -> (Arc<NinePClient>, Arc<Conn>, TestRequests) {
+            let (conn, requests) = test_conn_with_receiver();
+            let client = test_client_with_limit(Arc::clone(&conn), max_inflight_requests);
+            client.spawn_supervisor();
+            (client, conn, requests)
+        }
+
+        /// What the supervisor does once a server answers again.
+        fn server_returns(client: &NinePClient) -> (Arc<Conn>, TestRequests) {
+            let (conn, requests) = test_conn_with_receiver();
+            client.conn.store(Arc::clone(&conn));
+            client.mark_reconnected();
+            (conn, requests)
+        }
+
+        async fn settle<T>(task: tokio::task::JoinHandle<T>, what: &str) -> T {
+            tokio::time::timeout(NEVER, task)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{what} was still blocked {NEVER:?} after the server left")
+                })
+                .unwrap()
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_held_request_fails_with_eio_once_the_server_stays_gone() {
+            let (client, conn, _requests) = gone_client(MAX_INFLIGHT_REQUESTS);
+            conn.connection_lost(&client.reconnect_notify);
+
+            let held_client = Arc::clone(&client);
+            let held = tokio::spawn(async move { held_client.getattr(1, 0).await });
+            let error = settle(held, "a getattr issued after the server left")
+                .await
+                .expect_err("no server answered the getattr");
+            assert!(matches!(error, ClientError::Disconnected), "{error}");
+            assert_eq!(error.to_errno(), linux::EIO);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn an_outage_shorter_than_the_bound_returns_no_error() {
+            let (client, conn, _requests) = gone_client(MAX_INFLIGHT_REQUESTS);
+            conn.connection_lost(&client.reconnect_notify);
+            let write_client = Arc::clone(&client);
+            let write = tokio::spawn(async move { write_client.write(7, 0, b"a").await });
+
+            tokio::time::sleep(client.reconnect_timeout.get() - Duration::from_secs(1)).await;
+            assert!(
+                !write.is_finished(),
+                "the write must wait out a short outage"
+            );
+            let (returned, mut returned_requests) = server_returns(&client);
+            let sent =
+                recv_op_request(&mut returned_requests, "the write on the new connection").await;
+            answer(&returned, &sent);
+            assert_eq!(
+                settle(write, "the write held through a short outage")
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(client.unsynced.get(&7).and_then(|u| u.oldest), Some(0));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_failed_held_request_returns_its_admission_permit() {
+            let (client, conn, _requests) = gone_client(1);
+            conn.connection_lost(&client.reconnect_notify);
+
+            let held_client = Arc::clone(&client);
+            let held = tokio::spawn(async move { held_client.getattr(1, 0).await });
+            // Writes take their permit before staging the payload.
+            let queued_client = Arc::clone(&client);
+            let queued = tokio::spawn(async move { queued_client.write(7, 0, b"q").await });
+            assert!(settle(held, "the admitted getattr").await.is_err());
+            assert!(
+                settle(queued, "the write queued for admission")
+                    .await
+                    .is_err()
+            );
+            assert_eq!(client.request_admission.available_permits(), 1);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_request_issued_during_a_declared_outage_fails_without_waiting_for_the_bound() {
+            let (client, conn, _requests) = gone_client(MAX_INFLIGHT_REQUESTS);
+            conn.connection_lost(&client.reconnect_notify);
+            let held_client = Arc::clone(&client);
+            let held = tokio::spawn(async move { held_client.getattr(1, 0).await });
+            assert!(settle(held, "the first getattr").await.is_err());
+
+            let started = tokio::time::Instant::now();
+            let late_client = Arc::clone(&client);
+            let late = tokio::spawn(async move { late_client.getattr(1, 0).await });
+            assert!(
+                settle(late, "a getattr issued during the outage")
+                    .await
+                    .is_err()
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "a request issued during a declared outage waited {:?}",
+                started.elapsed()
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn an_unacknowledged_write_fails_is_not_recorded_and_is_not_resent() {
+            let (client, conn, mut requests) = gone_client(MAX_INFLIGHT_REQUESTS);
+            let write_client = Arc::clone(&client);
+            let write = tokio::spawn(async move { write_client.write(7, 0, b"a").await });
+            let sent = recv_op_request(&mut requests, "the write reached the transport").await;
+            assert!(matches!(sent.body, Message::Twrite(_)));
+            conn.connection_lost(&client.reconnect_notify);
+
+            let error = settle(write, "the unacknowledged write")
+                .await
+                .expect_err("an unacknowledged write must not report success");
+            assert!(matches!(error, ClientError::Disconnected), "{error}");
+            assert!(
+                client.unsynced.get(&7).is_none(),
+                "an unacknowledged write must not create a durability obligation"
+            );
+
+            let (_returned, mut returned_requests) = server_returns(&client);
+            assert_no_request(
+                &mut returned_requests,
+                "a write that already failed to its caller was resent",
+            )
+            .await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn an_unacknowledged_fsync_fails_and_keeps_the_write_obligation() {
+            let (client, conn, mut requests) = gone_client(MAX_INFLIGHT_REQUESTS);
+            conn.lineage_token.store(41, Ordering::Relaxed);
+            let write_client = Arc::clone(&client);
+            let write = tokio::spawn(async move { write_client.write(7, 0, b"a").await });
+            let sent = recv_op_request(&mut requests, "the write").await;
+            answer(&conn, &sent);
+            assert_eq!(write.await.unwrap().unwrap(), 1);
+
+            let fsync_client = Arc::clone(&client);
+            let fsync = tokio::spawn(async move { fsync_client.fsync(7, 0).await });
+            let sent = recv_op_request(&mut requests, "the fsync reached the transport").await;
+            assert!(matches!(sent.body, Message::Tfsyncdur(_)));
+            conn.connection_lost(&client.reconnect_notify);
+
+            let error = settle(fsync, "the unacknowledged fsync")
+                .await
+                .expect_err("an unacknowledged fsync must not report success");
+            assert!(matches!(error, ClientError::Disconnected), "{error}");
+            assert_eq!(
+                client.unsynced.get(&7).and_then(|u| u.oldest),
+                Some(41),
+                "a failed fsync must leave the acknowledged write unsynced"
+            );
+
+            let (returned, mut returned_requests) = server_returns(&client);
+            assert_no_request(
+                &mut returned_requests,
+                "an fsync that already failed to its caller was resent",
+            )
+            .await;
+            let fsync_client = Arc::clone(&client);
+            let fsync = tokio::spawn(async move { fsync_client.fsync(7, 0).await });
+            let sent = recv_op_request(&mut returned_requests, "the next fsync").await;
+            match &sent.body {
+                Message::Tfsyncdur(f) => assert_eq!(
+                    f.token, 41,
+                    "the next fsync must verify the write the failed fsync did not"
+                ),
+                other => panic!("expected Tfsyncdur, got {other:?}"),
+            }
+            reply(&returned, sent.tag, Message::Rfsync(Rfsync));
+            fsync.await.unwrap().unwrap();
+            assert!(client.unsynced.get(&7).is_none());
+        }
     }
 }
 

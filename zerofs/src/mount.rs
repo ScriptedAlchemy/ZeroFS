@@ -20,7 +20,9 @@ use fuser::{
     ReplyLseek, ReplyOpen, ReplyPoll, ReplyStatfs, ReplyWrite, ReplyXattr, Request, Session,
     SessionACL, TimeOrNow,
 };
-use ninep_client::{ClientError, NinePClient, ReaddirState, SetattrBuilder, SetattrTime, Target};
+use ninep_client::{
+    ClientError, NinePClient, ReaddirState, ReconnectTimeout, SetattrBuilder, SetattrTime, Target,
+};
 #[cfg(test)]
 use ninep_proto::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE};
 use ninep_proto::{
@@ -145,6 +147,10 @@ pub struct MountOptions {
     /// Server-side directory the mount is rooted at (9P attach aname). Empty
     /// (or "/") mounts the whole filesystem.
     pub aname: String,
+    /// How long a FUSE request waits for a lost 9P server before the kernel
+    /// gets `EIO`. The kernel releases the calling process, including one
+    /// sent SIGKILL, only when this daemon answers the request.
+    pub reconnect_timeout: ReconnectTimeout,
 }
 
 /// Who may access the mount.
@@ -1958,10 +1964,14 @@ impl Fuse9P {
     }
 }
 
-async fn connect(target: &str, msize: u32) -> Result<Arc<NinePClient>> {
+async fn connect(
+    target: &str,
+    msize: u32,
+    reconnect_timeout: ReconnectTimeout,
+) -> Result<Arc<NinePClient>> {
     // A comma-separated list is an HA node set (dials the leader, re-routes on failover).
     let targets = Target::parse_list(target).map_err(anyhow::Error::msg)?;
-    NinePClient::connect_multi(targets, msize)
+    NinePClient::connect_multi_with(targets, msize, reconnect_timeout)
         .await
         .with_context(|| format!("connecting to 9P server(s) {target}"))
 }
@@ -1991,7 +2001,7 @@ pub async fn run(target: String, mountpoint: PathBuf, opts: MountOptions) -> Res
         .with_writer(std::io::stderr)
         .try_init();
 
-    let client = connect(&target, opts.msize).await?;
+    let client = connect(&target, opts.msize, opts.reconnect_timeout).await?;
     let msize = client.msize();
 
     // Every request binds its own per-user fid by inode id; without --aname
