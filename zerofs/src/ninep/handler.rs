@@ -2439,8 +2439,14 @@ impl NinePHandler {
         let inode = self.filesystem.visible_inode(fid_entry.inode_id).await?;
 
         match inode {
+            // A 9P string carries at most `u16::MAX` bytes. NFS can store a
+            // longer target; refuse it rather than send a reply whose length
+            // field disagrees with its payload.
+            Inode::Symlink(s) if s.target.len() > usize::from(u16::MAX) => {
+                Err(FsError::NameTooLong.into())
+            }
             Inode::Symlink(s) => Ok(Message::Rreadlink(Rreadlink {
-                target: P9String::new(s.target.clone()),
+                target: P9String::new(s.target),
             })),
             _ => Err(P9Error::NotASymlink),
         }
@@ -2795,7 +2801,7 @@ impl NinePHandler {
             start: tg.start,
             length: tg.length,
             proc_id: tg.proc_id,
-            client_id: tg.client_id.data.clone(),
+            client_id: tg.client_id.data,
             fid: tg.fid,
             inode_id: fid.inode_id,
         };
@@ -2809,7 +2815,7 @@ impl NinePHandler {
                 start: conflicting_lock.start,
                 length: conflicting_lock.length,
                 proc_id: conflicting_lock.proc_id,
-                client_id: P9String::new(conflicting_lock.client_id.clone()),
+                client_id: P9String::new(conflicting_lock.client_id),
             }))
         } else {
             Ok(Message::Rgetlock(Rgetlock {

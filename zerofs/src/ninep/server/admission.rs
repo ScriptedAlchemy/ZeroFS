@@ -1,3 +1,4 @@
+use super::frame_codec::frame_admission_bytes;
 use ninep_proto::P9_MAX_MSIZE;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -278,6 +279,17 @@ pub(crate) struct P9ConnectionAdmission {
 }
 
 impl P9ConnectionAdmission {
+    /// Admit one received frame, charged by what its request type can hold.
+    pub(super) async fn admit_frame_or_shutdown(
+        &self,
+        frame: &[u8],
+        shutdown: &CancellationToken,
+    ) -> anyhow::Result<P9AdmissionPermit> {
+        let total = frame_admission_bytes(frame);
+        self.admit_request_or_shutdown(frame.len(), total - frame.len(), shutdown)
+            .await
+    }
+
     #[cfg(test)]
     pub(super) async fn admit_request(
         &self,
@@ -307,24 +319,26 @@ impl P9ConnectionAdmission {
         let permits = u32::try_from(reserved_bytes)
             .map_err(|_| anyhow::anyhow!("9P request memory reservation exceeds u32"))?;
 
-        let global_request =
-            acquire_owned_or_shutdown(Arc::clone(&self.global.requests), 1, shutdown).await?;
+        // Take the connection's slot first. The reader starts a task for every
+        // frame it reads, so a connection can have many frames waiting; they
+        // wait on its own slots, and at most its request limit of them hold
+        // or wait for a process-wide slot.
         let local_request =
             acquire_owned_or_shutdown(Arc::clone(&self.requests), 1, shutdown).await?;
+        let global_request =
+            acquire_owned_or_shutdown(Arc::clone(&self.global.requests), 1, shutdown).await?;
         let local_bytes =
             acquire_owned_or_shutdown(Arc::clone(&self.bytes), permits, shutdown).await?;
         let global_bytes =
             acquire_owned_or_shutdown(Arc::clone(&self.global.bytes), permits, shutdown).await?;
 
-        metrics::gauge!("zerofs_p9_inflight_reserved_bytes").increment(reserved_bytes as f64);
-        metrics::gauge!("zerofs_p9_inflight_requests").increment(1.0);
-        Ok(P9AdmissionPermit {
-            _local_request: local_request,
-            _global_request: global_request,
-            _local_bytes: local_bytes,
-            _global_bytes: global_bytes,
+        Ok(P9AdmissionPermit::shared(
+            local_request,
+            global_request,
+            local_bytes,
+            global_bytes,
             reserved_bytes,
-        })
+        ))
     }
 }
 
@@ -346,6 +360,31 @@ pub(crate) struct P9AdmissionPermit {
     _local_bytes: OwnedSemaphorePermit,
     _global_bytes: OwnedSemaphorePermit,
     reserved_bytes: usize,
+}
+
+impl P9AdmissionPermit {
+    fn shared(
+        local_request: OwnedSemaphorePermit,
+        global_request: OwnedSemaphorePermit,
+        local_bytes: OwnedSemaphorePermit,
+        global_bytes: OwnedSemaphorePermit,
+        reserved_bytes: usize,
+    ) -> Self {
+        metrics::gauge!("zerofs_p9_inflight_reserved_bytes").increment(reserved_bytes as f64);
+        metrics::gauge!("zerofs_p9_inflight_requests").increment(1.0);
+        Self {
+            _local_request: local_request,
+            _global_request: global_request,
+            _local_bytes: local_bytes,
+            _global_bytes: global_bytes,
+            reserved_bytes,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn reserved_bytes(&self) -> usize {
+        self.reserved_bytes
+    }
 }
 
 impl Drop for P9AdmissionPermit {

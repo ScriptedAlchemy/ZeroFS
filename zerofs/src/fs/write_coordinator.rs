@@ -368,7 +368,7 @@ impl WriteCoordinator {
     /// order. A wave of concurrent writers that fragments into many singleton
     /// batches shows up here as a run of 1s.
     #[cfg(test)]
-    fn batch_sizes(&self) -> Vec<usize> {
+    pub(crate) fn batch_sizes(&self) -> Vec<usize> {
         self.batch_sizes
             .lock()
             .expect("write coordinator batch-size probe poisoned")
