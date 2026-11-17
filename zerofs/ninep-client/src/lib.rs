@@ -768,6 +768,10 @@ pub struct NinePClient {
     /// Interrupts a replay candidate so an outage-failed clunk can retire a
     /// fid before another replay snapshot is taken.
     interrupt_replay: Notify,
+    /// Fid retirements waiting for the session transition right now. Replay
+    /// yields only while this is non-zero, so a retirement that already
+    /// finished cannot cancel a later reconnect attempt.
+    retirements_waiting: std::sync::atomic::AtomicUsize,
     /// Permanent replay errno; zero while replay remains possible.
     terminal_errno: AtomicU32,
     live_notify: Notify,
@@ -923,6 +927,7 @@ impl NinePClient {
             reconnect_failed_through: AtomicU64::new(0),
             retry_now: Arc::new(Notify::new()),
             interrupt_replay: Notify::new(),
+            retirements_waiting: std::sync::atomic::AtomicUsize::new(0),
             terminal_errno: AtomicU32::new(0),
             live_notify: Notify::new(),
             reconnect_notify,
@@ -1205,7 +1210,7 @@ impl NinePClient {
         let _transition = self.session_transition.lock().await;
         let result = tokio::select! {
             biased;
-            () = self.interrupt_replay.notified() => Err(ClientError::Disconnected),
+            () = self.retirement_waiting() => Err(ClientError::Disconnected),
             result = self.replay_supervised(&conn) => result,
         };
         if let Err(error) = result {
@@ -1217,6 +1222,20 @@ impl NinePClient {
         old.writer_shutdown.notify_one();
 
         Ok(())
+    }
+
+    /// Resolves while a fid retirement waits for the session transition.
+    async fn retirement_waiting(&self) {
+        loop {
+            let notified = self.interrupt_replay.notified();
+            tokio::pin!(notified);
+            // Register the waiter before the check to avoid a lost wakeup.
+            notified.as_mut().enable();
+            if self.retirements_waiting.load(Ordering::Acquire) > 0 {
+                return;
+            }
+            notified.await;
+        }
     }
 
     fn check_name_mode(&self, conn: &Conn) -> ClientResult<()> {
@@ -2652,12 +2671,23 @@ impl NinePClient {
         match self.session_transition.try_lock() {
             Ok(transition) => transition,
             Err(_) => {
-                if self.conn.load().dead.load(Ordering::Acquire) {
-                    // The candidate may be retrying a recorded lock. End
-                    // that replay before waiting for its transition, or the
-                    // clunk and the lock replay can wait on each other forever.
-                    self.interrupt_replay.notify_one();
+                struct Waiting<'a>(&'a std::sync::atomic::AtomicUsize);
+                impl Drop for Waiting<'_> {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, Ordering::AcqRel);
+                    }
                 }
+                // The candidate may be retrying a recorded lock. End that
+                // replay before waiting for its transition, or the clunk and
+                // the lock replay can wait on each other forever. The count
+                // lasts only as long as this wait: another retirement may hold
+                // the transition instead, and a notification stored for a
+                // replay that never ran would cancel the next reconnect.
+                let _waiting = self.conn.load().dead.load(Ordering::Acquire).then(|| {
+                    self.retirements_waiting.fetch_add(1, Ordering::AcqRel);
+                    self.interrupt_replay.notify_waiters();
+                    Waiting(&self.retirements_waiting)
+                });
                 self.session_transition.lock().await
             }
         }
@@ -4104,6 +4134,7 @@ mod session_transition_tests {
             reconnect_failed_through: AtomicU64::new(0),
             retry_now: Arc::new(Notify::new()),
             interrupt_replay: Notify::new(),
+            retirements_waiting: std::sync::atomic::AtomicUsize::new(0),
             terminal_errno: AtomicU32::new(0),
             live_notify: Notify::new(),
             reconnect_notify: Arc::new(Notify::new()),
@@ -7223,6 +7254,38 @@ mod session_transition_tests {
             assert_eq!(client.request_admission.available_permits(), 1);
             assert_eq!(client.state.lock().unwrap().fids[&7].opened, None);
             drop(transition);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_finished_fid_retirement_does_not_cancel_the_next_reconnect() {
+            let (client, conn, _requests) = gone_client(MAX_INFLIGHT_REQUESTS);
+            conn.connection_lost(&client.reconnect_notify);
+
+            // Two closes during an outage contend for the transition. No
+            // replay is running, so neither has anything to interrupt.
+            let held = client.session_transition.lock().await;
+            let retiring_client = Arc::clone(&client);
+            let retiring = tokio::spawn(async move {
+                drop(retiring_client.fid_retirement_transition().await);
+            });
+            while client.retirements_waiting.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+            drop(held);
+            settle(retiring, "a fid retirement behind another retirement").await;
+            assert_eq!(client.retirements_waiting.load(Ordering::Acquire), 0);
+
+            // The server returns. The first reconnect attempt must install its
+            // connection instead of failing on the earlier contention.
+            let (candidate, _candidate_requests) = test_conn_with_receiver();
+            let restored = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.restore_connection(Arc::clone(&candidate)),
+            )
+            .await
+            .expect("replay with no recorded state must finish");
+            assert!(restored.is_ok(), "{restored:?}");
+            assert!(Arc::ptr_eq(&client.conn.load_full(), &candidate));
         }
 
         #[tokio::test(start_paused = true)]
