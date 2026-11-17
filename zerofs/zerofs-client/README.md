@@ -65,7 +65,16 @@ session's established `msize`. Rust callers that already hold separate strings
 can use `Client::connect_multi(&targets)`.
 
 Use `Client::connect_with` for explicit identity (`uid`/`gid`/`uname`), the
-attach subtree (`aname`), `msize`, and `connect_timeout_ms`.
+attach subtree (`aname`), `msize`, `connect_timeout_ms`, and
+`reconnect_timeout_ms`.
+
+After a disconnect, operations wait for a reconnect for at most
+`reconnect_timeout_ms` (default 30000, at most 120000), counted from the
+moment the client notices the loss. A failover or restart inside that window
+returns no error. When it expires, every waiting operation fails with
+`ConnectFailed`. An operation the server never acknowledged is not reported as
+succeeded and is not resent later. The client keeps reconnecting, so
+operations issued after a server answers again succeed.
 
 ## Lifecycles
 
