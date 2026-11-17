@@ -49,7 +49,7 @@ macro_rules! acceptance_row {
     };
 }
 
-// The only list of rows. It defines the enum, `Row::ALL`, each row's stated
+// This macro is the only list of rows. It defines the enum, `Row::ALL`, each row's stated
 // reason and its ignored test, so a row cannot exist without all four.
 macro_rules! acceptance_rows {
     (
@@ -1974,8 +1974,8 @@ async fn interrupted_case(
 ) -> Result<()> {
     let candidate_slot = Arc::clone(&pause.candidate);
     let result: Result<(CutEvent, SurvivalReceipt, State, Vec<ReadRange>)> = async {
-        // Three completed generations precede the candidate: the third may
-        // retire the first, and the fourth can record that cleanup's completion.
+        // Three completed generations precede the candidate. The third may
+        // retire the first, and the fourth can record that the cleanup completed.
         // The two-generation retention policy otherwise leaves retirement and
         // later debt-completion cut points unreachable.
         let oldest = driver.commit(live).await?;
