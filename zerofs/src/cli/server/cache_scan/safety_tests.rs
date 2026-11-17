@@ -94,22 +94,29 @@ fn an_index_length_cannot_hide_nonzero_entry_padding() {
 }
 
 #[test]
-fn a_truncated_raw_partition_cannot_hide_beside_a_clean_block() {
-    let (root, parts, partition) = parts_fixture();
-    let mut bytes = vec![0; 2 * PAGE];
-    blob(&mut bytes, 0);
-    let mut file = File::create(partition).unwrap();
-    file.write_all(&bytes).unwrap();
-    file.set_len(super::super::PARTS_BLOCK_SIZE as u64).unwrap();
-    drop(file);
-    File::create(parts.join("foyer-storage-direct-fs-00000001")).unwrap();
+fn a_truncated_partition_cannot_hide_beside_a_clean_block() {
+    let (root, parts, _) = parts_fixture();
+    let decoded = root.path().join(super::super::BLOCK_CACHE_DIR);
+    std::fs::create_dir(&decoded).unwrap();
+    for (dir, kind) in [
+        (parts, CacheKind::RawParts),
+        (decoded, CacheKind::DecodedBlocks),
+    ] {
+        let mut bytes = vec![0; 2 * PAGE];
+        blob(&mut bytes, 0);
+        let mut file = File::create(dir.join("foyer-storage-direct-fs-00000000")).unwrap();
+        file.write_all(&bytes).unwrap();
+        file.set_len(kind.block_size() as u64).unwrap();
+        drop(file);
+        File::create(dir.join("foyer-storage-direct-fs-00000001")).unwrap();
 
-    let report = scan_cache_files(root.path(), ScanOptions::default()).unwrap();
-    assert_eq!(report.status, ScanStatus::NothingScanned, "{report:#?}");
-    let counts = report.caches[0].scanned.as_ref().unwrap();
-    assert_eq!(counts.entries, 1);
-    assert_eq!(counts.other_partitions, 1);
-    assert_eq!(counts.incomplete_partitions, 1);
+        let report = scan_cache_files(&dir, ScanOptions::default()).unwrap();
+        assert_eq!(report.status, ScanStatus::NothingScanned, "{report:#?}");
+        let counts = report.caches[0].scanned.as_ref().unwrap();
+        assert_eq!(counts.entries, 1);
+        assert_eq!(counts.other_partitions, 1);
+        assert_eq!(counts.incomplete_partitions, 1);
+    }
 }
 
 #[test]

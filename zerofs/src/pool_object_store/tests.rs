@@ -483,6 +483,68 @@ async fn multipart_reserves_bytes_before_parts_and_publishes_only_on_completion(
 }
 
 #[tokio::test]
+async fn capacity_refusals_require_a_healthy_member_that_can_run_out_of_space() {
+    use crate::retrying_object_store::{has_capacity_source, has_permanent_source, is_no_space};
+
+    let fixture = Fixture::new(4);
+    let pool = fixture.initialize().await;
+    pool.quarantine("hdd-a", "media fault").await.unwrap();
+    create(&pool, &segment(1), b"full").await;
+    assert_eq!(placement(&pool, &segment(1)).await, "hdd-b");
+
+    for capacity_limited in [true, false] {
+        if !capacity_limited {
+            pool.quarantine("hdd-b", "media fault").await.unwrap();
+        }
+        let failure = pool
+            .put_opts(
+                &segment(2),
+                Bytes::from_static(b"x").into(),
+                create_options(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(has_capacity_source(&failure), capacity_limited, "{failure}");
+        assert_eq!(is_no_space(&failure), capacity_limited, "{failure}");
+        assert!(has_permanent_source(&failure));
+        assert!(!super::is_prepublication_allocation_refusal(&failure));
+        assert!(!pool.inner.safety_failure.is_cancelled());
+    }
+}
+
+#[tokio::test]
+async fn missing_member_space_readings_do_not_report_a_full_pool() {
+    let fixture = Fixture::new(4);
+    let mut members = fixture.members();
+    for member in &mut members {
+        member.local_path = Some(fixture.catalog.path().join(&member.id));
+    }
+    let pool = PoolObjectStore::initialize(
+        fixture.authority.clone(),
+        Path::from("db"),
+        fixture.catalog.path().join("catalog"),
+        members,
+    )
+    .await
+    .unwrap();
+    let failure = pool
+        .put_opts(
+            &segment(1),
+            Bytes::from_static(b"x").into(),
+            create_options(),
+        )
+        .await
+        .unwrap_err();
+    assert!(!crate::retrying_object_store::is_no_space(&failure));
+    assert!(
+        failure
+            .to_string()
+            .contains("could not read filesystem space")
+    );
+    assert!(!pool.inner.safety_failure.is_cancelled());
+}
+
+#[tokio::test]
 async fn pending_uploads_cannot_overcommit_capacity_and_abort_releases_it() {
     let fixture = Fixture::new(6);
     let pool = fixture.initialize().await;

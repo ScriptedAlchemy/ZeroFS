@@ -534,8 +534,8 @@ fn scan_cache_files_with_hook(
         }
         let scanned = if current || options.legacy {
             let mut counts = scan_partitions(&dir, kind.block_size(), |_, _| {})?;
-            if current && kind == CacheKind::RawParts {
-                // This layout has no tombstone log. Every partition must be
+            if current {
+                // Neither current layout has a tombstone log. Each partition must be
                 // a full data block, so a truncated or foreign-size file is
                 // missing evidence, not an auxiliary partition to ignore.
                 counts.incomplete_partitions += counts.other_partitions;

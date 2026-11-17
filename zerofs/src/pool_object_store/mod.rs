@@ -724,6 +724,7 @@ impl PoolObjectStore {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(issue)) => {
                 if !issue.is::<catalog::NoCapacity>()
+                    && !issue.is::<catalog::NoAvailableMember>()
                     && !issue.is::<catalog::AllocationBlocked>()
                     && !issue.is::<catalog::AutomaticEvacuationBlocked>()
                 {
@@ -1937,7 +1938,9 @@ impl PoolObjectStore {
                     .reserve(&location, previous.size, Some(target))
                     .await
                     .map_err(|e| {
-                        if has_cause::<catalog::NoCapacity>(&e) {
+                        if has_cause::<catalog::NoCapacity>(&e)
+                            || has_cause::<catalog::NoAvailableMember>(&e)
+                        {
                             MoveFailure::Admission(e)
                         } else {
                             MoveFailure::Control(e)

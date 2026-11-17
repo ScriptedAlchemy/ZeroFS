@@ -31,6 +31,13 @@ pub(crate) mod survival_test_support;
 pub(super) struct NoCapacity;
 
 #[derive(Debug, thiserror::Error)]
+#[error("no pool member is available for placement: {member}: {reason}")]
+pub(super) struct NoAvailableMember {
+    member: String,
+    reason: String,
+}
+
+#[derive(Debug, thiserror::Error)]
 #[error("automatic evacuation stopped: multiple devices have unfinished evacuation")]
 pub(super) struct AutomaticEvacuationBlocked;
 
@@ -688,14 +695,22 @@ impl Catalog {
                     .context("local pool reservation overflow")?;
             }
             let mut chosen = None;
+            let mut unavailable = None;
+            let mut capacity_limited = false;
             for member in members
                 .iter()
                 .filter(|m| target.is_none_or(|id| id == m.id))
             {
-                if skip.contains(&member.id)
-                    || health_in(&tx, &member.id)?.quarantine.is_some()
-                    || health_in(&tx, &member.id)?.monitoring_error.is_some()
-                {
+                let health = health_in(&tx, &member.id)?;
+                if let Some(reason) = health.quarantine.or(health.monitoring_error) {
+                    unavailable = Some(NoAvailableMember {
+                        member: member.id.clone(),
+                        reason,
+                    });
+                    continue;
+                }
+                if skip.contains(&member.id) {
+                    capacity_limited = true;
                     continue;
                 }
                 let mut record: MemberRecord = bincode::deserialize(
@@ -717,10 +732,17 @@ impl Catalog {
                         member.min_free_bytes,
                         local_reserved,
                     )),
-                    Some(Err(_)) => continue,
+                    Some(Err(error)) => {
+                        unavailable = Some(NoAvailableMember {
+                            member: member.id.clone(),
+                            reason: format!("could not read filesystem space: {error}"),
+                        });
+                        continue;
+                    }
                 };
                 let declared = record.capacity.saturating_sub(occupied);
                 if super::space::room(declared, physical).is_none_or(|room| room < size) {
+                    capacity_limited = true;
                     continue;
                 }
                 record.reserved = record
@@ -731,7 +753,10 @@ impl Catalog {
                 chosen = Some(member.id.clone());
                 break;
             }
-            let member_id = chosen.ok_or(NoCapacity)?;
+            let member_id = chosen.ok_or_else(|| match unavailable {
+                Some(failure) if !capacity_limited => anyhow!(failure),
+                _ => anyhow!(NoCapacity),
+            })?;
             let id = Uuid::new_v4().to_string();
             Upload {
                 physical_key: format!(".zerofs-pool/{}/objects/{id}", self.identity.pool_id),
