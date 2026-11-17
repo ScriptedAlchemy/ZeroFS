@@ -267,8 +267,9 @@ impl RedbHeader {
                 "writeback journal database {} is {found} bytes, shorter than the {} bytes \
                  its last durable commit describes: the device holding the journal lost writes \
                  after acknowledging them, so the journal is older than what was acknowledged. \
-                 Writes it had not drained to the backend are lost. Restore the journal device, \
-                 or move the journal directory aside to start from what the backend holds",
+                 If a good copy of this journal exists, restore it and start again. Otherwise \
+                 move the journal directory aside to start from what the backend holds. Moving \
+                 it aside permanently discards every write the journal had not yet drained",
                 path.display(),
                 self.layout_len
             );
