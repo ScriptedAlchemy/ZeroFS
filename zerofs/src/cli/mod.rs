@@ -13,6 +13,8 @@ mod init;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) mod inventory;
 pub(crate) mod memory_budget;
+#[cfg(test)]
+mod metadata_fault_tests;
 pub mod monitor;
 pub mod nbd;
 pub mod otrace;

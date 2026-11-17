@@ -89,6 +89,12 @@ pub(crate) async fn open_storage(settings: &Settings) -> Result<OpenedStorage> {
         settings.sftp.as_ref(),
     )
     .await?;
+    #[cfg(test)]
+    let store = if url.scheme() == "file" {
+        crate::fault_store::native_errno::wrap(store)
+    } else {
+        store
+    };
     if url.scheme() == "file" {
         let marker = path.clone().join(".zerofs-pool").join("identity");
         match store.head(&marker).await {
@@ -140,6 +146,8 @@ pub(crate) async fn open_pool_storage(
         path,
         sftp_pool: authority_sessions,
     } = bind_readiness_root(settings, &authority_url, authority)?;
+    #[cfg(test)]
+    let authority = crate::fault_store::native_errno::wrap(authority);
     debug_assert!(authority_sessions.is_none(), "pool metadata must be local");
     let mut sessions = BackendSessions {
         pools: Vec::new(),
@@ -165,6 +173,14 @@ pub(crate) async fn open_pool_storage(
                 parse_url_opts(&url, options, None).await?
             };
             let parsed = bind_readiness_root(settings, &url, parsed)?;
+            #[cfg(test)]
+            let parsed = match scheme {
+                ObjectStoreScheme::Local => ParsedStore {
+                    store: crate::fault_store::native_errno::wrap(parsed.store),
+                    ..parsed
+                },
+                _ => parsed,
+            };
             if let Some(pool) = parsed.sftp_pool {
                 sessions.pools.push(pool);
             }
