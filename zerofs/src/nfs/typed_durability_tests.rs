@@ -635,6 +635,40 @@ async fn write_and_commit_share_service_verifier() {
 }
 
 #[tokio::test]
+async fn tcp_pathconf_reports_the_volume_name_mode() {
+    use crate::fs::name_mode::NameMode;
+
+    for mode in [NameMode::Sensitive, NameMode::Insensitive] {
+        let fs = ZeroFS::new_in_memory_with_name_mode(mode).await.unwrap();
+        let adapter = NFSAdapter::new(Arc::new(fs));
+        let mut call = rpc_call_prefix(1, 20);
+        let handle = adapter.id_to_fh(adapter.root_dir());
+        call.extend_from_slice(&(handle.data.len() as u32).to_be_bytes());
+        call.extend_from_slice(&handle.data);
+        let listener = NFSTcpListener::bind("127.0.0.1:0".parse().unwrap(), adapter)
+            .await
+            .unwrap();
+        let port = listener.get_listen_port();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let signal = shutdown.clone();
+        let server = tokio::spawn(async move { listener.handle_with_shutdown(signal).await });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let reply = rpc_roundtrip(&mut client, &call).await;
+        assert_eq!(parse_nfs_status(&reply, 1), nfsstat3::NFS3_OK as u32);
+        // The last two PATHCONF3resok fields are the two XDR case flags.
+        let mut offset = reply.len() - 8;
+        assert_eq!(
+            take_u32(&reply, &mut offset),
+            u32::from(mode == NameMode::Insensitive)
+        );
+        assert_eq!(take_u32(&reply, &mut offset), 1);
+        drop(client);
+        shutdown.cancel();
+        server.await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
 async fn service_restart_changes_nonzero_verifier() {
     let fs = Arc::new(ZeroFS::new_in_memory().await.expect("in-memory filesystem"));
     let first = NFSAdapter::new(Arc::clone(&fs)).get_write_verf();
