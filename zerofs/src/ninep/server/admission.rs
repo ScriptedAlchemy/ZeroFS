@@ -20,7 +20,7 @@ pub(super) const GLOBAL_TRANSPORT_SESSIONS: usize = 64;
 const MAX_PRE_ADMISSION_MEMORY: usize = GLOBAL_TRANSPORT_SESSIONS * P9_MAX_MSIZE as usize;
 const DOCUMENTED_P9_MEMORY_BOUND: usize = GLOBAL_INFLIGHT_MEMORY + MAX_PRE_ADMISSION_MEMORY;
 #[cfg(any(feature = "webui", test))]
-const WEBSOCKET_RECEIVE_RESERVATION: u32 = 2 * P9_MAX_MSIZE;
+const WEBSOCKET_RECEIVE_RESERVATION: u32 = 3 * P9_MAX_MSIZE;
 
 #[derive(Debug)]
 pub(crate) struct P9XattrPermit {
@@ -206,8 +206,9 @@ impl P9GlobalAdmission {
         shutdown: &CancellationToken,
     ) -> anyhow::Result<P9ReceivePermit> {
         // Tungstenite copies fragmented messages into a growing collector
-        // while retaining the current frame. Charging both maximum buffers
-        // keeps their combined peak inside the shared receive envelope.
+        // while retaining the current frame. One more maximum frame covers
+        // received requests waiting for admission, so the reader can reach
+        // Tflush while ordinary request slots are full.
         self.admit_receive_bytes(WEBSOCKET_RECEIVE_RESERVATION, shutdown)
             .await
     }

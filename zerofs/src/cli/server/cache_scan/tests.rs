@@ -25,6 +25,7 @@ fn handle() -> tokio::runtime::Handle {
 
 /// Fill a raw-parts cache through the production prefetching store.
 async fn write_parts_cache(namespace: &Path, objects: u8) {
+    let _owner = acquire_clean_cache_owner(namespace).unwrap();
     let parts = build_parts_hybrid(
         namespace,
         MIB,

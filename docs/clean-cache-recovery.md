@@ -93,19 +93,30 @@ because nothing is decrypted; the command takes none. It opens files read-only
 and changes, repairs or deletes nothing. It refuses a namespace whose
 ownership lock a running server holds, because a blob being written can look
 torn. `--live` scans anyway and labels the result a snapshot. A server that
-starts during a scan can fail to take its lock for the moment the scan probes
-it.
+starts during an offline scan cannot take the existing namespace lock until
+the scan finishes. Copied caches that have no ownership lock remain readable;
+pass `--live` to explicitly scan them without that exclusion. An offline scan
+refuses a missing ownership lock and never creates one.
 
 For each cache the report gives partitions, blobs, entries, and the index-tail
 and padding bytes scanned and found non-zero. A clean result reads
 `Result: clean: every scanned index-tail and padding byte is zero, and every
-cache had entries to scan (exit status 0).`
+cache had entries to scan with no incomplete blobs (exit status 0).`
+
+The scan checks that each recognized blob's index and entry headers agree on
+its bounds, lengths and identities. If a recognized index names an incomplete
+or inconsistent entry, the report counts that partition as incomplete and
+does not call a clean prefix proof that the cache is clean. Files of another
+partition size are counted separately without being loaded into memory. An
+all-zero index page marks the end of a blob chain; a nonzero page that cannot
+be parsed makes the result incomplete. This includes stale tails of reused
+blocks whose remaining bytes cannot be identified by the current index.
 
 | Exit status | Meaning |
 |---|---|
 | 0 | Every scanned byte is zero, and every cache had entries to scan. |
 | 3 | Some index-tail or padding bytes are not zero. |
-| 4 | A cache had no entries on disk, or was not scanned. Nothing scanned is not evidence that the cache is clean. |
+| 4 | A cache had no entries on disk, was not scanned, or contained an incomplete blob. An incomplete scan is not evidence that the cache is clean. |
 | 1 | The scan could not run, for example because a server holds the cache. |
 
 A cache written by an earlier build (a `hybrid_cache` directory, or a

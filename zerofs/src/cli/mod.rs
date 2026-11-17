@@ -331,15 +331,15 @@ pub enum DebugCommands {
     /// nothing and needs no password or key; this command takes none.
     ///
     /// It opens files read-only and changes, repairs or deletes nothing. It
-    /// refuses a cache whose ownership lock a running server holds, because a
-    /// blob being written can look torn; stop the server first, or pass
-    /// --live to scan a snapshot anyway. Caches written by builds before the
+    /// refuses a cache whose ownership lock is missing or held by a running
+    /// server, because a blob being written can look torn; stop the server
+    /// first, or pass --live to scan a snapshot anyway. Caches written before the
     /// zeroed padding are reported as such and counted only with --legacy.
     ///
     /// Exit status: 0 when every scanned byte is zero and every cache had
     /// entries to scan; 3 when non-zero bytes were found; 4 when a cache had
-    /// no entries on disk or was not scanned, which is not evidence that it
-    /// is clean; 1 on an error.
+    /// no entries on disk, was not scanned, or held an incomplete blob, which
+    /// is not evidence that it is clean; 1 on an error.
     ScanCacheFiles {
         /// The [cache] dir from the server's config, one namespace inside it
         /// (bucket_...), or one cache directory.

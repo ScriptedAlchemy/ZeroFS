@@ -396,15 +396,6 @@ impl ZeroFS {
         if from_name == b"." || from_name == b".." {
             return Err(FsError::InvalidArgument);
         }
-        if verification.is_none() && from_dirid == to_dirid && from_name == to_name {
-            // No-op renames still publish a durable replay result.
-            if crate::dedup::has_op_id(&op_id) {
-                let mut txn = self.db.new_transaction()?;
-                txn.set_dedup_result(op_id, DedupResult::Rename);
-                self.write_coordinator.commit(txn).await?;
-            }
-            return Ok(None);
-        }
 
         debug!(
             "rename: from_dir={}, from_name={}, to_dir={}, to_name={}",
@@ -567,8 +558,10 @@ impl ZeroFS {
             }
         }
 
-        // POSIX specifies that renaming one hard link over another link to the
-        // same inode succeeds without changing either directory entry. Keep
+        // Renaming an entry to itself, or one hard link over another link to
+        // the same inode, succeeds without changing either directory entry.
+        // Even an identical-name request must first resolve the source with
+        // its spelling rule under the directory lock. Keep
         // the normal directory permission and sticky-bit checks above (and
         // check the target directory's sticky policy for a cross-directory
         // rename), then publish only the replay result.
@@ -1036,6 +1029,52 @@ mod tests {
         assert!(matches!(result, Err(FsError::InvalidArgument)));
         assert!(fs.lookup(&test_creds(), 0, b"source").await.is_ok());
         assert!(fs.lookup(&test_creds(), 0, b"target").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn exact_same_name_rename_checks_the_source_before_recording_success() {
+        use crate::fs::name_mode::{NameMatch, NameMode};
+
+        let fs = ZeroFS::new_in_memory_with_name_mode(NameMode::Insensitive)
+            .await
+            .unwrap();
+        let creds = test_creds();
+        let auth = AuthContext::from(&creds);
+        let (file, _) = fs
+            .create(&creds, 0, b"Stored", &SetAttributes::default())
+            .await
+            .unwrap();
+        let before = bincode::serialize(&fs.inode_store.get(file).await.unwrap()).unwrap();
+
+        for name in [b"missing".as_slice(), b"stored"] {
+            let op_id = [0x71; 16];
+            assert_eq!(
+                fs.rename_idempotent_matching(&auth, 0, name, NameMatch::Exact, 0, name, op_id)
+                    .await,
+                Err(FsError::NotFound),
+                "same-name rename must resolve its exact source"
+            );
+            assert!(fs.dedup.get(&op_id).is_none());
+        }
+
+        let op_id = [0x72; 16];
+        fs.rename_idempotent_matching(&auth, 0, b"Stored", NameMatch::Exact, 0, b"Stored", op_id)
+            .await
+            .unwrap();
+        assert!(matches!(fs.dedup.get(&op_id), Some(DedupResult::Rename)));
+        assert_eq!(fs.lookup(&creds, 0, b"Stored").await.unwrap(), file);
+        assert_eq!(
+            bincode::serialize(&fs.inode_store.get(file).await.unwrap()).unwrap(),
+            before,
+            "a valid same-name rename must leave the inode unchanged"
+        );
+
+        // A successful retry remains replayable after its original source
+        // disappears, just like every other idempotent rename.
+        fs.remove(&auth, 0, b"Stored").await.unwrap();
+        fs.rename_idempotent_matching(&auth, 0, b"Stored", NameMatch::Exact, 0, b"Stored", op_id)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

@@ -61,10 +61,12 @@ use response_writer::{
 #[cfg(test)]
 use session::{CLIENT_DRAIN_TIMEOUT, CompletionWaiter, enqueue_terminal_response};
 #[cfg(any(feature = "webui", test))]
-pub(crate) use session::{InflightRegistry, dispatch_9p_frame, settle_request_tasks};
+pub(crate) use session::{ConnectionContext, P9PendingFrames};
+#[cfg(any(feature = "webui", test))]
+pub(crate) use session::{InflightRegistry, settle_request_tasks};
 use session::{P9SessionAdmission, handle_client_stream};
 #[cfg(test)]
-use session::{handle_client_loop, join_with_timeout};
+use session::{dispatch_9p_frame, handle_client_loop, join_with_timeout};
 
 /// TCP keepalive idle interval.
 const TCP_KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
@@ -1057,18 +1059,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fragmented_websocket_receive_reserves_collector_and_frame() {
+    async fn fragmented_websocket_receive_reserves_collector_frame_and_pending_requests() {
         let global = P9GlobalAdmission::for_test_with_transports(
             GLOBAL_INFLIGHT_MEMORY,
             GLOBAL_INFLIGHT_REQUESTS,
-            2,
+            3,
         );
         let shutdown = CancellationToken::new();
         let receive = global.admit_websocket_receive(&shutdown).await.unwrap();
         assert_eq!(
             global.snapshot().receive_reserved_bytes,
-            2 * P9_MAX_MSIZE as usize,
-            "fragment assembly must charge both the collector and current frame"
+            3 * P9_MAX_MSIZE as usize,
+            "receive credit covers the collector, current frame, and pending requests"
         );
         drop(receive);
         assert_eq!(global.snapshot().receive_reserved_bytes, 0);
@@ -2873,6 +2875,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn revocation_does_not_send_rflush_after_dropping_its_applied_reply() {
+        let (filesystem, lease, raw_db) = leased_filesystem_for_response_gate().await;
+        let applied = frame(41, Message::Rwrite(ninep_proto::Rwrite { count: 1 })).to_vec();
+        let flushed = frame(42, Message::Rflush(Rflush)).to_vec();
+        let (mut client, server) = tokio::io::duplex(4096);
+        // The committed mutation and the Tflush that waited for it have
+        // already enqueued their replies in order when authority is lost.
+        let rx = response_queue([(41, applied), (42, flushed)]).await;
+        lease.revoke();
+        let connection_shutdown = CancellationToken::new();
+        let writer = spawn_response_writer(
+            server,
+            rx,
+            ResponseAuthority::from_database(Arc::clone(&filesystem.db)),
+            connection_shutdown.clone(),
+        );
+        drain_writer(writer, "writer must close after dropping the applied reply").await;
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        assert!(
+            received.is_empty(),
+            "Rflush must not bypass the applied mutation's reply when that reply was suppressed"
+        );
+        assert!(connection_shutdown.is_cancelled());
+        raw_db.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn revocation_blocks_implicit_success_flush() {
         let (filesystem, lease, raw_db) = leased_filesystem_for_response_gate().await;
         let first_error = not_leader(51);
@@ -4309,6 +4339,132 @@ mod tests {
             fid: 1,
             request_mask: GETATTR_ALL,
         })
+    }
+
+    #[tokio::test]
+    async fn saturated_websocket_dispatch_still_reads_tflush() {
+        let (filesystem, handler) = in_memory_handler().await;
+        plain_root_session(&handler).await;
+        let parent_lock = filesystem.lock_manager.acquire(0).await;
+        let global = P9GlobalAdmission::for_test(64 * 1024 * 1024, 1);
+        let admission = global.connection_for_test(64 * 1024 * 1024, 1);
+        let shutdown = CancellationToken::new();
+        let pending =
+            P9PendingFrames::new(global.admit_websocket_receive(&shutdown).await.unwrap());
+        let inflight = InflightRegistry::default();
+        let requests = TaskTracker::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        let context = ConnectionContext {
+            handler: &handler,
+            tx: &tx,
+            inflight: &inflight,
+            admission: &admission,
+            requests: &requests,
+            connection_shutdown: &shutdown,
+            process_shutdown: &shutdown,
+        };
+
+        // WebSocket messages are dispatched serially by the receive loop.
+        // The second must let the loop read the Tflush even while the first
+        // owns its only request slot.
+        pending
+            .dispatch(frame(10, plain_mkdir(b"held")), &context)
+            .await
+            .unwrap();
+        tokio::time::timeout(PROMPT_FLUSH, async {
+            pending
+                .dispatch(frame(11, root_getattr()), &context)
+                .await
+                .unwrap();
+            pending
+                .dispatch(frame(12, Message::Tflush(Tflush { oldtag: 10 })), &context)
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("the WebSocket reader must reach Tflush while request admission is full");
+        let mut replies = Vec::new();
+        for _ in 0..2 {
+            let reply = tokio::time::timeout(PROMPT_FLUSH, rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            replies.push(reply.into_parts());
+        }
+        replies.sort_by_key(|(tag, _)| *tag);
+        assert_eq!(replies[0].0, 11);
+        assert!(matches!(decode(&replies[0].1).body, Message::Rgetattr(_)));
+        assert_eq!(replies[1].0, 12);
+        assert!(matches!(decode(&replies[1].1).body, Message::Rflush(_)));
+        drop(parent_lock);
+        requests.close();
+        tokio::time::timeout(TEST_TIMEOUT, requests.wait())
+            .await
+            .unwrap();
+        assert_eq!(
+            walk_errno(&handler, b"held").await,
+            Some(crate::linux_errno::ENOENT)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_pending_frame_releases_its_disconnected_readers_receive_credit() {
+        let (_, handler) = in_memory_handler().await;
+        let global = P9GlobalAdmission::for_test(64 * 1024 * 1024, 1);
+        let admission = global.connection_for_test(64 * 1024 * 1024, 1);
+        let blocked = admission.admit_request(1, 0).await.unwrap();
+        let shutdown = CancellationToken::new();
+        let pending =
+            P9PendingFrames::new(global.admit_websocket_receive(&shutdown).await.unwrap());
+        let inflight = InflightRegistry::default();
+        let requests = TaskTracker::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        let context = ConnectionContext {
+            handler: &handler,
+            tx: &tx,
+            inflight: &inflight,
+            admission: &admission,
+            requests: &requests,
+            connection_shutdown: &shutdown,
+            process_shutdown: &shutdown,
+        };
+        pending
+            .dispatch(frame(11, root_getattr()), &context)
+            .await
+            .unwrap();
+        drop(pending);
+        assert_eq!(
+            global.snapshot().receive_reserved_bytes,
+            3 * P9_MAX_MSIZE as usize,
+            "the unadmitted frame must keep receive credit after the reader ends"
+        );
+        dispatch_9p_frame(
+            frame(12, Message::Tflush(Tflush { oldtag: 11 })),
+            &handler,
+            &tx,
+            &inflight,
+            &admission,
+            &requests,
+            &shutdown,
+            &shutdown,
+        )
+        .await
+        .unwrap();
+        let response = tokio::time::timeout(PROMPT_FLUSH, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.into_parts().0, 12);
+        requests.close();
+        tokio::time::timeout(TEST_TIMEOUT, requests.wait())
+            .await
+            .unwrap();
+        assert_eq!(
+            global.snapshot().receive_reserved_bytes,
+            0,
+            "cancelling the last pending frame must return its receive credit"
+        );
+        drop(blocked);
     }
 
     #[tokio::test]

@@ -40,10 +40,11 @@ pub(crate) fn default_retry_builder() -> ExponentialBuilder {
         .with_max_delay(Duration::from_secs(1))
 }
 
-/// Terminal (never-retryable) backend error with no typed
+/// Backend error that ends the current object-store attempt, with no typed
 /// `object_store::Error` equivalent. Backends wrap such conditions in this
-/// marker before boxing them into `Error::Generic`, so retry classification
-/// needs no backend-specific knowledge.
+/// marker before boxing them into `Error::Generic`, so direct retries need no
+/// backend-specific knowledge. Durable journal replay also recognizes the
+/// explicit [`CapacityError`] exception, which can clear after the attempt.
 #[derive(Debug)]
 pub struct PermanentError(Box<dyn std::error::Error + Send + Sync + 'static>);
 
@@ -63,6 +64,41 @@ impl std::error::Error for PermanentError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.0.as_ref())
     }
+}
+
+/// A capacity refusal that should end the current request promptly, but can
+/// clear before a later background journal replay. Kept separate from other
+/// permanent errors so an ENOSPC buried in failed cleanup does not make that
+/// unsafe cleanup retryable.
+#[derive(Debug)]
+pub(crate) struct CapacityError(std::io::Error);
+
+impl CapacityError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            message.into(),
+        ))
+    }
+}
+
+impl std::fmt::Display for CapacityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for CapacityError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+pub(crate) fn has_capacity_source(err: &object_store::Error) -> bool {
+    std::iter::successors(Some(err as &(dyn std::error::Error + 'static)), |&cause| {
+        cause.source()
+    })
+    .any(|cause| cause.is::<CapacityError>())
 }
 
 pub(crate) fn has_permanent_source(err: &object_store::Error) -> bool {

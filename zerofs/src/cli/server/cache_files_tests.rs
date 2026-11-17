@@ -112,6 +112,7 @@ fn audit_cache_dir(dir: &std::path::Path, block_size: usize, audit: &mut CacheFi
     let total = &mut audit.undefined;
     total.partitions += counts.partitions;
     total.other_partitions += counts.other_partitions;
+    total.incomplete_partitions += counts.incomplete_partitions;
     total.blobs += counts.blobs;
     total.entries += counts.entries;
     total.index_tail_bytes += counts.index_tail_bytes;
@@ -134,9 +135,10 @@ fn assert_clean(name: &str, audit: &CacheFileAudit) {
         (
             audit.marker_hits,
             audit.undefined.index_tail_nonzero,
-            audit.undefined.padding_nonzero
+            audit.undefined.padding_nonzero,
+            audit.undefined.incomplete_partitions
         ),
-        (0, 0, 0),
+        (0, 0, 0, 0),
         "{name}: cache files carry bytes foyer did not define: {audit:?}"
     );
 }

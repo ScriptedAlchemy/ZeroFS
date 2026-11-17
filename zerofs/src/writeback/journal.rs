@@ -779,10 +779,10 @@ impl Journal {
         expected_identity: JournalIdentity,
     ) -> Result<Self> {
         let root = root_dir.display().to_path_buf();
-        let lock = match lock {
-            Some(lock) => lock,
+        let (lock, lock_existed) = match lock {
+            Some(lock) => (lock, true),
             None => {
-                let (lock_file, _) = root_dir
+                let (lock_file, existed) = root_dir
                     .open_owner_file("LOCK".as_ref(), true)
                     .with_context(|| {
                         format!(
@@ -790,17 +790,66 @@ impl Journal {
                             root.join("LOCK").display()
                         )
                     })?;
-                JournalLock::acquire(lock_file)?
+                (JournalLock::acquire(lock_file)?, existed)
             }
         };
 
         root_dir.open_or_create_child("blobs".as_ref(), 0o700)?;
         root_dir.open_or_create_child("tmp".as_ref(), 0o700)?;
-        let (database_file, database_existed) =
-            root_dir.open_owner_file("journal.redb".as_ref(), true)?;
         let database_path = root.join("journal.redb");
+        let (database_file, database_existed) =
+            match root_dir.try_open_existing_owner_file("journal.redb".as_ref())? {
+                Some(file) => (file, true),
+                None => {
+                    // A prior ownership file also covers acknowledged
+                    // metadata-only mutations, which leave no payload blobs.
+                    // An interrupted first initialization is uncertain too;
+                    // do not turn either case into a silently empty journal.
+                    if lock_existed {
+                        return Err(operator_required(anyhow!(
+                            "writeback journal database {} is missing after an earlier journal \
+                             initialization; refusing to initialize a replacement because doing \
+                             so could discard acknowledged writes. Restore a good copy of the \
+                             journal, or move the journal directory aside only if every write \
+                             it had not yet drained may be permanently discarded",
+                            database_path.display()
+                        )));
+                    }
+                    // A missing database does not make surviving journal
+                    // artifacts uncommitted. Refuse before creating a new
+                    // database whose zero watermark would discard them.
+                    for name in ["blobs", "tmp"] {
+                        let directory = root_dir.open_child(name.as_ref(), 0o700)?;
+                        directory.for_each_entry(|_| {
+                            Err(operator_required(anyhow!(
+                                "writeback journal database {} is missing but {} still contains \
+                                 journal state; refusing to initialize a replacement because doing \
+                                 so could discard acknowledged writes. Restore a good copy of the \
+                                 journal, or move the journal directory aside only if every write \
+                                 it had not yet drained may be permanently discarded",
+                                database_path.display(),
+                                directory.display().display()
+                            )))
+                        })?;
+                    }
+                    root_dir.open_owner_file("journal.redb".as_ref(), true)?
+                }
+            };
+        let database_len = database_file.metadata()?.len();
+        // redb's create_file initializes an empty file even when it already
+        // existed. That would reset our durable watermark and cause recovery
+        // to unlink acknowledged containers as if they were never committed.
+        if database_existed && database_len == 0 {
+            return Err(operator_required(anyhow!(
+                "writeback journal database {} already exists but is empty; refusing to \
+                 initialize it because doing so could discard acknowledged writes. Restore \
+                 a good copy of the journal, or move the journal directory aside only if \
+                 every write it had not yet drained may be permanently discarded",
+                database_path.display()
+            )));
+        }
         if let Some(header) = RedbHeader::read(&database_file)? {
-            header.ensure_openable(database_file.metadata()?.len(), &database_path)?;
+            header.ensure_openable(database_len, &database_path)?;
         }
         let database =
             open_journal_database(&database_path, || Builder::new().create_file(database_file))?;
@@ -4188,6 +4237,118 @@ mod tests {
         drop(inherited_lock);
         // The previous generation's descriptor cannot unlock the new owner.
         assert_locked();
+    }
+
+    /// An empty existing database has no header for the layout preflight to
+    /// inspect. It must never be mistaken for a new journal.
+    #[test]
+    fn an_existing_empty_journal_is_not_reinitialized_or_its_blobs_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let database = root.join("journal.redb");
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let committed = journal
+            .commit_put(put_record(1, "segments/1", b"pending"), b"pending")
+            .unwrap();
+        let blob = blob_file(&journal, &committed);
+        let payload = fs::read(&blob).unwrap();
+        drop(journal);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&database)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+
+        let error = Journal::open(&root, identity("bucket-a"))
+            .expect_err("an existing empty database must not reset the durable watermark");
+        assert!(
+            format!("{error:#}").contains(&database.display().to_string()),
+            "{error:#}"
+        );
+        assert_eq!(
+            crate::operator_required::ServerExit::of(error.as_ref()),
+            crate::operator_required::ServerExit::OperatorRequired
+        );
+        assert_eq!(fs::metadata(&database).unwrap().len(), 0);
+        assert_eq!(fs::read(&blob).unwrap(), payload);
+    }
+
+    #[test]
+    fn a_missing_journal_database_does_not_discard_surviving_committed_blobs() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let database = root.join("journal.redb");
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let committed = journal
+            .commit_put(put_record(1, "segments/1", b"pending"), b"pending")
+            .unwrap();
+        let blob = blob_file(&journal, &committed);
+        let payload = fs::read(&blob).unwrap();
+        drop(journal);
+        fs::remove_file(&database).unwrap();
+
+        let error = Journal::open(&root, identity("bucket-a"))
+            .expect_err("surviving blobs must prevent creation of a new durable watermark");
+        assert!(
+            format!("{error:#}").contains(&database.display().to_string()),
+            "{error:#}"
+        );
+        assert_eq!(
+            crate::operator_required::ServerExit::of(error.as_ref()),
+            crate::operator_required::ServerExit::OperatorRequired
+        );
+        assert!(
+            !database.exists(),
+            "refusal must not create a replacement database"
+        );
+        assert_eq!(fs::read(&blob).unwrap(), payload);
+    }
+
+    #[test]
+    fn a_missing_metadata_only_journal_is_not_reinitialized() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let database = root.join("journal.redb");
+        let journal = open_temp_journal(&temp, "bucket-a");
+        journal
+            .commit_metadata(delete_record(1, "obsolete-object"))
+            .unwrap();
+        drop(journal);
+        assert!(fs::read_dir(root.join("blobs")).unwrap().next().is_none());
+        assert!(fs::read_dir(root.join("tmp")).unwrap().next().is_none());
+        fs::remove_file(&database).unwrap();
+
+        let error = Journal::open(&root, identity("bucket-a"))
+            .expect_err("a pending delete must not disappear when its database is missing");
+        assert!(
+            format!("{error:#}").contains(&database.display().to_string()),
+            "{error:#}"
+        );
+        assert_eq!(
+            crate::operator_required::ServerExit::of(error.as_ref()),
+            crate::operator_required::ServerExit::OperatorRequired
+        );
+        assert!(!database.exists());
+    }
+
+    #[test]
+    fn a_fresh_journal_can_initialize_and_reopen_metadata_only_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        assert!(!root.exists());
+        let journal = Journal::open(&root, identity("bucket-a")).unwrap();
+        journal
+            .commit_metadata(delete_record(1, "obsolete-object"))
+            .unwrap();
+        drop(journal);
+
+        let journal = Journal::open(&root, identity("bucket-a")).unwrap();
+        let snapshot = journal.snapshot().unwrap();
+        assert_eq!(snapshot.local_seq, 1);
+        assert_eq!(snapshot.remote_seq, 0);
+        assert_eq!(snapshot.records.len(), 1);
+        assert!(matches!(snapshot.records[0].kind, MutationKind::Delete));
     }
 
     /// A redb commit that trims surplus space makes its new header durable and

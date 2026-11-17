@@ -314,6 +314,19 @@ impl<W: Write> Walker<'_, W> {
             version(&stat) == frame.version && mount_number(fd, &stat) == frame.mount_id,
             "resume ancestor directory changed"
         );
+        // Resumed ancestors bypass `entry`, so they must repeat its mount-boundary check
+        // before enumerating names. Device/inode identity alone cannot identify an overmount.
+        #[cfg(target_os = "linux")]
+        let boundary = mount_boundary(
+            &self.root_mount_id,
+            &platform::mount_id(fd, OsStr::new(""), &stat),
+        );
+        #[cfg(target_os = "macos")]
+        let boundary = self.descriptor_boundary(fd);
+        anyhow::ensure!(
+            boundary.is_none(),
+            "resume ancestor mount identity is unavailable or outside the inventory root"
+        );
         let path = resume::bytes(&frame.path)?;
         self.frames.push(frame.clone());
         let last = frame.last_child.as_ref().map(resume::bytes).transpose()?;
@@ -1043,6 +1056,56 @@ mod mount_boundary_tests {
             mount_boundary(&unreadable(), &root),
             Some(Reason::MountIdUnavailable)
         );
+    }
+
+    #[test]
+    fn resume_refuses_foreign_or_unavailable_mount_before_reading_directory() {
+        let _guard = super::super::tests::FIXTURE_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("must-not-read"), b"contents").unwrap();
+        let fd = fs::open(root.path(), DIRECTORY_FLAGS, Mode::empty()).unwrap();
+        let stat = fs::fstat(&fd).unwrap();
+        for missing in [false, true] {
+            let mut output = Manifest::new(Vec::new());
+            let work =
+                Workspace::new(root.path(), None, super::super::spill::MEMORY_BYTES).unwrap();
+            let mut walker = Walker {
+                output: &mut output,
+                root_dev: identity(&stat).dev,
+                #[cfg(target_os = "linux")]
+                root_mount_id: if missing {
+                    Field::unavailable(Reason::MountIdUnavailable)
+                } else {
+                    Field::Observed(mount_number(fd.as_fd(), &stat).unwrap().wrapping_add(1))
+                },
+                #[cfg(target_os = "macos")]
+                root_mount: if missing {
+                    unreadable()
+                } else {
+                    mount([0, 0], "/not-this-mount")
+                },
+                trusted_namespace: Field::Observed(()),
+                hash: true,
+                tree_complete: true,
+                links: Sorter::new(work.clone()),
+                work,
+                frames: Vec::new(),
+                noatime_fallback: false,
+                pacer: Pacer::new(None),
+            };
+            let frame = Frame {
+                path: RawBytes::new(b""),
+                version: version(&stat),
+                mount_id: mount_number(fd.as_fd(), &stat),
+                last_child: None,
+            };
+            let error = walker
+                .resume_directory(fd.as_fd(), &[frame])
+                .expect_err("resume must enforce the root mount boundary before descent");
+            assert!(error.to_string().contains("mount identity"), "{error}");
+            assert!(walker.frames.is_empty());
+            assert_eq!(walker.output.entries, 0);
+        }
     }
 }
 

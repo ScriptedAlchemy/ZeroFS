@@ -400,10 +400,9 @@ fn native_media_error(failure: &object_store::Error) -> bool {
 /// once instead of waiting for space that may never come back on its own.
 fn storage_full(failure: object_store::Error, size: u64) -> object_store::Error {
     if has_cause::<catalog::NoCapacity>(&failure) {
-        permanent(std::io::Error::new(
-            std::io::ErrorKind::StorageFull,
-            format!("no pool member has room for a {size}-byte object"),
-        ))
+        permanent(crate::retrying_object_store::CapacityError::new(format!(
+            "no pool member has room for a {size}-byte object"
+        )))
     } else {
         failure
     }

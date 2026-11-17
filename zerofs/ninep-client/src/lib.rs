@@ -259,7 +259,8 @@ async fn await_resend_bounded<T>(
 /// returns no error. When it expires, every waiting request fails together.
 /// Reconnection continues in the background; until it succeeds, each new
 /// request waits for one fresh reconnect attempt and fails if that attempt
-/// does.
+/// does. The same timeout also bounds that wait when session replay cannot
+/// finish, such as while another client holds a conflicting lock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReconnectTimeout(Duration);
 
@@ -728,6 +729,9 @@ pub struct NinePClient {
     /// Wakes the supervisor's backoff sleep for a caller that arrives during
     /// a declared outage.
     retry_now: Arc<Notify>,
+    /// Interrupts a replay candidate so an outage-failed clunk can retire a
+    /// fid before another replay snapshot is taken.
+    interrupt_replay: Notify,
     /// Permanent replay errno; zero while replay remains possible.
     terminal_errno: AtomicU32,
     live_notify: Notify,
@@ -880,6 +884,7 @@ impl NinePClient {
             reconnect_attempts: AtomicU64::new(0),
             reconnect_failed_through: AtomicU64::new(0),
             retry_now: Arc::new(Notify::new()),
+            interrupt_replay: Notify::new(),
             terminal_errno: AtomicU32::new(0),
             live_notify: Notify::new(),
             reconnect_notify,
@@ -1150,11 +1155,21 @@ impl NinePClient {
         )
         .await?;
 
+        debug_assert_eq!(msize, self.msize);
+        self.restore_connection(conn).await
+    }
+
+    /// Replays and installs a negotiated replacement connection.
+    async fn restore_connection(self: &Arc<Self>, conn: Arc<Conn>) -> ClientResult<()> {
         self.check_name_mode(&conn)?;
         // Settlement and snapshot/replay/install are mutually exclusive.
         let _transition = self.session_transition.lock().await;
-        debug_assert_eq!(msize, self.msize);
-        if let Err(error) = self.replay_supervised(&conn).await {
+        let result = tokio::select! {
+            biased;
+            () = self.interrupt_replay.notified() => Err(ClientError::Disconnected),
+            result = self.replay_supervised(&conn) => result,
+        };
+        if let Err(error) = result {
             self.discard_replay_candidate(&conn).await;
             return Err(error);
         }
@@ -1580,36 +1595,46 @@ impl NinePClient {
     /// Fails with [`ClientError::Disconnected`] when the supervisor declares
     /// the outage longer than the reconnect timeout. A caller that arrives
     /// after that declaration triggers one fresh reconnect attempt and fails
-    /// if it does.
+    /// if it does, or if the reconnect timeout bounds that attempt's replay.
     async fn wait_until_live(&self) -> ClientResult<()> {
         // A caller already waiting when the outage is declared fails with it.
         // A caller arriving after the declaration triggers a reconnect attempt
-        // and fails only if an attempt started after its arrival fails.
+        // and fails if an attempt started after its arrival fails, or replay
+        // keeps that attempt unfinished for another whole timeout.
         let fresh_attempt = self.unavailable.load(Ordering::Acquire).then(|| {
             let attempt = self.reconnect_attempts.load(Ordering::Acquire) + 1;
             self.retry_now.notify_one();
             attempt
         });
-        loop {
-            let notified = self.live_notify.notified();
-            tokio::pin!(notified);
-            // Register the waiter *before* the check to avoid a lost wakeup.
-            notified.as_mut().enable();
-            let terminal_errno = self.terminal_errno.load(Ordering::Acquire);
-            if terminal_errno != 0 {
-                return Err(ClientError::Errno(terminal_errno));
+        let wait = async {
+            loop {
+                let notified = self.live_notify.notified();
+                tokio::pin!(notified);
+                // Register the waiter *before* the check to avoid a lost wakeup.
+                notified.as_mut().enable();
+                let terminal_errno = self.terminal_errno.load(Ordering::Acquire);
+                if terminal_errno != 0 {
+                    return Err(ClientError::Errno(terminal_errno));
+                }
+                if self.live.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                if self.unavailable.load(Ordering::Acquire)
+                    && fresh_attempt.is_none_or(|attempt| {
+                        self.reconnect_failed_through.load(Ordering::Acquire) >= attempt
+                    })
+                {
+                    return Err(ClientError::Disconnected);
+                }
+                notified.await;
             }
-            if self.live.load(Ordering::Acquire) {
-                return Ok(());
-            }
-            if self.unavailable.load(Ordering::Acquire)
-                && fresh_attempt.is_none_or(|attempt| {
-                    self.reconnect_failed_through.load(Ordering::Acquire) >= attempt
-                })
-            {
-                return Err(ClientError::Disconnected);
-            }
-            notified.await;
+        };
+        if fresh_attempt.is_some() {
+            runtime::timeout(self.reconnect_timeout.get(), wait)
+                .await
+                .unwrap_or(Err(ClientError::Disconnected))
+        } else {
+            wait.await
         }
     }
 
@@ -1833,16 +1858,35 @@ impl NinePClient {
     async fn accept_stateful_response(
         &self,
         response_conn: &Arc<Conn>,
-    ) -> Option<tokio::sync::MutexGuard<'_, ()>> {
-        let transition = self.session_transition.lock().await;
-        let current = self.conn.load_full();
-        if self.live.load(Ordering::Acquire)
-            && !response_conn.dead.load(Ordering::Acquire)
-            && Arc::ptr_eq(response_conn, &current)
-        {
-            Some(transition)
-        } else {
-            None
+    ) -> ClientResult<Option<tokio::sync::MutexGuard<'_, ()>>> {
+        let transition = self.session_transition.lock();
+        tokio::pin!(transition);
+        loop {
+            let notified = self.live_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let terminal_errno = self.terminal_errno.load(Ordering::Acquire);
+            if terminal_errno != 0 {
+                return Err(ClientError::Errno(terminal_errno));
+            }
+            if self.unavailable.load(Ordering::Acquire) {
+                return Err(ClientError::Disconnected);
+            }
+            let is_current = || {
+                self.live.load(Ordering::Acquire)
+                    && !response_conn.dead.load(Ordering::Acquire)
+                    && Arc::ptr_eq(response_conn, &self.conn.load_full())
+            };
+            if !is_current() {
+                return Ok(None);
+            }
+            // Replay can hold the transition while retrying a conflicting
+            // lock indefinitely. Outage and terminal notifications must still
+            // release a response that can no longer be settled.
+            tokio::select! {
+                guard = &mut transition => return Ok(is_current().then_some(guard)),
+                () = notified => {}
+            }
         }
     }
 
@@ -1879,8 +1923,10 @@ impl NinePClient {
                 Ok(response) => response,
                 Err(error) => break Err(error),
             };
-            if let Some(transition) = self.accept_stateful_response(&response_conn).await {
-                break Ok((response, transition));
+            match self.accept_stateful_response(&response_conn).await {
+                Ok(Some(transition)) => break Ok((response, transition)),
+                Ok(None) => {}
+                Err(error) => break Err(error),
             }
         };
         // Errors and stale op-id results leave the server transition ambiguous.
@@ -2407,7 +2453,7 @@ impl NinePClient {
     /// was installed first: replay has already recreated the fid there, and
     /// the caller must clunk it on that connection.
     async fn forget_fid_of_lost_connection(&self, fid: u32) -> bool {
-        let _transition = self.session_transition.lock().await;
+        let _transition = self.fid_retirement_transition().await;
         if !self.conn.load().dead.load(Ordering::Acquire) {
             return false;
         }
@@ -2416,8 +2462,25 @@ impl NinePClient {
         true
     }
 
+    /// Retiring a lost or stale fid must be able to end a replay that holds
+    /// the transition while retrying a conflicting lock.
+    async fn fid_retirement_transition(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        match self.session_transition.try_lock() {
+            Ok(transition) => transition,
+            Err(_) => {
+                if self.conn.load().dead.load(Ordering::Acquire) {
+                    // The candidate may be retrying a recorded lock. End
+                    // that replay before waiting for its transition, or the
+                    // clunk and the lock replay can wait on each other forever.
+                    self.interrupt_replay.notify_one();
+                }
+                self.session_transition.lock().await
+            }
+        }
+    }
+
     async fn clear_stale_fid(&self, fid: u32) -> bool {
-        let _transition = self.session_transition.lock().await;
+        let _transition = self.fid_retirement_transition().await;
         if self.terminal_errno.load(Ordering::Acquire) != 0 {
             return false;
         }
@@ -3854,6 +3917,7 @@ mod session_transition_tests {
             reconnect_attempts: AtomicU64::new(0),
             reconnect_failed_through: AtomicU64::new(0),
             retry_now: Arc::new(Notify::new()),
+            interrupt_replay: Notify::new(),
             terminal_errno: AtomicU32::new(0),
             live_notify: Notify::new(),
             reconnect_notify: Arc::new(Notify::new()),
@@ -4134,6 +4198,7 @@ mod session_transition_tests {
             waiter_client
                 .accept_stateful_response(&waiter_old)
                 .await
+                .unwrap()
                 .is_some()
         });
         tokio::task::yield_now().await;
@@ -4161,6 +4226,7 @@ mod session_transition_tests {
         let settlement = client
             .accept_stateful_response(&conn)
             .await
+            .unwrap()
             .expect("current response should settle");
 
         let replay_client = Arc::clone(&client);
@@ -6434,6 +6500,23 @@ mod session_transition_tests {
         }
 
         #[tokio::test(start_paused = true)]
+        async fn a_late_request_is_bounded_even_when_a_fresh_replay_does_not_finish() {
+            let (conn, _requests) = test_conn_with_receiver();
+            let client = test_client(conn);
+            client.live.store(false, Ordering::Release);
+            client.declare_unavailable();
+            // A reconnect attempt that is stuck restoring locks need not
+            // report a failure or install a connection. It cannot hold a new
+            // request indefinitely after the original outage bound expired.
+            let late_client = Arc::clone(&client);
+            let late = tokio::spawn(async move { late_client.getattr(1, 0).await });
+            assert!(matches!(
+                settle(late, "a request waiting for a stalled fresh replay").await,
+                Err(ClientError::Disconnected)
+            ));
+        }
+
+        #[tokio::test(start_paused = true)]
         async fn an_unacknowledged_write_fails_is_not_recorded_and_is_not_resent() {
             let (client, conn, mut requests) = gone_client(MAX_INFLIGHT_REQUESTS);
             let write_client = Arc::clone(&client);
@@ -6536,6 +6619,153 @@ mod session_transition_tests {
                 "a clunk that already returned to its caller was resent",
             )
             .await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn the_outage_bound_releases_a_response_waiting_for_replay_settlement() {
+            let (client, conn, mut requests) = gone_client(1);
+            client
+                .state
+                .lock()
+                .unwrap()
+                .fids
+                .insert(7, inode_fid(70, 0, 0, None));
+            let transition = client.session_transition.lock().await;
+
+            let open_client = Arc::clone(&client);
+            let open = tokio::spawn(async move { open_client.lopen(7, 0).await });
+            let sent = recv_op_request(&mut requests, "the open before connection loss").await;
+            reply(
+                &conn,
+                sent.tag,
+                Message::Rlopen(Rlopen {
+                    qid: qid(70),
+                    iounit: 0,
+                }),
+            );
+            tokio::task::yield_now().await;
+            assert!(
+                !open.is_finished(),
+                "response settlement must wait for the transition"
+            );
+            conn.connection_lost(&client.reconnect_notify);
+
+            let error = settle(open, "a response waiting for replay settlement")
+                .await
+                .expect_err("a response from the lost connection cannot settle");
+            assert!(matches!(error, ClientError::Disconnected), "{error}");
+            assert_eq!(client.request_admission.available_permits(), 1);
+            assert_eq!(client.state.lock().unwrap().fids[&7].opened, None);
+            drop(transition);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_clunk_failed_by_the_outage_interrupts_conflicting_lock_replay() {
+            clunk_during_conflicting_lock_replay(false, false).await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_clunk_issued_after_the_outage_bound_interrupts_conflicting_lock_replay() {
+            clunk_during_conflicting_lock_replay(true, false).await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_stale_fid_clunk_interrupts_another_fids_conflicting_lock_replay() {
+            clunk_during_conflicting_lock_replay(false, true).await;
+        }
+
+        async fn clunk_during_conflicting_lock_replay(after_bound: bool, stale: bool) {
+            let (client, conn, _requests) = gone_client(MAX_INFLIGHT_REQUESTS);
+            {
+                let mut state = client.state.lock().unwrap();
+                state.fids.insert(7, inode_fid(70, 0, 0, None));
+                state.locks.push(LockRecord {
+                    fid: 7,
+                    lock_type: LockType::WriteLock,
+                    start: 0,
+                    length: 0,
+                    proc_id: 1,
+                    client_id: b"holder".to_vec(),
+                });
+            }
+            if stale {
+                // A prior replay already proved this opened fid stale. A
+                // later reconnect is now restoring another fid's lock.
+                client.stale_fids.insert(9);
+            }
+            conn.connection_lost(&client.reconnect_notify);
+
+            let (candidate, mut requests) = test_conn_with_receiver();
+            let (blocked_tx, blocked_rx) = oneshot::channel();
+            let responder_conn = Arc::clone(&candidate);
+            let responder = tokio::spawn(async move {
+                let mut blocked_tx = Some(blocked_tx);
+                while let Some(request) = next_request(&mut requests).await {
+                    match request.body {
+                        Message::Trebind(rebind) => reply(
+                            &responder_conn,
+                            request.tag,
+                            Message::Rrebind(Rrebind {
+                                qid: qid(rebind.inode_id),
+                            }),
+                        ),
+                        Message::Tlock(_) => {
+                            reply(
+                                &responder_conn,
+                                request.tag,
+                                Message::Rlock(Rlock {
+                                    status: LOCK_BLOCKED,
+                                }),
+                            );
+                            if let Some(blocked_tx) = blocked_tx.take() {
+                                let _ = blocked_tx.send(());
+                            }
+                        }
+                        Message::Tversion(_) => {
+                            reply(
+                                &responder_conn,
+                                request.tag,
+                                Message::Rversion(Rversion {
+                                    msize: 8192,
+                                    version: P9String::new(VERSION_9P2000L_ZEROFS.to_vec()),
+                                }),
+                            );
+                            return;
+                        }
+                        other => panic!("unexpected replay request: {other:?}"),
+                    }
+                }
+            });
+            let replay_client = Arc::clone(&client);
+            let replay =
+                tokio::spawn(async move { replay_client.restore_connection(candidate).await });
+            blocked_rx.await.unwrap();
+
+            if after_bound {
+                tokio::time::sleep(client.reconnect_timeout.get() + Duration::from_secs(1)).await;
+                assert!(client.unavailable.load(Ordering::Acquire));
+            }
+
+            let clunk_client = Arc::clone(&client);
+            let clunk_fid = if stale { 9 } else { 7 };
+            let clunk = tokio::spawn(async move { clunk_client.clunk(clunk_fid).await });
+            settle(clunk, "a clunk waiting for conflicting lock replay")
+                .await
+                .unwrap();
+            if stale {
+                assert!(!client.stale_fids.contains(&9));
+                assert!(client.state.lock().unwrap().fids.contains_key(&7));
+                assert_eq!(client.state.lock().unwrap().locks.len(), 1);
+            } else {
+                assert!(!client.state.lock().unwrap().fids.contains_key(&7));
+                assert!(client.state.lock().unwrap().locks.is_empty());
+            }
+            assert!(
+                settle(replay, "the interrupted replay candidate")
+                    .await
+                    .is_err()
+            );
+            settle(responder, "the replay candidate reset").await;
         }
     }
 }
