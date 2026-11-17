@@ -1,7 +1,7 @@
 import { Code, ConnectError } from "@connectrpc/connect";
 
 // Pool observations embed JSON in one protobuf string. Bound the wire frame before
-// connect-web sees its header: its decoder allocates the declared message length
+// connect-web sees its header. Its decoder allocates the declared message length
 // immediately, so checking response.json.length in the page is too late.
 export const MAX_STORAGE_MESSAGE_BYTES = 8 * 1024 * 1024 + 1024;
 const MAX_STORAGE_RESPONSE_BYTES = MAX_STORAGE_MESSAGE_BYTES + 16 * 1024;

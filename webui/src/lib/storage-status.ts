@@ -49,7 +49,7 @@ export interface SegmentFault {
   nextRetryMs: number;
 }
 
-// Every field is required: a fault that cannot be shown whole makes the list unavailable rather than
+// Every field is required. A fault that cannot be shown whole makes the list unavailable rather than
 // being dropped or shown with a guessed reason, attempt count or retry time.
 function segmentFault(raw: unknown): Value<SegmentFault> {
   const row = object(raw);

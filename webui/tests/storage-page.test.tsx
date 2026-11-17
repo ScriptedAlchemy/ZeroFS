@@ -38,7 +38,7 @@ const member = {
   },
   evacuation_capacity: { sufficient: true, unavailable_members: [] },
 };
-// The server's clock when it assembled the status: one minute after the observations used below.
+// The server's clock when it assembled the status, one minute after the observations used below.
 const generatedMs = 1_800_000_060_000;
 const pool = (members: unknown[], unreadable: unknown[] = [], extra: Record<string, unknown> = {}) =>
   JSON.stringify({
@@ -208,7 +208,7 @@ describe("Storage page filesystem activity", () => {
     expect(rowValue("Logical bytes read")).toBe("3.0 MiB (3,145,728 bytes)");
     expect(rowValue("Inodes used")).toBe("12,345");
     expect(document.body.textContent).not.toMatch(/Unavailable · .*not reported/);
-    // The fix makes the old caveat untrue, so the page must not print it.
+    // Explicit presence makes the old caveat untrue, so the page must not print it.
     expect(document.body.textContent).not.toMatch(/can mean zero or not reported/);
   });
 });
