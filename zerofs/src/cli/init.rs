@@ -60,6 +60,8 @@ struct StartupContext {
     opening: Option<crate::replication::leader_record::OpeningToken>,
     /// Backend data-plane tuning, resolved once from the storage URL.
     store_profile: crate::config::StoreProfile,
+    /// Trips on the first non-transient local I/O error of the metadata store.
+    metadata_fault: crate::metadata_fault::MetadataFault,
 }
 
 async fn resolve_startup_bucket_identity(
@@ -165,6 +167,7 @@ impl StartupContext {
             path: path_from_url,
             sftp_pool,
             pool,
+            metadata_fault,
         } = open_storage(settings)
             .await
             .context("Failed to connect to storage backend")?;
@@ -332,6 +335,7 @@ impl StartupContext {
                 recovering_handoff: false,
                 opening: None,
                 store_profile,
+                metadata_fault,
             })
         }
         .await;
@@ -974,6 +978,7 @@ impl ReconciledDb {
             recovering_handoff: _,
             opening: _,
             store_profile: backend_profile,
+            metadata_fault,
         } = startup;
 
         let serving_writer_epoch = match &slatedb {
@@ -1249,6 +1254,7 @@ impl ReconciledDb {
             db_path: actual_db_path,
             db_handle,
             authority,
+            metadata_fault,
             _cache_owner: cache_owner,
         })
     }
@@ -1285,6 +1291,9 @@ pub async fn initialize_filesystem_with_write_ack(
     let cleanup_writeback = startup.writeback.clone();
     let cleanup_pool = startup.sftp_pool.clone();
     let cleanup_storage_pool = startup.pool.clone();
+    // SlateDB retries a failed metadata read or write without limit. Once the
+    // local metadata store reports a non-transient error, stop waiting for it.
+    let metadata_fault = startup.metadata_fault.clone();
     let initialized = async move {
         let mut startup = startup.start_receiver()?;
         'role_election: loop {
@@ -1308,8 +1317,8 @@ pub async fn initialize_filesystem_with_write_ack(
                 }
             }
         }
-    }
-    .await;
+    };
+    let initialized = metadata_fault.bound(initialized).await;
 
     match initialized {
         Ok(initialized) => Ok(initialized),
@@ -1680,6 +1689,7 @@ mod role_decision_tests {
             recovering_handoff: false,
             opening: None,
             store_profile: crate::config::StoreProfile::default(),
+            metadata_fault: Default::default(),
         };
         let election = tokio::spawn(async move {
             startup.become_writer().await?;

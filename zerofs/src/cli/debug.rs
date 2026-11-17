@@ -114,8 +114,9 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
         path: path_from_url,
         sftp_pool,
         pool: _,
+        metadata_fault,
     } = open_storage(&settings).await?;
-    let command_result: Result<()> = async move {
+    let command = async move {
         let object_store = with_storage_class(
             Arc::from(object_store),
             settings.storage.storage_class.as_deref(),
@@ -238,8 +239,9 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
         db.close().await.context("Failed to close debug database")?;
 
         Ok(())
-    }
-    .await;
+    };
+    // SlateDB retries a failed metadata read without limit.
+    let command_result: Result<()> = metadata_fault.bound(command).await;
 
     finish_with_sftp_cleanup(
         sftp_pool.as_ref(),
@@ -274,6 +276,7 @@ pub async fn reseed_writeback_predecessor(
         sftp_pool,
         path: database_path,
         pool: _,
+        metadata_fault: _,
     } = open_storage(&settings).await?;
     let remote = with_storage_class(Arc::from(remote), settings.storage.storage_class.as_deref());
     let location = Path::parse(&path).context("invalid remote predecessor path")?;
@@ -358,6 +361,7 @@ pub async fn accept_remote_writeback_branch(
         sftp_pool,
         path: database_path,
         pool: _,
+        metadata_fault: _,
     } = open_storage(&settings).await?;
     let remote = with_storage_class(Arc::from(remote), settings.storage.storage_class.as_deref());
     let location = Path::parse(&manifest_path).context("invalid divergent manifest path")?;

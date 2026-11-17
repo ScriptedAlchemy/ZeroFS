@@ -21,6 +21,8 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::Notify;
 
+pub(crate) mod native_errno;
+
 /// Knobs shared with the test driving the store. Everything defaults to "no fault".
 #[derive(Debug, Default)]
 pub struct FaultControls {

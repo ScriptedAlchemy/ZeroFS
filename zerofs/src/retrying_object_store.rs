@@ -1,8 +1,10 @@
 //! Retry policy for direct ZeroFS object-store I/O.
 //!
 //! Transient errors retry indefinitely with exponential backoff. Deterministic
-//! errors return immediately. SlateDB applies its own retry policy to SST and
-//! manifest traffic.
+//! errors return immediately. Backends mark their own deterministic errors with
+//! [`PermanentError`]; the local metadata store does this for local I/O errors
+//! that do not clear on their own (see `metadata_fault`). SlateDB applies its
+//! own retry policy to SST and manifest traffic.
 //!
 //! Conditional writes are not generically verified. The HA marker protocol
 //! reconciles ambiguous writes by reading the record before continuing.
