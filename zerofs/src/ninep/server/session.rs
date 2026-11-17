@@ -502,7 +502,12 @@ impl P9PendingFrames {
 /// Upper bound on one spawned request task, charged with its frame against the
 /// reader's pending envelope. A debug assertion at spawn keeps it honest in
 /// every test that dispatches a request.
-pub(super) const PENDING_REQUEST_TASK_BYTES: usize = 16 * 1024;
+///
+/// The task's size depends on the build: with the `webui` feature it measured
+/// 16,400 bytes, 16 bytes over the 16 KiB this used to be, and only the
+/// default-feature tests had run against that bound. The bound leaves room for
+/// the task to grow without a feature or profile tipping it over.
+pub(super) const PENDING_REQUEST_TASK_BYTES: usize = 32 * 1024;
 
 /// A request whose task has started and is waiting for request admission.
 type StartedRequest = oneshot::Receiver<anyhow::Result<()>>;
