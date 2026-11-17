@@ -251,13 +251,8 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
     .await
 }
 
-pub async fn reseed_writeback_predecessor(
-    config_path: PathBuf,
-    journal_path: PathBuf,
-    path: String,
-    sequence: u64,
-) -> Result<()> {
-    let settings = Settings::from_file(&config_path)
+fn load_journal_recovery_settings(config_path: &std::path::Path) -> Result<Settings> {
+    let settings = Settings::from_file(config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
     if settings.storage.readiness.is_some() {
         anyhow::bail!(
@@ -271,6 +266,16 @@ pub async fn reseed_writeback_predecessor(
     {
         anyhow::bail!("[writeback] must be enabled in the supplied config");
     }
+    Ok(settings)
+}
+
+pub async fn reseed_writeback_predecessor(
+    config_path: PathBuf,
+    journal_path: PathBuf,
+    path: String,
+    sequence: u64,
+) -> Result<()> {
+    let settings = load_journal_recovery_settings(&config_path)?;
     let OpenedStorage {
         store: remote,
         sftp_pool,
@@ -342,20 +347,7 @@ pub async fn accept_remote_writeback_branch(
     }
     let local_sha256 = parse_sha256(&expected_local_sha256, "local SHA-256")?;
     let remote_sha256 = parse_sha256(&expected_remote_sha256, "remote SHA-256")?;
-    let settings = Settings::from_file(&config_path)
-        .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
-    if settings.storage.readiness.is_some() {
-        anyhow::bail!(
-            "storage readiness refuses --journal recovery because the supplied journal's filesystem binding cannot be verified"
-        );
-    }
-    if !settings
-        .writeback
-        .as_ref()
-        .is_some_and(|writeback| writeback.enabled)
-    {
-        anyhow::bail!("[writeback] must be enabled in the supplied config");
-    }
+    let settings = load_journal_recovery_settings(&config_path)?;
     let OpenedStorage {
         store: remote,
         sftp_pool,
@@ -794,84 +786,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_refuses_relocated_reseed_journals_before_mutation() {
-        for strict in [false, true] {
+    async fn readiness_refuses_relocated_recovery_journals_before_mutation() {
+        for (strict, accept) in [(false, false), (true, false), (false, true), (true, true)] {
             let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
             let (config, remote, prefix, identity) = readiness_recovery_config(&temp).await;
             let mut document: toml::Value =
                 toml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
             document["storage"]["readiness"]["strict"] = toml::Value::Boolean(strict);
             fs::write(&config, toml::to_string(&document).unwrap()).unwrap();
-            let journal_path = temp.path().join("relocated-reseed-journal");
-            let predecessor = format!("{prefix}/recovery/predecessor");
-            remote
-                .put(
-                    &Path::from(predecessor.as_str()),
-                    (&b"remote predecessor"[..]).into(),
+            let journal_path = temp.path().join("relocated-journal");
+            let (object, local, payload): (String, &[u8], &[u8]) = if accept {
+                (
+                    format!("{prefix}/manifest/00000000000000000007.manifest"),
+                    b"local manifest",
+                    b"remote manifest",
                 )
-                .await
-                .unwrap();
-            let journal = Journal::open(&journal_path, identity).unwrap();
-            journal
-                .commit_put(
-                    recovery_put(1, &predecessor, b"local predecessor"),
+            } else {
+                (
+                    format!("{prefix}/recovery/predecessor"),
                     b"local predecessor",
+                    b"remote predecessor",
                 )
-                .unwrap();
-            journal.mark_remote(1, None).unwrap();
-            drop(journal);
-            let before = stopped_journal_files(&journal_path);
-            let result =
-                reseed_writeback_predecessor(config, journal_path.clone(), predecessor, 1).await;
-            assert!(
-                result.is_err(),
-                "readiness must refuse relocated recovery journals, strict={strict}"
-            );
-            assert!(
-                format!("{:#}", result.unwrap_err())
-                    .contains("storage readiness refuses --journal recovery")
-            );
-            assert_eq!(stopped_journal_files(&journal_path), before);
-        }
-    }
-
-    #[tokio::test]
-    async fn readiness_refuses_relocated_accept_journals_before_mutation() {
-        for strict in [false, true] {
-            let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
-            let (config, remote, prefix, identity) = readiness_recovery_config(&temp).await;
-            let mut document: toml::Value =
-                toml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
-            document["storage"]["readiness"]["strict"] = toml::Value::Boolean(strict);
-            fs::write(&config, toml::to_string(&document).unwrap()).unwrap();
-            let journal_path = temp.path().join("relocated-accept-journal");
-            let manifest = format!("{prefix}/manifest/00000000000000000007.manifest");
-            let local = b"local manifest";
-            let payload = b"remote manifest";
+            };
             remote
-                .put(&Path::from(manifest.as_str()), payload.as_slice().into())
+                .put(&Path::from(object.as_str()), payload.into())
                 .await
                 .unwrap();
             let journal = Journal::open(&journal_path, identity).unwrap();
             journal
-                .commit_put(recovery_put(1, &manifest, local), local)
+                .commit_put(recovery_put(1, &object, local), local)
                 .unwrap();
+            if !accept {
+                journal.mark_remote(1, None).unwrap();
+            }
             drop(journal);
             let before = stopped_journal_files(&journal_path);
-            let result = accept_remote_writeback_branch(
-                config,
-                journal_path.clone(),
-                0,
-                1,
-                manifest,
-                hex_sha256(Sha256::digest(local).into()),
-                hex_sha256(Sha256::digest(payload).into()),
-                true,
-            )
-            .await;
+            let result = if accept {
+                accept_remote_writeback_branch(
+                    config,
+                    journal_path.clone(),
+                    0,
+                    1,
+                    object,
+                    hex_sha256(Sha256::digest(local).into()),
+                    hex_sha256(Sha256::digest(payload).into()),
+                    true,
+                )
+                .await
+            } else {
+                reseed_writeback_predecessor(config, journal_path.clone(), object, 1).await
+            };
             assert!(
                 result.is_err(),
-                "readiness must refuse relocated recovery journals, strict={strict}"
+                "readiness must refuse relocated recovery journals, strict={strict} accept={accept}"
             );
             assert!(
                 format!("{:#}", result.unwrap_err())
