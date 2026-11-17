@@ -4517,6 +4517,19 @@ mod tests {
             } else {
                 plain_root_session(&handler).await;
             }
+            let prior_id = [0x92; 16];
+            let applied = if private {
+                let Message::Rmkdir(response) = handler
+                    .handle_message_with_op_id(7, prior_id, plain_mkdir(b"already-applied"))
+                    .await
+                    .body
+                else {
+                    panic!("initial mkdir must succeed");
+                };
+                Some(response.qid)
+            } else {
+                None
+            };
             let mut connection = SaturatedConnection::start(Arc::clone(&handler));
             let held = connection.admission.admit_request(1, 0).await.unwrap();
             connection
@@ -4524,6 +4537,11 @@ mod tests {
                 .write_all(&maximum_write(10, private))
                 .await
                 .unwrap();
+            let stall = if private {
+                Some(fs.db.flush_barrier().write_owned().await)
+            } else {
+                None
+            };
             let id = [0x91; 16];
             let skipped = if private {
                 mkdir_frame(11, id, 0, b"retried-after-refusal")
@@ -4531,36 +4549,93 @@ mod tests {
                 frame(11, root_getattr())
             };
             connection.client.write_all(&skipped).await.unwrap();
+            if private {
+                connection
+                    .client
+                    .write_all(&mkdir_frame(
+                        13,
+                        prior_id,
+                        P9_OP_FLAG_RETRY,
+                        b"already-applied",
+                    ))
+                    .await
+                    .unwrap();
+            }
             connection
                 .send(12, Message::Tflush(Tflush { oldtag: 10 }))
                 .await;
-            let (tag, refused) = connection
-                .recv_within(Duration::from_secs(3), "ordinary frame refused")
-                .await;
-            assert_eq!(tag, 11);
-            let expected = if private {
-                ninep_proto::P9_ENOTLEADER_CLEAN
-            } else {
-                crate::linux_errno::EAGAIN
-            };
-            assert!(
-                matches!(refused.body, Message::Rlerror(Rlerror { ecode }) if ecode == expected)
+            let bound = Duration::from_secs(3);
+            let mut replies = vec![
+                connection
+                    .recv_within(bound, "flush or overload refusal")
+                    .await,
+            ];
+            if let Some(stall) = stall {
+                assert_eq!(
+                    replies[0].0, 12,
+                    "Tflush must pass the stalled refusal commit"
+                );
+                assert!(
+                    fs.dedup.get(&id).is_none(),
+                    "a refusal must not be visible before commit"
+                );
+                drop(stall);
+            }
+            replies.push(
+                connection
+                    .recv_within(TEST_TIMEOUT, "remaining reply")
+                    .await,
             );
-            let (tag, flushed) = connection
-                .recv_within(PROMPT_FLUSH, "flush behind the refused frame")
-                .await;
-            assert_eq!(tag, 12);
-            assert!(matches!(flushed.body, Message::Rflush(_)));
+            replies.sort_by_key(|(tag, _)| *tag);
+            assert_eq!(replies[0].0, 11);
+            assert!(matches!(
+                replies[0].1.body,
+                Message::Rlerror(Rlerror {
+                    ecode: crate::linux_errno::EAGAIN
+                })
+            ));
+            assert_eq!(replies[1].0, 12);
+            assert!(matches!(replies[1].1.body, Message::Rflush(_)));
             drop(held);
-            if private {
-                assert!(fs.dedup.get(&id).is_none());
-                let new_handler =
-                    NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
-                establish_session(&new_handler, 1, b"root", 0, None).await;
-                let applied = new_handler
-                    .handle_message_with_op_id(13, id, plain_mkdir(b"retried-after-refusal"))
+            if let Some(first_qid) = applied {
+                let (tag, replay) = connection
+                    .recv_within(TEST_TIMEOUT, "prior success on the same connection")
                     .await;
-                assert!(matches!(applied.body, Message::Rmkdir(_)));
+                assert_eq!(tag, 13);
+                assert!(matches!(replay.body, Message::Rmkdir(ref r) if r.qid == first_qid));
+                // A caller that lost the refusal must be able to replay it
+                // on a replacement connection as well.
+                let replacement =
+                    NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+                establish_session(&replacement, 1, b"root", 0, None).await;
+                let refused = replacement
+                    .handle_message_with_op_envelope_origin(
+                        14,
+                        id,
+                        P9_OP_FLAG_RETRY,
+                        0,
+                        plain_mkdir(b"retried-after-refusal"),
+                    )
+                    .await;
+                assert!(matches!(
+                    refused.body,
+                    Message::Rlerror(Rlerror {
+                        ecode: crate::linux_errno::EAGAIN
+                    })
+                ));
+                connection
+                    .client
+                    .write_all(&mkdir_frame(15, [0x93; 16], 0, b"retried-after-refusal"))
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    connection
+                        .recv_within(TEST_TIMEOUT, "unrelated FIRST stays on the live connection")
+                        .await
+                        .1
+                        .body,
+                    Message::Rmkdir(_)
+                ));
             }
             drop(connection.client);
             connection.reader.await.unwrap().unwrap();

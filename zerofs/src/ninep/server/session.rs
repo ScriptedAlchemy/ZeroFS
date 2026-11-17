@@ -3,8 +3,8 @@ use super::admission::{
     P9TransportPermit,
 };
 use super::frame_codec::{
-    FidFootprint, FrameHeader, TCLUNK_TYPE, TFLUSH_TYPE, TVERSION_TYPE, inspect_frame_metadata,
-    read_9p_frame_charged, shallow_epoch_zero_retry_write,
+    FidFootprint, FrameHeader, FramePlan, TCLUNK_TYPE, TFLUSH_TYPE, TVERSION_TYPE,
+    inspect_frame_metadata, read_9p_frame_charged, shallow_epoch_zero_retry_write,
 };
 use super::response_writer::{
     P9Response, ResponseAuthority, ResponseCredit, spawn_response_writer,
@@ -461,6 +461,11 @@ enum ReceiveCharge {
     // The WebSocket reader lends its current frame credit until admission or close.
     #[cfg(any(feature = "webui", test))]
     WebSocketFrame { _receive: Arc<P9ReceivePermit> },
+    // At most one overflow replay per connection, paid by spare receive bytes.
+    Replay {
+        _bytes: P9ReceivePermit,
+        _slot: OwnedSemaphorePermit,
+    },
     /// A `Tflush` reply slot.
     Flush(OwnedSemaphorePermit),
 }
@@ -468,6 +473,7 @@ enum ReceiveCharge {
 /// The bounded receive envelope shared by a reader and its unadmitted frames.
 pub(crate) struct P9PendingFrames {
     overloaded: AtomicBool,
+    replay_slot: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
     receive: Arc<P9ReceivePermit>,
 }
@@ -476,6 +482,7 @@ impl P9PendingFrames {
     pub(crate) fn new(receive: P9ReceivePermit) -> Self {
         Self {
             overloaded: AtomicBool::new(false),
+            replay_slot: Arc::new(Semaphore::new(1)),
             bytes: Arc::new(Semaphore::new(P9_MAX_MSIZE as usize)),
             receive: Arc::new(receive),
         }
@@ -501,6 +508,37 @@ impl P9PendingFrames {
             .try_acquire_many_owned(Self::frame_permits(header))
             .ok()
             .map(|bytes| self.pending_charge(bytes))
+    }
+
+    async fn charge_replay(
+        &self,
+        header: FrameHeader,
+        context: &ConnectionContext<'_>,
+    ) -> anyhow::Result<ReceiveCharge> {
+        let ordinary = Arc::clone(&self.bytes).acquire_many_owned(Self::frame_permits(header));
+        let spare = async {
+            let slot = Arc::clone(&self.replay_slot).acquire_owned().await?;
+            let bytes = context
+                .admission
+                .global
+                .admit_receive_bytes(
+                    (header.len + PENDING_REQUEST_TASK_BYTES) as u32,
+                    context.connection_shutdown,
+                )
+                .await?;
+            Ok(ReceiveCharge::Replay {
+                _slot: slot,
+                _bytes: bytes,
+            })
+        };
+        tokio::time::timeout(PENDING_FRAME_GRACE, async {
+            tokio::select! {
+                biased;
+                charge = ordinary => Ok(self.pending_charge(charge?)),
+                charge = spare => charge,
+            }
+        })
+        .await?
     }
 
     /// Dispatch one complete WebSocket frame while retaining bounded receive
@@ -872,6 +910,84 @@ fn is_fid_retirement(type_byte: u8) -> bool {
     matches!(type_byte, TCLUNK_TYPE | TVERSION_TYPE | 122)
 }
 
+struct FirstRefusal {
+    id: crate::dedup::OpId,
+    operation: crate::dedup::DedupGuard,
+    bytes: (OwnedSemaphorePermit, OwnedSemaphorePermit),
+    slot: OwnedSemaphorePermit,
+}
+
+impl FirstRefusal {
+    async fn reserve(
+        id: crate::dedup::OpId,
+        operation: crate::dedup::DedupGuard,
+        context: &ConnectionContext<'_>,
+    ) -> anyhow::Result<Self> {
+        tokio::time::timeout(PENDING_FRAME_GRACE, async {
+            let slot = Arc::clone(&context.inflight.inner.refusal_slots)
+                .acquire_owned()
+                .await?;
+            let bytes = context
+                .admission
+                .acquire_task_bytes(
+                    PENDING_REQUEST_TASK_BYTES as u32,
+                    context.connection_shutdown,
+                )
+                .await?;
+            Ok(Self {
+                id,
+                operation,
+                bytes,
+                slot,
+            })
+        })
+        .await?
+    }
+
+    fn start(self, tag: u16, context: &ConnectionContext<'_>) -> anyhow::Result<()> {
+        let accepted = context
+            .admission
+            .accepted_work
+            .try_accept()
+            .ok_or_else(|| anyhow::anyhow!("9P request admission is sealed for shutdown"))?;
+        let lease =
+            context
+                .inflight
+                .register_with(tag, FidFootprint::None, Abandonment::committed())?;
+        let handler = Arc::clone(context.handler);
+        let tx = context.tx.clone();
+        let shutdown = context.connection_shutdown.clone();
+        let revoked = accepted.revoked();
+        let task = async move {
+            // Keep the claim and byte credit until the replicated terminal
+            // result is visible. Reconnect retries join this same operation.
+            let _ownership = (self.operation, self.bytes, accepted);
+            if let Err(error) = handler.persist_overload_refusal(self.id).await {
+                warn!("9P could not record overloaded FIRST for tag {tag}: {error:?}");
+                shutdown.cancel();
+                return;
+            }
+            let reply = P9Message::new(
+                tag,
+                Message::Rlerror(Rlerror {
+                    ecode: crate::linux_errno::EAGAIN,
+                }),
+            )
+            .to_bytes()
+            .expect("fixed Rlerror encodes");
+            let _ =
+                enqueue_terminal_response(&tx, reply, &lease, ResponseCredit::Control(self.slot))
+                    .await;
+        };
+        let tracked = context.requests.track_future(async move {
+            tokio::select! { biased; _ = revoked => {}, _ = task => {} }
+        });
+        debug_assert!(std::mem::size_of_val(&tracked) <= PENDING_REQUEST_TASK_BYTES);
+        drop(spawn_named("9p-refuse-first", tracked));
+        Ok(())
+    }
+}
+
 async fn refuse_overload(
     header: &[u8],
     context: &ConnectionContext<'_>,
@@ -954,32 +1070,52 @@ where
     let pending = P9PendingFrames::new(admission.global.admit_receive(&connection_shutdown).await?);
 
     loop {
-        let Some((frame, charge)) =
-            read_9p_frame_charged(&mut read_stream, &connection_shutdown, async |header| {
-                let charge = charge_received_frame(header, &pending, &inflight).await?;
+        let Some((frame, plan)) = read_9p_frame_charged(
+            &mut read_stream,
+            &connection_shutdown,
+            || handler.zerofs_protocol_enabled(),
+            async |header, op| {
+                if let Some(charge) = charge_received_frame(header, &pending, &inflight).await? {
+                    return Ok(FramePlan::Read(charge));
+                }
                 anyhow::ensure!(
-                    charge.is_some() || !is_fid_retirement(header.type_byte),
+                    !is_fid_retirement(header.type_byte),
                     "9P pending frame capacity exhausted"
                 );
-                Ok(charge)
-            })
-            .await?
+                if let Some((id, flags, _)) = op
+                    && crate::dedup::has_op_id(&id)
+                {
+                    if let Some(guard) =
+                        handler.try_reserve_received_first(id, flags, header.type_byte)
+                        && guard.is_new_attempt()
+                    {
+                        let refusal = FirstRefusal::reserve(id, guard, &context).await?;
+                        return Ok(FramePlan::Refuse(Some(refusal)));
+                    }
+                    // A RETRY or duplicate FIRST needs its authoritative result.
+                    // Keep its full frame for normal replay, including write
+                    // fingerprint validation and promotion-epoch handling.
+                    let charge = pending.charge_replay(header, &context).await?;
+                    return Ok(FramePlan::Read(charge));
+                }
+                Ok(FramePlan::Refuse(None))
+            },
+        )
+        .await?
         else {
             debug!("Client disconnected");
             return Ok(());
         };
-        if let Some(charge) = charge {
-            drop(start_9p_request(frame, &context, charge)?);
-        } else {
-            let ecode = if handler.zerofs_protocol_enabled() && P9Message::carries_op_id(frame[4]) {
-                // Tell reconnecting clients this attempt never dispatched.
-                // They preserve ambiguity from any earlier RETRY, and can
-                // safely send a refused FIRST as FIRST on the next connection.
-                ninep_proto::P9_ENOTLEADER_CLEAN
-            } else {
-                crate::linux_errno::EAGAIN
-            };
-            refuse_overload(&frame, &context, ecode).await?;
+        match plan {
+            FramePlan::Read(charge) => {
+                drop(start_9p_request(frame, &context, charge)?);
+            }
+            FramePlan::Refuse(Some(first)) => {
+                first.start(u16::from_le_bytes([frame[5], frame[6]]), &context)?
+            }
+            FramePlan::Refuse(None) => {
+                refuse_overload(&frame, &context, crate::linux_errno::EAGAIN).await?
+            }
         }
     }
 }
