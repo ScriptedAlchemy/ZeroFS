@@ -1,7 +1,7 @@
 # Follow-up: anchor authority, member, and cache I/O
 
-This work follows the startup preflight in PR 76. It is not implemented by that
-preflight. Its purpose is to keep object and cache operations inside the
+This work follows the startup preflight in PR 76. That preflight does not
+implement it. Its purpose is to keep object and cache operations inside the
 directory that was opened when readiness succeeded, even if another process
 later replaces a path component.
 
