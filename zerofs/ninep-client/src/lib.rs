@@ -47,7 +47,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::net::{TcpStream, UnixStream};
-use tokio::sync::{Notify, mpsc, oneshot, watch};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 #[cfg(not(target_arch = "wasm32"))]
 use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{debug, info, warn};
@@ -67,6 +67,10 @@ mod xattr;
 
 /// The 9P "no tag" sentinel. We never allocate it for a normal request.
 const NOTAG: u16 = 0xFFFF;
+/// Filesystem RPCs one client admits at once. Each admitted request can hold
+/// a response slot and an outbound frame, so this bounds client memory.
+const MAX_INFLIGHT_REQUESTS: usize = 1024;
+const _: () = assert!(MAX_INFLIGHT_REQUESTS < NOTAG as usize);
 /// Default TCP port used when a target omits one.
 #[cfg(not(target_arch = "wasm32"))]
 const DEFAULT_9P_PORT: u16 = 5564;
@@ -445,7 +449,7 @@ mod target_parse_tests {
 /// One transport and its reader/writer tasks.
 struct Conn {
     writer_tx: mpsc::Sender<OutboundFrame>,
-    pending: DashMap<u16, oneshot::Sender<Bytes>>,
+    pending: DashMap<u16, PendingRequest>,
     tag_ctr: AtomicU16,
     /// Durability lineage returned by `Tgetlineage`.
     lineage_token: AtomicU64,
@@ -467,6 +471,16 @@ struct Conn {
     /// Forward write progress shared by all FIFO-queued request receipts.
     send_progress: SendProgress,
     counters: Arc<TrafficCounters>,
+}
+
+type AdmissionPermit = Arc<OwnedSemaphorePermit>;
+
+/// Response routing state kept until delivery or connection teardown. A
+/// dispatched request keeps its admission permit here, so cancelling the
+/// caller's future cannot release capacity while the reply is unresolved.
+struct PendingRequest {
+    reply: oneshot::Sender<Bytes>,
+    _admission: Option<AdmissionPermit>,
 }
 
 impl Conn {
@@ -512,7 +526,7 @@ impl Conn {
         }
         let tag = u16::from_le_bytes([frame[5], frame[6]]);
         if let Some((_, pending)) = self.pending.remove(&tag) {
-            let _ = pending.send(frame);
+            let _ = pending.reply.send(frame);
         } else {
             debug!("9P client: response for unknown tag {tag}");
         }
@@ -672,6 +686,9 @@ pub struct NinePClient {
     stale_fids: DashSet<u32>,
     /// Orders stateful response settlement against snapshot/replay/install.
     session_transition: tokio::sync::Mutex<()>,
+    /// Dispatch window for filesystem RPCs. Session-maintenance exchanges use
+    /// the raw request path and take no permit.
+    request_admission: Arc<Semaphore>,
     /// Per-fid durability obligations carried across reconnects.
     unsynced: DashMap<u32, Unsynced>,
     counters: Arc<TrafficCounters>,
@@ -783,6 +800,7 @@ impl NinePClient {
             state: Mutex::new(SessionState::default()),
             stale_fids: DashSet::new(),
             session_transition: tokio::sync::Mutex::new(()),
+            request_admission: Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS)),
             unsynced: DashMap::new(),
             counters,
         });
@@ -1446,10 +1464,14 @@ impl NinePClient {
         conn: &Conn,
         tag: u16,
         tx: oneshot::Sender<Bytes>,
+        admission: Option<AdmissionPermit>,
     ) -> Result<u16, oneshot::Sender<Bytes>> {
         match conn.pending.entry(tag) {
             Entry::Vacant(slot) => {
-                slot.insert(tx);
+                slot.insert(PendingRequest {
+                    reply: tx,
+                    _admission: admission,
+                });
                 Ok(tag)
             }
             Entry::Occupied(_) => Err(tx),
@@ -1460,6 +1482,7 @@ impl NinePClient {
     fn alloc_tag(
         conn: &Conn,
         mut tx: oneshot::Sender<Bytes>,
+        admission: Option<&AdmissionPermit>,
     ) -> Result<u16, oneshot::Sender<Bytes>> {
         // Scan all 65,535 usable tags, including a cycle starting at NOTAG.
         for _ in 0..=usize::from(NOTAG) {
@@ -1467,7 +1490,7 @@ impl NinePClient {
             if candidate == NOTAG {
                 continue;
             }
-            match Self::register_tag(conn, candidate, tx) {
+            match Self::register_tag(conn, candidate, tx, admission.cloned()) {
                 Ok(tag) => return Ok(tag),
                 Err(returned) => tx = returned,
             }
@@ -1482,6 +1505,7 @@ impl NinePClient {
         body: &Message,
         attempt: &mut OpAttemptState,
         stateful_dispatched_conn: Option<&Mutex<Option<Arc<Conn>>>>,
+        admission: &AdmissionPermit,
     ) -> ClientResult<(Message, Arc<Conn>)> {
         'resend: loop {
             self.validate_fids(body.request_fids())?;
@@ -1507,7 +1531,7 @@ impl NinePClient {
             }
 
             let (otx, mut orx) = oneshot::channel();
-            let tag = match Self::alloc_tag(&conn, otx) {
+            let tag = match Self::alloc_tag(&conn, otx, Some(admission)) {
                 Ok(tag) => tag,
                 Err(_) => {
                     // Teardown clears live and quarantined tags.
@@ -1621,15 +1645,28 @@ impl NinePClient {
         }
     }
 
+    /// Waits for a slot in the filesystem-RPC dispatch window. The permit is
+    /// held across resends and released when the reply is delivered or the
+    /// connection that carries it is torn down.
+    async fn acquire_request_admission(&self) -> ClientResult<AdmissionPermit> {
+        Ok(Arc::new(
+            Arc::clone(&self.request_admission)
+                .acquire_owned()
+                .await
+                .map_err(|_| ClientError::Disconnected)?,
+        ))
+    }
+
     /// Request path for operations that do not change replayable session state.
     async fn send_request(&self, body: Message) -> ClientResult<Message> {
+        let admission = self.acquire_request_admission().await?;
         let op_id = if body.is_mutation() {
             Uuid::new_v4().into_bytes()
         } else {
             [0u8; 16]
         };
         let mut attempt = OpAttemptState::default();
-        self.send_request_on_current(op_id, &body, &mut attempt, None)
+        self.send_request_on_current(op_id, &body, &mut attempt, None, &admission)
             .await
             .map(|(response, _)| response)
     }
@@ -1657,6 +1694,7 @@ impl NinePClient {
         &self,
         body: Message,
     ) -> ClientResult<(Message, tokio::sync::MutexGuard<'_, ()>)> {
+        let admission = self.acquire_request_admission().await?;
         let op_id = if body.is_mutation() {
             Uuid::new_v4().into_bytes()
         } else {
@@ -1671,7 +1709,13 @@ impl NinePClient {
         };
         let result = loop {
             let (response, response_conn) = match self
-                .send_request_on_current(op_id, &body, &mut attempt, Some(&dispatched_conn))
+                .send_request_on_current(
+                    op_id,
+                    &body,
+                    &mut attempt,
+                    Some(&dispatched_conn),
+                    &admission,
+                )
                 .await
             {
                 Ok(response) => response,
@@ -1791,9 +1835,9 @@ impl NinePClient {
         }
         let (otx, mut orx) = oneshot::channel();
         let tag = match exact_tag {
-            Some(tag) => Self::register_tag(conn, tag, otx)
+            Some(tag) => Self::register_tag(conn, tag, otx, None)
                 .map_err(|_| ClientError::Unexpected("raw tag already registered"))?,
-            None => match Self::alloc_tag(conn, otx) {
+            None => match Self::alloc_tag(conn, otx, None) {
                 Ok(tag) => tag,
                 Err(_) => {
                     drop(permit);
@@ -3588,6 +3632,10 @@ mod session_transition_tests {
     }
 
     fn test_client(conn: Arc<Conn>) -> Arc<NinePClient> {
+        test_client_with_limit(conn, MAX_INFLIGHT_REQUESTS)
+    }
+
+    fn test_client_with_limit(conn: Arc<Conn>, max_inflight_requests: usize) -> Arc<NinePClient> {
         Arc::new(NinePClient {
             targets: Vec::new(),
             case_insensitive: conn.case_insensitive.load(Ordering::Acquire),
@@ -3603,6 +3651,7 @@ mod session_transition_tests {
             state: Mutex::new(SessionState::default()),
             stale_fids: DashSet::new(),
             session_transition: tokio::sync::Mutex::new(()),
+            request_admission: Arc::new(Semaphore::new(max_inflight_requests)),
             unsynced: DashMap::new(),
             counters: Arc::new(TrafficCounters::default()),
         })
@@ -5597,12 +5646,140 @@ mod session_transition_tests {
         assert!(conn.pending.is_empty());
     }
 
+    #[tokio::test]
+    async fn admission_waits_locally_until_an_inflight_request_settles() {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let client = test_client_with_limit(Arc::clone(&conn), 1);
+
+        let first_client = Arc::clone(&client);
+        let first = tokio::spawn(async move { first_client.write(7, 0, b"a").await });
+        let first_request = recv_op_request(&mut requests, "first admitted request").await;
+        assert_eq!(client.request_admission.available_permits(), 0);
+
+        let second_client = Arc::clone(&client);
+        let second = tokio::spawn(async move { second_client.write(7, 1, b"b").await });
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            requests.try_recv().is_err(),
+            "the next request must remain local while the permit is held"
+        );
+
+        reply(
+            &conn,
+            first_request.tag,
+            Message::Rwrite(Rwrite { count: 1 }),
+        );
+        assert_eq!(first.await.unwrap().unwrap(), 1);
+
+        let second_request = recv_op_request(&mut requests, "second admitted request").await;
+        reply(
+            &conn,
+            second_request.tag,
+            Message::Rwrite(Rwrite { count: 1 }),
+        );
+        assert_eq!(second.await.unwrap().unwrap(), 1);
+        assert_eq!(client.request_admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_retains_admission_while_its_tag_is_quarantined() {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let client = test_client_with_limit(Arc::clone(&conn), 1);
+
+        let first_client = Arc::clone(&client);
+        let first = tokio::spawn(async move { first_client.write(7, 0, b"a").await });
+        let first_request = recv_op_request(&mut requests, "first request").await;
+        first.abort();
+        let _ = first.await;
+        assert_eq!(client.request_admission.available_permits(), 0);
+
+        let second_client = Arc::clone(&client);
+        let second = tokio::spawn(async move { second_client.write(7, 1, b"b").await });
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            requests.try_recv().is_err(),
+            "cancellation must not release capacity while the reply remains unresolved"
+        );
+
+        // Delivery removes the abandoned registration. Its retained permit is
+        // then released even though the response receiver no longer exists.
+        reply(
+            &conn,
+            first_request.tag,
+            Message::Rwrite(Rwrite { count: 1 }),
+        );
+        let second_request = recv_op_request(&mut requests, "second request").await;
+        reply(
+            &conn,
+            second_request.tag,
+            Message::Rwrite(Rwrite { count: 1 }),
+        );
+        assert_eq!(second.await.unwrap().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn reconnect_resend_keeps_the_original_admission_permit() {
+        let (old_conn, mut old_requests) = test_conn_with_receiver();
+        let client = test_client_with_limit(Arc::clone(&old_conn), 1);
+
+        let first_client = Arc::clone(&client);
+        let first = tokio::spawn(async move { first_client.write(7, 0, b"a").await });
+        let first_request = recv_op_request(&mut old_requests, "first request").await;
+        assert!(matches!(
+            first_request.body,
+            Message::Twrite(Twrite { offset: 0, .. })
+        ));
+
+        let second_client = Arc::clone(&client);
+        let second = tokio::spawn(async move { second_client.write(7, 1, b"b").await });
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert!(old_requests.try_recv().is_err());
+
+        client.live.store(false, Ordering::Release);
+        old_conn.connection_lost(&client.reconnect_notify);
+        let (new_conn, mut new_requests) = test_conn_with_receiver();
+        client.conn.store(Arc::clone(&new_conn));
+        client.live.store(true, Ordering::Release);
+        client.live_notify.notify_waiters();
+
+        let resent = recv_op_request(&mut new_requests, "resent first request").await;
+        assert!(matches!(
+            resent.body,
+            Message::Twrite(Twrite { offset: 0, .. })
+        ));
+        assert!(
+            new_requests.try_recv().is_err(),
+            "a resend must retain its permit instead of admitting another operation"
+        );
+
+        reply(&new_conn, resent.tag, Message::Rwrite(Rwrite { count: 1 }));
+        assert_eq!(first.await.unwrap().unwrap(), 1);
+
+        let second_request = recv_op_request(&mut new_requests, "second request").await;
+        assert!(matches!(
+            second_request.body,
+            Message::Twrite(Twrite { offset: 1, .. })
+        ));
+        reply(
+            &new_conn,
+            second_request.tag,
+            Message::Rwrite(Rwrite { count: 1 }),
+        );
+        assert_eq!(second.await.unwrap().unwrap(), 1);
+    }
+
     #[test]
     fn undispatched_guard_releases_its_tag() {
         let conn = test_conn();
 
         let (tx, _rx) = oneshot::channel();
-        let tag = NinePClient::alloc_tag(&conn, tx).expect("tag allocation failed");
+        let tag = NinePClient::alloc_tag(&conn, tx, None).expect("tag allocation failed");
         let guard = PendingTag {
             conn: Arc::clone(&conn),
             tag,
@@ -5619,12 +5796,13 @@ mod session_transition_tests {
 
         for tag in 0..(NOTAG - 1) {
             let (tx, _rx) = oneshot::channel();
-            assert!(NinePClient::register_tag(&conn, tag, tx).is_ok());
+            assert!(NinePClient::register_tag(&conn, tag, tx, None).is_ok());
         }
         conn.tag_ctr.store(NOTAG, Ordering::Relaxed);
 
         let (tx, _rx) = oneshot::channel();
-        let tag = NinePClient::alloc_tag(&conn, tx).expect("allocator missed the last usable tag");
+        let tag =
+            NinePClient::alloc_tag(&conn, tx, None).expect("allocator missed the last usable tag");
         assert_eq!(tag, NOTAG - 1);
     }
 }

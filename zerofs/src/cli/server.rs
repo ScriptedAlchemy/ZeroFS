@@ -1906,6 +1906,18 @@ pub async fn run_server(
                 SFTP_FINAL_WORKER_ABORT_TIMEOUT,
             )
             .await;
+            // Deferred orphan reclaims mutate metadata. Finish them while
+            // authority is still valid and before the final flush closes the
+            // database. Serving tasks are already joined, so their last open
+            // handles have queued their inodes.
+            info!("Waiting for deferred orphan reclaims to finish...");
+            tokio::select! {
+                biased;
+                _ = leadership_deposed.cancelled() => {
+                    return Err(leadership_lost_error());
+                }
+                _ = fs.shutdown_reclaim_drainer() => {}
+            }
             // Flush remains lease-gated while background tasks drain.
             if leadership_deposed.is_cancelled() {
                 return Err(leadership_lost_error());
