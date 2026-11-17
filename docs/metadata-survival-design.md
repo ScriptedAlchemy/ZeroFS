@@ -644,6 +644,10 @@ a backlog exceeding the deadline, deferred read faults while closed and
 read-only, idle skipping, record bounds and zero owned pins, lag status,
 authority promotion, orphan checkpoint recovery, crash-safe shared retention
 and live loss of the metadata replica disk.
+Fresh activation checks compare the membership epoch in each commit path and
+require canonical new replica roots to be disjoint from the old roots and one
+another. Advancing the sequence within a disabled epoch cannot satisfy them.
+Promotion also verifies that the new replica identities survive a cold restart.
 No case from the independent review is deferred without an acceptance row.
 
 Run formatting and the two CI clippy commands on the host through

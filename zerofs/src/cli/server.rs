@@ -9,7 +9,9 @@ use crate::fs::{CacheConfig, GarbageCollector, ZeroFS};
 use crate::length_checked_object_store::LengthCheckedObjectStore;
 use crate::nbd::{NBDServer, NbdExportGates};
 use crate::ninep::server::P9AcceptedWorkTracker;
-use crate::object_store_prefetch::PrefetchingObjectStore;
+use crate::object_store_prefetch::{
+    LEGACY_PARTS_CACHE_DIR, PARTS_CACHE_DIR, PARTS_CACHE_LAYOUT_FILE, PrefetchingObjectStore,
+};
 use crate::parse_object_store::{ParsedStore, parse_url_opts};
 use crate::storage_backend::{BackendSessions, OpenedStorage, open_storage};
 use crate::storage_class_object_store::with_storage_class;
@@ -902,6 +904,104 @@ async fn build_block_hybrid(
 /// max cacheable entry size.
 const PARTS_BLOCK_SIZE: usize = 64 * 1024 * 1024;
 
+/// Foyer's partition layout depends on the tombstone setting and capacity.
+/// Record both the geometry and recovery policy before opening its files, so
+/// older tombstone-enabled layouts cannot be mistaken for current data blocks.
+/// Unmarked/incompatible clean-cache data is disposable, not migratable.
+///
+/// The server holds its exclusive CleanCacheOwner before calling this helper
+/// and throughout the cache's lifetime. Test callers use owned temp directories.
+fn prepare_parts_cache_layout(parts_root: &StdPath, disk_bytes: usize) -> Result<()> {
+    use std::io::{Read, Write};
+
+    std::fs::create_dir_all(parts_root)
+        .with_context(|| format!("creating parts cache dir at {}", parts_root.display()))?;
+    if std::fs::symlink_metadata(parts_root)?
+        .file_type()
+        .is_symlink()
+    {
+        anyhow::bail!(
+            "parts cache directory {} must not be a symlink",
+            parts_root.display()
+        );
+    }
+    let expected = format!(
+        "zerofs-parts-cache-v1\nrecover=none\ntombstones=0\nblock_bytes={PARTS_BLOCK_SIZE}\ndisk_bytes={disk_bytes}\n"
+    );
+    let marker = parts_root.join(PARTS_CACHE_LAYOUT_FILE);
+    match std::fs::symlink_metadata(&marker) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                anyhow::bail!(
+                    "parts cache layout marker {} is not a regular file",
+                    marker.display()
+                );
+            }
+            let mut options = OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NOFOLLOW);
+            }
+            let file = options.open(&marker).with_context(|| {
+                format!("opening parts cache layout marker {}", marker.display())
+            })?;
+            if !file.metadata()?.file_type().is_file() {
+                anyhow::bail!(
+                    "parts cache layout marker {} is not a regular file",
+                    marker.display()
+                );
+            }
+            let mut actual = Vec::new();
+            file.take(expected.len() as u64 + 1)
+                .read_to_end(&mut actual)?;
+            if actual == expected.as_bytes() {
+                return Ok(());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("reading parts cache layout marker"),
+    }
+
+    // Make the old geometry unusable before deleting any of its partitions.
+    // A crash can persist only some unlinks (including the tombstone log), and
+    // reverting the configured capacity must not trust that incomplete cache.
+    match std::fs::remove_file(&marker) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("invalidating parts cache layout marker"),
+    }
+    #[cfg(unix)]
+    File::open(parts_root)?.sync_all()?;
+
+    // Reuse the ownership/type checks in pruning: foreign names remain intact,
+    // and a symlink or other non-file at a native partition name aborts the
+    // migration before the marker can be published.
+    let pruned = prune_foyer_partitions(parts_root, 0)?;
+    #[cfg(unix)]
+    File::open(parts_root)?.sync_all()?;
+
+    // Publish only after all old data has been removed durably. A failed or
+    // interrupted reset leaves no matching marker, so the next open retries it.
+    let mut temporary = tempfile::NamedTempFile::new_in(parts_root)?;
+    temporary.write_all(expected.as_bytes())?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(&marker)
+        .with_context(|| format!("publishing parts cache layout marker {}", marker.display()))?;
+    #[cfg(unix)]
+    File::open(parts_root)?.sync_all()?;
+    if pruned.removed_files > 0 {
+        info!(
+            removed_files = pruned.removed_files,
+            allocated_bytes_reclaimed = pruned.allocated_bytes_reclaimed,
+            "Discarded incompatible clean parts-cache partitions before opening Foyer"
+        );
+    }
+    Ok(())
+}
+
 /// Disk-engine knobs for the parts cache, scaled to the device.
 struct PartsEngineKnobs {
     flushers: usize,
@@ -922,69 +1022,6 @@ fn parts_engine_knobs(disk_bytes: usize) -> PartsEngineKnobs {
     }
 }
 
-/// Names the parts cache directory layout. foyer records no layout on its
-/// device and assigns partition files in creation order, so the same files
-/// read differently under another engine configuration.
-const PARTS_LAYOUT_MARKER: &str = ".zerofs-parts-layout";
-/// The current layout. Partition 0 is foyer's tombstone log, sized from the
-/// device capacity, and the data blocks follow it.
-const PARTS_LAYOUT: &[u8] = b"foyer block engine with tombstone log v1\n";
-
-/// Removes every foyer partition under `parts_root` unless the directory
-/// records the current layout, then records it.
-///
-/// A directory written before the tombstone log existed holds its first data
-/// block in partition 0. foyer would recover that block's part bytes as
-/// tombstone records, and a record whose sequence is `u64::MAX` overflows
-/// its recovery. The parts are a cache of backend bytes, so dropping them
-/// costs only refetches.
-fn discard_parts_of_another_layout(parts_root: &StdPath) -> Result<usize> {
-    let marker = parts_root.join(PARTS_LAYOUT_MARKER);
-    match std::fs::read(&marker) {
-        Ok(layout) if layout == PARTS_LAYOUT => return Ok(0),
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("reading parts cache layout {}", marker.display()));
-        }
-    }
-
-    let mut removed = 0;
-    for entry in std::fs::read_dir(parts_root)
-        .with_context(|| format!("reading parts cache directory {}", parts_root.display()))?
-    {
-        let entry = entry?;
-        if entry
-            .file_name()
-            .to_str()
-            .and_then(foyer_partition_id)
-            .is_none()
-        {
-            continue;
-        }
-        let path = entry.path();
-        if !std::fs::symlink_metadata(&path)?.file_type().is_file() {
-            anyhow::bail!(
-                "foyer-owned partition {} is not a regular file",
-                path.display()
-            );
-        }
-        std::fs::remove_file(&path)
-            .with_context(|| format!("discarding parts cache partition {}", path.display()))?;
-        removed += 1;
-    }
-    // The removals must be durable before the marker is, or a crash could
-    // leave the old partitions beside a marker that vouches for them.
-    File::open(parts_root)?.sync_all()?;
-    let mut file = File::create(&marker)
-        .with_context(|| format!("writing parts cache layout {}", marker.display()))?;
-    std::io::Write::write_all(&mut file, PARTS_LAYOUT)?;
-    file.sync_all()?;
-    File::open(parts_root)?.sync_all()?;
-    Ok(removed)
-}
-
 pub(crate) async fn build_parts_hybrid(
     cache_root: &std::path::Path,
     memory_bytes: usize,
@@ -995,19 +1032,12 @@ pub(crate) async fn build_parts_hybrid(
     use crate::object_store_prefetch::PartKey;
     use bytes::Bytes;
 
-    let parts_root = cache_root.join("parts_cache");
-    tokio::fs::create_dir_all(&parts_root)
-        .await
-        .with_context(|| format!("creating parts cache dir at {}", parts_root.display()))?;
-    let discarded = discard_parts_of_another_layout(&parts_root)?;
-    if discarded > 0 {
-        warn!(
-            discarded_partitions = discarded,
-            dir = %parts_root.display(),
-            "Discarded a raw-parts cache that does not record the current layout, \
-             such as one written before the tombstone log"
-        );
-    }
+    // Legacy binaries ignore our layout marker. Keep their files in a distinct
+    // namespace so a rollback cannot overwrite files belonging to this policy.
+    // Reclaim only their owned disposable files, under the caller's cache lock.
+    prune_foyer_partitions(&cache_root.join(LEGACY_PARTS_CACHE_DIR), 0)?;
+    let parts_root = cache_root.join(PARTS_CACHE_DIR);
+    prepare_parts_cache_layout(&parts_root, disk_bytes)?;
 
     let knobs = parts_engine_knobs(disk_bytes);
 
@@ -1020,6 +1050,9 @@ pub(crate) async fn build_parts_hybrid(
         .storage()
         .with_spawner(Spawner::from(foyer_handle.clone()))
         .with_io_engine_config(PsyncIoEngineConfig::new())
+        // Pinned Foyer 0.22.3 can lose tombstones on reopen or log wraparound.
+        // Start this disposable cache cold so invalidated parts cannot return.
+        .with_recover_mode(foyer::RecoverMode::None)
         .with_engine_config(
             BlockEngineConfig::new(
                 FsDeviceBuilder::new(&parts_root)
@@ -1028,10 +1061,8 @@ pub(crate) async fn build_parts_hybrid(
                     .map_err(|e| foyer_build_error("parts foyer device build failed", e))?,
             )
             .with_block_size(PARTS_BLOCK_SIZE)
-            // Recovery on open replays every entry still in a disk block. The
-            // log keeps a removed part removed across a restart, which a
-            // part dropped after failing frame authentication relies on.
-            .with_tombstone_log(true)
+            // Recovery is disabled, so no persistent deletion log is needed.
+            .with_tombstone_log(false)
             .with_submit_queue_size_threshold(knobs.submit_queue_bytes)
             .with_flushers(knobs.flushers)
             .with_reclaimers(knobs.flushers)
@@ -1185,8 +1216,13 @@ pub async fn build_slatedb(
             hybrid_disk_bytes,
         ),
         (
+            "legacy-raw-parts",
+            cache_config.root_folder.join(LEGACY_PARTS_CACHE_DIR),
+            0,
+        ),
+        (
             "raw-parts",
-            cache_config.root_folder.join("parts_cache"),
+            cache_config.root_folder.join(PARTS_CACHE_DIR),
             parts_disk_bytes,
         ),
     ] {
@@ -3162,6 +3198,141 @@ min_free_gb = 256.0
                 assert!(outside.path().exists());
             }
         }
+    }
+
+    #[test]
+    fn parts_cache_layout_discards_legacy_data_and_preserves_compatible_partitions() {
+        let root = tempfile::tempdir().unwrap();
+        let _owner = acquire_clean_cache_owner(root.path()).unwrap();
+        let parts = root.path().join(PARTS_CACHE_DIR);
+        std::fs::create_dir_all(&parts).unwrap();
+        for id in [0, 1, 100_000_000] {
+            std::fs::write(
+                parts.join(format!("{FOYER_PARTITION_PREFIX}{id:08}")),
+                b"old",
+            )
+            .unwrap();
+        }
+        let foreign = parts.join("foyer-storage-direct-fs-backup");
+        std::fs::write(&foreign, b"keep").unwrap();
+
+        prepare_parts_cache_layout(&parts, 256 * 1024 * 1024).unwrap();
+        for id in [0, 1, 100_000_000] {
+            assert!(
+                !parts
+                    .join(format!("{FOYER_PARTITION_PREFIX}{id:08}"))
+                    .exists()
+            );
+        }
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"keep");
+        assert!(parts.join(PARTS_CACHE_LAYOUT_FILE).is_file());
+
+        let reusable = parts.join(format!("{FOYER_PARTITION_PREFIX}00000001"));
+        std::fs::write(&reusable, b"same geometry").unwrap();
+        prepare_parts_cache_layout(&parts, 256 * 1024 * 1024).unwrap();
+        assert_eq!(std::fs::read(&reusable).unwrap(), b"same geometry");
+    }
+
+    #[test]
+    fn parts_cache_layout_resets_changed_geometry_and_corrupt_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let _owner = acquire_clean_cache_owner(root.path()).unwrap();
+        let parts = root.path().join(PARTS_CACHE_DIR);
+        prepare_parts_cache_layout(&parts, 256 * 1024 * 1024).unwrap();
+        let partition = parts.join(format!("{FOYER_PARTITION_PREFIX}00000000"));
+        std::fs::write(&partition, b"old geometry").unwrap();
+        prepare_parts_cache_layout(&parts, 128 * 1024 * 1024).unwrap();
+        assert!(!partition.exists());
+
+        std::fs::write(&partition, b"unknown layout").unwrap();
+        std::fs::write(parts.join(PARTS_CACHE_LAYOUT_FILE), b"partial marker").unwrap();
+        prepare_parts_cache_layout(&parts, 128 * 1024 * 1024).unwrap();
+        assert!(!partition.exists());
+
+        // The preceding recovery policy used a tombstone log in partition 0.
+        std::fs::write(&partition, b"old tombstone log").unwrap();
+        std::fs::write(
+            parts.join(PARTS_CACHE_LAYOUT_FILE),
+            format!(
+                "zerofs-parts-cache-v1\ntombstones=1\nblock_bytes={PARTS_BLOCK_SIZE}\ndisk_bytes={}\n",
+                128 * 1024 * 1024
+            ),
+        )
+        .unwrap();
+        prepare_parts_cache_layout(&parts, 128 * 1024 * 1024).unwrap();
+        assert!(!partition.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parts_cache_layout_invalidates_previous_geometry_before_reset() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let _owner = acquire_clean_cache_owner(root.path()).unwrap();
+        let parts = root.path().join(PARTS_CACHE_DIR);
+        prepare_parts_cache_layout(&parts, 256 * 1024 * 1024).unwrap();
+        let marker = parts.join(PARTS_CACHE_LAYOUT_FILE);
+        let partition = parts.join(format!("{FOYER_PARTITION_PREFIX}00000000"));
+        std::fs::write(&partition, b"old geometry").unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), b"outside").unwrap();
+        let unsafe_partition = parts.join(format!("{FOYER_PARTITION_PREFIX}00000001"));
+        symlink(outside.path(), &unsafe_partition).unwrap();
+
+        assert!(prepare_parts_cache_layout(&parts, 128 * 1024 * 1024).is_err());
+        assert!(
+            !marker.exists(),
+            "a failed reset must invalidate the old layout"
+        );
+        assert_eq!(std::fs::read(&partition).unwrap(), b"old geometry");
+        assert_eq!(std::fs::read(outside.path()).unwrap(), b"outside");
+
+        std::fs::remove_file(unsafe_partition).unwrap();
+        // Even returning to the previous geometry must complete the reset.
+        prepare_parts_cache_layout(&parts, 256 * 1024 * 1024).unwrap();
+        assert!(!partition.exists());
+        assert!(marker.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parts_cache_layout_rejects_symlinked_marker_and_partition() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let _owner = acquire_clean_cache_owner(root.path()).unwrap();
+        let parts = root.path().join(PARTS_CACHE_DIR);
+        std::fs::create_dir_all(&parts).unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), b"outside").unwrap();
+        let marker = parts.join(PARTS_CACHE_LAYOUT_FILE);
+        let partition = parts.join(format!("{FOYER_PARTITION_PREFIX}00000000"));
+        std::fs::write(&partition, b"cached").unwrap();
+        symlink(outside.path(), &marker).unwrap();
+        assert!(prepare_parts_cache_layout(&parts, 256 * 1024 * 1024).is_err());
+        assert_eq!(std::fs::read(&partition).unwrap(), b"cached");
+        assert_eq!(std::fs::read(outside.path()).unwrap(), b"outside");
+
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::create_dir(&marker).unwrap();
+        assert!(prepare_parts_cache_layout(&parts, 256 * 1024 * 1024).is_err());
+        assert_eq!(std::fs::read(&partition).unwrap(), b"cached");
+        std::fs::remove_dir(&marker).unwrap();
+        let unsafe_partition = parts.join(format!("{FOYER_PARTITION_PREFIX}00000001"));
+        symlink(outside.path(), &unsafe_partition).unwrap();
+        assert!(prepare_parts_cache_layout(&parts, 256 * 1024 * 1024).is_err());
+        assert!(
+            !marker.exists(),
+            "failed reset must not publish a layout marker"
+        );
+        assert_eq!(std::fs::read(&partition).unwrap(), b"cached");
+        assert_eq!(std::fs::read(outside.path()).unwrap(), b"outside");
+
+        std::fs::remove_file(unsafe_partition).unwrap();
+        prepare_parts_cache_layout(&parts, 256 * 1024 * 1024).unwrap();
+        assert!(
+            !partition.exists(),
+            "a subsequent open must retry the reset"
+        );
     }
 
     #[test]

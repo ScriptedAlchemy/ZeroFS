@@ -289,7 +289,20 @@ pub(crate) fn verify_bucket_paths(settings: &Settings, namespace: &str) -> Resul
         ("cache", cache.clone()),
         ("cache", cache.join(".zerofs-clean-cache.lock")),
         ("cache", cache.join("hybrid_cache")),
-        ("cache", cache.join("parts_cache")),
+        (
+            "cache",
+            cache.join(crate::object_store_prefetch::LEGACY_PARTS_CACHE_DIR),
+        ),
+        (
+            "cache",
+            cache.join(crate::object_store_prefetch::PARTS_CACHE_DIR),
+        ),
+        (
+            "cache",
+            cache
+                .join(crate::object_store_prefetch::PARTS_CACHE_DIR)
+                .join(crate::object_store_prefetch::PARTS_CACHE_LAYOUT_FILE),
+        ),
     ];
     if let Some(writeback) = settings
         .writeback

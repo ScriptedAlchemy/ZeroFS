@@ -243,6 +243,9 @@ fn validate_server_startup_with_limits(
     settings: &Settings,
     detected: CgroupMemoryLimits,
 ) -> Result<Option<MemoryBudgetReceipt>> {
+    if settings.memory.is_some() {
+        bail!("[memory] is available for planning only; production enforcement is not enabled");
+    }
     let write_ack = settings.filesystem_write_ack_settings(WritebackAccessMode::ReadWrite)?;
     let tiers = StartupMemoryTiers::from_settings(settings, write_ack.volatile_memory_bytes)?;
     let policy = MemoryPolicy::from_settings(settings, tiers)?;

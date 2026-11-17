@@ -265,6 +265,37 @@ fn admission_cannot_be_disabled_with_an_unknown_runtime_setting() {
 }
 
 #[test]
+fn admission_receipt_rejects_planning_only_memory_configuration() {
+    let temp = tempfile::tempdir().unwrap();
+    let text = include_str!("memory_package_fixture.toml")
+        .replace("/storage/", &format!("{}/", temp.path().display()))
+        .replace(
+            "[runtime]\nmemory_limit_gb = 8.0",
+            "[memory]\ntotal = \"4 GiB\"",
+        );
+    let path = temp.path().join("config.toml");
+    std::fs::write(&path, text).unwrap();
+    let settings = Settings::from_file(path).unwrap();
+    let detected = CgroupMemoryLimits {
+        dedicated: Some(super::MemoryEnvelope {
+            hard_limit_bytes: 64 * GIB,
+            source: "fixture/memory.max".into(),
+        }),
+        ..Default::default()
+    };
+    // memory-status uses this same admission helper. A wide cgroup must not
+    // produce a successful receipt while ignoring a planning-only budget that
+    // the server refuses to start with.
+    let error = validate_server_startup_with_limits(&settings, detected).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("[memory] is available for planning only"),
+        "{error:#}"
+    );
+}
+
+#[test]
 fn exact_minimum_does_not_shrink_with_the_envelope() {
     let temp = tempfile::tempdir().unwrap();
     let wide = admission(temp.path(), &package_config(temp.path(), 64 * GIB)).unwrap();
