@@ -303,17 +303,141 @@ fn find_cache_dirs(path: &Path) -> Result<Vec<(CacheKind, std::path::PathBuf)>> 
     Ok(found)
 }
 
-/// Scan the clean-cache files at or under `path`. Reads only; needs no
-/// password or key.
+/// The layout `dir` was written with, from its name and, for the parts
+/// cache, the layout marker the server writes.
+fn layout_of(kind: CacheKind, dir: &Path) -> Result<CacheLayout> {
+    use crate::object_store_prefetch::{LEGACY_PARTS_CACHE_DIR, PARTS_CACHE_LAYOUT_FILE};
+    let earlier = |reason: String| Ok(CacheLayout::Earlier { reason });
+    let name = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    match kind {
+        CacheKind::DecodedBlocks if name == super::BLOCK_CACHE_DIR => Ok(CacheLayout::Current),
+        CacheKind::DecodedBlocks => earlier(format!(
+            "{name} is where builds before the zeroed padding kept this cache"
+        )),
+        CacheKind::RawParts if name == LEGACY_PARTS_CACHE_DIR => earlier(format!(
+            "{name} is where builds before the cold-start layout kept this cache"
+        )),
+        CacheKind::RawParts => {
+            let marker = dir.join(PARTS_CACHE_LAYOUT_FILE);
+            let text = match std::fs::symlink_metadata(&marker) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return earlier("it has no layout marker".to_owned());
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("reading layout marker {}", marker.display()));
+                }
+                Ok(metadata) if !metadata.file_type().is_file() => {
+                    anyhow::bail!("layout marker {} is not a regular file", marker.display());
+                }
+                Ok(_) => std::fs::read_to_string(&marker)
+                    .with_context(|| format!("reading layout marker {}", marker.display()))?,
+            };
+            let disk_bytes = text
+                .lines()
+                .find_map(|line| line.strip_prefix("disk_bytes="))
+                .and_then(|value| value.parse().ok());
+            if disk_bytes.is_some_and(|disk_bytes| text == super::parts_cache_layout(disk_bytes)) {
+                Ok(CacheLayout::Current)
+            } else if !text.contains(super::CACHE_PADDING_POLICY) {
+                earlier(format!(
+                    "its layout marker does not record {}",
+                    super::CACHE_PADDING_POLICY.trim_end()
+                ))
+            } else {
+                earlier("its layout marker does not match this build's layout".to_owned())
+            }
+        }
+    }
+}
+
+/// Refuse a namespace whose ownership lock a server holds: it may be
+/// appending a blob, which can read as torn. Probes with a shared lock and
+/// releases it at once, so it never holds a lock a server needs.
+fn refuse_if_in_use(namespace: &Path) -> Result<()> {
+    use fs4::fs_std::FileExt;
+    let lock = namespace.join(super::CLEAN_CACHE_LOCK_FILE);
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = match options.open(&lock) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("opening {}", lock.display()));
+        }
+    };
+    if !FileExt::try_lock_shared(&file).with_context(|| format!("probing {}", lock.display()))? {
+        anyhow::bail!(
+            "a running ZeroFS server is using {} (it holds {}); stop the server and scan \
+             again, or pass --live to scan a snapshot in which a blob being written can \
+             look torn",
+            namespace.display(),
+            lock.display()
+        );
+    }
+    FileExt::unlock(&file).with_context(|| format!("releasing {}", lock.display()))?;
+    Ok(())
+}
+
+fn has_partitions(dir: &Path) -> Result<bool> {
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("reading cache directory {}", dir.display()))?
+    {
+        if entry?
+            .file_name()
+            .to_str()
+            .and_then(super::foyer_partition_id)
+            .is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Scan the clean-cache files at or under `path`. Opens files read-only,
+/// changes nothing, and needs no password or key: the check is that bytes
+/// carrying no data are zero, which needs no decryption.
 pub(crate) fn scan_cache_files(path: &Path, options: ScanOptions) -> Result<ScanReport> {
+    let found = find_cache_dirs(path)?;
+    if !options.live {
+        let mut namespaces: Vec<_> = found
+            .iter()
+            .filter_map(|(_, dir)| dir.parent().map(Path::to_path_buf))
+            .collect();
+        namespaces.sort();
+        namespaces.dedup();
+        for namespace in namespaces {
+            refuse_if_in_use(&namespace)?;
+        }
+    }
     let mut caches = Vec::new();
-    for (kind, dir) in find_cache_dirs(path)? {
-        let scanned = scan_partitions(&dir, kind.block_size(), |_, _| {})?;
+    for (kind, dir) in found {
+        let layout = layout_of(kind, &dir)?;
+        let current = layout == CacheLayout::Current;
+        // A server that starts with the fix removes earlier caches' partitions
+        // and leaves the empty directory; there is nothing left to report.
+        if !current && !has_partitions(&dir)? {
+            continue;
+        }
+        let scanned = if current || options.legacy {
+            Some(scan_partitions(&dir, kind.block_size(), |_, _| {})?)
+        } else {
+            None
+        };
         caches.push(CacheReport {
             kind,
             path: dir,
-            layout: CacheLayout::Current,
-            scanned: Some(scanned),
+            layout,
+            scanned,
         });
     }
     let status = if caches
@@ -321,6 +445,12 @@ pub(crate) fn scan_cache_files(path: &Path, options: ScanOptions) -> Result<Scan
         .any(|cache| cache.scanned.as_ref().is_some_and(|c| c.nonzero() > 0))
     {
         ScanStatus::UndefinedBytes
+    } else if caches.is_empty()
+        || caches
+            .iter()
+            .any(|cache| cache.scanned.as_ref().is_none_or(|c| c.entries == 0))
+    {
+        ScanStatus::NothingScanned
     } else {
         ScanStatus::Clean
     };
@@ -331,6 +461,7 @@ pub(crate) fn scan_cache_files(path: &Path, options: ScanOptions) -> Result<Scan
         status,
     })
 }
+
 
 #[cfg(test)]
 mod tests;
