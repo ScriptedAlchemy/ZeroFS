@@ -3,7 +3,7 @@ use super::inode::InodeId;
 use super::key_codec::KeyCodec;
 use bytes::Bytes;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct StatsShardData {
@@ -19,6 +19,9 @@ pub struct StatsShard {
 pub struct FileSystemGlobalStats {
     shards: Vec<StatsShard>,
     key_codec: Arc<KeyCodec>,
+    /// Set when a persisted shard could not be decoded at boot. That shard
+    /// starts from zero, so the totals are unknown for this process's life.
+    unreadable_shard: AtomicBool,
 }
 
 /// Absolute shard values staged by the commit worker for one batch. The
@@ -51,7 +54,16 @@ impl FileSystemGlobalStats {
                 used_inodes: AtomicU64::new(0),
             })
             .collect();
-        Self { shards, key_codec }
+        Self {
+            shards,
+            key_codec,
+            unreadable_shard: AtomicBool::new(false),
+        }
+    }
+
+    /// The totals, or `None` when a persisted shard could not be read at boot.
+    pub fn known_totals(&self) -> Option<(u64, u64)> {
+        (!self.unreadable_shard.load(Ordering::Relaxed)).then(|| self.get_totals())
     }
 
     pub fn get_totals(&self) -> (u64, u64) {
@@ -106,6 +118,22 @@ impl FileSystemGlobalStats {
         shard
             .used_inodes
             .store(staged.data.used_inodes, Ordering::Relaxed);
+    }
+
+    /// Load one persisted shard record. A record that does not decode leaves
+    /// the shard at zero and marks the totals unknown.
+    pub(crate) fn load_shard_record(&self, shard_id: usize, raw: &[u8]) {
+        match bincode::deserialize::<StatsShardData>(raw) {
+            Ok(data) => self.load_shard(shard_id, &data),
+            Err(error) => {
+                tracing::error!(
+                    shard_id,
+                    %error,
+                    "stats shard record is unreadable; usage totals are unknown until it is repaired"
+                );
+                self.unreadable_shard.store(true, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Load statistics from persistent storage

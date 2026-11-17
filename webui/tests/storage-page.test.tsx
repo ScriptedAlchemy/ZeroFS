@@ -33,23 +33,30 @@ const member = {
     evacuation_error: null,
     kernel_coverage: "current boot kernel ring; unrecognized device/error forms are not attributed",
     last_sample: { device: "synthetic", failed: false },
+    since_ms: null,
     observed_ms: null,
   },
   evacuation_capacity: { sufficient: true, unavailable_members: [] },
 };
-const pool = (members: unknown[]) =>
+// The server's clock when it assembled the status: one minute after the observations used below.
+const generatedMs = 1_800_000_060_000;
+const pool = (members: unknown[], unreadable: unknown[] = [], extra: Record<string, unknown> = {}) =>
   JSON.stringify({
     pool_id: "test-pool",
+    generated_ms: generatedMs,
+    ...extra,
     members,
     pending_operations: 0,
     mapped_objects: 3,
-    unreadable: [],
+    unreadable,
     quarantined_leftovers: [],
   });
-const sample = { bytesWritten: 5n * 1024n ** 3n, bytesRead: 0n, usedBytes: 2048n, usedInodes: 0n };
+// A decoded StatsSnapshot. Its usage counters carry presence, so the client sees an omitted one as undefined.
+type Sample = { bytesWritten?: bigint; bytesRead?: bigint; usedBytes?: bigint; usedInodes?: bigint };
+const sample: Sample = { bytesWritten: 5n * 1024n ** 3n, bytesRead: 0n, usedBytes: 2048n, usedInodes: 0n };
 
 // A stream that stays open until the page aborts it.
-function openStream(_request: unknown, options?: { signal?: AbortSignal }): AsyncIterable<typeof sample> {
+function openStream(_request: unknown, options?: { signal?: AbortSignal }): AsyncIterable<Sample> {
   return {
     [Symbol.asyncIterator]: () => ({
       next: () =>
@@ -60,7 +67,7 @@ function openStream(_request: unknown, options?: { signal?: AbortSignal }): Asyn
   };
 }
 
-function failingStream(error: Error): AsyncIterable<typeof sample> {
+function failingStream(error: Error): AsyncIterable<Sample> {
   return { [Symbol.asyncIterator]: () => ({ next: () => Promise.reject(error) }) };
 }
 
@@ -146,7 +153,7 @@ describe("Storage page controls", () => {
 });
 
 describe("Storage page filesystem activity", () => {
-  it("shows a received sample with the zero-or-missing note, then unavailable when the stream ends", async () => {
+  it("shows a received sample, then unavailable when the stream ends", async () => {
     let end!: () => void;
     const ended = new Promise<void>((resolve) => (end = resolve));
     client.streamStats.mockImplementationOnce(() =>
@@ -159,7 +166,6 @@ describe("Storage page filesystem activity", () => {
     await screen.findByText("Logical bytes written");
     expect(rowValue("Logical bytes written")).toBe("5.0 GiB (5,368,709,120 bytes)");
     expect(rowValue("Inodes used")).toBe("0");
-    expect(screen.getByText(/A 0 here can mean zero or not reported/)).toBeTruthy();
     end();
     expect(await screen.findByText(/Stats stream ended/)).toBeTruthy();
     expect(screen.queryByText("Logical bytes written")).toBeNull();
@@ -172,7 +178,38 @@ describe("Storage page filesystem activity", () => {
     render(<StoragePage />);
     expect(await screen.findByText(/stats service down/)).toBeTruthy();
     expect(screen.queryByText("Logical bytes written")).toBeNull();
-    expect(screen.queryByText(/A 0 here can mean zero/)).toBeNull();
+  });
+
+  async function showSample(next: Sample) {
+    client.streamStats.mockImplementationOnce((_request: unknown, options?: { signal?: AbortSignal }) =>
+      (async function* () {
+        yield next;
+        yield* openStream(_request, options);
+      })(),
+    );
+    render(<StoragePage />);
+    await screen.findByText("Logical bytes written");
+  }
+
+  it("renders a counter the server omitted as unavailable, never as 0", async () => {
+    await showSample({ bytesWritten: 4096n, bytesRead: 0n });
+    for (const label of ["Logical storage used", "Inodes used"]) {
+      expect(rowValue(label)).toMatch(/^Unavailable · .*not reported/);
+      expect(rowValue(label)).not.toMatch(/\b0\b/);
+    }
+    expect(rowValue("Logical bytes written")).toBe("4.0 KiB (4,096 bytes)");
+    expect(rowValue("Logical bytes read")).toBe("0 bytes");
+  });
+
+  it("renders a reported zero as 0 and a nonzero count as its value", async () => {
+    await showSample({ bytesWritten: 0n, bytesRead: 3n * 1024n ** 2n, usedBytes: 0n, usedInodes: 12_345n });
+    expect(rowValue("Logical bytes written")).toBe("0 bytes");
+    expect(rowValue("Logical storage used")).toBe("0 bytes");
+    expect(rowValue("Logical bytes read")).toBe("3.0 MiB (3,145,728 bytes)");
+    expect(rowValue("Inodes used")).toBe("12,345");
+    expect(document.body.textContent).not.toMatch(/Unavailable · .*not reported/);
+    // The fix makes the old caveat untrue, so the page must not print it.
+    expect(document.body.textContent).not.toMatch(/can mean zero or not reported/);
   });
 });
 
@@ -333,5 +370,91 @@ describe("Storage page monitoring limits", () => {
     await show(observed, { unreadable_objects: 3 });
     expect(screen.getByText("1 health issue reported")).toBeTruthy();
     expect(screen.queryByText("No health issues reported")).toBeNull();
+  });
+
+  it("shows the observation's age and stops calling a member healthy once it is stale", async () => {
+    await show(observed);
+    expect(screen.getByText("No health issues reported")).toBeTruthy();
+    expect(screen.getByText(/^Last health observation .*, 1 min before this status$/)).toBeTruthy();
+
+    // Five minutes is the bound; a monitor that refreshed on schedule would have observed again by then.
+    await show({ ...observed, observed_ms: generatedMs - 5 * 60_000 - 1 });
+    expect(screen.getByText("Monitoring or evacuation is limited")).toBeTruthy();
+    expect(screen.getByText(/^last made 5 min before this status/)).toBeTruthy();
+    expect(screen.queryByText("No health issues reported")).toBeNull();
+
+    await show({ ...observed, observed_ms: generatedMs - 3 * 86_400_000 });
+    expect(screen.getByText(/^last made 3 d before this status/)).toBeTruthy();
+    expect(screen.queryByText("No health issues reported")).toBeNull();
+
+    // A server without the status time cannot say how old the observation is.
+    cleanup();
+    client.getPoolStatus.mockResolvedValue({
+      json: pool([{ ...member, health: observed }], [], { generated_ms: undefined }),
+    });
+    render(<StoragePage />);
+    await screen.findAllByText("hdd-a");
+    expect(screen.getByText("Health not fully reported")).toBeTruthy();
+    expect(screen.queryByText("No health issues reported")).toBeNull();
+  });
+});
+
+describe("Storage page segment faults", () => {
+  const fault = (n: number, extra: Record<string, unknown> = {}) => ({
+    location: `segments/${n}`,
+    physical_key: `hdd-a/segments/${n}`,
+    member_id: "hdd-a",
+    reason: "checksum mismatch",
+    observed_ms: 1_800_000_000_000,
+    attempts: 2,
+    next_retry_ms: 1_800_000_240_000,
+    ...extra,
+  });
+  async function show(faults: unknown[], health: Record<string, unknown> = member.health) {
+    client.getPoolStatus.mockResolvedValue({
+      json: pool([{ ...member, health, unreadable_objects: faults.length }], faults),
+    });
+    render(<StoragePage />);
+    await screen.findByText("hdd-a");
+  }
+
+  it("lists a member's fault with its location, reason, attempts and next retry time", async () => {
+    await show([fault(7, { attempts: 1 })]);
+    const list = screen.getByRole("list", { name: "Unreadable segment faults" });
+    expect(list.closest("section")?.textContent).toContain("hdd-a");
+    expect(list.textContent).toContain("segments/7");
+    expect(list.textContent).toContain("checksum mismatch");
+    expect(list.textContent).toContain("1 attempt ·");
+    expect(list.textContent).toContain(`next retry ${new Date(1_800_000_240_000).toLocaleString()}`);
+    expect(screen.queryByText(/more faults? not listed/)).toBeNull();
+  });
+
+  it("shows when a quarantined member's quarantine began", async () => {
+    await show([], { ...member.health, quarantine: "SMART media failure", since_ms: 1_700_000_000_000 });
+    expect(screen.getByText("SMART media failure")).toBeTruthy();
+    expect(screen.getByText(`Quarantined since ${new Date(1_700_000_000_000).toLocaleString()}`)).toBeTruthy();
+  });
+
+  it("caps a long fault list and says how many it left out", async () => {
+    await show(Array.from({ length: 1203 }, (_, n) => fault(n)));
+    const list = screen.getByRole("list", { name: "Unreadable segment faults" });
+    expect(list.querySelectorAll("li")).toHaveLength(50);
+    expect(screen.getByText("and 1,153 more faults not listed")).toBeTruthy();
+    expect(rowValue("Unreadable objects")).toBe("1,203");
+  });
+
+  it("renders the fault details unavailable when one entry is malformed, rather than dropping it", async () => {
+    await show([fault(1), without(fault(2), "attempts")]);
+    expect(screen.queryByRole("list", { name: "Unreadable segment faults" })).toBeNull();
+    expect(screen.getByText(/^Segment fault details unavailable · unreadable: attempts was not reported/)).toBeTruthy();
+    expect(screen.queryByText("No health issues reported")).toBeNull();
+  });
+
+  it("lists a fault whose member id names no listed member in its own section", async () => {
+    await show([fault(9, { member_id: "authority" })]);
+    const list = screen.getByRole("list", { name: "Unattributed segment faults" });
+    expect(list.textContent).toContain("segments/9");
+    expect(screen.getByText("1 unreadable segment record outside the listed members")).toBeTruthy();
+    expect(screen.queryByRole("list", { name: "Unreadable segment faults" })).toBeNull();
   });
 });

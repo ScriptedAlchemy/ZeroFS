@@ -20,8 +20,8 @@ export function IOChart({ history }: IOChartProps) {
     if (dtSec <= 0) return { t: i, readBps: 0, writeBps: 0 };
     return {
       t: i,
-      readBps: Number(snap.bytesRead - prev.bytesRead) / dtSec,
-      writeBps: Number(snap.bytesWritten - prev.bytesWritten) / dtSec,
+      readBps: rate(prev.bytesRead, snap.bytesRead, dtSec),
+      writeBps: rate(prev.bytesWritten, snap.bytesWritten, dtSec),
     };
   });
 
@@ -77,7 +77,7 @@ export function IOChart({ history }: IOChartProps) {
               fontFamily,
               boxShadow: "0 4px 24px rgba(0,0,0,0.3)",
             }}
-            formatter={(value) => formatSize(Number(value)) + "/s"}
+            formatter={(value) => (value == null ? "Unavailable" : formatSize(Number(value)) + "/s")}
             labelFormatter={() => ""}
           />
           <Area
@@ -104,6 +104,11 @@ export function IOChart({ history }: IOChartProps) {
       </ResponsiveContainer>
     </div>
   );
+}
+
+// A counter the server omitted has no rate; null leaves a gap in the chart instead of a 0.
+function rate(before: bigint | undefined, after: bigint | undefined, seconds: number): number | null {
+  return before === undefined || after === undefined ? null : Number(after - before) / seconds;
 }
 
 function deltaSeconds(a: StatsSnapshot, b: StatsSnapshot): number {

@@ -353,6 +353,28 @@ async fn metadata_stays_on_authority_while_segments_fill_members_in_order() {
 }
 
 #[tokio::test]
+async fn status_carries_the_server_time_of_its_catalog_snapshot() {
+    let fixture = Fixture::new(8);
+    let pool = fixture.initialize().await;
+    pool.observe_health(
+        "hdd-a",
+        crate::pool_object_store::SmartSample::default(),
+        None,
+    )
+    .await
+    .unwrap();
+    let before = chrono::Utc::now().timestamp_millis();
+    let status = pool.status().await.unwrap();
+    let after = chrono::Utc::now().timestamp_millis();
+    assert!((before..=after).contains(&status.generated_ms));
+    let member = status.members.iter().find(|m| m.id == "hdd-a").unwrap();
+    let observed = member.health.observed_ms.unwrap();
+    assert!(observed <= status.generated_ms);
+    let json = serde_json::to_value(&status).unwrap();
+    assert_eq!(json["generated_ms"], status.generated_ms);
+}
+
+#[tokio::test]
 async fn adding_and_reordering_members_does_not_move_existing_segments() {
     let fixture = Fixture::new(8);
     let pool = PoolObjectStore::initialize(

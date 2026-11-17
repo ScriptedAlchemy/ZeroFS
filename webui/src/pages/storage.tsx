@@ -7,6 +7,7 @@ import { adminClient } from "../lib/grpc/client";
 import { binaryBytesParts } from "../lib/format";
 import {
   capacityBreakdown,
+  formatAge,
   known,
   memberHealth,
   parseAffectedStatus,
@@ -14,13 +15,15 @@ import {
   summarizeView,
   unavailable,
 } from "../lib/storage-status";
-import type { AffectedStatus, AffectedView, MemberStatus, Value } from "../lib/storage-status";
+import type { AffectedStatus, AffectedView, MemberStatus, SegmentFault, Value } from "../lib/storage-status";
 import { Button } from "../components/ui/Button";
 
 // A larger response cannot be parsed and drawn without freezing the tab. The server sends one
 // reference per extent today, so real pools exceed this until the admin API pages its answer.
 const MAX_AFFECTED_JSON_CHARS = 8 * 1024 * 1024;
 const MAX_PATHS_SHOWN = 200;
+// A member can carry thousands of fault records; drawing them all would stall the page.
+const MAX_FAULTS_SHOWN = 50;
 
 const sectionTitle = "text-xs font-medium uppercase tracking-wider text-muted-foreground";
 const count = (value: number | bigint) => value.toLocaleString("en-US");
@@ -144,6 +147,33 @@ function Capacity({ member }: { member: MemberStatus }) {
   );
 }
 
+const serverTime = (ms: number) => new Date(ms).toLocaleString();
+
+function FaultList({ faults, label }: { faults: SegmentFault[]; label: string }) {
+  if (faults.length === 0) return null;
+  const hidden = faults.length - MAX_FAULTS_SHOWN;
+  return (
+    <div className="space-y-1">
+      <ul className="divide-y divide-border/50 text-xs" aria-label={label}>
+        {faults.slice(0, MAX_FAULTS_SHOWN).map((fault) => (
+          <li key={fault.location} className="space-y-0.5 py-1.5">
+            <p className="break-all font-mono">{fault.location}</p>
+            <p className="text-muted-foreground">
+              <span className="text-destructive">{fault.reason}</span> · {count(fault.attempts)}{" "}
+              {fault.attempts === 1 ? "attempt" : "attempts"} · next retry {serverTime(fault.nextRetryMs)}
+            </p>
+          </li>
+        ))}
+      </ul>
+      {hidden > 0 && (
+        <p className="text-xs text-muted-foreground">
+          and {count(hidden)} more {hidden === 1 ? "fault" : "faults"} not listed
+        </p>
+      )}
+    </div>
+  );
+}
+
 function HealthSummary({ member }: { member: MemberStatus }) {
   const health = memberHealth(member);
   // Green needs a completed observation, every field reported, and every monitor running.
@@ -178,6 +208,19 @@ function HealthSummary({ member }: { member: MemberStatus }) {
           <span className="text-muted">{issue.label}:</span> {issue.text}
         </p>
       ))}
+      {member.quarantine.state === "known" && member.quarantine.value !== null && (
+        <p className="pl-6 text-xs text-muted-foreground">
+          Quarantined since{" "}
+          <Fact value={member.quarantineSinceMs}>
+            {(since) => (since === null ? "an unrecorded time" : serverTime(since))}
+          </Fact>
+        </p>
+      )}
+      {member.faults.state === "known" && (
+        <div className="pl-6">
+          <FaultList faults={member.faults.value} label="Unreadable segment faults" />
+        </div>
+      )}
       {health.limits.map((limit) => (
         <p key={limit.label} className="pl-6 text-warning">
           <span className="text-muted">{limit.label}:</span> {limit.text}
@@ -193,7 +236,10 @@ function HealthSummary({ member }: { member: MemberStatus }) {
       ))}
       {member.observedMs.state === "known" && (
         <p className="pl-6 text-xs text-muted-foreground">
-          Last health observation {new Date(member.observedMs.value).toLocaleString()}
+          Last health observation {serverTime(member.observedMs.value)}
+          {member.observationAgeMs.state === "known" &&
+            member.observationAgeMs.value >= 0 &&
+            `, ${formatAge(member.observationAgeMs.value)} before this status`}
         </p>
       )}
     </div>
@@ -512,6 +558,21 @@ export function StoragePage() {
                 ))}
               </div>
             )}
+            {pool.unattributedFaults.state === "unavailable" ? (
+              <p className="text-sm">
+                Segment faults outside the listed members: <Fact value={pool.unattributedFaults} />
+              </p>
+            ) : (
+              pool.unattributedFaults.value.length > 0 && (
+                <section className="card-surface space-y-2 rounded-lg p-5 text-sm">
+                  <h3 className="font-medium text-destructive">
+                    {count(pool.unattributedFaults.value.length)} unreadable segment{" "}
+                    {pool.unattributedFaults.value.length === 1 ? "record" : "records"} outside the listed members
+                  </h3>
+                  <FaultList faults={pool.unattributedFaults.value} label="Unattributed segment faults" />
+                </section>
+              )
+            )}
             <p className="text-xs text-muted-foreground">
               Charged usage includes superseded bodies awaiting cleanup. Reserved uploads are not yet published.
               Allocatable accounts for the configured quota, reservations and the local free-space reserve.
@@ -529,26 +590,23 @@ export function StoragePage() {
           </section>
         ) : (
           <dl className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-            <Stat label="Logical bytes written" value={known(activity.value.logicalBytesWritten)}>
+            <Stat label="Logical bytes written" value={activity.value.logicalBytesWritten}>
               {(bytes) => <Bytes value={bytes} />}
             </Stat>
-            <Stat label="Logical bytes read" value={known(activity.value.logicalBytesRead)}>
+            <Stat label="Logical bytes read" value={activity.value.logicalBytesRead}>
               {(bytes) => <Bytes value={bytes} />}
             </Stat>
-            <Stat label="Logical storage used" value={known(activity.value.logicalUsedBytes)}>
+            <Stat label="Logical storage used" value={activity.value.logicalUsedBytes}>
               {(bytes) => <Bytes value={bytes} />}
             </Stat>
-            <Stat label="Inodes used" value={known(activity.value.usedInodes)}>
+            <Stat label="Inodes used" value={activity.value.usedInodes}>
               {count}
             </Stat>
           </dl>
         )}
         <p className="text-xs text-muted-foreground">
           Cumulative logical filesystem counters from StreamStats. These are not per-device writes or durability
-          receipts.{" "}
-          {activity.state === "known" &&
-            "StreamStats sends these counters as plain protobuf numbers, so a counter the server omits arrives as 0. A 0 here can mean zero or not reported. "}
-          {statsReceived && `Last sample received ${statsReceived.toLocaleString()}.`}
+          receipts. {statsReceived && `Last sample received ${statsReceived.toLocaleString()}.`}
         </p>
       </div>
 

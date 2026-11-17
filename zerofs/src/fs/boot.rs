@@ -8,7 +8,7 @@ use crate::fs::inode::{DirectoryInode, Inode};
 use crate::fs::key_codec::KeyCodec;
 use crate::fs::lock_manager::KeyedLockManager;
 use crate::fs::metrics::FileSystemStats;
-use crate::fs::stats::{FileSystemGlobalStats, StatsShardData};
+use crate::fs::stats::FileSystemGlobalStats;
 use crate::fs::store::{DirectoryStore, ExtentStore, InodeStore, OrphanStore, TombstoneStore};
 use crate::fs::tracing::AccessTracer;
 use crate::fs::write_coordinator::WriteCoordinator;
@@ -153,10 +153,8 @@ impl ZeroFS {
 
         for i in 0..STATS_SHARDS {
             let shard_key = key_codec.stats_shard_key(i);
-            if let Some(data) = db.get_bytes(&shard_key).await?
-                && let Ok(shard_data) = bincode::deserialize::<StatsShardData>(&data)
-            {
-                global_stats.load_shard(i, &shard_data);
+            if let Some(data) = db.get_bytes(&shard_key).await? {
+                global_stats.load_shard_record(i, &data);
             }
         }
 
