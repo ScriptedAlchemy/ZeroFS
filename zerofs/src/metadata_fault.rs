@@ -65,6 +65,8 @@ fn errno_name(errno: i32) -> String {
         libc::EACCES => "EACCES",
         libc::EPERM => "EPERM",
         libc::ENOENT => "ENOENT",
+        // FreeBSD has no ENODATA.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         libc::ENODATA => "ENODATA",
         libc::EBADMSG => "EBADMSG",
         #[cfg(target_os = "linux")]
