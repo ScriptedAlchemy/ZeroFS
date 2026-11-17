@@ -52,6 +52,7 @@ pub(super) struct StorageRoot<'a> {
     pub(super) role: RoleName,
     pub(super) path: PathBuf,
     pub(super) filesystem: &'a FilesystemDeclaration,
+    pub(super) reserve_bytes: u64,
 }
 
 pub(super) fn absolute_path(path: &Path) -> Result<()> {
@@ -139,16 +140,19 @@ impl ReadinessConfig {
                 role: RoleName::Authority,
                 path: local_url(&settings.storage.url)?,
                 filesystem: resolve(&self.authority)?,
+                reserve_bytes: 0,
             },
             StorageRoot {
                 role: RoleName::Catalog,
                 path: pool.catalog_dir.clone(),
                 filesystem: resolve(&self.catalog)?,
+                reserve_bytes: 0,
             },
             StorageRoot {
                 role: RoleName::Cache,
                 path: settings.cache.dir.clone(),
                 filesystem: resolve(&self.cache)?,
+                reserve_bytes: 0,
             },
         ];
         match settings.writeback.as_ref().filter(|w| w.enabled) {
@@ -159,6 +163,7 @@ impl ReadinessConfig {
                     filesystem: resolve(self.journal.as_deref().context(
                         "readiness journal binding is required when writeback is enabled",
                     )?)?,
+                    reserve_bytes: 0,
                 })
             }
             None if self.journal.is_some() => {
@@ -190,6 +195,7 @@ impl ReadinessConfig {
                 role: RoleName::Member(member.id.clone()),
                 path: local_url(&member.url)?,
                 filesystem,
+                reserve_bytes: 0,
             });
         }
         for root in &roots {
@@ -225,6 +231,10 @@ impl ReadinessConfig {
             }
         }
         self.validate_devices(&roots)?;
+        let reserves = self.reserves_by_domain()?;
+        for root in &mut roots {
+            root.reserve_bytes = reserves[&root.filesystem.identity.capacity_domain()];
+        }
         self.validate_reserves(settings, &roots)?;
         Ok(roots)
     }
@@ -244,21 +254,7 @@ impl ReadinessConfig {
         Ok(())
     }
 
-    pub(super) fn reserve_bytes(&self, filesystem: &FilesystemDeclaration) -> Result<u64> {
-        self.reserves
-            .iter()
-            .find(|reserve| {
-                self.filesystems.iter().any(|candidate| {
-                    candidate.id == reserve.filesystem
-                        && candidate.identity.capacity_domain()
-                            == filesystem.identity.capacity_domain()
-                })
-            })
-            .map(|reserve| reserve.bytes)
-            .context("missing reserve for readiness capacity domain")
-    }
-
-    fn validate_reserves(&self, settings: &Settings, roots: &[StorageRoot<'_>]) -> Result<()> {
+    fn reserves_by_domain(&self) -> Result<BTreeMap<String, u64>> {
         let mut reserves = BTreeMap::new();
         for reserve in &self.reserves {
             let filesystem = self
@@ -278,12 +274,16 @@ impl ReadinessConfig {
                 bail!("missing reserve for readiness filesystem {}", filesystem.id);
             }
         }
+        Ok(reserves)
+    }
+
+    fn validate_reserves(&self, settings: &Settings, roots: &[StorageRoot<'_>]) -> Result<()> {
         let declared_for = |role: &RoleName| -> Result<u64> {
-            let root = roots
+            roots
                 .iter()
                 .find(|root| root.role == *role)
-                .context("missing reserve role binding")?;
-            Ok(reserves[&root.filesystem.identity.capacity_domain()])
+                .map(|root| root.reserve_bytes)
+                .context("missing reserve role binding")
         };
         let pool = settings
             .storage
@@ -310,7 +310,12 @@ impl ReadinessConfig {
             }
         }
         for (domain, capacity) in capacities {
-            if u128::from(reserves[&domain]) > capacity {
+            let reserve = roots
+                .iter()
+                .find(|root| root.filesystem.identity.capacity_domain() == domain)
+                .map(|root| root.reserve_bytes)
+                .expect("member capacity domain has a stamped reserve");
+            if u128::from(reserve) > capacity {
                 bail!("declared domain reserve exceeds summed configured member capacity");
             }
         }

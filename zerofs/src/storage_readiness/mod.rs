@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 #[cfg(any(target_os = "linux", test))]
 use config::FilesystemIdentity;
 pub(crate) use config::ReadinessConfig;
-use config::{StorageRoot, absolute_path};
+use config::StorageRoot;
 pub(crate) use devices::RoleName;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -137,7 +137,6 @@ fn verify_identity(
     provider: &dyn IdentityProvider,
 ) -> Result<()> {
     let mountpoint = &root.filesystem.mountpoint;
-    absolute_path(mountpoint)?;
     if mountpoint.canonicalize()? != *mountpoint {
         bail!(
             "readiness mountpoint must be canonical: {}",
@@ -171,7 +170,7 @@ fn verify_identity(
     let size = provider
         .filesystem_size(path)
         .with_context(|| format!("readiness {} filesystem size unavailable", root.role))?;
-    if config.reserve_bytes(root.filesystem)? > size {
+    if root.reserve_bytes > size {
         bail!(
             "readiness {} reserve exceeds observed filesystem size",
             root.role
@@ -224,7 +223,6 @@ fn verify_open_paths_with(
     };
     let roots = config.validated_roots(settings)?;
     for (role, path) in paths {
-        absolute_path(path)?;
         let root = roots
             .iter()
             .find(|root| &root.role == role)
