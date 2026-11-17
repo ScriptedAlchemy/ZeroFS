@@ -38,9 +38,13 @@ const member = {
   },
   evacuation_capacity: { sufficient: true, unavailable_members: [] },
 };
-const pool = (members: unknown[], unreadable: unknown[] = []) =>
+// The server's clock when it assembled the status: one minute after the observations used below.
+const generatedMs = 1_800_000_060_000;
+const pool = (members: unknown[], unreadable: unknown[] = [], extra: Record<string, unknown> = {}) =>
   JSON.stringify({
     pool_id: "test-pool",
+    generated_ms: generatedMs,
+    ...extra,
     members,
     pending_operations: 0,
     mapped_objects: 3,
@@ -365,6 +369,32 @@ describe("Storage page monitoring limits", () => {
 
     await show(observed, { unreadable_objects: 3 });
     expect(screen.getByText("1 health issue reported")).toBeTruthy();
+    expect(screen.queryByText("No health issues reported")).toBeNull();
+  });
+
+  it("shows the observation's age and stops calling a member healthy once it is stale", async () => {
+    await show(observed);
+    expect(screen.getByText("No health issues reported")).toBeTruthy();
+    expect(screen.getByText(/^Last health observation .*, 1 min before this status$/)).toBeTruthy();
+
+    // Five minutes is the bound; a monitor that refreshed on schedule would have observed again by then.
+    await show({ ...observed, observed_ms: generatedMs - 5 * 60_000 - 1 });
+    expect(screen.getByText("Monitoring or evacuation is limited")).toBeTruthy();
+    expect(screen.getByText(/^last made 5 min before this status/)).toBeTruthy();
+    expect(screen.queryByText("No health issues reported")).toBeNull();
+
+    await show({ ...observed, observed_ms: generatedMs - 3 * 86_400_000 });
+    expect(screen.getByText(/^last made 3 d before this status/)).toBeTruthy();
+    expect(screen.queryByText("No health issues reported")).toBeNull();
+
+    // A server without the status time cannot say how old the observation is.
+    cleanup();
+    client.getPoolStatus.mockResolvedValue({
+      json: pool([{ ...member, health: observed }], [], { generated_ms: undefined }),
+    });
+    render(<StoragePage />);
+    await screen.findAllByText("hdd-a");
+    expect(screen.getByText("Health not fully reported")).toBeTruthy();
     expect(screen.queryByText("No health issues reported")).toBeNull();
   });
 });
