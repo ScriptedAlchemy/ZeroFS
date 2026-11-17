@@ -46,10 +46,12 @@ const pool = (members: unknown[]) =>
     unreadable: [],
     quarantined_leftovers: [],
   });
-const sample = { bytesWritten: 5n * 1024n ** 3n, bytesRead: 0n, usedBytes: 2048n, usedInodes: 0n };
+// A decoded StatsSnapshot. Its usage counters carry presence, so the client sees an omitted one as undefined.
+type Sample = { bytesWritten?: bigint; bytesRead?: bigint; usedBytes?: bigint; usedInodes?: bigint };
+const sample: Sample = { bytesWritten: 5n * 1024n ** 3n, bytesRead: 0n, usedBytes: 2048n, usedInodes: 0n };
 
 // A stream that stays open until the page aborts it.
-function openStream(_request: unknown, options?: { signal?: AbortSignal }): AsyncIterable<typeof sample> {
+function openStream(_request: unknown, options?: { signal?: AbortSignal }): AsyncIterable<Sample> {
   return {
     [Symbol.asyncIterator]: () => ({
       next: () =>
@@ -60,7 +62,7 @@ function openStream(_request: unknown, options?: { signal?: AbortSignal }): Asyn
   };
 }
 
-function failingStream(error: Error): AsyncIterable<typeof sample> {
+function failingStream(error: Error): AsyncIterable<Sample> {
   return { [Symbol.asyncIterator]: () => ({ next: () => Promise.reject(error) }) };
 }
 
@@ -146,7 +148,7 @@ describe("Storage page controls", () => {
 });
 
 describe("Storage page filesystem activity", () => {
-  it("shows a received sample with the zero-or-missing note, then unavailable when the stream ends", async () => {
+  it("shows a received sample, then unavailable when the stream ends", async () => {
     let end!: () => void;
     const ended = new Promise<void>((resolve) => (end = resolve));
     client.streamStats.mockImplementationOnce(() =>
@@ -159,7 +161,6 @@ describe("Storage page filesystem activity", () => {
     await screen.findByText("Logical bytes written");
     expect(rowValue("Logical bytes written")).toBe("5.0 GiB (5,368,709,120 bytes)");
     expect(rowValue("Inodes used")).toBe("0");
-    expect(screen.getByText(/A 0 here can mean zero or not reported/)).toBeTruthy();
     end();
     expect(await screen.findByText(/Stats stream ended/)).toBeTruthy();
     expect(screen.queryByText("Logical bytes written")).toBeNull();
@@ -172,7 +173,38 @@ describe("Storage page filesystem activity", () => {
     render(<StoragePage />);
     expect(await screen.findByText(/stats service down/)).toBeTruthy();
     expect(screen.queryByText("Logical bytes written")).toBeNull();
-    expect(screen.queryByText(/A 0 here can mean zero/)).toBeNull();
+  });
+
+  async function showSample(next: Sample) {
+    client.streamStats.mockImplementationOnce((_request: unknown, options?: { signal?: AbortSignal }) =>
+      (async function* () {
+        yield next;
+        yield* openStream(_request, options);
+      })(),
+    );
+    render(<StoragePage />);
+    await screen.findByText("Logical bytes written");
+  }
+
+  it("renders a counter the server omitted as unavailable, never as 0", async () => {
+    await showSample({ bytesWritten: 4096n, bytesRead: 0n });
+    for (const label of ["Logical storage used", "Inodes used"]) {
+      expect(rowValue(label)).toMatch(/^Unavailable · .*not reported/);
+      expect(rowValue(label)).not.toMatch(/\b0\b/);
+    }
+    expect(rowValue("Logical bytes written")).toBe("4.0 KiB (4,096 bytes)");
+    expect(rowValue("Logical bytes read")).toBe("0 bytes");
+  });
+
+  it("renders a reported zero as 0 and a nonzero count as its value", async () => {
+    await showSample({ bytesWritten: 0n, bytesRead: 3n * 1024n ** 2n, usedBytes: 0n, usedInodes: 12_345n });
+    expect(rowValue("Logical bytes written")).toBe("0 bytes");
+    expect(rowValue("Logical storage used")).toBe("0 bytes");
+    expect(rowValue("Logical bytes read")).toBe("3.0 MiB (3,145,728 bytes)");
+    expect(rowValue("Inodes used")).toBe("12,345");
+    expect(document.body.textContent).not.toMatch(/Unavailable · .*not reported/);
+    // The fix makes the old caveat untrue, so the page must not print it.
+    expect(document.body.textContent).not.toMatch(/can mean zero or not reported/);
   });
 });
 
