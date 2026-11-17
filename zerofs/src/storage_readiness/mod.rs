@@ -271,11 +271,12 @@ pub(crate) fn verify_pool_paths(settings: &Settings, pool_id: &str) -> Result<()
             continue;
         };
         let pool = root.path.join(".zerofs-pool").join(pool_id);
+        let lock = crate::local_object_store::LOCK_FILE;
         for path in [
             pool.join("members").join(id),
-            pool.join("members/.zerofs-local-mutations#0"),
+            pool.join("members").join(lock),
             pool.join("objects"),
-            pool.join("objects/.zerofs-local-mutations#0"),
+            pool.join("objects").join(lock),
         ] {
             paths::existing_ancestor(&root.path, &path)?;
         }

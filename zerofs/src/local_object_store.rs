@@ -44,7 +44,7 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::{Semaphore, oneshot};
 
 const STORE: &str = "LocalConditionalStore";
-const LOCK_FILE: &str = ".zerofs-local-mutations#0";
+pub(crate) const LOCK_FILE: &str = ".zerofs-local-mutations#0";
 const MAX_WORKERS: usize = 32;
 
 /// The same absolute object paths as `LocalFileSystem::new()`, with durable CAS.

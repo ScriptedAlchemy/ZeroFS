@@ -21,7 +21,7 @@ const ARGON2_TIME_COST: u32 = 3;
 const ARGON2_PARALLELISM: u32 = 4;
 
 /// Filename for the wrapped encryption key in object store
-const WRAPPED_KEY_FILENAME: &str = "zerofs.key";
+pub(crate) const WRAPPED_KEY_FILENAME: &str = "zerofs.key";
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct WrappedDataKey {
