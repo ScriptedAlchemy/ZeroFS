@@ -64,14 +64,10 @@ impl MonitorApp {
         if let (Some(base), Some(base_time)) = (&self.rate_base, &self.rate_base_time) {
             let elapsed = base_time.elapsed().as_secs_f64();
             if elapsed >= CHART_INTERVAL_SECS {
-                // A counter the server omitted has no rate. Skip the point
-                // rather than chart an invented zero.
-                let rate = |now: Option<u64>, then: Option<u64>| {
-                    now.zip(then)
-                        .map(|(now, then)| now.saturating_sub(then) as f64 / elapsed)
-                };
-                let read_bps = rate(snapshot.bytes_read, base.bytes_read);
-                let write_bps = rate(snapshot.bytes_written, base.bytes_written);
+                let read_bps =
+                    (snapshot.bytes_read.saturating_sub(base.bytes_read)) as f64 / elapsed;
+                let write_bps =
+                    (snapshot.bytes_written.saturating_sub(base.bytes_written)) as f64 / elapsed;
                 let read_ops = (snapshot
                     .read_operations
                     .saturating_sub(base.read_operations)) as f64
@@ -85,12 +81,8 @@ impl MonitorApp {
                     .saturating_sub(base.total_operations)) as f64
                     / elapsed;
 
-                if let Some(read_bps) = read_bps {
-                    push_ring(&mut self.read_throughput, read_bps);
-                }
-                if let Some(write_bps) = write_bps {
-                    push_ring(&mut self.write_throughput, write_bps);
-                }
+                push_ring(&mut self.read_throughput, read_bps);
+                push_ring(&mut self.write_throughput, write_bps);
                 push_ring(&mut self.read_iops, read_ops);
                 push_ring(&mut self.write_iops, write_ops);
                 push_ring(&mut self.total_ops, total as u64);

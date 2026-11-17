@@ -137,16 +137,16 @@ message StatsSnapshot {
     uint64 links_renamed = 10;
     uint64 read_operations = 11;
     uint64 write_operations = 12;
-    // bytes_read, bytes_written, used_bytes and used_inodes carry explicit
-    // presence. A server omits a value it cannot state and sends a real zero
-    // as zero, so a client can tell the two apart.
-    optional uint64 bytes_read = 13;
-    optional uint64 bytes_written = 14;
+    uint64 bytes_read = 13;
+    uint64 bytes_written = 14;
     uint64 tombstones_created = 15;
     uint64 tombstones_processed = 16;
     uint64 gc_chunks_deleted = 17;
     uint64 gc_runs = 18;
     uint64 total_operations = 19;
+    // used_bytes and used_inodes carry explicit presence. A server omits a
+    // value it cannot state and sends a real zero as zero, so a client can
+    // tell the two apart.
     optional uint64 used_bytes = 20;
     optional uint64 used_inodes = 21;
     uint64 max_bytes = 22;

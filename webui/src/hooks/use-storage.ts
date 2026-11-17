@@ -11,7 +11,7 @@ export interface StorageActivity {
   usedInodes: Value<bigint>;
 }
 
-// These StatsSnapshot counters carry presence: the server omits one it cannot state.
+// The StatsSnapshot usage counters carry presence: the server omits one it cannot state.
 const counter = (value: bigint | undefined, name: string): Value<bigint> =>
   value === undefined ? unavailable(`${name} was not reported by the server`) : known(value);
 
@@ -48,8 +48,8 @@ export function useStorageActivity(): { activity: Value<StorageActivity>; lastSu
     latest.state === "unavailable"
       ? latest
       : known({
-          logicalBytesWritten: counter(latest.value.bytesWritten, "bytes_written"),
-          logicalBytesRead: counter(latest.value.bytesRead, "bytes_read"),
+          logicalBytesWritten: known(latest.value.bytesWritten),
+          logicalBytesRead: known(latest.value.bytesRead),
           logicalUsedBytes: counter(latest.value.usedBytes, "used_bytes"),
           usedInodes: counter(latest.value.usedInodes, "used_inodes"),
         });

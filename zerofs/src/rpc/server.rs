@@ -496,8 +496,8 @@ impl AdminService for AdminRpcServer {
                 links_renamed: fs_stats.links_renamed.load(Ordering::Relaxed),
                 read_operations: fs_stats.read_operations.load(Ordering::Relaxed),
                 write_operations: fs_stats.write_operations.load(Ordering::Relaxed),
-                bytes_read: Some(fs_stats.bytes_read.load(Ordering::Relaxed)),
-                bytes_written: Some(fs_stats.bytes_written.load(Ordering::Relaxed)),
+                bytes_read: fs_stats.bytes_read.load(Ordering::Relaxed),
+                bytes_written: fs_stats.bytes_written.load(Ordering::Relaxed),
                 tombstones_created: fs_stats.tombstones_created.load(Ordering::Relaxed),
                 tombstones_processed: fs_stats.tombstones_processed.load(Ordering::Relaxed),
                 gc_extents_deleted: fs_stats.gc_extents_deleted.load(Ordering::Relaxed),
@@ -1005,13 +1005,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_stats_sends_a_known_zero_counter_as_present() {
+    async fn stream_stats_sends_known_usage_as_present() {
         let (_fs, client, shutdown, _dir) = setup().await;
         let sample = first_stats_sample(&client).await;
-        // Nothing has read file data yet, so the read counter is a known zero. With
-        // explicit presence a zero is on the wire, so the client decodes Some(0).
-        assert_eq!(sample.bytes_read, Some(0));
-        assert!(sample.bytes_written.is_some());
+        // Nothing has read file data yet, so the read counter is zero.
+        assert_eq!(sample.bytes_read, 0);
         assert!(sample.used_bytes.is_some());
         assert!(sample.used_inodes.is_some());
         shutdown.cancel();
@@ -1036,47 +1034,54 @@ mod tests {
         assert_eq!(sample.used_bytes, None);
         assert_eq!(sample.used_inodes, None);
         // The process-lifetime I/O counters do not depend on the shards.
-        assert_eq!(sample.bytes_read, Some(0));
-        assert!(sample.bytes_written.is_some());
+        assert_eq!(sample.bytes_read, 0);
         shutdown.cancel();
     }
 
-    /// Two StatsSnapshot fields as they were declared before they gained presence.
+    /// Two StatsSnapshot fields with the other presence. used_bytes is declared as
+    /// releases before it gained presence declared it. bytes_read is declared as an
+    /// earlier build of this change declared it, with explicit presence.
     #[derive(Clone, PartialEq, prost::Message)]
-    struct ImplicitPresenceStats {
-        #[prost(uint64, tag = "13")]
-        bytes_read: u64,
+    struct OtherPresenceStats {
+        #[prost(uint64, optional, tag = "13")]
+        bytes_read: Option<u64>,
         #[prost(uint64, tag = "20")]
         used_bytes: u64,
     }
 
     #[test]
-    fn stats_presence_decodes_both_ways_with_implicit_presence_peers() {
+    fn stats_presence_decodes_both_ways_with_peers_of_the_other_presence() {
         use prost::Message;
-        // An old client reading a new server sees a sent value as itself and an
-        // omitted one as 0, which is what it saw before.
-        let new = proto::StatsSnapshot {
-            bytes_read: Some(7),
-            used_bytes: None,
-            ..Default::default()
-        };
-        let old = ImplicitPresenceStats::decode(new.encode_to_vec().as_slice()).unwrap();
-        assert_eq!(
-            old,
-            ImplicitPresenceStats {
-                bytes_read: 7,
-                used_bytes: 0
-            }
-        );
-        // A new client reading an old server sees a nonzero value as itself. The old
-        // server never sends a zero, so a zero arrives as absent, never as Some(0).
-        let old = ImplicitPresenceStats {
-            bytes_read: 0,
-            used_bytes: 5,
-        };
-        let new = proto::StatsSnapshot::decode(old.encode_to_vec().as_slice()).unwrap();
-        assert_eq!(new.bytes_read, None);
-        assert_eq!(new.used_bytes, Some(5));
+        // A peer of the other presence reading this server sees a sent value as
+        // itself. This server sends no zero bytes_read and no unknown used_bytes,
+        // so the peer sees an absent bytes_read and the 0 an old client always saw.
+        for (bytes_read, expected) in [(7, Some(7)), (0, None)] {
+            let new = proto::StatsSnapshot {
+                bytes_read,
+                used_bytes: None,
+                ..Default::default()
+            };
+            let other = OtherPresenceStats::decode(new.encode_to_vec().as_slice()).unwrap();
+            assert_eq!(
+                other,
+                OtherPresenceStats {
+                    bytes_read: expected,
+                    used_bytes: 0
+                }
+            );
+        }
+        // This client reading a peer of the other presence sees every bytes_read,
+        // including an explicit zero, as its value. An old server never sends a zero
+        // used_bytes, so only a nonzero one arrives as present.
+        for (bytes_read, used_bytes, expected) in [(Some(0), 5, (0, Some(5))), (None, 0, (0, None))]
+        {
+            let other = OtherPresenceStats {
+                bytes_read,
+                used_bytes,
+            };
+            let new = proto::StatsSnapshot::decode(other.encode_to_vec().as_slice()).unwrap();
+            assert_eq!((new.bytes_read, new.used_bytes), expected);
+        }
     }
 
     #[tokio::test]
