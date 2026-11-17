@@ -17,9 +17,8 @@ pub(super) const RESPONSE_BUFFER_CAPACITY: usize = 64 * 1024;
 pub(crate) enum ResponseCredit {
     /// The request's admission covers its reply.
     Admitted(#[allow(dead_code, reason = "held for its Drop")] P9AdmissionPermit),
-    /// A Tflush needs no request admission: its reply is one fixed 7-byte
-    /// frame, and the connection bounds how many flushes are outstanding.
-    Flush(#[allow(dead_code, reason = "held for its Drop")] OwnedSemaphorePermit),
+    /// Fixed-size flush or overload reply, charged to its own class of slots.
+    Control(#[allow(dead_code, reason = "held for its Drop")] OwnedSemaphorePermit),
 }
 
 impl From<P9AdmissionPermit> for ResponseCredit {

@@ -416,9 +416,11 @@ pub(super) async fn read_9p_frame<R>(
 where
     R: AsyncRead + Unpin,
 {
-    Ok(read_9p_frame_charged(reader, shutdown, async |_| Ok(()))
-        .await?
-        .map(|(frame, ())| frame))
+    Ok(
+        read_9p_frame_charged(reader, shutdown, async |_| Ok(Some(())))
+            .await?
+            .map(|(frame, _)| frame),
+    )
 }
 
 /// Read one frame, calling `charge` with its header before allocating the
@@ -427,8 +429,8 @@ where
 pub(super) async fn read_9p_frame_charged<R, C>(
     reader: &mut R,
     shutdown: &CancellationToken,
-    charge: impl AsyncFnOnce(FrameHeader) -> anyhow::Result<C>,
-) -> anyhow::Result<Option<(Bytes, C)>>
+    charge: impl AsyncFnOnce(FrameHeader) -> anyhow::Result<Option<C>>,
+) -> anyhow::Result<Option<(Bytes, Option<C>)>>
 where
     R: AsyncRead + Unpin,
 {
@@ -468,6 +470,21 @@ where
         }) => charged?,
     };
 
+    if charged.is_none() {
+        // An overload refusal needs only the tag. Consume exactly this body
+        // so the next header, including Tflush, remains reachable.
+        let remaining = (frame_len - P9_HEADER_SIZE) as u64;
+        let mut body = reader.take(remaining);
+        let mut sink = tokio::io::sink();
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return Ok(None),
+            result = tokio::io::copy(&mut body, &mut sink) => {
+                anyhow::ensure!(result? == remaining, "truncated refused 9P request");
+            }
+        }
+        return Ok(Some((Bytes::copy_from_slice(&header), None)));
+    }
     let mut frame = Vec::with_capacity(frame_len);
     frame.extend_from_slice(&header);
     frame.resize(frame_len, 0);
