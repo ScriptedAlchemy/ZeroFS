@@ -2,6 +2,7 @@ use super::admission::P9AdmissionPermit;
 use crate::task::spawn_named;
 use std::sync::Arc;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
@@ -9,25 +10,41 @@ use tracing::{error, warn};
 
 const RLERROR_TYPE: u8 = 7;
 const RVERSION_TYPE: u8 = 101;
+const RFLUSH_TYPE: u8 = 109;
 pub(super) const RESPONSE_BUFFER_CAPACITY: usize = 64 * 1024;
+
+/// What keeps a queued reply's memory accounted until the writer sends it.
+pub(crate) enum ResponseCredit {
+    /// The request's admission covers its reply.
+    Admitted(#[allow(dead_code, reason = "held for its Drop")] P9AdmissionPermit),
+    /// A Tflush needs no request admission: its reply is one fixed 7-byte
+    /// frame, and the connection bounds how many flushes are outstanding.
+    Flush(#[allow(dead_code, reason = "held for its Drop")] OwnedSemaphorePermit),
+}
+
+impl From<P9AdmissionPermit> for ResponseCredit {
+    fn from(admission: P9AdmissionPermit) -> Self {
+        Self::Admitted(admission)
+    }
+}
 
 pub(crate) struct P9Response {
     tag: u16,
     bytes: Vec<u8>,
-    _admission: P9AdmissionPermit,
+    _credit: ResponseCredit,
 }
 
 impl P9Response {
-    pub(super) fn new(tag: u16, bytes: Vec<u8>, admission: P9AdmissionPermit) -> Self {
+    pub(super) fn new(tag: u16, bytes: Vec<u8>, credit: impl Into<ResponseCredit>) -> Self {
         Self {
             tag,
             bytes,
-            _admission: admission,
+            _credit: credit.into(),
         }
     }
 
-    pub(crate) fn into_guarded_parts(self) -> (u16, Vec<u8>, P9AdmissionPermit) {
-        (self.tag, self.bytes, self._admission)
+    pub(crate) fn into_guarded_parts(self) -> (u16, Vec<u8>, ResponseCredit) {
+        (self.tag, self.bytes, self._credit)
     }
 
     #[cfg(test)]
@@ -37,10 +54,13 @@ impl P9Response {
     }
 }
 
+/// Errors, version negotiation and Rflush report no filesystem state. Rflush
+/// either follows the flushed request's own (gated) reply or means the request
+/// never took effect, which is true on a deposed server too.
 fn response_requires_serving_authority(response_bytes: &[u8]) -> bool {
     !matches!(
         response_bytes.get(4),
-        Some(&RLERROR_TYPE) | Some(&RVERSION_TYPE)
+        Some(&RLERROR_TYPE) | Some(&RVERSION_TYPE) | Some(&RFLUSH_TYPE)
     )
 }
 

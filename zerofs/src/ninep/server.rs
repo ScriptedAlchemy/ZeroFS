@@ -1862,14 +1862,11 @@ mod tests {
     #[tokio::test]
     async fn revocation_filters_success_not_errors() {
         let (filesystem, lease, raw_db) = leased_filesystem_for_response_gate().await;
-        let handler = NinePHandler::new(Arc::clone(&filesystem), Arc::new(FileLockManager::new()));
 
         // Revoke authority after response serialization and before transport write.
-        let completed = handler
-            .handle_message(41, Message::Tflush(Tflush { oldtag: 40 }))
-            .await;
-        assert!(matches!(completed.body, Message::Rflush(Rflush)));
-        let completed_bytes = completed.to_bytes().unwrap();
+        // Rclunk stands for any success; Rflush is exempt because it reports
+        // no filesystem state (`tflush_needs_no_serving_authority`).
+        let completed_bytes = frame(41, Message::Rclunk(Rclunk)).to_vec();
         let (mut client, server) = tokio::io::duplex(4096);
         let rx = response_queue([(41, completed_bytes)]).await;
         lease.revoke();
@@ -2814,5 +2811,645 @@ mod tests {
             .await;
         assert!(matches!(getattr.body, Message::Rlerror(_)));
         assert!(filesystem.open_handles.get(&0).is_none());
+    }
+
+    // Tflush cancellation (flush(5); Linux net/9p/client.c p9_client_rpc).
+
+    /// Upper bound for a Tflush that must not depend on the flushed work.
+    const PROMPT_FLUSH: Duration = Duration::from_millis(250);
+
+    async fn wait_until(mut ready: impl FnMut() -> bool, message: &str) {
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            while !ready() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect(message);
+    }
+
+    fn admission_is_idle(admission: &P9ConnectionAdmission) -> bool {
+        let snapshot = admission.global.snapshot();
+        snapshot.reserved_bytes == 0 && snapshot.active_requests == 0
+    }
+
+    async fn plain_root_session(handler: &NinePHandler) {
+        let version = handler
+            .handle_message(
+                0,
+                Message::Tversion(Tversion {
+                    msize: super::super::handler::DEFAULT_MSIZE,
+                    version: P9String::new(ninep_proto::VERSION_9P2000L.to_vec()),
+                }),
+            )
+            .await;
+        assert!(matches!(version.body, Message::Rversion(_)));
+        let attach = handler
+            .handle_message(
+                1,
+                Message::Tattach(Tattach {
+                    fid: 1,
+                    afid: u32::MAX,
+                    uname: P9String::new(b"root".to_vec()),
+                    aname: P9String::new(b"/".to_vec()),
+                    n_uname: 0,
+                }),
+            )
+            .await;
+        assert!(matches!(attach.body, Message::Rattach(_)));
+    }
+
+    const HELD_FILE_BYTES: usize = 64 * 1024;
+
+    fn held_file_payload() -> Vec<u8> {
+        (0..HELD_FILE_BYTES)
+            .map(|index| (index % 251) as u8)
+            .collect()
+    }
+
+    async fn open_test_filesystem(
+        metadata: Arc<dyn slatedb::object_store::ObjectStore>,
+        segments: Arc<dyn slatedb::object_store::ObjectStore>,
+    ) -> Arc<ZeroFS> {
+        use crate::block_transformer::ZeroFsBlockTransformer;
+        use crate::config::CompressionConfig;
+        use slatedb::object_store::path::Path;
+        use slatedb::{BlockTransformer, DbBuilder};
+
+        let key = [0x3c; 32];
+        let transformer: Arc<dyn BlockTransformer> =
+            ZeroFsBlockTransformer::new_arc(&key, CompressionConfig::default());
+        let db = Arc::new(
+            DbBuilder::new(Path::from("db"), metadata)
+                .with_block_transformer(transformer)
+                .with_filter_policies(crate::fs::filter_policy::filter_policies())
+                .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+                .build()
+                .await
+                .unwrap(),
+        );
+        Arc::new(
+            ZeroFS::new_with_slatedb_and_lease(
+                crate::db::SlateDbHandle::ReadWrite(db),
+                u64::MAX,
+                None,
+                false,
+                false,
+                None,
+                None,
+                Arc::new(crate::dedup::DedupCache::new()),
+                None,
+                crate::object_trace::ObjectTracer::new(),
+                segments,
+                crate::frame_codec::FrameCodec::new(
+                    &key,
+                    crate::segment::SEGMENT_INFO,
+                    CompressionConfig::default(),
+                ),
+                None,
+                crate::config::StoreProfile::default(),
+                crate::fs::name_mode::NameMode::Sensitive,
+            )
+            .await
+            .unwrap(),
+        )
+    }
+
+    fn walk_message(fid: u32, newfid: u32, names: &[&[u8]]) -> Message {
+        Message::Twalk(ninep_proto::Twalk {
+            fid,
+            newfid,
+            nwname: names.len() as u16,
+            wnames: names
+                .iter()
+                .map(|name| P9String::new(name.to_vec()))
+                .collect(),
+        })
+    }
+
+    /// A plain-dialect session whose fid 2 is a file opened for reading.
+    /// The file was written and closed by an earlier instance, so its bytes
+    /// live only in a segment object and this instance has no cached copy.
+    /// That segment store's GET bodies can be held, so a Tread waits on the
+    /// backend.
+    async fn held_segment_session() -> (
+        Arc<ZeroFS>,
+        Arc<NinePHandler>,
+        Arc<crate::fault_store::FaultControls>,
+    ) {
+        use slatedb::object_store::ObjectStore;
+        use slatedb::object_store::memory::InMemory;
+
+        let metadata: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let segments: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let writer = open_test_filesystem(Arc::clone(&metadata), Arc::clone(&segments)).await;
+        let handler = NinePHandler::new(Arc::clone(&writer), Arc::new(FileLockManager::new()));
+        plain_root_session(&handler).await;
+        let walk = handler.handle_message(2, walk_message(1, 2, &[])).await;
+        assert!(matches!(walk.body, Message::Rwalk(_)));
+        let create = handler
+            .handle_message(
+                3,
+                Message::Tlcreate(ninep_proto::Tlcreate {
+                    fid: 2,
+                    name: P9String::new(b"held".to_vec()),
+                    flags: libc::O_RDWR as u32,
+                    mode: 0o644,
+                    gid: 0,
+                }),
+            )
+            .await;
+        assert!(matches!(create.body, Message::Rlcreate(_)));
+        let payload = held_file_payload();
+        let write = handler
+            .handle_message(
+                4,
+                Message::Twrite(Twrite {
+                    fid: 2,
+                    offset: 0,
+                    count: payload.len() as u32,
+                    data: payload.into(),
+                }),
+            )
+            .await;
+        assert!(matches!(write.body, Message::Rwrite(_)));
+        drop(handler);
+        writer.flush_coordinator.close().await.unwrap();
+        drop(writer);
+
+        let (held, controls) = crate::fault_store::FaultStore::new(segments);
+        let filesystem = open_test_filesystem(metadata, held).await;
+        let handler = Arc::new(NinePHandler::new(
+            Arc::clone(&filesystem),
+            Arc::new(FileLockManager::new()),
+        ));
+        plain_root_session(&handler).await;
+        let walk = handler
+            .handle_message(2, walk_message(1, 2, &[b"held"]))
+            .await;
+        assert!(matches!(walk.body, Message::Rwalk(_)));
+        let open = handler
+            .handle_message(
+                3,
+                Message::Tlopen(ninep_proto::Tlopen {
+                    fid: 2,
+                    flags: libc::O_RDONLY as u32,
+                }),
+            )
+            .await;
+        assert!(matches!(open.body, Message::Rlopen(_)));
+        (filesystem, handler, controls)
+    }
+
+    fn held_read() -> Message {
+        Message::Tread(ninep_proto::Tread {
+            fid: 2,
+            offset: 0,
+            count: 4096,
+        })
+    }
+
+    #[tokio::test]
+    async fn tflush_abandons_a_read_held_on_its_backend_fetch() {
+        let (_filesystem, handler, controls) = held_segment_session().await;
+        let mut io = DispatchFixture::new(handler, 4);
+        assert!(admission_is_idle(&io.admission));
+
+        controls.hold_get_bodies(usize::MAX);
+        let gets = controls.get_count();
+        io.dispatch(10, held_read()).await;
+        wait_until(
+            || controls.get_count() > gets,
+            "the read must reach its backend fetch",
+        )
+        .await;
+        io.expect_quiet("the read must wait on its held backend fetch")
+            .await;
+        assert!(!admission_is_idle(&io.admission));
+
+        let flushed = std::time::Instant::now();
+        io.dispatch(11, Message::Tflush(Tflush { oldtag: 10 }))
+            .await;
+        let (tag, response) = tokio::time::timeout(PROMPT_FLUSH, io.rx.recv())
+            .await
+            .expect("Rflush must not wait for the held backend fetch")
+            .expect("response channel")
+            .into_parts();
+        assert_eq!(tag, 11);
+        assert!(matches!(decode(&response).body, Message::Rflush(Rflush)));
+        assert!(flushed.elapsed() < PROMPT_FLUSH);
+        wait_until(
+            || admission_is_idle(&io.admission),
+            "the cancelled read must return its admission bytes",
+        )
+        .await;
+
+        controls.release_get_bodies();
+        io.expect_quiet("a cancelled read must never answer after Rflush")
+            .await;
+
+        // The client may reuse the flushed tag as soon as Rflush arrives.
+        io.dispatch(10, held_read()).await;
+        let (tag, reply) = io.recv("a read on the reused tag").await;
+        assert_eq!(tag, 10);
+        let Message::Rread(read) = reply.body else {
+            panic!("the reused tag must carry the new read's reply");
+        };
+        assert_eq!(read.data.as_ref(), &held_file_payload()[..4096]);
+    }
+
+    #[tokio::test]
+    async fn tflush_abandons_a_held_fsync_without_reporting_success() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        fs.flush_coordinator.set_local_durability_barrier({
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                Box::pin(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(())
+                })
+            })
+        });
+        let filesystem = Arc::new(fs);
+        let handler = Arc::new(NinePHandler::new(
+            Arc::clone(&filesystem),
+            Arc::new(FileLockManager::new()),
+        ));
+        plain_root_session(&handler).await;
+        let mut io = DispatchFixture::new(handler, 4);
+        let fsync = || {
+            Message::Tfsync(ninep_proto::Tfsync {
+                fid: 1,
+                datasync: 0,
+            })
+        };
+
+        io.dispatch(10, fsync()).await;
+        tokio::time::timeout(TEST_TIMEOUT, entered.notified())
+            .await
+            .expect("Tfsync must reach its durability wait");
+        io.dispatch(11, Message::Tflush(Tflush { oldtag: 10 }))
+            .await;
+        let (tag, response) = tokio::time::timeout(PROMPT_FLUSH, io.rx.recv())
+            .await
+            .expect("Rflush must not wait for the durability barrier")
+            .expect("response channel")
+            .into_parts();
+        assert_eq!(tag, 11);
+        assert!(matches!(decode(&response).body, Message::Rflush(Rflush)));
+        wait_until(
+            || admission_is_idle(&io.admission),
+            "the cancelled fsync must return its admission",
+        )
+        .await;
+
+        release.notify_one();
+        io.expect_quiet("a cancelled fsync must never report success after Rflush")
+            .await;
+
+        // The durability machinery is intact: a later fsync completes.
+        io.dispatch(12, fsync()).await;
+        tokio::time::timeout(TEST_TIMEOUT, entered.notified())
+            .await
+            .expect("the next Tfsync must reach its durability wait");
+        release.notify_one();
+        let (tag, reply) = io.recv("the next fsync").await;
+        assert_eq!(tag, 12);
+        assert!(matches!(reply.body, Message::Rfsync(_)));
+    }
+
+    fn mkdir_frame(tag: u16, op_id: [u8; 16], op_flags: u8, name: &[u8]) -> Bytes {
+        Bytes::from(
+            P9Message::new_with_op_id_flags_and_origin(
+                tag,
+                op_id,
+                op_flags,
+                0,
+                Message::Tmkdir(Tmkdir {
+                    dfid: 1,
+                    name: P9String::new(name.to_vec()),
+                    mode: 0o755,
+                    gid: 0,
+                }),
+            )
+            .to_bytes_ctx(true)
+            .unwrap(),
+        )
+    }
+
+    async fn walk_errno(handler: &NinePHandler, name: &[u8]) -> Option<u32> {
+        let walk = handler
+            .handle_message(
+                90,
+                Message::Twalk(ninep_proto::Twalk {
+                    fid: 1,
+                    newfid: 90,
+                    nwname: 1,
+                    wnames: vec![P9String::new(name.to_vec())],
+                }),
+            )
+            .await;
+        match walk.body {
+            Message::Rwalk(_) => {
+                let clunk = handler
+                    .handle_message(91, Message::Tclunk(Tclunk { fid: 90 }))
+                    .await;
+                assert!(matches!(clunk.body, Message::Rclunk(_)));
+                None
+            }
+            Message::Rlerror(error) => Some(error.ecode),
+            other => panic!("unexpected walk reply {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tflush_before_submission_applies_nothing() {
+        let (filesystem, handler) = in_memory_handler().await;
+        establish_session(&handler, 0, b"root", 0, Some([0; 16])).await;
+        let op_id = [0x71; 16];
+
+        // The parent's inode lock holds mkdir before it submits its commit.
+        let parent_lock = filesystem.lock_manager.acquire(0).await;
+        let mut io = DispatchFixture::new(Arc::clone(&handler), 4);
+        io.dispatch_frame(mkdir_frame(10, op_id, 0, b"cancelled"))
+            .await;
+        io.expect_quiet("mkdir must wait for the parent lock").await;
+
+        io.dispatch(11, Message::Tflush(Tflush { oldtag: 10 }))
+            .await;
+        let (tag, response) = tokio::time::timeout(PROMPT_FLUSH, io.rx.recv())
+            .await
+            .expect("Rflush must not wait for a mutation that has not submitted")
+            .expect("response channel")
+            .into_parts();
+        assert_eq!(tag, 11);
+        assert!(matches!(decode(&response).body, Message::Rflush(Rflush)));
+        wait_until(
+            || filesystem.dedup.stats().inflight_ids == 0,
+            "the cancelled mkdir must release its operation reservation",
+        )
+        .await;
+
+        drop(parent_lock);
+        io.expect_quiet("a cancelled mkdir must never answer after Rflush")
+            .await;
+        assert_eq!(
+            walk_errno(&handler, b"cancelled").await,
+            Some(crate::linux_errno::ENOENT),
+            "a mutation cancelled before submission must apply nothing"
+        );
+        assert!(filesystem.dedup.get(&op_id).is_none());
+
+        // Nothing was applied, so the client may send the operation again.
+        io.dispatch_frame(mkdir_frame(12, op_id, 0, b"cancelled"))
+            .await;
+        let (tag, reply) = io.recv("the resent mkdir").await;
+        assert_eq!(tag, 12);
+        assert!(matches!(reply.body, Message::Rmkdir(_)));
+        assert_eq!(walk_errno(&handler, b"cancelled").await, None);
+    }
+
+    #[tokio::test]
+    async fn tflush_after_submission_waits_for_the_single_applied_reply() {
+        let (filesystem, handler) = in_memory_handler().await;
+        establish_session(&handler, 0, b"root", 0, Some([0; 16])).await;
+        let op_id = [0x72; 16];
+        let (reached, resume) = pause_success_terminal_dedup(op_id);
+        let mut io = DispatchFixture::new(Arc::clone(&handler), 4);
+        io.dispatch_frame(mkdir_frame(10, op_id, 0, b"applied"))
+            .await;
+        tokio::time::timeout(TEST_TIMEOUT, reached)
+            .await
+            .expect("mkdir must apply and reach its terminal pause")
+            .unwrap();
+
+        io.dispatch(11, Message::Tflush(Tflush { oldtag: 10 }))
+            .await;
+        io.expect_quiet("Rflush must wait for an applied mutation to answer")
+            .await;
+        resume.send(()).unwrap();
+
+        let (tag, original) = io.recv("the applied mkdir reply").await;
+        assert_eq!(tag, 10, "the applied reply must precede Rflush");
+        let Message::Rmkdir(original) = original.body else {
+            panic!("the applied mkdir must report success");
+        };
+        assert_eq!(io.recv_flush("Rflush after the applied reply").await, 11);
+
+        // A retry of the same operation replays the applied result.
+        io.dispatch_frame(mkdir_frame(
+            12,
+            op_id,
+            ninep_proto::P9_OP_FLAG_RETRY,
+            b"applied",
+        ))
+        .await;
+        let (tag, retried) = io.recv("the retried mkdir").await;
+        assert_eq!(tag, 12);
+        let Message::Rmkdir(retried) = retried.body else {
+            panic!("the retry must replay the applied result");
+        };
+        assert_eq!(retried.qid.path, original.qid.path);
+
+        // The directory exists exactly once.
+        io.dispatch_frame(mkdir_frame(13, [0x73; 16], 0, b"applied"))
+            .await;
+        let (_, second) = io.recv("a new operation on the same name").await;
+        assert!(matches!(
+            second.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EEXIST
+        ));
+        drop(filesystem);
+    }
+
+    struct SaturatedConnection {
+        client: tokio::io::DuplexStream,
+        rx: mpsc::Receiver<P9Response>,
+        admission: P9ConnectionAdmission,
+        reader: tokio::task::JoinHandle<anyhow::Result<()>>,
+    }
+
+    impl SaturatedConnection {
+        /// Run the real connection reader with room for exactly one request.
+        fn start(handler: Arc<NinePHandler>) -> Self {
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let (tx, rx) = mpsc::channel(8);
+            let byte_limit = P9_MAX_MSIZE as usize * 4;
+            let global = P9GlobalAdmission::for_test(byte_limit, 1);
+            let admission = global.connection_for_test(byte_limit, 1);
+            let reader_admission = admission.clone();
+            let reader = tokio::spawn(async move {
+                handle_client_loop(
+                    handler,
+                    server,
+                    tx,
+                    CancellationToken::new(),
+                    CancellationToken::new(),
+                    &reader_admission,
+                    &TaskTracker::new(),
+                )
+                .await
+            });
+            Self {
+                client,
+                rx,
+                admission,
+                reader,
+            }
+        }
+
+        async fn send(&mut self, tag: u16, body: Message) {
+            self.client.write_all(&frame(tag, body)).await.unwrap();
+        }
+
+        async fn recv_within(&mut self, bound: Duration, context: &str) -> (u16, P9Message) {
+            let (tag, bytes) = tokio::time::timeout(bound, self.rx.recv())
+                .await
+                .expect(context)
+                .expect("response channel")
+                .into_parts();
+            (tag, decode(&bytes))
+        }
+
+        async fn expect_quiet(&mut self, message: &str) {
+            assert!(
+                tokio::time::timeout(QUIET_TIMEOUT, self.rx.recv())
+                    .await
+                    .is_err(),
+                "{message}"
+            );
+        }
+    }
+
+    fn plain_mkdir(name: &[u8]) -> Message {
+        Message::Tmkdir(Tmkdir {
+            dfid: 1,
+            name: P9String::new(name.to_vec()),
+            mode: 0o755,
+            gid: 0,
+        })
+    }
+
+    fn root_getattr() -> Message {
+        Message::Tgetattr(Tgetattr {
+            fid: 1,
+            request_mask: GETATTR_ALL,
+        })
+    }
+
+    #[tokio::test]
+    async fn saturated_connection_still_reads_tflush() {
+        let (filesystem, handler) = in_memory_handler().await;
+        plain_root_session(&handler).await;
+        let parent_lock = filesystem.lock_manager.acquire(0).await;
+        let mut connection = SaturatedConnection::start(Arc::clone(&handler));
+
+        // The held mkdir owns the connection's only request slot, so the
+        // getattr behind it cannot be admitted.
+        connection.send(10, plain_mkdir(b"held")).await;
+        connection.send(11, root_getattr()).await;
+        connection
+            .expect_quiet("both requests must wait while the slot is held")
+            .await;
+
+        connection
+            .send(12, Message::Tflush(Tflush { oldtag: 10 }))
+            .await;
+        let mut replies = Vec::new();
+        for _ in 0..2 {
+            replies.push(
+                connection
+                    .recv_within(
+                        PROMPT_FLUSH,
+                        "a saturated connection must still read Tflush",
+                    )
+                    .await,
+            );
+        }
+        replies.sort_by_key(|(tag, _)| *tag);
+        assert_eq!(
+            replies[0].0, 11,
+            "the queued getattr runs once the slot is free"
+        );
+        assert!(matches!(replies[0].1.body, Message::Rgetattr(_)));
+        assert_eq!(replies[1].0, 12);
+        assert!(matches!(replies[1].1.body, Message::Rflush(Rflush)));
+
+        drop(parent_lock);
+        connection
+            .expect_quiet("the cancelled mkdir must never answer after Rflush")
+            .await;
+        assert_eq!(
+            walk_errno(&handler, b"held").await,
+            Some(crate::linux_errno::ENOENT)
+        );
+        assert!(admission_is_idle(&connection.admission));
+        drop(connection.client);
+        connection.reader.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn tflush_cancels_a_request_still_waiting_for_admission() {
+        let (filesystem, handler) = in_memory_handler().await;
+        plain_root_session(&handler).await;
+        let parent_lock = filesystem.lock_manager.acquire(0).await;
+        let mut connection = SaturatedConnection::start(Arc::clone(&handler));
+
+        connection.send(10, plain_mkdir(b"kept")).await;
+        connection.send(11, root_getattr()).await;
+        connection
+            .send(12, Message::Tflush(Tflush { oldtag: 11 }))
+            .await;
+        let (tag, response) = connection
+            .recv_within(
+                PROMPT_FLUSH,
+                "Tflush of a queued request must answer at once",
+            )
+            .await;
+        assert_eq!(tag, 12);
+        assert!(matches!(response.body, Message::Rflush(Rflush)));
+
+        drop(parent_lock);
+        let (tag, mkdir) = connection
+            .recv_within(TEST_TIMEOUT, "the held mkdir completes")
+            .await;
+        assert_eq!(tag, 10);
+        assert!(matches!(mkdir.body, Message::Rmkdir(_)));
+        connection
+            .expect_quiet("the cancelled getattr must never run or answer")
+            .await;
+        wait_until(
+            || admission_is_idle(&connection.admission),
+            "every request must release admission",
+        )
+        .await;
+        drop(connection.client);
+        connection.reader.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn tflush_needs_no_serving_authority() {
+        let (filesystem, lease, raw_db) = leased_filesystem_for_response_gate().await;
+        let handler = NinePHandler::new(Arc::clone(&filesystem), Arc::new(FileLockManager::new()));
+        lease.revoke();
+
+        // flush(5): "A Tflush can never be responded to by an Rerror message."
+        let flushed = handler
+            .handle_message(41, Message::Tflush(Tflush { oldtag: 40 }))
+            .await;
+        assert!(matches!(flushed.body, Message::Rflush(Rflush)));
+        let bytes = flushed.to_bytes().unwrap();
+        assert!(
+            response_may_be_emitted(&filesystem.db, &bytes),
+            "Rflush reports no filesystem state, so a deposed server may still send it"
+        );
+        raw_db.close().await.unwrap();
     }
 }

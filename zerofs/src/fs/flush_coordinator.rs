@@ -239,20 +239,34 @@ impl FlushCoordinator {
         })
     }
 
+    /// Seal, flush and capture under the database flush barrier.
+    ///
+    /// Waiting for the barrier is abandonable. The work under it is not: a
+    /// caller that stops waiting (a 9P `Tflush`, a closed connection) must not
+    /// stop a seal between rotating a segment and publishing it. Once the
+    /// barrier is held, the work runs in its own task, which owns the barrier
+    /// and releases it when the flush ends.
     async fn capture_under_barrier(&self) -> Result<ObjectCoverage, DurabilityError> {
-        let _barrier = self.db.flush_barrier().write_owned().await;
-        if let Some(seal) = self.seal_hook.get() {
-            seal().await.map_err(DurabilityError::from_flush)?;
-        }
-        self.db
-            .flush()
-            .await
-            .map_err(DurabilityError::FilesystemFlush)?;
-        Ok(self
-            .object_capture
-            .get()
-            .map(|capture| capture())
-            .unwrap_or(ObjectCoverage::DirectRemote))
+        let barrier = self.db.flush_barrier().write_owned().await;
+        let seal = self.seal_hook.get().cloned();
+        let capture = self.object_capture.get().cloned();
+        let db = Arc::clone(&self.db);
+        spawn_named("durability-barrier", async move {
+            let _barrier = barrier;
+            if let Some(seal) = seal {
+                seal().await.map_err(DurabilityError::from_flush)?;
+            }
+            db.flush().await.map_err(DurabilityError::FilesystemFlush)?;
+            Ok(capture
+                .map(|capture| capture())
+                .unwrap_or(ObjectCoverage::DirectRemote))
+        })
+        .await
+        .map_err(|error| {
+            DurabilityError::FilesystemFlush(anyhow::anyhow!(
+                "durability barrier task failed: {error}"
+            ))
+        })?
     }
 
     async fn wait_object(
@@ -544,6 +558,66 @@ mod tests {
         assert!(
             *released.lock().unwrap(),
             "the local durability hook must not hold the database flush barrier"
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_durability_wait_still_finishes_its_seal_and_flush() {
+        let (_fs, coordinator) = isolated_coordinator().await;
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let finished = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        coordinator.set_sealer({
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            let started = Arc::clone(&started);
+            let finished = Arc::clone(&finished);
+            Arc::new(move || {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                let started = Arc::clone(&started);
+                let finished = Arc::clone(&finished);
+                Box::pin(async move {
+                    // Only the first seal is held.
+                    if started.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        entered.notify_one();
+                        release.notified().await;
+                    }
+                    finished.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                })
+            })
+        });
+
+        let abandoned = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move {
+                coordinator
+                    .durable_through(cutoff(0), DurabilityTarget::RemoteBackend)
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("the first durability wait must reach its seal");
+        abandoned.abort();
+        assert!(abandoned.await.unwrap_err().is_cancelled());
+
+        // A client that stops waiting abandons the wait, not the barrier: the
+        // seal it started finishes and releases the database flush barrier.
+        release.notify_one();
+        let _receipt = tokio::time::timeout(
+            Duration::from_secs(2),
+            coordinator.durable_through(cutoff(1), DurabilityTarget::RemoteBackend),
+        )
+        .await
+        .expect("the next durability wait must not inherit a half-finished barrier")
+        .unwrap();
+        assert_eq!(
+            finished.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the abandoned waiter's seal must run to completion"
         );
     }
 }

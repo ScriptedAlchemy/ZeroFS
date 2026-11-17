@@ -510,6 +510,9 @@ impl FilesystemVolatileOverlay {
         if members.is_empty() || admissions.len() != members.len() {
             return Err(OverlayError::InvalidArgument);
         }
+        // Staging publishes the write; from here it applies even if the
+        // request stops waiting.
+        crate::abandonment::pass_point_of_no_return().map_err(FsError::from)?;
         let visibility = WriteVisibility::staged();
         let member_ids = members.iter().map(|member| member.id).collect::<Vec<_>>();
         let (accepted_tx, accepted_rx) = oneshot::channel();

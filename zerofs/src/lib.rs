@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::io::BufRead;
 
+pub(crate) mod abandonment;
 pub mod alloc_rss;
 pub mod block_transformer;
 mod bucket_identity;

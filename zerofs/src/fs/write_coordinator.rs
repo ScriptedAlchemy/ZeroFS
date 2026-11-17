@@ -310,6 +310,8 @@ impl WriteCoordinator {
         ownership: CommitOwnership,
         settlement: CommitSettlement,
     ) -> Result<PendingCommit, FsError> {
+        // Once queued, the commit applies whether or not anyone awaits it.
+        crate::abandonment::pass_point_of_no_return()?;
         let (pending_write_request, materialized_replay) = match ownership {
             CommitOwnership::None => (None, None),
             CommitOwnership::Dedup(request) => (Some(request), None),
@@ -421,6 +423,7 @@ pub struct WeakWriteCoordinator {
 
 impl WeakWriteCoordinator {
     pub(crate) async fn commit(&self, txn: Transaction) -> Result<(), FsError> {
+        crate::abandonment::pass_point_of_no_return()?;
         let sender = self.sender.upgrade().ok_or(FsError::IoError)?;
         // Same submit-time queueing as the strong handle; see there.
         let queued_inode = self.inode_store.install_pending(txn.inode_cache_updates());
