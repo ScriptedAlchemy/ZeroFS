@@ -28,6 +28,8 @@ use tokio_util::task::AbortOnDropHandle;
 use tracing::{error, info, warn};
 
 mod admission;
+#[cfg(test)]
+mod create_bench;
 mod frame_codec;
 mod response_writer;
 mod session;
