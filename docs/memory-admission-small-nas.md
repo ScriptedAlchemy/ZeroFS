@@ -27,11 +27,11 @@ The optimized `ci+webui` binary at `b190e399` completed those growth rungs under
 
 The predeclared ladder is 12 GiB with 5,000 small files, 50 GiB with 50,000, and 150 GiB with 200,000. Each completed rung requires full SHA-256 verification, flush and a subsequent GC pass. The top completed rung gets restart and full verification. A separate SIGKILL check verifies every file flushed before the kill. A rung stops after two hours or before starting if less than 80 GiB of backing disk remains.
 
-Three independent clean smallest-rung runs of the same committed optimized binary under 8 GiB determine repeat spread. Noise is the larger of 128 MiB or 5 percent of their median P. The report retains every maximum. Spread above that threshold prevents a stable slope or plateau claim. Growth above 128 MiB per additional 50,000 files beyond noise requires a positive-slope warning. A recomputed requirement above the 6.5 GiB engine budget fails the approved 8 GiB partition. Margins are not reduced to fit it.
+Three smallest-rung runs on fresh stores with the same committed optimized binary under 8 GiB determine repeat spread. Noise is the larger of 128 MiB or 5 percent of their median P. The report retains every maximum. Spread above that threshold prevents a stable slope or plateau claim. Growth above 128 MiB per additional 50,000 files beyond noise requires a positive-slope warning. A recomputed requirement above the 6.5 GiB engine budget fails the approved 8 GiB partition. Margins are not reduced to fit it.
 
 ## Evidence and allocator accounting
 
-All ZeroFS execution and Rust checks run in Linux. The original completed optimized `ci+webui` cell is `b1-design/measure/package-baseline-ci-limit64g-cache0.001-wb0-jobs8-primary`. Its raw `samples.jsonl` and `companion-samples.jsonl` are retained under `/Users/zackjackson/.t3/userdata/pstack/orch/ZeroFS/`. The source snapshot was `bdc2f331d592a4aea9c1ae55d0b514e25e961fab`, and the binary hash was `7e413bc693a7edba511145fbf8eea096f97453b9ba17493dfb29dcdcedfd74f5`.
+All ZeroFS execution and Rust checks run in Linux. The original completed optimized `ci+webui` cell is `b1-design/measure/package-baseline-ci-limit64g-cache0.001-wb0-jobs8-primary`. Its raw `samples.jsonl` and `companion-samples.jsonl` are retained under that cell label. The source snapshot was `bdc2f331d592a4aea9c1ae55d0b514e25e961fab`, and the binary hash was `7e413bc693a7edba511145fbf8eea096f97453b9ba17493dfb29dcdcedfd74f5`.
 
 | Completed workload observation | Bytes | Repeats, spread and limiter |
 | --- | ---: | --- |
