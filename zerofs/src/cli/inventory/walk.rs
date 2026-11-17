@@ -911,18 +911,7 @@ fn same_mount(_entry: &Entry, _parent: BorrowedFd<'_>, _name: &OsStr, _stat: &St
 
 // Reading the source may update its access time, so the comparison excludes it.
 fn same_version(a: &Stat, b: &Stat) -> bool {
-    identity(a) == identity(b)
-        && a.st_mode == b.st_mode
-        && a.st_nlink == b.st_nlink
-        && a.st_uid == b.st_uid
-        && a.st_gid == b.st_gid
-        && a.st_size == b.st_size
-        && a.st_blocks == b.st_blocks
-        && a.st_rdev == b.st_rdev
-        && a.st_mtime == b.st_mtime
-        && a.st_mtime_nsec == b.st_mtime_nsec
-        && a.st_ctime == b.st_ctime
-        && a.st_ctime_nsec == b.st_ctime_nsec
+    version(a) == version(b)
 }
 
 fn extents(fd: BorrowedFd<'_>, size: u64) -> Field<Vec<Extent>> {

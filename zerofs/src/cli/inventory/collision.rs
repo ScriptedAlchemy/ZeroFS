@@ -87,29 +87,44 @@ pub(super) fn emit<W: Write>(rows: &Rows, path: &[u8], output: &mut Manifest<W>)
 }
 
 #[cfg(test)]
-fn collisions(names: &[Vec<u8>]) -> Vec<(&'static str, Vec<Vec<u8>>)> {
-    use std::collections::{BTreeMap, BTreeSet};
-    let mut result = Vec::new();
-    for (rule, label) in RULES.iter().enumerate() {
-        let mut groups = BTreeMap::<Vec<u8>, BTreeSet<Vec<u8>>>::new();
-        for name in names {
-            if let Some(key) = key(rule, name) {
-                groups.entry(key).or_default().insert(name.clone());
-            }
-        }
-        for group in groups.into_values().filter(|group| group.len() > 1) {
-            result.push((*label, group.into_iter().collect()));
-        }
-    }
-    result
-}
-
-#[cfg(test)]
 mod tests {
+    use super::super::spill::Workspace;
     use super::*;
 
     fn detect(names: &[&[u8]]) -> Vec<(&'static str, Vec<Vec<u8>>)> {
-        collisions(&names.iter().map(|n| n.to_vec()).collect::<Vec<_>>())
+        let temp = tempfile::tempdir().unwrap();
+        let work = Workspace::new(temp.path(), None, 1024 * 1024).unwrap();
+        let mut sorter = Sorter::new(work);
+        let mut seen = std::collections::BTreeSet::new();
+        for name in names {
+            if seen.insert(*name) {
+                push(&mut sorter, name).unwrap();
+            }
+        }
+        let rows = sorter.finish().unwrap();
+        let mut output = Manifest::new(Vec::new());
+        emit(&rows, b"", &mut output).unwrap();
+        output
+            .writer
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let record: serde_json::Value = serde_json::from_slice(line).unwrap();
+                let rule = RULES
+                    .into_iter()
+                    .find(|rule| Some(*rule) == record["rule"].as_str())
+                    .unwrap();
+                let names = record["names"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|name| {
+                        super::super::resume::decode_hex(name["hex"].as_str().unwrap()).unwrap()
+                    })
+                    .collect();
+                (rule, names)
+            })
+            .collect()
     }
 
     #[test]
