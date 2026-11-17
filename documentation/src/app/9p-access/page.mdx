@@ -146,6 +146,40 @@ For a persistent TCP mount, add an `_netdev` entry to `/etc/fstab`:
 127.0.0.1 /mnt/zerofs 9p trans=tcp,port=5564,version=9p2000.L,access=user,_netdev 0 0
 ```
 
+### Case-insensitive filesystems
+
+On a filesystem created with `name_mode = "insensitive"`, the server matches
+every name a stock v9fs client sends by its folded form, so a lookup of `foo`
+finds a stored `Foo`. Linux then treats `Foo` and `foo` as one file. A
+case-only rename such as `mv Foo foo` never reaches the server and leaves the
+name unchanged.
+
+Set `standard_lookup = "exact"` to match names from stock clients by their
+stored spelling:
+
+```toml
+[servers.ninep]
+unix_socket = "/tmp/zerofs.9p.sock"
+standard_lookup = "exact"
+```
+
+With `exact`, a lookup, unlink, or rename source whose spelling differs from
+the stored name returns `ENOENT`, so `mv Foo foo` reaches the server and
+renames the entry. Creating `foo` beside `Foo` still returns `EEXIST`, because
+the filesystem allows only one of the two names in a directory. Directory
+listings show stored spellings with either setting.
+
+The setting has a cost. A program that opens `movie.mkv` does not find
+`Movie.mkv` through that mount, and an attempt to create `movie.mkv` there
+fails with `EEXIST`. A server that exports the mount, such as Samba, must
+match case itself by scanning directories.
+
+The setting applies to every TCP address and Unix socket of the listener.
+`zerofs mount`, the client libraries, and the web UI use the ZeroFS dialect
+and ignore it. A case-sensitive filesystem accepts it and behaves the same
+with either value. The default, `"folded"`, keeps the behavior described at
+the start of this section.
+
 ### Client Caching
 
 The v9fs `cache` option controls client-side caching and cross-client visibility:
