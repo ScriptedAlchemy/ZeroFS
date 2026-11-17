@@ -46,10 +46,16 @@ pub(crate) fn run_exit_status_help() -> String {
     )
 }
 
-/// Marks a failure that needs an operator. It displays as the error it wraps
-/// and reports that error's causes as its own, so marking changes no output.
-#[derive(Debug)]
+/// Marks a failure that needs an operator. It displays and debug-prints as
+/// the error it wraps and reports that error's causes as its own, so marking
+/// changes no output.
 pub(crate) struct OperatorRequired(Box<dyn Error + Send + Sync + 'static>);
+
+impl fmt::Debug for OperatorRequired {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, f)
+    }
+}
 
 impl OperatorRequired {
     pub(crate) fn new(cause: impl Into<Box<dyn Error + Send + Sync + 'static>>) -> Self {
@@ -223,6 +229,12 @@ mod tests {
         assert_eq!(format!("{marked}"), format!("{}", plain()));
         assert_eq!(format!("{marked:#}"), format!("{:#}", plain()));
         assert_eq!(causes(&marked), causes(&plain()));
+
+        let io = || std::io::Error::from_raw_os_error(libc::EIO);
+        assert_eq!(
+            format!("{:#?}", OperatorRequired::new(io())),
+            format!("{:#?}", io())
+        );
     }
 
     #[test]

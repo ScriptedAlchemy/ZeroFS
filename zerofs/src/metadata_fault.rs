@@ -157,6 +157,18 @@ impl MetadataFault {
         ))
     }
 
+    /// Mark `error` as needing an operator when the store has failed. An
+    /// operation that fails after the fault is recorded failed because of it,
+    /// even where its error embeds the store's error as text and loses the
+    /// marker the store attached.
+    pub(crate) fn attribute(&self, error: anyhow::Error) -> anyhow::Error {
+        if self.0.tripped.is_cancelled() {
+            operator_required(error)
+        } else {
+            error
+        }
+    }
+
     /// Run `operation` until it finishes or the metadata store fails.
     pub(crate) async fn bound<T>(
         &self,
@@ -165,7 +177,7 @@ impl MetadataFault {
         tokio::select! {
             biased;
             error = self.tripped() => Err(error),
-            result = operation => result,
+            result = operation => result.map_err(|error| self.attribute(error)),
         }
     }
 
@@ -594,6 +606,29 @@ mod tests {
             "metadata_fault::tests::an_ordinary_write_error_still_exits_with_status_one",
         );
         exit_probe::assert_exited_as(&serving, ServerExit::Failed);
+    }
+
+    /// Startup code embeds a store error in its own message as text, which
+    /// drops the store's marker. The fault still classifies that failure.
+    #[test]
+    fn a_failure_after_the_fault_needs_an_operator_even_as_text() {
+        let (fault, error) = tripped_by_eio();
+        let flattened = anyhow::anyhow!("Failed to read bucket ID marker: {error:#?}");
+        assert_eq!(ServerExit::of(flattened.as_ref()), ServerExit::Failed);
+        let attributed = fault.attribute(flattened);
+        assert_eq!(
+            ServerExit::of(attributed.as_ref()),
+            ServerExit::OperatorRequired
+        );
+        assert!(
+            attributed
+                .to_string()
+                .starts_with("Failed to read bucket ID marker")
+        );
+
+        let healthy = MetadataFault::default();
+        let unrelated = healthy.attribute(anyhow::anyhow!("Address already in use"));
+        assert_eq!(ServerExit::of(unrelated.as_ref()), ServerExit::Failed);
     }
 
     #[tokio::test]
