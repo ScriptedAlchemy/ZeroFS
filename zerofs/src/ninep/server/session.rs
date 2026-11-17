@@ -96,8 +96,7 @@ pub(super) async fn handle_client_stream<R, W>(
     write_stream: W,
     filesystem: Arc<ZeroFS>,
     lock_manager: Arc<FileLockManager>,
-    credential_override: Option<(u32, u32)>,
-    standard_lookup: crate::fs::name_mode::NameMatch,
+    policy: super::super::handler::ListenerPolicy,
     shutdown: CancellationToken,
     session: P9SessionAdmission,
 ) -> anyhow::Result<()>
@@ -110,12 +109,11 @@ where
         transport_label,
         accepted_work,
     } = session;
-    let mut handler = NinePHandler::new(Arc::clone(&filesystem), lock_manager)
-        .with_standard_lookup(standard_lookup);
-    if let Some((uid, gid)) = credential_override {
-        handler = handler.with_credential_override(uid, gid);
-    }
-    let handler = Arc::new(handler);
+    let handler = Arc::new(NinePHandler::for_listener(
+        Arc::clone(&filesystem),
+        lock_manager,
+        policy,
+    ));
     let admission = P9GlobalAdmission::shared().connection_with_accepted_work(accepted_work);
     let requests = TaskTracker::new();
 

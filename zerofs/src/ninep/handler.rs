@@ -416,6 +416,15 @@ fn fid_allows_write(fid: &Fid) -> bool {
     flags & LINUX_O_PATH == 0 && matches!(flags & LINUX_O_ACCMODE, LINUX_O_WRONLY | LINUX_O_RDWR)
 }
 
+/// Settings one 9P listener applies to every session it accepts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ListenerPolicy {
+    /// Replaces the client-supplied credentials on attach.
+    pub credential_override: Option<(u32, u32)>,
+    /// Name matching for standard `9P2000.L` sessions.
+    pub standard_lookup: NameMatch,
+}
+
 /// One resolved walk component.
 struct WalkStep {
     id: InodeId,
@@ -483,6 +492,20 @@ impl NinePHandler {
             exact_lookup_pause: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             exact_pin_pause: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// A session handler configured by its listener.
+    pub fn for_listener(
+        filesystem: Arc<ZeroFS>,
+        lock_manager: Arc<FileLockManager>,
+        policy: ListenerPolicy,
+    ) -> Self {
+        let handler =
+            Self::new(filesystem, lock_manager).with_standard_lookup(policy.standard_lookup);
+        match policy.credential_override {
+            Some((uid, gid)) => handler.with_credential_override(uid, gid),
+            None => handler,
         }
     }
 
