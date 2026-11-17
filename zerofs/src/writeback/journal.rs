@@ -4023,6 +4023,96 @@ mod tests {
         assert_locked();
     }
 
+    /// A redb commit that trims surplus space makes its new header durable and
+    /// then truncates the file. A device that drops the header write while the
+    /// truncation reaches it as file metadata, as the storage-union fault lane's
+    /// drop_writes test does to the journal device, leaves a file that ends
+    /// before the end its surviving header describes. An honest device never
+    /// leaves that after a crash, so it proves acknowledged journal writes were
+    /// lost. Both opens must refuse it with an error naming the file, not panic.
+    #[test]
+    fn a_journal_database_shorter_than_its_last_commit_is_refused_with_its_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let journal = open_temp_journal(&temp, "bucket-a");
+        journal
+            .commit_put(put_record(1, "segments/1", b"pending"), b"pending")
+            .unwrap();
+        drop(journal);
+        let database = root.join("journal.redb");
+        let described = fs::metadata(&database).unwrap().len();
+        let found = described - 4096;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&database)
+            .unwrap()
+            .set_len(found)
+            .unwrap();
+        let damaged = fs::read(&database).unwrap();
+
+        for (open, result) in [
+            ("open", Journal::open(&root, identity("bucket-a")).map(drop)),
+            ("open_existing", Journal::open_existing(&root).map(drop)),
+        ] {
+            let message = format!("{:#}", result.unwrap_err());
+            assert!(
+                message.contains(&database.display().to_string()),
+                "{open}: {message}"
+            );
+            assert!(
+                message.contains(&format!("{found} bytes"))
+                    && message.contains(&format!("{described} bytes")),
+                "{open}: {message}"
+            );
+            assert!(message.contains("lost writes"), "{open}: {message}");
+        }
+        assert_eq!(
+            fs::read(&database).unwrap(),
+            damaged,
+            "a refused journal must stay as found"
+        );
+    }
+
+    /// redb marks its file recovery-required when a writer opens it and clears
+    /// the mark when the writer closes it, so a killed server leaves the mark.
+    /// The identity read refused such a file through redb's read-only open; it
+    /// must refuse it and leave it untouched whether or not the server had
+    /// committed since opening, while the server's own open recovers it.
+    #[test]
+    fn existing_open_refuses_a_journal_left_by_a_killed_server() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let database = root.join("journal.redb");
+        let journal = open_temp_journal(&temp, "bucket-a");
+        journal
+            .commit_put(put_record(1, "segments/1", b"pending"), b"pending")
+            .unwrap();
+        let killed_after_commit = fs::read(&database).unwrap();
+        drop(journal);
+        // What redb writes when a writer opens this cleanly closed file: the
+        // same header with the recovery-required bit set.
+        let mut killed_after_open = fs::read(&database).unwrap();
+        killed_after_open[9] |= 2;
+
+        for (case, killed) in [
+            ("killed after it opened", killed_after_open),
+            ("killed after it committed", killed_after_commit),
+        ] {
+            fs::write(&database, &killed).unwrap();
+            let message = format!("{:#}", Journal::open_existing(&root).map(drop).unwrap_err());
+            assert!(
+                message.contains(&database.display().to_string())
+                    && message.contains("needs recovery"),
+                "{case}: {message}"
+            );
+            assert_eq!(fs::read(&database).unwrap(), killed, "{case}");
+
+            let recovered = Journal::open(&root, identity("bucket-a")).unwrap();
+            assert_eq!(recovered.snapshot().unwrap().local_seq, 1, "{case}");
+            assert_eq!(recovered.read_blob(1).unwrap(), b"pending", "{case}");
+        }
+    }
+
     #[test]
     fn existing_open_refuses_a_live_journal_before_reading_it() {
         let temp = tempfile::tempdir().unwrap();
