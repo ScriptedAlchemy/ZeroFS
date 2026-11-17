@@ -6130,6 +6130,172 @@ mod session_transition_tests {
             NinePClient::alloc_tag(&conn, tx, None).expect("allocator missed the last usable tag");
         assert_eq!(tag, NOTAG - 1);
     }
+
+    /// The server goes away and never returns: the client has no reconnect
+    /// target, so every reconnect attempt fails. Time is paused, so the test
+    /// clock advances only through the client's own timers.
+    mod server_gone {
+        use super::*;
+
+        /// Longer than the client's reconnect bound, so expiry means the
+        /// held request was never failed.
+        const NEVER: Duration = Duration::from_secs(60);
+
+        fn gone_client(
+            max_inflight_requests: usize,
+        ) -> (Arc<NinePClient>, Arc<Conn>, TestRequests) {
+            let (conn, requests) = test_conn_with_receiver();
+            let client = test_client_with_limit(Arc::clone(&conn), max_inflight_requests);
+            client.spawn_supervisor();
+            (client, conn, requests)
+        }
+
+        /// What the supervisor does once a server answers again.
+        fn server_returns(client: &NinePClient) -> (Arc<Conn>, TestRequests) {
+            let (conn, requests) = test_conn_with_receiver();
+            client.conn.store(Arc::clone(&conn));
+            client.live.store(true, Ordering::Release);
+            client.live_notify.notify_waiters();
+            (conn, requests)
+        }
+
+        async fn settle<T>(task: tokio::task::JoinHandle<T>, what: &str) -> T {
+            tokio::time::timeout(NEVER, task)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{what} was still blocked {NEVER:?} after the server left")
+                })
+                .unwrap()
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_held_request_fails_with_eio_once_the_server_stays_gone() {
+            let (client, conn, _requests) = gone_client(MAX_INFLIGHT_REQUESTS);
+            conn.connection_lost(&client.reconnect_notify);
+
+            let held_client = Arc::clone(&client);
+            let held = tokio::spawn(async move { held_client.getattr(1, 0).await });
+            let error = settle(held, "a getattr issued after the server left")
+                .await
+                .expect_err("no server answered the getattr");
+            assert!(matches!(error, ClientError::Disconnected), "{error}");
+            assert_eq!(error.to_errno(), linux::EIO);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_failed_held_request_returns_its_admission_permit() {
+            let (client, conn, _requests) = gone_client(1);
+            conn.connection_lost(&client.reconnect_notify);
+
+            let held_client = Arc::clone(&client);
+            let held = tokio::spawn(async move { held_client.getattr(1, 0).await });
+            let queued_client = Arc::clone(&client);
+            let queued = tokio::spawn(async move { queued_client.getattr(2, 0).await });
+            assert!(settle(held, "the admitted getattr").await.is_err());
+            assert!(
+                settle(queued, "the getattr queued for admission")
+                    .await
+                    .is_err()
+            );
+            assert_eq!(client.request_admission.available_permits(), 1);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_request_issued_during_a_declared_outage_fails_without_waiting_for_the_bound() {
+            let (client, conn, _requests) = gone_client(MAX_INFLIGHT_REQUESTS);
+            conn.connection_lost(&client.reconnect_notify);
+            let held_client = Arc::clone(&client);
+            let held = tokio::spawn(async move { held_client.getattr(1, 0).await });
+            assert!(settle(held, "the first getattr").await.is_err());
+
+            let started = tokio::time::Instant::now();
+            let late_client = Arc::clone(&client);
+            let late = tokio::spawn(async move { late_client.getattr(1, 0).await });
+            assert!(
+                settle(late, "a getattr issued during the outage")
+                    .await
+                    .is_err()
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "a request issued during a declared outage waited {:?}",
+                started.elapsed()
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn an_unacknowledged_write_fails_is_not_recorded_and_is_not_resent() {
+            let (client, conn, mut requests) = gone_client(MAX_INFLIGHT_REQUESTS);
+            let write_client = Arc::clone(&client);
+            let write = tokio::spawn(async move { write_client.write(7, 0, b"a").await });
+            let sent = recv_op_request(&mut requests, "the write reached the transport").await;
+            assert!(matches!(sent.body, Message::Twrite(_)));
+            conn.connection_lost(&client.reconnect_notify);
+
+            let error = settle(write, "the unacknowledged write")
+                .await
+                .expect_err("an unacknowledged write must not report success");
+            assert!(matches!(error, ClientError::Disconnected), "{error}");
+            assert!(
+                client.unsynced.get(&7).is_none(),
+                "an unacknowledged write must not create a durability obligation"
+            );
+
+            let (_returned, mut returned_requests) = server_returns(&client);
+            assert_no_request(
+                &mut returned_requests,
+                "a write that already failed to its caller was resent",
+            )
+            .await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn an_unacknowledged_fsync_fails_and_keeps_the_write_obligation() {
+            let (client, conn, mut requests) = gone_client(MAX_INFLIGHT_REQUESTS);
+            conn.lineage_token.store(41, Ordering::Relaxed);
+            let write_client = Arc::clone(&client);
+            let write = tokio::spawn(async move { write_client.write(7, 0, b"a").await });
+            let sent = recv_op_request(&mut requests, "the write").await;
+            answer(&conn, &sent);
+            assert_eq!(write.await.unwrap().unwrap(), 1);
+
+            let fsync_client = Arc::clone(&client);
+            let fsync = tokio::spawn(async move { fsync_client.fsync(7, 0).await });
+            let sent = recv_op_request(&mut requests, "the fsync reached the transport").await;
+            assert!(matches!(sent.body, Message::Tfsyncdur(_)));
+            conn.connection_lost(&client.reconnect_notify);
+
+            let error = settle(fsync, "the unacknowledged fsync")
+                .await
+                .expect_err("an unacknowledged fsync must not report success");
+            assert!(matches!(error, ClientError::Disconnected), "{error}");
+            assert_eq!(
+                client.unsynced.get(&7).and_then(|u| u.oldest),
+                Some(41),
+                "a failed fsync must leave the acknowledged write unsynced"
+            );
+
+            let (returned, mut returned_requests) = server_returns(&client);
+            assert_no_request(
+                &mut returned_requests,
+                "an fsync that already failed to its caller was resent",
+            )
+            .await;
+            let fsync_client = Arc::clone(&client);
+            let fsync = tokio::spawn(async move { fsync_client.fsync(7, 0).await });
+            let sent = recv_op_request(&mut returned_requests, "the next fsync").await;
+            match &sent.body {
+                Message::Tfsyncdur(f) => assert_eq!(
+                    f.token, 41,
+                    "the next fsync must verify the write the failed fsync did not"
+                ),
+                other => panic!("expected Tfsyncdur, got {other:?}"),
+            }
+            reply(&returned, sent.tag, Message::Rfsync(Rfsync));
+            fsync.await.unwrap().unwrap();
+            assert!(client.unsynced.get(&7).is_none());
+        }
+    }
 }
 
 #[cfg(test)]
