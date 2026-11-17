@@ -37,6 +37,45 @@ function list<T>(row: JsonObject, key: string, parse: (value: unknown) => Value<
 
 const stringValue = (raw: unknown): Value<string> => (text(raw) ? known(raw) : unavailable("expected text"));
 
+/** One unreadable segment record from the pool catalog. */
+export interface SegmentFault {
+  location: string;
+  memberId: string;
+  reason: string;
+  attempts: number;
+  /** Server wall-clock milliseconds when the fault was last recorded. */
+  observedMs: number;
+  /** Server wall-clock milliseconds before which the read is not retried. */
+  nextRetryMs: number;
+}
+
+// Every field is required: a fault that cannot be shown whole makes the list unavailable rather than
+// being dropped or shown with a guessed reason, attempt count or retry time.
+function segmentFault(raw: unknown): Value<SegmentFault> {
+  const row = object(raw);
+  if (!row) return unavailable("invalid fault record");
+  const location = field(row, "location", text);
+  if (location.state === "unavailable") return location;
+  const memberId = field(row, "member_id", text);
+  if (memberId.state === "unavailable") return memberId;
+  const reason = field(row, "reason", text);
+  if (reason.state === "unavailable") return reason;
+  const attempts = field(row, "attempts", count);
+  if (attempts.state === "unavailable") return attempts;
+  const observedMs = field(row, "observed_ms", count);
+  if (observedMs.state === "unavailable") return observedMs;
+  const nextRetryMs = field(row, "next_retry_ms", count);
+  if (nextRetryMs.state === "unavailable") return nextRetryMs;
+  return known({
+    location: location.value,
+    memberId: memberId.value,
+    reason: reason.value,
+    attempts: attempts.value,
+    observedMs: observedMs.value,
+    nextRetryMs: nextRetryMs.value,
+  });
+}
+
 export interface MemberStatus {
   id: Value<string>;
   capacity: Value<number>;
@@ -52,6 +91,8 @@ export interface MemberStatus {
   safeToPullWithKnownLoss: Value<boolean>;
   readableEvacuated: Value<boolean>;
   quarantine: Value<string | null>;
+  /** When the current quarantine began. Null means the server recorded no start time. */
+  quarantineSinceMs: Value<number | null>;
   monitoringError: Value<string | null>;
   warning: Value<string | null>;
   evacuationError: Value<string | null>;
@@ -63,16 +104,21 @@ export interface MemberStatus {
   /** Members whose binding or free-space check failed when the server computed evacuation capacity. */
   unavailableMembers: Value<string[]>;
   observedMs: Value<number>;
+  /** This member's unreadable segment records, taken from the pool's fault list. */
+  faults: Value<SegmentFault[]>;
 }
 
-function member(raw: unknown): Value<MemberStatus> {
+const nullableCount = (value: unknown): value is number | null => value === null || count(value);
+
+function member(raw: unknown, poolFaults: Value<SegmentFault[]>): Value<MemberStatus> {
   const row = object(raw);
   if (!row) return unavailable("invalid member record");
+  const id = field(row, "id", text);
   const health = object(row.health);
   const healthText = (key: string) =>
     health ? field(health, key, nullableText) : unavailable("health was not reported");
   return known({
-    id: field(row, "id", text),
+    id,
     capacity: field(row, "capacity_bytes", count),
     used: field(row, "used_bytes", count),
     reserved: field(row, "reserved_bytes", count),
@@ -86,6 +132,7 @@ function member(raw: unknown): Value<MemberStatus> {
     safeToPullWithKnownLoss: field(row, "safe_to_pull_with_known_loss", flag),
     readableEvacuated: field(row, "readable_evacuated", flag),
     quarantine: healthText("quarantine"),
+    quarantineSinceMs: health ? field(health, "since_ms", nullableCount) : unavailable("health was not reported"),
     monitoringError: healthText("monitoring_error"),
     warning: healthText("warning"),
     evacuationError: healthText("evacuation_error"),
@@ -109,6 +156,12 @@ function member(raw: unknown): Value<MemberStatus> {
         : health
           ? field(health, "observed_ms", count)
           : unavailable("health was not reported"),
+    faults:
+      poolFaults.state === "unavailable"
+        ? poolFaults
+        : id.state === "unavailable"
+          ? unavailable("member id was not reported, so its faults cannot be matched")
+          : known(poolFaults.value.filter((fault) => fault.memberId === id.value)),
   });
 }
 
@@ -118,6 +171,8 @@ export interface PoolStatus {
   pendingOperations: Value<number>;
   mappedObjects: Value<number>;
   unreadableObjects: Value<number>;
+  /** Faults whose member id names no reported member, such as legacy objects in the authority store. */
+  unattributedFaults: Value<SegmentFault[]>;
   quarantinedLeftovers: Value<number>;
 }
 
@@ -134,12 +189,23 @@ export function parsePoolStatus(json: string): Value<PoolStatus> {
   }
   const row = object(raw);
   if (!row) return unavailable("Pool status is not an object");
+  const faults = list(row, "unreadable", segmentFault);
+  const members = list(row, "members", (raw) => member(raw, faults));
+  const ids = new Set(
+    members.state === "known" ? members.value.flatMap((m) => (m.id.state === "known" ? [m.id.value] : [])) : [],
+  );
   return known({
     id: field(row, "pool_id", text),
-    members: list(row, "members", member),
+    members,
     pendingOperations: field(row, "pending_operations", count),
     mappedObjects: field(row, "mapped_objects", count),
     unreadableObjects: arrayLength(row, "unreadable"),
+    unattributedFaults:
+      faults.state === "unavailable"
+        ? faults
+        : members.state === "unavailable"
+          ? unavailable("members were not reported, so faults cannot be matched to them")
+          : known(faults.value.filter((fault) => !ids.has(fault.memberId))),
     quarantinedLeftovers: arrayLength(row, "quarantined_leftovers"),
   });
 }
@@ -335,6 +401,8 @@ export function memberHealth(member: MemberStatus): MemberHealth {
     if (value.state === "unavailable") health.unavailable.push({ label, reason: value.reason });
     else if (value.value !== null) health.issues.push({ label, text: value.value });
   }
+  if (member.faults.state === "unavailable")
+    health.unavailable.push({ label: "Segment fault details", reason: member.faults.reason });
   const unreadable = member.unreadableObjects;
   if (unreadable.state === "unavailable")
     health.unavailable.push({ label: "Unreadable objects", reason: unreadable.reason });
