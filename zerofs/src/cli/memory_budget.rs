@@ -12,6 +12,12 @@ const GIB: u64 = 1024 * 1024 * 1024;
 const UNMODELED_RESIDENCY_RESERVE_BYTES: u64 = 32 * GIB;
 const COMPANION_PROCESS_RESERVE_BYTES: u64 = 8 * GIB;
 
+#[cfg(test)]
+#[path = "memory_admission_tests.rs"]
+mod admission_tests;
+#[path = "memory_package_policy.rs"]
+mod package_policy;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct StartupMemoryTiers {
     clean_cache_bytes: u64,
@@ -35,15 +41,150 @@ impl StartupMemoryTiers {
         let object_writeback_bytes = settings
             .writeback_settings(WritebackAccessMode::ReadWrite)?
             .map_or(0, |writeback| writeback.memory_bytes);
-
         Ok(Self {
             clean_cache_bytes,
             object_writeback_bytes,
-            // The caller supplies the one normalized volatile-write budget. In
-            // configurations that retain a legacy NBD alias, it must not be
-            // added a second time here.
-            volatile_write_bytes,
+            volatile_write_bytes: volatile_write_bytes
+                .checked_mul(2)
+                .context("volatile-write ownership-stage allowance overflowed")?,
         })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MemoryPolicyProfile {
+    Legacy { reason: &'static str },
+    SmallNasPackage,
+}
+
+struct MemoryPolicy {
+    profile: MemoryPolicyProfile,
+    residency_bytes: u64,
+    headroom_bytes: u64,
+    residency_source: String,
+    headroom_source: String,
+}
+
+impl MemoryPolicy {
+    fn legacy(reason: &'static str) -> Self {
+        Self {
+            profile: MemoryPolicyProfile::Legacy { reason },
+            residency_bytes: UNMODELED_RESIDENCY_RESERVE_BYTES,
+            headroom_bytes: COMPANION_PROCESS_RESERVE_BYTES,
+            residency_source: "computed legacy 32 GiB from fork ad6835d5/4b2b645d".into(),
+            headroom_source:
+                "computed legacy mixed process/companion 8 GiB from fork ad6835d5/4b2b645d".into(),
+        }
+    }
+
+    fn from_settings(settings: &Settings, tiers: StartupMemoryTiers) -> Result<Self> {
+        let mut policy = match package_policy::exclusion(
+            settings,
+            tiers.clean_cache_bytes,
+            tiers.volatile_write_bytes,
+        ) {
+            Some(reason) => Self::legacy(reason),
+            None => Self {
+                profile: MemoryPolicyProfile::SmallNasPackage,
+                residency_bytes: package_policy::RESIDENCY_BYTES,
+                headroom_bytes: package_policy::HEADROOM_BYTES,
+                residency_source: package_policy::EVIDENCE.into(),
+                headroom_source: package_policy::EVIDENCE.into(),
+            },
+        };
+        let (residency, headroom) = settings.runtime_memory_reserve_bytes()?;
+        for (configured, computed, source, field) in [
+            (
+                residency,
+                &mut policy.residency_bytes,
+                &mut policy.residency_source,
+                "unmodeled_residency_reserve_gb",
+            ),
+            (
+                headroom,
+                &mut policy.headroom_bytes,
+                &mut policy.headroom_source,
+                "engine_headroom_gb",
+            ),
+        ] {
+            if let Some(value) = configured {
+                if value < *computed {
+                    bail!(
+                        "[runtime] {field} resolves to {value} bytes, below computed minimum {} bytes from {source}",
+                        *computed
+                    );
+                }
+                *source = format!(
+                    "[runtime] {field} upward override; computed minimum {} bytes from {source}",
+                    *computed
+                );
+                *computed = value;
+            }
+        }
+        Ok(policy)
+    }
+
+    fn name(&self) -> &'static str {
+        match self.profile {
+            MemoryPolicyProfile::Legacy { .. } => "legacy",
+            MemoryPolicyProfile::SmallNasPackage => "small-nas-package-v1",
+        }
+    }
+
+    fn reason(&self) -> &'static str {
+        match self.profile {
+            MemoryPolicyProfile::Legacy { reason } => reason,
+            MemoryPolicyProfile::SmallNasPackage => {
+                "all measured configuration bounds matched; one SMB client and CLI jobs <= 8 are operational conditions"
+            }
+        }
+    }
+
+    fn direct_segment_bytes(&self) -> u64 {
+        match self.profile {
+            MemoryPolicyProfile::Legacy { .. } => 0,
+            MemoryPolicyProfile::SmallNasPackage => {
+                crate::fs::store::extent::DEFAULT_DIRECT_SEGMENT_BYTES
+            }
+        }
+    }
+
+    fn headroom_label(&self) -> &'static str {
+        match self.profile {
+            MemoryPolicyProfile::Legacy { .. } => "companion/process reserve",
+            MemoryPolicyProfile::SmallNasPackage => "engine kernel/allocator headroom",
+        }
+    }
+
+    fn brake_headroom(&self) -> Result<u64> {
+        match self.profile {
+            MemoryPolicyProfile::Legacy { .. } => self
+                .residency_bytes
+                .checked_add(self.headroom_bytes)
+                .context("startup memory policy reserves overflowed"),
+            MemoryPolicyProfile::SmallNasPackage => Ok(self.headroom_bytes),
+        }
+    }
+
+    fn accounting(&self, tiers: StartupMemoryTiers, source: &str) -> String {
+        format!(
+            "memory_policy={} reason={}; clean_cache_bytes={} source=resolved cache split with three 32 MiB floors; \
+             object_writeback_bytes={} source=resolved writeback RAM or disabled; \
+             volatile_write_bytes={} source=resolved shared write-ack setting times two ownership stages; \
+             direct_segment_bytes={} source=generic four open plus four retained 256 MiB segments in measured policy only; \
+             unmodeled_residency_reserve_bytes={} source={}; engine_headroom_bytes={} source={}; \
+             hard_limit_source={source}; external_companions=excluded from measured engine reserves, subtract FUSE/smbd and file cache from container limit before runtime.memory_limit_gb",
+            self.name(),
+            self.reason(),
+            tiers.clean_cache_bytes,
+            tiers.object_writeback_bytes,
+            tiers.volatile_write_bytes,
+            self.direct_segment_bytes(),
+            self.residency_bytes,
+            self.residency_source,
+            self.headroom_bytes,
+            self.headroom_source,
+        )
     }
 }
 
@@ -65,75 +206,93 @@ pub(crate) struct MemoryBudgetReceipt {
     pub(crate) required_bytes: u64,
     pub(crate) remaining_bytes: u64,
     pub(crate) rss_pressure_cap_bytes: u64,
+    pub(crate) accounting: String,
 }
 
-pub(crate) fn validate_server_startup(
-    settings: &Settings,
-    volatile_write_bytes: u64,
-) -> Result<Option<MemoryBudgetReceipt>> {
-    let tiers = StartupMemoryTiers::from_settings(settings, volatile_write_bytes)?;
+pub(crate) fn validate_server_startup(settings: &Settings) -> Result<Option<MemoryBudgetReceipt>> {
+    let write_ack = settings.filesystem_write_ack_settings(WritebackAccessMode::ReadWrite)?;
+    let tiers = StartupMemoryTiers::from_settings(settings, write_ack.volatile_memory_bytes)?;
+    let policy = MemoryPolicy::from_settings(settings, tiers)?;
     let detected = detect_process_cgroup_v2_memory_limit()?;
     let configured = settings.runtime_memory_limit_bytes()?;
     let Some(envelope) = select_memory_limit(detected, configured)? else {
         tracing::warn!(
+            accounting = policy.accounting(tiers, "unavailable"),
             "no cgroup-v2 memory ceiling or [runtime] memory_limit_gb; startup memory defense-in-depth admission is unavailable"
         );
         return Ok(None);
     };
     let source = envelope.source.display().to_string();
-    let receipt = validate_memory_budget(tiers, envelope.hard_limit_bytes, &source)?;
+    let receipt =
+        validate_resolved_memory_budget(tiers, policy, envelope.hard_limit_bytes, &source)?;
     tracing::info!(
-        hard_limit_bytes = envelope.hard_limit_bytes,
+        hard_limit_bytes = receipt.hard_limit_bytes,
         required_bytes = receipt.required_bytes,
         remaining_bytes = receipt.remaining_bytes,
         rss_pressure_cap_bytes = receipt.rss_pressure_cap_bytes,
-        unmodeled_residency_reserve_bytes = UNMODELED_RESIDENCY_RESERVE_BYTES,
-        companion_process_reserve_bytes = COMPANION_PROCESS_RESERVE_BYTES,
+        accounting = receipt.accounting,
         source,
         "startup memory defense-in-depth admission passed"
     );
     Ok(Some(receipt))
 }
 
+#[cfg(test)]
 fn validate_memory_budget(
     tiers: StartupMemoryTiers,
     hard_limit_bytes: u64,
     source: &str,
 ) -> Result<MemoryBudgetReceipt> {
-    // The production OOM reproduced roughly 28.6 GiB of residency above the
-    // charged cache/writeback tiers. Round that unmodeled excess up to 32 GiB,
-    // then retain a separate 8 GiB allowance for GC, protocol companions and
-    // the rest of the process. These are conservative admission reserves, not
-    // proofs that every allocation path is bounded.
+    validate_resolved_memory_budget(
+        tiers,
+        MemoryPolicy::legacy("legacy arithmetic fixture"),
+        hard_limit_bytes,
+        source,
+    )
+}
+
+fn validate_resolved_memory_budget(
+    tiers: StartupMemoryTiers,
+    policy: MemoryPolicy,
+    hard_limit_bytes: u64,
+    source: &str,
+) -> Result<MemoryBudgetReceipt> {
+    let direct_segment_bytes = policy.direct_segment_bytes();
     let required_bytes = tiers
         .clean_cache_bytes
         .checked_add(tiers.object_writeback_bytes)
         .and_then(|total| total.checked_add(tiers.volatile_write_bytes))
-        .and_then(|total| total.checked_add(UNMODELED_RESIDENCY_RESERVE_BYTES))
-        .and_then(|total| total.checked_add(COMPANION_PROCESS_RESERVE_BYTES))
+        .and_then(|total| total.checked_add(direct_segment_bytes))
+        .and_then(|total| total.checked_add(policy.residency_bytes))
+        .and_then(|total| total.checked_add(policy.headroom_bytes))
         .context("startup memory budget overflowed")?;
+    let accounting = policy.accounting(tiers, source);
     if required_bytes > hard_limit_bytes {
         bail!(
             "startup memory admission rejected: {:.2} GB clean cache + {:.2} GB object writeback + \
-             {:.2} GB volatile writes + 32.00 GiB observed-unmodeled reserve + 8.00 GiB \
-             companion/process reserve require {:.2} GiB, above the {:.2} GiB hard limit \
-             from {source}",
+             {:.2} GB volatile writes + {:.2} GiB observed-unmodeled reserve + {:.2} GiB \
+             {headroom_label} + {:.2} GiB direct segments require {:.2} GiB, above the {:.2} GiB hard limit \
+             from {source}; required_bytes={required_bytes}; {accounting}",
             decimal_gb(tiers.clean_cache_bytes),
             decimal_gb(tiers.object_writeback_bytes),
             decimal_gb(tiers.volatile_write_bytes),
+            gib(policy.residency_bytes),
+            gib(policy.headroom_bytes),
+            gib(direct_segment_bytes),
             gib(required_bytes),
             gib(hard_limit_bytes),
+            headroom_label = policy.headroom_label(),
         );
     }
     let rss_pressure_cap_bytes = hard_limit_bytes
-        .checked_sub(UNMODELED_RESIDENCY_RESERVE_BYTES)
-        .and_then(|cap| cap.checked_sub(COMPANION_PROCESS_RESERVE_BYTES))
-        .context("startup memory envelope is smaller than its fixed policy reserves")?;
+        .checked_sub(policy.brake_headroom()?)
+        .context("startup memory envelope is smaller than its policy headroom")?;
     Ok(MemoryBudgetReceipt {
         hard_limit_bytes,
         required_bytes,
         remaining_bytes: hard_limit_bytes - required_bytes,
         rss_pressure_cap_bytes,
+        accounting,
     })
 }
 
@@ -699,7 +858,7 @@ mod tests {
     }
 
     #[test]
-    fn tier_accounting_counts_the_normalized_volatile_budget_once() {
+    fn tier_accounting_charges_raw_input_and_accepted_overlay_stages() {
         let mut settings = crate::config::Settings::generate_default();
         settings.cache.dir = "/tmp/zerofs-clean".into();
         settings.cache.memory_size_gb = Some(64.0);
@@ -719,6 +878,6 @@ mod tests {
 
         assert_eq!(tiers.clean_cache_bytes, 64_000_000_000);
         assert_eq!(tiers.object_writeback_bytes, 4_000_000_000);
-        assert_eq!(tiers.volatile_write_bytes, 7_000_000_000);
+        assert_eq!(tiers.volatile_write_bytes, 14_000_000_000);
     }
 }

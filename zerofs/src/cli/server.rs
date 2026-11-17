@@ -2067,9 +2067,8 @@ fn load_and_validate_server_settings(
     let write_ack = settings
         .filesystem_write_ack_settings(access_mode)
         .context("Invalid filesystem write-acknowledgement configuration")?;
-    let memory_budget =
-        super::memory_budget::validate_server_startup(&settings, write_ack.volatile_memory_bytes)
-            .context("Invalid startup memory budget")?;
+    let memory_budget = super::memory_budget::validate_server_startup(&settings)
+        .context("Invalid startup memory budget")?;
     Ok((settings, write_ack, memory_budget))
 }
 
@@ -2209,6 +2208,7 @@ mod tests {
             required_bytes: 88 * gib,
             remaining_bytes: 8 * gib,
             rss_pressure_cap_bytes: validated_service_cap,
+            accounting: "memory_policy=legacy reason=server test fixture".into(),
         };
 
         crate::alloc_rss::set_rss_cap_bytes(0);

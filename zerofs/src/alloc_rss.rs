@@ -140,12 +140,14 @@ const RESUME_PERMILLE: u128 = 950;
 
 struct Hysteresis {
     over: AtomicBool,
+    trips: AtomicU64,
 }
 
 impl Hysteresis {
     const fn new() -> Self {
         Self {
             over: AtomicBool::new(false),
+            trips: AtomicU64::new(0),
         }
     }
 
@@ -158,7 +160,9 @@ impl Hysteresis {
             // In the band between resume and trip: hold the previous verdict.
             return self.over.load(Ordering::Relaxed);
         };
-        self.over.store(over, Ordering::Relaxed);
+        if !self.over.swap(over, Ordering::Relaxed) && over {
+            self.trips.fetch_add(1, Ordering::Relaxed);
+        }
         over
     }
 }
@@ -166,6 +170,15 @@ impl Hysteresis {
 // One latch shared by every gate: the GC brake and the parts-admission caps
 // are installed from the same validated pressure cap at startup.
 static PRESSURE: Hysteresis = Hysteresis::new();
+
+/// Read the cap, last gate verdict and cumulative trips without sampling pressure.
+pub(crate) fn pressure_observation() -> (u64, bool, u64) {
+    (
+        rss_cap_bytes(),
+        PRESSURE.over.load(Ordering::Relaxed),
+        PRESSURE.trips.load(Ordering::Relaxed),
+    )
+}
 
 pub(crate) fn over_rss_cap_of(cap: u64) -> bool {
     cap > 0 && PRESSURE.check(cap, jemalloc_rss_envelope())
