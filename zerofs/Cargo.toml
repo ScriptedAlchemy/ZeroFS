@@ -24,6 +24,8 @@ members = [
     "zerofs-client-web",
     "zerofs-ffi",
 ]
+# A patched dependency, not a member: its tests and lints stay upstream's.
+exclude = ["vendor/foyer-storage"]
 
 # Single source of truth for the release version. The zerofs-csi image is
 # tagged with the repo release tag and layers on the zerofs image of that
@@ -170,6 +172,11 @@ tempfile = "3.21"
 fuser = { version = "0.17", default-features = false }
 # The `zerofs mount` FUSE path uses the low-level 9P client directly.
 ninep-client = { path = "ninep-client" }
+
+# foyer-storage 0.22.3 as published, carried in-tree so it can be patched.
+# See vendor/README.md.
+[patch.crates-io]
+foyer-storage = { path = "vendor/foyer-storage" }
 
 [build-dependencies]
 tonic-prost-build = "0.14"
