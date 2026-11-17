@@ -37,12 +37,6 @@ impl AnchoredDir {
     }
 
     fn walk_absolute(path: &Path, create: bool, mode: u32) -> Result<Self> {
-        let directory = Self::walk_absolute_components(path, create, mode)?;
-        directory.validate_owner_mode(mode)?;
-        Ok(directory)
-    }
-
-    fn walk_absolute_components(path: &Path, create: bool, mode: u32) -> Result<Self> {
         if !path.is_absolute() {
             bail!("anchored directory path must be absolute");
         }
@@ -69,6 +63,7 @@ impl AnchoredDir {
                 }
             }
         }
+        current.validate_owner_mode(mode)?;
         Ok(current)
     }
 
