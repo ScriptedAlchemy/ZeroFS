@@ -83,21 +83,21 @@ macro_rules! acceptance_rows {
 acceptance_rows! {
     core {
         AuthorityLoss => authority_device_loss_preserves_committed_namespace,
-            "the production survival receipt hook is absent";
+            "the metadata_survival configuration table is unsupported";
         JournalBeforeBackend => journal_device_loss_before_backend_cutoff_preserves_committed_prefix,
-            "the production survival receipt hook is absent";
+            "the metadata_survival configuration table is unsupported";
         JournalAfterBackend => journal_device_loss_after_backend_cutoff_preserves_committed_prefix,
-            "the production survival receipt hook is absent";
+            "the metadata_survival configuration table is unsupported";
         DataAndReplicaLoss => data_member_with_metadata_replica_loss_preserves_namespace_and_reports_ranges,
-            "the production survival receipt hook is absent";
+            "the metadata_survival configuration table is unsupported";
         PayloadRetention => reclaim_preserves_payload_referenced_by_the_last_survival_commit,
-            "the production survival receipt hook is absent";
+            "the metadata_survival configuration table is unsupported";
         AdmittedWriteLoss => writes_in_flight_during_loss_preserve_last_survival_commit,
             "the admitted-write mid-commit hook is absent";
         InterruptedCommit => interrupted_commit_at_every_step_preserves_a_consistent_generation,
             "the production commit cut hook is absent";
         ExactRecovery => recovery_preserves_exact_catalog_identity_cleanup_debts_and_key_epoch,
-            "the production survival receipt hook is absent";
+            "the metadata_survival configuration table is unsupported";
         SlowReplica => slow_replica_past_timeout_stops_survival_acknowledgements,
             "the production Slow replica fault hook is absent";
         FullReplica => full_replica_stops_survival_acknowledgements,
@@ -113,41 +113,41 @@ acceptance_rows! {
     }
     review {
         DurableEnablement => durable_enablement_survives_missing_or_mismatched_configuration,
-            "the durable survival startup hook is absent";
+            "the production DurableEnablement scenario hook is absent";
         TerminalDisable => offline_disable_blocks_stale_recovery_and_requires_a_fresh_epoch,
-            "the terminal disable and re-enable hooks are absent";
+            "the production TerminalDisable scenario hook is absent";
         StaleRestart => restart_refuses_a_replica_that_missed_a_committed_generation,
-            "the stale-replica restart hook is absent";
+            "the production StaleRestart scenario hook is absent";
         CorruptDependency => recovery_refuses_corrupt_dependency_bytes,
-            "the dependency verification recovery hook is absent";
+            "the production CorruptDependency scenario hook is absent";
         CorruptRecord => recovery_refuses_corrupt_commit_record_bytes,
-            "the commit authentication recovery hook is absent";
+            "the production CorruptRecord scenario hook is absent";
         HighestGeneration => recovery_selects_highest_valid_chain_without_a_receipt_hint,
-            "the independent recovery selection hook is absent";
+            "the production HighestGeneration scenario hook is absent";
         ConflictingForks => recovery_refuses_authenticated_conflicting_forks,
-            "the authenticated fork recovery hook is absent";
+            "the production ConflictingForks scenario hook is absent";
         PartialFanoutRestart => restart_completes_partial_record_fanout_idempotently,
-            "the partial record fanout restart hook is absent";
+            "the production PartialFanoutRestart scenario hook is absent";
         BacklogRetry => large_writeback_backlog_aborts_and_retries_with_admission_open,
-            "the bounded backlog pre-drain hook is absent";
+            "the production BacklogRetry scenario hook is absent";
         ReadFaultClosed => read_faults_defer_catalog_writes_while_admission_is_closed,
-            "the closed-admission read observation hook is absent";
+            "the production ReadFaultClosed scenario hook is absent";
         ReadFaultReadOnly => read_faults_preserve_eio_and_catalog_in_read_only_mode,
-            "the read-only read observation hook is absent";
+            "the production ReadFaultReadOnly scenario hook is absent";
         IdleAndBounds => idle_commits_skip_and_records_and_checkpoints_stabilize,
-            "the adaptive commit and bounded retirement hooks are absent";
+            "the production IdleAndBounds scenario hook is absent";
         StatusLag => failed_commits_report_actual_status_and_growing_lag,
-            "the survival status and lag hooks are absent";
+            "the production StatusLag scenario hook is absent";
         PromoteAuthority => authority_promotion_restores_writes_and_cold_durability,
-            "the offline authority promotion hook is absent";
+            "the production PromoteAuthority scenario hook is absent";
         OrphanCheckpoint => restart_reconciles_a_named_orphan_checkpoint,
-            "the named finite checkpoint intent hook is absent";
+            "the production OrphanCheckpoint scenario hook is absent";
         AdmissionLockOrder => admission_precedes_contended_inode_locks,
-            "the admission-before-inode hook is absent";
+            "the production AdmissionLockOrder scenario hook is absent";
         DataOnlyLoss => payload_only_device_loss_keeps_unaffected_files_writable,
-            "the payload-only loss availability hook is absent";
+            "the production DataOnlyLoss scenario hook is absent";
         RetentionCrash => retained_dependency_union_survives_restart_and_repeated_sweep,
-            "the crash-safe retained-union sweep hook is absent";
+            "the production RetentionCrash scenario hook is absent";
     }
 }
 
@@ -843,8 +843,10 @@ trait Survival: Sync {
     async fn pause_write(&self, _live: &Live) -> Result<Option<PausedWrite>> {
         Ok(None)
     }
-    async fn fault(&self, _live: &Live, _fault: ReplicaFault) -> Result<FaultObservation> {
-        Ok(FaultObservation::default())
+    async fn fault(&self, _live: &Live, fault: ReplicaFault) -> Result<FaultObservation> {
+        missing(format!(
+            "the production {fault:?} replica fault hook is absent"
+        ))
     }
 }
 
@@ -853,10 +855,18 @@ struct CurrentImplementation;
 #[async_trait]
 impl Survival for CurrentImplementation {
     async fn commit(&self, live: &Live) -> Result<SurvivalReceipt> {
-        let _settings = live.proposed_settings()?;
         // The future production binding must return the owner's real receipt.
-        // Accepting the configuration alone supplies no such receipt.
-        missing("the production survival receipt hook is absent")
+        // Accepting the configuration alone supplies no such receipt. Today the
+        // parser refuses the table first, because config.rs denies unknown pool
+        // fields. Only that exact refusal is the missing prerequisite. Any other
+        // parse error is a fixture fault and stays one.
+        match live.proposed_settings() {
+            Ok(_settings) => missing("the production survival receipt hook is absent"),
+            Err(error) if format!("{error:#}").contains("unknown field `metadata_survival`") => {
+                missing("the metadata_survival configuration table is unsupported")
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn recover(&self, sources: &RecoverySources) -> Result<Option<Recovered>> {
@@ -895,6 +905,11 @@ impl Survival for StubSurvival {
     }
     async fn recover(&self, _sources: &RecoverySources) -> Result<Option<Recovered>> {
         Ok(None)
+    }
+    // The stub claims no injected fault. The mutation test's optimistic
+    // observation supplies one.
+    async fn fault(&self, _live: &Live, _fault: ReplicaFault) -> Result<FaultObservation> {
+        Ok(FaultObservation::default())
     }
 }
 
@@ -2112,23 +2127,35 @@ async fn acceptance(row: Row) -> Result<()> {
             };
             if let Err(error) = result {
                 println!("METADATA_SURVIVAL_COMMIT_CUT {cut:?} {error:#}");
-                failures.push(format!("{cut:?}. {error:#}"));
+                failures.push(error);
             }
         }
-        let result = if let Some(first) = failures.first() {
-            Err(anyhow::anyhow!(
-                "{} commit cuts failed. {first}",
-                failures.len()
-            ))
-        } else {
-            Ok(())
+        // The row keeps a cut's own error only when every requested cut failed
+        // with the same root cause. A partial pass or mixed causes produce a
+        // summary that names no single missing prerequisite.
+        let requested = cuts().len();
+        let failed = failures.len();
+        let mut causes: Vec<String> = failures
+            .iter()
+            .map(|error| error.root_cause().to_string())
+            .collect();
+        causes.sort();
+        causes.dedup();
+        let result = match failures.into_iter().next() {
+            None => Ok(()),
+            Some(first) if failed == requested && causes.len() == 1 => {
+                Err(first.context(format!("all {requested} commit cuts failed")))
+            }
+            Some(_) => Err(anyhow::anyhow!(
+                "{failed} of {requested} commit cuts failed, with root causes {causes:?}"
+            )),
         };
         if let Some(live) = idle_fixture {
             finish(live, row, Ok(())).await?;
         }
         println!(
             "METADATA_SURVIVAL_ACCEPTANCE {}",
-            serde_json::json!({"row": "InterruptedCommit", "requested_cuts": cuts().len(), "failed_cuts": failures.len(), "cleanup": "passed"})
+            serde_json::json!({"row": "InterruptedCommit", "requested_cuts": cuts().len(), "failed_cuts": failed, "cleanup": "passed"})
         );
         return result;
     }
