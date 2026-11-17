@@ -4,11 +4,15 @@ import { loadPoolStatus, known, rpcFailure, unavailable } from "../lib/storage-s
 import type { PoolResult, Value } from "../lib/storage-status";
 
 export interface StorageActivity {
-  logicalBytesWritten: bigint;
-  logicalBytesRead: bigint;
-  logicalUsedBytes: bigint;
-  usedInodes: bigint;
+  logicalBytesWritten: Value<bigint>;
+  logicalBytesRead: Value<bigint>;
+  logicalUsedBytes: Value<bigint>;
+  usedInodes: Value<bigint>;
 }
+
+// These StatsSnapshot counters carry presence: the server omits one it cannot state.
+const counter = (value: bigint | undefined, name: string): Value<bigint> =>
+  value === undefined ? unavailable(`${name} was not reported by the server`) : known(value);
 
 export function useStoragePool() {
   const [result, setResult] = useState<PoolResult>(unavailable("Pool status has not been received"));
@@ -50,13 +54,12 @@ export function useStorageActivity() {
         try {
           for await (const sample of adminClient.streamStats({ intervalMs: 1000 }, { signal: abort.signal })) {
             if (abort.signal.aborted) return;
-            // These counters now carry presence, but the page still reads an omitted one as 0.
             setActivity(
               known({
-                logicalBytesWritten: sample.bytesWritten ?? 0n,
-                logicalBytesRead: sample.bytesRead ?? 0n,
-                logicalUsedBytes: sample.usedBytes ?? 0n,
-                usedInodes: sample.usedInodes ?? 0n,
+                logicalBytesWritten: counter(sample.bytesWritten, "bytes_written"),
+                logicalBytesRead: counter(sample.bytesRead, "bytes_read"),
+                logicalUsedBytes: counter(sample.usedBytes, "used_bytes"),
+                usedInodes: counter(sample.usedInodes, "used_inodes"),
               }),
             );
             setLastSuccess(new Date());

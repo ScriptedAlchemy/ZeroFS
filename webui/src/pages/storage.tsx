@@ -529,16 +529,16 @@ export function StoragePage() {
           </section>
         ) : (
           <dl className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-            <Stat label="Logical bytes written" value={known(activity.value.logicalBytesWritten)}>
+            <Stat label="Logical bytes written" value={activity.value.logicalBytesWritten}>
               {(bytes) => <Bytes value={bytes} />}
             </Stat>
-            <Stat label="Logical bytes read" value={known(activity.value.logicalBytesRead)}>
+            <Stat label="Logical bytes read" value={activity.value.logicalBytesRead}>
               {(bytes) => <Bytes value={bytes} />}
             </Stat>
-            <Stat label="Logical storage used" value={known(activity.value.logicalUsedBytes)}>
+            <Stat label="Logical storage used" value={activity.value.logicalUsedBytes}>
               {(bytes) => <Bytes value={bytes} />}
             </Stat>
-            <Stat label="Inodes used" value={known(activity.value.usedInodes)}>
+            <Stat label="Inodes used" value={activity.value.usedInodes}>
               {count}
             </Stat>
           </dl>
@@ -546,8 +546,6 @@ export function StoragePage() {
         <p className="text-xs text-muted-foreground">
           Cumulative logical filesystem counters from StreamStats. These are not per-device writes or durability
           receipts.{" "}
-          {activity.state === "known" &&
-            "StreamStats sends these counters as plain protobuf numbers, so a counter the server omits arrives as 0. A 0 here can mean zero or not reported. "}
           {statsReceived && `Last sample received ${statsReceived.toLocaleString()}.`}
         </p>
       </div>
