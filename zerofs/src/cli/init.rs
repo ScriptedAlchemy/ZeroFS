@@ -171,6 +171,7 @@ impl StartupContext {
         } = open_storage(settings)
             .await
             .context("Failed to connect to storage backend")?;
+        let startup_fault = metadata_fault.clone();
         let cleanup_pool = sftp_pool.clone();
         let cleanup_storage_pool = pool.clone();
         let prepared: Result<Self> = async {
@@ -337,6 +338,7 @@ impl StartupContext {
         match prepared {
             Ok(prepared) => Ok(prepared),
             Err(error) => {
+                let error = startup_fault.attribute(error);
                 if let Some(pool) = cleanup_storage_pool {
                     pool.settle().await;
                 }

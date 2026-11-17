@@ -33,6 +33,7 @@ mod nfs;
 mod ninep;
 pub mod object_store_prefetch;
 pub mod object_trace;
+pub mod operator_required;
 mod parse_object_store;
 #[cfg(test)]
 mod pool_export_tests;
@@ -77,7 +78,7 @@ mod posix_tests;
 #[cfg(test)]
 mod zerofs_client_tests;
 
-pub async fn run_cli() -> Result<()> {
+pub async fn run_cli() -> Result<(), operator_required::CliFailure> {
     let cli = cli::Cli::parse_args();
 
     match cli.command {
@@ -148,7 +149,9 @@ pub async fn run_cli() -> Result<()> {
             eprintln!("New password read successfully.");
 
             eprintln!("Changing encryption password...");
-            cli::password::change_password(&settings, new_password).await?;
+            cli::password::change_password(&settings, new_password)
+                .await
+                .map_err(anyhow::Error::from)?;
             println!("✓ Encryption password changed successfully!");
             println!("ℹ To use the new password, update your config file or environment variable");
         }
@@ -157,7 +160,9 @@ pub async fn run_cli() -> Result<()> {
             read_only,
             checkpoint,
         } => {
-            cli::server::run_server(config, read_only, checkpoint).await?;
+            cli::server::run_server(config, read_only, checkpoint)
+                .await
+                .map_err(operator_required::CliFailure::server)?;
         }
         cli::Commands::MemoryStatus { config } => {
             cli::memory_budget::print_status(&config)?;

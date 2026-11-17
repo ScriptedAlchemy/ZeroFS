@@ -122,13 +122,14 @@
 //! it runs ahead of it; it takes the expected first sequence from its caller
 //! as an early check and leaves the authoritative one to the commit.
 
+use crate::operator_required::operator_required;
 use crate::writeback::anchored_dir::AnchoredDir;
 use crate::writeback::model::{
     FenceClass, JournalIdentity, MutationKind, MutationMode, MutationRecord, Sequence,
     classify_mutation_fence, is_canonical_segment_path,
 };
 use crate::writeback::payload::VerifiedPayload;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use fs4::fs_std::FileExt;
 use futures::{StreamExt, stream, stream::BoxStream};
@@ -254,16 +255,16 @@ impl RedbHeader {
     /// that dropped the header write but kept the truncation does.
     fn ensure_openable(&self, found: u64, path: &Path) -> Result<()> {
         if self.page_size != Self::PAGE_SIZE {
-            bail!(
+            return Err(operator_required(anyhow!(
                 "writeback journal database {} is damaged: its header records a page size of {} \
                  bytes, and the journal writes {}-byte pages",
                 path.display(),
                 self.page_size,
                 Self::PAGE_SIZE
-            );
+            )));
         }
         if found < self.layout_len {
-            bail!(
+            return Err(operator_required(anyhow!(
                 "writeback journal database {} is {found} bytes, shorter than the {} bytes \
                  its last durable commit describes: the device holding the journal lost writes \
                  after acknowledging them, so the journal is older than what was acknowledged. \
@@ -272,7 +273,7 @@ impl RedbHeader {
                  it aside permanently discards every write the journal had not yet drained",
                 path.display(),
                 self.layout_len
-            );
+            )));
         }
         Ok(())
     }
@@ -295,8 +296,25 @@ fn open_journal_database<T>(
     open: impl FnOnce() -> Result<T, redb::DatabaseError>,
 ) -> Result<T> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(open)) {
-        Ok(opened) => {
-            opened.with_context(|| format!("failed to open journal database {}", path.display()))
+        Ok(Ok(opened)) => Ok(opened),
+        Ok(Err(error)) => {
+            // redb reports a file it finds inconsistent as corrupted, and one
+            // it cannot read without a manual upgrade as such. Other open
+            // errors (an I/O error, a lock) keep the ordinary class.
+            let corrupted = matches!(
+                &error,
+                redb::DatabaseError::Storage(redb::StorageError::Corrupted(_))
+                    | redb::DatabaseError::UpgradeRequired(_)
+            );
+            let error = anyhow::Error::new(error).context(format!(
+                "failed to open journal database {}",
+                path.display()
+            ));
+            Err(if corrupted {
+                operator_required(error)
+            } else {
+                error
+            })
         }
         Err(panic) => {
             let reason = panic
@@ -304,11 +322,11 @@ fn open_journal_database<T>(
                 .map(|reason| (*reason).to_owned())
                 .or_else(|| panic.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "no message".to_owned());
-            bail!(
+            Err(operator_required(anyhow!(
                 "writeback journal database {} is damaged: redb failed an internal check while \
                  opening it ({reason})",
                 path.display()
-            )
+            )))
         }
     }
 }
@@ -638,7 +656,9 @@ impl Journal {
         let lock = Self::lock_existing(&root_dir)?;
         let actual_identity = Self::read_existing_identity(&root_dir, || {})?;
         if actual_identity != expected_identity {
-            bail!("writeback journal identity mismatch");
+            return Err(operator_required(anyhow!(
+                "writeback journal identity mismatch"
+            )));
         }
         Self::open_locked(root_dir, lock, expected_identity)
     }
@@ -2204,7 +2224,16 @@ impl Journal {
         Ok(pending)
     }
 
+    /// A failure here means the journal on disk contradicts itself (a
+    /// sequence is missing, a committed blob is gone or differs from its
+    /// record, the remote watermark is ahead) or could not be read back. A
+    /// restart finds the same files, and replaying around the gap would drop
+    /// acknowledged writes, so each failure needs an operator.
     fn validate_recovery_state(&self) -> Result<()> {
+        self.check_recovery_state().map_err(operator_required)
+    }
+
+    fn check_recovery_state(&self) -> Result<()> {
         let snapshot = self.snapshot()?;
         if snapshot.remote_seq > snapshot.local_seq {
             bail!("remote journal watermark exceeds local watermark");
@@ -2315,7 +2344,9 @@ fn initialize_or_validate_identity(database: &Database, expected: &JournalIdenti
                 let actual: JournalIdentity =
                     bincode::deserialize(&encoded).context("failed to decode journal identity")?;
                 if &actual != expected {
-                    bail!("writeback journal identity mismatch");
+                    return Err(operator_required(anyhow!(
+                        "writeback journal identity mismatch"
+                    )));
                 }
             }
             None => {

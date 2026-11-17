@@ -1,4 +1,5 @@
 use crate::fs::name_mode::NameMode;
+use crate::operator_required::operator_required;
 use crate::task::spawn_blocking_named;
 use anyhow::{Context, Result, bail};
 use argon2::{
@@ -100,10 +101,10 @@ impl KeyEnvelope {
 
     fn check_mode(&self, configured: NameMode) -> Result<()> {
         if self.name_mode != configured {
-            bail!(
+            return Err(operator_required(anyhow::anyhow!(
                 "filesystem name mode mismatch: stored {:?}, configured {configured:?}; converting an existing filesystem is not supported",
                 self.name_mode
-            );
+            )));
         }
         Ok(())
     }
@@ -253,8 +254,11 @@ pub async fn load_wrapped_key_from_object_store(
     match object_store.get(&key_path).await {
         Ok(result) => {
             let data = result.bytes().await?;
-            let wrapped_key = KeyEnvelope::decode(&data)
-                .map_err(|e| anyhow::anyhow!("Failed to deserialize wrapped key: {}", e))?;
+            // A key file this build cannot decode is damaged or from a newer
+            // format, and a restart reads the same bytes.
+            let wrapped_key = KeyEnvelope::decode(&data).map_err(|e| {
+                operator_required(anyhow::anyhow!("Failed to deserialize wrapped key: {}", e))
+            })?;
             Ok(Some(wrapped_key))
         }
         Err(object_store::Error::NotFound { .. }) => Ok(None),

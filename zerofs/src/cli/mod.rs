@@ -94,6 +94,7 @@ pub enum Commands {
         path: PathBuf,
     },
     /// Run the filesystem server
+    #[command(after_help = crate::operator_required::run_exit_status_help())]
     Run {
         #[arg(short, long)]
         config: PathBuf,

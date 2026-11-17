@@ -88,6 +88,38 @@ $EDITOR zerofs.toml    # Set S3 credentials
 zerofs run -c zerofs.toml
 ```
 
+#### Exit status
+
+`zerofs run` exits with status 0 after a clean shutdown and with status 1 after
+an ordinary failure, such as a port in use, a config file that does not parse,
+an unreachable backend, a held lock or a rejected startup memory admission. A
+supervisor may restart the server after status 1.
+
+Status 10 means the server refuses to serve until a person decides what to do.
+Restarting refuses again, and serving anyway could lose acknowledged writes or
+mix up data. The error and its causes come first, and the last line on stderr
+is `zerofs stopped: this failure needs an operator decision, and restarting
+will refuse again`. A supervisor should stop restarting the server and alert an
+operator. The server exits with status 10 when:
+
+- the writeback journal database is damaged, is shorter than its last durable
+  commit describes, contradicts itself on reopen (a missing sequence or
+  committed blob), or belongs to another volume;
+- the local metadata store fails with a non-transient I/O error (EIO, EROFS,
+  EACCES and similar), at startup or while serving. A full metadata disk is not
+  in this class, and the server waits for space;
+- the pool catalog is missing, has no identity, was moved or copied, belongs to
+  another pool, did not finish `zerofs pool init`, or uses an unsupported format;
+- the pool authority marker or a member's identity marker is missing, oversized
+  or different, or a volume with a pool is opened without `[storage.pool]`;
+- strict storage readiness finds a different device serial, filesystem
+  identity or backing device set than the configuration declares, or a boot
+  device under a storage role;
+- the stored key envelope cannot be decoded, or its filesystem name mode
+  differs from the configured one.
+
+Other subcommands never exit with status 10.
+
 ### Direct file transfers (no mount)
 
 The `zerofs` binary can copy or remove files and directory trees directly

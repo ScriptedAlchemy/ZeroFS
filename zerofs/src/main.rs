@@ -1,4 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::Context;
+use std::process::ExitCode;
+use zerofs::operator_required::CliFailure;
 
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
@@ -7,12 +9,20 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-fn main() -> Result<()> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+/// The one place the process decides its exit status from an error. `zerofs
+/// run` exits with `OPERATOR_REQUIRED_EXIT_STATUS` when its error is marked as
+/// needing an operator; every other failure exits with 1, as a `Result` from
+/// `main` did.
+fn main() -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .enable_eager_driver_handoff()
         .build()
-        .context("Failed to build Tokio runtime")?;
+        .context("Failed to build Tokio runtime")
+    {
+        Ok(runtime) => runtime,
+        Err(error) => return CliFailure::from(error).report(),
+    };
 
     #[cfg(feature = "hotpath-profile")]
     let _hotpath_guard = hotpath::HotpathGuardBuilder::new("zerofs::main")
@@ -26,5 +36,8 @@ fn main() -> Result<()> {
     #[cfg(feature = "hotpath-profile")]
     hotpath::tokio_runtime!(runtime.handle());
 
-    runtime.block_on(zerofs::run_cli())
+    match runtime.block_on(zerofs::run_cli()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(failure) => failure.report(),
+    }
 }
