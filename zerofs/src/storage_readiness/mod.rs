@@ -233,7 +233,6 @@ fn verify_open_paths_with(
     provider: &dyn IdentityProvider,
     paths: &[(&str, PathBuf)],
 ) -> Result<()> {
-    verify_with(settings, provider)?;
     let Some(config) = &settings.storage.readiness else {
         return Ok(());
     };

@@ -96,7 +96,6 @@ pub(crate) async fn open_storage(settings: &Settings) -> Result<OpenedStorage> {
             .await
             .map(|(opened, _)| opened);
     }
-    crate::storage_readiness::verify(settings)?;
     let url: url::Url = settings.storage.url.parse()?;
     let ParsedStore {
         store,
@@ -141,6 +140,7 @@ pub(crate) async fn open_pool_storage(
         .as_ref()
         .context("[storage.pool] is not configured")?;
     settings.validate()?;
+    crate::storage_readiness::verify(settings)?;
     crate::storage_readiness::verify_open_paths(
         settings,
         &[
@@ -250,7 +250,7 @@ fn bind_readiness_root(
     url: &url::Url,
     mut parsed: ParsedStore,
 ) -> Result<ParsedStore> {
-    if settings.storage.readiness.is_some() && url.scheme() == "file" {
+    if settings.storage.readiness.is_some() {
         let root = url
             .to_file_path()
             .map_err(|_| anyhow::anyhow!("invalid local storage URL"))?;
