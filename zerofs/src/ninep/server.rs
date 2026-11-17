@@ -2867,25 +2867,16 @@ mod tests {
             .collect()
     }
 
-    /// A plain-dialect session whose fid 2 is an open file. The file's bytes
-    /// live only in a sealed segment behind a store whose GET bodies can be
-    /// held, and the decoded-extent cache is disabled, so a Tread waits on the
-    /// backend.
-    async fn held_segment_session() -> (
-        Arc<ZeroFS>,
-        Arc<NinePHandler>,
-        Arc<crate::fault_store::FaultControls>,
-    ) {
+    async fn open_test_filesystem(
+        metadata: Arc<dyn slatedb::object_store::ObjectStore>,
+        segments: Arc<dyn slatedb::object_store::ObjectStore>,
+    ) -> Arc<ZeroFS> {
         use crate::block_transformer::ZeroFsBlockTransformer;
-        use crate::config::{CompressionConfig, StoreProfile};
-        use slatedb::object_store::ObjectStore;
-        use slatedb::object_store::memory::InMemory;
+        use crate::config::CompressionConfig;
         use slatedb::object_store::path::Path;
         use slatedb::{BlockTransformer, DbBuilder};
 
         let key = [0x3c; 32];
-        let metadata: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let (segments, controls) = crate::fault_store::FaultStore::new(Arc::new(InMemory::new()));
         let transformer: Arc<dyn BlockTransformer> =
             ZeroFsBlockTransformer::new_arc(&key, CompressionConfig::default());
         let db = Arc::new(
@@ -2897,7 +2888,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let filesystem = Arc::new(
+        Arc::new(
             ZeroFS::new_with_slatedb_and_lease(
                 crate::db::SlateDbHandle::ReadWrite(db),
                 u64::MAX,
@@ -2916,31 +2907,46 @@ mod tests {
                     CompressionConfig::default(),
                 ),
                 None,
-                StoreProfile {
-                    decoded_extent_cache_bytes: Some(0),
-                    ..Default::default()
-                },
+                crate::config::StoreProfile::default(),
                 crate::fs::name_mode::NameMode::Sensitive,
             )
             .await
             .unwrap(),
-        );
-        let handler = Arc::new(NinePHandler::new(
-            Arc::clone(&filesystem),
-            Arc::new(FileLockManager::new()),
-        ));
+        )
+    }
+
+    fn walk_message(fid: u32, newfid: u32, names: &[&[u8]]) -> Message {
+        Message::Twalk(ninep_proto::Twalk {
+            fid,
+            newfid,
+            nwname: names.len() as u16,
+            wnames: names
+                .iter()
+                .map(|name| P9String::new(name.to_vec()))
+                .collect(),
+        })
+    }
+
+    /// A plain-dialect session whose fid 2 is a file opened for reading.
+    /// The file was written and closed by an earlier instance, so its bytes
+    /// live only in a segment object and this instance has no cached copy.
+    /// That segment store's GET bodies can be held, so a Tread waits on the
+    /// backend.
+    async fn held_segment_session() -> (
+        Arc<ZeroFS>,
+        Arc<NinePHandler>,
+        Arc<crate::fault_store::FaultControls>,
+    ) {
+        use slatedb::object_store::ObjectStore;
+        use slatedb::object_store::memory::InMemory;
+
+        let metadata: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let segments: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let writer = open_test_filesystem(Arc::clone(&metadata), Arc::clone(&segments)).await;
+        let handler = NinePHandler::new(Arc::clone(&writer), Arc::new(FileLockManager::new()));
         plain_root_session(&handler).await;
-        let walk = handler
-            .handle_message(
-                2,
-                Message::Twalk(ninep_proto::Twalk {
-                    fid: 1,
-                    newfid: 2,
-                    nwname: 0,
-                    wnames: Vec::new(),
-                }),
-            )
-            .await;
+        let walk = handler.handle_message(2, walk_message(1, 2, &[])).await;
         assert!(matches!(walk.body, Message::Rwalk(_)));
         let create = handler
             .handle_message(
@@ -2968,7 +2974,31 @@ mod tests {
             )
             .await;
         assert!(matches!(write.body, Message::Rwrite(_)));
-        filesystem.flush_coordinator.flush().await.unwrap();
+        drop(handler);
+        writer.flush_coordinator.close().await.unwrap();
+        drop(writer);
+
+        let (held, controls) = crate::fault_store::FaultStore::new(segments);
+        let filesystem = open_test_filesystem(metadata, held).await;
+        let handler = Arc::new(NinePHandler::new(
+            Arc::clone(&filesystem),
+            Arc::new(FileLockManager::new()),
+        ));
+        plain_root_session(&handler).await;
+        let walk = handler
+            .handle_message(2, walk_message(1, 2, &[b"held"]))
+            .await;
+        assert!(matches!(walk.body, Message::Rwalk(_)));
+        let open = handler
+            .handle_message(
+                3,
+                Message::Tlopen(ninep_proto::Tlopen {
+                    fid: 2,
+                    flags: libc::O_RDONLY as u32,
+                }),
+            )
+            .await;
+        assert!(matches!(open.body, Message::Rlopen(_)));
         (filesystem, handler, controls)
     }
 
