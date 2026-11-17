@@ -3167,6 +3167,81 @@ mod tests {
         ));
     }
 
+    /// A create keeps its inode for a retry whose reply was lost. A session
+    /// that clunks the fid the create opened already has that reply, so
+    /// removing the file afterwards must free its space at once rather than
+    /// after the retry retention period.
+    #[tokio::test]
+    async fn removing_a_created_file_after_its_clunk_frees_its_space() {
+        let mut fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.max_bytes = 4096;
+        fs.quota = crate::fs::quota::LogicalQuota::new(4096, 0);
+        let fs = Arc::new(fs);
+        let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+
+        for (round, op_id) in [[0x41u8; 16], [0x42; 16]].into_iter().enumerate() {
+            let tag = 10 * round as u16 + 2;
+            let created = handler
+                .handle_message_with_op_id(
+                    tag,
+                    op_id,
+                    Message::Tlcreateattr(Tlcreateattr {
+                        dfid: 1,
+                        newfid: 2,
+                        name: P9String::new(b"spc".to_vec()),
+                        flags: O_RDWR as u32,
+                        mode: 0o644,
+                        gid: 1000,
+                    }),
+                )
+                .await;
+            assert!(
+                matches!(created.body, Message::Rlcreateattr(_)),
+                "round {round}: {:?}",
+                created.body
+            );
+            let written = request(
+                &handler,
+                tag + 1,
+                Message::Twrite(Twrite {
+                    fid: 2,
+                    offset: 0,
+                    count: 4096,
+                    data: DekuBytes::from(vec![b'x'; 4096]),
+                }),
+            )
+            .await;
+            assert!(
+                matches!(written.body, Message::Rwrite(Rwrite { count: 4096 })),
+                "round {round}: {:?}",
+                written.body
+            );
+            let clunked = request(&handler, tag + 2, Message::Tclunk(Tclunk { fid: 2 })).await;
+            assert!(matches!(clunked.body, Message::Rclunk(_)));
+            let removed = request(
+                &handler,
+                tag + 3,
+                Message::Tunlinkat(Tunlinkat {
+                    dirfid: 1,
+                    name: P9String::new(b"spc".to_vec()),
+                    flags: 0,
+                }),
+            )
+            .await;
+            assert!(
+                matches!(removed.body, Message::Runlinkat(_)),
+                "round {round}: {:?}",
+                removed.body
+            );
+            assert_eq!(
+                fs.quota.committed_bytes(),
+                0,
+                "round {round}: the removed file still holds its space"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn standard_attach_uses_unknown_group_dac_without_group_credentials() {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
