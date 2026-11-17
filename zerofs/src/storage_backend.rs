@@ -144,8 +144,14 @@ pub(crate) async fn open_pool_storage(
     crate::storage_readiness::verify_open_paths(
         settings,
         &[
-            ("catalog", config.catalog_dir.join(CATALOG_FILE_NAME)),
-            ("catalog", config.catalog_dir.join("pool.lock")),
+            (
+                crate::storage_readiness::RoleName::Catalog,
+                config.catalog_dir.join(CATALOG_FILE_NAME),
+            ),
+            (
+                crate::storage_readiness::RoleName::Catalog,
+                config.catalog_dir.join("pool.lock"),
+            ),
         ],
     )?;
     validate_directories(settings)?;

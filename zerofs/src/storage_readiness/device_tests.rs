@@ -434,7 +434,12 @@ fn actual_open_paths_keep_the_declared_backing_device_set() {
         provider
             .backing
             .insert(child.clone(), provider.backing[&root].clone());
-        verify_open_paths_with(&settings, &provider, &[(role, child.clone())]).unwrap();
+        verify_open_paths_with(
+            &settings,
+            &provider,
+            &[(super::open_role(role), child.clone())],
+        )
+        .unwrap();
         provider.backing.insert(
             child.clone(),
             [Serial::try_from("EXAMPLE-WRONG-0001".to_owned()).unwrap()]
@@ -442,7 +447,11 @@ fn actual_open_paths_keep_the_declared_backing_device_set() {
                 .collect(),
         );
         error_contains(
-            verify_open_paths_with(&settings, &provider, &[(role, child.clone())]),
+            verify_open_paths_with(
+                &settings,
+                &provider,
+                &[(super::open_role(role), child.clone())],
+            ),
             "backing device set",
         );
         assert_eq!(std::fs::read_dir(child).unwrap().count(), 0);

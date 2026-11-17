@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use config::FilesystemIdentity;
 pub(crate) use config::ReadinessConfig;
 use config::{StorageRoot, absolute_path};
-use devices::RoleName;
+pub(crate) use devices::RoleName;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -210,14 +210,14 @@ fn verify_identity(
     Ok(())
 }
 
-pub(crate) fn verify_open_paths(settings: &Settings, paths: &[(&str, PathBuf)]) -> Result<()> {
+pub(crate) fn verify_open_paths(settings: &Settings, paths: &[(RoleName, PathBuf)]) -> Result<()> {
     verify_open_paths_with(settings, &HostIdentityProvider, paths)
 }
 
 fn verify_open_paths_with(
     settings: &Settings,
     provider: &dyn IdentityProvider,
-    paths: &[(&str, PathBuf)],
+    paths: &[(RoleName, PathBuf)],
 ) -> Result<()> {
     let Some(config) = &settings.storage.readiness else {
         return Ok(());
@@ -225,10 +225,9 @@ fn verify_open_paths_with(
     let roots = config.validated_roots(settings)?;
     for (role, path) in paths {
         absolute_path(path)?;
-        let role_name = RoleName::try_from((*role).to_owned()).map_err(anyhow::Error::msg)?;
         let root = roots
             .iter()
-            .find(|root| root.role == role_name)
+            .find(|root| &root.role == role)
             .with_context(|| format!("undeclared readiness open role {role}"))?;
         if !path.starts_with(&root.path) {
             bail!("readiness {role} open path escapes its declared role");
@@ -272,19 +271,19 @@ pub(crate) fn verify_pool_paths(settings: &Settings, pool_id: &str) -> Result<()
 pub(crate) fn verify_bucket_paths(settings: &Settings, namespace: &str) -> Result<()> {
     let cache = settings.cache.dir.join(namespace);
     let mut paths = vec![
-        ("cache", cache.clone()),
-        ("cache", cache.join(".zerofs-clean-cache.lock")),
-        ("cache", cache.join("hybrid_cache")),
+        (RoleName::Cache, cache.clone()),
+        (RoleName::Cache, cache.join(".zerofs-clean-cache.lock")),
+        (RoleName::Cache, cache.join("hybrid_cache")),
         (
-            "cache",
+            RoleName::Cache,
             cache.join(crate::object_store_prefetch::LEGACY_PARTS_CACHE_DIR),
         ),
         (
-            "cache",
+            RoleName::Cache,
             cache.join(crate::object_store_prefetch::PARTS_CACHE_DIR),
         ),
         (
-            "cache",
+            RoleName::Cache,
             cache
                 .join(crate::object_store_prefetch::PARTS_CACHE_DIR)
                 .join(crate::object_store_prefetch::PARTS_CACHE_LAYOUT_FILE),
@@ -297,12 +296,12 @@ pub(crate) fn verify_bucket_paths(settings: &Settings, namespace: &str) -> Resul
     {
         let journal = writeback.dir.join(namespace);
         paths.extend([
-            ("journal", journal.clone()),
-            ("journal", journal.join("LOCK")),
-            ("journal", journal.join("journal.redb")),
-            ("journal", journal.join("blobs")),
-            ("journal", journal.join("tmp")),
-            ("journal", journal.join("tmp/multipart")),
+            (RoleName::Journal, journal.clone()),
+            (RoleName::Journal, journal.join("LOCK")),
+            (RoleName::Journal, journal.join("journal.redb")),
+            (RoleName::Journal, journal.join("blobs")),
+            (RoleName::Journal, journal.join("tmp")),
+            (RoleName::Journal, journal.join("tmp/multipart")),
         ]);
     }
     verify_open_paths(settings, &paths)?;

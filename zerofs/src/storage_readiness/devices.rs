@@ -9,7 +9,7 @@ pub(super) use super::identity::Serial;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(try_from = "String", into = "String")]
-pub(super) enum RoleName {
+pub(crate) enum RoleName {
     Authority,
     Catalog,
     Cache,
