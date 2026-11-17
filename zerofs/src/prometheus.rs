@@ -581,6 +581,33 @@ fn collect_jemalloc_stats() {
     gauge!("zerofs_jemalloc_mapped_bytes").set(mem.mapped as f64);
     gauge!("zerofs_jemalloc_retained_bytes").set(mem.retained as f64);
     gauge!("zerofs_jemalloc_metadata_bytes").set(mem.metadata as f64);
+    gauge!("zerofs_jemalloc_arena_page_stats_available")
+        .set(u8::from(mem.arena_pages.is_some()) as f64);
+    if let Some(pages) = mem.arena_pages {
+        for (name, bytes) in [
+            ("zerofs_jemalloc_active_bytes", pages.active_bytes),
+            ("zerofs_jemalloc_dirty_bytes", pages.dirty_bytes),
+            ("zerofs_jemalloc_muzzy_bytes", pages.muzzy_bytes),
+            (
+                "zerofs_jemalloc_small_allocated_bytes",
+                pages.small_allocated_bytes,
+            ),
+            (
+                "zerofs_jemalloc_large_allocated_bytes",
+                pages.large_allocated_bytes,
+            ),
+        ] {
+            gauge!(name).set(bytes as f64);
+        }
+        gauge!("zerofs_jemalloc_arenas").set(pages.arenas as f64);
+        for (mib, count) in [128, 256, 512, 1024]
+            .into_iter()
+            .zip(pages.large_extent_counts)
+        {
+            gauge!("zerofs_jemalloc_large_extents", "size_mib" => mib.to_string())
+                .set(count as f64);
+        }
+    }
 }
 
 fn record_cache_metrics(snapshot: &CacheMetricsSnapshot) {

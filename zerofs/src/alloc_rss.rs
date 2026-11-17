@@ -190,6 +190,44 @@ pub(crate) fn purge_arenas() {
     let _ = unsafe { tikv_jemalloc_ctl::raw::write::<()>(b"arena.*.purge\0", ()) };
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ArenaPageStats {
+    pub(crate) active_bytes: u64,
+    pub(crate) dirty_bytes: u64,
+    pub(crate) muzzy_bytes: u64,
+    pub(crate) small_allocated_bytes: u64,
+    pub(crate) large_allocated_bytes: u64,
+    pub(crate) arenas: u32,
+    pub(crate) large_extent_counts: [u64; 4],
+}
+
+impl ArenaPageStats {
+    fn read() -> Option<Self> {
+        let read_size = |name: &[u8]| unsafe { tikv_jemalloc_ctl::raw::read::<usize>(name).ok() };
+        let page = read_size(b"arenas.page\0")? as u64;
+        let mut large_extent_counts = [0; 4];
+        let sizes = [128, 256, 512, 1024].map(|mib| mib * 1024 * 1024);
+        let classes = unsafe { tikv_jemalloc_ctl::raw::read::<u32>(b"arenas.nlextents\0").ok()? };
+        for index in 0..classes {
+            let name = format!("arenas.lextent.{index}.size\0");
+            let size = read_size(name.as_bytes())?;
+            if let Some(slot) = sizes.iter().position(|value| *value == size) {
+                let name = format!("stats.arenas.4096.lextents.{index}.curlextents\0");
+                large_extent_counts[slot] = read_size(name.as_bytes())? as u64;
+            }
+        }
+        Some(Self {
+            active_bytes: stats::active::read().ok()? as u64,
+            dirty_bytes: (read_size(b"stats.arenas.4096.pdirty\0")? as u64).checked_mul(page)?,
+            muzzy_bytes: (read_size(b"stats.arenas.4096.pmuzzy\0")? as u64).checked_mul(page)?,
+            small_allocated_bytes: read_size(b"stats.arenas.4096.small.allocated\0")? as u64,
+            large_allocated_bytes: read_size(b"stats.arenas.4096.large.allocated\0")? as u64,
+            arenas: unsafe { tikv_jemalloc_ctl::raw::read::<u32>(b"arenas.narenas\0").ok()? },
+            large_extent_counts,
+        })
+    }
+}
+
 /// Snapshot of jemalloc memory statistics, for the RPC status surface and
 /// Prometheus. One epoch advance, then every stat, so the values are fresh
 /// and mutually coherent. Cold-path (scrapes and status calls); the hot
@@ -198,7 +236,7 @@ pub(crate) fn purge_arenas() {
 pub struct JemallocMemStats {
     /// Bytes actively allocated by the application.
     pub(crate) allocated: u64,
-    /// Bytes in physically resident pages mapped by the allocator.
+    /// Allocator residency upper bound, including active pages not physically touched.
     pub(crate) resident: u64,
     /// Bytes in active pages mapped by the allocator.
     pub(crate) mapped: u64,
@@ -206,6 +244,7 @@ pub struct JemallocMemStats {
     pub(crate) retained: u64,
     /// Bytes dedicated to allocator metadata.
     pub(crate) metadata: u64,
+    pub(crate) arena_pages: Option<ArenaPageStats>,
 }
 
 impl JemallocMemStats {
@@ -219,6 +258,7 @@ impl JemallocMemStats {
             mapped: stats::mapped::read().unwrap_or(0) as u64,
             retained: stats::retained::read().unwrap_or(0) as u64,
             metadata: stats::metadata::read().unwrap_or(0) as u64,
+            arena_pages: ArenaPageStats::read(),
         }
     }
 }

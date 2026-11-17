@@ -1,4 +1,4 @@
-use super::{MemoryBudgetReceipt, validate_server_startup};
+use super::{CgroupMemoryLimits, MemoryBudgetReceipt, validate_server_startup_with_limits};
 use crate::config::Settings;
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -19,7 +19,8 @@ fn admission(root: &Path, text: &str) -> Result<MemoryBudgetReceipt> {
     let path = root.join("config.toml");
     std::fs::write(&path, text)?;
     let settings = Settings::from_file(path)?;
-    validate_server_startup(&settings)?.context("test requires a dedicated memory envelope")
+    validate_server_startup_with_limits(&settings, CgroupMemoryLimits::default())?
+        .context("test requires a dedicated memory envelope")
 }
 
 #[test]
@@ -306,15 +307,9 @@ fn pool_and_direct_write_mode_are_part_of_the_measured_envelope() {
     let temp = tempfile::tempdir().unwrap();
     let base = package_config(temp.path(), 64 * GIB);
     for (text, bound, additional) in [
+        (format!("{base}\n{}", extra_members(3)), "storage.pool", 0),
         (
-            format!(
-                "{base}\n[[storage.pool.members]]\nid = \"third\"\nurl = \"file:///tmp/third\"\ncapacity_gb = 1.0\nreserve_free_gb = 0.01\n"
-            ),
-            "storage.pool",
-            0,
-        ),
-        (
-            base.replace("capacity_gb = 1.0", "capacity_gb = 33.0"),
+            base.replace("capacity_gb = 1.0", "capacity_gb = 18001.0"),
             "storage.pool",
             0,
         ),
@@ -355,4 +350,73 @@ fn equivalent_cache_floor_and_explicit_gc_defaults_match_the_package() {
     let receipt = admission(temp.path(), &equivalent).unwrap();
     assert_eq!(receipt.required_bytes, original.required_bytes);
     assert!(format!("{receipt:?}").contains("small-nas-package-v1"));
+}
+
+#[cfg(feature = "webui")]
+fn extra_members(count: usize) -> String {
+    (0..count).map(|index| format!(
+        "\n[[storage.pool.members]]\nid = \"extra-{index}\"\nurl = \"file:///tmp/extra-{index}\"\ncapacity_gb = 18000.0\nreserve_free_gb = 0.01\n"
+    )).collect()
+}
+
+#[test]
+#[cfg(feature = "webui")]
+fn real_nas_declarations_and_memory_neutral_identity_settings_are_admitted() {
+    let temp = tempfile::tempdir().unwrap();
+    let base =
+        package_config(temp.path(), 7 * GIB).replace("capacity_gb = 1.0", "capacity_gb = 18000.0");
+    for additional in 0..=2 {
+        let text = format!("{base}{}", extra_members(additional));
+        let receipt = admission(temp.path(), &text).unwrap();
+        assert!(receipt.accounting.contains("small-nas-package"));
+        assert!(receipt.required_bytes <= 7 * GIB);
+    }
+    let mixed = base.replacen("capacity_gb = 18000.0", "capacity_gb = 6000.0", 1);
+    let mixed = format!("{mixed}{}", extra_members(1).replace("18000.0", "1000.0"));
+    assert!(admission(temp.path(), &mixed).is_ok());
+    for (uid, gid, address) in [
+        (0u32, 0u32, "127.0.0.1:18080"),
+        (65534, 65533, "0.0.0.0:8081"),
+        (u32::MAX, u32::MAX, "[::1]:8080"),
+        (1001, 999, "[::]:8080"),
+    ] {
+        let text = base
+            .replace("uid = 1000", &format!("uid = {uid}"))
+            .replace("gid = 1000", &format!("gid = {gid}"))
+            .replace("0.0.0.0:8080", address);
+        assert!(admission(temp.path(), &text).is_ok(), "{text}");
+    }
+    let diagnostic = format!("{base}\n[prometheus]\naddresses = [\"0.0.0.0:9091\"]\n");
+    assert!(admission(temp.path(), &diagnostic).is_ok());
+}
+
+#[test]
+#[cfg(feature = "webui")]
+fn startup_receipt_states_empirical_stored_state_coverage() {
+    let temp = tempfile::tempdir().unwrap();
+    let receipt = admission(temp.path(), &package_config(temp.path(), 8 * GIB)).unwrap();
+    for term in [
+        "qualification_stored_logical_bytes=",
+        "qualification_regular_files=",
+        "empirical_not_enforced",
+    ] {
+        assert!(receipt.accounting.contains(term), "{}", receipt.accounting);
+    }
+}
+
+#[test]
+#[cfg(feature = "webui")]
+fn json_receipt_distinguishes_empirical_coverage_from_legacy_policy() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = package_config(temp.path(), 64 * GIB);
+    let receipt = admission(temp.path(), &base).unwrap();
+    let json = serde_json::to_value(receipt).unwrap();
+    let state = &json["stored_state_qualification"];
+    assert_eq!(state["logical_bytes"], 12 * GIB + 5000 * 1024);
+    assert_eq!(state["regular_files"], 5001);
+    assert_eq!(state["enforcement"], "empirical_not_enforced");
+    let legacy = base.replace("memory_size_gb = 0.001", "memory_size_gb = 1.0");
+    let receipt = admission(temp.path(), &legacy).unwrap();
+    let json = serde_json::to_value(receipt).unwrap();
+    assert!(json["stored_state_qualification"].is_null());
 }

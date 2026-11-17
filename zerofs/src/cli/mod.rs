@@ -12,7 +12,7 @@ pub mod flush;
 mod init;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) mod inventory;
-mod memory_budget;
+pub(crate) mod memory_budget;
 pub mod monitor;
 pub mod nbd;
 pub mod otrace;
@@ -101,6 +101,11 @@ pub enum Commands {
         /// Open from a specific checkpoint by name (read-only mode)
         #[arg(long, conflicts_with = "read_only")]
         checkpoint: Option<String>,
+    },
+    /// Report memory admission and empirical stored-state coverage as JSON
+    MemoryStatus {
+        #[arg(short, long)]
+        config: PathBuf,
     },
     /// Change the encryption password
     ///
