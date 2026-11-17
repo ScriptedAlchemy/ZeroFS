@@ -25,7 +25,7 @@ to the pinned commit, and the prototype below exercises the first four rows.
 | Catalog | `zerofs/src/pool_object_store/catalog.rs` owns `pool.redb`. It holds identity, members, physical generations and checksums, reservations, garbage, health, faults and hidden legacy objects. Immediate redb durability protects one device. `Catalog::open` rejects a missing authority marker, and `storage_backend::open_pool_storage` rejects a missing catalog. Neither rebuilds it from members. Identity is also bound to the canonical catalog directory. |
 | Namespace | `zerofs/src/fs/store/directory.rs`, `fs/inode.rs` and `fs/key_codec.rs` keep directory names, inodes, attributes and current extent locations in the database. `segment::DirEntry` holds only the offset, length, inode and extent. It cannot tell a deleted or overwritten extent from the current mapping. It also cannot recover empty directories, hardlink names, lengths, modes or ownership. |
 | Encryption | `key_management::{load_or_init_encryption_key,load_existing_encryption_key}` uses a random data encryption key (DEK) and the authority object `zerofs.key`. Its bincode envelope carries the salt, nonce, wrapped DEK and version. The KDF parameters are code constants today. The password alone cannot recreate the DEK. Normal writable initialization can create a new key when none exists, so recovery must use the existing-key path and refuse that substitution. |
-| Publication | `fs/flush_coordinator.rs` seals data before it flushes database metadata. Pool `put_reserved` writes a fresh physical generation, optionally verifies it, commits the catalog mapping and then cleans the old generation. `local_object_store.rs` uses fsync. This ordering is useful, but it is not an atomic commit across independent metadata devices. |
+| Publication | `fs/flush_coordinator.rs` seals data before it flushes database metadata. Pool `put_reserved` writes a fresh physical generation, optionally verifies it, commits the catalog mapping and then cleans the old generation. `local_object_store.rs` uses fsync. This ordering is not an atomic commit across independent metadata devices. |
 | Receipts | `fs/mutation/{ack,durability}.rs` tells the local SSD apart from the remote backend and captures mutation and object cutoffs. Administrative flush targets the backend. Neither target asserts redundant metadata survival today. `pool_export_tests.rs` covers NFS and NBD exports, not recovery without the authority. |
 
 The current inode and protocol contract does not represent ACLs or extended
@@ -106,7 +106,7 @@ maintenance and membership mutation.
    interrupted fanout may expose a complete generation that was never
    acknowledged, but it must never expose half a transaction. Recovery selects
    the highest valid chained commit in the fenced epoch, checks every dependency
-   and rejects conflicting digests. Timestamps are not votes.
+   and rejects conflicting digests. Recovery never picks a commit by timestamp.
 5. The owner retires journal prefixes and old payload and metadata generations
    only after this commit and every retained recovery or checkpoint reference
    allow it. GC, compaction, relocation and debt cleanup follow the same order.
@@ -156,14 +156,14 @@ hashes, missing ranges, catalog identity and debts, and the key epoch.
 | Wrapped key only | Recovery restores the original DEK from a surviving envelope and the password. | The existing-key loader fails even though the pool, catalog and segments survive. |
 | Any data member, including one that holds metadata | Recovery restores metadata, reports the exact lost sole-copy ranges and keeps other files readable. | Not verified: whole-file and striped layouts need tests once they exist. |
 | Interrupted commit, repair or key change, followed by each device loss | At least the acknowledged prefix survives, with no partial rename or remap, stale replay, key substitution or premature GC. | Not verified: each step above needs a cut before and after its sync and receipt. |
-| Offline, full, corrupt, wrong-identity or stale replica, or a concurrent mutation | Unsafe commits are refused, and the previous recovery state and bounded pending work are kept. | Not verified: the cases include metadata-only and empty-volume workloads. |
+| Offline, full, corrupt, wrong-identity or stale replica, or a concurrent mutation | The owner refuses unsafe commits and keeps the previous recovery state and bounded pending work. | Not verified: the cases include metadata-only and empty-volume workloads. |
 
 The Mac-safe test module `zerofs/src/metadata_survival_tests.rs` uses disposable
 directories on one host filesystem as logical devices. It initializes the real
 pool and catalog and creates a real encrypted SlateDB namespace. It writes and
 overwrites real segments, then truncates, renames, links and removes a file, and
-closes all workers. A cold lookup and read verify the control before any fault
-is injected, and the test checks physical member hashes after the loss. The
+closes all workers. A cold lookup and read verify the control before the test
+injects any fault, and it checks physical member hashes after the loss. The
 fixture uses `ObjectCoverage::DirectRemote`, so its materialized mutation cutoff
 is zero. The completed flush and cold control prove the serialized fixture
 prefix. They do not prove NVMe journal coverage or a survival receipt. The test

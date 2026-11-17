@@ -2,9 +2,9 @@
 
 The raw-parts cache starts empty after every ZeroFS server restart. It refills
 from the configured object store as clients read data. Within a running process,
-both its RAM and SSD tiers work normally: evicted RAM entries can be read from
-the SSD tier, and failed frame authentication invalidates cached parts before
-an authoritative refetch and authenticated repair.
+the cache serves evicted RAM entries from the SSD tier. Failed frame
+authentication invalidates cached parts before an authoritative refetch and
+authenticated repair.
 
 This policy applies to disposable cached copies of object bytes. It does not
 discard authoritative file contents or filesystem metadata. The optional dirty
@@ -23,14 +23,15 @@ The production raw-parts builder therefore explicitly selects
 `RecoverMode::None` and disables the tombstone log. It starts with an empty disk
 index and makes the configured disk capacity available for new cache entries.
 Existing partition files can be reused; compatible startup does not require
-deleting and recreating every file. Bytes left in those files are not recovered
-as readable cache entries. Deletes and authenticated repairs still invalidate
+deleting and recreating every file. Startup does not recover bytes left in
+those files as readable cache entries. Deletes and authenticated repairs still invalidate
 the active process's cache index.
 
 The regression tests exercise disk reads and repair inside one process, removal
 batches spanning the former tombstone page boundaries, a removal count exceeding
-the former log's capacity, and repeated restarts. Live control entries are also
-absent after restart, making the deliberate cold-start policy explicit.
+the former log's capacity, and repeated restarts. They also check that live
+control entries are absent after restart, so the cold start is asserted rather
+than incidental.
 
 ## Upgrade, rollback, and geometry changes
 
@@ -41,11 +42,11 @@ policy. Startup reclaims canonical legacy Foyer partitions while preserving
 unrelated files.
 
 A layout marker records the recovery policy, tombstone setting, block size, and
-disk capacity. Incompatible layouts are reset under the existing exclusive
-cache-root ownership lock. The old marker is invalidated and synced before
-partition removal; removals are synced before the new marker is published.
-An interrupted reset is therefore retried even if configuration rolls back to
-the earlier geometry. Symlinked or nonregular markers are rejected. No manual
+disk capacity. Startup resets an incompatible layout under the existing
+exclusive cache-root ownership lock. It invalidates and syncs the old marker
+before removing partitions, and it syncs the removals before publishing the new
+marker. Startup therefore retries an interrupted reset even if configuration
+rolls back to the earlier geometry. It rejects symlinked or nonregular markers. No manual
 cache migration is required.
 
 ## Operational and benchmark impact
