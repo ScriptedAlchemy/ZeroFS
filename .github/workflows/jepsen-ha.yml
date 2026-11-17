@@ -65,25 +65,14 @@ jobs:
           # default perf checker shells out to it; without it the verdict drops
           # to :unknown.
           sudo apt-get install -y fuse3 gnuplot-nox
-          curl --fail --location --show-error --retry 3 --retry-all-errors \
-            --connect-timeout 15 --max-time 60 --retry-max-time 180 \
-            https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein \
-            -o /usr/local/bin/lein
-          sudo chmod +x /usr/local/bin/lein
-          bash "$GITHUB_WORKSPACE/scripts/ci/retry-lein-deps.sh" --bootstrap \
-            sudo env HOME=/root LEIN_ROOT=1 JAVA_HOME="$JAVA_HOME" /usr/local/bin/lein
+          bash "$GITHUB_WORKSPACE/scripts/ci/install-lein.sh" --root
 
       - name: Install guest JDK, Leiningen, and gnuplot
         if: matrix.mount-client == 'native'
         timeout-minutes: 10
         run: |
           bash "$GITHUB_WORKSPACE/scripts/ci/install-jepsen-native-deps.sh"
-          sudo curl --fail --location --show-error --retry 3 --retry-all-errors \
-            --connect-timeout 15 --max-time 60 --retry-max-time 180 \
-            https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein \
-            -o /usr/local/bin/lein
-          sudo chmod +x /usr/local/bin/lein
-          bash "$GITHUB_WORKSPACE/scripts/ci/retry-lein-deps.sh" --bootstrap lein
+          bash "$GITHUB_WORKSPACE/scripts/ci/install-lein.sh"
 
       # Verify lifecycle and takeover contracts before mounted HA scenarios.
       # Dependency transport failures must not rerun or mask durability assertions.
@@ -296,25 +285,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y fuse3 gnuplot-nox
-          curl --fail --location --show-error --retry 3 --retry-all-errors \
-            --connect-timeout 15 --max-time 60 --retry-max-time 180 \
-            https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein \
-            -o /usr/local/bin/lein
-          sudo chmod +x /usr/local/bin/lein
-          bash "$GITHUB_WORKSPACE/scripts/ci/retry-lein-deps.sh" --bootstrap \
-            sudo env HOME=/root LEIN_ROOT=1 JAVA_HOME="$JAVA_HOME" /usr/local/bin/lein
+          bash "$GITHUB_WORKSPACE/scripts/ci/install-lein.sh" --root
 
       - name: Install guest JDK, Leiningen, and gnuplot
         if: matrix.mount-client == 'native'
         timeout-minutes: 10
         run: |
           bash "$GITHUB_WORKSPACE/scripts/ci/install-jepsen-native-deps.sh"
-          sudo curl --fail --location --show-error --retry 3 --retry-all-errors \
-            --connect-timeout 15 --max-time 60 --retry-max-time 180 \
-            https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein \
-            -o /usr/local/bin/lein
-          sudo chmod +x /usr/local/bin/lein
-          bash "$GITHUB_WORKSPACE/scripts/ci/retry-lein-deps.sh" --bootstrap lein
+          bash "$GITHUB_WORKSPACE/scripts/ci/install-lein.sh"
 
       # Dependency transport failures must not rerun or mask durability assertions.
       - name: Resolve Jepsen dependencies with bounded retries
