@@ -102,6 +102,7 @@ use crate::fs::inode::InodeId;
 use crate::fs::{EXTENT_SIZE, FsError};
 use crate::replication::ReplOp;
 use crate::segment::{DirEntry, FrameLoc, Segid, SegmentFormatLimits};
+use crate::segment_store::SegmentStoreError;
 use bytes::{Bytes, BytesMut};
 use futures::stream::{self, FuturesUnordered, StreamExt, TryStreamExt};
 use std::collections::{HashMap, HashSet};
@@ -147,6 +148,19 @@ pub(super) const OPEN_SEGMENT_LANES: usize = 4;
 /// (`SegmentStore::put_segment`), so its fsync-path latency stays bounded
 /// despite the size.
 pub(crate) const SEAL_THRESHOLD: usize = 256 * 1024 * 1024;
+
+/// The error a flush reports for its failed segment PUTs: ENOSPC only when
+/// every failure was a full backend, so a client can tell full from broken.
+fn seal_failure(previous: Option<FsError>, error: &SegmentStoreError) -> FsError {
+    let this = match error {
+        SegmentStoreError::NoSpace(_) => FsError::NoSpace,
+        _ => FsError::IoError,
+    };
+    match previous {
+        None | Some(FsError::NoSpace) => this,
+        Some(other) => other,
+    }
+}
 
 /// Max active seal PUTs and finalized seal generations retained in RAM. Separate
 /// semaphores enforce both limits so a failed PUT keeps its residency charge
@@ -455,6 +469,43 @@ impl StagePhaseNanos {
 
 /// Immutable segment bytes retained until publication succeeds. The owned permit
 /// makes removal from `sealing` the single release point for its RAM budget.
+/// The failure behind the generations still waiting in `sealing`.
+///
+/// A generation keeps its residency permit until its PUT succeeds, so while
+/// storage is full the permits run out. A writer that needs one more must not
+/// wait for space that may never come back on its own: when the failure here
+/// is no space, it returns ENOSPC. `changed` wakes writers that were waiting
+/// on an upload that has since failed, so they can check.
+#[derive(Debug, Default)]
+pub(super) struct SealFailures {
+    last: std::sync::Mutex<Option<FsError>>,
+    changed: tokio::sync::Notify,
+}
+
+impl SealFailures {
+    fn record(&self, failure: FsError) {
+        *self.last.lock().unwrap() = Some(failure);
+        self.changed.notify_waiters();
+    }
+
+    /// Forget the failure once nothing is left waiting for publication.
+    fn published(
+        &self,
+        sealing: &std::sync::Mutex<std::collections::BTreeMap<Segid, SealingGeneration>>,
+        segid: Segid,
+    ) {
+        let mut sealing = sealing.lock().unwrap();
+        sealing.remove(&segid);
+        if sealing.is_empty() {
+            *self.last.lock().unwrap() = None;
+        }
+    }
+
+    fn current(&self) -> Option<FsError> {
+        *self.last.lock().unwrap()
+    }
+}
+
 pub(super) struct SealingGeneration {
     pub(super) bytes: Bytes,
     _residency: tokio::sync::OwnedSemaphorePermit,
@@ -870,6 +921,12 @@ impl ExtentStore {
         let lane = append_guard.lane();
         #[cfg(test)]
         StagePhaseNanos::add(&phase.gate_wait, t_gate_wait);
+        // A rotation this lane still owes (its owner found storage full) is
+        // paid before any new bytes are claimed, so the open buffer never
+        // grows past the threshold plus one write while storage stays full.
+        if has_frames && lane.open.lock().unwrap().buf.len() >= self.seal_threshold() {
+            self.spawn_seal(&append_guard).await?;
+        }
         #[cfg(test)]
         let t_gate_hold = std::time::Instant::now();
         // Under the gate, claim only what the AAD binds and the buffer layout
@@ -1003,7 +1060,12 @@ impl ExtentStore {
         if let Some(append_guard) = rotate_guard {
             #[cfg(test)]
             let t_spawn_seal = std::time::Instant::now();
-            self.spawn_seal(&append_guard).await;
+            // This write's frames are already in the buffer and its
+            // transaction is staged, so it stays accepted; if storage is full
+            // the rotation stays owed and the next writer on this lane pays it.
+            if let Err(failure) = self.spawn_seal(&append_guard).await {
+                tracing::debug!(%failure, "segment rotation deferred");
+            }
             #[cfg(test)]
             StagePhaseNanos::add(&phase.spawn_seal, t_spawn_seal);
         }
@@ -1031,7 +1093,7 @@ impl ExtentStore {
             .collect()
     }
 
-    async fn publish_pending_seals(&self) -> bool {
+    async fn publish_pending_seals(&self) -> Option<FsError> {
         let mut results: Vec<_> = stream::iter(self.pending_seals())
             .map(|(segid, bytes)| {
                 let segments = Arc::clone(&self.segments);
@@ -1042,17 +1104,18 @@ impl ExtentStore {
             .await;
         results.sort_by_key(|(segid, _)| *segid);
 
-        let mut failed = false;
+        let mut failed = None;
         for (segid, result) in results {
             match result {
-                Ok(()) => {
-                    self.sealing.lock().unwrap().remove(&segid);
-                }
+                Ok(()) => self.seal_failures.published(&self.sealing, segid),
                 Err(e) => {
-                    failed = true;
+                    failed = Some(seal_failure(failed, &e));
                     error!("seal PUT failed for {:?}: {}; retained for retry", segid, e);
                 }
             }
+        }
+        if let Some(failure) = failed {
+            self.seal_failures.record(failure);
         }
         failed
     }
@@ -1144,13 +1207,13 @@ impl ExtentStore {
         // the semaphore's FIFO lock hands the gate to this barrier next.
         let mut append_guards = Vec::with_capacity(OPEN_SEGMENT_LANES);
         for lane in self.open_lanes.iter() {
-            if self.publish_pending_seals().await {
-                return Err(FsError::IoError);
+            if let Some(failure) = self.publish_pending_seals().await {
+                return Err(failure);
             }
             append_guards.push(LaneAppendGuard::lock(lane).await);
         }
-        if self.publish_pending_seals().await {
-            return Err(FsError::IoError);
+        if let Some(failure) = self.publish_pending_seals().await {
+            return Err(failure);
         }
 
         let dirty_lanes: Vec<_> = self
@@ -1168,7 +1231,7 @@ impl ExtentStore {
         let mut append_guards = Some(append_guards);
         let mut uploads = FuturesUnordered::new();
         let mut next_lane = 0;
-        let mut failed = false;
+        let mut failed = None;
         #[cfg(test)]
         let mut put_gate = self.seal_open_put_gate.clone();
 
@@ -1201,7 +1264,7 @@ impl ExtentStore {
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        failed = true;
+                        failed = Some(FsError::IoError);
                         error!("failed to seal open segment directory: {}", e);
                     }
                 }
@@ -1225,26 +1288,26 @@ impl ExtentStore {
                 break;
             };
             match result {
-                Ok(()) => {
-                    self.sealing.lock().unwrap().remove(&segid);
-                }
+                Ok(()) => self.seal_failures.published(&self.sealing, segid),
                 Err(e) => {
-                    failed = true;
+                    let failure = seal_failure(failed, &e);
+                    failed = Some(failure);
+                    self.seal_failures.record(failure);
                     error!("seal PUT failed for {:?}: {}; retained for retry", segid, e);
                 }
             }
         }
 
         if next_lane < dirty_lanes.len() {
-            failed = true;
+            failed.get_or_insert(FsError::IoError);
             error!(
                 "seal residency budget exhausted by failed generations; remaining lanes retained"
             );
         }
-        if failed {
-            return Err(FsError::IoError);
+        match failed {
+            Some(failure) => Err(failure),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     /// Rotate the open buffer and PUT it in the background (the size-threshold
@@ -1256,24 +1319,22 @@ impl ExtentStore {
     /// later writers from reserving into the generation being rotated — both
     /// while this waits for a residency permit and while it drains reservations
     /// already in flight.
-    async fn spawn_seal(&self, appended: &LaneAppendGuard<'_>) {
-        let residency = match Arc::clone(&self.seal_residency_sem).acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => return,
-        };
+    async fn spawn_seal(&self, appended: &LaneAppendGuard<'_>) -> Result<(), FsError> {
+        let residency = self.acquire_residency().await?;
         let freeze = LaneFreeze::acquire(appended).await;
         let (segid, _) =
             match self.rotate_sealing_generation(&freeze, residency, SegmentFormatLimits::WIRE) {
                 Ok(Some(generation)) => generation,
-                Ok(None) => return,
+                Ok(None) => return Ok(()),
                 Err(e) => {
                     error!("failed to seal open segment directory: {}", e);
-                    return;
+                    return Ok(());
                 }
             };
         drop(freeze);
         let segments = self.segments.clone();
         let sealing = self.sealing.clone();
+        let failures = self.seal_failures.clone();
         let upload_sem = self.seal_upload_sem.clone();
         crate::task::spawn_named("segment-seal", async move {
             let _upload = match upload_sem.acquire_owned().await {
@@ -1292,10 +1353,9 @@ impl ExtentStore {
                 return;
             };
             match segments.put_segment(segid, bytes).await {
-                Ok(()) => {
-                    sealing.lock().unwrap().remove(&segid);
-                }
+                Ok(()) => failures.published(&sealing, segid),
                 Err(e) => {
+                    failures.record(seal_failure(None, &e));
                     error!(
                         "background seal PUT failed for {:?}: {}; retried on flush",
                         segid, e
@@ -1303,6 +1363,48 @@ impl ExtentStore {
                 }
             }
         });
+        Ok(())
+    }
+
+    /// A residency permit for one more sealed generation. While uploads are
+    /// slow, or failed for a reason a later flush can retry past, this waits
+    /// for a permit as backpressure. When the retained generations failed
+    /// because storage is full, it tries once to publish them (space may have
+    /// returned) and otherwise returns ENOSPC at once, so a writer never
+    /// waits for space that nothing is freeing.
+    async fn acquire_residency(&self) -> Result<tokio::sync::OwnedSemaphorePermit, FsError> {
+        loop {
+            let changed = self.seal_failures.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            match Arc::clone(&self.seal_residency_sem).try_acquire_owned() {
+                Ok(permit) => return Ok(permit),
+                Err(tokio::sync::TryAcquireError::Closed) => return Err(FsError::IoError),
+                Err(tokio::sync::TryAcquireError::NoPermits) => {}
+            }
+            if self.seal_failures.current() == Some(FsError::NoSpace) {
+                // Only republish when no flush or upload holds the upload
+                // gate: a flush that does may be waiting for this writer's
+                // append gate, so waiting for its permits could deadlock.
+                let Ok(_uploads) = Arc::clone(&self.seal_upload_sem)
+                    .try_acquire_many_owned(self.max_inflight_seals as u32)
+                else {
+                    return Err(FsError::NoSpace);
+                };
+                match self.publish_pending_seals().await {
+                    None => continue,
+                    Some(FsError::NoSpace) => return Err(FsError::NoSpace),
+                    // Not full after all: wait for a flush, as before.
+                    Some(_) => {}
+                }
+            }
+            tokio::select! {
+                permit = Arc::clone(&self.seal_residency_sem).acquire_owned() => {
+                    return permit.map_err(|_| FsError::IoError);
+                }
+                () = &mut changed => {}
+            }
+        }
     }
 
     /// Stage a write at `offset` as read-modify-write over full extents;

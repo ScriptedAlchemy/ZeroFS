@@ -165,6 +165,9 @@ pub struct ExtentStore {
     seal_upload_sem: Arc<Semaphore>,
     /// Bounds finalized segment buffers resident in `sealing`, including failures.
     seal_residency_sem: Arc<Semaphore>,
+    /// Why generations in `sealing` are still unpublished, so a writer that
+    /// needs residency answers at once instead of waiting on full storage.
+    seal_failures: Arc<write::SealFailures>,
     /// Deadline after which each currently-dead segment may be deleted:
     /// recorded the first pass it's seen dead, from the latest expiry of the
     /// checkpoints active then, so reclamation outlasts anything that could
@@ -310,6 +313,7 @@ impl ExtentStore {
             sealing: Arc::new(Mutex::new(BTreeMap::new())),
             seal_upload_sem: Arc::new(Semaphore::new(max_inflight_seals)),
             seal_residency_sem: Arc::new(Semaphore::new(max_inflight_seals)),
+            seal_failures: Arc::new(write::SealFailures::default()),
             delete_at: Arc::new(Mutex::new(HashMap::new())),
             nominations: Arc::new(Mutex::new(NominationSet::default())),
             nominations_enabled: Arc::new(AtomicBool::new(false)),

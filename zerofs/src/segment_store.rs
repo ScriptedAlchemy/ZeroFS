@@ -72,6 +72,10 @@ impl ConditionalMultipartCreate {
 pub enum SegmentStoreError {
     #[error("segment object store error: {0}")]
     ObjectStore(String),
+    /// The backend has no room for the segment. Full is not broken: the
+    /// filesystem reports it to clients as ENOSPC, never EIO.
+    #[error("segment object store has no space: {0}")]
+    NoSpace(String),
     /// The segment object does not exist. Distinguished from a transient
     /// `ObjectStore` error so reclamation can tell "the object is genuinely gone"
     /// (trivially dead) from "the store is momentarily unreachable" (fail-closed).
@@ -82,6 +86,15 @@ pub enum SegmentStoreError {
 }
 
 type Result<T> = std::result::Result<T, SegmentStoreError>;
+
+/// A failed segment write, keeping "no space" apart from every other failure.
+fn write_failure(error: &slatedb::object_store::Error) -> SegmentStoreError {
+    if crate::retrying_object_store::is_no_space(error) {
+        SegmentStoreError::NoSpace(error.to_string())
+    } else {
+        SegmentStoreError::ObjectStore(error.to_string())
+    }
+}
 
 #[derive(Debug)]
 enum SegmentPublication {
@@ -189,6 +202,10 @@ impl SegmentStore {
             .await
         {
             Ok(result) => Ok(result),
+            // A no-space answer is definitive: nothing was published.
+            Err(error) if crate::retrying_object_store::is_no_space(&error) => {
+                Err(write_failure(&error))
+            }
             // A create whose success response was lost can return either a
             // transport error or AlreadyExists on a lower-layer retry. Exact
             // readback is the only safe way to reconcile either response.
@@ -270,7 +287,7 @@ impl SegmentStore {
                 self.put_segment_create(path, bytes).await?;
                 return Ok(SegmentPublication::SingleFallback);
             }
-            Err(error) => return Err(SegmentStoreError::ObjectStore(error.to_string())),
+            Err(error) => return Err(write_failure(&error)),
         };
         if capability.is_acknowledged() {
             return self
@@ -322,7 +339,7 @@ impl SegmentStore {
             if let Err(abort_err) = abort_segment_upload(upload).await {
                 tracing::warn!("segment seal: aborting failed upload of {path}: {abort_err}");
             }
-            return Err(SegmentStoreError::ObjectStore(error.to_string()));
+            return Err(write_failure(&error));
         }
 
         match upload.complete().await {
@@ -331,7 +348,7 @@ impl SegmentStore {
                 if let Err(abort_err) = abort_segment_upload(upload).await {
                     tracing::warn!("segment seal: aborting failed upload of {path}: {abort_err}");
                 }
-                if reconcile_completion {
+                if reconcile_completion && !crate::retrying_object_store::is_no_space(&e) {
                     match self.verify_existing_segment_bytes(path, bytes).await {
                         Ok(result) => return Ok(result),
                         Err(conflict)
@@ -342,7 +359,7 @@ impl SegmentStore {
                         Err(_) => {}
                     }
                 }
-                Err(SegmentStoreError::ObjectStore(e.to_string()))
+                Err(write_failure(&e))
             }
         }
     }
