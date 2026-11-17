@@ -1,13 +1,10 @@
 //! Conservative evacuation snapshots using the allocator's capacity budgets.
+//!
+//! Room per member comes from [`super::space`], the same rule placement uses.
+use super::space::{self, FilesystemSpace};
 use super::{PoolMember, PoolMemberStatus};
 use std::collections::BTreeMap;
-use std::os::unix::fs::MetadataExt;
 
-#[derive(Clone, Copy)]
-struct Space {
-    filesystem: u64,
-    available: u64,
-}
 struct Budget {
     available: u64,
     reserve: u64,
@@ -27,11 +24,9 @@ pub(super) fn assess(
 ) {
     assess_with(config, members, segments, |member| {
         member.validate_binding()?;
-        let path = member.local_path.as_ref().expect("local member");
-        Ok(Space {
-            filesystem: std::fs::metadata(path)?.dev(),
-            available: fs4::available_space(path)?,
-        })
+        member
+            .filesystem_space()
+            .expect("assess_with asks only local members")
     });
 }
 
@@ -39,7 +34,7 @@ fn assess_with(
     config: &[PoolMember],
     members: &mut [PoolMemberStatus],
     segments: &BTreeMap<String, Vec<u64>>,
-    mut space: impl FnMut(&PoolMember) -> std::io::Result<Space>,
+    mut space: impl FnMut(&PoolMember) -> std::io::Result<FilesystemSpace>,
 ) {
     // Match reserve(): unpublished local bytes may not yet appear in statvfs.
     let local_reserved = config
@@ -56,39 +51,40 @@ fn assess_with(
         if member.health.quarantine.is_some() || member.health.monitoring_error.is_some() {
             continue;
         }
+        let observed = config.local_path.is_some().then(|| space(config));
+        let physical = match &observed {
+            None => None,
+            Some(Ok(observed)) => Some(space::physical_room(
+                *observed,
+                config.min_free_bytes,
+                local_reserved,
+            )),
+            Some(Err(_)) => None,
+        };
         let quota = member
             .capacity_bytes
             .saturating_sub(member.used_bytes)
             .saturating_sub(member.reserved_bytes);
-        if config.local_path.is_none() {
-            member.available_bytes = quota;
-            available = available.saturating_add(quota);
-            destinations.push(Destination {
-                available: quota,
-                filesystem: None,
-            });
-            continue;
-        }
-        let observed = match space(config) {
-            Ok(observed) => observed,
-            Err(_) => {
+        let observed = match observed {
+            None => {
+                member.available_bytes = quota;
+                available = available.saturating_add(quota);
+                destinations.push(Destination {
+                    available: quota,
+                    filesystem: None,
+                });
+                continue;
+            }
+            Some(Ok(observed)) => observed,
+            Some(Err(_)) => {
                 unavailable.push(member.id.clone());
                 continue;
             }
         };
-        member.available_bytes = quota.min(
-            observed
-                .available
-                .saturating_sub(config.min_free_bytes)
-                .saturating_sub(local_reserved),
-        );
-        if config
-            .min_free_bytes
-            .checked_add(local_reserved)
-            .is_some_and(|reserve| observed.available >= reserve)
-        {
+        if let Some(room) = space::room(quota, physical) {
+            member.available_bytes = room;
             destinations.push(Destination {
-                available: member.available_bytes,
+                available: room,
                 filesystem: Some(observed.filesystem),
             });
         }
@@ -167,6 +163,7 @@ mod tests {
                 local_path: Some(format!("/{id}").into()),
                 min_free_bytes: 10,
                 health_device: None,
+                free_space: None,
             },
             PoolMemberStatus {
                 id: id.into(),
@@ -197,9 +194,10 @@ mod tests {
         let (b, sb) = member("b", 1000, 0, 30);
         let mut statuses = vec![sa, sb];
         assess_with(&[a, b], &mut statuses, &BTreeMap::new(), |_| {
-            Ok(Space {
+            Ok(FilesystemSpace {
                 filesystem: 1,
                 available: 150,
+                total: 1000,
             })
         });
         assert_eq!(statuses[0].available_bytes, 90);
@@ -215,9 +213,10 @@ mod tests {
         sb.health.quarantine = Some("media failure".into());
         let mut statuses = vec![sa, sb];
         assess_with(&[a, b], &mut statuses, &BTreeMap::new(), |_| {
-            Ok(Space {
+            Ok(FilesystemSpace {
                 filesystem: 1,
                 available: 1000,
+                total: 1000,
             })
         });
         assert_eq!(statuses[0].evacuation_capacity.available_bytes, 40);
@@ -243,9 +242,10 @@ mod tests {
         let (b, sb) = member("b", 1000, 0, 0);
         let mut statuses = vec![sa, sb];
         assess_with(&[a, b], &mut statuses, &BTreeMap::new(), |member| {
-            Ok(Space {
+            Ok(FilesystemSpace {
                 filesystem: if member.id == "a" { 1 } else { 2 },
                 available: 60,
+                total: 1000,
             })
         });
         assert_eq!(statuses[0].evacuation_capacity.available_bytes, 100);
@@ -264,9 +264,10 @@ mod tests {
             let mut statuses = vec![source_status, sa, sb, sc];
             let segments = BTreeMap::from([("source".into(), vec![6, 6])]);
             assess_with(&[source, a, b, c], &mut statuses, &segments, |member| {
-                Ok(Space {
+                Ok(FilesystemSpace {
                     filesystem: if member.id == "c" { 2 } else { 1 },
                     available: if member.id == "c" { 14 } else { shared_free },
+                    total: 1000,
                 })
             });
             assert!(statuses[0].evacuation_capacity.available_bytes >= 12);
@@ -284,9 +285,10 @@ mod tests {
             let mut statuses = vec![source_status, target_status];
             let segments = BTreeMap::from([("source".into(), vec![0])]);
             assess_with(&[source, target], &mut statuses, &segments, |_| {
-                Ok(Space {
+                Ok(FilesystemSpace {
                     filesystem: 1,
                     available,
+                    total: 1000,
                 })
             });
             assert_eq!(statuses[0].evacuation_capacity.sufficient, sufficient);

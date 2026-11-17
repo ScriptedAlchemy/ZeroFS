@@ -697,23 +697,20 @@ impl Catalog {
                     .used
                     .checked_add(record.reserved)
                     .context("pool usage overflow")?;
-                if record.capacity.saturating_sub(occupied) < size {
+                // Outstanding reservations may not have reached the device
+                // yet. Counting all of them is deliberately conservative.
+                let physical = match member.filesystem_space() {
+                    None => None,
+                    Some(Ok(space)) => Some(super::space::physical_room(
+                        space,
+                        member.min_free_bytes,
+                        local_reserved,
+                    )),
+                    Some(Err(_)) => continue,
+                };
+                let declared = record.capacity.saturating_sub(occupied);
+                if super::space::room(declared, physical).is_none_or(|room| room < size) {
                     continue;
-                }
-                if let Some(path) = &member.local_path {
-                    let Ok(available) = fs4::available_space(path) else {
-                        continue;
-                    };
-                    // Outstanding reservations may not have reached the device
-                    // yet. Counting all of them is deliberately conservative.
-                    let required = member
-                        .min_free_bytes
-                        .checked_add(local_reserved)
-                        .and_then(|n| n.checked_add(size))
-                        .context("pool free-space reservation overflow")?;
-                    if available < required {
-                        continue;
-                    }
                 }
                 record.reserved = record
                     .reserved
@@ -1392,6 +1389,7 @@ mod catalog_lock_tests {
             local_path: None,
             min_free_bytes: 0,
             health_device: None,
+            free_space: None,
         };
         catalog.configure_members(&[member]).unwrap();
         catalog.finish_initialization().unwrap();
@@ -1562,6 +1560,7 @@ mod legacy_health_compatibility {
             local_path: None,
             min_free_bytes: 0,
             health_device: None,
+            free_space: None,
         };
         let status = catalog.status(&[config], None).unwrap();
         assert_eq!(status.mapped_objects, 1);
@@ -1620,6 +1619,7 @@ mod empty_quarantine_tests {
                 local_path: None,
                 min_free_bytes: 0,
                 health_device: None,
+                free_space: None,
             })
             .collect::<Vec<_>>();
         catalog.configure_members(&members).unwrap();

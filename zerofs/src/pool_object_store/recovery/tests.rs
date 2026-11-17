@@ -39,6 +39,7 @@ async fn evacuation_fixture_with_target(
             local_path: None,
             min_free_bytes: 0,
             health_device: None,
+            free_space: None,
         })
         .collect();
     let pool = PoolObjectStore::initialize(
@@ -531,6 +532,7 @@ async fn fault_fixture(count: usize) -> (tempfile::TempDir, PoolObjectStore, Vec
             local_path: None,
             min_free_bytes: 0,
             health_device: None,
+            free_space: None,
         }],
     )
     .await

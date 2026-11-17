@@ -10,8 +10,11 @@ mod capacity;
 mod catalog;
 mod health;
 mod recovery;
+mod space;
 pub use health::{MemberHealth, SegmentFault, SmartSample};
 pub(crate) use recovery::PoolRecovery;
+#[cfg(test)]
+pub use space::{FilesystemSpace, FreeSpace};
 #[cfg(test)]
 mod tests;
 
@@ -78,6 +81,9 @@ pub struct PoolMember {
     pub local_path: Option<PathBuf>,
     pub min_free_bytes: u64,
     pub health_device: Option<PathBuf>,
+    /// Real free space of a local member. `None` reads `statvfs` on
+    /// `local_path`; tests inject exact numbers. Unused for remote members.
+    pub free_space: Option<Arc<dyn space::FreeSpace>>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
