@@ -99,6 +99,12 @@ pub(crate) struct UndefinedBytes {
     pub(crate) padding_nonzero: usize,
 }
 
+impl UndefinedBytes {
+    pub(crate) fn nonzero(&self) -> usize {
+        self.index_tail_nonzero + self.padding_nonzero
+    }
+}
+
 fn count_nonzero(bytes: &[u8]) -> usize {
     bytes.iter().filter(|b| **b != 0).count()
 }
@@ -157,3 +163,174 @@ pub(crate) fn scan_partitions(
     }
     Ok(counts)
 }
+
+/// Which on-disk cache a directory holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum CacheKind {
+    RawParts,
+    DecodedBlocks,
+}
+
+impl CacheKind {
+    fn block_size(self) -> usize {
+        match self {
+            Self::RawParts => super::PARTS_BLOCK_SIZE,
+            Self::DecodedBlocks => super::BLOCK_CACHE_BLOCK_SIZE,
+        }
+    }
+}
+
+/// The cache directories of the current layouts and of earlier builds, by
+/// the names the server gives them.
+fn cache_dir_kind(name: &str) -> Option<CacheKind> {
+    use crate::object_store_prefetch::{LEGACY_PARTS_CACHE_DIR, PARTS_CACHE_DIR};
+    match name {
+        PARTS_CACHE_DIR | LEGACY_PARTS_CACHE_DIR => Some(CacheKind::RawParts),
+        super::BLOCK_CACHE_DIR | super::LEGACY_BLOCK_CACHE_DIR => Some(CacheKind::DecodedBlocks),
+        _ => None,
+    }
+}
+
+/// Whether a cache directory was written with the zeroed padding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "layout", rename_all = "kebab-case")]
+pub(crate) enum CacheLayout {
+    Current,
+    /// Written by an earlier build, which left padding undefined.
+    Earlier {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct CacheReport {
+    pub(crate) kind: CacheKind,
+    pub(crate) path: std::path::PathBuf,
+    #[serde(flatten)]
+    pub(crate) layout: CacheLayout,
+    /// The counts, or nothing for an earlier layout scanned without `--legacy`.
+    pub(crate) scanned: Option<UndefinedBytes>,
+}
+
+/// The scan's verdict; each has its own process exit status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ScanStatus {
+    /// Every scanned byte is zero and every cache had entries to scan.
+    Clean,
+    /// Some index tail or padding byte is non-zero.
+    UndefinedBytes,
+    /// A cache had no entries on disk, or was not scanned.
+    NothingScanned,
+}
+
+impl ScanStatus {
+    pub(crate) fn exit_code(self) -> i32 {
+        match self {
+            Self::Clean => 0,
+            Self::UndefinedBytes => 3,
+            Self::NothingScanned => 4,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ScanReport {
+    pub(crate) path: std::path::PathBuf,
+    /// Scanned while a server may have been writing.
+    pub(crate) live: bool,
+    pub(crate) caches: Vec<CacheReport>,
+    pub(crate) status: ScanStatus,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ScanOptions {
+    /// Scan even when a server holds the cache's ownership lock.
+    pub(crate) live: bool,
+    /// Count the bytes of caches written by earlier builds too.
+    pub(crate) legacy: bool,
+}
+
+/// The cache directories at or under `path`: one cache directory, a
+/// clean-cache namespace holding them, or the `[cache] dir` holding
+/// namespaces.
+fn find_cache_dirs(path: &Path) -> Result<Vec<(CacheKind, std::path::PathBuf)>> {
+    let is_dir = |path: &Path| {
+        std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+    };
+    let named = |path: &Path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .and_then(cache_dir_kind)
+    };
+    if !is_dir(path) {
+        anyhow::bail!("{} is not a directory", path.display());
+    }
+    if let Some(kind) = named(path) {
+        return Ok(vec![(kind, path.to_path_buf())]);
+    }
+    let children = |dir: &Path| -> Result<Vec<std::path::PathBuf>> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+            let path = entry?.path();
+            if is_dir(&path) {
+                found.push(path);
+            }
+        }
+        found.sort();
+        Ok(found)
+    };
+    let caches_in = |dir: &Path| -> Result<Vec<(CacheKind, std::path::PathBuf)>> {
+        Ok(children(dir)?
+            .into_iter()
+            .filter_map(|child| named(&child).map(|kind| (kind, child)))
+            .collect())
+    };
+    let mut found = caches_in(path)?;
+    if found.is_empty() {
+        for namespace in children(path)? {
+            found.extend(caches_in(&namespace)?);
+        }
+    }
+    if found.is_empty() {
+        anyhow::bail!(
+            "no ZeroFS clean-cache directory found at or under {}; pass the [cache] dir, \
+             one of its namespaces, or a cache directory inside one",
+            path.display()
+        );
+    }
+    Ok(found)
+}
+
+/// Scan the clean-cache files at or under `path`. Reads only; needs no
+/// password or key.
+pub(crate) fn scan_cache_files(path: &Path, options: ScanOptions) -> Result<ScanReport> {
+    let mut caches = Vec::new();
+    for (kind, dir) in find_cache_dirs(path)? {
+        let scanned = scan_partitions(&dir, kind.block_size(), |_, _| {})?;
+        caches.push(CacheReport {
+            kind,
+            path: dir,
+            layout: CacheLayout::Current,
+            scanned: Some(scanned),
+        });
+    }
+    let status = if caches
+        .iter()
+        .any(|cache| cache.scanned.as_ref().is_some_and(|c| c.nonzero() > 0))
+    {
+        ScanStatus::UndefinedBytes
+    } else {
+        ScanStatus::Clean
+    };
+    Ok(ScanReport {
+        path: path.to_path_buf(),
+        live: options.live,
+        caches,
+        status,
+    })
+}
+
+#[cfg(test)]
+mod tests;
