@@ -474,9 +474,19 @@ fn normalize_journal_root(root: &Path) -> Result<PathBuf> {
 impl Journal {
     #[cfg(test)]
     pub(crate) fn open_existing(root: impl AsRef<Path>) -> Result<Self> {
+        Self::open_existing_with_identity_read_hook(root, || {})
+    }
+
+    /// [`Journal::open_existing`], running `during_identity_read` while the
+    /// identity read holds the database open.
+    #[cfg(test)]
+    fn open_existing_with_identity_read_hook(
+        root: impl AsRef<Path>,
+        during_identity_read: impl FnOnce(),
+    ) -> Result<Self> {
         let root = normalize_journal_root(root.as_ref())?;
         let root_dir = AnchoredDir::open_absolute(&root, 0o700)?;
-        let identity = Self::read_existing_identity(&root_dir)?;
+        let identity = Self::read_existing_identity(&root_dir, during_identity_read)?;
         Self::open_anchored(root_dir, identity)
     }
 
@@ -489,14 +499,17 @@ impl Journal {
     ) -> Result<Self> {
         let root = normalize_journal_root(root.as_ref())?;
         let root_dir = AnchoredDir::open_absolute(&root, 0o700)?;
-        let actual_identity = Self::read_existing_identity(&root_dir)?;
+        let actual_identity = Self::read_existing_identity(&root_dir, || {})?;
         if actual_identity != expected_identity {
             bail!("writeback journal identity mismatch");
         }
         Self::open_anchored(root_dir, expected_identity)
     }
 
-    fn read_existing_identity(root_dir: &AnchoredDir) -> Result<JournalIdentity> {
+    fn read_existing_identity(
+        root_dir: &AnchoredDir,
+        during_read: impl FnOnce(),
+    ) -> Result<JournalIdentity> {
         let database_file = root_dir
             .open_existing_owner_file_read_only("journal.redb".as_ref())
             .with_context(|| {
@@ -512,6 +525,7 @@ impl Journal {
                 root_dir.display().join("journal.redb").display()
             )
         })?;
+        during_read();
         let read = database
             .begin_read()
             .context("failed to read existing journal identity")?;
@@ -3947,6 +3961,86 @@ mod tests {
         drop(inherited_lock);
         // The previous generation's descriptor cannot unlock the new owner.
         assert_locked();
+    }
+
+    /// A child forked from this process, holding every descriptor it inherited
+    /// until it is dropped. It never execs, so close-on-exec does not apply.
+    #[cfg(target_os = "linux")]
+    struct ForkedChild {
+        pid: libc::pid_t,
+        release: Option<std::os::fd::OwnedFd>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ForkedChild {
+        fn hold_inherited_descriptors() -> Self {
+            use std::os::fd::FromRawFd;
+            let mut pipe = [0; 2];
+            assert_eq!(
+                unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+                0
+            );
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+            if pid == 0 {
+                // The child of a multithreaded process may only make
+                // async-signal-safe calls: wait for the parent to close the
+                // pipe, then exit without running any destructor.
+                unsafe {
+                    libc::close(pipe[1]);
+                    let mut byte = 0_u8;
+                    libc::read(pipe[0], (&raw mut byte).cast(), 1);
+                    libc::_exit(0);
+                }
+            }
+            unsafe { libc::close(pipe[0]) };
+            Self {
+                pid,
+                release: Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(pipe[1]) }),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ForkedChild {
+        fn drop(&mut self) {
+            drop(self.release.take());
+            let mut status = 0;
+            unsafe { libc::waitpid(self.pid, &mut status, 0) };
+        }
+    }
+
+    /// Another thread may fork while the journal's identity is being read. The
+    /// child then shares every descriptor the read has open until it execs or
+    /// exits, which the reopen must not have to wait for. The descriptor is
+    /// opened inside redb, so unlike the journal lock it cannot be duplicated
+    /// directly; a real fork models it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn existing_open_is_not_blocked_by_a_fork_during_its_identity_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let journal = open_temp_journal(&temp, "bucket-a");
+        journal
+            .commit_put(put_record(1, "segments/1", b"pending"), b"pending")
+            .unwrap();
+        drop(journal);
+
+        let mut child = None;
+        let reopened = Journal::open_existing_with_identity_read_hook(&root, || {
+            child = Some(ForkedChild::hold_inherited_descriptors());
+        });
+        let child = child.expect("the identity read ran");
+        let reopened = reopened
+            .expect("a child forked during the identity read must not keep the journal locked");
+        assert_eq!(reopened.snapshot().unwrap().local_seq, 1);
+        assert_eq!(reopened.read_blob(1).unwrap(), b"pending");
+        drop(reopened);
+
+        // The child still holds everything it inherited, and pins nothing.
+        Journal::open(&root, identity("bucket-a"))
+            .expect("a closed journal reopens while the forked child is alive");
+        drop(child);
     }
 
     #[test]
