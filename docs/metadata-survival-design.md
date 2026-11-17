@@ -2,9 +2,11 @@
 
 This is the first design stage of the metadata survival implementation. It is
 verified against ZeroFS commit `9b67f82eddedb30d268ac31fccaa0e3d49d9f2c3`.
-The survival gate still fails. This change adds no replication, recovery command,
-survival acknowledgement or placement capability. The proposed mechanism is
-promising on source inspection only. The ignored acceptance contracts fail
+The metadata survival gate, which requires the namespace, placement catalog and
+encryption material to survive the loss of any one device, still fails. This
+change adds no replication, recovery command, survival acknowledgement or
+placement capability. Source inspection is the only support for the proposed
+mechanism. The ignored acceptance contracts fail
 at missing production prerequisites. Two ordinary journal-loss controls exercise
 today's backend durability. No production recovery or interrupted-commit coverage
 is claimed. The coordinator accepted the first mechanism
@@ -30,8 +32,9 @@ bucket-identity and key paths. It preserves an old version before replacing it
 when a retained generation or candidate needs those bytes.
 
 One serialization owner establishes a common namespace and catalog prefix.
-It pre-drains writeback with admission open, then briefly closes admission for
-the final drain, seal, flush, checkpoint and catalog export. It reopens
+It pre-drains writeback with admission open. It then closes admission for the
+final drain, seal, flush, checkpoint and catalog export, a pause bounded by
+`final_pause_max_milliseconds`. It reopens
 admission before any replica I/O, so replica publication runs with writes
 admitted. Ordinary memory, local SSD and backend receipts keep their current
 meaning. They can wait at this bounded gate, but do not wait for a survival
@@ -54,12 +57,12 @@ local Cargo checkout, not inferred from upstream documentation.
 
 | Integration point | Verified behavior and required change |
 | --- | --- |
-| Pool startup | `zerofs/src/storage_backend.rs:111` validates paths and refuses a missing catalog at line 122. It constructs one local authority at line 127 and the pool at line 180. Construct the retention wrapper before the authority is passed into the pool. Copy recovery dependencies only during a commit. Keep ordinary startup refusal. Add an explicit recovery entry point before this path. |
+| Pool startup | `zerofs/src/storage_backend.rs:111` validates paths and refuses a missing catalog at line 122. It constructs one local authority at line 127 and the pool at line 180. Construct the retention wrapper before startup passes the authority into the pool. Copy recovery dependencies only during a commit. Keep ordinary startup refusal. Add an explicit recovery entry point before this path. |
 | Directory and device identity | `zerofs/src/storage_backend.rs:263` rejects overlapping authority, catalog, cache, journal and member roots. `zerofs/src/storage_backend.rs:308` derives member identity from its location. Replicas on data devices need disjoint sibling directories, device bindings and mount validation. Different directory names alone do not prove independent devices. |
 | Authority writes | `zerofs/src/pool_object_store/mod.rs:1875` forwards non-segment puts to the authority at line 1884. Multipart operations take a separate route at line 1902. Wrap the underlying authority, including privileged pool-marker creation at line 550, rather than only the public pool put method. |
 | Authority deletion and movement | `zerofs/src/pool_object_store/mod.rs:2000` implements deletion streams and forwards authority deletion at line 2016. Non-segment copy delegates at line 2115. Rename delegates at line 2165. All destructive authority paths must preserve retained versions through the ledger. They do not mirror live mutations. Internal `.zerofs-pool` paths are reserved at line 643, so the replica manager needs its own owned operations. |
 | Conditional authority objects | `zerofs/src/key_management.rs:279` creates the key using `PutMode::Create`. `zerofs/src/bucket_identity.rs:69` creates `.zerofs_bucket_id` the same way. `zerofs/src/local_object_store.rs:161` handles create and conditional update under local locks. The live authority makes the create decision. A survival commit copies the winning bytes and binds their digest. |
-| Local durability | `zerofs/src/local_object_store.rs:58` enables fsync. Directory ancestry sync is at line 105. Standalone deletes sync the parent at line 247. A replica implementation must preserve these properties, including owned workers after caller cancellation. These calls do not constitute hardware power-loss evidence. |
+| Local durability | `zerofs/src/local_object_store.rs:58` enables fsync. Directory ancestry sync is at line 105. Standalone deletes sync the parent at line 247. A replica implementation must preserve these properties, including owned workers after caller cancellation. These calls are not hardware power-loss evidence. |
 | Namespace flush completion | `zerofs/src/fs/flush_coordinator.rs:119` holds the database write barrier through seal and flush. The typed durability path at line 224 materializes a cutoff, seals and flushes at line 242, releases the barrier, then waits for object coverage at line 258. `zerofs/src/db.rs:947` awaits SlateDB flush. Extend this ordering with a separate survival operation and receipt. Existing backend receipts must retain their current meaning. |
 | Database exclusion | `zerofs/src/db.rs:885` admits database batches under the barrier's read side. It does not serialize redb or all maintenance. The new owner must sit outside this barrier and drain operations before taking it. A pool operation must not acquire the new gate recursively while the commit owner waits for its drain. |
 | Production WAL and background flush | `zerofs/src/cli/server.rs:1162` disables the WAL and automatic size-driven metadata freezing. The settings at line 1170 preserve barrier-controlled publication. `zerofs/src/cli/init.rs:237` can still construct a separate WAL store. Reject that setting in the initial survival mode and keep the WAL disabled in acceptance fixtures. |
@@ -73,7 +76,7 @@ local Cargo checkout, not inferred from upstream documentation.
 | Writer locks | `zerofs/src/pool_object_store/catalog.rs:250` holds an exclusive catalog lock. `zerofs/src/local_object_store.rs:95` orders local locks and keeps their files stable. Neither locks every metadata replica. Add a persistent lock file on each replica and hold every exclusive lock for the writer's lifetime, together with the existing SlateDB writer epoch. |
 | Config parsing | `zerofs/src/config.rs:669` denies unknown pool fields. `Settings::from_file` at line 1958 parses and validates. The proposed `metadata_survival` table is unsupported. Configuration acceptance alone provides no replication or recovery evidence. |
 
-The pinned SlateDB implementation supplies several useful pieces, with limits.
+The pinned SlateDB source behaves as follows, including its limits.
 
 | Dependency source | Verified behavior |
 | --- | --- |
@@ -238,8 +241,8 @@ such as write(2). The FUSE client `zerofs mount` speaks 9P to the server and
 answers the kernel with the same errno at `zerofs/src/mount.rs:255`, so a
 program on a FUSE mount sees the same value. ZeroFS already returns EAGAIN this
 way when writeback admission is backpressured, at
-`zerofs/src/fs/mutation/overlay_helpers.rs:61`. EAGAIN rather than EROFS keeps
-the read-only error for states that need an operator.
+`zerofs/src/fs/mutation/overlay_helpers.rs:61`. Returning EAGAIN rather than
+EROFS reserves the read-only error for states that need an operator.
 
 | Key | Proposed default | Needs measuring on HDD-backed replicas or members |
 | --- | --- | --- |
@@ -386,7 +389,7 @@ K new key-record bytes, I durable intent bytes, and B dependency-root, commit an
 retirement or anchor bytes for one changed generation. Per replica a commit
 writes `D + C + K + I + B` logical bytes. At a 60-second active interval that is
 `1440 * (D + C + K + I + B)` bytes per day if each interval has that same churn.
-For example, 1 MiB of new SSTs, 64 KiB of changed catalog, zero key/intent bytes
+For example, 1 MiB of new SSTs, 64 KiB of changed catalog, zero key and intent bytes
 and 16 KiB of record overhead cost 1,130,496 bytes per commit and 1,627,914,240
 bytes per day per replica. This is arithmetic, not a workload estimate.
 An idle day writes zero new generation bytes. Filesystem amplification and live
@@ -404,7 +407,7 @@ HDD fsync latency and actual byte and write-operation counts remain unmeasured.
 
 Retain two selectable generations, one candidate and any explicit reader pins.
 Charge the union of their metadata and physical payload dependencies once per
-capacity domain, plus relocation copies, unresolved upload/cleanup debts,
+capacity domain, plus relocation copies, unresolved upload and cleanup debts,
 intents, scratch headroom and free reserve. An immutable object is live if the
 union of retained dependency lists, candidate lists or reader pins marks it.
 Store no mutable reference counts. Rebuild marks after restart and make sweep
@@ -436,7 +439,7 @@ No record stores a raw DEK or password.
 | `writer.lock` | A stable local exclusive lock held for the writer lifetime. Recovery locks existing files without creating source files. |
 | `identity.json` | The pool UUID, format, replica and hardware bindings, membership digest and epoch, original authority/catalog bindings and durable enablement. It includes enough bounded bootstrap information to recover from a replica plus the password alone. |
 | `keys/<epoch>.json` | The exact original envelope bytes, their SHA-256, envelope version, KDF algorithm and parameters, DEK identity digest, pool binding and key epoch. The original envelope includes name mode. |
-| `catalog/objects/<sha256>` | Immutable sorted table chunks and an authenticated logical catalog root covering all eight tables, original identity, schema, generation, counters and debts. No raw live redb copy. |
+| `catalog/objects/<sha256>` | Immutable sorted table chunks and an authenticated logical catalog root covering all eight tables, original identity, schema, generation, counters and debts. It contains no raw copy of the live redb file. |
 | `dependencies/<generation>.json` | The named checkpoint and manifest, immutable metadata dependency chunks with logical names, sizes and hashes, catalog root, bucket identity and key record. It also names exact physical payload generations, owners, lengths and checksums. |
 | `objects/<sha256>` | Immutable metadata bytes copied at commit time. Live authority files remain in their existing layout. |
 | `intents/<epoch>/<operation>.json` | Authenticated allocations, checkpoint intents and deletion permissions. A checkpoint intent stores `checkpoint_name` as `zerofs-survival/<epoch>/<sequence>` and its finite expiry before checkpoint creation. An allocation intent reaches every replica before physical writes. |
@@ -458,7 +461,7 @@ Recovery bootstraps bounded envelope candidates and pool/membership identity
 from surviving `identity.json` plus the password. A separately supplied expected
 pool UUID is optional additional validation. Authenticate the identity and all
 bindings after unwrapping, before accepting paths. Config and environment files
-may have died with the authority. The password and any underlying encrypted
+may be lost with the authority. The password and any underlying encrypted
 filesystem unlock material must survive independently. No external freshness
 service is required. Recovery reports that it cannot detect substitution of an
 older copy of the same otherwise valid device without independent history.
@@ -662,23 +665,23 @@ require separate deployment tests. No NAS access or benchmarks belong here.
 
 | Finding | Decision and section |
 | --- | --- |
-| F1 | Accepted. Configuration and durable enablement prevents silent disable and terminal-record rollback. |
-| F2 | Accepted. Operating contract and Abort, restart and retirement use pre-drain, bounded timeout, admission reopening and online retry before publication. |
-| F3 | Accepted. Recovery selection and writable promotion removes receipt hints and forbids acknowledged rollback. Acceptance contracts require two valid generations. |
-| F4 | Accepted. Exact survival commit ordering records a named finite checkpoint intent before creation. Abort, restart and retirement reconciles it. |
-| F5 | Accepted. Chosen mechanism uses commit-time copies and only retention in the live authority wrapper. |
-| F6 | Accepted. Space, writes and record bounds specifies reused catalog chunks, adaptive idle skipping, byte arithmetic and authenticated record compaction. |
-| F7 | Accepted. Admission, locks and read observations defers every advisory read-path catalog write. |
-| F8 | Accepted. Admission, locks and read observations fixes token-before-lock order. Acceptance contracts require a contended inode schedule. |
-| F9 | Accepted. Operating contract keeps unaffected files writable after payload-only loss. Recovery selection and writable promotion specifies offline promotion, scratch sizing and bootstrap without lost config. |
-| F10 | Accepted. Acceptance contracts require a real nonempty journal and refuse deletion of nonexistent devices. |
-| F11 | Accepted. Acceptance contracts prepares three distinct commits and real cleanup debt before retirement cuts. |
-| F12 | Accepted. Acceptance contracts overlaps an admitted write, a draining commit and a late arrival. |
-| F13 | Accepted. Acceptance contracts observes actual API results, elapsed time and status for replica faults. |
-| F14 | Accepted. Abort, restart and retirement and the payload oracle require a dead unretained control to disappear in the same sweep. |
-| F15 | Accepted. Proposed on-disk formats defines one full-record receipt and predecessor digest, including the MAC field. |
-| F16 | Accepted. Abort, restart and retirement completes the same partial fanout before admission and sequence reuse. |
-| F17 | Accepted as a design ambiguity, not proof of implemented counters. Space, writes and record bounds derives liveness from retained lists and stores no reference counts. |
+| F1 | Accepted. [Configuration and durable enablement](#configuration-and-durable-enablement) prevents silent disable and terminal-record rollback. |
+| F2 | Accepted. [Operating contract](#operating-contract-awaiting-operator-confirmation) and [Abort, restart and retirement](#abort-restart-and-retirement) use pre-drain, bounded timeout, admission reopening and online retry before publication. |
+| F3 | Accepted. [Recovery selection and writable promotion](#recovery-selection-and-writable-promotion) removes receipt hints and forbids acknowledged rollback. [Acceptance contracts](#acceptance-contracts-and-evidence-limits) require two valid generations. |
+| F4 | Accepted. [Exact survival commit ordering](#exact-survival-commit-ordering) records a named finite checkpoint intent before creation. [Abort, restart and retirement](#abort-restart-and-retirement) reconciles it. |
+| F5 | Accepted. [Chosen mechanism](#chosen-mechanism) uses commit-time copies and only retention in the live authority wrapper. |
+| F6 | Accepted. [Space, writes and record bounds](#space-writes-and-record-bounds) specifies reused catalog chunks, adaptive idle skipping, byte arithmetic and authenticated record compaction. |
+| F7 | Accepted. [Admission, locks and read observations](#admission-locks-and-read-observations) defers every advisory read-path catalog write. |
+| F8 | Accepted. [Admission, locks and read observations](#admission-locks-and-read-observations) fixes token-before-lock order. [Acceptance contracts](#acceptance-contracts-and-evidence-limits) require a contended inode schedule. |
+| F9 | Accepted. [Operating contract](#operating-contract-awaiting-operator-confirmation) keeps unaffected files writable after payload-only loss. [Recovery selection and writable promotion](#recovery-selection-and-writable-promotion) specifies offline promotion, scratch sizing and bootstrap without lost config. |
+| F10 | Accepted. [Acceptance contracts](#acceptance-contracts-and-evidence-limits) require a real nonempty journal and refuse deletion of nonexistent devices. |
+| F11 | Accepted. [Acceptance contracts](#acceptance-contracts-and-evidence-limits) prepares three distinct commits and real cleanup debt before retirement cuts. |
+| F12 | Accepted. [Acceptance contracts](#acceptance-contracts-and-evidence-limits) overlaps an admitted write, a draining commit and a late arrival. |
+| F13 | Accepted. [Acceptance contracts](#acceptance-contracts-and-evidence-limits) observes actual API results, elapsed time and status for replica faults. |
+| F14 | Accepted. [Abort, restart and retirement](#abort-restart-and-retirement) and the payload oracle require a dead unretained control to disappear in the same sweep. |
+| F15 | Accepted. [Proposed on-disk formats](#proposed-on-disk-formats) defines one full-record receipt and predecessor digest, including the MAC field. |
+| F16 | Accepted. [Abort, restart and retirement](#abort-restart-and-retirement) completes the same partial fanout before admission and sequence reuse. |
+| F17 | Accepted as a design ambiguity, not proof of implemented counters. [Space, writes and record bounds](#space-writes-and-record-bounds) derives liveness from retained lists and stores no reference counts. |
 
 ## Unverified assumptions
 
