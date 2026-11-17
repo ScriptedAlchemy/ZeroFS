@@ -5,90 +5,159 @@ use crate::fs::key_codec::KeyCodec;
 use crate::pool_object_store::survival_test_support::{self, CatalogImage};
 use crate::segment::FrameLoc;
 use async_trait::async_trait;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
 use tokio::sync::oneshot;
 
 const REPLICA_TIMEOUT: Duration = Duration::from_secs(90);
+// The proposed `final_pause_max_milliseconds` default. A mutation that finds
+// admission closed for a commit waits at most this long, then fails with
+// EAGAIN. Latched closed admission refuses mutations at once.
+const FINAL_PAUSE_MAX: Duration = Duration::from_millis(1000);
 const REPLACEMENT_DEVICE_ID: &str = "fixture-replacement-device";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Row {
-    AuthorityLoss,
-    JournalBeforeBackend,
-    JournalAfterBackend,
-    DataAndReplicaLoss,
-    PayloadRetention,
-    AdmittedWriteLoss,
-    InterruptedCommit,
-    ExactRecovery,
-    SlowReplica,
-    FullReplica,
-    StaleReplica,
-    ErroringReplica,
-    CompetingWriter,
-    ReplacementCatchUp,
-    DurableEnablement,
-    TerminalDisable,
-    StaleRestart,
-    CorruptDependency,
-    CorruptRecord,
-    HighestGeneration,
-    ConflictingForks,
-    PartialFanoutRestart,
-    BacklogRetry,
-    ReadFaultClosed,
-    ReadFaultReadOnly,
-    IdleAndBounds,
-    StatusLag,
-    PromoteAuthority,
-    OrphanCheckpoint,
-    AdmissionLockOrder,
-    DataOnlyLoss,
-    RetentionCrash,
+/// A production prerequisite that the current implementation lacks. Every
+/// acceptance row fails today with exactly one of these as its root cause.
+/// Nothing else constructs it, so a broken fixture or an unrelated error cannot
+/// pass for a missing prerequisite.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+struct Missing(String);
+
+fn missing<T>(prerequisite: impl Into<String>) -> Result<T> {
+    Err(Missing(prerequisite.into()).into())
+}
+
+macro_rules! acceptance_row {
+    ($name:ident, $row:ident, $reason:literal) => {
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = $reason]
+        async fn $name() {
+            tokio::time::timeout(
+                Duration::from_secs(if Row::$row == Row::InterruptedCommit {
+                    5400
+                } else {
+                    600
+                }),
+                acceptance(Row::$row),
+            )
+            .await
+            .expect("acceptance exceeded its deadline")
+            .expect($reason);
+        }
+    };
+}
+
+// The only list of rows. It defines the enum, `Row::ALL`, each row's stated
+// reason and its ignored test, so a row cannot exist without all four.
+macro_rules! acceptance_rows {
+    (
+        core { $($core:ident => $core_test:ident, $core_reason:literal;)+ }
+        review { $($review:ident => $review_test:ident, $review_reason:literal;)+ }
+    ) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Row {
+            $($core,)+
+            $($review,)+
+        }
+
+        impl Row {
+            const ALL: &'static [Self] = &[$(Self::$core,)+ $(Self::$review,)+];
+
+            fn review_case(self) -> bool {
+                matches!(self, $(Self::$review)|+)
+            }
+
+            /// The missing prerequisite this row fails with today, verbatim.
+            /// It is also the row's `#[ignore]` reason.
+            fn stated_reason(self) -> &'static str {
+                match self {
+                    $(Self::$core => $core_reason,)+
+                    $(Self::$review => $review_reason,)+
+                }
+            }
+        }
+
+        $(acceptance_row!($core_test, $core, $core_reason);)+
+        $(acceptance_row!($review_test, $review, $review_reason);)+
+    };
+}
+
+acceptance_rows! {
+    core {
+        AuthorityLoss => authority_device_loss_preserves_committed_namespace,
+            "the metadata_survival configuration table is unsupported";
+        JournalBeforeBackend => journal_device_loss_before_backend_cutoff_preserves_committed_prefix,
+            "the metadata_survival configuration table is unsupported";
+        JournalAfterBackend => journal_device_loss_after_backend_cutoff_preserves_committed_prefix,
+            "the metadata_survival configuration table is unsupported";
+        DataAndReplicaLoss => data_member_with_metadata_replica_loss_preserves_namespace_and_reports_ranges,
+            "the metadata_survival configuration table is unsupported";
+        PayloadRetention => reclaim_preserves_payload_referenced_by_the_last_survival_commit,
+            "the metadata_survival configuration table is unsupported";
+        AdmittedWriteLoss => writes_in_flight_during_loss_preserve_last_survival_commit,
+            "the admitted-write mid-commit hook is absent";
+        InterruptedCommit => interrupted_commit_at_every_step_preserves_a_consistent_generation,
+            "the production commit cut hook is absent";
+        ExactRecovery => recovery_preserves_exact_catalog_identity_cleanup_debts_and_key_epoch,
+            "the metadata_survival configuration table is unsupported";
+        SlowReplica => slow_replica_past_timeout_stops_survival_acknowledgements,
+            "the production Slow replica fault hook is absent";
+        FullReplica => full_replica_stops_survival_acknowledgements,
+            "the production Full replica fault hook is absent";
+        StaleReplica => stale_replica_stops_survival_acknowledgements,
+            "the production Stale replica fault hook is absent";
+        ErroringReplica => erroring_replica_stops_survival_acknowledgements,
+            "the production Io replica fault hook is absent";
+        CompetingWriter => competing_writer_is_refused_by_every_replica_lock,
+            "the production SecondWriter replica fault hook is absent";
+        ReplacementCatchUp => replaced_replica_requires_verified_offline_catch_up,
+            "the production Replacement replica fault hook is absent";
+    }
+    review {
+        DurableEnablement => durable_enablement_survives_missing_or_mismatched_configuration,
+            "the production DurableEnablement scenario hook is absent";
+        TerminalDisable => offline_disable_blocks_stale_recovery_and_requires_a_fresh_epoch,
+            "the production TerminalDisable scenario hook is absent";
+        StaleRestart => restart_refuses_a_replica_that_missed_a_committed_generation,
+            "the production StaleRestart scenario hook is absent";
+        CorruptDependency => recovery_refuses_corrupt_dependency_bytes,
+            "the production CorruptDependency scenario hook is absent";
+        CorruptRecord => recovery_refuses_corrupt_commit_record_bytes,
+            "the production CorruptRecord scenario hook is absent";
+        HighestGeneration => recovery_selects_highest_valid_chain_without_a_receipt_hint,
+            "the production HighestGeneration scenario hook is absent";
+        ConflictingForks => recovery_refuses_authenticated_conflicting_forks,
+            "the production ConflictingForks scenario hook is absent";
+        PartialFanoutRestart => restart_completes_partial_record_fanout_idempotently,
+            "the production PartialFanoutRestart scenario hook is absent";
+        BacklogRetry => large_writeback_backlog_aborts_and_retries_with_admission_open,
+            "the production BacklogRetry scenario hook is absent";
+        ReadFaultClosed => read_faults_defer_catalog_writes_while_admission_is_closed,
+            "the production ReadFaultClosed scenario hook is absent";
+        ReadFaultReadOnly => read_faults_preserve_eio_and_catalog_in_read_only_mode,
+            "the production ReadFaultReadOnly scenario hook is absent";
+        IdleAndBounds => idle_commits_skip_and_records_and_checkpoints_stabilize,
+            "the production IdleAndBounds scenario hook is absent";
+        StatusLag => failed_commits_report_actual_status_and_growing_lag,
+            "the production StatusLag scenario hook is absent";
+        PromoteAuthority => authority_promotion_restores_writes_and_cold_durability,
+            "the production PromoteAuthority scenario hook is absent";
+        OrphanCheckpoint => restart_reconciles_a_named_orphan_checkpoint,
+            "the production OrphanCheckpoint scenario hook is absent";
+        AdmissionLockOrder => admission_precedes_contended_inode_locks,
+            "the production AdmissionLockOrder scenario hook is absent";
+        DataOnlyLoss => payload_only_device_loss_keeps_unaffected_files_writable,
+            "the production DataOnlyLoss scenario hook is absent";
+        RetentionCrash => retained_dependency_union_survives_restart_and_repeated_sweep,
+            "the production RetentionCrash scenario hook is absent";
+        MetadataReplicaLoss => metadata_replica_device_loss_while_writable_closes_admission,
+            "the production MetadataReplicaLoss scenario hook is absent";
+    }
 }
 
 impl Row {
-    const ALL: [Self; 32] = [
-        Self::AuthorityLoss,
-        Self::JournalBeforeBackend,
-        Self::JournalAfterBackend,
-        Self::DataAndReplicaLoss,
-        Self::PayloadRetention,
-        Self::AdmittedWriteLoss,
-        Self::InterruptedCommit,
-        Self::ExactRecovery,
-        Self::SlowReplica,
-        Self::FullReplica,
-        Self::StaleReplica,
-        Self::ErroringReplica,
-        Self::CompetingWriter,
-        Self::ReplacementCatchUp,
-        Self::DurableEnablement,
-        Self::TerminalDisable,
-        Self::StaleRestart,
-        Self::CorruptDependency,
-        Self::CorruptRecord,
-        Self::HighestGeneration,
-        Self::ConflictingForks,
-        Self::PartialFanoutRestart,
-        Self::BacklogRetry,
-        Self::ReadFaultClosed,
-        Self::ReadFaultReadOnly,
-        Self::IdleAndBounds,
-        Self::StatusLag,
-        Self::PromoteAuthority,
-        Self::OrphanCheckpoint,
-        Self::AdmissionLockOrder,
-        Self::DataOnlyLoss,
-        Self::RetentionCrash,
-    ];
-
-    fn review_case(self) -> bool {
-        Self::ALL[14..].contains(&self)
-    }
-
     fn fault(self) -> Option<ReplicaFault> {
         match self {
             Self::SlowReplica => Some(ReplicaFault::Slow),
@@ -754,25 +823,25 @@ struct Observation {
 #[async_trait]
 trait Survival: Sync {
     async fn crash_writer(&self, _live: &mut Live) -> Result<()> {
-        None.context("the production interrupted-writer shutdown hook is absent")
+        missing("the production interrupted-writer shutdown hook is absent")
     }
     async fn commit(&self, live: &Live) -> Result<SurvivalReceipt>;
     async fn recover(&self, sources: &RecoverySources) -> Result<Option<Recovered>>;
     async fn status(&self, _live: &Live) -> Result<SurvivalStatus> {
-        None.context("the production survival status hook is absent")
+        missing("the production survival status hook is absent")
     }
     async fn clear_fault(&self, _live: &Live) -> Result<()> {
-        None.context("the production transient replica retry hook is absent")
+        missing("the production transient replica retry hook is absent")
     }
     async fn review_action(&self, _live: &mut Live, action: review_cases::Action) -> Result<()> {
         let scenario = match action {
             review_cases::Action::Enable(row) => format!("{row:?}"),
             other => format!("{other:?}"),
         };
-        None.with_context(|| format!("the production {scenario} scenario hook is absent"))
+        missing(format!("the production {scenario} scenario hook is absent"))
     }
     async fn owned_checkpoints(&self, _live: &Live) -> Result<Vec<slatedb::Checkpoint>> {
-        None.context("the production owned-checkpoint inspection hook is absent")
+        missing("the production owned-checkpoint inspection hook is absent")
     }
     async fn pause_commit(&self, _live: &Live, _cut: Cut) -> Result<Option<PausedCommit>> {
         Ok(None)
@@ -780,8 +849,10 @@ trait Survival: Sync {
     async fn pause_write(&self, _live: &Live) -> Result<Option<PausedWrite>> {
         Ok(None)
     }
-    async fn fault(&self, _live: &Live, _fault: ReplicaFault) -> Result<FaultObservation> {
-        Ok(FaultObservation::default())
+    async fn fault(&self, _live: &Live, fault: ReplicaFault) -> Result<FaultObservation> {
+        missing(format!(
+            "the production {fault:?} replica fault hook is absent"
+        ))
     }
 }
 
@@ -790,15 +861,23 @@ struct CurrentImplementation;
 #[async_trait]
 impl Survival for CurrentImplementation {
     async fn commit(&self, live: &Live) -> Result<SurvivalReceipt> {
-        let _settings = live.proposed_settings()?;
         // The future production binding must return the owner's real receipt.
-        // Accepting the configuration alone supplies no such receipt.
-        None.context("the production survival receipt hook is absent")
+        // Accepting the configuration alone supplies no such receipt. Today the
+        // parser refuses the table first, because config.rs denies unknown pool
+        // fields. Only that exact refusal is the missing prerequisite. Any other
+        // parse error is a fixture fault and stays one.
+        match live.proposed_settings() {
+            Ok(_settings) => missing("the production survival receipt hook is absent"),
+            Err(error) if format!("{error:#}").contains("unknown field `metadata_survival`") => {
+                missing("the metadata_survival configuration table is unsupported")
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn recover(&self, sources: &RecoverySources) -> Result<Option<Recovered>> {
         let _bootstrap_inputs = (&sources.replicas, sources.password, &sources.scratch_parent);
-        None.context("the production offline recovery hook is absent")
+        missing("the production offline recovery hook is absent")
     }
 }
 
@@ -833,6 +912,11 @@ impl Survival for StubSurvival {
     async fn recover(&self, _sources: &RecoverySources) -> Result<Option<Recovered>> {
         Ok(None)
     }
+    // The stub claims no injected fault. The mutation test's optimistic
+    // observation supplies one.
+    async fn fault(&self, _live: &Live, _fault: ReplicaFault) -> Result<FaultObservation> {
+        Ok(FaultObservation::default())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -853,6 +937,8 @@ enum SurvivalFailure {
     Corrupt,
     #[error("authenticated commit chains conflict")]
     Fork,
+    #[error("metadata replica device is lost")]
+    Lost,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -870,7 +956,7 @@ async fn probe_create(live: &Live, name: &[u8]) -> Result<Result<(), FsError>> {
     let auth = AuthContext::default();
     let creds = Credentials::from_auth_context(&auth);
     Ok(tokio::time::timeout(
-        Duration::from_secs(2),
+        FINAL_PAUSE_MAX + Duration::from_secs(1),
         live.fs().create(&creds, 0, name, &SetAttributes::default()),
     )
     .await
@@ -1200,7 +1286,7 @@ fn oracle(row: Row, live: &Live, observed: &Observation) -> Result<()> {
         Row::AdmittedWriteLoss => ensure!(
             observed.admitted_pending_at_loss
                 && observed.commit_waited_for_admitted
-                && observed.late_arrival == Some(Err(FsError::ReadOnlyFilesystem)),
+                && observed.late_arrival == Some(Err(FsError::RetryLater)),
             "the admitted write must overlap a waiting commit and a bounded rejected late arrival"
         ),
         Row::InterruptedCommit => {
@@ -1792,7 +1878,7 @@ async fn one_case(row: Row, live: &mut Live, driver: &dyn Survival) -> Result<()
         let write = driver
             .pause_write(live)
             .await?
-            .context("the admitted-write mid-commit hook is absent")?;
+            .ok_or_else(|| Missing("the admitted-write mid-commit hook is absent".to_owned()))?;
         let mut commit = None;
         let result = async {
             let prior = driver.commit(live).await?;
@@ -1813,7 +1899,7 @@ async fn one_case(row: Row, live: &mut Live, driver: &dyn Survival) -> Result<()
             let pause = driver
                 .pause_commit(live, cut)
                 .await?
-                .context("the production commit drain hook is absent")?;
+                .ok_or_else(|| Missing("the production commit drain hook is absent".to_owned()))?;
             pause
                 .start
                 .send(())
@@ -2041,30 +2127,43 @@ async fn acceptance(row: Row) -> Result<()> {
                 }
                 None => {
                     idle_fixture = Some(live);
-                    Err(anyhow::anyhow!(
-                        "the production commit cut hook is absent for {cut:?}"
+                    Err(anyhow::Error::from(Missing(
+                        "the production commit cut hook is absent".to_owned(),
                     ))
+                    .context(format!("{cut:?}")))
                 }
             };
             if let Err(error) = result {
                 println!("METADATA_SURVIVAL_COMMIT_CUT {cut:?} {error:#}");
-                failures.push(format!("{cut:?}. {error:#}"));
+                failures.push(error);
             }
         }
-        let result = if let Some(first) = failures.first() {
-            Err(anyhow::anyhow!(
-                "{} commit cuts failed. {first}",
-                failures.len()
-            ))
-        } else {
-            Ok(())
+        // The row keeps a cut's own error only when every requested cut failed
+        // with the same root cause. A partial pass or mixed causes produce a
+        // summary that names no single missing prerequisite.
+        let requested = cuts().len();
+        let failed = failures.len();
+        let mut causes: Vec<String> = failures
+            .iter()
+            .map(|error| error.root_cause().to_string())
+            .collect();
+        causes.sort();
+        causes.dedup();
+        let result = match failures.into_iter().next() {
+            None => Ok(()),
+            Some(first) if failed == requested && causes.len() == 1 => {
+                Err(first.context(format!("all {requested} commit cuts failed")))
+            }
+            Some(_) => Err(anyhow::anyhow!(
+                "{failed} of {requested} commit cuts failed, with root causes {causes:?}"
+            )),
         };
         if let Some(live) = idle_fixture {
             finish(live, row, Ok(())).await?;
         }
         println!(
             "METADATA_SURVIVAL_ACCEPTANCE {}",
-            serde_json::json!({"row": "InterruptedCommit", "requested_cuts": cuts().len(), "failed_cuts": failures.len(), "cleanup": "passed"})
+            serde_json::json!({"row": "InterruptedCommit", "requested_cuts": cuts().len(), "failed_cuts": failed, "cleanup": "passed"})
         );
         return result;
     }
@@ -2072,97 +2171,6 @@ async fn acceptance(row: Row) -> Result<()> {
     let result = one_case(row, &mut live, &CurrentImplementation).await;
     finish(live, row, result).await
 }
-
-macro_rules! acceptance_row {
-    ($name:ident, $row:ident, $reason:literal) => {
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        #[ignore = $reason]
-        async fn $name() {
-            tokio::time::timeout(
-                Duration::from_secs(if Row::$row == Row::InterruptedCommit {
-                    5400
-                } else {
-                    600
-                }),
-                acceptance(Row::$row),
-            )
-            .await
-            .expect("acceptance exceeded its deadline")
-            .expect($reason);
-        }
-    };
-}
-
-acceptance_row!(
-    authority_device_loss_preserves_committed_namespace,
-    AuthorityLoss,
-    "Named survival receipts and offline authority recovery are missing"
-);
-acceptance_row!(
-    journal_device_loss_before_backend_cutoff_preserves_committed_prefix,
-    JournalBeforeBackend,
-    "A receipt-covered recovery prefix independent of the journal is missing"
-);
-acceptance_row!(
-    journal_device_loss_after_backend_cutoff_preserves_committed_prefix,
-    JournalAfterBackend,
-    "A survival commit covering the drained suffix is missing"
-);
-acceptance_row!(
-    data_member_with_metadata_replica_loss_preserves_namespace_and_reports_ranges,
-    DataAndReplicaLoss,
-    "Metadata replica recovery and exact sole-copy range reporting are missing"
-);
-acceptance_row!(
-    reclaim_preserves_payload_referenced_by_the_last_survival_commit,
-    PayloadRetention,
-    "Survival receipts and payload-retention enforcement are missing"
-);
-acceptance_row!(
-    writes_in_flight_during_loss_preserve_last_survival_commit,
-    AdmittedWriteLoss,
-    "The admitted-write mid-commit hook is absent"
-);
-acceptance_row!(
-    interrupted_commit_at_every_step_preserves_a_consistent_generation,
-    InterruptedCommit,
-    "The production commit cut hook is absent"
-);
-acceptance_row!(
-    recovery_preserves_exact_catalog_identity_cleanup_debts_and_key_epoch,
-    ExactRecovery,
-    "Replicated catalog exports and committed envelope epochs are missing"
-);
-acceptance_row!(
-    slow_replica_past_timeout_stops_survival_acknowledgements,
-    SlowReplica,
-    "The Slow replica hook is absent"
-);
-acceptance_row!(
-    full_replica_stops_survival_acknowledgements,
-    FullReplica,
-    "The Full replica hook is absent"
-);
-acceptance_row!(
-    stale_replica_stops_survival_acknowledgements,
-    StaleReplica,
-    "The Stale replica hook is absent"
-);
-acceptance_row!(
-    erroring_replica_stops_survival_acknowledgements,
-    ErroringReplica,
-    "The Io replica hook is absent"
-);
-acceptance_row!(
-    competing_writer_is_refused_by_every_replica_lock,
-    CompetingWriter,
-    "The SecondWriter replica hook is absent"
-);
-acceptance_row!(
-    replaced_replica_requires_verified_offline_catch_up,
-    ReplacementCatchUp,
-    "The Replacement replica hook is absent"
-);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_acceptance_oracle_rejects_success_without_survival() -> Result<()> {
@@ -2175,7 +2183,7 @@ async fn every_acceptance_oracle_rejects_success_without_survival() -> Result<()
             .is_none()
     );
     let mut rejected = 0;
-    for row in Row::ALL {
+    for &row in Row::ALL {
         // Feed successful stub output directly to the same oracle used by the
         // ignored row. Configuration rejection cannot make this mutation pass.
         let observed = StubSurvival.observe(row, &live).await?;
@@ -2218,7 +2226,7 @@ async fn every_acceptance_oracle_rejects_success_without_survival() -> Result<()
                 .collect(),
             admitted_pending_at_loss: true,
             commit_waited_for_admitted: true,
-            late_arrival: Some(Err(FsError::ReadOnlyFilesystem)),
+            late_arrival: Some(Err(FsError::RetryLater)),
             review: row
                 .review_case()
                 .then(|| review_cases::optimistic(row, &live, &receipt)),
@@ -2271,6 +2279,61 @@ async fn every_acceptance_oracle_rejects_success_without_survival() -> Result<()
         "the stub manufactured a durable commit"
     );
     finish(live, Row::ExactRecovery, Ok(())).await
+}
+
+// Each row runs its real driver path against the current implementation, with
+// its own fresh fixture, until its first missing prerequisite. The row must
+// fail with exactly the `Missing` error it states. A row that passes, panics,
+// times out, or fails for any other reason (a broken fixture, an unrelated
+// error, a different missing prerequisite) fails this test. Rows come from
+// `Row::ALL`, so a new row is covered without editing this test.
+//
+// The budget bounds each row, not the matrix it would run with a production
+// binding. Today every row stops at its first driver call. If a binding lets
+// a row run further, this test fails until the row's stated reason is updated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_acceptance_row_fails_for_its_stated_reason() -> Result<()> {
+    const ROW_BUDGET: Duration = Duration::from_secs(120);
+    let outcomes: Vec<_> = futures::stream::iter(Row::ALL.iter().copied())
+        .map(|row| async move {
+            let started = std::time::Instant::now();
+            let outcome = tokio::spawn(tokio::time::timeout(ROW_BUDGET, acceptance(row))).await;
+            (row, started.elapsed(), outcome)
+        })
+        .buffer_unordered(4)
+        .collect()
+        .await;
+    ensure!(outcomes.len() == Row::ALL.len(), "a row was not run");
+    let mut wrong = Vec::new();
+    for (row, elapsed, outcome) in outcomes {
+        let verdict = match outcome {
+            Err(join) => format!("panicked: {join}"),
+            Ok(Err(_)) => format!("reached no failure within {ROW_BUDGET:?}"),
+            Ok(Ok(Ok(()))) => "passed without a survival implementation".to_owned(),
+            Ok(Ok(Err(error))) => match error.root_cause().downcast_ref::<Missing>() {
+                Some(Missing(reason)) if reason == row.stated_reason() => {
+                    println!(
+                        "METADATA_SURVIVAL_STATED_REASON {row:?} seconds={:.1} {reason}",
+                        elapsed.as_secs_f64()
+                    );
+                    continue;
+                }
+                _ => format!("failed for another reason: {error:#}"),
+            },
+        };
+        wrong.push(format!(
+            "{row:?} states \"{}\" but {verdict}",
+            row.stated_reason()
+        ));
+    }
+    ensure!(
+        wrong.is_empty(),
+        "{} of {} rows did not fail for their stated reason:\n{}",
+        wrong.len(),
+        Row::ALL.len(),
+        wrong.join("\n")
+    );
+    Ok(())
 }
 
 #[test]
