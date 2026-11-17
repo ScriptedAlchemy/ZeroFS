@@ -1096,6 +1096,115 @@ mod tests {
         assert_eq!(global.snapshot().reserved_bytes, 0);
     }
 
+    /// Frames past the request limit wait in their own tasks, charged to the
+    /// reader's one-msize pending envelope. Offer a burst of paused metadata
+    /// requests on one connection and check that the reader reads all of it,
+    /// and that the waiting frames do not take the process-wide request slots
+    /// another connection needs.
+    #[tokio::test]
+    async fn waiting_frames_on_one_connection_leave_other_connections_admissible() {
+        const OFFERED: usize = CONNECTION_INFLIGHT_REQUESTS + 100;
+        let (_, handler) = in_memory_handler().await;
+        establish_session(&handler, 1, b"root", 0, None).await;
+        let global = P9GlobalAdmission::for_test(GLOBAL_INFLIGHT_MEMORY, GLOBAL_INFLIGHT_REQUESTS);
+        let busy =
+            global.connection_for_test(CONNECTION_INFLIGHT_MEMORY, CONNECTION_INFLIGHT_REQUESTS);
+        let other =
+            global.connection_for_test(CONNECTION_INFLIGHT_MEMORY, CONNECTION_INFLIGHT_REQUESTS);
+        let requests = TaskTracker::new();
+        let (tx, mut rx) = mpsc::channel(OFFERED + 1);
+        let (mut client, server) = tokio::io::duplex(4 * 1024 * 1024);
+        let shutdown = CancellationToken::new();
+
+        let mut releases = Vec::new();
+        let mut frames = Vec::new();
+        let mut frame_len = 0;
+        for index in 0..OFFERED {
+            let mut op_id = [0xd5; P9_OP_ID_LEN];
+            op_id[..2].copy_from_slice(&(index as u16).to_le_bytes());
+            let (_reached, release) = pause_success_terminal_dedup(op_id);
+            releases.push(release);
+            let frame = P9Message::new_with_op_id(
+                10 + index as u16,
+                op_id,
+                Message::Tmkdir(Tmkdir {
+                    dfid: 1,
+                    name: P9String::new(format!("burst-{index:04}").into_bytes()),
+                    mode: 0o755,
+                    gid: 0,
+                }),
+            )
+            .to_bytes_ctx(true)
+            .unwrap();
+            frame_len = frame.len();
+            frames.extend(frame);
+        }
+        client.write_all(&frames).await.unwrap();
+
+        let reader = handle_client_loop(
+            Arc::clone(&handler),
+            server,
+            tx,
+            shutdown.clone(),
+            CancellationToken::new(),
+            &busy,
+            &requests,
+        );
+        let observe = async {
+            // The reader starts one task per frame it reads.
+            let read_all = tokio::time::timeout(TEST_TIMEOUT, async {
+                while requests.len() < OFFERED {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+            let read = requests.len();
+            let probe = frame(9, Message::Tgetlineage(ninep_proto::Tgetlineage));
+            let other_admitted = tokio::time::timeout(
+                TEST_TIMEOUT,
+                other.admit_frame_or_shutdown(&probe, &CancellationToken::new()),
+            )
+            .await
+            .ok()
+            .map(|admitted| admitted.unwrap());
+            let busy_global_slots =
+                global.snapshot().active_requests - usize::from(other_admitted.is_some());
+            let other_admitted_now = other_admitted.is_some();
+            drop(other_admitted);
+            for release in releases.drain(..) {
+                let _ = release.send(());
+            }
+            for _ in 0..OFFERED {
+                tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                    .await
+                    .expect("released requests must reply")
+                    .expect("response channel");
+            }
+            shutdown.cancel();
+            (read_all, read, other_admitted_now, busy_global_slots)
+        };
+        let (reader_result, (read_all, read, other_admitted, busy_global_slots)) =
+            tokio::join!(reader, observe);
+        reader_result.unwrap();
+        requests.close();
+        requests.wait().await;
+
+        let pending_capacity =
+            P9_MAX_MSIZE as usize / (frame_len + session::PENDING_REQUEST_TASK_BYTES);
+        assert!(
+            read_all,
+            "the reader read {read} of {OFFERED} frames; its pending envelope holds about \
+             {pending_capacity} small frames"
+        );
+        assert!(
+            other_admitted,
+            "one connection's waiting frames hold {busy_global_slots} of \
+             {GLOBAL_INFLIGHT_REQUESTS} process-wide request slots"
+        );
+        assert!(busy_global_slots <= CONNECTION_INFLIGHT_REQUESTS);
+    }
+
     /// A Samba share served through one 9P mount shares one connection, so
     /// the number of metadata requests that connection can hold is the
     /// share's metadata concurrency. Offer more paused `Tmkdir` requests than
