@@ -186,8 +186,7 @@ impl NinePServer {
         let result = self
             .start_with_accepted_work(shutdown, accepted_work.clone())
             .await;
-        accepted_work.stop_accepting();
-        accepted_work.wait().await;
+        accepted_work.settle(session::CLIENT_DRAIN_TIMEOUT).await;
         result
     }
 
@@ -1817,6 +1816,46 @@ mod tests {
             fixture.rx.try_recv().is_err(),
             "a dropped request must not reply"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_shutdown_settlement_is_bounded_when_a_commit_never_applies() {
+        let mut fixture = ProcessShutdownFixture::new().await;
+        let block_apply = fixture.filesystem.db.flush_barrier().write_owned().await;
+        let queued = fixture.filesystem.write_coordinator.probe_next_apply();
+        fixture.dispatch_mkdir(10, [0x95; 16], b"stuck").await;
+        tokio::time::timeout(TEST_TIMEOUT, queued)
+            .await
+            .expect("the mkdir must queue its commit")
+            .unwrap();
+
+        fixture.shut_down();
+        let revoked = tokio::time::timeout(
+            TEST_TIMEOUT,
+            fixture.accepted_work.settle(Duration::from_millis(50)),
+        )
+        .await
+        .expect("process settlement must return within its grace");
+        assert_eq!(revoked, 1, "settlement must report the request it revoked");
+        tokio::time::timeout(TEST_TIMEOUT, fixture.requests.wait())
+            .await
+            .expect("a revoked request must be dropped");
+        assert!(
+            fixture.rx.try_recv().is_err(),
+            "a revoked request must not reply"
+        );
+
+        // The queued commit still owns the directory lock and applies once
+        // its backend can.
+        assert!(fixture.filesystem.lock_manager.is_locked_for_test(0));
+        assert!(!fixture.entry_exists(b"stuck").await);
+        drop(block_apply);
+        drop(
+            tokio::time::timeout(TEST_TIMEOUT, fixture.filesystem.lock_manager.acquire(0))
+                .await
+                .expect("the lock must be released once the commit applies"),
+        );
+        assert!(fixture.entry_exists(b"stuck").await);
     }
 
     #[tokio::test(flavor = "current_thread")]

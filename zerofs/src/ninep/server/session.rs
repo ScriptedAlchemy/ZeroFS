@@ -591,6 +591,7 @@ fn start_9p_request(
         (None, Vec::new(), request_lease, prior_waiters)
     };
     let abandonment = Arc::clone(&request_lease.state.abandonment);
+    let revoked = accepted_work.revoked();
 
     let handler = Arc::clone(context.handler);
     let tx = context.tx.clone();
@@ -719,15 +720,16 @@ fn start_9p_request(
 
     let request = context.requests.track_future(async move {
         // A disconnected client retains process ownership during its bounded
-        // settlement grace. Process shutdown is different: no response can be
-        // delivered, and the mutation layer owns work after submission, so
-        // dropping the protocol future releases its request and accepted-work
-        // guards without abandoning committed work. A Tflush drops only a
-        // request that has made no observable change.
+        // settlement grace. A Tflush, and process shutdown, drop only a
+        // request that has made no observable change. Past its point of no
+        // return a request may hold locks across a queued commit and owes the
+        // operation ledger its result, so it runs on until process shutdown
+        // revokes it at the end of its grace
+        // (`P9AcceptedWorkTracker::settle`).
         tokio::select! {
             biased;
-            _ = request_shutdown.cancelled() => {}
-            _ = abandonment.abandoned() => {}
+            _ = revoked => {}
+            _ = abandoned(&request_shutdown, &abandonment) => {}
             _ = request => {}
         }
     });
@@ -739,6 +741,21 @@ fn start_9p_request(
     );
     drop(spawn_named("9p-request", request));
     Ok(StartedRequest { admitted })
+}
+
+/// Resolves once `abandonment` is abandoned: by a `Tflush`, or by process
+/// shutdown while the request has not passed its point of no return.
+async fn abandoned(shutdown: &CancellationToken, abandonment: &Abandonment) {
+    let abandon_at_shutdown = async {
+        shutdown.cancelled().await;
+        // Fails once the request is committed; it then runs to completion.
+        abandonment.abandon();
+        std::future::pending::<()>().await
+    };
+    tokio::select! {
+        _ = abandonment.abandoned() => {}
+        _ = abandon_at_shutdown => {}
+    }
 }
 
 /// Charge for one frame read by the connection reader.

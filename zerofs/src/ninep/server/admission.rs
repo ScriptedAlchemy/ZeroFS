@@ -47,10 +47,21 @@ pub(crate) struct P9AcceptedWorkTracker {
 struct P9AcceptedWorkInner {
     accepting: AtomicBool,
     tasks: TaskTracker,
+    /// Cancelled when process shutdown stops waiting for accepted work.
+    revoked: CancellationToken,
 }
 
 pub(crate) struct P9AcceptedWorkGuard {
     _token: TaskTrackerToken,
+    revoked: CancellationToken,
+}
+
+impl P9AcceptedWorkGuard {
+    /// Resolves when process shutdown stops waiting for this work
+    /// ([`P9AcceptedWorkTracker::settle`]).
+    pub(crate) fn revoked(&self) -> tokio_util::sync::WaitForCancellationFutureOwned {
+        self.revoked.clone().cancelled_owned()
+    }
 }
 
 impl P9AcceptedWorkTracker {
@@ -59,6 +70,7 @@ impl P9AcceptedWorkTracker {
             inner: Arc::new(P9AcceptedWorkInner {
                 accepting: AtomicBool::new(true),
                 tasks: TaskTracker::new(),
+                revoked: CancellationToken::new(),
             }),
         }
     }
@@ -70,7 +82,10 @@ impl P9AcceptedWorkTracker {
         if !self.inner.accepting.load(Ordering::Acquire) {
             return None;
         }
-        Some(P9AcceptedWorkGuard { _token: token })
+        Some(P9AcceptedWorkGuard {
+            _token: token,
+            revoked: self.inner.revoked.clone(),
+        })
     }
 
     pub(crate) fn stop_accepting(&self) {
@@ -82,7 +97,42 @@ impl P9AcceptedWorkTracker {
         self.inner.tasks.wait().await;
     }
 
-    #[cfg(test)]
+    /// Stop accepting work and wait up to `grace` for accepted work to finish.
+    ///
+    /// Process shutdown drops a request that has made no observable change,
+    /// but a request past its point of no return runs on: it may hold locks
+    /// across a queued commit, and it owes the operation ledger its result.
+    /// This bounds that wait. Work still running after `grace` is revoked:
+    /// its request is dropped without a reply. A commit it already queued is
+    /// unaffected, because the commit owns the request's locks
+    /// ([`crate::fs::write_coordinator::HeldUntilApplied`]) and the final
+    /// close drains the commit queue or reports that it could not.
+    ///
+    /// Returns how many accepted requests were revoked.
+    pub(crate) async fn settle(&self, grace: std::time::Duration) -> usize {
+        self.stop_accepting();
+        if tokio::time::timeout(grace, self.wait()).await.is_ok() {
+            return 0;
+        }
+        let revoked = self.len();
+        self.inner.revoked.cancel();
+        metrics::counter!("zerofs_p9_shutdown_revoked_requests_total").increment(revoked as u64);
+        tracing::error!(
+            revoked,
+            grace_ms = grace.as_millis() as u64,
+            "accepted 9P requests did not finish within the shutdown grace; dropping them \
+             without replies. Commits they queued keep their locks until they apply, and the \
+             final close reports any commit that cannot."
+        );
+        if tokio::time::timeout(grace, self.wait()).await.is_err() {
+            tracing::error!(
+                remaining = self.len(),
+                "accepted work is still running after revocation; the final close bounds it"
+            );
+        }
+        revoked
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.inner.tasks.len()
     }
