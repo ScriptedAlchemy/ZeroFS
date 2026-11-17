@@ -1,6 +1,7 @@
 import { lazy, Suspense, useState } from "react";
 import { Routes, Route, useLocation } from "react-router";
 import { Layout } from "./components/layout/Layout";
+import { ActivePage } from "./hooks/use-title";
 import { FilesPage } from "./pages/files";
 
 const DashboardPage = lazy(() => import("./pages/dashboard").then((m) => ({ default: m.DashboardPage })));
@@ -12,7 +13,11 @@ function KeepAlive({ active, children }: { active: boolean; children: React.Reac
   const [mounted, setMounted] = useState(active);
   if (active && !mounted) setMounted(true);
   if (!mounted) return null;
-  return <div className={`h-full ${active ? "" : "hidden"}`}>{children}</div>;
+  return (
+    <ActivePage.Provider value={active}>
+      <div className={`h-full ${active ? "" : "hidden"}`}>{children}</div>
+    </ActivePage.Provider>
+  );
 }
 
 export default function App() {
