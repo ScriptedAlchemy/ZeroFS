@@ -7,6 +7,9 @@ struct XattrFid<'a> {
     conn: Arc<Conn>,
     fid: u32,
     settled: bool,
+    /// One admission slot covers the whole exchange. Each dispatched step's
+    /// response slot also holds a clone until its reply or teardown.
+    admission: AdmissionPermit,
 }
 
 impl Drop for XattrFid<'_> {
@@ -21,6 +24,7 @@ impl Drop for XattrFid<'_> {
 impl NinePClient {
     async fn xattr_fid(&self, fid: u32) -> ClientResult<XattrFid<'_>> {
         self.validate_fids([fid])?;
+        let admission = self.acquire_request_admission().await?;
         let conn = loop {
             self.wait_until_live().await?;
             let conn = self.conn.load_full();
@@ -36,15 +40,17 @@ impl NinePClient {
             conn,
             fid: self.alloc_fid(),
             settled: false,
+            admission,
         })
     }
 
     // An xattr fid exists only on this connection. A reconnect must abort the
     // whole exchange because staged bytes and the clunk result cannot replay.
-    async fn xattr_rpc(conn: &Conn, body: Message) -> ClientResult<Message> {
+    async fn xattr_rpc(attr: &XattrFid<'_>, body: Message) -> ClientResult<Message> {
+        let conn = &attr.conn;
         match runtime::timeout(
             REQUEST_TIMEOUT,
-            Self::send_raw_at_tag_ctx(conn, None, body, true),
+            Self::send_raw_at_tag_ctx(conn, None, body, true, Some(&attr.admission)),
         )
         .await
         {
@@ -80,7 +86,7 @@ impl NinePClient {
         let mut attr = self.xattr_fid(fid).await?;
         let result = async {
             let size = match Self::xattr_rpc(
-                &attr.conn,
+                &attr,
                 Message::Txattrwalk(Txattrwalk {
                     fid,
                     newfid: attr.fid,
@@ -100,7 +106,7 @@ impl NinePClient {
             while value.len() < size {
                 let count = (size - value.len()).min(self.max_io().max(1) as usize) as u32;
                 match Self::xattr_rpc(
-                    &attr.conn,
+                    &attr,
                     Message::Tread(Tread {
                         fid: attr.fid,
                         offset: value.len() as u64,
@@ -118,7 +124,7 @@ impl NinePClient {
             Ok(value.freeze())
         }
         .await;
-        let clunk = Self::xattr_rpc(&attr.conn, Message::Tclunk(Tclunk { fid: attr.fid })).await;
+        let clunk = Self::xattr_rpc(&attr, Message::Tclunk(Tclunk { fid: attr.fid })).await;
         attr.settled = matches!(&clunk, Ok(Message::Rclunk(_)) | Err(ClientError::Errno(_)));
         match result {
             Err(error) => Err(error),
@@ -158,7 +164,7 @@ impl NinePClient {
         let mut attr = self.xattr_fid(fid).await?;
         let result = async {
             match Self::xattr_rpc(
-                &attr.conn,
+                &attr,
                 Message::Twalk(Twalk {
                     fid,
                     newfid: attr.fid,
@@ -172,7 +178,7 @@ impl NinePClient {
                 _ => return Err(ClientError::Unexpected("xattr clone")),
             }
             match Self::xattr_rpc(
-                &attr.conn,
+                &attr,
                 Message::Txattrcreate(Txattrcreate {
                     fid: attr.fid,
                     name: P9String::new(name.to_vec()),
@@ -190,7 +196,7 @@ impl NinePClient {
             let max = self.max_write_payload().max(1) as usize;
             for (i, chunk) in value.chunks(max).enumerate() {
                 match Self::xattr_rpc(
-                    &attr.conn,
+                    &attr,
                     Message::Twrite(Twrite {
                         fid: attr.fid,
                         offset: (i * max) as u64,
@@ -212,7 +218,7 @@ impl NinePClient {
                 // An errno is a completed request. Clunk the temporary fid;
                 // an incomplete write may itself return EINVAL at cleanup.
                 let cleanup =
-                    Self::xattr_rpc(&attr.conn, Message::Tclunk(Tclunk { fid: attr.fid })).await;
+                    Self::xattr_rpc(&attr, Message::Tclunk(Tclunk { fid: attr.fid })).await;
                 attr.settled =
                     matches!(cleanup, Ok(Message::Rclunk(_)) | Err(ClientError::Errno(_)));
                 return Err(error);
@@ -222,7 +228,7 @@ impl NinePClient {
             Err(error) => return Err(error),
             Ok(()) => {}
         }
-        let result = Self::xattr_rpc(&attr.conn, Message::Tclunk(Tclunk { fid: attr.fid })).await;
+        let result = Self::xattr_rpc(&attr, Message::Tclunk(Tclunk { fid: attr.fid })).await;
         attr.settled = matches!(&result, Ok(Message::Rclunk(_)) | Err(ClientError::Errno(_)));
         match result {
             Ok(Message::Rclunk(_)) => {

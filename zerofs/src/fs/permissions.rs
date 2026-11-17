@@ -75,12 +75,19 @@ pub(crate) fn new_entry_gid(
 }
 
 /// Clears the setgid bit on a new non-directory entry unless the caller is
-/// root or a member of the entry's group, as Linux does at creation.
-pub(crate) fn strip_sgid_unless_member(mode: u32, gid: u32, creds: &Credentials) -> u32 {
-    if creds.uid != 0 && !creds.is_member_of_group(gid) {
-        mode & !0o2000
-    } else {
+/// root or a member of the entry's group. An inherited group follows Linux
+/// `mode_strip_sgid`, which keeps the bit when group execute is clear.
+pub(crate) fn strip_sgid_unless_member(
+    parent: &DirectoryInode,
+    mode: u32,
+    gid: u32,
+    creds: &Credentials,
+) -> u32 {
+    let inherited = parent.mode & 0o2000 != 0 && gid == parent.gid;
+    if inherited && mode & 0o010 == 0 || creds.uid == 0 || creds.is_member_of_group(gid) {
         mode
+    } else {
+        mode & !0o2000
     }
 }
 

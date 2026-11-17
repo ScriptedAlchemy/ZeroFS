@@ -117,7 +117,9 @@ impl NFSAdapter {
         let mut attr = SetAttributes::from(attr);
         if let Some(identity) = self.shared_identity {
             attr.uid = SetUid::Set(identity.uid);
-            attr.gid = SetGid::Set(identity.gid);
+            // The identity's group is in the credentials, so a setgid
+            // parent's group still wins.
+            attr.gid = SetGid::NoChange;
         }
         attr
     }
@@ -822,6 +824,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((attrs.uid, attrs.gid), (501, 20));
+    }
+
+    #[tokio::test]
+    async fn shared_identity_creates_under_a_setgid_parent_take_the_parent_group() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let shared_adapter = NFSAdapter::new(Arc::clone(&fs))
+            .with_shared_identity(Some(NfsSharedIdentity { uid: 501, gid: 20 }));
+        let auth = NfsAuthContext {
+            uid: 1000,
+            gid: 1000,
+            gids: Vec::new(),
+        };
+        let root_auth = NfsAuthContext {
+            uid: 0,
+            gid: 0,
+            gids: Vec::new(),
+        };
+        let mut groups = Vec::new();
+        for (parent_name, parent_mode) in [(b"plain".as_slice(), 0o777), (b"sgid", 0o2777)] {
+            let (parent, _) = NFSAdapter::new(Arc::clone(&fs))
+                .mkdir(
+                    &root_auth,
+                    0,
+                    &filename(parent_name),
+                    &sattr3 {
+                        mode: set_mode3::mode(parent_mode),
+                        gid: set_gid3::gid(2000),
+                        ..sattr3::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let (_, file) = shared_adapter
+                .create(&auth, parent, &filename(b"file"), sattr3::default())
+                .await
+                .unwrap();
+            let (_, dir) = shared_adapter
+                .mkdir(&auth, parent, &filename(b"dir"), &sattr3::default())
+                .await
+                .unwrap();
+            let (_, link) = shared_adapter
+                .symlink(
+                    &auth,
+                    parent,
+                    &filename(b"link"),
+                    &nfspath3 {
+                        0: b"file".to_vec(),
+                    },
+                    &sattr3::default(),
+                )
+                .await
+                .unwrap();
+            let (_, fifo) = shared_adapter
+                .mknod(
+                    &auth,
+                    parent,
+                    &filename(b"fifo"),
+                    ftype3::NF3FIFO,
+                    &sattr3::default(),
+                    None,
+                )
+                .await
+                .unwrap();
+            groups.push([file.gid, dir.gid, link.gid, fifo.gid]);
+        }
+        assert_eq!(groups, [[20; 4], [2000; 4]]);
     }
 
     #[tokio::test]

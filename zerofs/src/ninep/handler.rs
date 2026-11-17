@@ -655,7 +655,8 @@ impl NinePHandler {
 
     /// Returns the effective GID for a create-type operation. When a credential
     /// override is active, the server-configured GID is used instead of
-    /// whatever the client sent.
+    /// whatever the client sent. Creates pass it in the credentials rather
+    /// than as an explicit group, so a setgid parent's group still wins.
     fn effective_gid(&self, client_gid: u32, fid_creds: &Credentials) -> u32 {
         if self.credential_override.is_some() {
             fid_creds.gid
@@ -1868,7 +1869,7 @@ impl NinePHandler {
                 &SetAttributes {
                     mode: SetMode::Set(mode),
                     uid: SetUid::Set(parent_fid.creds.uid),
-                    gid: SetGid::Set(gid),
+                    gid: SetGid::NoChange,
                     ..Default::default()
                 },
                 op_id,
@@ -2197,7 +2198,7 @@ impl NinePHandler {
                 &SetAttributes {
                     mode: SetMode::Set(tm.mode),
                     uid: SetUid::Set(parent_fid.creds.uid),
-                    gid: SetGid::Set(gid),
+                    gid: SetGid::NoChange,
                     ..Default::default()
                 },
                 op_id,
@@ -2239,7 +2240,7 @@ impl NinePHandler {
                 &SetAttributes {
                     mode: SetMode::Set(SYMLINK_DEFAULT_MODE),
                     uid: SetUid::Set(parent_fid.creds.uid),
-                    gid: SetGid::Set(gid),
+                    gid: SetGid::NoChange,
                     ..Default::default()
                 },
                 op_id,
@@ -2294,7 +2295,7 @@ impl NinePHandler {
                 &SetAttributes {
                     mode: SetMode::Set(tm.mode & 0o7777),
                     uid: SetUid::Set(parent_fid.creds.uid),
-                    gid: SetGid::Set(gid),
+                    gid: SetGid::NoChange,
                     ..Default::default()
                 },
                 rdev,
@@ -7591,6 +7592,104 @@ mod tests {
             .expect("9P Tfsync did not resume")
             .expect("9P Tfsync panicked");
         assert!(matches!(reply.body, Message::Rfsync(_)));
+    }
+
+    /// Creates one entry of each kind through 9P with request gid 1000 under
+    /// a parent owned by group 2000, and returns each new entry's group.
+    async fn protocol_create_groups(parent_mode: u32) -> Vec<(&'static str, u32, u32)> {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let (parent, _) = fs
+            .mkdir(
+                &test_creds(),
+                0,
+                b"shared",
+                &SetAttributes {
+                    mode: SetMode::Set(parent_mode),
+                    gid: SetGid::Set(2000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+        start_plain_session(&handler).await;
+        expect_walk(&handler, 2, 1, 2, &[b"shared"]).await;
+        expect_walk(&handler, 3, 2, 3, &[]).await;
+        let name = |name: &[u8]| P9String::new(name.to_vec());
+        let requests = [
+            Message::Tlcreate(Tlcreate {
+                fid: 3,
+                name: name(b"file"),
+                flags: 0x8002,
+                mode: 0o644,
+                gid: 1000,
+            }),
+            Message::Tmkdir(Tmkdir {
+                dfid: 2,
+                name: name(b"dir"),
+                mode: 0o755,
+                gid: 1000,
+            }),
+            Message::Tmknod(Tmknod {
+                dfid: 2,
+                name: name(b"fifo"),
+                mode: S_IFIFO | 0o644,
+                major: 0,
+                minor: 0,
+                gid: 1000,
+            }),
+            Message::Tsymlink(Tsymlink {
+                dfid: 2,
+                name: name(b"link"),
+                symtgt: name(b"file"),
+                gid: 1000,
+            }),
+        ];
+        for (tag, body) in (4..).zip(requests) {
+            let reply = request(&handler, tag, body).await;
+            assert!(
+                !matches!(reply.body, Message::Rlerror(_)),
+                "{:?}",
+                reply.body
+            );
+        }
+        let mut groups = Vec::new();
+        for entry in ["file", "dir", "fifo", "link"] {
+            let id = fs
+                .lookup(&test_creds(), parent, entry.as_bytes())
+                .await
+                .unwrap();
+            let inode = fs.inode_store.get(id).await.unwrap();
+            groups.push((entry, inode.gid(), inode.mode() & 0o2000));
+        }
+        groups
+    }
+
+    #[tokio::test]
+    async fn protocol_creates_under_a_setgid_parent_take_the_parent_group() {
+        assert_eq!(
+            protocol_create_groups(0o2777).await,
+            [
+                ("file", 2000, 0),
+                ("dir", 2000, 0o2000),
+                ("fifo", 2000, 0),
+                ("link", 2000, 0),
+            ],
+            "a setgid parent's group must win over the group in the request"
+        );
+    }
+
+    #[tokio::test]
+    async fn protocol_creates_under_a_plain_parent_keep_the_request_group() {
+        assert_eq!(
+            protocol_create_groups(0o777).await,
+            [
+                ("file", 1000, 0),
+                ("dir", 1000, 0),
+                ("fifo", 1000, 0),
+                ("link", 1000, 0),
+            ]
+        );
     }
 
     fn test_creds() -> Credentials {

@@ -110,6 +110,7 @@ impl ZeroFS {
 
                 let new_gid = new_entry_gid(dir, &attr.gid, creds);
                 let final_mode = strip_sgid_unless_member(
+                    dir,
                     match &attr.mode {
                         SetMode::Set(m) => validate_mode(*m),
                         SetMode::NoChange => 0o666,
@@ -501,6 +502,7 @@ impl ZeroFS {
 
                 let new_gid = new_entry_gid(dir, &attr.gid, creds);
                 let final_mode = strip_sgid_unless_member(
+                    dir,
                     if let SetMode::Set(m) = attr.mode {
                         validate_mode(m)
                     } else {
@@ -985,6 +987,27 @@ mod tests {
                 assert_eq!(inode.mode(), expected_mode, "stored {entry}");
             }
         }
+    }
+
+    /// Linux `mode_strip_sgid` (fs/inode.c) clears an inherited setgid bit
+    /// only when group execute is also set.
+    #[tokio::test]
+    async fn inherited_group_keeps_sgid_without_group_execute() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let dir = setgid_dir(&fs, b"sgid-no-exec").await;
+        let attr = SetAttributes {
+            mode: SetMode::Set(0o2644),
+            ..Default::default()
+        };
+        let (_, file) = fs.create(&test_creds(), dir, b"file", &attr).await.unwrap();
+        let (_, fifo) = fs
+            .mknod(&test_creds(), dir, b"fifo", FileType::Fifo, &attr, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            (file.gid, file.mode, fifo.gid, fifo.mode),
+            (SETGID_PARENT_GID, 0o2644, SETGID_PARENT_GID, 0o2644)
+        );
     }
 
     #[tokio::test]
