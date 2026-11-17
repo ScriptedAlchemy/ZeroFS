@@ -10,6 +10,8 @@ on:
     paths:
       - "zerofs/**"
       - ".github/workflows/source-inventory.yml"
+  schedule:
+    - cron: "30 5 * * *"
   workflow_dispatch:
 
 permissions:
@@ -45,6 +47,10 @@ jobs:
 
   inventory-macos:
     name: Inventory on macOS
+    # GitHub cancelled this job on four pushes in one day for lack of a macOS arm64
+    # runner, which left a failed check that said nothing about the code. It runs daily,
+    # on main and develop, and on request, so a shortage cannot mark a pull request red.
+    if: github.event_name != 'pull_request'
     runs-on: macos-latest
     # Running these fixture tests in parallel panicked the macOS 27.2 kernel twice on a
     # many-core developer Mac. The tests serialize on a shared fixture lock, and this job
