@@ -31,7 +31,7 @@ set -eu
 case "$*" in
   version)
     mkdir -p "$LEIN_HOME/self-installs"
-    touch "$LEIN_HOME/self-installs/lein.jar";;
+    echo jar > "$LEIN_HOME/self-installs/leiningen-2.12.0-standalone.jar";;
   deps)
     repo=$(sed -n 's/.*:local-repo "\([^"]*\)".*/\1/p' "$LEIN_HOME/profiles.clj")
     mkdir -p "$repo"
@@ -43,6 +43,11 @@ esac
 """)
             curl = root / "curl"
             curl.write_text(r"""#!/usr/bin/env bash
+if [[ " ${*} " == *" -o /dev/null "* ]]; then
+  echo "${!#}" >> "$RUNNER_TEMP/probes"
+  [[ "${FAIL_PROBE:-}" != "${!#}" ]]
+  exit $?
+fi
 printf '%s\n' "$@" > "$RUNNER_TEMP/curl-args"
 cp "$MOCK_LAUNCHER" "${!#}"
 """)
@@ -52,6 +57,19 @@ cp "$MOCK_LAUNCHER" "${!#}"
             sudo.chmod(0o755)
             env = dict(os.environ, COPYFILE_DISABLE="1", PATH=f"{root}:{os.environ['PATH']}",
                        GITHUB_WORKSPACE=str(ROOT), RUNNER_TEMP=directory, MOCK_LAUNCHER=str(launcher))
+            first_central = "https://repo.maven.apache.org/maven2/org/clojure/clojure/1.11.1/clojure-1.11.1.pom"
+            env["FAIL_PROBE"] = first_central
+            (root / "jepsen-ha-deps.tar").write_bytes(b"incomplete cache entry")
+            rebuilt = subprocess.run(["bash", str(ROOT / "scripts/ci/prepare-jepsen-deps.sh")],
+                                     env=env, check=True, capture_output=True, text=True)
+            self.assertIn("Discarding incomplete cached Jepsen bundle", rebuilt.stderr)
+            self.assertEqual((root / "probes").read_text().splitlines(), [
+                first_central,
+                "https://repo1.maven.org/maven2/org/clojure/clojure/1.11.1/clojure-1.11.1.pom",
+                "https://repo.clojars.org/jepsen/jepsen/0.3.7/jepsen-0.3.7.pom",
+            ])
+            # A fresh invocation with the bundle can verify it entirely offline.
+            curl.write_text("#!/usr/bin/env bash\nexit 22\n")
             subprocess.run(["bash", str(ROOT / "scripts/ci/prepare-jepsen-deps.sh")],
                            env=env, check=True)
             download = (root / "curl-args").read_text().splitlines()
@@ -62,7 +80,7 @@ cp "$MOCK_LAUNCHER" "${!#}"
                 self.assertEqual(download[download.index(option) + 1], value)
             with tarfile.open(root / "jepsen-ha-deps.tar") as bundle:
                 self.assertEqual(set(bundle.getnames()), {
-                    "lein", ".lein/self-installs", ".lein/self-installs/lein.jar",
+                    "lein", ".lein/self-installs", ".lein/self-installs/leiningen-2.12.0-standalone.jar",
                     ".m2/repository", ".m2/repository/dependency.jar",
                 })
             for index, step in enumerate(install):
@@ -170,7 +188,7 @@ if name == "apt-get":
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             curl = root / "curl"
-            curl.write_text("#!/usr/bin/env bash\nexit 22\n")
+            curl.write_text('#!/usr/bin/env bash\n[[ " $* " == *" -o /dev/null "* ]] && exit 0\nexit 22\n')
             curl.chmod(0o755)
             result = subprocess.run(
                 ["bash", str(ROOT / "scripts/ci/prepare-jepsen-deps.sh")],

@@ -17,6 +17,11 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
+      - name: Cache the verified Jepsen dependencies
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/jepsen-ha-deps.tar
+          key: jepsen-ha-${{ runner.os }}-${{ runner.arch }}-jdk17-${{ hashFiles('jepsen/ha/project.clj', 'scripts/ci/prepare-jepsen-deps.sh', 'scripts/ci/retry-lein-deps.sh') }}
       - name: Resolve Jepsen dependencies with bounded retries
         working-directory: jepsen/ha
         run: bash "$GITHUB_WORKSPACE/scripts/ci/prepare-jepsen-deps.sh"
