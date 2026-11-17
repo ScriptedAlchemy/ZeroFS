@@ -321,6 +321,38 @@ pub enum DebugCommands {
         #[arg(short, long)]
         config: PathBuf,
     },
+    /// Scan clean-cache files a server left behind for undefined bytes.
+    ///
+    /// Finds the raw-parts cache (parts_cache_v1) and the decoded-block cache
+    /// (hybrid_cache_v1) at or under PATH and checks that every blob index
+    /// tail past its last record, and every entry's padding up to the next
+    /// 4 KiB page, is zero. Those bytes carry no data, so the check decrypts
+    /// nothing and needs no password or key; this command takes none.
+    ///
+    /// It opens files read-only and changes, repairs or deletes nothing. It
+    /// refuses a cache whose ownership lock a running server holds, because a
+    /// blob being written can look torn; stop the server first, or pass
+    /// --live to scan a snapshot anyway. Caches written by builds before the
+    /// zeroed padding are reported as such and counted only with --legacy.
+    ///
+    /// Exit status: 0 when every scanned byte is zero and every cache had
+    /// entries to scan; 3 when non-zero bytes were found; 4 when a cache had
+    /// no entries on disk or was not scanned, which is not evidence that it
+    /// is clean; 1 on an error.
+    ScanCacheFiles {
+        /// The [cache] dir from the server's config, one namespace inside it
+        /// (bucket_...), or one cache directory.
+        path: PathBuf,
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Scan even while a server holds the cache; the result is a snapshot.
+        #[arg(long)]
+        live: bool,
+        /// Also count the bytes of caches written by earlier builds.
+        #[arg(long)]
+        legacy: bool,
+    },
     /// Explicitly repair one pruned writeback predecessor from remote HEAD.
     ///
     /// The ZeroFS server must be stopped. This command is intended only for
@@ -571,6 +603,45 @@ mod tests {
         assert!(expected_local_sha256.starts_with("f999"));
         assert!(expected_remote_sha256.starts_with("0f3f"));
         assert!(confirm_abandon_maintenance_tail);
+    }
+
+    #[test]
+    fn scan_cache_files_takes_a_path_and_no_password() {
+        let cli = Cli::try_parse_from([
+            "zerofs",
+            "debug",
+            "scan-cache-files",
+            "/var/cache/zerofs",
+            "--json",
+            "--live",
+            "--legacy",
+        ])
+        .unwrap();
+        let Commands::Debug {
+            subcommand:
+                DebugCommands::ScanCacheFiles {
+                    path,
+                    json,
+                    live,
+                    legacy,
+                },
+        } = cli.command
+        else {
+            panic!("expected scan-cache-files command");
+        };
+        assert_eq!(path, PathBuf::from("/var/cache/zerofs"));
+        assert!(json && live && legacy);
+        assert!(
+            Cli::try_parse_from([
+                "zerofs",
+                "debug",
+                "scan-cache-files",
+                "/var/cache/zerofs",
+                "--password",
+                "x",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

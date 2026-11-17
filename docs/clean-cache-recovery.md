@@ -72,6 +72,52 @@ there; startup removes the partitions left in `hybrid_cache`. Removing a file
 does not overwrite its blocks on the device, so a disk that held an older cache
 can still carry those bytes until they are reused or the disk is wiped.
 
+### Checking a cache directory
+
+`zerofs debug scan-cache-files` reads the cache files a server left behind and
+checks the bytes that carry no data: in every blob, the index tail past the
+last record, and in every entry, the padding from the end of the entry to the
+next 4 KiB page. It finds the raw-parts cache (`parts_cache_v1`) and the
+decoded-block cache (`hybrid_cache_v1`) under the path it is given, which can
+be the `[cache] dir` from the config, one `bucket_...` namespace inside it, or
+one cache directory.
+
+Stop the server first, then run:
+
+```
+zerofs debug scan-cache-files /var/cache/zerofs
+```
+
+Add `--json` for a machine-readable report. The scan needs no password or key,
+because nothing is decrypted; the command takes none. It opens files read-only
+and changes, repairs or deletes nothing. It refuses a namespace whose
+ownership lock a running server holds, because a blob being written can look
+torn. `--live` scans anyway and labels the result a snapshot. A server that
+starts during a scan can fail to take its lock for the moment the scan probes
+it.
+
+For each cache the report gives partitions, blobs, entries, and the index-tail
+and padding bytes scanned and found non-zero. A clean result reads
+`Result: clean: every scanned index-tail and padding byte is zero, and every
+cache had entries to scan (exit status 0).`
+
+| Exit status | Meaning |
+|---|---|
+| 0 | Every scanned byte is zero, and every cache had entries to scan. |
+| 3 | Some index-tail or padding bytes are not zero. |
+| 4 | A cache had no entries on disk, or was not scanned. Nothing scanned is not evidence that the cache is clean. |
+| 1 | The scan could not run, for example because a server holds the cache. |
+
+A cache written by an earlier build (a `hybrid_cache` directory, or a
+`parts_cache_v1` whose layout marker lacks `padding=zeroed`) is reported as
+written by an earlier build and not covered by the fix, and is not scanned.
+`--legacy` counts its bytes too. A server with the fix removes such a cache
+when it starts.
+
+The scan checks the files as they are now. It does not show that no secret
+was ever written by an earlier build, and a cache deleted before the scan, or
+removed at startup, may still sit in the disk's free blocks.
+
 ## Operational and benchmark impact
 
 After a restart, initial reads can generate additional backend traffic and take

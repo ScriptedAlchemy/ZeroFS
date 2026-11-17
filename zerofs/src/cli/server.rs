@@ -41,8 +41,7 @@ use tracing::{debug, info, warn};
 
 #[cfg(test)]
 mod cache_files_tests;
-#[cfg(test)]
-mod cache_scan;
+pub(crate) mod cache_scan;
 mod mutation_lifecycle;
 use mutation_lifecycle::{LifecycleOwners, MutationLifecycle};
 

@@ -169,6 +169,17 @@ pub async fn run_cli() -> Result<()> {
             cli::DebugCommands::ListKeys { config } => {
                 cli::debug::list_keys(config).await?;
             }
+            cli::DebugCommands::ScanCacheFiles {
+                path,
+                json,
+                live,
+                legacy,
+            } => {
+                let exit_status = cli::debug::scan_cache_files(&path, json, live, legacy)?;
+                if exit_status != 0 {
+                    std::process::exit(exit_status);
+                }
+            }
             cli::DebugCommands::ReseedWritebackPredecessor {
                 config,
                 journal,

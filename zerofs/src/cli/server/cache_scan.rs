@@ -173,6 +173,13 @@ pub(crate) enum CacheKind {
 }
 
 impl CacheKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::RawParts => "raw-parts cache",
+            Self::DecodedBlocks => "decoded-block cache",
+        }
+    }
+
     fn block_size(self) -> usize {
         match self {
             Self::RawParts => super::PARTS_BLOCK_SIZE,
@@ -242,6 +249,8 @@ pub(crate) struct ScanReport {
     pub(crate) live: bool,
     pub(crate) caches: Vec<CacheReport>,
     pub(crate) status: ScanStatus,
+    /// The process exit status the command returns for `status`.
+    pub(crate) exit_status: i32,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -459,9 +468,88 @@ pub(crate) fn scan_cache_files(path: &Path, options: ScanOptions) -> Result<Scan
         live: options.live,
         caches,
         status,
+        exit_status: status.exit_code(),
     })
 }
 
+/// The report for a person reading a terminal.
+pub(crate) fn render(report: &ScanReport) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Clean-cache scan of {} (read-only; no password or key used)",
+        report.path.display()
+    );
+    if report.live {
+        let _ = writeln!(
+            out,
+            "Scanned live: a snapshot taken while a server may have been writing."
+        );
+    }
+    for cache in &report.caches {
+        let layout = match &cache.layout {
+            CacheLayout::Current => "current layout".to_owned(),
+            CacheLayout::Earlier { reason } => {
+                format!("written by an earlier build, not covered by the fix: {reason}")
+            }
+        };
+        let _ = writeln!(
+            out,
+            "\n{}: {} ({layout})",
+            cache.kind.name(),
+            cache.path.display()
+        );
+        let Some(counts) = &cache.scanned else {
+            let _ = writeln!(
+                out,
+                "  not scanned; pass --legacy to count its bytes. A server with the fix \
+                 removes it when it starts."
+            );
+            continue;
+        };
+        let _ = writeln!(
+            out,
+            "  partitions {}, blobs {}, entries {}",
+            counts.partitions, counts.blobs, counts.entries
+        );
+        let _ = writeln!(
+            out,
+            "  index tails:   {} bytes scanned, {} non-zero",
+            counts.index_tail_bytes, counts.index_tail_nonzero
+        );
+        let _ = writeln!(
+            out,
+            "  entry padding: {} bytes scanned, {} non-zero",
+            counts.padding_bytes, counts.padding_nonzero
+        );
+        if counts.entries == 0 {
+            let _ = writeln!(
+                out,
+                "  no entries on disk: nothing was scanned, so this is not evidence that \
+                 the cache is clean"
+            );
+        }
+    }
+    let verdict = match report.status {
+        ScanStatus::Clean => {
+            "clean: every scanned index-tail and padding byte is zero, and every cache had \
+             entries to scan"
+        }
+        ScanStatus::UndefinedBytes => {
+            "undefined bytes found: some index-tail or padding bytes are not zero"
+        }
+        ScanStatus::NothingScanned => {
+            "not proven clean: a cache had no entries on disk or was not scanned"
+        }
+    };
+    let _ = writeln!(
+        out,
+        "\nResult: {verdict} (exit status {}).",
+        report.exit_status
+    );
+    out
+}
 
 #[cfg(test)]
 mod tests;
