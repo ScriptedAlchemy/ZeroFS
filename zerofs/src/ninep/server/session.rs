@@ -808,7 +808,8 @@ async fn abandoned(shutdown: &CancellationToken, abandonment: &Abandonment) {
 /// slots are full. A `Tflush` takes a flush slot instead: it must stay
 /// readable when the envelope is full, because cancelling is how a client
 /// frees the capacity it is waiting for. An ordinary frame that cannot fit
-/// closes the connection, rather than blocking a later Tflush behind it.
+/// waits for the envelope. A client that pipelines large writes fills it in
+/// normal use, so closing the connection instead would fail every such upload.
 async fn charge_received_frame(
     header: FrameHeader,
     pending: &P9PendingFrames,
@@ -829,8 +830,8 @@ async fn charge_received_frame(
     let permits = u32::try_from(bytes).expect("a 9P frame charge fits in u32");
     Ok(ReceiveCharge::Pending {
         _bytes: Arc::clone(&pending.bytes)
-            .try_acquire_many_owned(permits)
-            .map_err(|_| anyhow::anyhow!("9P pending-frame envelope exhausted"))?,
+            .acquire_many_owned(permits)
+            .await?,
         _receive: Arc::clone(&pending.receive),
     })
 }
@@ -915,35 +916,27 @@ mod pending_tests {
     }
 
     #[tokio::test]
-    async fn full_pending_envelope_rejects_ordinary_frames_but_admits_flush() {
+    async fn full_pending_envelope_holds_ordinary_frames_but_admits_flush() {
         let global = P9GlobalAdmission::for_test(P9_MAX_MSIZE as usize, 1);
         let shutdown = CancellationToken::new();
         let pending = P9PendingFrames::new(global.admit_receive(&shutdown).await.unwrap());
         let inflight = InflightRegistry::default();
-        let full = charge_received_frame(
-            FrameHeader {
-                len: P9_MAX_MSIZE as usize,
-                type_byte: T_WRITE,
-            },
-            &pending,
-            &inflight,
-        )
-        .await
-        .unwrap();
-        let overflow = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            charge_received_frame(
-                FrameHeader {
-                    len: 23,
-                    type_byte: ninep_proto::message_type::TGETATTR,
-                },
-                &pending,
-                &inflight,
-            ),
-        )
-        .await
-        .expect("overflow must close the reader without waiting for an ordinary frame");
-        assert!(overflow.is_err());
+        let write = FrameHeader {
+            len: P9_MAX_MSIZE as usize,
+            type_byte: T_WRITE,
+        };
+        let full = charge_received_frame(write, &pending, &inflight)
+            .await
+            .unwrap();
+        // A second pipelined write must wait for the envelope, not end the
+        // connection: an uploader sends the next chunk while one is admitted.
+        let mut waiting = Box::pin(charge_received_frame(write, &pending, &inflight));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut waiting)
+                .await
+                .is_err(),
+            "an ordinary frame must wait while the envelope is full"
+        );
         let flush = charge_received_frame(
             FrameHeader {
                 len: P9_HEADER_SIZE + 2,
@@ -954,13 +947,19 @@ mod pending_tests {
         )
         .await
         .unwrap();
+        drop(full);
+        let second = tokio::time::timeout(std::time::Duration::from_secs(5), &mut waiting)
+            .await
+            .expect("the waiting frame must be charged once the envelope frees")
+            .unwrap();
+        drop(waiting);
         drop(pending);
         assert_eq!(
             global.snapshot().receive_reserved_bytes,
             P9_MAX_MSIZE as usize,
             "a pending frame must retain receive credit after its reader ends"
         );
-        drop(full);
+        drop(second);
         assert_eq!(global.snapshot().receive_reserved_bytes, 0);
         drop(flush);
     }
