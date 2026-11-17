@@ -48,7 +48,7 @@ Only regular files and directories may carry `user.*` attributes. Access to that
 namespace on symlinks, FIFOs, sockets, or device nodes returns `EPERM`, including
 for uid 0. On a directory with the sticky bit, only the owner or uid 0 may set or
 remove `user.*` attributes. Unknown namespace prefixes return `EOPNOTSUPP`.
-POSIX ACL enforcement is not implemented by storing these attributes.
+Storing these attributes does not implement POSIX ACL enforcement.
 
 A set with flags zero creates or replaces an attribute. `XATTR_CREATE` requires the
 attribute to be absent and returns `EEXIST` if it exists. `XATTR_REPLACE` requires it
@@ -78,13 +78,13 @@ The ZeroFS FUSE client uses the private removal flag. Linux v6.18 implements its
 plain-session sequence in
 [`v9fs_fid_xattr_set`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/fs/9p/xattr.c?h=v6.18).
 
-Xattr set and remove are not deduplicated across HA failover. `Tclunk` has no
+ZeroFS does not deduplicate xattr set and remove across HA failover. `Tclunk` has no
 operation id. Retrying a successful create-only set may return `EEXIST`; retrying a
 successful removal may return `ENODATA`. The `ninep-client` helpers keep each
 exchange on one connection and abort if it is lost. A lost clunk response can leave
 the caller uncertain whether the mutation committed. Read back the attribute to
-resolve that uncertainty. A completed mutation is covered by a later filesystem
-fsync cutoff under the configured durability contract.
+resolve that uncertainty. Under the configured durability contract, a later
+filesystem fsync cutoff covers a completed mutation.
 
 `zerofs mount` supports `getxattr`, `listxattr`, `setxattr`, and `removexattr` through
 `ninep-client`. Linux caps an attribute value at 65,536 bytes before a request
@@ -92,7 +92,7 @@ reaches ZeroFS, even though the core and 9P store accept 2,097,152 bytes.
 NFSv3 and the separate Rust kernel client have no xattr API in this change.
 
 Client and server must both include extended-attribute support. A new client
-connected to a server from `main` receives `EOPNOTSUPP` for get and list: that
+connected to a server from `main` receives `EOPNOTSUPP` for get and list. That
 server recognizes `Txattrwalk` but rejects it. Set and remove receive `ENOSYS`
 because its decoder does not recognize `Txattrcreate`. No attribute changes in
 either case. Earlier development encodings from this unmerged change are not
