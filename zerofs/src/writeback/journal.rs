@@ -187,6 +187,80 @@ pub struct Journal {
 
 struct JournalLock(File);
 
+/// The fields of a redb 4.1 database header that decide how redb treats the
+/// file when it opens it. Offsets and the layout arithmetic follow
+/// `redb-4.1.0/src/tree_store/page_store/header.rs` and `layout.rs`.
+#[derive(Debug, PartialEq, Eq)]
+struct RedbHeader {
+    /// Bytes the layout of the header's durable commit covers.
+    layout_len: u64,
+    /// Set while a writer has the file open and cleared when it closes.
+    recovery_required: bool,
+}
+
+impl RedbHeader {
+    const MAGIC: [u8; 9] = [b'r', b'e', b'd', b'b', 0x1A, 0x0A, 0xA9, 0x0D, 0x0A];
+    const LEN: usize = 32;
+
+    /// `None` when the bytes hold no redb header yet.
+    fn parse(bytes: &[u8]) -> Option<Self> {
+        let header = bytes.get(..Self::LEN)?;
+        if header[..Self::MAGIC.len()] != Self::MAGIC {
+            return None;
+        }
+        let field = |offset: usize| {
+            u64::from(u32::from_le_bytes(
+                header[offset..offset + 4].try_into().expect("four bytes"),
+            ))
+        };
+        let page_size = field(12);
+        let region_header_pages = field(16);
+        let region_data_pages = field(20);
+        let full_regions = field(24);
+        let trailing_data_pages = field(28);
+        let full_region = (region_header_pages + region_data_pages).saturating_mul(page_size);
+        let trailing_region = if trailing_data_pages == 0 {
+            0
+        } else {
+            (region_header_pages + trailing_data_pages).saturating_mul(page_size)
+        };
+        Some(Self {
+            layout_len: page_size
+                .saturating_add(full_regions.saturating_mul(full_region))
+                .saturating_add(trailing_region),
+            recovery_required: header[Self::MAGIC.len()] & 2 != 0,
+        })
+    }
+
+    fn read(file: &File) -> Result<Option<Self>> {
+        if file.metadata()?.len() < Self::LEN as u64 {
+            return Ok(None);
+        }
+        let mut bytes = [0; Self::LEN];
+        std::os::unix::fs::FileExt::read_exact_at(file, &mut bytes, 0)?;
+        Ok(Self::parse(&bytes))
+    }
+
+    /// Refuse a file that ends before the end its header describes. redb makes
+    /// a commit's header durable before it truncates the file, so a crash on an
+    /// honest device never leaves this; a device that dropped the header write
+    /// and kept the truncation does. redb itself panics on it.
+    fn ensure_not_truncated(&self, found: u64, path: &Path) -> Result<()> {
+        if found < self.layout_len {
+            bail!(
+                "writeback journal database {} is {found} bytes, shorter than the {} bytes \
+                 its last durable commit describes: the device holding the journal lost writes \
+                 after acknowledging them, so the journal is older than what was acknowledged. \
+                 Writes it had not drained to the backend are lost. Restore the journal device, \
+                 or move the journal directory aside to start from what the backend holds",
+                path.display(),
+                self.layout_len
+            );
+        }
+        Ok(())
+    }
+}
+
 impl JournalLock {
     fn acquire(file: File) -> Result<Self> {
         if !FileExt::try_lock_exclusive(&file).context("failed to acquire journal lock")? {
@@ -551,15 +625,28 @@ impl Journal {
         // and never releases it explicitly, so a child forked while it is open
         // keeps the file locked until that child execs, and the exclusive open
         // that follows fails. The copy holds no lock, and the writes its
-        // handle makes on close stay in memory. Repair stays refused, as the
-        // read-only open refused it: an unclean journal is repaired by `open`.
+        // handle makes on close stay in memory. The copy is opened writable,
+        // which would repair an unclean header in memory, so the checks below
+        // refuse what redb's read-only open refused: a file that needs
+        // recovery is recovered by the journal's own open, not by this read.
+        let path = root_dir.display().join("journal.redb");
         let mut image = Vec::new();
         database_file.read_to_end(&mut image).with_context(|| {
             format!(
                 "failed to read existing journal database {}",
-                root_dir.display().join("journal.redb").display()
+                path.display()
             )
         })?;
+        if let Some(header) = RedbHeader::parse(&image) {
+            header.ensure_not_truncated(image.len() as u64, &path)?;
+            if header.recovery_required || header.layout_len != image.len() as u64 {
+                bail!(
+                    "writeback journal database {} was not closed cleanly and needs recovery, \
+                     which reading its identity does not perform",
+                    path.display()
+                );
+            }
+        }
         let copy = InMemoryBackend::new();
         copy.set_len(image.len() as u64)?;
         copy.write(0, &image)?;
@@ -570,7 +657,7 @@ impl Journal {
             .with_context(|| {
                 format!(
                     "failed to open a copy of existing journal database {}",
-                    root_dir.display().join("journal.redb").display()
+                    path.display()
                 )
             })?;
         during_read();
@@ -642,6 +729,12 @@ impl Journal {
         root_dir.open_or_create_child("tmp".as_ref(), 0o700)?;
         let (database_file, database_existed) =
             root_dir.open_owner_file("journal.redb".as_ref(), true)?;
+        if let Some(header) = RedbHeader::read(&database_file)? {
+            header.ensure_not_truncated(
+                database_file.metadata()?.len(),
+                &root.join("journal.redb"),
+            )?;
+        }
         let database = Builder::new().create_file(database_file).with_context(|| {
             format!(
                 "failed to open journal database {}",
@@ -4111,6 +4204,52 @@ mod tests {
             assert_eq!(recovered.snapshot().unwrap().local_seq, 1, "{case}");
             assert_eq!(recovered.read_blob(1).unwrap(), b"pending", "{case}");
         }
+    }
+
+    /// Pins the header reader to the files redb writes: a mismatch here means
+    /// the redb file format changed under the checks in the journal's opens.
+    #[test]
+    fn redb_header_reading_matches_the_files_redb_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let database = root.join("journal.redb");
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let open = super::RedbHeader::parse(&fs::read(&database).unwrap()).unwrap();
+        assert!(
+            open.recovery_required,
+            "an open database is recovery-required"
+        );
+        for sequence in 1..=64 {
+            let path = format!("segments/{sequence}");
+            journal
+                .commit_put(put_record(sequence, &path, b"pending"), b"pending")
+                .unwrap();
+        }
+        drop(journal);
+        let closed = fs::read(&database).unwrap();
+        assert_eq!(
+            super::RedbHeader::parse(&closed),
+            Some(super::RedbHeader {
+                layout_len: closed.len() as u64,
+                recovery_required: false,
+            })
+        );
+
+        let raw = temp.path().join("raw.redb");
+        drop(redb::Database::create(&raw).unwrap());
+        let raw = fs::read(&raw).unwrap();
+        assert_eq!(
+            super::RedbHeader::parse(&raw),
+            Some(super::RedbHeader {
+                layout_len: raw.len() as u64,
+                recovery_required: false,
+            })
+        );
+        assert_eq!(
+            super::RedbHeader::parse(b"not a redb database file at all."),
+            None
+        );
+        assert_eq!(super::RedbHeader::parse(&[]), None);
     }
 
     #[test]
