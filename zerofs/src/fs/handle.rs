@@ -150,27 +150,21 @@ impl ZeroFS {
         let weak = Arc::downgrade(self);
         let shutdown = self.reclaim_shutdown.clone();
         let handle = tokio::spawn(async move {
+            let mut closed = false;
             loop {
-                tokio::select! {
+                let id = tokio::select! {
                     biased;
-                    _ = shutdown.cancelled() => {
-                        // Refuse new notifications, then finish everything
-                        // queued before shutdown.
+                    _ = shutdown.cancelled(), if !closed => {
+                        // Refuse new notifications, then finish everything queued before shutdown.
                         rx.close();
-                        break;
+                        closed = true;
+                        continue;
                     }
-                    id = rx.recv() => {
-                        let Some(id) = id else {
-                            return;
-                        };
-                        match weak.upgrade() {
-                            Some(fs) => fs.reclaim_if_unreferenced(id).await,
-                            None => return,
-                        }
-                    }
-                }
-            }
-            while let Some(id) = rx.recv().await {
+                    id = rx.recv() => id,
+                };
+                let Some(id) = id else {
+                    return;
+                };
                 match weak.upgrade() {
                     Some(fs) => fs.reclaim_if_unreferenced(id).await,
                     None => return,
