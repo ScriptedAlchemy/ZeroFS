@@ -204,6 +204,9 @@ pub struct FidSlot {
     /// locks on drop.
     pub lock_guard: Option<LockGuard>,
     xattr: Option<XattrFid>,
+    /// The create that opened this fid. Its clunk ends that create's inode
+    /// protection; see `DedupCache::release_create_protection`.
+    create_op: Option<crate::dedup::OpId>,
 }
 
 impl FidSlot {
@@ -215,6 +218,7 @@ impl FidSlot {
             replay_reopen: false,
             lock_guard: None,
             xattr: None,
+            create_op: None,
         }
     }
 }
@@ -1365,6 +1369,7 @@ impl NinePHandler {
                 replay_reopen,
                 lock_guard: None,
                 xattr: None,
+                create_op: None,
             },
         );
         Ok(Message::Rrebind(Rrebind { qid }))
@@ -1804,6 +1809,11 @@ impl NinePHandler {
     async fn clunk(&self, tc: Tclunk) -> P9Result<Message> {
         let slot = self.session_state().fids.remove(&tc.fid);
         if let Some(slot) = slot {
+            // Before the handle drops, so its last-close reclaim sees no
+            // protection left.
+            if let Some(op_id) = &slot.create_op {
+                self.filesystem.dedup.release_create_protection(op_id);
+            }
             self.commit_xattr(slot).await?;
         }
         Ok(Message::Rclunk(Rclunk))
@@ -2029,6 +2039,7 @@ impl NinePHandler {
             slot.replay_reopen = false;
             slot.handle = Some(self.filesystem.new_open_handle(child_id));
             slot.directory_pin = None;
+            slot.create_op = crate::dedup::has_op_id(&op_id).then_some(op_id);
         }
 
         Ok(Message::Rlcreate(Rlcreate {
@@ -2072,6 +2083,9 @@ impl NinePHandler {
                 creds: parent_fid.creds,
             };
             self.install_open_fid(&mut state, tc.newfid, tc.dfid, new_fid)?;
+            if let Some(slot) = state.fids.get_mut(&tc.newfid) {
+                slot.create_op = crate::dedup::has_op_id(&op_id).then_some(op_id);
+            }
         }
 
         Ok(Message::Rlcreateattr(Rlcreateattr {
@@ -6584,6 +6598,7 @@ mod tests {
                 replay_reopen: false,
                 lock_guard: None,
                 xattr: None,
+                create_op: None,
             },
         );
         assert_eq!(fs.open_handle_count(file_id), 1);
