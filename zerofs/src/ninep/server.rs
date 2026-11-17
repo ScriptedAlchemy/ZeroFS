@@ -4538,7 +4538,22 @@ mod tests {
                 .await
                 .unwrap();
             let stall = if private {
-                Some(fs.db.flush_barrier().write_owned().await)
+                // A ledger-only result needs no local SlateDB write. Hold a
+                // preceding nonempty commit at its write permit to stall the
+                // same worker that will replicate and publish the refusal.
+                let barrier = fs.db.flush_barrier().write_owned().await;
+                let reached = fs.write_coordinator.probe_next_apply();
+                let mut preceding = fs.db.new_transaction().unwrap();
+                preceding.put_bytes(
+                    &Bytes::from_static(b"test/refusal-gate"),
+                    Bytes::from_static(b"held"),
+                );
+                let commit = fs.write_coordinator.submit(preceding).unwrap();
+                tokio::time::timeout(TEST_TIMEOUT, reached)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                Some((barrier, commit))
             } else {
                 None
             };
@@ -4570,7 +4585,7 @@ mod tests {
                     .recv_within(bound, "flush or overload refusal")
                     .await,
             ];
-            if let Some(stall) = stall {
+            if let Some((barrier, commit)) = stall {
                 assert_eq!(
                     replies[0].0, 12,
                     "Tflush must pass the stalled refusal commit"
@@ -4579,7 +4594,8 @@ mod tests {
                     fs.dedup.get(&id).is_none(),
                     "a refusal must not be visible before commit"
                 );
-                drop(stall);
+                drop(barrier);
+                commit.wait().await.unwrap();
             }
             replies.push(
                 connection
