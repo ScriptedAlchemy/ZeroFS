@@ -108,40 +108,29 @@ pub(in crate::storage_readiness) fn backing_serials(
     root: &Path,
 ) -> Result<std::collections::HashSet<Serial>> {
     use super::Probe;
-    use std::os::unix::fs::MetadataExt;
-    let before = std::fs::read_to_string("/proc/self/mountinfo")?;
-    let mount = super::containing_mount(&before, root)?;
-    let metadata = std::fs::metadata(root)?;
-    if (libc::major(metadata.dev()), libc::minor(metadata.dev())) != mount.device {
-        bail!("storage root device changed before backing observation");
-    }
-    let paths = match mount.filesystem.as_str() {
-        "ext4" | "xfs" => vec![PathBuf::from(format!(
-            "/dev/block/{}:{}",
-            mount.device.0, mount.device.1
-        ))],
-        "zfs" => {
-            let pool = mount
-                .source
-                .split('/')
-                .next()
-                .filter(|pool| !pool.is_empty() && !pool.starts_with('-'))
-                .context("ZFS pool unavailable")?;
-            let output = super::HostProbe.output("zpool", &["status", "-P", pool])?;
-            zpool_device_paths(&output, pool)?
-        }
-        other => bail!("backing serials unavailable for filesystem {other}"),
-    };
-    let serials = paths
-        .iter()
-        .map(|path| block_serial(path, true))
-        .collect::<Result<std::collections::HashSet<_>>>()?;
-    if before != std::fs::read_to_string("/proc/self/mountinfo")?
-        || metadata.dev() != std::fs::metadata(root)?.dev()
-    {
-        bail!("mount namespace changed during backing device observation");
-    }
-    Ok(serials)
+    super::with_stable_mount(
+        root,
+        "storage root device changed before backing observation",
+        "mount namespace changed during backing device observation",
+        |mount| {
+            let paths = match mount.filesystem.as_str() {
+                "ext4" | "xfs" => {
+                    vec![PathBuf::from(super::block_device_path(mount.device))]
+                }
+                "zfs" => {
+                    let pool = super::zfs_pool(&mount)
+                        .map_err(|_| anyhow::anyhow!("ZFS pool unavailable"))?;
+                    let output = super::HostProbe.output("zpool", &["status", "-P", pool])?;
+                    zpool_device_paths(&output, pool)?
+                }
+                other => bail!("backing serials unavailable for filesystem {other}"),
+            };
+            paths
+                .iter()
+                .map(|path| block_serial(path, true))
+                .collect()
+        },
+    )
 }
 
 #[cfg(test)]

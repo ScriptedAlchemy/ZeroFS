@@ -121,12 +121,28 @@ fn scalar(output: &str) -> Result<&str> {
     Ok(value)
 }
 
+fn block_device_path(device: (u32, u32)) -> String {
+    format!("/dev/block/{}:{}", device.0, device.1)
+}
+
+fn zfs_pool(mount: &Mount) -> Result<&str> {
+    let pool = mount
+        .source
+        .split('/')
+        .next()
+        .context("missing ZFS pool name")?;
+    if pool.is_empty() || mount.source.starts_with('-') || mount.source.contains('@') {
+        bail!("invalid mounted ZFS dataset name");
+    }
+    Ok(pool)
+}
+
 pub(super) fn identify(mount: Mount, probe: &dyn Probe) -> Result<MountedFilesystem> {
     let (identity, unlocked, writable) = match mount.filesystem.as_str() {
         "ext4" | "xfs" => {
             // Probe the actual mounted device, not an operator-supplied UUID
             // symlink or a possibly stale blkid cache.
-            let device = format!("/dev/block/{}:{}", mount.device.0, mount.device.1);
+            let device = block_device_path(mount.device);
             let output = probe.output("blkid", &["-p", "-s", "UUID", "-o", "value", &device])?;
             let uuid = uuid::Uuid::parse_str(scalar(&output)?)?;
             if uuid.is_nil() {
@@ -141,14 +157,7 @@ pub(super) fn identify(mount: Mount, probe: &dyn Probe) -> Result<MountedFilesys
             )
         }
         "zfs" => {
-            let pool = mount
-                .source
-                .split('/')
-                .next()
-                .context("missing ZFS pool name")?;
-            if pool.is_empty() || mount.source.starts_with('-') || mount.source.contains('@') {
-                bail!("invalid mounted ZFS dataset name");
-            }
+            let pool = zfs_pool(&mount)?;
             let output = probe.output(
                 "zfs",
                 &[
@@ -218,29 +227,47 @@ pub(super) fn identify(mount: Mount, probe: &dyn Probe) -> Result<MountedFilesys
 }
 
 #[cfg(target_os = "linux")]
+fn with_stable_mount<T>(
+    root: &Path,
+    device_changed: &'static str,
+    namespace_changed: &'static str,
+    body: impl FnOnce(Mount) -> Result<T>,
+) -> Result<T> {
+    use std::os::unix::fs::MetadataExt;
+    let before = std::fs::read_to_string("/proc/self/mountinfo")?;
+    let mount = containing_mount(&before, root)?;
+    let metadata = std::fs::metadata(root)?;
+    if (libc::major(metadata.dev()), libc::minor(metadata.dev())) != mount.device {
+        bail!("{device_changed}");
+    }
+    let value = body(mount)?;
+    if before != std::fs::read_to_string("/proc/self/mountinfo")?
+        || metadata.dev() != std::fs::metadata(root)?.dev()
+    {
+        bail!("{namespace_changed}");
+    }
+    Ok(value)
+}
+
+#[cfg(target_os = "linux")]
 pub(super) fn observe(path: &Path) -> Result<MountedFilesystem> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
-    let before = std::fs::read_to_string("/proc/self/mountinfo")?;
-    let mount = containing_mount(&before, path)?;
-    let metadata = std::fs::metadata(path)?;
-    let actual = (libc::major(metadata.dev()), libc::minor(metadata.dev()));
-    if actual != mount.device {
-        bail!("storage root device changed while checking mountinfo")
-    }
-    if matches!(mount.filesystem.as_str(), "ext4" | "xfs") {
-        let device = std::fs::metadata(format!("/dev/block/{}:{}", actual.0, actual.1))?;
-        if !device.file_type().is_block_device()
-            || (libc::major(device.rdev()), libc::minor(device.rdev())) != actual
-        {
-            bail!("mounted block device is unavailable or changed")
-        }
-    }
-    let facts = identify(mount, &HostProbe)?;
-    let after = std::fs::read_to_string("/proc/self/mountinfo")?;
-    if before != after || std::fs::metadata(path)?.dev() != metadata.dev() {
-        bail!("mount namespace changed during storage readiness verification");
-    }
-    Ok(facts)
+    with_stable_mount(
+        path,
+        "storage root device changed while checking mountinfo",
+        "mount namespace changed during storage readiness verification",
+        |mount| {
+            if matches!(mount.filesystem.as_str(), "ext4" | "xfs") {
+                let device = std::fs::metadata(block_device_path(mount.device))?;
+                if !device.file_type().is_block_device()
+                    || (libc::major(device.rdev()), libc::minor(device.rdev())) != mount.device
+                {
+                    bail!("mounted block device is unavailable or changed");
+                }
+            }
+            identify(mount, &HostProbe)
+        },
+    )
 }
 
 #[cfg(test)]
