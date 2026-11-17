@@ -3660,7 +3660,11 @@ async fn test_abandoned_batch_reservation_leaves_a_sound_segment() {
 async fn insensitive_case_only_rename_is_atomic_when_interrupted() {
     use zerofs::fs::name_mode::NameMode;
     let _scenario = fail::FailScenario::setup();
-    for point in [fp::RENAME_AFTER_NEW_ENTRY, fp::RENAME_AFTER_COMMIT] {
+    for point in [
+        fp::RENAME_AFTER_SOURCE_UNLINK,
+        fp::RENAME_AFTER_NEW_ENTRY,
+        fp::RENAME_AFTER_COMMIT,
+    ] {
         let ctx = CrashTestContext::new();
         let fs = ctx.create_fs_with_name_mode(NameMode::Insensitive).await;
         let creds = test_creds();

@@ -184,24 +184,7 @@ impl ZeroFS {
             return Err(FsError::NoSpace);
         }
         let (sec, nsec) = get_current_time();
-        match &mut inode {
-            Inode::File(i) => {
-                i.ctime = sec;
-                i.ctime_nsec = nsec;
-            }
-            Inode::Directory(i) => {
-                i.ctime = sec;
-                i.ctime_nsec = nsec;
-            }
-            Inode::Symlink(i) => {
-                i.ctime = sec;
-                i.ctime_nsec = nsec;
-            }
-            Inode::Fifo(i) | Inode::Socket(i) | Inode::CharDevice(i) | Inode::BlockDevice(i) => {
-                i.ctime = sec;
-                i.ctime_nsec = nsec;
-            }
-        }
+        inode.set_ctime(sec, nsec);
         let mut txn = self.db.new_transaction()?;
         match value {
             Some((value, _)) => self.xattr_store.put(&mut txn, id, name.as_bytes(), value.0),
