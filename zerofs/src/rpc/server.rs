@@ -475,7 +475,8 @@ impl AdminService for AdminRpcServer {
             interval_ms,
         )))
         .map(move |_| {
-            let (used_bytes, used_inodes) = global_stats.get_totals();
+            // Absent rather than a partial sum when a stats shard was unreadable at boot.
+            let usage = global_stats.known_totals();
             let mem = JemallocMemStats::read();
             Ok(proto::StatsSnapshot {
                 timestamp: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
@@ -497,8 +498,8 @@ impl AdminService for AdminRpcServer {
                 gc_extents_deleted: fs_stats.gc_extents_deleted.load(Ordering::Relaxed),
                 gc_runs: fs_stats.gc_runs.load(Ordering::Relaxed),
                 total_operations: fs_stats.total_operations.load(Ordering::Relaxed),
-                used_bytes: Some(used_bytes),
-                used_inodes: Some(used_inodes),
+                used_bytes: usage.map(|(bytes, _)| bytes),
+                used_inodes: usage.map(|(_, inodes)| inodes),
                 max_bytes,
                 jemalloc_allocated: mem.allocated,
                 jemalloc_resident: mem.resident,
