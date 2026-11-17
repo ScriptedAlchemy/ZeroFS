@@ -112,6 +112,48 @@ reserve for both metadata and data. `[filesystem].max_size_gb` remains the
 separate logical filesystem quota; `zerofs pool status` reports physical member
 capacity and reservations. Compression means logical and physical usage differ.
 
+### When a member fills
+
+`capacity_gb` is an upper bound that an operator typed. The free space the
+member's filesystem reports is a fact. For a local member, placement and
+`pool status` both allow the smaller of the declared capacity left and the
+filesystem's free bytes minus `reserve_free_gb` and the pool's outstanding
+local reservations. Each reservation reads `statvfs` inside the catalog
+transaction that records it. Nothing caches the reading.
+
+The filesystem can still fill between that check and the write, because of
+another writer on the same dataset or because ZFS refuses writes before its
+reported free space reaches zero. If a member write then returns ENOSPC or
+EDQUOT, the pool marks the member full and writes the same segment to the next
+member with room. This happens within the same flush and needs no operator
+action. Full is not a media fault, so the member stays readable and is not
+quarantined. Later placements skip it until its filesystem reports more free
+bytes than it had when the write failed. A remote member has no free-space
+figure, so a no-space answer keeps it out of placement for 30 seconds, after
+which one write may try it again.
+
+When no member has room, a write or fsync answers ENOSPC, not EIO, over 9P.
+The FUSE client forwards that errno, and NFS maps it to `NFS3ERR_NOSPC`. NBD
+still reports EIO for every filesystem error. A test harness on a tmp
+directory measured the ENOSPC answer in milliseconds. An fsync that returns ENOSPC has made nothing durable past
+the previous successful fsync. Files flushed before the pool filled keep
+reading back correctly. Data written since then stays in memory, readable by
+the server, but is not durable. A later fsync publishes it once space returns,
+and no restart is needed. While storage stays full, the retained data is
+bounded. It is at most `max_inflight_seals` sealed segments plus one open
+segment per write lane, each no larger than the seal threshold plus one
+write. A write that would need more answers ENOSPC instead of waiting.
+
+`zerofs pool status` and the admin JSON report each member's
+`space.filesystem_free_bytes`, `space.filesystem_total_bytes` and
+`space.full`. The last one is null, `write_returned_no_space` with the time
+it filled, or `below_free_space_reserve`.
+
+A declared capacity larger than the filesystem's total size is legitimate
+with thin provisioning or a quota that will grow. The server logs a warning
+at startup that names the member and both numbers, sets
+`space.declared_exceeds_filesystem`, and starts.
+
 The first version owns its local catalog exclusively. It supports one server,
 including a read-only or checkpoint server when the writer is stopped, and
 rejects HA replication. Adding members and maintenance require a server restart
