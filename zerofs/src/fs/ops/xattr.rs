@@ -1,4 +1,3 @@
-use crate::dedup::{DedupResult, OpId};
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId};
 use crate::fs::mutation::types::{ConflictKey, ConflictScope};
@@ -142,7 +141,7 @@ impl ZeroFS {
         value: XattrValue,
         mode: XattrSetMode,
     ) -> Result<(), FsError> {
-        self.mutate_xattr(creds, id, name, Some((value, mode)), [0; 16])
+        self.mutate_xattr(creds, id, name, Some((value, mode)))
             .await
     }
 
@@ -152,7 +151,7 @@ impl ZeroFS {
         id: InodeId,
         name: &XattrName,
     ) -> Result<(), FsError> {
-        self.mutate_xattr(creds, id, name, None, [0; 16]).await
+        self.mutate_xattr(creds, id, name, None).await
     }
 
     async fn mutate_xattr(
@@ -161,22 +160,11 @@ impl ZeroFS {
         id: InodeId,
         name: &XattrName,
         value: Option<(XattrValue, XattrSetMode)>,
-        op_id: OpId,
     ) -> Result<(), FsError> {
-        let applied = |result| match result {
-            DedupResult::Applied => Some(()),
-            _ => None,
-        };
-        if self.replay_dedup_result(&op_id, applied)?.is_some() {
-            return Ok(());
-        }
         let fence = self
             .fence_metadata(ConflictScope::single(ConflictKey::Inode(id)))
             .await?;
         let guard = self.lock_manager.acquire(id).await;
-        if self.replay_dedup_result(&op_id, applied)?.is_some() {
-            return Ok(());
-        }
         let mut inode = self.inode_store.get(id).await?;
         name.check(&inode, creds, true)?;
         let exists = match self.xattr_store.get(id, name.as_bytes()).await {
@@ -228,7 +216,6 @@ impl ZeroFS {
                 .update_inode_in_entry(&mut txn, parent, filename, id, &inode)
                 .await?;
         }
-        txn.set_dedup_result(op_id, DedupResult::Applied);
         let pending = self.write_coordinator.submit(txn)?;
         // Keep the lock through apply even if the request stops awaiting us.
         crate::task::spawn_named("xattr-commit", async move {
