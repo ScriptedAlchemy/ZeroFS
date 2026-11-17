@@ -18,9 +18,6 @@ import {
 import type { AffectedStatus, AffectedView, MemberStatus, SegmentFault, Value } from "../lib/storage-status";
 import { Button } from "../components/ui/Button";
 
-// A larger response cannot be parsed and drawn without freezing the tab. The server sends one
-// reference per extent today, so real pools exceed this until the admin API pages its answer.
-const MAX_AFFECTED_JSON_CHARS = 8 * 1024 * 1024;
 const MAX_PATHS_SHOWN = 200;
 // A member can carry thousands of fault records; drawing them all would stall the page.
 const MAX_FAULTS_SHOWN = 50;
@@ -391,14 +388,6 @@ function Affected({ member }: { member: string }) {
     void adminClient.getPoolAffected({ member }, { signal: abort.signal, timeoutMs: 60_000 }).then(
       (response) => {
         if (abort.signal.aborted) return;
-        if (response.json.length > MAX_AFFECTED_JSON_CHARS) {
-          setResult(
-            unavailable(
-              `The scan answer is ${count(response.json.length)} characters, which is too large to display. Use a smaller scope once the admin API supports paging.`,
-            ),
-          );
-          return;
-        }
         const parsed = parseAffectedStatus(response.json, member);
         setResult(parsed);
         if (parsed.state === "known") setLastSuccess(new Date());

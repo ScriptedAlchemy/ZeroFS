@@ -311,13 +311,6 @@ describe("Storage page affected-path display", () => {
     expect(screen.getAllByText("/Movie")).toHaveLength(1);
     expect(screen.getByText("2 views report no affected paths")).toBeTruthy();
   });
-
-  it("refuses to draw an answer too large for the browser and says why", async () => {
-    client.getPoolAffected.mockResolvedValue({ json: " ".repeat(8 * 1024 * 1024 + 1) });
-    await inspect();
-    expect(await screen.findByText(/too large to display/)).toBeTruthy();
-    expect(screen.queryByText("Scan complete")).toBeNull();
-  });
 });
 
 describe("Storage page monitoring limits", () => {
