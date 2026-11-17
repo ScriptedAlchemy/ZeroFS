@@ -722,6 +722,15 @@ fn foyer_build_error(context: &str, err: foyer::Error) -> anyhow::Error {
 
 const FOYER_PARTITION_PREFIX: &str = "foyer-storage-direct-fs-";
 
+/// The foyer partition ID a directory entry name encodes, if it is one.
+fn foyer_partition_id(name: &str) -> Option<u32> {
+    let id = name.strip_prefix(FOYER_PARTITION_PREFIX)?;
+    let partition_id = id.parse::<u32>().ok()?;
+    // Foyer pads its u32 ID to a minimum width of eight digits. Accept wider
+    // native IDs too, but never similarly named foreign files.
+    (id == format!("{partition_id:08}")).then_some(partition_id)
+}
+
 #[derive(Debug)]
 pub(super) struct CleanCacheOwner {
     _lock: File,
@@ -798,18 +807,9 @@ fn prune_foyer_partitions(root: &StdPath, capacity: usize) -> Result<FoyerPruneR
         progress.entry();
         let entry = entry?;
         let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let Some(id) = name.strip_prefix(FOYER_PARTITION_PREFIX) else {
+        let Some(partition_id) = name.to_str().and_then(foyer_partition_id) else {
             continue;
         };
-        let Ok(partition_id) = id.parse::<u32>() else {
-            continue;
-        };
-        // Foyer pads its u32 ID to a minimum width of eight digits. Reclaim
-        // wider native IDs too, but never delete similarly named foreign files.
-        if id != format!("{partition_id:08}") {
-            continue;
-        }
         let metadata = std::fs::symlink_metadata(entry.path())?;
         if !metadata.file_type().is_file() {
             anyhow::bail!(
@@ -922,6 +922,69 @@ fn parts_engine_knobs(disk_bytes: usize) -> PartsEngineKnobs {
     }
 }
 
+/// Names the parts cache directory layout. foyer records no layout on its
+/// device and assigns partition files in creation order, so the same files
+/// read differently under another engine configuration.
+const PARTS_LAYOUT_MARKER: &str = ".zerofs-parts-layout";
+/// The current layout. Partition 0 is foyer's tombstone log, sized from the
+/// device capacity, and the data blocks follow it.
+const PARTS_LAYOUT: &[u8] = b"foyer block engine with tombstone log v1\n";
+
+/// Removes every foyer partition under `parts_root` unless the directory
+/// records the current layout, then records it.
+///
+/// A directory written before the tombstone log existed holds its first data
+/// block in partition 0. foyer would recover that block's part bytes as
+/// tombstone records, and a record whose sequence is `u64::MAX` overflows
+/// its recovery. The parts are a cache of backend bytes, so dropping them
+/// costs only refetches.
+fn discard_parts_of_another_layout(parts_root: &StdPath) -> Result<usize> {
+    let marker = parts_root.join(PARTS_LAYOUT_MARKER);
+    match std::fs::read(&marker) {
+        Ok(layout) if layout == PARTS_LAYOUT => return Ok(0),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading parts cache layout {}", marker.display()));
+        }
+    }
+
+    let mut removed = 0;
+    for entry in std::fs::read_dir(parts_root)
+        .with_context(|| format!("reading parts cache directory {}", parts_root.display()))?
+    {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_str()
+            .and_then(foyer_partition_id)
+            .is_none()
+        {
+            continue;
+        }
+        let path = entry.path();
+        if !std::fs::symlink_metadata(&path)?.file_type().is_file() {
+            anyhow::bail!(
+                "foyer-owned partition {} is not a regular file",
+                path.display()
+            );
+        }
+        std::fs::remove_file(&path)
+            .with_context(|| format!("discarding parts cache partition {}", path.display()))?;
+        removed += 1;
+    }
+    // The removals must be durable before the marker is, or a crash could
+    // leave the old partitions beside a marker that vouches for them.
+    File::open(parts_root)?.sync_all()?;
+    let mut file = File::create(&marker)
+        .with_context(|| format!("writing parts cache layout {}", marker.display()))?;
+    std::io::Write::write_all(&mut file, PARTS_LAYOUT)?;
+    file.sync_all()?;
+    File::open(parts_root)?.sync_all()?;
+    Ok(removed)
+}
+
 pub(crate) async fn build_parts_hybrid(
     cache_root: &std::path::Path,
     memory_bytes: usize,
@@ -936,6 +999,15 @@ pub(crate) async fn build_parts_hybrid(
     tokio::fs::create_dir_all(&parts_root)
         .await
         .with_context(|| format!("creating parts cache dir at {}", parts_root.display()))?;
+    let discarded = discard_parts_of_another_layout(&parts_root)?;
+    if discarded > 0 {
+        warn!(
+            discarded_partitions = discarded,
+            dir = %parts_root.display(),
+            "Discarded a raw-parts cache that does not record the current layout, \
+             such as one written before the tombstone log"
+        );
+    }
 
     let knobs = parts_engine_knobs(disk_bytes);
 
