@@ -1972,7 +1972,12 @@ pub async fn run_server(
                     true,
                 )
                 .expect("an unexpected listener exit must be an error");
-                tracing::error!(error = %error, "server listener stopped; initiating shutdown");
+                // The alternate form prints the cause chain, which names the address or
+                // socket path and the operating system's reason.
+                tracing::error!(
+                    error = %format_args!("{error:#}"),
+                    "server listener stopped; initiating shutdown"
+                );
                 ServingStopCause::ListenerFailure(error)
             }
         };
