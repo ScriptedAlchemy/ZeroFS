@@ -3,7 +3,7 @@ use super::admission::{
 };
 use super::frame_codec::{
     FidFootprint, FrameHeader, TCLUNK_TYPE, TFLUSH_TYPE, TVERSION_TYPE, inspect_frame_metadata,
-    possible_frame_response_bytes, read_9p_frame_charged, shallow_epoch_zero_retry_write,
+    read_9p_frame_charged, shallow_epoch_zero_retry_write,
 };
 use super::response_writer::{
     P9Response, ResponseAuthority, ResponseCredit, spawn_response_writer,
@@ -607,11 +607,7 @@ fn start_9p_request(
             }
             pending => {
                 match admission
-                    .admit_request_or_shutdown(
-                        frame.len(),
-                        possible_frame_response_bytes(&frame),
-                        &admission_shutdown,
-                    )
+                    .admit_frame_or_shutdown(&frame, &admission_shutdown)
                     .await
                 {
                     Ok(admitted) => {
@@ -735,6 +731,12 @@ fn start_9p_request(
             _ = request => {}
         }
     });
+    // Request admission charges the spawned task at most this much.
+    debug_assert!(
+        std::mem::size_of_val(&request) <= PENDING_REQUEST_TASK_BYTES,
+        "the spawned 9P request task is {} bytes",
+        std::mem::size_of_val(&request)
+    );
     drop(spawn_named("9p-request", request));
     Ok(StartedRequest { admitted })
 }

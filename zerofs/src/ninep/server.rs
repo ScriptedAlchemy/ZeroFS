@@ -46,14 +46,17 @@ use admission::{
 pub(crate) use admission::{P9AcceptedWorkTracker, P9GlobalAdmission, P9XattrPermit};
 #[cfg(test)]
 use frame_codec::{
-    FidFootprint, P9_RWRITE_MAX_SIZE, ShallowFrameMetadata, inspect_frame_metadata,
+    FidFootprint, P9_RWRITE_MAX_SIZE, REQUEST_STATE_BYTES, ShallowFrameMetadata,
+    decoded_request_bytes, frame_admission_bytes, inspect_frame_metadata,
     possible_frame_response_bytes, possible_response_bytes, read_9p_frame,
 };
 #[cfg(any(feature = "webui", test))]
 #[allow(unused_imports)]
 pub(crate) use response_writer::{P9Response, response_may_be_emitted};
 #[cfg(test)]
-use response_writer::{RESPONSE_BUFFER_CAPACITY, ResponseAuthority, spawn_response_writer};
+use response_writer::{
+    RESPONSE_BUFFER_CAPACITY, ResponseAuthority, ResponseCredit, spawn_response_writer,
+};
 #[cfg(test)]
 use session::{CLIENT_DRAIN_TIMEOUT, CompletionWaiter, enqueue_terminal_response};
 #[cfg(any(feature = "webui", test))]
@@ -494,6 +497,450 @@ mod tests {
                     2 * P9_MAX_MSIZE as usize
                 );
             }
+        }
+    }
+
+    fn typed_frame(type_byte: u8) -> Vec<u8> {
+        let mut frame = vec![0; P9_HEADER_SIZE];
+        frame[..4].copy_from_slice(&(P9_HEADER_SIZE as u32).to_le_bytes());
+        frame[4] = type_byte;
+        frame
+    }
+
+    fn reply_len(body: Message) -> usize {
+        P9Message::new(1, body).to_bytes().unwrap().len()
+    }
+
+    fn fixed_stat() -> ninep_proto::Stat {
+        ninep_proto::Stat::default()
+    }
+
+    /// Each request type's charge is at least the largest reply its handler
+    /// can send, from the reply's wire layout. Fixed-size replies are charged
+    /// exactly that, so the bound is tight; read-like replies also carry the
+    /// buffer the handler builds the payload in.
+    #[test]
+    fn every_reply_fits_its_request_charge() {
+        use message_type as t;
+        use ninep_proto::{
+            Qid, Rattach, Rfallocate, Rfsync, Rgetattr, Rgetlineage, Rgetlock, Rlcreate,
+            Rlcreateattr, Rlink, Rlinkattr, Rlock, Rlopen, Rmkdir, Rmkdirattr, Rmknod, Rmknodattr,
+            Rreadlink, Rrebind, Rrename, Rrenameat, Rsetattr, Rsetattrattr, Rstatfs, Rsymlink,
+            Rsymlinkattr, Runlinkat, Rversion, Rwrite, Rxattrcreate, Rxattrwalk,
+        };
+        let qid = Qid::default();
+        let rlerror = reply_len(Message::Rlerror(Rlerror { ecode: 0 }));
+        let max_string = || P9String::new(vec![b'x'; usize::from(u16::MAX)]);
+        let fixed: Vec<(u8, Message)> = vec![
+            (
+                t::TVERSION,
+                Message::Rversion(Rversion {
+                    msize: P9_MAX_MSIZE,
+                    version: P9String::new(ninep_proto::VERSION_9P2000L_ZEROFS_CI.to_vec()),
+                }),
+            ),
+            (t::TATTACH, Message::Rattach(Rattach { qid })),
+            (t::TREBIND, Message::Rrebind(Rrebind { qid })),
+            (t::TLOPEN, Message::Rlopen(Rlopen { qid, iounit: 0 })),
+            (t::TLOPENAT, Message::Rlopenat(Rlopenat { qid, iounit: 0 })),
+            (t::TLCREATE, Message::Rlcreate(Rlcreate { qid, iounit: 0 })),
+            (T_WRITE, Message::Rwrite(Rwrite { count: u32::MAX })),
+            (t::TCLUNK, Message::Rclunk(Rclunk)),
+            (t::TSETATTR, Message::Rsetattr(Rsetattr)),
+            (t::TFALLOCATE, Message::Rfallocate(Rfallocate)),
+            (t::TLINK, Message::Rlink(Rlink)),
+            (t::TRENAME, Message::Rrename(Rrename)),
+            (t::TRENAMEAT, Message::Rrenameat(Rrenameat)),
+            (t::TRENAMENOREPLACE, Message::Rrenameat(Rrenameat)),
+            (t::TUNLINKAT, Message::Runlinkat(Runlinkat)),
+            (t::TFSYNC, Message::Rfsync(Rfsync)),
+            (t::TFSYNCDUR, Message::Rfsync(Rfsync)),
+            (t::TFLUSH, Message::Rflush(Rflush)),
+            (t::TXATTRCREATE, Message::Rxattrcreate(Rxattrcreate)),
+            (
+                t::TGETATTR,
+                Message::Rgetattr(Rgetattr {
+                    valid: u64::MAX,
+                    stat: fixed_stat(),
+                }),
+            ),
+            (t::TMKDIR, Message::Rmkdir(Rmkdir { qid })),
+            (t::TSYMLINK, Message::Rsymlink(Rsymlink { qid })),
+            (t::TMKNOD, Message::Rmknod(Rmknod { qid })),
+            (
+                t::TSETATTRATTR,
+                Message::Rsetattrattr(Rsetattrattr { stat: fixed_stat() }),
+            ),
+            (
+                t::TMKDIRATTR,
+                Message::Rmkdirattr(Rmkdirattr { stat: fixed_stat() }),
+            ),
+            (
+                t::TSYMLINKATTR,
+                Message::Rsymlinkattr(Rsymlinkattr { stat: fixed_stat() }),
+            ),
+            (
+                t::TMKNODATTR,
+                Message::Rmknodattr(Rmknodattr { stat: fixed_stat() }),
+            ),
+            (
+                t::TLINKATTR,
+                Message::Rlinkattr(Rlinkattr { stat: fixed_stat() }),
+            ),
+            (
+                t::TLCREATEATTR,
+                Message::Rlcreateattr(Rlcreateattr {
+                    iounit: 0,
+                    stat: fixed_stat(),
+                }),
+            ),
+            (t::TLOCK, Message::Rlock(Rlock { status: 0 })),
+            (t::TSTATFS, Message::Rstatfs(Rstatfs::default())),
+            (t::TGETLINEAGE, Message::Rgetlineage(Rgetlineage::default())),
+        ];
+        for (request_type, reply) in fixed {
+            let encoded = reply_len(reply);
+            assert_eq!(
+                possible_frame_response_bytes(&typed_frame(request_type)),
+                encoded.max(rlerror),
+                "request type {request_type}"
+            );
+        }
+
+        // Replies that also hold the source of a variable field.
+        let readlink = reply_len(Message::Rreadlink(Rreadlink {
+            target: max_string(),
+        }));
+        assert_eq!(
+            possible_frame_response_bytes(&typed_frame(t::TREADLINK)),
+            readlink + 2 + usize::from(u16::MAX),
+            "the target is held once in the reply body and once on the wire"
+        );
+        let getlock = reply_len(Message::Rgetlock(Rgetlock {
+            lock_type: LockType::WriteLock,
+            start: u64::MAX,
+            length: u64::MAX,
+            proc_id: u32::MAX,
+            client_id: max_string(),
+        }));
+        assert_eq!(
+            possible_frame_response_bytes(&typed_frame(t::TGETLOCK)),
+            2 * getlock
+        );
+        let xattrwalk = reply_len(Message::Rxattrwalk(Rxattrwalk { size: u64::MAX }));
+        assert_eq!(
+            possible_frame_response_bytes(&typed_frame(t::TXATTRWALK)),
+            xattrwalk + 2 * crate::fs::XATTR_VALUE_MAX
+        );
+
+        // A walk reply has one qid per name the frame carries.
+        for names in [0, 1, 16, 1000] {
+            let wnames = (0..names)
+                .map(|_| P9String::new(b"n".to_vec()))
+                .collect::<Vec<_>>();
+            let walk = P9Message::new(
+                1,
+                Message::Twalk(ninep_proto::Twalk {
+                    fid: 1,
+                    newfid: 2,
+                    nwname: names as u16,
+                    wnames: wnames.clone(),
+                }),
+            )
+            .to_bytes()
+            .unwrap();
+            let rwalk = reply_len(Message::Rwalk(ninep_proto::Rwalk {
+                nwqid: names as u16,
+                wqids: vec![qid; names],
+            }));
+            assert!(rwalk <= possible_frame_response_bytes(&walk));
+            let walk_getattr = P9Message::new(
+                1,
+                Message::Twalkgetattr(ninep_proto::Twalkgetattr {
+                    fid: 1,
+                    newfid: 2,
+                    nwname: names as u16,
+                    wnames,
+                }),
+            )
+            .to_bytes()
+            .unwrap();
+            let rwalkgetattr = reply_len(Message::Rwalkgetattr(ninep_proto::Rwalkgetattr {
+                nwqid: names as u16,
+                wqids: vec![qid; names],
+                stat: fixed_stat(),
+            }));
+            assert!(rwalkgetattr <= possible_frame_response_bytes(&walk_getattr));
+        }
+        // A walk that declares more names than its frame carries is charged
+        // for the names that fit, two bytes each.
+        let mut lying_walk = typed_frame(t::TWALK);
+        lying_walk.extend_from_slice(&[0; 8]);
+        lying_walk.extend_from_slice(&u16::MAX.to_le_bytes());
+        lying_walk.extend_from_slice(&[0; 4]);
+        let lying_len = lying_walk.len() as u32;
+        lying_walk[..4].copy_from_slice(&lying_len.to_le_bytes());
+        assert!(possible_frame_response_bytes(&lying_walk) < 1024);
+        assert!(
+            decoded_request_bytes(&lying_walk) >= 2 * usize::from(u16::MAX) * 32,
+            "the decoder may size its name vector by the declared count"
+        );
+
+        // Count-bounded replies hold the payload source and the wire copy.
+        for count in [0, 4096, 1024 * 1024, u32::MAX] {
+            let read = encoded_read(count);
+            let payload = count.min(P9_MAX_MSIZE - ninep_proto::P9_IOHDRSZ) as usize;
+            let rread = reply_len(Message::Rread(Rread {
+                count: payload as u32,
+                data: DekuBytes::from(vec![0; payload]),
+            }));
+            assert!(2 * rread <= possible_frame_response_bytes(&read));
+            let readdir = P9Message::new(
+                1,
+                Message::Treaddir(ninep_proto::Treaddir {
+                    fid: 1,
+                    offset: 0,
+                    count,
+                }),
+            )
+            .to_bytes()
+            .unwrap();
+            assert!(2 * rread <= possible_frame_response_bytes(&readdir));
+            let readdirattr = P9Message::new(
+                1,
+                Message::Treaddirattr(ninep_proto::Treaddirattr {
+                    fid: 1,
+                    offset: 0,
+                    count,
+                }),
+            )
+            .to_bytes()
+            .unwrap();
+            assert!(
+                possible_frame_response_bytes(&readdir)
+                    < possible_frame_response_bytes(&readdirattr)
+            );
+            let openatread = P9Message::new(
+                1,
+                Message::Tlopenatread(ninep_proto::Tlopenatread {
+                    fid: 1,
+                    newfid: 2,
+                    flags: 0,
+                    count,
+                }),
+            )
+            .to_bytes()
+            .unwrap();
+            let prefetch = count.min(P9_MAX_MSIZE - ninep_proto::P9_RLOPENATREAD_HDR) as usize;
+            let rlopenatread = reply_len(Message::Rlopenatread(ninep_proto::Rlopenatread {
+                qid,
+                iounit: 0,
+                eof: 1,
+                count: prefetch as u32,
+                data: DekuBytes::from(vec![0; prefetch]),
+            }));
+            assert!(2 * rlopenatread <= possible_frame_response_bytes(&openatread));
+            for frame in [read, readdir, readdirattr, openatread] {
+                assert!(
+                    possible_frame_response_bytes(&frame)
+                        <= possible_response_bytes(frame[4]) + (2 << 20),
+                    "a lying count is charged by the protocol maximum, not by its value"
+                );
+                let mut truncated = frame.clone();
+                truncated.pop();
+                let len = truncated.len() as u32;
+                truncated[..4].copy_from_slice(&len.to_le_bytes());
+                assert_eq!(
+                    possible_frame_response_bytes(&truncated),
+                    possible_response_bytes(frame[4]),
+                    "a malformed count keeps the conservative charge"
+                );
+            }
+        }
+
+        // Unknown and future types keep the conservative maximum.
+        for unknown in [0, 102, 122, 199, 227, 255] {
+            assert_eq!(
+                possible_frame_response_bytes(&typed_frame(unknown)),
+                P9_MAX_MSIZE as usize,
+                "type {unknown}"
+            );
+        }
+        assert_eq!(
+            decoded_request_bytes(&encoded_read(1)),
+            encoded_read(1).len()
+        );
+    }
+
+    /// A count beyond the negotiated msize is clamped by the handler, and the
+    /// reply it then builds stays inside the admission it was charged.
+    #[tokio::test(flavor = "current_thread")]
+    async fn lying_counts_cannot_grow_a_reply_past_its_charge() {
+        const MSIZE: u32 = 64 * 1024;
+        let (_, handler) = in_memory_handler().await;
+        let version = handler
+            .handle_message(
+                0,
+                Message::Tversion(Tversion {
+                    msize: MSIZE,
+                    version: P9String::new(ninep_proto::VERSION_9P2000L.to_vec()),
+                }),
+            )
+            .await;
+        assert!(matches!(version.body, Message::Rversion(ref r) if r.msize == MSIZE));
+        let call = |tag: u16, body: Message| {
+            let handler = Arc::clone(&handler);
+            async move {
+                let reply = handler.handle_message(tag, body).await;
+                assert!(
+                    !matches!(reply.body, Message::Rlerror(_)),
+                    "setup request {tag} failed: {:?}",
+                    reply.body
+                );
+                reply
+            }
+        };
+        call(
+            1,
+            Message::Tattach(Tattach {
+                fid: 1,
+                afid: u32::MAX,
+                uname: P9String::new(b"root".to_vec()),
+                aname: P9String::new(b"/".to_vec()),
+                n_uname: 0,
+            }),
+        )
+        .await;
+        let walk = |fid: u32, newfid: u32, names: &[&[u8]]| {
+            Message::Twalk(ninep_proto::Twalk {
+                fid,
+                newfid,
+                nwname: names.len() as u16,
+                wnames: names
+                    .iter()
+                    .map(|name| P9String::new(name.to_vec()))
+                    .collect(),
+            })
+        };
+
+        // A file four times the msize.
+        call(2, walk(1, 2, &[])).await;
+        call(
+            3,
+            Message::Tlcreate(ninep_proto::Tlcreate {
+                fid: 2,
+                name: P9String::new(b"large".to_vec()),
+                flags: libc::O_RDWR as u32,
+                mode: 0o644,
+                gid: 0,
+            }),
+        )
+        .await;
+        for chunk in 0..8u64 {
+            call(
+                4,
+                Message::Twrite(Twrite {
+                    fid: 2,
+                    offset: chunk * 32 * 1024,
+                    count: 32 * 1024,
+                    data: DekuBytes::from(vec![0x5a; 32 * 1024]),
+                }),
+            )
+            .await;
+        }
+        call(5, walk(1, 3, &[b"large"])).await;
+        call(
+            6,
+            Message::Tlopen(ninep_proto::Tlopen {
+                fid: 3,
+                flags: libc::O_RDONLY as u32,
+            }),
+        )
+        .await;
+
+        // A directory whose entries need more than one msize.
+        call(
+            7,
+            Message::Tmkdir(Tmkdir {
+                dfid: 1,
+                name: P9String::new(b"wide".to_vec()),
+                mode: 0o755,
+                gid: 0,
+            }),
+        )
+        .await;
+        for index in 0..600u32 {
+            call(8, walk(1, 4, &[b"wide"])).await;
+            call(
+                9,
+                Message::Tlcreate(ninep_proto::Tlcreate {
+                    fid: 4,
+                    name: P9String::new(format!("{index:0>100}").into_bytes()),
+                    flags: libc::O_RDWR as u32,
+                    mode: 0o644,
+                    gid: 0,
+                }),
+            )
+            .await;
+            call(10, Message::Tclunk(Tclunk { fid: 4 })).await;
+        }
+        call(11, walk(1, 5, &[b"wide"])).await;
+        call(
+            12,
+            Message::Tlopen(ninep_proto::Tlopen {
+                fid: 5,
+                flags: libc::O_RDONLY as u32,
+            }),
+        )
+        .await;
+
+        let mut io = DispatchFixture::new(Arc::clone(&handler), 4);
+        for (tag, request) in [
+            (
+                20,
+                Message::Tread(ninep_proto::Tread {
+                    fid: 3,
+                    offset: 0,
+                    count: u32::MAX,
+                }),
+            ),
+            (
+                21,
+                Message::Treaddir(ninep_proto::Treaddir {
+                    fid: 5,
+                    offset: 0,
+                    count: u32::MAX,
+                }),
+            ),
+        ] {
+            let request = frame(tag, request);
+            io.dispatch_frame(request.clone()).await;
+            let response = tokio::time::timeout(TEST_TIMEOUT, io.rx.recv())
+                .await
+                .expect("reply")
+                .expect("response channel");
+            let (_, reply, credit) = response.into_guarded_parts();
+            let ResponseCredit::Admitted(permit) = credit else {
+                panic!("tag {tag} replied without request admission");
+            };
+            assert!(
+                !matches!(decode(&reply).body, Message::Rlerror(_)),
+                "tag {tag} failed"
+            );
+            assert!(
+                reply.len() > MSIZE as usize / 2 && reply.len() <= MSIZE as usize,
+                "the handler fills the negotiated msize and no more: {} bytes",
+                reply.len()
+            );
+            assert_eq!(permit.reserved_bytes(), frame_admission_bytes(&request));
+            assert!(
+                request.len() + 2 * reply.len() + REQUEST_STATE_BYTES <= permit.reserved_bytes(),
+                "the source and wire copies of the reply fit the charge"
+            );
+            assert!(
+                permit.reserved_bytes() < CONNECTION_INFLIGHT_MEMORY,
+                "a lying count is charged by the handler's cap, not by its value"
+            );
         }
     }
 
