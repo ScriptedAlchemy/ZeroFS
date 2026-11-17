@@ -10,6 +10,7 @@ use tracing::{error, warn};
 
 const RLERROR_TYPE: u8 = 7;
 const RVERSION_TYPE: u8 = 101;
+const RFLUSH_TYPE: u8 = 109;
 pub(super) const RESPONSE_BUFFER_CAPACITY: usize = 64 * 1024;
 
 /// What keeps a queued reply's memory accounted until the writer sends it.
@@ -53,10 +54,13 @@ impl P9Response {
     }
 }
 
+/// Errors, version negotiation and Rflush report no filesystem state. Rflush
+/// either follows the flushed request's own (gated) reply or means the request
+/// never took effect, which is true on a deposed server too.
 fn response_requires_serving_authority(response_bytes: &[u8]) -> bool {
     !matches!(
         response_bytes.get(4),
-        Some(&RLERROR_TYPE) | Some(&RVERSION_TYPE)
+        Some(&RLERROR_TYPE) | Some(&RVERSION_TYPE) | Some(&RFLUSH_TYPE)
     )
 }
 

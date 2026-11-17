@@ -813,7 +813,9 @@ impl NinePHandler {
         let is_retry = op_flags & ninep_proto::P9_OP_FLAG_RETRY != 0;
 
         // Pre-dispatch rejection is CLEAN; loss during dispatch is ambiguous.
-        let lease_gated = !matches!(msg, Message::Tversion(_));
+        // Tflush only cancels local work and reports no filesystem state, and
+        // flush(5) forbids answering it with an error.
+        let lease_gated = !matches!(msg, Message::Tversion(_) | Message::Tflush(_));
         if lease_gated && !self.filesystem.db.permits_successful_response() {
             return P9Message::new(
                 tag,
