@@ -44,7 +44,7 @@ The native raw file is `b1-design/widen/bootstrap-small-1-retry/samples.jsonl`. 
 
 At the original P, whole-cgroup anonymous memory was 947,466,240 bytes, about 3.4 times smaller than P. Jemalloc residency includes active pages that need not be physically touched. It is an allocator accounting upper bound, not physical RSS. The native peak is also dominated by active large allocations, rather than dirty retention. The added aggregate-arena page and size-class counters distinguish live allocation classes, metadata and retained dirty pages. They do not by themselves identify every Rust owner or prove that future stored state cannot double demand. Each qualified rung must retain its peak decomposition and name any attribution that remains unresolved.
 
-`python3 scripts/derive-small-nas-memory.py <completed-cell> ...` checks completion, integrity, GC, swap and OOM receipts before taking the largest P and K across supplied cells. Combining the original cell with the completed native bootstrap keeps the higher original inputs. The range between different cells is not a repeat-noise estimate.
+`python3 scripts/derive-small-nas-memory.py <completed-cell> ...` checks completion, integrity, GC, swap and OOM receipts before taking the largest P and K across supplied cells. Native manifests must cover at least the smallest qualified workload: one file of at least 12 GiB and at least 5,000 additional files of at least 1 KiB each. Larger ladder rungs remain valid inputs; empty, tiny or bulk-only controls cannot justify the package reserves. Combining the original cell with the completed native bootstrap keeps the higher original inputs. The range between different cells is not a repeat-noise estimate.
 
 ## Formula and brake
 

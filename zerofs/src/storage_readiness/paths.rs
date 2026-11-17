@@ -66,7 +66,11 @@ pub(super) fn verify_role(root: &super::config::StorageRoot<'_>) -> Result<()> {
 }
 
 pub(super) fn verify_cache_partitions(cache: &Path) -> Result<()> {
-    for directory in [cache.join("hybrid_cache"), cache.join("parts_cache")] {
+    for directory in [
+        cache.join("hybrid_cache"),
+        cache.join(crate::object_store_prefetch::LEGACY_PARTS_CACHE_DIR),
+        cache.join(crate::object_store_prefetch::PARTS_CACHE_DIR),
+    ] {
         let entries = match std::fs::read_dir(&directory) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,

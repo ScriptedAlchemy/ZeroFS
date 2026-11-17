@@ -292,6 +292,8 @@ A `[replication]` section runs a leader and a standby backed by the same bucket;
 
 TOML with `$VAR`/`${VAR}` environment substitution; all referenced variables must be set. `[cache]`, `[storage]`, and `[servers]` are required. Full option reference: [Configuration Guide](https://www.zerofs.net/configuration).
 
+The raw-parts read cache starts cold after every server restart and refills from storage as data is read. Its configured disk capacity remains available for caching during the new process. See [clean-cache recovery](docs/clean-cache-recovery.md) for the correctness rationale, migration behavior, and performance tradeoff.
+
 ```toml
 [cache]
 dir = "${HOME}/.cache/zerofs"

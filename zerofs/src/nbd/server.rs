@@ -1817,6 +1817,21 @@ mod tests {
             .await
             .expect("open the same export on another connection");
 
+        // Observe entry past the export gate before any storage I/O can make
+        // a FLUSH that overtook the WRITE look blocked.
+        let flush_entered = Arc::new(AtomicBool::new(false));
+        filesystem.flush_coordinator.set_materialize({
+            let entered = Arc::clone(&flush_entered);
+            Arc::new(move |_| {
+                entered.store(true, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            })
+        });
+        // Keep this 50 ms ordering check below the test's 100 ms payload
+        // deadline even if the executor is descheduled. Fixture setup above
+        // and flush completion below retain real time for storage I/O.
+        tokio::time::pause();
+
         let (payload_started_tx, payload_started_rx) = oneshot::channel();
         let mut write_session = NBDSession::new(
             BlockingPayload {
@@ -1838,10 +1853,12 @@ mod tests {
 
         let flush_handler = NBDHandler::new(filesystem, export_gates);
         let mut flush_task = tokio::spawn(async move { flush_handler.flush(&flush_device).await });
+        let flush_waited = timeout(Duration::from_millis(50), &mut flush_task)
+            .await
+            .is_err();
+        tokio::time::resume();
         assert!(
-            timeout(Duration::from_millis(50), &mut flush_task)
-                .await
-                .is_err(),
+            flush_waited && !flush_entered.load(Ordering::SeqCst),
             "FLUSH overtook a WRITE whose request was already admitted"
         );
 
@@ -1852,6 +1869,7 @@ mod tests {
             .expect("FLUSH resumed after the earlier write was canceled")
             .expect("FLUSH task did not panic")
             .expect("FLUSH succeeded");
+        assert!(flush_entered.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

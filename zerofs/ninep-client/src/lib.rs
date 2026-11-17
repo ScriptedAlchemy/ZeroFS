@@ -1658,15 +1658,18 @@ impl NinePClient {
     }
 
     /// Request path for operations that do not change replayable session state.
-    async fn send_request(&self, body: Message) -> ClientResult<Message> {
-        let admission = self.acquire_request_admission().await?;
+    async fn send_request(
+        &self,
+        body: Message,
+        admission: &AdmissionPermit,
+    ) -> ClientResult<Message> {
         let op_id = if body.is_mutation() {
             Uuid::new_v4().into_bytes()
         } else {
             [0u8; 16]
         };
         let mut attempt = OpAttemptState::default();
-        self.send_request_on_current(op_id, &body, &mut attempt, None, &admission)
+        self.send_request_on_current(op_id, &body, &mut attempt, None, admission)
             .await
             .map(|(response, _)| response)
     }
@@ -1909,7 +1912,16 @@ impl NinePClient {
 
     /// Issue a request, turning a returned `Rlerror` into [`ClientError::Errno`].
     async fn rpc(&self, body: Message) -> ClientResult<Message> {
-        match self.send_request(body).await? {
+        let admission = self.acquire_request_admission().await?;
+        self.rpc_with_admission(body, &admission).await
+    }
+
+    async fn rpc_with_admission(
+        &self,
+        body: Message,
+        admission: &AdmissionPermit,
+    ) -> ClientResult<Message> {
+        match self.send_request(body, admission).await? {
             Message::Rlerror(e) => Err(ClientError::Errno(e.ecode)),
             other => Ok(other),
         }
@@ -2535,11 +2547,16 @@ impl NinePClient {
         let mut written = 0usize;
         let max = self.max_write_payload().max(1) as usize;
         while written < len {
+            // Bound the internal staging copy as well as the response slot and
+            // serialized frame. Waiters retain only their caller-owned input.
+            let admission = self.acquire_request_admission().await?;
             let end = written + (len - written).min(max);
             let data = chunk(written, end);
             debug_assert_eq!(data.len(), end - written);
             let attempted = data.len();
-            let n = self.write_chunk(fid, offset + written as u64, data).await? as usize;
+            let n = self
+                .write_chunk(fid, offset + written as u64, data, &admission)
+                .await? as usize;
             written += n;
             if n < attempted {
                 break;
@@ -2548,16 +2565,25 @@ impl NinePClient {
         Ok(written as u64)
     }
 
-    async fn write_chunk(&self, fid: u32, offset: u64, data: Bytes) -> ClientResult<u32> {
+    async fn write_chunk(
+        &self,
+        fid: u32,
+        offset: u64,
+        data: Bytes,
+        admission: &AdmissionPermit,
+    ) -> ClientResult<u32> {
         let attempted = u32::try_from(data.len())
             .expect("write chunks are bounded by the negotiated u32 msize");
         let resp = self
-            .rpc(Message::Twrite(Twrite {
-                fid,
-                offset,
-                count: attempted,
-                data: DekuBytes::from(data),
-            }))
+            .rpc_with_admission(
+                Message::Twrite(Twrite {
+                    fid,
+                    offset,
+                    count: attempted,
+                    data: DekuBytes::from(data),
+                }),
+                admission,
+            )
             .await?;
         match resp {
             Message::Rwrite(r) if r.count <= attempted => Ok(r.count),
@@ -5085,8 +5111,9 @@ mod session_transition_tests {
 
         let request_client = Arc::clone(&client);
         let request = tokio::spawn(async move {
+            let admission = request_client.acquire_request_admission().await?;
             request_client
-                .write_chunk(7, 0, Bytes::from_static(b"x"))
+                .write_chunk(7, 0, Bytes::from_static(b"x"), &admission)
                 .await
         });
         let sent = recv_op_request(&mut requests, "write request").await;
@@ -5682,6 +5709,71 @@ mod session_transition_tests {
             Message::Rwrite(Rwrite { count: 1 }),
         );
         assert_eq!(second.await.unwrap().unwrap(), 1);
+        assert_eq!(client.request_admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn waiting_write_does_not_construct_its_payload_before_admission() {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let client = test_client_with_limit(Arc::clone(&conn), 1);
+        let first_client = Arc::clone(&client);
+        let first = tokio::spawn(async move { first_client.write(7, 0, b"a").await });
+        let first_request = recv_op_request(&mut requests, "first admitted request").await;
+
+        let copies = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let waiting_copies = Arc::clone(&copies);
+        let waiting_client = Arc::clone(&client);
+        let waiting = tokio::spawn(async move {
+            waiting_client
+                .write_chunks(7, 1, 1, move |start, end| {
+                    waiting_copies.fetch_add(1, Ordering::SeqCst);
+                    Bytes::copy_from_slice(&b"b"[start..end])
+                })
+                .await
+        });
+        assert_no_request(&mut requests, "the dispatch bound is full").await;
+        assert_eq!(
+            copies.load(Ordering::SeqCst),
+            0,
+            "waiting writes must not allocate their staging copy before admission"
+        );
+
+        answer(&conn, &first_request);
+        assert_eq!(first.await.unwrap().unwrap(), 1);
+        let second_request = recv_op_request(&mut requests, "newly admitted write").await;
+        assert_eq!(copies.load(Ordering::SeqCst), 1);
+        answer(&conn, &second_request);
+        assert_eq!(waiting.await.unwrap().unwrap(), 1);
+        assert_eq!(client.request_admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_waiting_write_never_constructs_its_payload() {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let client = test_client_with_limit(Arc::clone(&conn), 1);
+        let first_client = Arc::clone(&client);
+        let first = tokio::spawn(async move { first_client.write(7, 0, b"a").await });
+        let first_request = recv_op_request(&mut requests, "first admitted request").await;
+
+        let copies = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let waiting_copies = Arc::clone(&copies);
+        let waiting_client = Arc::clone(&client);
+        let waiting = tokio::spawn(async move {
+            waiting_client
+                .write_chunks(7, 1, 1, move |start, end| {
+                    waiting_copies.fetch_add(1, Ordering::SeqCst);
+                    Bytes::copy_from_slice(&b"b"[start..end])
+                })
+                .await
+        });
+        assert_no_request(&mut requests, "the waiting write must remain local").await;
+        waiting.abort();
+        let _ = waiting.await;
+        assert_eq!(copies.load(Ordering::SeqCst), 0);
+
+        answer(&conn, &first_request);
+        assert_eq!(first.await.unwrap().unwrap(), 1);
+        assert_no_request(&mut requests, "the canceled write must never dispatch").await;
         assert_eq!(client.request_admission.available_permits(), 1);
     }
 

@@ -46,6 +46,8 @@ pub(super) struct ReviewObservation {
     damaged_record: Option<(PathBuf, [u8; 32])>,
     byte_counts: Vec<u64>,
     terminal_dirs: Vec<PathBuf>,
+    prior_roots: Vec<PathBuf>,
+    active_roots: Vec<PathBuf>,
 }
 
 async fn action_error(
@@ -91,6 +93,75 @@ fn flip_byte(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn membership_epoch(receipt: &SurvivalReceipt) -> Result<&std::ffi::OsStr> {
+    let mut components = receipt.relative_record.components();
+    ensure!(
+        matches!(components.next(), Some(Component::Normal(root)) if root == "commits"),
+        "receipt must name a commit"
+    );
+    let Some(Component::Normal(epoch)) = components.next() else {
+        anyhow::bail!("receipt must name a membership epoch");
+    };
+    ensure!(
+        matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none(),
+        "receipt must name commits/<epoch>/<sequence>.json"
+    );
+    Ok(epoch)
+}
+
+fn verify_fresh_activation(
+    prior: &SurvivalReceipt,
+    fresh: &SurvivalReceipt,
+    prior_roots: &[PathBuf],
+    active_roots: &[PathBuf],
+) -> Result<()> {
+    ensure!(
+        membership_epoch(prior)? != membership_epoch(fresh)?,
+        "activation reused the old membership epoch"
+    );
+    ensure!(
+        prior_roots.len() == 2 && active_roots.len() == 2,
+        "activation must identify both old and new replica roots"
+    );
+    let prior_roots = prior_roots
+        .iter()
+        .map(|root| match root.canonicalize() {
+            Ok(path) => Ok(path),
+            // Authority loss intentionally removes one of the old roots.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(root.clone()),
+            Err(error) => Err(error),
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let active_roots = active_roots
+        .iter()
+        .map(|root| root.canonicalize())
+        .collect::<std::io::Result<Vec<_>>>()?;
+    for (index, active) in active_roots.iter().enumerate() {
+        for previous in prior_roots.iter().chain(&active_roots[..index]) {
+            ensure!(
+                !active.starts_with(previous) && !previous.starts_with(active),
+                "activation reused or overlapped a replica root"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn verify_restarted_replica_roots(
+    promoted_roots: &[PathBuf],
+    restarted_roots: &[PathBuf],
+) -> Result<()> {
+    let restarted_roots = restarted_roots
+        .iter()
+        .map(|root| root.canonicalize())
+        .collect::<std::io::Result<Vec<_>>>()?;
+    ensure!(
+        promoted_roots.len() == 2 && promoted_roots == restarted_roots,
+        "restart changed the promoted replica roots"
+    );
+    Ok(())
+}
+
 async fn probe_read(live: &Live, range: &ReadRange) -> Result<Result<(), FsError>> {
     let read = tokio::time::timeout(
         Duration::from_secs(2),
@@ -127,6 +198,11 @@ pub(super) async fn exercise(
     verify_replica_record(live, &prior, RecordCoverage::AllRequired)?;
     let mut result = ReviewObservation {
         receipts: vec![prior.clone()],
+        prior_roots: live
+            .replica_roots()
+            .into_iter()
+            .map(|root| root.canonicalize())
+            .collect::<std::io::Result<_>>()?,
         ..Default::default()
     };
     let mut observed = Observation::default();
@@ -162,10 +238,11 @@ pub(super) async fn exercise(
                 .review_action(live, Action::ReenableFreshEpoch)
                 .await?;
             let fresh = driver.commit(live).await?;
-            ensure!(
-                fresh.relative_record != prior.relative_record,
-                "re-enable reused a disabled epoch"
-            );
+            result.active_roots = live
+                .replica_roots()
+                .into_iter()
+                .map(|root| root.canonicalize())
+                .collect::<std::io::Result<_>>()?;
             result.receipts.push(fresh);
         }
         Row::StaleRestart => {
@@ -464,6 +541,11 @@ pub(super) async fn exercise(
             // The binding takes only surviving identity plus PASSWORD, builds
             // new authority roots and updates this owned fixture's handles.
             driver.review_action(live, Action::PromoteOffline).await?;
+            result.active_roots = live
+                .replica_roots()
+                .into_iter()
+                .map(|root| root.canonicalize())
+                .collect::<std::io::Result<_>>()?;
             let promoted = State::capture(live.fs(), live.pool(), &live.replica_roots()[0]).await?;
             live.expected.verify(&promoted, false)?;
             result.api.push(probe_create(live, b"promoted").await?);
@@ -716,6 +798,15 @@ pub(super) fn oracle(row: Row, live: &Live, observed: &Observation) -> Result<()
         verify_replica_record(live, record, RecordCoverage::AllSurviving)?;
     }
     if matches!(row, Row::TerminalDisable | Row::PromoteAuthority) {
+        verify_fresh_activation(
+            prior,
+            evidence.receipts.last().context("no fresh epoch record")?,
+            &evidence.prior_roots,
+            &evidence.active_roots,
+        )?;
+        if row == Row::PromoteAuthority {
+            verify_restarted_replica_roots(&evidence.active_roots, &live.replica_roots())?;
+        }
         verify_replica_record(
             live,
             evidence.receipts.last().context("no fresh epoch record")?,
@@ -1087,4 +1178,104 @@ pub(super) fn optimistic(row: Row, live: &Live, receipt: &SurvivalReceipt) -> Re
         result.api = vec![Err(FsError::ReadOnlyFilesystem), Ok(())];
     }
     result
+}
+
+#[test]
+fn fresh_activation_requires_a_new_epoch_and_disjoint_roots() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let old_roots = [fixture.path().join("old-a"), fixture.path().join("old-b")];
+    let new_roots = [fixture.path().join("new-a"), fixture.path().join("new-b")];
+    for root in old_roots.iter().chain(&new_roots) {
+        std::fs::create_dir(root)?;
+    }
+    let prior = SurvivalReceipt {
+        relative_record: "commits/old-epoch/1.json".into(),
+        digest: [1; 32],
+        mutation_cutoff: 1,
+        envelope_epoch: 1,
+        sequence: 1,
+    };
+    let mut fresh = prior.clone();
+    fresh.sequence = 2;
+    fresh.relative_record = "commits/old-epoch/2.json".into();
+    // A different sequence filename alone previously passed the epoch check.
+    assert_ne!(prior.relative_record, fresh.relative_record);
+    ensure!(verify_fresh_activation(&prior, &fresh, &old_roots, &new_roots).is_err());
+
+    fresh.relative_record = "commits/new-epoch/1.json".into();
+    fresh.sequence = 1;
+    verify_fresh_activation(&prior, &fresh, &old_roots, &new_roots)?;
+    ensure!(verify_fresh_activation(&prior, &fresh, &old_roots, &old_roots).is_err());
+    ensure!(
+        verify_fresh_activation(
+            &prior,
+            &fresh,
+            &old_roots,
+            &[new_roots[0].clone(), new_roots[0].clone()],
+        )
+        .is_err()
+    );
+    let nested = old_roots[0].join("nested");
+    std::fs::create_dir(&nested)?;
+    ensure!(
+        verify_fresh_activation(&prior, &fresh, &old_roots, &[nested, new_roots[1].clone()])
+            .is_err()
+    );
+    #[cfg(unix)]
+    {
+        let alias = fixture.path().join("old-alias");
+        std::os::unix::fs::symlink(&old_roots[0], &alias)?;
+        ensure!(
+            verify_fresh_activation(&prior, &fresh, &old_roots, &[alias, new_roots[1].clone()])
+                .is_err()
+        );
+    }
+    std::fs::remove_dir_all(&old_roots[0])?;
+    verify_fresh_activation(&prior, &fresh, &old_roots, &new_roots)?;
+    Ok(())
+}
+
+#[test]
+fn membership_epoch_rejects_paths_without_one_commit_generation() {
+    let mut receipt = SurvivalReceipt {
+        relative_record: "commits/epoch/1.json".into(),
+        digest: [1; 32],
+        mutation_cutoff: 1,
+        envelope_epoch: 1,
+        sequence: 1,
+    };
+    for path in [
+        "commits/1.json",
+        "commits/epoch/subdir/1.json",
+        "objects/epoch/1.json",
+        "/commits/epoch/1.json",
+        "commits/../1.json",
+    ] {
+        receipt.relative_record = path.into();
+        assert!(membership_epoch(&receipt).is_err(), "{path}");
+    }
+}
+
+#[test]
+fn promotion_cannot_restart_using_the_previous_replica_roots() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let old_roots = [fixture.path().join("old-a"), fixture.path().join("old-b")];
+    let new_roots = [fixture.path().join("new-a"), fixture.path().join("new-b")];
+    for root in old_roots.iter().chain(&new_roots) {
+        std::fs::create_dir(root)?;
+    }
+    let promoted_roots = new_roots
+        .iter()
+        .map(|root| root.canonicalize())
+        .collect::<std::io::Result<Vec<_>>>()?;
+    verify_restarted_replica_roots(&promoted_roots, &new_roots)?;
+    ensure!(verify_restarted_replica_roots(&promoted_roots, &old_roots).is_err());
+    ensure!(
+        verify_restarted_replica_roots(
+            &promoted_roots,
+            &[new_roots[0].clone(), old_roots[1].clone()],
+        )
+        .is_err()
+    );
+    Ok(())
 }

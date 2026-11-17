@@ -110,6 +110,12 @@ impl Debug for AuthenticatedRefetch {
     }
 }
 
+// Keep the current Foyer cache policy isolated from legacy binaries, including
+// after a rollback and subsequent upgrade; those binaries ignore our marker.
+pub(crate) const LEGACY_PARTS_CACHE_DIR: &str = "parts_cache";
+pub(crate) const PARTS_CACHE_DIR: &str = "parts_cache_v1";
+pub(crate) const PARTS_CACHE_LAYOUT_FILE: &str = ".zerofs-parts-cache-layout";
+
 const DEFAULT_PART_SIZE_BYTES: usize = 128 * 1024;
 const HEADS_CAPACITY_ENTRIES: usize = 16 * 1024;
 const ACCESS_TRACKER_CAPACITY: usize = 8 * 1024;
@@ -3208,14 +3214,12 @@ mod tests {
         .unwrap()
     }
 
-    /// Fill `dir` the way the server did before it enabled foyer's tombstone
-    /// log: the same device and block size, with every block partition
-    /// starting at partition 0. Closing flushes the memory tier to disk.
-    async fn write_parts_cache_without_a_tombstone_log(
+    async fn open_parts_cache_without_a_tombstone_log(
         dir: &std::path::Path,
-        parts: impl IntoIterator<Item = (PartKey, Bytes)>,
-    ) {
-        let previous = HybridCacheBuilder::new()
+    ) -> HybridCache<PartKey, Bytes> {
+        // The previous server configuration: the same device and block
+        // size, with no tombstone log partition or layout marker.
+        HybridCacheBuilder::new()
             .with_name("test-previous-parts")
             .memory(MEM)
             .with_weighter(|_: &PartKey, v: &Bytes| v.len())
@@ -3224,7 +3228,7 @@ mod tests {
             .with_engine_config(
                 BlockEngineConfig::new(
                     foyer::DeviceBuilder::build(
-                        FsDeviceBuilder::new(dir.join("parts_cache"))
+                        FsDeviceBuilder::new(dir.join(LEGACY_PARTS_CACHE_DIR))
                             .with_capacity(256 * 1024 * 1024),
                     )
                     .unwrap(),
@@ -3233,7 +3237,16 @@ mod tests {
             )
             .build()
             .await
-            .unwrap();
+            .unwrap()
+    }
+
+    /// Fill a legacy directory with the layout used before tombstone logging.
+    /// Closing flushes the memory tier to disk.
+    async fn write_parts_cache_without_a_tombstone_log(
+        dir: &std::path::Path,
+        parts: impl IntoIterator<Item = (PartKey, Bytes)>,
+    ) {
+        let previous = open_parts_cache_without_a_tombstone_log(dir).await;
         for (key, value) in parts {
             previous.insert(key, value);
         }
@@ -3252,40 +3265,229 @@ mod tests {
         )
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn parts_cache_written_without_a_tombstone_log_opens_with_one() {
-        let dir = tempfile::tempdir().unwrap();
-        let value = |part: usize| Bytes::from(vec![part as u8; 4096]);
-        write_parts_cache_without_a_tombstone_log(
-            dir.path(),
-            (0..64).map(|part| (upgrade_part_key(part), value(part))),
-        )
-        .await;
-
-        let upgraded = open_production_parts_cache(dir.path()).await;
-        for part in 0..64 {
-            if let Some(entry) = upgraded.get(&upgrade_part_key(part)).await.unwrap() {
-                assert_eq!(
-                    entry.value(),
-                    &value(part),
-                    "part {part} recovered wrong bytes"
-                );
-            }
-        }
-        upgraded.close().await.unwrap();
-    }
-
-    /// Bytes that, read as a foyer tombstone record (a big-endian hash and
-    /// sequence), carry the largest sequence foyer can represent.
+    /// These bytes, interpreted as tombstone records, carry u64::MAX sequences.
     fn all_ones_part() -> Bytes {
         Bytes::from(vec![0xff; 4096])
     }
 
-    /// foyer recovers the tombstone log from partition 0, which the previous
-    /// layout used for the first data block. Part bytes that read as a
-    /// tombstone with sequence `u64::MAX` must not break the upgrade.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn parts_cache_without_a_tombstone_log_holding_all_ones_parts_opens_with_one() {
+    async fn parts_cache_migration_and_rollbacks_start_cold() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Path::from("segments/upgrade");
+        let generation = CacheGeneration::Versioned {
+            e_tag: Some("upgrade".into()),
+            version: None,
+        };
+        let value = |part: usize| {
+            // If old data is mistaken for tombstones, these bytes become
+            // u64::MAX sequences and deterministically expose the overflow.
+            let mut bytes = vec![0xff; 4096];
+            bytes[0] = part as u8;
+            Bytes::from(bytes)
+        };
+        let previous = open_parts_cache_without_a_tombstone_log(dir.path()).await;
+        for part in 0..64 {
+            previous.insert(PartKey::new(&path, 4096, &generation, part), value(part));
+        }
+        previous.close().await.unwrap();
+        drop(previous);
+
+        // Confirm the legacy writer produced a recoverable disk cache before
+        // testing the format change, and leave an unrelated file beside it.
+        let previous = open_parts_cache_without_a_tombstone_log(dir.path()).await;
+        let mut recovered = 0;
+        for part in 0..64 {
+            let key = PartKey::new(&path, 4096, &generation, part);
+            if let Some(entry) = previous.get(&key).await.unwrap() {
+                assert_eq!(entry.value(), &value(part));
+                recovered += 1;
+            }
+        }
+        assert!(recovered > 0, "legacy entries must have reached disk");
+        previous.close().await.unwrap();
+        drop(previous);
+        let legacy = dir.path().join(LEGACY_PARTS_CACHE_DIR);
+        let foreign = legacy.join("foyer-storage-direct-fs-backup");
+        std::fs::write(&foreign, b"keep").unwrap();
+
+        let upgraded = open_production_parts_cache(dir.path()).await;
+        assert!(!legacy.join("foyer-storage-direct-fs-00000000").exists());
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"keep");
+        for part in 0..64 {
+            let key = PartKey::new(&path, 4096, &generation, part);
+            assert!(
+                upgraded.get(&key).await.unwrap().is_none(),
+                "the incompatible old cache must be discarded before recovery"
+            );
+            upgraded.insert(key, value(part));
+        }
+        // The disk tier remains usable within this process even though its
+        // index will deliberately not be recovered by the next process.
+        upgraded.memory().flush().await;
+        upgraded.storage().wait().await;
+        upgraded.memory().clear();
+        for part in 0..64 {
+            let key = PartKey::new(&path, 4096, &generation, part);
+            assert!(!upgraded.memory().contains(&key));
+            assert_eq!(
+                upgraded.get(&key).await.unwrap().unwrap().value(),
+                &value(part)
+            );
+        }
+        upgraded.close().await.unwrap();
+        drop(upgraded);
+
+        // Even a compatible reopen is deliberately cold. Both removed entries
+        // and otherwise valid entries from the previous process stay absent.
+        let reopened = open_production_parts_cache(dir.path()).await;
+        for part in 0..64 {
+            let key = PartKey::new(&path, 4096, &generation, part);
+            assert!(reopened.get(&key).await.unwrap().is_none());
+        }
+        reopened.close().await.unwrap();
+        drop(reopened);
+
+        // An old binary ignores the new marker and writes its old layout
+        // again. Its namespace remains isolated during a rollback and
+        // subsequent upgrade, and neither namespace is recovered as warm data.
+        let downgraded = open_parts_cache_without_a_tombstone_log(dir.path()).await;
+        for part in 0..64 {
+            downgraded.insert(
+                PartKey::new(&path, 4096, &generation, part),
+                Bytes::from(vec![0xff; 4096]),
+            );
+        }
+        downgraded.close().await.unwrap();
+        drop(downgraded);
+        assert!(legacy.join("foyer-storage-direct-fs-00000000").is_file());
+
+        let upgraded = open_production_parts_cache(dir.path()).await;
+        for part in 0..64 {
+            let key = PartKey::new(&path, 4096, &generation, part);
+            assert!(upgraded.get(&key).await.unwrap().is_none());
+        }
+        assert!(!legacy.join("foyer-storage-direct-fs-00000000").exists());
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"keep");
+        upgraded.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parts_cache_restarts_cold_after_multiple_deletion_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let generation = CacheGeneration::Versioned {
+            e_tag: Some("deletions".into()),
+            version: None,
+        };
+        let key = |part| PartKey::new(&Path::from("segments/deletions"), 4096, &generation, part);
+        let value = Bytes::from(vec![0x42; 4096]);
+        let parts = open_production_parts_cache(dir.path()).await;
+        for part in 0..900 {
+            parts.insert(key(part), value.clone());
+        }
+        parts.memory().flush().await;
+        parts.storage().wait().await;
+        parts.memory().clear();
+        assert_eq!(parts.get(&key(0)).await.unwrap().unwrap().value(), &value);
+        assert_eq!(parts.get(&key(899)).await.unwrap().unwrap().value(), &value);
+        // These batches crossed multiple pages in the former tombstone log.
+        for part in 0..600 {
+            parts.remove(&key(part));
+        }
+        parts.storage().wait().await;
+        for part in 0..600 {
+            assert!(parts.get(&key(part)).await.unwrap().is_none());
+        }
+        assert_eq!(parts.get(&key(899)).await.unwrap().unwrap().value(), &value);
+        parts.close().await.unwrap();
+        drop(parts);
+
+        let parts = open_production_parts_cache(dir.path()).await;
+        for part in 0..900 {
+            assert!(
+                parts.get(&key(part)).await.unwrap().is_none(),
+                "both deleted parts and the live control must restart cold"
+            );
+        }
+        // Model ordinary backend refills after the cold restart, then another
+        // deletion batch and restart without allowing earlier data to return.
+        for part in 600..900 {
+            parts.insert(key(part), value.clone());
+        }
+        parts.memory().flush().await;
+        parts.storage().wait().await;
+        parts.memory().clear();
+        assert_eq!(parts.get(&key(600)).await.unwrap().unwrap().value(), &value);
+        for part in 600..800 {
+            parts.remove(&key(part));
+        }
+        parts.storage().wait().await;
+        for part in 0..800 {
+            assert!(parts.get(&key(part)).await.unwrap().is_none());
+        }
+        assert_eq!(parts.get(&key(899)).await.unwrap().unwrap().value(), &value);
+        parts.close().await.unwrap();
+        drop(parts);
+
+        let parts = open_production_parts_cache(dir.path()).await;
+        for part in 0..900 {
+            assert!(parts.get(&key(part)).await.unwrap().is_none());
+        }
+        parts.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parts_cache_restarts_cold_after_tombstone_ring_sized_removals() {
+        let dir = tempfile::tempdir().unwrap();
+        let generation = CacheGeneration::Versioned {
+            e_tag: Some("deletion-wrap".into()),
+            version: None,
+        };
+        let key = |part| {
+            PartKey::new(
+                &Path::from("segments/deletion-wrap"),
+                4096,
+                &generation,
+                part,
+            )
+        };
+        let parts = open_production_parts_cache(dir.path()).await;
+        parts.insert(key(0), Bytes::from_static(b"removed"));
+        parts.insert(key(1), Bytes::from_static(b"live control"));
+        parts.memory().flush().await;
+        parts.storage().wait().await;
+        parts.memory().clear();
+        assert_eq!(
+            parts.get(&key(0)).await.unwrap().unwrap().value(),
+            &Bytes::from_static(b"removed")
+        );
+        parts.remove(&key(0));
+        // The former 256 MiB device's log held 65,536 tombstones. Removing
+        // absent keys also consumed slots and overwrote this part's deletion.
+        for part in 2..65_538 {
+            parts.remove(&key(part));
+        }
+        parts.storage().wait().await;
+        assert!(parts.get(&key(0)).await.unwrap().is_none());
+        assert_eq!(
+            parts.get(&key(1)).await.unwrap().unwrap().value(),
+            &Bytes::from_static(b"live control")
+        );
+        parts.close().await.unwrap();
+        drop(parts);
+
+        let parts = open_production_parts_cache(dir.path()).await;
+        assert!(parts.get(&key(0)).await.unwrap().is_none());
+        assert!(
+            parts.get(&key(1)).await.unwrap().is_none(),
+            "the live control is also absent under the cold-restart policy"
+        );
+        parts.close().await.unwrap();
+    }
+
+    /// Preserve the all-ones upgrade regression that exposed sequence overflow
+    /// when an old data partition was interpreted as a tombstone log.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_all_ones_parts_are_discarded_on_upgrade() {
         let dir = tempfile::tempdir().unwrap();
         write_parts_cache_without_a_tombstone_log(
             dir.path(),
@@ -3293,17 +3495,36 @@ mod tests {
         )
         .await;
 
+        let previous = open_parts_cache_without_a_tombstone_log(dir.path()).await;
+        for part in 0..4 {
+            assert_eq!(
+                previous
+                    .get(&upgrade_part_key(part))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+                &all_ones_part(),
+            );
+        }
+        previous.close().await.unwrap();
+        drop(previous);
+
         let upgraded = open_production_parts_cache(dir.path()).await;
         for part in 0..4 {
-            if let Some(entry) = upgraded.get(&upgrade_part_key(part)).await.unwrap() {
-                assert_eq!(entry.value(), &all_ones_part(), "part {part}");
-            }
+            assert!(
+                upgraded
+                    .get(&upgrade_part_key(part))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
         }
         upgraded.close().await.unwrap();
     }
 
-    /// After the upgrade, replace one part and restart twice. The cache must
-    /// return the replacement or nothing, never the replaced bytes.
+    /// After upgrade, replacement must supersede old disk bytes within the
+    /// process, and neither version may be replayed by subsequent processes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn replaced_part_stays_replaced_after_upgrading_a_cache_without_a_tombstone_log() {
         let dir = tempfile::tempdir().unwrap();
@@ -3321,22 +3542,28 @@ mod tests {
             parts.insert(upgrade_part_key(part), Bytes::from(vec![3; 4096]));
         }
         parts.insert(replaced.clone(), stale.clone());
-        parts.close().await.unwrap();
-        drop(parts);
+        parts.memory().flush().await;
+        parts.storage().wait().await;
+        parts.memory().clear();
+        assert_eq!(parts.get(&replaced).await.unwrap().unwrap().value(), &stale);
 
-        let parts = open_production_parts_cache(dir.path()).await;
         parts.remove(&replaced);
         parts.insert(replaced.clone(), replacement.clone());
+        parts.memory().flush().await;
+        parts.storage().wait().await;
+        parts.memory().clear();
+        assert_eq!(
+            parts.get(&replaced).await.unwrap().unwrap().value(),
+            &replacement
+        );
         parts.close().await.unwrap();
         drop(parts);
 
         for reopen in 0..2 {
             let parts = open_production_parts_cache(dir.path()).await;
-            let got = parts.get(&replaced).await.unwrap();
             assert!(
-                got.as_ref()
-                    .is_none_or(|entry| entry.value() == &replacement),
-                "reopen {reopen} returned the replaced bytes"
+                parts.get(&replaced).await.unwrap().is_none(),
+                "reopen {reopen} must not replay either version",
             );
             parts.close().await.unwrap();
         }
@@ -3357,7 +3584,7 @@ mod tests {
         cached_range.extensions.insert(CacheRangeOnly);
 
         // Admit one corrupt response through the ordinary cached read path,
-        // then close the cache so foyer flushes the memory tier to disk.
+        // then flush it to disk while keeping this cache instance open.
         let parts = open_production_parts_cache(dir.path()).await;
         for part in 0..earlier_parts {
             parts.insert(upgrade_part_key(1000 + part), Bytes::from(vec![3; 4096]));
@@ -3374,16 +3601,34 @@ mod tests {
             &fixture.object[run.clone()]
         );
         let keys = fixture.run_part_keys();
-        parts.close().await.unwrap();
-        drop(parts);
+        parts.memory().flush().await;
+        parts.storage().wait().await;
+        parts.memory().clear();
 
-        // A reopened cache starts with an empty memory tier, so every part
-        // of the run is served from disk.
-        let parts = open_production_parts_cache(dir.path()).await;
+        // Verify actual poisoned disk bytes, then evict RAM only. Hybrid
+        // remove would also delete disk entries and bypass the repair path.
+        let mut poisoned_parts = 0;
         for key in &keys {
             assert!(!parts.memory().contains(key), "{key:?} is in memory");
             assert!(parts.storage().may_contains(key), "{key:?} is not on disk");
+            let entry = parts
+                .get(key)
+                .await
+                .unwrap()
+                .expect("part must load from disk");
+            let start = key.part_id * CORRUPTION_PART;
+            let end = (start + CORRUPTION_PART).min(fixture.object.len());
+            if entry.value().as_ref() != &fixture.object[start..end] {
+                poisoned_parts += 1;
+            }
+            drop(entry);
+            parts.memory().remove(key);
+            assert!(!parts.memory().contains(key));
         }
+        assert!(
+            poisoned_parts > 0,
+            "the disk tier must contain corrupt bytes"
+        );
         fixture.attach(parts.clone());
         // Learn the object metadata without a data read, as a warm process
         // would already have it.
@@ -3396,12 +3641,43 @@ mod tests {
             gets + 1,
             "the first decode used the disk tier and the only backend read was the retry"
         );
-        fixture.assert_cache_holds_only_true_bytes().await;
+        assert!(
+            fixture.assert_cache_holds_only_true_bytes().await > 0,
+            "repair must admit authenticated complete parts"
+        );
+        parts.memory().flush().await;
+        parts.storage().wait().await;
+        parts.memory().clear();
+        let mut repaired_on_disk = 0;
+        for key in &keys {
+            assert!(!parts.memory().contains(key));
+            if let Some(entry) = parts.get(key).await.unwrap() {
+                let start = key.part_id * CORRUPTION_PART;
+                let end = (start + CORRUPTION_PART).min(fixture.object.len());
+                assert_eq!(entry.value().as_ref(), &fixture.object[start..end]);
+                repaired_on_disk += 1;
+                drop(entry);
+                parts.memory().remove(key);
+            }
+        }
+        assert!(
+            repaired_on_disk > 0,
+            "repaired parts must be readable from disk"
+        );
+        fixture.assert_frames(&fixture.read().await.unwrap());
+        assert_eq!(
+            fixture.reader.integrity_refetches(),
+            1,
+            "reading the repaired disk tier must not need another integrity refetch"
+        );
         parts.close().await.unwrap();
         drop(parts);
 
-        // Reopen again and read the run.
+        // Every reopen is intentionally cold, including repaired live entries.
         let parts = open_production_parts_cache(dir.path()).await;
+        for key in &keys {
+            assert!(parts.get(key).await.unwrap().is_none());
+        }
         fixture.attach(parts.clone());
         fixture.cache.head(&fixture.path()).await.unwrap();
         fixture.assert_frames(&fixture.read().await.unwrap());
@@ -3419,8 +3695,8 @@ mod tests {
         );
     }
 
-    /// The same repair on a cache directory first written without the
-    /// tombstone log, as every existing deployment's is.
+    /// The same repair after migrating a legacy directory written without
+    /// a tombstone log, with unrelated parts admitted before the corrupt run.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn corrupt_part_stays_repaired_after_upgrading_a_cache_without_a_tombstone_log() {
         let dir = tempfile::tempdir().unwrap();
