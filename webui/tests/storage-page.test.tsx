@@ -33,17 +33,18 @@ const member = {
     evacuation_error: null,
     kernel_coverage: "current boot kernel ring; unrecognized device/error forms are not attributed",
     last_sample: { device: "synthetic", failed: false },
+    since_ms: null,
     observed_ms: null,
   },
   evacuation_capacity: { sufficient: true, unavailable_members: [] },
 };
-const pool = (members: unknown[]) =>
+const pool = (members: unknown[], unreadable: unknown[] = []) =>
   JSON.stringify({
     pool_id: "test-pool",
     members,
     pending_operations: 0,
     mapped_objects: 3,
-    unreadable: [],
+    unreadable,
     quarantined_leftovers: [],
   });
 // A decoded StatsSnapshot. Its usage counters carry presence, so the client sees an omitted one as undefined.
@@ -365,5 +366,65 @@ describe("Storage page monitoring limits", () => {
     await show(observed, { unreadable_objects: 3 });
     expect(screen.getByText("1 health issue reported")).toBeTruthy();
     expect(screen.queryByText("No health issues reported")).toBeNull();
+  });
+});
+
+describe("Storage page segment faults", () => {
+  const fault = (n: number, extra: Record<string, unknown> = {}) => ({
+    location: `segments/${n}`,
+    physical_key: `hdd-a/segments/${n}`,
+    member_id: "hdd-a",
+    reason: "checksum mismatch",
+    observed_ms: 1_800_000_000_000,
+    attempts: 2,
+    next_retry_ms: 1_800_000_240_000,
+    ...extra,
+  });
+  async function show(faults: unknown[], health: Record<string, unknown> = member.health) {
+    client.getPoolStatus.mockResolvedValue({
+      json: pool([{ ...member, health, unreadable_objects: faults.length }], faults),
+    });
+    render(<StoragePage />);
+    await screen.findByText("hdd-a");
+  }
+
+  it("lists a member's fault with its location, reason, attempts and next retry time", async () => {
+    await show([fault(7, { attempts: 1 })]);
+    const list = screen.getByRole("list", { name: "Unreadable segment faults" });
+    expect(list.closest("section")?.textContent).toContain("hdd-a");
+    expect(list.textContent).toContain("segments/7");
+    expect(list.textContent).toContain("checksum mismatch");
+    expect(list.textContent).toContain("1 attempt ·");
+    expect(list.textContent).toContain(`next retry ${new Date(1_800_000_240_000).toLocaleString()}`);
+    expect(screen.queryByText(/more faults? not listed/)).toBeNull();
+  });
+
+  it("shows when a quarantined member's quarantine began", async () => {
+    await show([], { ...member.health, quarantine: "SMART media failure", since_ms: 1_700_000_000_000 });
+    expect(screen.getByText("SMART media failure")).toBeTruthy();
+    expect(screen.getByText(`Quarantined since ${new Date(1_700_000_000_000).toLocaleString()}`)).toBeTruthy();
+  });
+
+  it("caps a long fault list and says how many it left out", async () => {
+    await show(Array.from({ length: 1203 }, (_, n) => fault(n)));
+    const list = screen.getByRole("list", { name: "Unreadable segment faults" });
+    expect(list.querySelectorAll("li")).toHaveLength(50);
+    expect(screen.getByText("and 1,153 more faults not listed")).toBeTruthy();
+    expect(rowValue("Unreadable objects")).toBe("1,203");
+  });
+
+  it("renders the fault details unavailable when one entry is malformed, rather than dropping it", async () => {
+    await show([fault(1), without(fault(2), "attempts")]);
+    expect(screen.queryByRole("list", { name: "Unreadable segment faults" })).toBeNull();
+    expect(screen.getByText(/^Segment fault details unavailable · unreadable: attempts was not reported/)).toBeTruthy();
+    expect(screen.queryByText("No health issues reported")).toBeNull();
+  });
+
+  it("lists a fault whose member id names no listed member in its own section", async () => {
+    await show([fault(9, { member_id: "authority" })]);
+    const list = screen.getByRole("list", { name: "Unattributed segment faults" });
+    expect(list.textContent).toContain("segments/9");
+    expect(screen.getByText("1 unreadable segment record outside the listed members")).toBeTruthy();
+    expect(screen.queryByRole("list", { name: "Unreadable segment faults" })).toBeNull();
   });
 });
