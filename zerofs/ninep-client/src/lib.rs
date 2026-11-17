@@ -6481,6 +6481,38 @@ mod session_transition_tests {
             fsync.await.unwrap().unwrap();
             assert!(client.unsynced.get(&7).is_none());
         }
+
+        /// A clunk that fails because the server is gone still ends the fid.
+        /// The FUSE mount and the SDK return the fid number to the free list
+        /// once a clunk returns, so a fid left in the replay record would be
+        /// recreated on the next connection under a number the client hands
+        /// out again, and every walk or open that reused it would fail.
+        #[tokio::test(start_paused = true)]
+        async fn a_clunk_that_fails_with_the_outage_is_not_replayed() {
+            let (client, conn, _requests) = gone_client(MAX_INFLIGHT_REQUESTS);
+            client
+                .state
+                .lock()
+                .unwrap()
+                .fids
+                .insert(7, inode_fid(70, 0, 0, Some(0)));
+            conn.connection_lost(&client.reconnect_notify);
+
+            let clunk_client = Arc::clone(&client);
+            let clunk = tokio::spawn(async move { clunk_client.clunk(7).await });
+            let _ = settle(clunk, "a clunk issued after the server left").await;
+            assert!(
+                !client.state.lock().unwrap().fids.contains_key(&7),
+                "the next replay would recreate a fid its caller already released"
+            );
+
+            let (_returned, mut returned_requests) = server_returns(&client);
+            assert_no_request(
+                &mut returned_requests,
+                "a clunk that already returned to its caller was resent",
+            )
+            .await;
+        }
     }
 }
 
