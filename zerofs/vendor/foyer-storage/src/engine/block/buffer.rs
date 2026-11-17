@@ -118,6 +118,9 @@ impl BlobIndex {
     }
 
     pub fn seal(&mut self) -> IoSliceMut {
+        // The tail past the last record goes to disk with the index. Zero it so the
+        // index carries neither uninitialized memory nor records of an earlier blob.
+        self.bytes[BlobIndex::INDEX_OFFSET + self.count * BlobEntryIndex::serialized_len()..].fill(0);
         (&mut self.bytes[BlobIndex::COUNT_OFFSET..BlobIndex::COUNT_OFFSET + BlobIndex::COUNT_BYTES])
             .put_u32(self.count as _);
         let checksum = Checksummer::checksum64(&self.bytes[BlobIndex::CHECKSUM_BYTES..]);
@@ -243,6 +246,10 @@ impl Buffer {
             return false;
         }
 
+        // The page padding goes to disk with the entry. Zero it so it carries neither
+        // uninitialized memory nor bytes of an entry this buffer held before.
+        buf[len..aligned].fill(0);
+
         let info = BufferEntryInfo {
             hash,
             sequence,
@@ -272,6 +279,7 @@ impl Buffer {
         }
 
         buf[..slice.len()].copy_from_slice(slice);
+        buf[slice.len()..aligned].fill(0);
 
         let info = BufferEntryInfo {
             hash,
@@ -516,6 +524,35 @@ mod tests {
         let buf = bi.seal();
         let ins = BlobIndexReader::read(&buf).unwrap();
         assert_eq!(indices, ins);
+    }
+
+    /// Every byte the flusher writes is defined, even from a reused buffer.
+    #[test_log::test]
+    fn test_written_bytes_are_defined() {
+        const BLOCK_SIZE: usize = 64 * KB;
+        const BLOB_INDEX_SIZE: usize = 4 * KB;
+        const BATCH_SIZE: usize = 32 * KB;
+
+        let mut bytes = IoSliceMut::new(BATCH_SIZE);
+        bytes.fill(0xAA);
+        let mut buffer = Buffer::new(bytes, BLOCK_SIZE - BLOB_INDEX_SIZE, Arc::new(Metrics::noop()));
+        assert!(buffer.push(&1u64, &vec![1u8; 3 * KB], 1, Compression::None, 1));
+        assert!(buffer.push_slice(&[2u8; 5 * KB], 2, 2));
+        let (bytes, infos) = buffer.finish();
+        for info in &infos {
+            let padding = &bytes[info.offset + info.len..info.offset + info.aligned()];
+            assert!(padding.iter().all(|b| *b == 0), "entry {} padding", info.hash);
+        }
+
+        let mut index_bytes = IoSliceMut::new(BLOB_INDEX_SIZE);
+        index_bytes.fill(0xAA);
+        let mut ctx = SplitCtx::new(BLOCK_SIZE, BLOB_INDEX_SIZE);
+        ctx.current_blob_index = BlobIndex::new(index_bytes);
+        let batch = Splitter::split(&mut ctx, bytes.into_io_slice(), infos);
+        let part = &batch.blocks[0].blob_parts[0];
+        let records = BlobIndex::INDEX_OFFSET + part.indices.len() * BlobEntryIndex::serialized_len();
+        assert!(part.index[records..].iter().all(|b| *b == 0), "blob index tail");
+        assert_eq!(BlobIndexReader::read(&part.index).unwrap(), part.indices);
     }
 
     #[test_log::test]
