@@ -23,8 +23,8 @@ mount only for an open descriptor. After `st_dev` matches, the collector opens
 each directory, regular file and symlink, then compares its `fstatfs` filesystem
 ID (`f_fsid`) and mount point (`f_mntonname`) with the root's before reading
 through it. A difference is a `mount_boundary`, and a failed `fstatfs` reports
-`mount_id_unavailable`. Either one skips the entry's reads and descendants. FIFOs,
-sockets and devices are not opened. macOS mounts only on directories, so they
+`mount_id_unavailable`. Either one skips the entry's reads and descendants. The
+collector does not open FIFOs, sockets or devices. macOS mounts only on directories, so they
 share the mount of the directory that lists them. The command is available only
 on Linux and macOS.
 
@@ -175,8 +175,8 @@ Each sorter holds at most 4,096 rows and a 1 MiB byte budget. The budget include
 reserved raw byte capacity and the actual capacity of the row-vector allocation.
 Each vector descriptor uses 24 bytes on a 64-bit target. One oversized row can
 temporarily exceed the budget before it spills. Directory listing creates a raw-name sorter and a folded-key sorter.
-The folded sorter holds keys for all three rules and is released before visiting
-children. The hardlink sorter uses the same caps and stores observations instead of an inode-to-path map.
+The folded sorter holds keys for all three rules. The collector releases it before
+visiting children. The hardlink sorter uses the same caps and stores observations instead of an inode-to-path map.
 Large groups stream in chunks of 256 rows, so one inode cannot retain all its
 paths in memory.
 
@@ -186,7 +186,7 @@ there only when a sorter exceeds a cap. Without this option, exceeding either
 cap stops the walk with an error. Sorted runs merge two at a time in binary
 levels, with at most one run per level. This limits merge buffers to two input
 rows and three 8 KiB I/O buffers, plus file descriptors for logarithmically many
-runs. Scratch files disappear on success and returned errors. A killed process
+runs. The collector removes scratch files on success and on returned errors. A killed process
 can leave its private scratch child for the operator to remove.
 
 An active ancestor can retain up to 1 MiB of sorted raw names. Traversal stops
@@ -218,10 +218,10 @@ original bytes through the last complete
 checkpoint, rebuilds summary counts and the hardlink sorter, and reopens active
 ancestors without following symlinks. A changed ancestor or mount ID stops resume.
 The collector continues after the saved child cursors without recollecting
-completed subtrees. Records after that checkpoint, including a torn final line,
-are discarded. A manifest with no complete directory checkpoint cannot resume.
-Schema 4 manifests lack the checkpoint-state digest and are refused by the header
-version check; collect a new schema 5 manifest instead of resuming them.
+completed subtrees. Resume discards records after that checkpoint, including a
+torn final line. A manifest with no complete directory checkpoint cannot resume.
+Schema 4 manifests lack the checkpoint-state digest, and the header version check
+refuses them. Collect a new schema 5 manifest instead of resuming them.
 
 The source must remain stable across the interruption. Resume retains earlier
 observations and does not rescan completed subtrees to detect later changes.
@@ -234,11 +234,8 @@ each newline. It excludes its own line. Output order and serialization are
 deterministic for the same metadata observations and collector build. A source
 whose atime changes between runs can produce different output.
 
-The macOS collector's tests were last run on macOS before this serialization
-change and are not rerun on the host.
-
-The Linux bind-mount and special-device fixture is explicitly ignored by normal
-unit-test runs. The Rust workflow runs it separately with `--ignored --exact`,
+Normal unit-test runs skip the Linux bind-mount and special-device fixture,
+which is marked ignored. The Rust workflow runs it separately with `--ignored --exact`,
 the opt-in environment variable, and mount privileges in a private mount
 namespace. The step builds as the normal user and elevates only the fixture
 binary, retaining `inventory-mounts.log`. Omitting the opt-in when explicitly
@@ -250,3 +247,6 @@ and this exact ignored fixture in a private mount namespace.
 - Not verified: TrueNAS and ZFS collection and ACL exposure require runs on those
   platforms. Local fixtures do not establish which ACLs or xattrs a NAS carries,
   its space usage, or Samba's name matching behavior.
+
+- Not verified: The macOS collector's tests last ran on macOS before this
+  serialization change. This change did not rerun them on the host.
