@@ -175,7 +175,7 @@ The `user.*` namespace requires inode read permission for reads and write permis
 
 Attribute writes commit at clunk, which can return an error. A disconnect discards staged bytes that have not reached the clunk commit. A submitted commit may finish after disconnect. Linux uses a zero-size `Txattrcreate` with `XATTR_REPLACE` to remove an attribute, so that combination removes rather than stores an empty value. Flags zero or `XATTR_CREATE` can store an empty value.
 
-Attribute changes are not deduplicated across HA failover because clunk has no operation id. Retrying a successful create-only set can return `EEXIST`; retrying a removal can return `ENODATA`. If the clunk response is lost, read the attribute to determine whether the change committed. A later fsync covers completed attribute changes under the configured durability contract.
+ZeroFS does not deduplicate attribute changes across HA failover because clunk has no operation id. Retrying a successful create-only set can return `EEXIST`; retrying a removal can return `ENODATA`. If the clunk response is lost, read the attribute to determine whether the change committed. A later fsync covers completed attribute changes under the configured durability contract.
 
 ## Limitations
 
