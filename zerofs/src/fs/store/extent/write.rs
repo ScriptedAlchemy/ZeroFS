@@ -1010,6 +1010,19 @@ impl ExtentStore {
         Ok(())
     }
 
+    /// Sealed generations still waiting for a successful PUT, and their bytes.
+    #[cfg(test)]
+    pub(crate) fn retained_seals(&self) -> (usize, usize) {
+        let sealing = self.sealing.lock().unwrap();
+        (
+            sealing.len(),
+            sealing
+                .values()
+                .map(|generation| generation.bytes.len())
+                .sum(),
+        )
+    }
+
     fn pending_seals(&self) -> Vec<(Segid, Bytes)> {
         let sealing = self.sealing.lock().unwrap();
         sealing
