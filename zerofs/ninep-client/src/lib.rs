@@ -1815,14 +1815,16 @@ impl NinePClient {
         exact_tag: Option<u16>,
         body: Message,
     ) -> ClientResult<Message> {
-        Self::send_raw_at_tag_ctx(conn, exact_tag, body, false).await
+        Self::send_raw_at_tag_ctx(conn, exact_tag, body, false, None).await
     }
 
+    /// `admission` stays with the response slot once the request is registered.
     async fn send_raw_at_tag_ctx(
         conn: &Conn,
         exact_tag: Option<u16>,
         body: Message,
         op_id_enabled: bool,
+        admission: Option<&AdmissionPermit>,
     ) -> ClientResult<Message> {
         let permit = conn
             .writer_tx
@@ -1835,9 +1837,9 @@ impl NinePClient {
         }
         let (otx, mut orx) = oneshot::channel();
         let tag = match exact_tag {
-            Some(tag) => Self::register_tag(conn, tag, otx, None)
+            Some(tag) => Self::register_tag(conn, tag, otx, admission.cloned())
                 .map_err(|_| ClientError::Unexpected("raw tag already registered"))?,
-            None => match Self::alloc_tag(conn, otx, None) {
+            None => match Self::alloc_tag(conn, otx, admission) {
                 Ok(tag) => tag,
                 Err(_) => {
                     drop(permit);
