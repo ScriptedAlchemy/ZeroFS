@@ -2904,7 +2904,7 @@ mod tests {
 
     async fn stalled_success_stops_after_revocation(batch: bool) {
         let (filesystem, lease, raw_db) = leased_filesystem_for_response_gate().await;
-        let success = frame(41, Message::Rwrite(Rwrite { count: 1 })).to_vec();
+        let success = frame(41, Message::Rwrite(ninep_proto::Rwrite { count: 1 })).to_vec();
         let responses = if batch {
             // Exercise both the direct write path and the buffered batch's
             // final flush. The Rflush must not outlive the suppressed success.
