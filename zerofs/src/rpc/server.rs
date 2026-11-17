@@ -1027,6 +1027,11 @@ mod tests {
             &[(shard, b"bad".as_slice())],
         )
         .await;
+        assert!(fs.quota.is_poisoned());
+        assert!(matches!(
+            fs.quota.reserve(1),
+            Err(crate::fs::errors::FsError::IoError)
+        ));
         let (client, shutdown, _dir) = setup_fs(fs, checkpoint_manager, false).await;
         let sample = first_stats_sample(&client).await;
         // The fields are absent on the wire. Prost decodes an optional field to None

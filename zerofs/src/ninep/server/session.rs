@@ -501,8 +501,10 @@ impl P9PendingFrames {
 
 /// Upper bound on one spawned request task, charged with its frame against the
 /// reader's pending envelope. A debug assertion at spawn keeps it honest in
-/// every test that dispatches a request.
-pub(super) const PENDING_REQUEST_TASK_BYTES: usize = 16 * 1024;
+/// every test that dispatches a request. Retaining receive ownership makes the
+/// tracked task 16,400 bytes in the WebUI test build; reserve a full 20 KiB for
+/// both pending and admitted requests, including build-dependent layout padding.
+pub(super) const PENDING_REQUEST_TASK_BYTES: usize = 20 * 1024;
 
 /// A request whose task has started and is waiting for request admission.
 type StartedRequest = oneshot::Receiver<anyhow::Result<()>>;
@@ -813,6 +815,11 @@ async fn charge_received_frame(
     inflight: &InflightRegistry,
 ) -> anyhow::Result<ReceiveCharge> {
     if header.type_byte == TFLUSH_TYPE {
+        // Flush credit covers a fixed-size control frame. Reject any other
+        // length before the stream reader allocates and reads its body.
+        if header.len != P9_HEADER_SIZE + 2 {
+            anyhow::bail!("Tflush message must carry exactly one oldtag");
+        }
         return Ok(ReceiveCharge::Flush(inflight.flush_slot().await?));
     }
     let bytes = header
@@ -874,6 +881,38 @@ where
 #[cfg(test)]
 mod pending_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn malformed_flush_cannot_allocate_an_uncharged_maximum_frame() {
+        let global = P9GlobalAdmission::for_test(P9_MAX_MSIZE as usize, 1);
+        let shutdown = CancellationToken::new();
+        let pending = P9PendingFrames::new(global.admit_receive(&shutdown).await.unwrap());
+        let inflight = InflightRegistry::default();
+        let full = charge_received_frame(
+            FrameHeader {
+                len: P9_MAX_MSIZE as usize,
+                type_byte: T_WRITE,
+            },
+            &pending,
+            &inflight,
+        )
+        .await
+        .unwrap();
+        let malformed = charge_received_frame(
+            FrameHeader {
+                len: P9_MAX_MSIZE as usize,
+                type_byte: TFLUSH_TYPE,
+            },
+            &pending,
+            &inflight,
+        )
+        .await;
+        assert!(
+            malformed.is_err(),
+            "a malformed Tflush must be rejected before allocating a second maximum frame"
+        );
+        drop(full);
+    }
 
     #[tokio::test]
     async fn full_pending_envelope_rejects_ordinary_frames_but_admits_flush() {

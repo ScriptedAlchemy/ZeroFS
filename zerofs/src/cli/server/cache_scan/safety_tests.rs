@@ -94,6 +94,25 @@ fn an_index_length_cannot_hide_nonzero_entry_padding() {
 }
 
 #[test]
+fn a_truncated_raw_partition_cannot_hide_beside_a_clean_block() {
+    let (root, parts, partition) = parts_fixture();
+    let mut bytes = vec![0; 2 * PAGE];
+    blob(&mut bytes, 0);
+    let mut file = File::create(partition).unwrap();
+    file.write_all(&bytes).unwrap();
+    file.set_len(super::super::PARTS_BLOCK_SIZE as u64).unwrap();
+    drop(file);
+    File::create(parts.join("foyer-storage-direct-fs-00000001")).unwrap();
+
+    let report = scan_cache_files(root.path(), ScanOptions::default()).unwrap();
+    assert_eq!(report.status, ScanStatus::NothingScanned, "{report:#?}");
+    let counts = report.caches[0].scanned.as_ref().unwrap();
+    assert_eq!(counts.entries, 1);
+    assert_eq!(counts.other_partitions, 1);
+    assert_eq!(counts.incomplete_partitions, 1);
+}
+
+#[test]
 fn a_direct_cache_does_not_hide_a_cache_in_a_sibling_namespace() {
     let (root, _, direct_partition) = parts_fixture();
     let mut bytes = vec![0; 2 * PAGE];

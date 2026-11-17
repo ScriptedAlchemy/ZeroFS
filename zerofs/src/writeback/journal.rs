@@ -133,7 +133,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use fs4::fs_std::FileExt;
 use futures::{StreamExt, stream, stream::BoxStream};
-use redb::backends::InMemoryBackend;
 use redb::{
     Builder, Database, Durability, ReadableDatabase, ReadableTable, StorageBackend, TableDefinition,
 };
@@ -275,6 +274,121 @@ impl RedbHeader {
                 self.layout_len
             )));
         }
+        Ok(())
+    }
+}
+
+/// A pinned, read-only journal file with a private header page.
+///
+/// redb 4.1 has no public read-only constructor for a custom StorageBackend.
+/// Its ordinary constructor marks a clean header writable, so keep just that
+/// page in memory. Reads of every other page go directly to the owner-locked
+/// file. Constructor scratch-space growth is virtual and reads as zeros.
+/// Data writes are forbidden, including the allocator checkpoint redb attempts
+/// on drop. That checkpoint is unnecessary for a read-only identity inspection
+/// and its error is handled by redb's Drop.
+struct JournalIdentityBackend {
+    file: File,
+    state: Mutex<JournalIdentityReadState>,
+}
+
+struct JournalIdentityReadState {
+    len: u64,
+    /// Original bytes still visible after any virtual truncation.
+    file_len: u64,
+    header: [u8; RedbHeader::PAGE_SIZE as usize],
+}
+
+impl fmt::Debug for JournalIdentityBackend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JournalIdentityBackend")
+            .field("file", &self.file)
+            .finish_non_exhaustive()
+    }
+}
+
+impl JournalIdentityBackend {
+    fn new(file: File) -> std::io::Result<Self> {
+        let len = file.metadata()?.len();
+        let mut header = [0; RedbHeader::PAGE_SIZE as usize];
+        let header_len = len.min(RedbHeader::PAGE_SIZE) as usize;
+        std::os::unix::fs::FileExt::read_exact_at(&file, &mut header[..header_len], 0)?;
+        Ok(Self {
+            file,
+            state: Mutex::new(JournalIdentityReadState {
+                len,
+                file_len: len,
+                header,
+            }),
+        })
+    }
+
+    fn state(&self) -> std::io::Result<std::sync::MutexGuard<'_, JournalIdentityReadState>> {
+        self.state
+            .lock()
+            .map_err(|_| std::io::Error::other("journal identity backend lock poisoned"))
+    }
+}
+
+impl StorageBackend for JournalIdentityBackend {
+    fn len(&self) -> std::io::Result<u64> {
+        Ok(self.state()?.len)
+    }
+
+    fn read(&self, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
+        let state = self.state()?;
+        let end = offset
+            .checked_add(out.len() as u64)
+            .filter(|end| *end <= state.len)
+            .ok_or(std::io::ErrorKind::UnexpectedEof)?;
+        out.fill(0);
+        if offset < RedbHeader::PAGE_SIZE {
+            let start = offset as usize;
+            let copied = out.len().min(state.header.len() - start);
+            out[..copied].copy_from_slice(&state.header[start..start + copied]);
+        }
+        let file_start = offset.max(RedbHeader::PAGE_SIZE);
+        let file_end = end.min(state.file_len);
+        if file_start < file_end {
+            std::os::unix::fs::FileExt::read_exact_at(
+                &self.file,
+                &mut out[(file_start - offset) as usize..(file_end - offset) as usize],
+                file_start,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn set_len(&self, len: u64) -> std::io::Result<()> {
+        let mut state = self.state()?;
+        state.len = len;
+        state.file_len = state.file_len.min(len);
+        if len < RedbHeader::PAGE_SIZE {
+            state.header[len as usize..].fill(0);
+        }
+        Ok(())
+    }
+
+    fn sync_data(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+        let mut state = self.state()?;
+        let end = offset
+            .checked_add(data.len() as u64)
+            .filter(|end| *end <= RedbHeader::PAGE_SIZE && *end <= state.len)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "identity backend cannot write {} bytes at {offset}",
+                        data.len()
+                    ),
+                )
+            })?;
+        state.header[offset as usize..end as usize].copy_from_slice(data);
         Ok(())
     }
 }
@@ -684,7 +798,7 @@ impl Journal {
         root_dir: &AnchoredDir,
         during_read: impl FnOnce(),
     ) -> Result<JournalIdentity> {
-        let mut database_file = root_dir
+        let database_file = root_dir
             .open_existing_owner_file_read_only("journal.redb".as_ref())
             .with_context(|| {
                 format!(
@@ -692,26 +806,17 @@ impl Journal {
                     root_dir.display().join("journal.redb").display()
                 )
             })?;
-        // Read a copy of the database rather than opening it read-only. A redb
-        // 4.1 read-only handle takes a shared flock on a descriptor of its own
-        // and never releases it explicitly, so a child forked while it is open
-        // keeps the file locked until that child execs, and the exclusive open
-        // that follows fails. The copy holds no lock, and the writes its
-        // handle makes on close stay in memory. The copy is opened writable,
-        // which would repair an unclean header in memory, so the checks below
-        // refuse what redb's read-only open refused: a file that needs
-        // recovery is recovered by the journal's own open, not by this read.
+        // Use our owner lock and pinned read-only descriptor. A redb read-only
+        // path open takes its own flock, which a forked child can retain until
+        // exec and block the following writable open. A custom backend avoids
+        // that lock without copying the entire database into memory.
+        // Preserve the existing offline contract: only the journal's normal
+        // open may recover an unclean database, never this identity read.
         let path = root_dir.display().join("journal.redb");
-        let mut image = Vec::new();
-        database_file.read_to_end(&mut image).with_context(|| {
-            format!(
-                "failed to read existing journal database {}",
-                path.display()
-            )
-        })?;
-        if let Some(header) = RedbHeader::parse(&image) {
-            header.ensure_openable(image.len() as u64, &path)?;
-            if header.recovery_required || header.layout_len != image.len() as u64 {
+        let len = database_file.metadata()?.len();
+        if let Some(header) = RedbHeader::read(&database_file)? {
+            header.ensure_openable(len, &path)?;
+            if header.recovery_required || header.layout_len != len {
                 bail!(
                     "writeback journal database {} was not closed cleanly and needs recovery, \
                      which reading its identity does not perform",
@@ -719,16 +824,14 @@ impl Journal {
                 );
             }
         }
-        let copy = InMemoryBackend::new();
-        copy.set_len(image.len() as u64)?;
-        copy.write(0, &image)?;
-        drop(image);
+        let backend = JournalIdentityBackend::new(database_file)?;
         let database = open_journal_database(&path, || {
             Builder::new()
+                .set_cache_size(1024 * 1024)
                 .set_repair_callback(|session| session.abort())
-                .create_with_backend(copy)
+                .create_with_backend(backend)
         })
-        .context("failed to read the identity from a copy of the journal database")?;
+        .context("failed to read the identity through the read-only journal backend")?;
         during_read();
         let read = database
             .begin_read()
@@ -4611,6 +4714,129 @@ mod tests {
         assert!(format!("{error:#}").contains("already locked"), "{error:#}");
         assert!(!identity_read, "the identity of a live journal was read");
         drop(journal);
+    }
+
+    #[test]
+    fn identity_backend_pins_bytes_and_keeps_virtual_changes_private() {
+        use redb::StorageBackend;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("identity.redb");
+        let retained = temp.path().join("retained.redb");
+        let page = super::RedbHeader::PAGE_SIZE;
+        let original = vec![0x5a; 3 * page as usize];
+        fs::write(&path, &original).unwrap();
+        let backend = super::JournalIdentityBackend::new(fs::File::open(&path).unwrap()).unwrap();
+        fs::rename(&path, &retained).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+
+        backend.write(0, b"private").unwrap();
+        let mut header = [0; 7];
+        backend.read(0, &mut header).unwrap();
+        assert_eq!(&header, b"private");
+        let mut bytes = [0; 12];
+        backend.read(page, &mut bytes).unwrap();
+        assert_eq!(bytes, [0x5a; 12]);
+        backend.set_len(4 * page).unwrap();
+        backend.read(3 * page, &mut bytes).unwrap();
+        assert_eq!(bytes, [0; 12]);
+
+        backend.set_len(page + 4).unwrap();
+        backend.set_len(3 * page).unwrap();
+        backend.read(page, &mut bytes).unwrap();
+        assert_eq!(bytes, [0x5a, 0x5a, 0x5a, 0x5a, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            backend.write(page, b"forbidden").unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            backend.read(u64::MAX, &mut bytes).unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            backend.write(u64::MAX, b"overflow").unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        backend.set_len(4).unwrap();
+        backend.set_len(page).unwrap();
+        backend.read(0, &mut header).unwrap();
+        assert_eq!(&header, b"priv\0\0\0");
+        backend.sync_data().unwrap();
+        drop(backend);
+        assert_eq!(fs::read(retained).unwrap(), original);
+        assert_eq!(fs::read(path).unwrap(), b"replacement");
+    }
+
+    /// Reading one identity must not allocate an image of the entire redb
+    /// file. A child gets a bounded amount of additional address space so
+    /// the regression fails safely, without exhausting the test machine.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn identity_read_does_not_copy_the_whole_database() {
+        const CHILD: &str = "ZEROFS_JOURNAL_IDENTITY_MEMORY_CHILD";
+        const ALLOWANCE: u64 = 48 * 1024 * 1024;
+        if let Some(root) = std::env::var_os(CHILD) {
+            let status = fs::read_to_string("/proc/self/status").unwrap();
+            let current_kib: u64 = status
+                .lines()
+                .find_map(|line| line.strip_prefix("VmSize:"))
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            let limit = libc::rlimit {
+                rlim_cur: current_kib * 1024 + ALLOWANCE,
+                rlim_max: current_kib * 1024 + ALLOWANCE,
+            };
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) }, 0);
+            let root = super::AnchoredDir::open_absolute(Path::new(&root), 0o700).unwrap();
+            let _lock = Journal::lock_existing(&root).unwrap();
+            assert_eq!(
+                Journal::read_existing_identity(&root, || {}).unwrap(),
+                identity("bucket-a")
+            );
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        drop(open_temp_journal(&temp, "bucket-a"));
+        let database = root.join("journal.redb");
+        let db = redb::Builder::new()
+            .set_cache_size(4 * 1024 * 1024)
+            .open(&database)
+            .unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(redb::TableDefinition::<u64, &[u8]>::new("large_fixture"))
+                .unwrap();
+            let value = vec![0x5a; 32 * 1024];
+            for row in 0..1024 {
+                table.insert(row, value.as_slice()).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        drop(db);
+        assert!(fs::metadata(&database).unwrap().len() > ALLOWANCE);
+        let before = Sha256::digest(fs::read(&database).unwrap());
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "identity_read_does_not_copy_the_whole_database",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, &root)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "bounded identity read failed: {}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert_eq!(Sha256::digest(fs::read(database).unwrap()), before);
     }
 
     /// A child forked from this process, holding every descriptor it inherited

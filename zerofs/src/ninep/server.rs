@@ -53,7 +53,7 @@ use frame_codec::{
 };
 #[cfg(any(feature = "webui", test))]
 #[allow(unused_imports)]
-pub(crate) use response_writer::{P9Response, response_may_be_emitted};
+pub(crate) use response_writer::{P9Response, response_may_be_emitted, with_response_authority};
 #[cfg(test)]
 use response_writer::{
     RESPONSE_BUFFER_CAPACITY, ResponseAuthority, ResponseCredit, spawn_response_writer,
@@ -2900,6 +2900,56 @@ mod tests {
         );
         assert!(connection_shutdown.is_cancelled());
         raw_db.close().await.unwrap();
+    }
+
+    async fn stalled_success_stops_after_revocation(batch: bool) {
+        let (filesystem, lease, raw_db) = leased_filesystem_for_response_gate().await;
+        let success = frame(41, Message::Rwrite(Rwrite { count: 1 })).to_vec();
+        let responses = if batch {
+            // Exercise both the direct write path and the buffered batch's
+            // final flush. The Rflush must not outlive the suppressed success.
+            response_queue([
+                (41, success),
+                (42, frame(42, Message::Rflush(Rflush)).to_vec()),
+            ])
+            .await
+        } else {
+            response_queue([(41, success)]).await
+        };
+        let (mut client, server) = tokio::io::duplex(1);
+        let connection_shutdown = CancellationToken::new();
+        let writer = spawn_response_writer(
+            server,
+            responses,
+            ResponseAuthority::from_database(Arc::clone(&filesystem.db)),
+            connection_shutdown.clone(),
+        );
+        // A one-byte transport ensures the frame cannot finish in the first
+        // poll. Revoke before the blocked writer is polled again on this thread.
+        client.read_exact(&mut [0]).await.unwrap();
+        lease.revoke();
+        let mut tail = Vec::new();
+        tokio::time::timeout(TEST_TIMEOUT, client.read_to_end(&mut tail))
+            .await
+            .expect("the revoked writer must close")
+            .unwrap();
+        drain_writer(writer, "the revoked writer must stop after backpressure").await;
+        assert!(
+            tail.is_empty(),
+            "a revoked success frame must stay incomplete"
+        );
+        assert!(connection_shutdown.is_cancelled());
+        raw_db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn single_success_stops_after_transport_backpressure_revocation() {
+        stalled_success_stops_after_revocation(false).await;
+    }
+
+    #[tokio::test]
+    async fn batch_success_stops_after_transport_backpressure_revocation() {
+        stalled_success_stops_after_revocation(true).await;
     }
 
     #[tokio::test]

@@ -2713,7 +2713,11 @@ impl NinePHandler {
             return Err(P9Error::BadFid);
         }
 
-        let (used_bytes, used_inodes) = self.filesystem.global_stats.get_totals();
+        let (used_bytes, used_inodes) = self
+            .filesystem
+            .global_stats
+            .known_totals()
+            .ok_or(FsError::IoError)?;
 
         const BLOCK_SIZE: u32 = 4096; // 4KB blocks
 
@@ -5733,6 +5737,15 @@ mod tests {
                 assert_eq!(rerror.ecode, crate::linux_errno::EBADF);
             }
             _ => panic!("Expected Rlerror, got {:?}", invalid_resp.body),
+        }
+
+        fs.global_stats.load_shard_record(3, b"bad");
+        let unknown_usage = handler
+            .handle_message(4, Message::Tstatfs(Tstatfs { fid: 1 }))
+            .await;
+        match unknown_usage.body {
+            Message::Rlerror(rerror) => assert_eq!(rerror.ecode, crate::linux_errno::EIO),
+            other => panic!("Expected EIO for unknown usage, got {other:?}"),
         }
     }
 

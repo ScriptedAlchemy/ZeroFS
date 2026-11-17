@@ -356,6 +356,14 @@ fn has_cause<T: std::error::Error + 'static>(error: &object_store::Error) -> boo
     false
 }
 
+/// The catalog rejected this member's eligibility before publishing a placement.
+/// Durable replay may reserve a fresh generation on another healthy member;
+/// any failed cleanup of the old generation remains charged to its own upload.
+/// Foreground attempts still return this permanent refusal without retrying.
+pub(crate) fn is_prepublication_allocation_refusal(error: &object_store::Error) -> bool {
+    has_cause::<catalog::AllocationBlocked>(error)
+}
+
 fn error(message: impl Into<String>) -> object_store::Error {
     permanent(std::io::Error::other(message.into()))
 }

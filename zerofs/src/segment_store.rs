@@ -283,6 +283,16 @@ impl SegmentStore {
         options.extensions.insert(capability.clone());
         let upload = match self.object_store.put_multipart_opts(path, options).await {
             Ok(upload) => upload,
+            Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
+                // Pool and other conditional backends may reject an existing
+                // key before returning an upload handle. An earlier completion
+                // can have committed before its waiter was cancelled, so this
+                // boundary needs the same exact-byte reconciliation as complete.
+                return self
+                    .verify_existing_segment_bytes(path, bytes)
+                    .await
+                    .map(SegmentPublication::Multipart);
+            }
             Err(slatedb::object_store::Error::NotSupported { .. }) => {
                 self.put_segment_create(path, bytes).await?;
                 return Ok(SegmentPublication::SingleFallback);
@@ -1091,6 +1101,7 @@ mod tests {
         cancelled: Arc<AtomicBool>,
         aborted: Arc<AtomicBool>,
         saw_generated_segment_create: AtomicBool,
+        reject_existing_multipart: bool,
     }
 
     impl MultipartFaultStore {
@@ -1109,6 +1120,7 @@ mod tests {
                     cancelled: Arc::new(AtomicBool::new(false)),
                     aborted: aborted.clone(),
                     saw_generated_segment_create: AtomicBool::new(false),
+                    reject_existing_multipart: false,
                 }),
                 aborted,
             )
@@ -1127,6 +1139,7 @@ mod tests {
                 cancelled: Arc::new(AtomicBool::new(false)),
                 aborted: Arc::new(AtomicBool::new(false)),
                 saw_generated_segment_create: AtomicBool::new(false),
+                reject_existing_multipart: false,
             })
         }
 
@@ -1143,6 +1156,7 @@ mod tests {
                 cancelled: Arc::new(AtomicBool::new(false)),
                 aborted: Arc::new(AtomicBool::new(false)),
                 saw_generated_segment_create: AtomicBool::new(false),
+                reject_existing_multipart: false,
             })
         }
 
@@ -1243,6 +1257,12 @@ mod tests {
                 opts.extensions.get::<GeneratedSegmentCreate>().is_some(),
                 Ordering::SeqCst,
             );
+            if self.reject_existing_multipart && self.inner.head(location).await.is_ok() {
+                return Err(slatedb::object_store::Error::AlreadyExists {
+                    path: location.to_string(),
+                    source: "existing segment rejected before multipart initiation".into(),
+                });
+            }
             let inner = self.inner.put_multipart_opts(location, opts).await?;
             Ok(Box::new(FaultUpload {
                 inner,
@@ -1513,6 +1533,55 @@ mod tests {
             );
             assert_eq!(
                 os.get(&path).await.unwrap().bytes().await.unwrap(),
+                Bytes::copy_from_slice(existing)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_initiation_reconciles_only_exact_existing_bytes() {
+        // PoolObjectStore checks Create before returning an upload handle.
+        // A preceding complete may have committed even if its waiter was
+        // cancelled, so the next seal sees this error at initiation instead
+        // of completion. Both boundaries must reconcile the same exact bytes.
+        for (existing, wanted, succeeds) in [
+            (b"".as_slice(), b"".as_slice(), true),
+            (b"exact".as_slice(), b"exact".as_slice(), true),
+            (b"other".as_slice(), b"exact".as_slice(), false),
+            (b"exac".as_slice(), b"exact".as_slice(), false),
+            (b"exact!".as_slice(), b"exact".as_slice(), false),
+        ] {
+            let (mut backend, _) = MultipartFaultStore::new(None, false);
+            Arc::get_mut(&mut backend)
+                .unwrap()
+                .reject_existing_multipart = true;
+            let object_store: Arc<dyn ObjectStore> = backend.clone();
+            let store = SegmentStore::new(object_store.clone(), codec(), 5, None);
+            let path = Path::from(store.next_segid().object_key());
+            object_store
+                .put(&path, Bytes::copy_from_slice(existing).into())
+                .await
+                .unwrap();
+
+            assert_eq!(
+                store
+                    .put_segment_multipart(&path, &Bytes::copy_from_slice(wanted))
+                    .await
+                    .is_ok(),
+                succeeds,
+                "existing length {}, wanted length {}",
+                existing.len(),
+                wanted.len()
+            );
+            assert!(!backend.aborted.load(Ordering::SeqCst));
+            assert_eq!(
+                object_store
+                    .get(&path)
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap(),
                 Bytes::copy_from_slice(existing)
             );
         }

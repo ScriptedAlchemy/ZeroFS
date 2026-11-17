@@ -709,6 +709,42 @@ impl SessionState {
     }
 }
 
+#[derive(Default)]
+struct StatefulRequests {
+    next_id: u64,
+    pending: HashMap<u64, PendingStatefulRequest>,
+}
+
+struct PendingStatefulRequest {
+    fids: Vec<u32>,
+    changed_fid: u32,
+    completed: watch::Sender<()>,
+}
+
+/// Keeps conflicting fid transitions ordered through local replay bookkeeping,
+/// even when callers poll received replies out of order.
+struct StatefulRequest {
+    registry: Arc<Mutex<StatefulRequests>>,
+    id: u64,
+    admission: AdmissionPermit,
+    predecessors: Vec<watch::Receiver<()>>,
+    // The registry owns the sender. Retirement can close it even while the
+    // caller keeps this future unpolled; that caller must never resume dispatch
+    // or publish replay state after its fid was released.
+    completed: watch::Receiver<()>,
+}
+
+impl Drop for StatefulRequest {
+    fn drop(&mut self) {
+        self.registry.lock().unwrap().pending.remove(&self.id);
+    }
+}
+
+struct StatefulResponse<'a> {
+    _transition: tokio::sync::MutexGuard<'a, ()>,
+    _request: StatefulRequest,
+}
+
 pub struct NinePClient {
     /// Targets probed by the reconnect supervisor.
     targets: Vec<Target>,
@@ -750,6 +786,8 @@ pub struct NinePClient {
     stale_fids: DashSet<u32>,
     /// Orders stateful response settlement against snapshot/replay/install.
     session_transition: tokio::sync::Mutex<()>,
+    /// Admission bounds this registry; independent fid transitions run in parallel.
+    stateful_requests: Arc<Mutex<StatefulRequests>>,
     /// Dispatch window for filesystem RPCs. Session-maintenance exchanges use
     /// the raw request path and take no permit.
     request_admission: Arc<Semaphore>,
@@ -895,6 +933,7 @@ impl NinePClient {
             state: Mutex::new(SessionState::default()),
             stale_fids: DashSet::new(),
             session_transition: tokio::sync::Mutex::new(()),
+            stateful_requests: Arc::new(Mutex::new(StatefulRequests::default())),
             request_admission: Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS)),
             unsynced: DashMap::new(),
             counters,
@@ -1684,10 +1723,13 @@ impl NinePClient {
         op_id: [u8; 16],
         body: &Message,
         attempt: &mut OpAttemptState,
-        stateful_dispatched_conn: Option<&Mutex<Option<Arc<Conn>>>>,
+        stateful: Option<(&Mutex<Option<Arc<Conn>>>, &StatefulRequest)>,
         admission: &AdmissionPermit,
     ) -> ClientResult<(Message, Arc<Conn>)> {
         'resend: loop {
+            if let Some((_, request)) = stateful {
+                self.check_stateful_request(request)?;
+            }
             self.validate_fids(body.request_fids())?;
             await_resend_bounded(attempt, self.wait_until_live()).await??;
             let conn = self.conn.load_full();
@@ -1736,6 +1778,9 @@ impl NinePClient {
             }
 
             // Frames after the first possible dispatch carry RETRY.
+            if let Some((_, request)) = stateful {
+                self.check_stateful_request(request)?;
+            }
             let has_op_id = op_id != [0u8; 16];
             let connection_epoch = conn.writer_epoch.load(Ordering::Relaxed);
             let (op_flags, mut send) =
@@ -1753,7 +1798,7 @@ impl NinePClient {
                     // Registration-to-enqueue has no cancellation point.
                     let (frame, send) = OutboundFrame::new(bytes, &conn.send_progress);
                     pending.mark_dispatched();
-                    if let Some(dispatched_conn) = stateful_dispatched_conn {
+                    if let Some((dispatched_conn, _)) = stateful {
                         *dispatched_conn.lock().unwrap() = Some(Arc::clone(&conn));
                     }
                     permit.send(frame);
@@ -1806,7 +1851,7 @@ impl NinePClient {
             {
                 if e.ecode == P9_ENOTLEADER_CLEAN {
                     attempt.proven_predispatch(op_flags);
-                    if let Some(dispatched_conn) = stateful_dispatched_conn {
+                    if let Some((dispatched_conn, _)) = stateful {
                         dispatched_conn.lock().unwrap().take();
                     }
                 }
@@ -1895,8 +1940,111 @@ impl NinePClient {
     async fn send_stateful_request(
         &self,
         body: Message,
-    ) -> ClientResult<(Message, tokio::sync::MutexGuard<'_, ()>)> {
+    ) -> ClientResult<(Message, StatefulResponse<'_>)> {
+        let request = self.begin_stateful_request(&body).await?;
+        self.wait_stateful_predecessors(&request).await?;
+        let (response, transition) = self.send_stateful_request_inflight(&body, &request).await?;
+        Ok((
+            response,
+            StatefulResponse {
+                _transition: transition,
+                _request: request,
+            },
+        ))
+    }
+
+    async fn begin_stateful_request(&self, body: &Message) -> ClientResult<StatefulRequest> {
         let admission = self.acquire_request_admission().await?;
+        let fids = body.request_fids().collect::<Vec<_>>();
+        // Each stateful RPC changes exactly one fid. A source used to create
+        // another fid is shared, so independent child walks/opens stay parallel.
+        let changed_fid = match body {
+            Message::Tattach(m) => m.fid,
+            Message::Trebind(m) => m.fid,
+            Message::Twalk(m) => m.newfid,
+            Message::Twalkgetattr(m) | Message::Twalkgetattrexact(m) => m.newfid,
+            Message::Tlopen(m) => m.fid,
+            Message::Tlopenat(m) => m.newfid,
+            Message::Tlopenatread(m) => m.newfid,
+            Message::Tlcreate(m) => m.fid,
+            Message::Tlcreateattr(m) => m.newfid,
+            Message::Tlock(m) => m.fid,
+            Message::Tclunk(m) => m.fid,
+            _ => unreachable!("stateful RPC must declare its changed fid"),
+        };
+        let request = {
+            let mut registry = self.stateful_requests.lock().unwrap();
+            let waiters = registry
+                .pending
+                .values()
+                .filter(|pending| {
+                    pending.fids.contains(&changed_fid) || fids.contains(&pending.changed_fid)
+                })
+                .map(|pending| pending.completed.subscribe())
+                .collect::<Vec<_>>();
+            let id = registry.next_id;
+            registry.next_id = registry.next_id.wrapping_add(1);
+            let (completed, waiter) = watch::channel(());
+            registry.pending.insert(
+                id,
+                PendingStatefulRequest {
+                    fids,
+                    changed_fid,
+                    completed,
+                },
+            );
+            StatefulRequest {
+                registry: Arc::clone(&self.stateful_requests),
+                id,
+                admission,
+                predecessors: waiters,
+                completed: waiter,
+            }
+        };
+        Ok(request)
+    }
+
+    fn check_stateful_request(&self, request: &StatefulRequest) -> ClientResult<()> {
+        let terminal_errno = self.terminal_errno.load(Ordering::Acquire);
+        if terminal_errno != 0 {
+            return Err(ClientError::Errno(terminal_errno));
+        }
+        if request.completed.has_changed().is_err() {
+            return Err(ClientError::Disconnected);
+        }
+        Ok(())
+    }
+
+    async fn wait_stateful_predecessors(&self, request: &StatefulRequest) -> ClientResult<()> {
+        let mut retired = request.completed.clone();
+        for mut predecessor in request.predecessors.iter().cloned() {
+            loop {
+                let notified = self.live_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                self.check_stateful_request(request)?;
+                if self.unavailable.load(Ordering::Acquire) {
+                    return Err(ClientError::Disconnected);
+                }
+                // An earlier caller can stop polling after its wire reply.
+                // The outage bound and terminal failure still release active
+                // callers waiting for that caller's replay bookkeeping.
+                tokio::select! {
+                    biased;
+                    _ = retired.changed() => self.check_stateful_request(request)?,
+                    _ = predecessor.changed() => break,
+                    () = notified => {}
+                }
+            }
+        }
+        self.check_stateful_request(request)
+    }
+
+    async fn send_stateful_request_inflight(
+        &self,
+        body: &Message,
+        request: &StatefulRequest,
+    ) -> ClientResult<(Message, tokio::sync::MutexGuard<'_, ()>)> {
         let op_id = if body.is_mutation() {
             Uuid::new_v4().into_bytes()
         } else {
@@ -1909,25 +2057,43 @@ impl NinePClient {
             dispatched_conn: &dispatched_conn,
             armed: true,
         };
-        let result = loop {
-            let (response, response_conn) = match self
-                .send_request_on_current(
-                    op_id,
-                    &body,
-                    &mut attempt,
-                    Some(&dispatched_conn),
-                    &admission,
-                )
-                .await
-            {
-                Ok(response) => response,
-                Err(error) => break Err(error),
-            };
-            match self.accept_stateful_response(&response_conn).await {
-                Ok(Some(transition)) => break Ok((response, transition)),
-                Ok(None) => {}
-                Err(error) => break Err(error),
+        let exchange = async {
+            loop {
+                self.check_stateful_request(request)?;
+                let (response, response_conn) = match self
+                    .send_request_on_current(
+                        op_id,
+                        body,
+                        &mut attempt,
+                        Some((&dispatched_conn, request)),
+                        &request.admission,
+                    )
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(error) => break Err(error),
+                };
+                match self.accept_stateful_response(&response_conn).await {
+                    Ok(Some(transition)) => {
+                        // Retirement holds the same transition. Once this check
+                        // succeeds, public methods publish bookkeeping without
+                        // another await before releasing the guard.
+                        self.check_stateful_request(request)?;
+                        break Ok((response, transition));
+                    }
+                    Ok(None) => {}
+                    Err(error) => break Err(error),
+                }
             }
+        };
+        let mut retired = request.completed.clone();
+        let result = tokio::select! {
+            biased;
+            _ = retired.changed() => {
+                self.check_stateful_request(request)?;
+                unreachable!("stateful registration only closes on retirement")
+            }
+            result = exchange => result,
         };
         // Errors and stale op-id results leave the server transition ambiguous.
         if !matches!(
@@ -2129,10 +2295,7 @@ impl NinePClient {
     }
 
     /// Stateful [`Self::rpc`]; the guard covers replay-state bookkeeping.
-    async fn rpc_stateful(
-        &self,
-        body: Message,
-    ) -> ClientResult<(Message, tokio::sync::MutexGuard<'_, ()>)> {
+    async fn rpc_stateful(&self, body: Message) -> ClientResult<(Message, StatefulResponse<'_>)> {
         let (response, transition) = self.send_stateful_request(body).await?;
         match response {
             Message::Rlerror(e) => Err(ClientError::Errno(e.ecode)),
@@ -2411,23 +2574,27 @@ impl NinePClient {
     /// Ends `fid`. Callers return the number to the free list afterwards, so
     /// the fid must not survive in the replay record whatever the outcome.
     pub async fn clunk(&self, fid: u32) -> ClientResult<()> {
+        let body = Message::Tclunk(Tclunk { fid });
+        let request = self.begin_stateful_request(&body).await?;
         let (resp, _transition) = loop {
-            if self.stale_fids.contains(&fid) && self.clear_stale_fid(fid).await {
+            self.check_stateful_request(&request)?;
+            if self.stale_fids.contains(&fid) && self.clear_stale_fid(fid, &request).await? {
                 return Ok(());
             }
-            match self
-                .send_stateful_request(Message::Tclunk(Tclunk { fid }))
-                .await
-            {
+            let result = match self.wait_stateful_predecessors(&request).await {
+                Ok(()) => self.send_stateful_request_inflight(&body, &request).await,
+                Err(error) => Err(error),
+            };
+            match result {
                 Ok(result) => break result,
                 Err(ClientError::Disconnected) => {
-                    if self.forget_fid_of_lost_connection(fid).await {
+                    if self.forget_fid_of_lost_connection(fid, &request).await? {
                         return Ok(());
                     }
                 }
                 Err(error) => {
                     if matches!(&error, ClientError::Errno(errno) if *errno == linux::ESTALE)
-                        && self.clear_stale_fid(fid).await
+                        && self.clear_stale_fid(fid, &request).await?
                     {
                         return Ok(());
                     }
@@ -2452,14 +2619,31 @@ impl NinePClient {
     /// replay could recreate it. Returns false when a replacement connection
     /// was installed first: replay has already recreated the fid there, and
     /// the caller must clunk it on that connection.
-    async fn forget_fid_of_lost_connection(&self, fid: u32) -> bool {
+    async fn forget_fid_of_lost_connection(
+        &self,
+        fid: u32,
+        request: &StatefulRequest,
+    ) -> ClientResult<bool> {
         let _transition = self.fid_retirement_transition().await;
+        self.check_stateful_request(request)?;
         if !self.conn.load().dead.load(Ordering::Acquire) {
-            return false;
+            return Ok(false);
         }
+        self.invalidate_fid_requests(fid, request.id);
         self.state.lock().unwrap().forget_fid(fid);
         self.stale_fids.remove(&fid);
-        true
+        Ok(true)
+    }
+
+    /// Called under the session transition before a lost/stale fid is freed.
+    /// Closing these registrations wakes dependents and permanently prevents
+    /// retained callers from resending or publishing state for a reused fid.
+    fn invalidate_fid_requests(&self, fid: u32, retiring_request: u64) {
+        self.stateful_requests
+            .lock()
+            .unwrap()
+            .pending
+            .retain(|id, pending| *id == retiring_request || !pending.fids.contains(&fid));
     }
 
     /// Retiring a lost or stale fid must be able to end a replay that holds
@@ -2479,17 +2663,19 @@ impl NinePClient {
         }
     }
 
-    async fn clear_stale_fid(&self, fid: u32) -> bool {
+    async fn clear_stale_fid(&self, fid: u32, request: &StatefulRequest) -> ClientResult<bool> {
         let _transition = self.fid_retirement_transition().await;
-        if self.terminal_errno.load(Ordering::Acquire) != 0 {
-            return false;
+        self.check_stateful_request(request)?;
+        if !self.stale_fids.contains(&fid) {
+            return Ok(false);
         }
-        if self.stale_fids.remove(&fid).is_none() {
-            return false;
-        }
+        // Keep stale validation in force until every overlapping registration
+        // is invalid. A retained caller must never observe both gates open.
+        self.invalidate_fid_requests(fid, request.id);
+        self.stale_fids.remove(&fid);
         let mut state = self.state.lock().unwrap();
         state.forget_fid(fid);
-        true
+        Ok(true)
     }
 
     pub async fn getattr(&self, fid: u32, mask: u64) -> ClientResult<Stat> {
@@ -3928,6 +4114,7 @@ mod session_transition_tests {
             state: Mutex::new(SessionState::default()),
             stale_fids: DashSet::new(),
             session_transition: tokio::sync::Mutex::new(()),
+            stateful_requests: Arc::new(Mutex::new(StatefulRequests::default())),
             request_admission: Arc::new(Semaphore::new(max_inflight_requests)),
             unsynced: DashMap::new(),
             counters: Arc::new(TrafficCounters::default()),
@@ -4252,6 +4439,243 @@ mod session_transition_tests {
             snapshot.await.unwrap(),
             "the replay snapshot must include the settled fid transition"
         );
+    }
+
+    #[tokio::test]
+    async fn a_parent_clunk_cannot_erase_a_completed_child_walks_replay_identity() {
+        clunk_after_unsettled_walk(1).await;
+    }
+
+    #[tokio::test]
+    async fn a_new_fid_clunk_cannot_be_undone_by_its_walks_delayed_bookkeeping() {
+        clunk_after_unsettled_walk(2).await;
+    }
+
+    async fn clunk_after_unsettled_walk(clunk_fid: u32) {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let client = test_client(Arc::clone(&conn));
+        client
+            .state
+            .lock()
+            .unwrap()
+            .fids
+            .insert(1, attach_fid(10, 42));
+        let names: &[&[u8]] = &[b"child"];
+        let walk = client.walk(1, 2, names);
+        tokio::pin!(walk);
+        assert!(futures::poll!(&mut walk).is_pending());
+        let walked = recv_op_request(&mut requests, "the child walk").await;
+
+        let clunk = client.clunk(clunk_fid);
+        tokio::pin!(clunk);
+        assert!(futures::poll!(&mut clunk).is_pending());
+        assert!(
+            requests.try_recv().is_err(),
+            "clunk must wait for earlier replay bookkeeping"
+        );
+        // The walk reply arrives, but the clunk caller is polled first. It
+        // cannot erase the source identity or retire newfid before that reply
+        // has been recorded by the walk caller.
+        reply(
+            &conn,
+            walked.tag,
+            Message::Rwalk(Rwalk {
+                nwqid: 1,
+                wqids: vec![qid(70)],
+            }),
+        );
+        assert!(futures::poll!(&mut clunk).is_pending());
+        assert!(
+            requests.try_recv().is_err(),
+            "a wire reply alone does not finish bookkeeping"
+        );
+        assert_eq!(walk.await.unwrap()[0].path, 70);
+        assert!(futures::poll!(&mut clunk).is_pending());
+        let clunked = recv_op_request(&mut requests, "the clunk after walk bookkeeping").await;
+        reply(&conn, clunked.tag, Message::Rclunk(Rclunk));
+        clunk.await.unwrap();
+        let state = client.state.lock().unwrap();
+        if clunk_fid == 1 {
+            let child = state
+                .fids
+                .get(&2)
+                .expect("the successful child fid must be replayable");
+            assert_eq!(
+                (child.inode_id, child.root_inode, child.n_uname),
+                (70, 10, 42)
+            );
+        } else {
+            assert!(
+                !state.fids.contains_key(&2),
+                "the clunked child must stay retired"
+            );
+        }
+        assert!(client.stateful_requests.lock().unwrap().pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_clunk_waits_only_for_overlapping_stateful_calls() {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let client = test_client(Arc::clone(&conn));
+        client
+            .state
+            .lock()
+            .unwrap()
+            .fids
+            .insert(1, attach_fid(10, 42));
+        client
+            .state
+            .lock()
+            .unwrap()
+            .fids
+            .insert(3, attach_fid(30, 42));
+        let names: &[&[u8]] = &[b"child"];
+        let walk = client.walk(1, 2, names);
+        tokio::pin!(walk);
+        assert!(futures::poll!(&mut walk).is_pending());
+        let walked = recv_op_request(&mut requests, "the child walk").await;
+        let clunk = client.clunk(3);
+        tokio::pin!(clunk);
+        assert!(futures::poll!(&mut clunk).is_pending());
+        let clunked = recv_op_request(&mut requests, "the unrelated clunk").await;
+        reply(&conn, clunked.tag, Message::Rclunk(Rclunk));
+        clunk.await.unwrap();
+        reply(
+            &conn,
+            walked.tag,
+            Message::Rwalk(Rwalk {
+                nwqid: 1,
+                wqids: vec![qid(70)],
+            }),
+        );
+        walk.await.unwrap();
+        assert!(client.state.lock().unwrap().fids.contains_key(&2));
+    }
+
+    #[tokio::test]
+    async fn a_later_stateful_call_cannot_overtake_its_fids_clunk() {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let client = test_client(Arc::clone(&conn));
+        client
+            .state
+            .lock()
+            .unwrap()
+            .fids
+            .insert(1, attach_fid(10, 42));
+        let clunk = client.clunk(1);
+        tokio::pin!(clunk);
+        assert!(futures::poll!(&mut clunk).is_pending());
+        let clunked = recv_op_request(&mut requests, "the earlier clunk").await;
+        let names: &[&[u8]] = &[b"child"];
+        let walk = client.walk(1, 2, names);
+        tokio::pin!(walk);
+        assert!(futures::poll!(&mut walk).is_pending());
+        assert!(
+            requests.try_recv().is_err(),
+            "later calls must not bypass an unsettled clunk"
+        );
+        reply(&conn, clunked.tag, Message::Rclunk(Rclunk));
+        clunk.await.unwrap();
+        assert!(futures::poll!(&mut walk).is_pending());
+        let walked = recv_op_request(&mut requests, "the walk after clunk").await;
+        reply(
+            &conn,
+            walked.tag,
+            Message::Rlerror(Rlerror {
+                ecode: 9, // Linux EBADF: the source fid has been clunked.
+            }),
+        );
+        assert!(walk.await.is_err());
+        assert!(!client.state.lock().unwrap().fids.contains_key(&2));
+    }
+
+    #[tokio::test]
+    async fn a_successful_unlock_cannot_be_undone_by_delayed_lock_bookkeeping() {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let client = test_client(Arc::clone(&conn));
+        let lock = client.lock(7, LockType::WriteLock, 0, 0, 0, 1, b"owner");
+        tokio::pin!(lock);
+        assert!(futures::poll!(&mut lock).is_pending());
+        let locked = recv_op_request(&mut requests, "the lock").await;
+        let unlock = client.lock(7, LockType::Unlock, 0, 0, 0, 1, b"owner");
+        tokio::pin!(unlock);
+        assert!(futures::poll!(&mut unlock).is_pending());
+        assert!(requests.try_recv().is_err());
+        reply(
+            &conn,
+            locked.tag,
+            Message::Rlock(Rlock {
+                status: LOCK_SUCCESS,
+            }),
+        );
+        assert!(futures::poll!(&mut unlock).is_pending());
+        assert!(requests.try_recv().is_err());
+        lock.await.unwrap();
+        assert!(futures::poll!(&mut unlock).is_pending());
+        let unlocked = recv_op_request(&mut requests, "the unlock after lock bookkeeping").await;
+        reply(
+            &conn,
+            unlocked.tag,
+            Message::Rlock(Rlock {
+                status: LOCK_SUCCESS,
+            }),
+        );
+        unlock.await.unwrap();
+        assert!(
+            client.state.lock().unwrap().locks.is_empty(),
+            "an acknowledged unlock must not be replayed as a held lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_waiting_clunk_releases_its_barrier_and_admission() {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let client = test_client_with_limit(Arc::clone(&conn), 3);
+        client
+            .state
+            .lock()
+            .unwrap()
+            .fids
+            .insert(1, attach_fid(10, 42));
+        let names: &[&[u8]] = &[b"child"];
+        let first = client.walk(1, 2, names);
+        tokio::pin!(first);
+        assert!(futures::poll!(&mut first).is_pending());
+        let first_request = recv_op_request(&mut requests, "the earlier child walk").await;
+        let mut clunk = Box::pin(client.clunk(1));
+        assert!(futures::poll!(&mut clunk).is_pending());
+        let second = client.walk(1, 3, names);
+        tokio::pin!(second);
+        assert!(futures::poll!(&mut second).is_pending());
+        assert!(requests.try_recv().is_err());
+        assert_eq!(client.request_admission.available_permits(), 0);
+
+        drop(clunk);
+        assert_eq!(client.request_admission.available_permits(), 1);
+        assert!(
+            !conn.dead.load(Ordering::Acquire),
+            "the cancelled clunk never dispatched"
+        );
+        assert!(futures::poll!(&mut second).is_pending());
+        // Two child walks only read their shared parent. Removing the clunk
+        // must let the second dispatch while the first is still outstanding.
+        let second_request = recv_op_request(&mut requests, "the concurrent child walk").await;
+        for (request, inode) in [(second_request, 80), (first_request, 70)] {
+            reply(
+                &conn,
+                request.tag,
+                Message::Rwalk(Rwalk {
+                    nwqid: 1,
+                    wqids: vec![qid(inode)],
+                }),
+            );
+        }
+        second.await.unwrap();
+        first.await.unwrap();
+        assert!(client.state.lock().unwrap().fids.contains_key(&2));
+        assert!(client.state.lock().unwrap().fids.contains_key(&3));
+        assert!(client.stateful_requests.lock().unwrap().pending.is_empty());
+        assert_eq!(client.request_admission.available_permits(), 3);
     }
 
     #[tokio::test]
@@ -6619,6 +7043,148 @@ mod session_transition_tests {
                 "a clunk that already returned to its caller was resent",
             )
             .await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn an_outage_releases_a_barrier_behind_an_unpolled_response() {
+            let (client, conn, mut requests) = gone_client(3);
+            let first = client.lopen(7, 0);
+            tokio::pin!(first);
+            assert!(futures::poll!(&mut first).is_pending());
+            let sent = recv_op_request(&mut requests, "the earlier open").await;
+            reply(
+                &conn,
+                sent.tag,
+                Message::Rlopen(Rlopen {
+                    qid: qid(70),
+                    iounit: 0,
+                }),
+            );
+
+            let later_client = Arc::clone(&client);
+            let later = tokio::spawn(async move { later_client.lopen(7, 0).await });
+            tokio::task::yield_now().await;
+            assert!(requests.try_recv().is_err());
+            conn.connection_lost(&client.reconnect_notify);
+            assert!(matches!(
+                settle(later, "a stateful barrier behind an unpolled response").await,
+                Err(ClientError::Disconnected)
+            ));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn terminal_failure_releases_a_barrier_behind_an_unpolled_response() {
+            let (client, conn, mut requests) = gone_client(3);
+            let first = client.lopen(7, 0);
+            tokio::pin!(first);
+            assert!(futures::poll!(&mut first).is_pending());
+            let sent = recv_op_request(&mut requests, "the earlier open").await;
+            reply(
+                &conn,
+                sent.tag,
+                Message::Rlopen(Rlopen {
+                    qid: qid(70),
+                    iounit: 0,
+                }),
+            );
+
+            let later_client = Arc::clone(&client);
+            let later = tokio::spawn(async move { later_client.lopen(7, 0).await });
+            tokio::task::yield_now().await;
+            client.fail_session(linux::ESTALE);
+            assert!(matches!(
+                settle(later, "a stateful barrier after terminal replay failure").await,
+                Err(ClientError::Errno(linux::ESTALE))
+            ));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_lost_parent_clunk_invalidates_an_unpolled_child_walk() {
+            retired_clunk_with_unpolled_walk(1, false).await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_lost_child_clunk_invalidates_its_unpolled_walk() {
+            retired_clunk_with_unpolled_walk(2, false).await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_stale_fid_clunk_invalidates_an_unpolled_walk_after_reconnect() {
+            retired_clunk_with_unpolled_walk(2, true).await;
+        }
+
+        async fn retired_clunk_with_unpolled_walk(fid: u32, stale: bool) {
+            let (client, conn, mut requests) = gone_client(3);
+            client
+                .state
+                .lock()
+                .unwrap()
+                .fids
+                .insert(1, attach_fid(10, 42));
+            let names: &[&[u8]] = &[b"child"];
+            let earlier = client.walk(1, 2, names);
+            tokio::pin!(earlier);
+            assert!(futures::poll!(&mut earlier).is_pending());
+            let sent = recv_op_request(&mut requests, "the earlier child walk").await;
+            reply(
+                &conn,
+                sent.tag,
+                Message::Rwalk(Rwalk {
+                    nwqid: 1,
+                    wqids: vec![qid(70)],
+                }),
+            );
+            // This caller is admitted but has not dispatched. Retirement must
+            // invalidate it too, even if its caller resumes after fid reuse.
+            let queued = client.lopen(fid, 0);
+            tokio::pin!(queued);
+            assert!(futures::poll!(&mut queued).is_pending());
+
+            let returned = if stale {
+                conn.connection_lost(&client.reconnect_notify);
+                let returned = server_returns(&client);
+                client.stale_fids.insert(fid);
+                Some(returned)
+            } else {
+                None
+            };
+
+            let clunk_client = Arc::clone(&client);
+            let clunk = tokio::spawn(async move { clunk_client.clunk(fid).await });
+            tokio::task::yield_now().await;
+            assert!(requests.try_recv().is_err());
+            if !stale {
+                conn.connection_lost(&client.reconnect_notify);
+            }
+            settle(clunk, "a lost clunk behind an unpolled child walk")
+                .await
+                .unwrap();
+            assert!(!client.state.lock().unwrap().fids.contains_key(&fid));
+
+            // Reuse the retired number before polling the old caller again.
+            let (returned, mut returned_requests) =
+                returned.unwrap_or_else(|| server_returns(&client));
+            let reuse_client = Arc::clone(&client);
+            let reuse = tokio::spawn(async move { reuse_client.rebind(fid, 999, 42).await });
+            let sent = recv_op_request(&mut returned_requests, "reusing the retired fid").await;
+            reply(
+                &returned,
+                sent.tag,
+                Message::Rrebind(Rrebind { qid: qid(999) }),
+            );
+            reuse.await.unwrap().unwrap();
+            assert!(matches!(earlier.await, Err(ClientError::Disconnected)));
+            assert!(matches!(queued.await, Err(ClientError::Disconnected)));
+            assert_eq!(client.state.lock().unwrap().fids[&fid].inode_id, 999);
+            if fid == 1 {
+                assert!(!client.state.lock().unwrap().fids.contains_key(&2));
+            }
+            assert!(
+                returned_requests.try_recv().is_err(),
+                "the retired caller was resent"
+            );
+            assert!(!returned.dead.load(Ordering::Acquire));
+            assert!(client.stateful_requests.lock().unwrap().pending.is_empty());
         }
 
         #[tokio::test(start_paused = true)]
