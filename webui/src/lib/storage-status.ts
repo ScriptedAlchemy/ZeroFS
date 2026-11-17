@@ -76,9 +76,33 @@ function segmentFault(raw: unknown): Value<SegmentFault> {
   });
 }
 
+type FullReason = { reason: "write_returned_no_space"; sinceMs: Value<number> } | { reason: "below_free_space_reserve" };
+
+function fullReason(raw: unknown): Value<FullReason | null> {
+  if (raw === null) return known(null);
+  const full = object(raw);
+  if (full?.reason === "write_returned_no_space")
+    return known({ reason: full.reason, sinceMs: field(full, "since_ms", count) });
+  if (full?.reason === "below_free_space_reserve") return known({ reason: full.reason });
+  return unavailable(raw === undefined ? "full was not reported by the server" : "unrecognized full condition");
+}
+
+interface SmartSample {
+  device: Value<string>;
+  failed: Value<boolean>;
+  reallocated: Value<number | null>;
+  pending: Value<number | null>;
+  uncorrectable: Value<number | null>;
+  crc: Value<number | null>;
+}
+
 export interface MemberStatus {
   id: Value<string>;
   capacity: Value<number>;
+  filesystemFree: Value<number | null>;
+  filesystemTotal: Value<number | null>;
+  declaredExceedsFilesystem: Value<boolean>;
+  full: Value<FullReason | null>;
   used: Value<number>;
   reserved: Value<number>;
   available: Value<number>;
@@ -98,8 +122,12 @@ export interface MemberStatus {
   evacuationError: Value<string | null>;
   /** Free text from the server's kernel error watcher. Null means it has never reported. */
   kernelCoverage: Value<string | null>;
-  /** Whether the server holds a SMART sample for this member. */
-  smartSampled: Value<boolean>;
+  /** Counters retained by the server across samples, including individually absent readings. */
+  smartSample: Value<SmartSample | null>;
+  crcIncreases: Value<number>;
+  evacuationRequired: Value<number>;
+  evacuationReserved: Value<number>;
+  evacuationAvailable: Value<number>;
   evacuationCapacitySufficient: Value<boolean>;
   /** Members whose binding or free-space check failed when the server computed evacuation capacity. */
   unavailableMembers: Value<string[]>;
@@ -117,6 +145,9 @@ function member(raw: unknown, poolFaults: Value<SegmentFault[]>, generatedMs: Va
   if (!row) return unavailable("invalid member record");
   const id = field(row, "id", text);
   const health = object(row.health);
+  const sample = object(health?.last_sample);
+  const space = object(row.space) ?? {};
+  const evacuationCapacity = object(row.evacuation_capacity);
   const observedMs: Value<number> =
     health?.observed_ms === null
       ? unavailable("No health observation has been reported")
@@ -128,6 +159,10 @@ function member(raw: unknown, poolFaults: Value<SegmentFault[]>, generatedMs: Va
   return known({
     id,
     capacity: field(row, "capacity_bytes", count),
+    filesystemFree: field(space, "filesystem_free_bytes", nullableCount),
+    filesystemTotal: field(space, "filesystem_total_bytes", nullableCount),
+    declaredExceedsFilesystem: field(space, "declared_exceeds_filesystem", flag),
+    full: fullReason(space.full),
     used: field(row, "used_bytes", count),
     reserved: field(row, "reserved_bytes", count),
     available: field(row, "available_bytes", count),
@@ -145,18 +180,27 @@ function member(raw: unknown, poolFaults: Value<SegmentFault[]>, generatedMs: Va
     warning: healthText("warning"),
     evacuationError: healthText("evacuation_error"),
     kernelCoverage: healthText("kernel_coverage"),
-    smartSampled: !health
-      ? unavailable("health was not reported")
-      : !("last_sample" in health)
-        ? unavailable("last_sample was not reported by the server")
-        : health.last_sample === null || object(health.last_sample)
-          ? known(health.last_sample !== null)
-          : unavailable("last_sample has an unsupported value"),
-    evacuationCapacitySufficient: object(row.evacuation_capacity)
-      ? field(object(row.evacuation_capacity)!, "sufficient", flag)
+    smartSample: sample
+      ? known({
+          device: field(sample, "device", text),
+          failed: field(sample, "failed", flag),
+          reallocated: field(sample, "reallocated", nullableCount),
+          pending: field(sample, "pending", nullableCount),
+          uncorrectable: field(sample, "uncorrectable", nullableCount),
+          crc: field(sample, "crc", nullableCount),
+        })
+      : health?.last_sample === null
+        ? known(null)
+        : unavailable(health?.last_sample === undefined ? "last_sample was not reported by the server" : "last_sample has an unsupported value"),
+    crcIncreases: field(health ?? {}, "crc_increases", count),
+    evacuationRequired: field(evacuationCapacity ?? {}, "required_bytes", count),
+    evacuationReserved: field(evacuationCapacity ?? {}, "reserved_destination_bytes", count),
+    evacuationAvailable: field(evacuationCapacity ?? {}, "available_bytes", count),
+    evacuationCapacitySufficient: evacuationCapacity
+      ? field(evacuationCapacity, "sufficient", flag)
       : unavailable("evacuation_capacity was not reported by the server"),
-    unavailableMembers: object(row.evacuation_capacity)
-      ? list(object(row.evacuation_capacity)!, "unavailable_members", stringValue)
+    unavailableMembers: evacuationCapacity
+      ? list(evacuationCapacity, "unavailable_members", stringValue)
       : unavailable("evacuation_capacity was not reported by the server"),
     observedMs,
     observationAgeMs:
@@ -466,9 +510,9 @@ export function memberHealth(member: MemberStatus): MemberHealth {
       label: "Health observation",
       text: `last made ${formatAge(age.value)} before this status; the disk monitor normally refreshes it about once a minute`,
     });
-  const smart = member.smartSampled;
+  const smart = member.smartSample;
   if (smart.state === "unavailable") health.unavailable.push({ label: "SMART sample", reason: smart.reason });
-  else if (!smart.value) health.limits.push({ label: "SMART", text: "no sample recorded" });
+  else if (smart.value === null) health.limits.push({ label: "SMART", text: "no sample recorded" });
   return health;
 }
 

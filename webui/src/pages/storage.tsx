@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
-import { CircleAlert, CircleCheck, CircleHelp, HardDrive, Lock, RefreshCw, Search } from "lucide-react";
+import { CircleAlert, CircleCheck, CircleHelp, HardDrive, RefreshCw, Search } from "lucide-react";
 import { useTitle } from "../hooks/use-title";
 import { useStorageActivity, useStoragePool } from "../hooks/use-storage";
 import { adminClient } from "../lib/grpc/client";
@@ -112,6 +112,19 @@ function Capacity({ member }: { member: MemberStatus }) {
         <Row label="Configured capacity" value={member.capacity}>
           {(bytes) => <Bytes value={bytes} />}
         </Row>
+        <Row label="Backing filesystem size" value={member.filesystemTotal}>
+          {(bytes) => bytes === null ? "No measurement" : <Bytes value={bytes} />}
+        </Row>
+        <Row label="Backing filesystem free" value={member.filesystemFree}>
+          {(bytes) => bytes === null ? "No measurement" : <Bytes value={bytes} />}
+        </Row>
+        <Row label="Space constraint" value={member.full}>
+          {(full) =>
+            full === null ? "No full condition reported" : full.reason === "below_free_space_reserve"
+              ? "Below the free-space reserve"
+              : <>Write returned no space at <Fact value={full.sinceMs}>{serverTime}</Fact></>
+          }
+        </Row>
         {capacityParts.map((part) => (
           <Row
             key={part.key}
@@ -140,6 +153,9 @@ function Capacity({ member }: { member: MemberStatus }) {
           </Row>
         )}
       </dl>
+      {member.declaredExceedsFilesystem.state === "known" && member.declaredExceedsFilesystem.value && (
+        <p className="text-sm text-warning">Configured capacity exceeds the backing filesystem size.</p>
+      )}
     </div>
   );
 }
@@ -231,6 +247,27 @@ function HealthSummary({ member }: { member: MemberStatus }) {
           {item.label} unavailable · {item.reason}
         </p>
       ))}
+      {member.smartSample.state === "known" && member.smartSample.value && (
+        <details>
+          <summary className="cursor-pointer text-muted hover:text-foreground">Recorded SMART values</summary>
+          <dl className="mt-2">
+            <Row label="Device" value={member.smartSample.value.device} />
+            <Row label="Overall SMART failure" value={member.smartSample.value.failed}>{yesNo}</Row>
+            {([
+              ["Reallocated sectors", member.smartSample.value.reallocated],
+              ["Pending sectors", member.smartSample.value.pending],
+              ["Uncorrectable sectors", member.smartSample.value.uncorrectable],
+              ["UDMA CRC errors", member.smartSample.value.crc],
+            ] as const).map(([label, value]) => (
+              <Row key={label} label={label} value={value}>{(n) => n === null ? "No reading" : count(n)}</Row>
+            ))}
+            <Row label="Observed CRC increases" value={member.crcIncreases}>{count}</Row>
+          </dl>
+          <p className="text-xs text-muted-foreground">
+            Each counter shows its last recorded value. A later SMART sample can omit individual counters.
+          </p>
+        </details>
+      )}
       {member.observedMs.state === "known" && (
         <p className="pl-6 text-xs text-muted-foreground">
           Last health observation {serverTime(member.observedMs.value)}
@@ -295,6 +332,9 @@ function Member({ member, onScan }: { member: MemberStatus; onScan: (id: string)
           <Row label="Evacuation capacity sufficient" value={member.evacuationCapacitySufficient}>
             {yesNo}
           </Row>
+          <Row label="Bytes still to reserve" value={member.evacuationRequired}>{(bytes) => <Bytes value={bytes} />}</Row>
+          <Row label="Reserved at destinations" value={member.evacuationReserved}>{(bytes) => <Bytes value={bytes} />}</Row>
+          <Row label="Healthy destination space" value={member.evacuationAvailable}>{(bytes) => <Bytes value={bytes} />}</Row>
           <Row label="Unavailable members" value={member.unavailableMembers}>
             {(ids) => (ids.length ? ids.join(", ") : "None")}
           </Row>
@@ -466,11 +506,14 @@ const capabilities = [
     "Declared profiles and verified readiness are not exposed by the current admin API.",
   ],
   [
-    "Buffered, locally durable and HDD-published bytes",
-    "The current admin API does not expose durability receipts or writeback watermarks.",
+    "Buffered, locally durable and published bytes",
+    "For aggregate writeback progress, compare the accepted, local and remote sequence gauges on a writeback-enabled server’s Prometheus endpoint.",
   ],
-  ["NVMe backlog and reserve", "Journal occupancy and reserve are not exposed by the current admin API."],
-  ["NVMe read retention", "Pin coverage and reserved read-copy status are not exposed by the current admin API."],
+  [
+    "Writeback journal backlog and reserve",
+    "The server’s Prometheus writeback metrics report reserved SSD bytes, capacity and pending age. For memory admission, run zerofs memory-status -c config.toml in the server’s cgroup.",
+  ],
+  ["Read-cache retention", "Pin coverage and reserved read-copy status are not exposed by the current admin API."],
   ["Per-device write activity", "The current admin API provides no per-device software byte counters."],
 ] as const;
 
@@ -600,17 +643,9 @@ export function StoragePage() {
       </div>
 
       <section className="card-surface space-y-4 rounded-lg p-5">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <h2 className={sectionTitle}>Placement</h2>
-          <span className="flex items-center gap-1.5 rounded-full bg-accent px-2 py-0.5 text-xs text-muted">
-            <Lock size={12} />
-            Strict placement is disabled
-          </span>
-        </div>
+        <h2 className={sectionTitle}>Placement</h2>
         <p className="text-sm text-muted">
-          Buffered writes are accepted without durability. Locally durable writes are held in the NVMe journal.
-          Published writes require HDD payload and catalog publication. This page cannot assert those states from the
-          available APIs.
+          The admin service does not report the placement policy, configured media or per-write durability here.
         </p>
         <dl className="grid grid-cols-1 gap-x-8 gap-y-3 text-sm md:grid-cols-2">
           {capabilities.map(([label, reason]) => (
@@ -628,8 +663,8 @@ export function StoragePage() {
             Move or evacuate files
           </Button>
           <p id="storage-edit-reason" className="text-xs text-muted-foreground">
-            Disabled: validated policy edits and placement-safe whole-file movement are not available in the current
-            backend.
+            Placement controls are read-only here. Pool members and their order are set in the server configuration.
+            Segment migration runs through <code>zerofs pool migrate</code> while the server is stopped.
           </p>
         </div>
       </section>
