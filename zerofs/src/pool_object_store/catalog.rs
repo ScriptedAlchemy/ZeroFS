@@ -6,6 +6,7 @@
 
 use super::health::{MemberHealth, SegmentFault, SmartSample};
 use super::{EvacuationCapacity, PoolMember, PoolMemberStatus, PoolPlacement, PoolStatus};
+use crate::config::SegmentPlacement;
 use crate::operator_required::operator_required;
 use anyhow::{Context, Result, anyhow, bail};
 use fs4::fs_std::FileExt;
@@ -52,6 +53,7 @@ pub const CATALOG_FILE_NAME: &str = "pool.redb";
 const HEALTH: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_member_health_v1");
 const FAULTS: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_segment_faults_v1");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_meta");
+const LAST_LOCAL_RESERVATION: &str = "last_local_reservation";
 const MEMBERS: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_members");
 const OBJECTS: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_objects");
 const UPLOADS: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_uploads");
@@ -674,6 +676,7 @@ impl Catalog {
         members: &[PoolMember],
         target: Option<&str>,
         skip: &BTreeSet<String>,
+        placement: SegmentPlacement,
     ) -> Result<Upload> {
         let mut tx = self.database.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
@@ -694,13 +697,30 @@ impl Catalog {
                     .checked_add(record.reserved)
                     .context("local pool reservation overflow")?;
             }
+            let rotate = target.is_none() && placement == SegmentPlacement::RoundRobinLocal;
+            let (locals, start) = if rotate {
+                let meta = tx.open_table(META)?;
+                let last = meta.get(LAST_LOCAL_RESERVATION)?.and_then(|last| {
+                    members
+                        .iter()
+                        .position(|member| member.id.as_bytes() == last.value())
+                });
+                (members, last.map_or(0, |index| index + 1))
+            } else {
+                (&[][..], 0)
+            };
+            let candidates = locals[start..]
+                .iter()
+                .chain(&locals[..start])
+                .filter(|member| member.local_path.is_some())
+                .chain(members.iter().filter(|member| {
+                    target.is_none_or(|id| id == member.id)
+                        && (!rotate || member.local_path.is_none())
+                }));
             let mut chosen = None;
             let mut unavailable = None;
             let mut capacity_limited = false;
-            for member in members
-                .iter()
-                .filter(|m| target.is_none_or(|id| id == m.id))
-            {
+            for member in candidates {
                 let health = health_in(&tx, &member.id)?;
                 if let Some(reason) = health.quarantine.or(health.monitoring_error) {
                     unavailable = Some(NoAvailableMember {
@@ -750,6 +770,12 @@ impl Catalog {
                     .checked_add(size)
                     .context("pool reservation overflow")?;
                 table.insert(member.id.as_str(), bincode::serialize(&record)?.as_slice())?;
+                if rotate && member.local_path.is_some() {
+                    // Advance only for a local reservation, in the same transaction
+                    // as the capacity charge and upload record.
+                    tx.open_table(META)?
+                        .insert(LAST_LOCAL_RESERVATION, member.id.as_bytes())?;
+                }
                 chosen = Some(member.id.clone());
                 break;
             }
@@ -1673,7 +1699,14 @@ mod empty_quarantine_tests {
         size: u64,
     ) -> Entry {
         let upload = catalog
-            .reserve(location, size, members, Some(member), &BTreeSet::new())
+            .reserve(
+                location,
+                size,
+                members,
+                Some(member),
+                &BTreeSet::new(),
+                SegmentPlacement::FirstFit,
+            )
             .unwrap();
         let entry = Entry {
             physical: Physical::Member {
@@ -1724,7 +1757,14 @@ mod empty_quarantine_tests {
         assert_eq!(catalog.empty_ownership_scans.load(Ordering::Relaxed), 1);
         assert!(
             catalog
-                .reserve("new-data", 0, &members, Some("old"), &BTreeSet::new())
+                .reserve(
+                    "new-data",
+                    0,
+                    &members,
+                    Some("old"),
+                    &BTreeSet::new(),
+                    SegmentPlacement::FirstFit
+                )
                 .is_err()
         );
         let marker = catalog.identity.marker().unwrap();
@@ -1750,7 +1790,14 @@ mod empty_quarantine_tests {
         let (_root, catalog, members) = fixture();
         let zero = insert(&catalog, &members, "zero-data", "old", 0);
         let upload = catalog
-            .reserve("zero-upload", 0, &members, Some("old"), &BTreeSet::new())
+            .reserve(
+                "zero-upload",
+                0,
+                &members,
+                Some("old"),
+                &BTreeSet::new(),
+                SegmentPlacement::FirstFit,
+            )
             .unwrap();
         insert(&catalog, &members, "current-data", "current", 8);
         quarantine(&catalog);

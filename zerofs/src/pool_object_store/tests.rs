@@ -1,4 +1,5 @@
 use super::{PoolMember, PoolObjectStore};
+use crate::config::SegmentPlacement;
 use crate::segment::Segid;
 use crate::segment_store::{ConditionalMultipartCreate, GeneratedSegmentCreate};
 use bytes::Bytes;
@@ -109,6 +110,32 @@ impl Fixture {
 
     fn members(&self) -> Vec<PoolMember> {
         vec![self.member(true), self.member(false)]
+    }
+
+    fn local_members(&self) -> Vec<PoolMember> {
+        self.members()
+            .into_iter()
+            .map(|mut member| {
+                let root = self.catalog.path().join(&member.id);
+                std::fs::create_dir_all(&root).unwrap();
+                member.local_path = Some(root);
+                member
+            })
+            .collect()
+    }
+
+    async fn open_balanced(&self, members: Vec<PoolMember>, initialize: bool) -> PoolObjectStore {
+        PoolObjectStore::open_with_preflight(
+            self.authority.clone(),
+            Path::from("db"),
+            self.catalog.path().join("catalog"),
+            members,
+            SegmentPlacement::RoundRobinLocal,
+            initialize,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap()
     }
 
     async fn initialize(&self) -> PoolObjectStore {
@@ -351,6 +378,91 @@ async fn metadata_stays_on_authority_while_segments_fill_members_in_order() {
     assert_eq!(placement(&pool, &segment(2)).await, "hdd-b");
     assert_eq!(usage(&pool, "hdd-a").await, (8, 0, 1));
     assert_eq!(usage(&pool, "hdd-b").await, (4, 0, 1));
+}
+
+#[tokio::test]
+async fn round_robin_local_accounts_for_concurrent_multipart_reservations() {
+    let fixture = Fixture::new(32);
+    let pool = fixture.open_balanced(fixture.local_members(), true).await;
+    let paths = [segment(1), segment(2), segment(3), segment(4)];
+    let uploads =
+        futures::future::join_all(paths.iter().map(|path| multipart(&pool, path, 4))).await;
+
+    assert_eq!(usage(&pool, "hdd-a").await, (0, 8, 0));
+    assert_eq!(usage(&pool, "hdd-b").await, (0, 8, 0));
+    futures::future::join_all(uploads.into_iter().map(|mut upload| async move {
+        upload
+            .put_part(Bytes::from_static(b"data").into())
+            .await
+            .unwrap();
+        upload.complete().await.unwrap();
+    }))
+    .await;
+    assert_eq!(usage(&pool, "hdd-a").await, (8, 0, 2));
+    assert_eq!(usage(&pool, "hdd-b").await, (8, 0, 2));
+    assert_eq!(pool.placements().await.unwrap().len(), paths.len());
+    for path in paths {
+        assert_eq!(read(&pool, &path).await, "data");
+    }
+}
+
+#[tokio::test]
+async fn round_robin_local_resumes_after_reopen_with_imbalanced_occupancy() {
+    let fixture = Fixture::new(16);
+    let pool = fixture.open_balanced(fixture.local_members(), true).await;
+    create(&pool, &segment(1), b"12345678").await;
+    assert_eq!(placement(&pool, &segment(1)).await, "hdd-a");
+    drop(pool);
+
+    let pool = fixture.open_balanced(fixture.local_members(), false).await;
+    create(&pool, &segment(2), b"ab").await;
+    create(&pool, &segment(3), b"cdef").await;
+    assert_eq!(placement(&pool, &segment(2)).await, "hdd-b");
+    assert_eq!(placement(&pool, &segment(1)).await, "hdd-a");
+    assert_eq!(placement(&pool, &segment(3)).await, "hdd-a");
+    assert_eq!(usage(&pool, "hdd-a").await, (12, 0, 2));
+    assert_eq!(usage(&pool, "hdd-b").await, (2, 0, 1));
+    let result = pool
+        .put_opts(
+            &segment(1),
+            Bytes::from_static(b"other").into(),
+            create_options(),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(object_store::Error::AlreadyExists { .. })
+    ));
+    assert_eq!(read(&pool, &segment(1)).await, "12345678");
+    assert_eq!(usage(&pool, "hdd-a").await, (12, 0, 2));
+    assert_eq!(usage(&pool, "hdd-b").await, (2, 0, 1));
+    create(&pool, &segment(4), b"gh").await;
+    assert_eq!(placement(&pool, &segment(4)).await, "hdd-b");
+}
+
+#[tokio::test]
+async fn round_robin_local_skips_full_and_quarantined_members() {
+    let fixture = Fixture::new(4);
+    let mut locals = fixture.local_members();
+    let mut overflow = fixture.member(true);
+    overflow.id = "remote-overflow".into();
+    overflow.identity = "memory://remote-overflow".into();
+    overflow.store = Arc::new(InMemory::new());
+    locals[0].min_free_bytes = u64::MAX;
+    let mut members = vec![overflow];
+    members.extend(locals);
+    let pool = fixture.open_balanced(members, true).await;
+
+    create(&pool, &segment(1), b"full").await;
+    assert_eq!(placement(&pool, &segment(1)).await, "hdd-b");
+    create(&pool, &segment(2), b"a").await;
+    assert_eq!(placement(&pool, &segment(2)).await, "remote-overflow");
+    pool.delete(&segment(1)).await.unwrap();
+    pool.quarantine("hdd-b", "media fault").await.unwrap();
+    create(&pool, &segment(3), b"b").await;
+    assert_eq!(placement(&pool, &segment(3)).await, "remote-overflow");
+    assert_eq!(usage(&pool, "hdd-a").await, (0, 0, 0));
+    assert_eq!(usage(&pool, "hdd-b").await, (0, 0, 0));
 }
 
 #[tokio::test]

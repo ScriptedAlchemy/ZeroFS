@@ -98,11 +98,24 @@ configuration. The catalog is also bound to its original resolved directory;
 copying the database into a different directory cannot create a second owner of
 the same member data.
 
-Members are considered in configuration order. Each new immutable segment goes
-to the first member whose configured quota and local free-space reserve allow
-it. The quota counts committed data, pending uploads, and superseded data still
-awaiting deletion. Adding another permanent member adds capacity without
-changing filesystem paths or remapping previously written segments.
+The default setting, `segment_placement = "first_fit"`, considers members in
+configuration order. Each new immutable segment goes to the first eligible
+member whose quota and local free-space reserve allow it. The quota counts
+committed data, pending uploads, and superseded data still awaiting deletion.
+Adding another permanent member adds capacity without changing filesystem paths
+or remapping previously written segments.
+
+Set `segment_placement = "round_robin_local"` in `[storage.pool]` to rotate new
+immutable segment reservations across eligible local members. Rotation follows
+configuration order and resumes after restart from the last local reservation
+recorded in the catalog. Members that are quarantined, unavailable, or out of room
+are skipped. When no local member can accept a segment, remote members are
+considered in configuration order.
+
+Each segment has one backing member. Placement works at segment granularity, so
+a small write can land entirely on one disk and placement does not stripe every
+file. To measure how a workload used the pool, compare its new entries in
+`zerofs pool placements` and sum their `size` by `member_id`.
 
 `capacity_gb` is a physical segment-storage budget in decimal GB. Metadata,
 catalog space, provider overhead, and other files on the same disk need their

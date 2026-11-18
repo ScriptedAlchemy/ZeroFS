@@ -1450,6 +1450,7 @@ mod role_decision_tests {
             if pooled {
                 settings.storage.pool = Some(crate::config::StoragePoolConfig {
                     catalog_dir: temp.path().join("catalog"),
+                    segment_placement: Default::default(),
                     members: vec![crate::config::StoragePoolMemberConfig {
                         health_device: None,
                         id: "local".to_owned(),

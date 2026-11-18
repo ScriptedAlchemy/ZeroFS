@@ -44,6 +44,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock};
 use uuid::Uuid;
 
+use crate::config::SegmentPlacement;
 use crate::local_object_store::pool::{GenerationState, PoolObjectCreate};
 use crate::operator_required::{OperatorRequired, requires_operator};
 use crate::segment::Segid;
@@ -177,6 +178,7 @@ struct PoolInner {
     authority_prefix: Path,
     catalog: Arc<Catalog>,
     members: Vec<PoolMember>,
+    segment_placement: SegmentPlacement,
     member_indices: HashMap<String, usize>,
     member_checks: Vec<Mutex<bool>>,
     // Physical read/copy/cleanup dependencies for each member's pull status.
@@ -531,6 +533,7 @@ impl PoolObjectStore {
             authority_prefix,
             catalog_dir,
             members,
+            SegmentPlacement::FirstFit,
             true,
             |_| Ok(()),
         )
@@ -549,6 +552,7 @@ impl PoolObjectStore {
             authority_prefix,
             catalog_dir,
             members,
+            SegmentPlacement::FirstFit,
             false,
             |_| Ok(()),
         )
@@ -560,6 +564,7 @@ impl PoolObjectStore {
         authority_prefix: Path,
         catalog_dir: PathBuf,
         members: Vec<PoolMember>,
+        segment_placement: SegmentPlacement,
         initialize: bool,
         preflight: impl FnOnce(&str) -> anyhow::Result<()> + Send,
     ) -> object_store::Result<Self> {
@@ -604,6 +609,7 @@ impl PoolObjectStore {
                     })
                     .collect(),
                 members,
+                segment_placement,
                 member_indices,
                 migration: Mutex::new(()),
                 evacuating: Arc::new(StdMutex::new(None)),
@@ -931,8 +937,14 @@ impl PoolObjectStore {
         size: u64,
         target: Option<String>,
     ) -> object_store::Result<OwnedUpload> {
-        self.reserve_excluding(location, size, target, &BTreeSet::new())
-            .await
+        self.reserve_excluding(
+            location,
+            size,
+            target,
+            &BTreeSet::new(),
+            SegmentPlacement::FirstFit,
+        )
+        .await
     }
 
     /// Reserve on the first eligible member that has room, skipping members
@@ -943,6 +955,7 @@ impl PoolObjectStore {
         size: u64,
         target: Option<String>,
         refused: &BTreeSet<String>,
+        placement: SegmentPlacement,
     ) -> object_store::Result<OwnedUpload> {
         if size > MAX_TRANSFER_BYTES {
             return Err(unsupported(format!(
@@ -968,7 +981,9 @@ impl PoolObjectStore {
         skip.extend(refused.iter().cloned());
         let key = location.to_string();
         let upload = self
-            .catalog(move |catalog| catalog.reserve(&key, size, &members, target.as_deref(), &skip))
+            .catalog(move |catalog| {
+                catalog.reserve(&key, size, &members, target.as_deref(), &skip, placement)
+            })
             .await?;
         #[cfg(test)]
         crash_cutpoint("after_reserve");
@@ -1127,12 +1142,17 @@ impl PoolObjectStore {
     ) -> object_store::Result<PutResult> {
         let size = u64::try_from(payload.content_length())
             .map_err(|_| error("pool payload length overflow"))?;
+        let placement = if previous.is_none() && matches!(options.mode, PutMode::Create) {
+            self.inner.segment_placement
+        } else {
+            SegmentPlacement::FirstFit
+        };
         let mut refused = BTreeSet::new();
         loop {
             let upload = match reserved.take() {
                 Some(upload) => upload,
                 None => self
-                    .reserve_excluding(&location, size, None, &refused)
+                    .reserve_excluding(&location, size, None, &refused, placement)
                     .await
                     .map_err(|e| storage_full(e, size))?,
             };
@@ -1179,7 +1199,13 @@ impl PoolObjectStore {
         let previous = self.visible(&location).await?;
         Self::check_mode(&location, &PutMode::Create, previous.as_ref())?;
         let upload = self
-            .reserve(&location, length, None)
+            .reserve_excluding(
+                &location,
+                length,
+                None,
+                &BTreeSet::new(),
+                self.inner.segment_placement,
+            )
             .await
             .map_err(|e| storage_full(e, length))?;
         capability.acknowledge();

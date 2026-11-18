@@ -694,8 +694,24 @@ pub struct StoragePoolConfig {
     /// Authoritative placement database; this is data, never an evictable cache.
     #[serde(deserialize_with = "deserialize_expandable_path")]
     pub(crate) catalog_dir: PathBuf,
-    /// First member with sufficient capacity receives each new segment.
+    /// Placement policy for newly created immutable segments.
+    #[serde(default, skip_serializing_if = "SegmentPlacement::is_first_fit")]
+    pub(crate) segment_placement: SegmentPlacement,
     pub(crate) members: Vec<StoragePoolMemberConfig>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SegmentPlacement {
+    #[default]
+    FirstFit,
+    RoundRobinLocal,
+}
+
+impl SegmentPlacement {
+    fn is_first_fit(&self) -> bool {
+        *self == Self::FirstFit
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone)]

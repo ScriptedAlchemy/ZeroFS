@@ -231,6 +231,7 @@ pub(crate) async fn open_pool_storage(
             path.clone(),
             config.catalog_dir.clone(),
             members,
+            config.segment_placement,
             initialize,
             |pool_id| crate::storage_readiness::verify_pool_paths(settings, pool_id),
         )
