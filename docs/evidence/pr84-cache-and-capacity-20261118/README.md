@@ -21,6 +21,17 @@ These groups passed 18, 2 and 8 tests respectively. Formatting and library Clipp
 
 The local test build supplied the package Dockerfile with its standard commit and archive-hash arguments. Its input was a local Git archive with prefix `ZeroFS-a4adede0/` and SHA256 `48003d8b102229c8cf8f450d42073a1d0cc77a32c12e9cdd67d2f7bd711cb5d5`. The release executable SHA256 was `0cd6b449d1c3c0186841945d069aa703a58ab900978ae3e21c81c5b2d3da1cf8`. The local app image ID was `sha256:ad07e4bb9a3c1c7eea002d55df49ebfcda8e6c366a6674332c83b537ac1cb7ed`. The test image ID was `sha256:275816c5cb5607febfc9cb80ca7c0063836ec6b0ade5de5a8aae3df65584b397`.
 
+## Sustained mounted results
+
+Both clients completed all 20 workloads and ten cold-cache restart cycles. Each final inventory contained 210,032 files and 71,002,228,129 logical bytes. After clean stop, the scanner read 16 decoded-block and 16 raw-parts partitions in each mode. Every index tail, entry padding region and byte beyond the last valid blob was zero across both caches. Each mode recorded zero workload OOM events and kills. [Sanitized results and transcript hashes](mounted-results.json)
+
+| Client | Decoded entries | Raw-parts entries | Cache scan exit | Matrix exit | Peak reserve with margin |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Kernel 9P | 21,413 | 6,929 | 0 | 1, empty xattr replacement | 576 MiB |
+| FUSE | 21,831 | 7,850 | 0 | 0 | 768 MiB |
+
+Against an 8,589,934,592-byte service limit, the recorded lifetime cgroup peaks were 8,591,073,280 bytes for kernel 9P and 8,590,401,536 bytes for FUSE. These observations include the small excursions above the configured limit. Both reserves fit the 1,610,612,736-byte companion allowance. The app and test images contained the same verified executable hash. This run used the SMB sustained-memory fixture in both mount modes. The earlier concurrent SMB/NFS/NVMe acceptance remains attributed to its original app and engine revisions.
+
 ## What the full-pool test requires
 
 The original SMB test deletes a closed, flushed 33,554,432-byte file and immediately FLUSHes the already-staged replacement on the same open handle. The deadline is five seconds. A separate mounted FUSE control writes different bytes for the old and replacement files with no explicit pin, an open reader across unlink, and a persistent checkpoint in separate fixtures. The test reads the held file after unlink and the checkpoint view after crash/restart. An independently fsynced sentinel is verified after restart in all three cases.
@@ -43,3 +54,7 @@ The shortfall is the additional headroom needed to keep both generations on A. A
 The explicit FUSE trial preserves empty xattr replacement and removal. Stock kernel 9P sends identical frames for the two operations. The product default remains kernel 9P. [Wire receipt and engine acceptance gates](../pr84-acceptance-20261118/README.md)
 
 The earlier three-protocol package trial exercised one public file subtree and a separate private block namespace. Required member mount loss withdrew all endpoints, and cold start with a missing local member or catalog refused. Neither behavior provides degraded availability. Current first-fit placement is per immutable segment. Whole-file policy binding, intentional striping, metadata/catalog survival after device loss and NFSv4 ACL fidelity remain open. Bulk HDD placement and a clean read cache do not establish durable NVMe landing. The deployment owner retains physical commissioning and private publication.
+
+## Cleanup
+
+At 16:03:54 UTC the native scratch root was absent. Both image IDs, all three local tags, both build histories, and all 43 owned cache records were removed. All 734 pre-existing cache records survived. No owned container, network, volume or mount remained. The host module lists matched before and after the fixtures. NAS changes were zero. [Exact cleanup inventory](cleanup.json)
