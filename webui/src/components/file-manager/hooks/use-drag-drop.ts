@@ -1,12 +1,12 @@
 import { useState } from "react";
 import { type FileEntry } from "../../../lib/zerofs/client";
 import { joinPath } from "../../../lib/format";
-import { DRAG_MIME } from "../FileBrowser";
+import { DRAG_MIME, draggedPaths } from "../drag-data";
 
 interface UseDragAndDropOptions {
   currentPath: string;
   selectedNames: Set<string>;
-  onMoveToDir: (entryName: string, targetDir: string) => void;
+  onMoveToDir: (sourcePath: string, targetDir: string) => void;
 }
 
 export function useDragAndDrop({ currentPath, selectedNames, onMoveToDir }: UseDragAndDropOptions) {
@@ -14,7 +14,7 @@ export function useDragAndDrop({ currentPath, selectedNames, onMoveToDir }: UseD
 
   const onDragStart = (e: React.DragEvent, entry: FileEntry) => {
     const names = selectedNames.has(entry.name) && selectedNames.size > 1 ? Array.from(selectedNames) : [entry.name];
-    e.dataTransfer.setData(DRAG_MIME, JSON.stringify(names));
+    e.dataTransfer.setData(DRAG_MIME, JSON.stringify(names.map((name) => joinPath(currentPath, name))));
     e.dataTransfer.effectAllowed = "move";
 
     const badge = document.createElement("div");
@@ -53,13 +53,10 @@ export function useDragAndDrop({ currentPath, selectedNames, onMoveToDir }: UseD
     e.preventDefault();
     setDropTarget(null);
     if (!entry.resolvedIsDir) return;
-    const raw = e.dataTransfer.getData(DRAG_MIME);
-    if (!raw) return;
-    const names: string[] = JSON.parse(raw);
     const targetDir = joinPath(currentPath, entry.name);
-    for (const name of names) {
-      if (name === entry.name) continue;
-      onMoveToDir(name, targetDir);
+    for (const sourcePath of draggedPaths(e.dataTransfer)) {
+      if (sourcePath === targetDir) continue;
+      onMoveToDir(sourcePath, targetDir);
     }
   };
 
