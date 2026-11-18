@@ -1,0 +1,5 @@
+zerofs-external-I2HzkxtI-client
+container absent zerofs-external-I2HzkxtI-client
+zerofs-external-I2HzkxtI-service
+container absent zerofs-external-I2HzkxtI-service
+scratch absent /var/tmp/zerofs-external.I2HzkxtI
