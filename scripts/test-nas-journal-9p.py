@@ -53,12 +53,21 @@ class NineP:
             result.extend(data)
         return result
 
-    def call(self, kind, body, *, tag=None):
+    def call(self, kind, body, *, tag=None, payload=b""):
         if tag is None:
             self.tag = (self.tag + 1) % 65535
             tag = self.tag
         self.socket.settimeout(self.timeout())
-        self.socket.sendall(struct.pack("<IBH", 7 + len(body), kind, tag) + body)
+        header = struct.pack("<IBH", 7 + len(body) + len(payload), kind, tag) + body
+        if payload:
+            # Keep the pre-generated WRITE buffer out of Python frame copies.
+            sent = self.socket.sendmsg([header, payload])
+            if sent < len(header):
+                self.socket.sendall(header[sent:])
+            if sent < len(header) + len(payload):
+                self.socket.sendall(payload[max(0, sent - len(header)) :])
+        else:
+            self.socket.sendall(header)
         length, reply_kind, reply_tag = struct.unpack("<IBH", self.receive(7))
         if not 7 <= length <= MSIZE or reply_tag != tag:
             raise RuntimeError(f"invalid 9P response header for request {kind}")
@@ -95,10 +104,13 @@ class NineP:
         return min(iounit or CHUNK, CHUNK)
 
     def write(self, payload):
+        payload = memoryview(payload)
         offset = 0
         while offset < len(payload):
             chunk = payload[offset : offset + self.io_chunk]
-            reply = self.call(118, struct.pack("<IQI", 2, offset, len(chunk)) + chunk)
+            reply = self.call(
+                118, struct.pack("<IQI", 2, offset, len(chunk)), payload=chunk
+            )
             (count,) = struct.unpack("<I", reply)
             if not 0 < count <= len(chunk):
                 raise RuntimeError(f"invalid 9P write count {count} at {offset}")

@@ -239,8 +239,21 @@ class FileDrainFixture(fixture.Fixture):
             started = time.monotonic() - self.start
             client.write(data)
             acknowledged = time.monotonic() - self.start
+            if barrier is None:
+                # Check acknowledged visibility from an independent connection
+                # before issuing any explicit fsync on the warm-up file.
+                with fixture.NineP(self.ninep, self.remaining) as reader:
+                    require(
+                        reader.read_hash(name.encode(), size) == digest,
+                        f"pre-fsync cross-client read failed for {name}",
+                    )
+            else:
+                barrier.wait(timeout=self.remaining())
+            fsync_started = time.monotonic() - self.start
             client.fsync()
             fsynced = time.monotonic() - self.start
+            if barrier is not None:
+                barrier.wait(timeout=self.remaining())
             client.clunk()
         return {
             "file": name,
@@ -248,7 +261,9 @@ class FileDrainFixture(fixture.Fixture):
             "sha256": digest,
             "write_started_seconds": started,
             "write_acknowledged_seconds": acknowledged,
+            "fsync_started_seconds": fsync_started,
             "fsync_completed_seconds": fsynced,
+            "verified_by_second_client_before_fsync": barrier is None,
         }
 
     def wait_idle_after(self, previous_remote):
@@ -260,8 +275,30 @@ class FileDrainFixture(fixture.Fixture):
 
         return self.wait(advanced)
 
+    def sample_cpu(self):
+        sample = {
+            "elapsed_seconds": time.monotonic() - self.start,
+            "client_process_cpu_seconds": time.process_time(),
+        }
+        # proc stat fields 14 and 15 follow the command name in parentheses.
+        stat = (
+            Path(f"/proc/{self.server.pid}/stat").read_text().rsplit(")", 1)[1].split()
+        )
+        sample["engine_cpu_seconds"] = (int(stat[11]) + int(stat[12])) / os.sysconf(
+            "SC_CLK_TCK"
+        )
+        sample["cgroup_cpu_stat"] = {
+            key: int(value)
+            for key, value in (
+                line.split()
+                for line in Path("/sys/fs/cgroup/cpu.stat").read_text().splitlines()
+            )
+        }
+        self.receipt["phase_cpu"].append(sample)
+
     def start_writers(self):
-        self.barrier = threading.Barrier(self.args.files)
+        self.receipt["phase_cpu"] = []
+        self.barrier = threading.Barrier(self.args.files, action=self.sample_cpu)
         self.writers = []
         for index in range(self.args.files):
             name = f"ext4-drain-{index:02d}"
@@ -311,6 +348,7 @@ class FileDrainFixture(fixture.Fixture):
         self.stage = "parallel-9p-write-and-destage"
         with StagingWatch(paths, self) as watch:
             self.start_writers()
+            samples = []
 
             def settled():
                 watch.read_pending()
@@ -318,6 +356,10 @@ class FileDrainFixture(fixture.Fixture):
                     result.result() for _, result in self.writers if result.done()
                 ]
                 rows = self.metric_snapshot()
+                if rows:
+                    samples.append(
+                        dict(elapsed_seconds=time.monotonic() - self.start, **rows)
+                    )
                 if (
                     len(responses) == self.args.files
                     and self.drained(rows)
@@ -327,6 +369,19 @@ class FileDrainFixture(fixture.Fixture):
                 return None
 
             responses, drained = self.wait(settled)
+            first_send = min(row["write_started_seconds"] for row in responses)
+            last_ack = max(row["write_acknowledged_seconds"] for row in responses)
+            last_sync = max(row["fsync_completed_seconds"] for row in responses)
+            self.receipt["writeback_samples"] = samples
+            self.receipt["transfer"] = {
+                "logical_bytes": sum(row["bytes"] for row in responses),
+                "write_seconds": last_ack - first_send,
+                "through_fsync_seconds": last_sync - first_send,
+                "through_observed_drain_seconds": samples[-1]["elapsed_seconds"]
+                - first_send,
+                "clients": len(responses),
+                "outstanding_writes_per_client": 1,
+            }
             files.extend(responses)
             for row in responses:
                 self.event(**row)
@@ -396,12 +451,13 @@ class FileDrainFixture(fixture.Fixture):
 
 def validate_args(parser, args):
     if not (
-        2 <= args.files <= 8
-        and 1 <= args.file_mib <= 64
-        and args.files * args.file_mib + len(MEMBERS) <= 256
+        1 <= args.files <= 8
+        and 1 <= args.file_mib <= 256
+        and args.files * args.file_mib <= 1152
+        and (args.files > 1 or args.file_mib >= 64)
     ):
         parser.error(
-            "expected 2–8 files of 1–64 MiB and a total up to 256 MiB with warm-up"
+            "expected 1–8 files of 1–256 MiB, at most 1152 MiB total; a single file needs at least 64 MiB to exercise both members"
         )
 
 

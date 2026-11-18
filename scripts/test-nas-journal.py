@@ -363,8 +363,11 @@ class Fixture:
         finally:
             connection.close()
         rows = {}
+        overlay = {}
         for line in body.decode().splitlines():
             key, _, value = line.partition(" ")
+            if key.startswith("zerofs_nbd_volatile_"):
+                overlay[key.removeprefix("zerofs_nbd_volatile_")] = int(float(value))
             name = key.removeprefix("zerofs_writeback_")
             if name in METRICS and key != name:
                 require(name not in rows, f"duplicate metric {key}")
@@ -386,6 +389,7 @@ class Fixture:
             >= rows["remote_sequence"],
             f"invalid writeback frontiers: {rows}",
         )
+        rows["volatile_overlay"] = overlay
         return rows
 
     def pool_status(self, *, offline=False):

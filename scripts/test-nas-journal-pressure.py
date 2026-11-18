@@ -69,9 +69,9 @@ class Writer:
         writer = self
 
         class ObservedNineP(NineP):
-            def call(self, kind, body, *, tag=None):
+            def call(self, kind, body, *, tag=None, payload=b""):
                 if kind not in (118, 50):
-                    return super().call(kind, body, tag=tag)
+                    return super().call(kind, body, tag=tag, payload=payload)
                 offset, size = (
                     struct.unpack_from("<QI", body, 4) if kind == 118 else (None, None)
                 )
@@ -86,7 +86,7 @@ class Writer:
                         time.monotonic() - writer.case.start,
                     )
                     writer.active = request
-                reply = super().call(kind, body, tag=tag)
+                reply = super().call(kind, body, tag=tag, payload=payload)
                 with writer.lock:
                     writer.acknowledgments[request.ordinal] = (
                         time.monotonic() - writer.case.start
