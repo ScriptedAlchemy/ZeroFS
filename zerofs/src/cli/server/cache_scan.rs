@@ -330,15 +330,16 @@ pub(crate) struct ScanOptions {
 /// clean-cache namespace holding them, or the `[cache] dir` holding
 /// namespaces.
 fn find_cache_dirs(path: &Path) -> Result<Vec<(CacheKind, std::path::PathBuf)>> {
-    let is_dir = |path: &Path| {
-        std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
-    };
     let named = |path: &Path| {
         path.file_name()
             .and_then(|name| name.to_str())
             .and_then(cache_dir_kind)
     };
-    if !is_dir(path) {
+    if !std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspecting {}", path.display()))?
+        .file_type()
+        .is_dir()
+    {
         anyhow::bail!("{} is not a directory", path.display());
     }
     if let Some(kind) = named(path) {
@@ -347,9 +348,18 @@ fn find_cache_dirs(path: &Path) -> Result<Vec<(CacheKind, std::path::PathBuf)>> 
     let children = |dir: &Path| -> Result<Vec<std::path::PathBuf>> {
         let mut found = Vec::new();
         for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
-            let path = entry?.path();
-            if is_dir(&path) {
+            let entry = entry?;
+            let path = entry.path();
+            let kind = entry
+                .file_type()
+                .with_context(|| format!("inspecting {}", path.display()))?;
+            if kind.is_dir() {
                 found.push(path);
+            } else if named(&path).is_some() {
+                // A recognized cache cannot disappear from coverage merely
+                // because it is a symlink or has an unexpected type. A clean
+                // sibling would otherwise make the partial scan report clean.
+                anyhow::bail!("cache path {} is not a directory", path.display());
             }
         }
         found.sort();
