@@ -1,0 +1,9 @@
+    Finished `ci` profile [optimized] target(s) in 0.38s
+     Running unittests src/lib.rs (/var/tmp/zerofs-nas-journal.1XHScyY3/target/ci/deps/zerofs-59b7112322a285ce)
+
+running 3 tests
+test pool_object_store::tests::round_robin_local_accounts_for_concurrent_multipart_reservations ... ok
+test pool_object_store::tests::round_robin_local_resumes_after_reopen_with_imbalanced_occupancy ... ok
+test pool_object_store::tests::round_robin_local_skips_full_and_quarantined_members ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 2719 filtered out; finished in 0.08s

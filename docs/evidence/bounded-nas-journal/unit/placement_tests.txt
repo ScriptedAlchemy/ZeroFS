@@ -1,0 +1,8 @@
+    Finished `ci` profile [optimized] target(s) in 0.39s
+     Running unittests src/lib.rs (/var/tmp/zerofs-nas-journal.1XHScyY3/target/ci/deps/zerofs-59b7112322a285ce)
+
+running 2 tests
+test writeback::remote::placement_tests::direct_quarantine_refusal_remains_permanent ... ok
+test writeback::remote::placement_tests::quarantined_replay_reselects_member_and_keeps_cleanup_debt ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 2720 filtered out; finished in 0.26s
