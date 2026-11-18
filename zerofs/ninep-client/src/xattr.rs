@@ -100,7 +100,10 @@ impl NinePClient {
                 _ => return Err(ClientError::Unexpected("xattrwalk")),
             };
             let size = usize::try_from(size).map_err(|_| ClientError::Unexpected("xattr size"))?;
-            if !name.is_empty() && size > XATTR_VALUE_MAX {
+            // Bound list transfers too: ZeroFS's limit of 4,096 names
+            // fit within 1 MiB, while individual values may reach 2 MiB.
+            // Neither response may make the client accumulate arbitrary data.
+            if size > XATTR_VALUE_MAX {
                 return Err(ClientError::Unexpected("xattr size"));
             }
             let mut value = BytesMut::new();

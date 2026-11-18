@@ -98,6 +98,9 @@ the scan finishes. Copied caches that have no ownership lock remain readable;
 pass `--live` to explicitly scan them without that exclusion. An offline scan
 refuses a missing ownership lock and never creates one.
 
+A recognized cache path that is a symlink or is not a directory stops the scan.
+It is never silently omitted from a clean result.
+
 For each cache the report gives partitions, blobs, entries, and the index-tail,
 padding and past-the-last-blob bytes scanned and found non-zero. A clean
 result reads `Result: clean: every index-tail, padding and past-the-last-blob

@@ -6803,6 +6803,33 @@ mod session_transition_tests {
     }
 
     #[tokio::test]
+    async fn oversized_xattr_lists_are_rejected_before_reading() {
+        for size in [2_097_153, u64::MAX] {
+            let (conn, mut requests) = test_conn_with_receiver();
+            let client = test_client_with_limit(Arc::clone(&conn), 1);
+            let listing_client = Arc::clone(&client);
+            let listing = tokio::spawn(async move { listing_client.list_xattrs(7).await });
+            let walk = recv_op_request(&mut requests, "xattr list walk").await;
+            assert!(matches!(&walk.body, Message::Txattrwalk(walk) if walk.name.data.is_empty()));
+            reply(&conn, walk.tag, Message::Rxattrwalk(Rxattrwalk { size }));
+
+            let cleanup = recv_op_request(&mut requests, "oversized xattr list cleanup").await;
+            assert!(
+                matches!(cleanup.body, Message::Tclunk(_)),
+                "an oversized list must be rejected before requesting payload bytes: {:?}",
+                cleanup.body
+            );
+            answer(&conn, &cleanup);
+            assert!(matches!(
+                listing.await.unwrap(),
+                Err(ClientError::Unexpected("xattr size"))
+            ));
+            assert_eq!(client.request_admission.available_permits(), 1);
+            assert!(!conn.dead.load(Ordering::Acquire));
+        }
+    }
+
+    #[tokio::test]
     async fn xattr_exchange_holds_its_permit_from_walk_to_clunk() {
         let (conn, mut requests) = test_conn_with_receiver();
         let client = test_client_with_limit(Arc::clone(&conn), 1);

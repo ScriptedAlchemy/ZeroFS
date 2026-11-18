@@ -1216,8 +1216,7 @@ impl NinePHandler {
         let qid = inode_to_qid(&root_inode, root_id);
         let directory_pin = self.pin_walked_directory(root_id).await?;
 
-        crate::abandonment::pass_point_of_no_return().map_err(FsError::from)?;
-        let mut state = self.session_state();
+        let mut state = self.session_for_update()?;
         if state.fids.contains_key(&ta.fid) {
             return Err(P9Error::FidInUse);
         }
@@ -2551,12 +2550,13 @@ impl NinePHandler {
         let auth = AuthContext::from(&creds);
 
         self.filesystem
-            .rename_idempotent(
+            .rename_inode_idempotent(
                 &auth,
                 source_parent_id,
                 source_name,
                 dest_parent_id,
                 &new_name_bytes,
+                source_fid.inode_id,
                 op_id,
             )
             .await?;
@@ -5418,6 +5418,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trename_does_not_move_a_replacement_at_the_fids_cached_path() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let creds = test_creds();
+        let auth = AuthContext::from(&creds);
+        let original = fs
+            .create(&creds, 0, b"source", &SetAttributes::default())
+            .await
+            .unwrap()
+            .0;
+        let destination = fs
+            .create(&creds, 0, b"destination", &SetAttributes::default())
+            .await
+            .unwrap()
+            .0;
+        let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+        expect_walk(&handler, 2, 1, 2, &[b"source"]).await;
+
+        // Another client moves the inode this fid identifies, then places a
+        // different inode at the cached path. Neither that replacement nor
+        // the destination may be changed by a rename of the original fid.
+        fs.rename(&auth, 0, b"source", 0, b"moved").await.unwrap();
+        let replacement = fs
+            .create(&creds, 0, b"source", &SetAttributes::default())
+            .await
+            .unwrap()
+            .0;
+        let response = request(
+            &handler,
+            3,
+            Message::Trename(Trename {
+                fid: 2,
+                dfid: 1,
+                name: P9String::new(b"destination".to_vec()),
+            }),
+        )
+        .await;
+        assert!(matches!(
+            response.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::ESTALE
+        ));
+        assert_eq!(fs.lookup(&creds, 0, b"source").await, Ok(replacement));
+        assert_eq!(fs.lookup(&creds, 0, b"moved").await, Ok(original));
+        assert_eq!(fs.lookup(&creds, 0, b"destination").await, Ok(destination));
+    }
+
+    #[tokio::test]
     async fn trename_retry_replays_after_source_parent_is_removed() {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
         let creds = test_creds();
@@ -6542,6 +6589,36 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn disconnect_prevents_inflight_attach_from_repinning_directory() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let (directory_id, _) = fs
+            .mkdir(&test_creds(), 0, b"late-attach", &SetAttributes::default())
+            .await
+            .unwrap();
+        let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+        negotiate(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS).await;
+
+        // An attach can already be received when disconnect sweeps the
+        // session. Waiting for its subtree pin must not let it repopulate
+        // the retired session while other accepted work retains the handler.
+        let inode_guard = fs.lock_manager.acquire(directory_id).await;
+        let mut attaching = Box::pin(attach(&handler, 1, 1, b"test", b"late-attach", 1000));
+        assert!(futures::poll!(attaching.as_mut()).is_pending());
+        handler.close_for_disconnect();
+        drop(inode_guard);
+
+        let response = attaching.await;
+        assert!(matches!(
+            response.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::ESTALE
+        ));
+        assert!(handler.get_fid(1).is_err());
+        assert_eq!(fs.open_handle_count(directory_id), 0);
+        handler.close_for_disconnect();
+        assert_eq!(fs.open_handle_count(directory_id), 0);
     }
 
     #[tokio::test]

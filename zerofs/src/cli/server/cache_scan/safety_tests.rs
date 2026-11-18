@@ -337,3 +337,36 @@ fn a_blob_cut_off_by_the_end_of_the_block_is_not_clean() {
     assert_eq!((counts.entries, counts.incomplete_partitions), (1, 1));
     assert_eq!(counts.trailing_bytes, PAGE);
 }
+
+fn assert_unscannable_cache_is_rejected(create_other_cache: impl FnOnce(&Path)) {
+    let (root, _, partition) = parts_fixture();
+    let mut bytes = vec![0; 2 * PAGE];
+    blob(&mut bytes, 0);
+    let mut file = File::create(partition).unwrap();
+    file.write_all(&bytes).unwrap();
+    file.set_len(super::super::PARTS_BLOCK_SIZE as u64).unwrap();
+    drop(file);
+    create_other_cache(&root.path().join(super::super::BLOCK_CACHE_DIR));
+
+    let error = scan_cache_files(root.path(), ScanOptions::default())
+        .expect_err("a clean sibling must not hide an unscannable recognized cache path");
+    assert!(
+        format!("{error:#}").contains("not a directory"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn a_symlinked_cache_cannot_hide_beside_a_clean_cache() {
+    let elsewhere = tempfile::tempdir().unwrap();
+    assert_unscannable_cache_is_rejected(|path| {
+        std::os::unix::fs::symlink(elsewhere.path(), path).unwrap();
+    });
+}
+
+#[test]
+fn a_non_directory_cache_cannot_hide_beside_a_clean_cache() {
+    assert_unscannable_cache_is_rejected(|path| {
+        File::create(path).unwrap();
+    });
+}
