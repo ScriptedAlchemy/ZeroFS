@@ -173,9 +173,17 @@ pub struct Settings {
     pub(crate) replication: Option<ReplicationConfig>,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+enum RuntimeProfile {
+    #[serde(rename = "small-nas-journal-v1")]
+    SmallNasJournal,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    profile: Option<RuntimeProfile>,
     /// Administrator-declared ZeroFS-dedicated memory envelope in decimal GB.
     /// Use this when a container namespace hides the dedicated service limit.
     /// A shared parent cgroup is only a ceiling and cannot supply this budget.
@@ -314,6 +322,11 @@ pub struct StoreProfile {
     pub decoded_extent_cache_bytes: Option<usize>,
     /// Cold segment-read prefetch geometry.
     pub prefetch: crate::object_store_prefetch::PrefetchProfile,
+}
+
+impl StoreProfile {
+    pub(crate) const NAS_JOURNAL_SEAL_BYTES: usize = 32 * 1024 * 1024;
+    pub(crate) const NAS_JOURNAL_INFLIGHT: usize = 2;
 }
 
 impl From<SftpDataProfile> for StoreProfile {
@@ -2159,6 +2172,9 @@ impl Settings {
         access_mode: crate::writeback::config::WritebackAccessMode,
     ) -> Result<Option<crate::writeback::config::WritebackSettings>> {
         let Some(writeback) = &self.writeback else {
+            if self.small_nas_journal() {
+                anyhow::bail!("small-nas-journal-v1 requires enabled [writeback]");
+            }
             return Ok(None);
         };
         let sftp_write_concurrency = if self.sftp_endpoint()?.is_some() {
@@ -2172,12 +2188,60 @@ impl Settings {
         } else {
             None
         };
-        writeback.normalize(
+        let settings = writeback.normalize(
             &self.cache.dir,
             sftp_write_concurrency,
             access_mode,
             self.replication.is_some(),
-        )
+        )?;
+        if self.small_nas_journal() {
+            use crate::writeback::config::{AckMode, ShutdownFlush};
+            let wb = settings
+                .as_ref()
+                .context("small-nas-journal-v1 requires enabled [writeback]")?;
+            if wb.ack_mode != AckMode::Memory
+                || wb.shutdown_flush != ShutdownFlush::Local
+                || wb.memory_bytes != 128 << 20
+                || wb.disk_bytes != 512 << 20
+                || wb.min_free_bytes < 64 << 20
+                || wb.local_concurrency != 1
+                || wb.upload_concurrency != 2
+                || wb.high_watermark_percent != 95
+                || wb.resume_percent != 85
+            {
+                anyhow::bail!(
+                    "small-nas-journal-v1 requires memory acknowledgement, local shutdown, 128 MiB dirty RAM, 512 MiB dirty journal, at least 64 MiB free, one local and two upload workers, and 95/85 watermarks"
+                );
+            }
+            let pool = self
+                .storage
+                .pool
+                .as_ref()
+                .context("small-nas-journal-v1 requires a local pool")?;
+            let local_path = |value: &str| -> Result<PathBuf> {
+                url::Url::parse(value)?
+                    .to_file_path()
+                    .map_err(|_| anyhow::anyhow!("small-nas-journal-v1 requires local directories"))
+            };
+            let mut directories = vec![
+                self.cache.dir.clone(),
+                pool.catalog_dir.clone(),
+                local_path(&self.storage.url)?,
+            ];
+            for member in &pool.members {
+                directories.push(local_path(&member.url)?);
+            }
+            for path in directories {
+                let path =
+                    crate::writeback::config::normalize_absolute_path(&path, "storage directory")?;
+                if path.starts_with(&wb.dir) || wb.dir.starts_with(&path) {
+                    anyhow::bail!(
+                        "small-nas-journal-v1 requires a journal directory disjoint from cache, catalog, authority and member roots"
+                    );
+                }
+            }
+        }
+        Ok(settings)
     }
 
     /// Resolve the shared write-acknowledgement contract once, merging the
@@ -2226,9 +2290,21 @@ impl Settings {
         .max_by_key(|(_, bytes)| *bytes)
     }
 
+    pub(crate) fn small_nas_journal(&self) -> bool {
+        self.runtime.as_ref().and_then(|runtime| runtime.profile)
+            == Some(RuntimeProfile::SmallNasJournal)
+    }
+
     /// Data-plane tuning for the configured backend. SFTP publishes its own
     /// profile; every other backend runs on the defaults.
     pub(crate) fn store_profile(&self) -> Result<StoreProfile> {
+        if self.small_nas_journal() {
+            return Ok(StoreProfile {
+                seal_threshold: Some(StoreProfile::NAS_JOURNAL_SEAL_BYTES),
+                max_inflight_seals: Some(StoreProfile::NAS_JOURNAL_INFLIGHT),
+                ..StoreProfile::default()
+            });
+        }
         if let Some(pool) = &self.storage.pool {
             let profile = pool
                 .members

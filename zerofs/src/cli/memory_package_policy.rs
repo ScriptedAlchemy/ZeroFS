@@ -57,7 +57,7 @@ pub(super) fn exclusion(
         (clean_cache_bytes <= 96 * 1024 * 1024, "clean_cache_bytes exceeds 100663296"),
         (settings.cache.disk_size_gb.is_finite() && settings.cache.disk_size_gb > 0.0 && settings.cache.disk_size_gb <= 0.064, "cache.disk_size_gb exceeds measured 0.064 GB"),
         (settings.cache.warm_metadata == WarmMetadata::Off, "cache.warm_metadata must be off"),
-        (settings.writeback.as_ref().is_none_or(|config| !config.enabled), "writeback must be disabled; its workers and journal are unqualified"),
+        (settings.small_nas_journal() || settings.writeback.as_ref().is_none_or(|config| !config.enabled), "writeback must be disabled; its workers and journal are unqualified"),
         (volatile_write_bytes == 0, "filesystem.write_ack_mode must be materialized"),
         (settings.replication.is_none(), "replication must be off"),
         (settings.servers.nbd.is_none(), "servers.nbd is unqualified"),

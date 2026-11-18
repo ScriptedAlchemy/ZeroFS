@@ -49,8 +49,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::Semaphore;
 use tracing::error;
+pub(crate) use write::OPEN_SEGMENT_LANES;
 pub(crate) use write::{DEFAULT_DIRECT_SEGMENT_BYTES, MAX_INFLIGHT_SEALS, SEAL_THRESHOLD};
-use write::{OPEN_SEGMENT_LANES, OpenLane, OpenSegment, SealingGeneration, TAIL_CACHE_BYTES};
+use write::{OpenLane, OpenSegment, SealingGeneration, TAIL_CACHE_BYTES};
 
 pub(super) const PARALLEL_EXTENT_OPS: usize = 20;
 

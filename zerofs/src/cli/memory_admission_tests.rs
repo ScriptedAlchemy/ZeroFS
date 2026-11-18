@@ -465,3 +465,51 @@ fn json_receipt_distinguishes_empirical_coverage_from_legacy_policy() {
     let json = serde_json::to_value(receipt).unwrap();
     assert!(json["stored_state_qualification"].is_null());
 }
+
+#[test]
+#[cfg(feature = "webui")]
+fn bounded_journal_keeps_an_independent_budget_and_rejects_shape_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().display();
+    let base = package_config(temp.path(), 6 * GIB + GIB / 2)
+        .replace("[runtime]", "[runtime]\nprofile = \"small-nas-journal-v1\"");
+    let config = format!(
+        "{base}\n[writeback]\nenabled = true\ndir = \"{root}/journal\"\nack_mode = \"memory\"\nmemory_size_gb = 0.134217728\ndisk_size_gb = 0.536870912\nmin_free_gb = 0.067108864\nlocal_concurrency = 1\nupload_concurrency = 2\n"
+    );
+    let receipt = admission(temp.path(), &config).unwrap();
+    assert!(
+        receipt
+            .accounting
+            .contains("memory_policy=small-nas-journal-v1")
+    );
+    assert!(
+        receipt
+            .accounting
+            .contains("direct_segment_bytes=201326592")
+    );
+    assert_eq!(receipt.required_bytes, 5_804_916_736);
+    assert!(receipt.stored_state_qualification.is_none());
+    let settings = Settings::from_file(temp.path().join("config.toml")).unwrap();
+    let geometry = settings.store_profile().unwrap();
+    assert_eq!(geometry.seal_threshold, Some(32 * 1024 * 1024));
+    assert_eq!(geometry.max_inflight_seals, Some(2));
+    for (before, after) in [
+        ("0.134217728", "0.25"),
+        ("0.536870912", "1.0"),
+        ("0.067108864", "0.001"),
+        ("local_concurrency = 1", "local_concurrency = 2"),
+        ("upload_concurrency = 2", "upload_concurrency = 3"),
+        ("ack_mode = \"memory\"", "ack_mode = \"ssd\""),
+        ("enabled = true", "enabled = false"),
+        ("/journal\"", "/cache/journal\""),
+        ("0.064", "0.065"),
+        ("6.979321856", "5.0"),
+    ] {
+        assert_ne!(config.replace(before, after), config);
+        assert!(
+            admission(temp.path(), &config.replace(before, after)).is_err(),
+            "{after}"
+        );
+    }
+    assert!(admission(temp.path(), &base).is_err());
+}

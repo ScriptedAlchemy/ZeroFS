@@ -55,6 +55,7 @@ impl StartupMemoryTiers {
 enum MemoryPolicyProfile {
     Legacy { reason: &'static str },
     SmallNasPackage,
+    SmallNasJournal,
 }
 
 struct MemoryPolicy {
@@ -83,7 +84,22 @@ impl MemoryPolicy {
             tiers.clean_cache_bytes,
             tiers.volatile_write_bytes,
         ) {
+            Some(reason) if settings.small_nas_journal() => {
+                bail!("small-nas-journal-v1 configuration rejected: {reason}")
+            }
             Some(reason) => Self::legacy(reason),
+            None if settings.small_nas_journal() => Self {
+                profile: MemoryPolicyProfile::SmallNasJournal,
+                // Charge an extra two full journal budgets for metadata, redb and worker
+                // buffers, in addition to the accepted RAM tier and segment geometry.
+                residency_bytes: package_policy::RESIDENCY_BYTES + GIB,
+                headroom_bytes: package_policy::HEADROOM_BYTES,
+                residency_source: format!(
+                    "baseline plus 1 GiB journal workers/replay allowance; {}",
+                    package_policy::EVIDENCE
+                ),
+                headroom_source: package_policy::EVIDENCE.into(),
+            },
             None => Self {
                 profile: MemoryPolicyProfile::SmallNasPackage,
                 residency_bytes: package_policy::RESIDENCY_BYTES,
@@ -128,12 +144,16 @@ impl MemoryPolicy {
         match self.profile {
             MemoryPolicyProfile::Legacy { .. } => "legacy",
             MemoryPolicyProfile::SmallNasPackage => "small-nas-package-v1",
+            MemoryPolicyProfile::SmallNasJournal => "small-nas-journal-v1",
         }
     }
 
     fn reason(&self) -> &'static str {
         match self.profile {
             MemoryPolicyProfile::Legacy { reason } => reason,
+            MemoryPolicyProfile::SmallNasJournal => {
+                "explicit bounded journal fixture geometry; application-wide qualification required"
+            }
             MemoryPolicyProfile::SmallNasPackage => {
                 "all measured configuration bounds matched; one SMB client and CLI jobs <= 8 are operational conditions"
             }
@@ -143,6 +163,12 @@ impl MemoryPolicy {
     fn direct_segment_bytes(&self) -> u64 {
         match self.profile {
             MemoryPolicyProfile::Legacy { .. } => 0,
+            MemoryPolicyProfile::SmallNasJournal => {
+                use crate::config::StoreProfile;
+                ((crate::fs::store::extent::OPEN_SEGMENT_LANES
+                    + StoreProfile::NAS_JOURNAL_INFLIGHT)
+                    * StoreProfile::NAS_JOURNAL_SEAL_BYTES) as u64
+            }
             MemoryPolicyProfile::SmallNasPackage => {
                 crate::fs::store::extent::DEFAULT_DIRECT_SEGMENT_BYTES
             }
@@ -152,7 +178,9 @@ impl MemoryPolicy {
     fn headroom_label(&self) -> &'static str {
         match self.profile {
             MemoryPolicyProfile::Legacy { .. } => "companion/process reserve",
-            MemoryPolicyProfile::SmallNasPackage => "engine kernel/allocator headroom",
+            MemoryPolicyProfile::SmallNasPackage | MemoryPolicyProfile::SmallNasJournal => {
+                "engine kernel/allocator headroom"
+            }
         }
     }
 
@@ -162,13 +190,15 @@ impl MemoryPolicy {
                 .residency_bytes
                 .checked_add(self.headroom_bytes)
                 .context("startup memory policy reserves overflowed"),
-            MemoryPolicyProfile::SmallNasPackage => Ok(self.headroom_bytes),
+            MemoryPolicyProfile::SmallNasPackage | MemoryPolicyProfile::SmallNasJournal => {
+                Ok(self.headroom_bytes)
+            }
         }
     }
 
     fn qualification(&self) -> Option<StoredStateQualification> {
         match self.profile {
-            MemoryPolicyProfile::Legacy { .. } => None,
+            MemoryPolicyProfile::Legacy { .. } | MemoryPolicyProfile::SmallNasJournal => None,
             MemoryPolicyProfile::SmallNasPackage => Some(StoredStateQualification {
                 logical_bytes: package_policy::QUALIFIED_LOGICAL_BYTES,
                 regular_files: package_policy::QUALIFIED_REGULAR_FILES,
@@ -183,13 +213,13 @@ impl MemoryPolicy {
                 "qualification_stored_logical_bytes={} qualification_regular_files={} {}",
                 state.logical_bytes, state.regular_files, state.enforcement
             ),
-            None => "stored_state_qualification=unavailable for legacy policy".into(),
+            None => "stored_state_qualification=unavailable for selected policy".into(),
         };
         format!(
             "memory_policy={} reason={}; clean_cache_bytes={} source=resolved cache split with three 32 MiB floors; \
              object_writeback_bytes={} source=resolved writeback RAM or disabled; \
              volatile_write_bytes={} source=resolved shared write-ack setting times two ownership stages; \
-             direct_segment_bytes={} source=generic four open plus four retained 256 MiB segments in measured policy only; \
+             direct_segment_bytes={} source=selected store geometry (open plus retained segments); \
              unmodeled_residency_reserve_bytes={} source={}; engine_headroom_bytes={} source={}; \
              hard_limit_source={source}; external_companions=excluded from measured engine reserves, subtract FUSE/smbd and file cache from container limit before runtime.memory_limit_gb; {qualification}",
             self.name(),
@@ -251,6 +281,9 @@ fn validate_server_startup_with_limits(
     let policy = MemoryPolicy::from_settings(settings, tiers)?;
     let configured = settings.runtime_memory_limit_bytes()?;
     let Some(envelope) = select_memory_limit(detected, configured)? else {
+        if settings.small_nas_journal() {
+            bail!("small-nas-journal-v1 requires a finite dedicated memory envelope");
+        }
         tracing::warn!(
             accounting = policy.accounting(tiers, "unavailable"),
             "no cgroup-v2 memory ceiling or [runtime] memory_limit_gb; startup memory defense-in-depth admission is unavailable"

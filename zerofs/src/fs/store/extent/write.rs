@@ -141,7 +141,7 @@ pub(super) const TAIL_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Independent inode-affine append lanes. Four matches the foreground fio
 /// workload while keeping the number of preallocated open buffers bounded.
-pub(super) const OPEN_SEGMENT_LANES: usize = 4;
+pub(crate) const OPEN_SEGMENT_LANES: usize = 4;
 
 /// Seal (PUT) the open segment once its packed frames reach this size, bounding
 /// the in-RAM buffer between flushes. The seal PUT is concurrent multipart
