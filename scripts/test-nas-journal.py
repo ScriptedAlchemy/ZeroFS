@@ -467,7 +467,7 @@ class Fixture:
             self.root / "catalog",
             *self.members,
         ):
-            path.mkdir()
+            path.mkdir(mode=0o700)
         self.ninep = self.root / "ninep.sock"
         self.rpc = self.root / "rpc.sock"
         require(
@@ -561,7 +561,7 @@ class Fixture:
             journal_payloads(self.journal), "no journal payload files after SIGKILL"
         )
         shutil.rmtree(self.cache)
-        self.cache.mkdir()
+        self.cache.mkdir(mode=0o700)
         self.event(prior_clean_cache_removed=True)
 
         self.stage = "recover-still-held"
