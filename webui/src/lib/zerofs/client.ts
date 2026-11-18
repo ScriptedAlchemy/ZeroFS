@@ -727,24 +727,23 @@ export class ZeroFsClient {
     onProgress: (file: string) => void,
     signal?: AbortSignal,
   ): Promise<{ path: string; data: Uint8Array }[]> {
-    if (signal?.aborted) return [];
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
     const entries = await this.listDirectory(dirPath, signal);
     const results: { path: string; data: Uint8Array }[] = [];
     await pooled(entries, 8, async (entry) => {
-      if (signal?.aborted) return;
+      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
       const child = join(dirPath, entry.name);
       const relative = basePath ? `${basePath}/${entry.name}` : entry.name;
-      try {
-        if (entry.isDir) {
-          results.push(...(await this.collectFiles(child, relative, onProgress, signal)));
-        } else {
-          onProgress(relative);
-          results.push({ path: relative, data: await this.readFile(child, signal) });
-        }
-      } catch (error) {
-        if (error instanceof RawFilenameError || (error instanceof DOMException && error.name === "AbortError")) throw error;
+      // An archive must not silently omit unreadable files or subdirectories.
+      // pooled drains in-flight reads before propagating the first failure.
+      if (entry.isDir) {
+        results.push(...(await this.collectFiles(child, relative, onProgress, signal)));
+      } else {
+        onProgress(relative);
+        results.push({ path: relative, data: await this.readFile(child, signal) });
       }
     });
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
     return results;
   }
 }
