@@ -78,11 +78,15 @@ impl MemoryPolicy {
         }
     }
 
-    fn from_settings(settings: &Settings, tiers: StartupMemoryTiers) -> Result<Self> {
+    fn from_settings(
+        settings: &Settings,
+        tiers: StartupMemoryTiers,
+        write_ack: crate::fs::mutation::config::FilesystemWriteAckSettings,
+    ) -> Result<Self> {
         let mut policy = match package_policy::exclusion(
             settings,
             tiers.clean_cache_bytes,
-            tiers.volatile_write_bytes,
+            write_ack,
         ) {
             Some(reason) if settings.small_nas_journal() => {
                 bail!("small-nas-journal-v1 configuration rejected: {reason}")
@@ -278,7 +282,7 @@ fn validate_server_startup_with_limits(
     }
     let write_ack = settings.filesystem_write_ack_settings(WritebackAccessMode::ReadWrite)?;
     let tiers = StartupMemoryTiers::from_settings(settings, write_ack.volatile_memory_bytes)?;
-    let policy = MemoryPolicy::from_settings(settings, tiers)?;
+    let policy = MemoryPolicy::from_settings(settings, tiers, write_ack)?;
     let configured = settings.runtime_memory_limit_bytes()?;
     let Some(envelope) = select_memory_limit(detected, configured)? else {
         if settings.small_nas_journal() {

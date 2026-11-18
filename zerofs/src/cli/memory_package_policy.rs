@@ -1,10 +1,11 @@
 use crate::config::{CompressionConfig, GcConfig, LsmConfig, Settings, WarmMetadata};
+use crate::fs::mutation::config::FilesystemWriteAckSettings;
 use crate::fs::name_mode::NameMode;
 
 pub(super) fn exclusion(
     settings: &Settings,
     clean_cache_bytes: u64,
-    volatile_write_bytes: u64,
+    write_ack: FilesystemWriteAckSettings,
 ) -> Option<&'static str> {
     let local_url = |value: &str| {
         url::Url::parse(value).is_ok_and(|url| url.scheme() == "file" && url.to_file_path().is_ok())
@@ -53,20 +54,15 @@ pub(super) fn exclusion(
         && gc.busy_backlog_interval_secs() == defaults.busy_backlog_interval_secs()
         && gc.busy_backlog_dead_percent() == defaults.busy_backlog_dead_percent()
         && gc.compact_round_bytes() == defaults.compact_round_bytes();
-    // The caller charges both the raw-admission and overlay ownership stages.
     let bounded_ram_ack = settings.small_nas_journal()
-        && volatile_write_bytes == 2 * (256 << 20)
-        && settings
-            .filesystem
-            .as_ref()
-            .and_then(|fs| fs.volatile_max_operations)
-            == Some(2048);
+        && write_ack.volatile_memory_bytes == 256 << 20
+        && write_ack.volatile_max_operations == 2048;
     [
         (clean_cache_bytes <= 96 * 1024 * 1024, "clean_cache_bytes exceeds 100663296"),
         (settings.cache.disk_size_gb.is_finite() && settings.cache.disk_size_gb > 0.0 && settings.cache.disk_size_gb <= 0.064, "cache.disk_size_gb exceeds measured 0.064 GB"),
         (settings.cache.warm_metadata == WarmMetadata::Off, "cache.warm_metadata must be off"),
         (settings.small_nas_journal() || settings.writeback.as_ref().is_none_or(|config| !config.enabled), "writeback must be disabled; its workers and journal are unqualified"),
-        (volatile_write_bytes == 0 || bounded_ram_ack, "volatile writes require small-nas-journal-v1, 256 MiB volatile_memory_gb and 2048 volatile_max_operations"),
+        (write_ack.volatile_memory_bytes == 0 || bounded_ram_ack, "volatile writes require small-nas-journal-v1, 256 MiB volatile_memory_gb and 2048 volatile_max_operations"),
         (settings.replication.is_none(), "replication must be off"),
         (settings.servers.nbd.is_none(), "servers.nbd is unqualified"),
         (settings.servers.nfs.is_none(), "servers.nfs is unqualified"),
