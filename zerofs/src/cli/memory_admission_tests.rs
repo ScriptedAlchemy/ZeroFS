@@ -493,6 +493,31 @@ fn bounded_journal_keeps_an_independent_budget_and_rejects_shape_changes() {
     let geometry = settings.store_profile().unwrap();
     assert_eq!(geometry.seal_threshold, Some(32 * 1024 * 1024));
     assert_eq!(geometry.max_inflight_seals, Some(2));
+    let ram_ack = config.replace(
+        "write_ack_mode = \"materialized\"",
+        "write_ack_mode = \"volatile_memory\"\nvolatile_memory_gb = 0.268435456\nvolatile_max_operations = 2048",
+    );
+    let ram_receipt = admission(temp.path(), &ram_ack).unwrap();
+    assert_eq!(
+        ram_receipt.required_bytes,
+        receipt.required_bytes + (512 << 20)
+    );
+    assert!(ram_receipt.stored_state_qualification.is_none());
+    for (before, after) in [
+        ("0.268435456", "0.536870912"),
+        (
+            "volatile_max_operations = 2048",
+            "volatile_max_operations = 2049",
+        ),
+        ("volatile_max_operations = 2048", ""),
+        ("6.979321856", "6.0"),
+        ("profile = \"small-nas-journal-v1\"", ""),
+    ] {
+        assert!(
+            admission(temp.path(), &ram_ack.replace(before, after)).is_err(),
+            "{after}"
+        );
+    }
     for (before, after) in [
         ("0.134217728", "0.25"),
         ("0.536870912", "1.0"),
