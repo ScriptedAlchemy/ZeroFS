@@ -66,7 +66,7 @@ describe("Storage write acknowledgement settings", () => {
       credentials: "omit",
       redirect: "error",
     });
-    expect(section().getByText(/still in RAM/).textContent).toContain("fsync and NBD FUA");
+    expect(section().getByText(/still in RAM/).textContent).toContain("fsync and protocol durability requests");
     selectVolatile();
     const token = setToken("admin-for-one-save");
     fetchMock.mockResolvedValueOnce(Response.json({ ...status, desired: volatile, pending_restart: true }));

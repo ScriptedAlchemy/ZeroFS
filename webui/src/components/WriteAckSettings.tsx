@@ -204,9 +204,7 @@ function SettingsForm({ desired, onSaved }: { desired: FilesystemSettings; onSav
           )}
         </div>
         {volatile && (
-          <p className="text-xs text-muted-foreground">
-            Qualification used 256 MiB and 2,048 pending operations.
-          </p>
+          <p className="text-xs text-muted-foreground">Qualification used 256 MiB and 2,048 pending operations.</p>
         )}
         <div className="flex flex-wrap items-end gap-3">
           <label className="block min-w-0">
@@ -299,7 +297,7 @@ export function WriteAckSettings() {
           </p>
           <p className="text-muted-foreground">
             Volatile memory can acknowledge an ordinary WRITE while its data is still in RAM. A crash can lose those
-            writes. Explicit fsync and NBD FUA requests still wait for their durability boundary.
+            writes. Explicit fsync and protocol durability requests still wait for their configured durability boundary.
           </p>
           {load.status.editable && secure ? (
             <SettingsForm
