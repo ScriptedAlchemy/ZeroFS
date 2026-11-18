@@ -8,9 +8,10 @@ mode=${2:?materialized or volatile}
 files=${3:-6}
 file_mib=${4:-36}
 trial=${5:-1}
+msize=${6:-256}
 [[ $trial =~ ^[0-9]+$ && $files =~ ^[0-9]+$ && $file_mib =~ ^[0-9]+$ ]]
 source_config="$PWD/src/scripts/fixtures/nas-journal/engine.toml.in"
-result="$PWD/evidence/$kind-$mode-$files-$file_mib-$trial"
+result="$PWD/evidence/$kind-$mode-$files-$file_mib-$trial-$msize"
 mkdir "$result"
 config="$result/engine.toml.in"
 case "$mode" in
@@ -50,10 +51,13 @@ record() {
     done
 }
 record start || exit 2
-python -B "/fixtures/$1" --binary /bin/zerofs --scratch /scratch --evidence /result/run \
+script=$1; a=$2; b=$3; files=$4; mib=$5; msize=$6
+shift 6
+if [ "$script" = test-nas-journal-file-drain.py ]; then set -- --msize-kib "$msize"; fi
+python -B "/fixtures/$script" --binary /bin/zerofs --scratch /scratch --evidence /result/run \
     --config-template /result/engine.toml.in --verify-config-template /fixtures/fixtures/nas-journal/verify.toml.in \
-    --member-a "$2" --member-b "$3" --files "$4" --file-mib "$5" --timeout 600 >/result/stdout 2>&1
+    --member-a "$a" --member-b "$b" --files "$files" --file-mib "$mib" "$@" --timeout 600 >/result/stdout 2>&1
 status=$?
 record end || exit 2
 exit "$status"
-' sh "$script" "${members[@]}" "$files" "$file_mib"
+' sh "$script" "${members[@]}" "$files" "$file_mib" "$msize"

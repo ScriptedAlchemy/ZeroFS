@@ -232,7 +232,9 @@ class FileDrainFixture(fixture.Fixture):
     def write_file(self, name, size, barrier=None):
         data = hashlib.shake_256(f"zerofs-file-drain:{name}".encode()).digest(size)
         digest = hashlib.sha256(data).hexdigest()
-        with fixture.NineP(self.ninep, self.remaining) as client:
+        with fixture.NineP(
+            self.ninep, self.remaining, self.args.msize_kib * 1024
+        ) as client:
             client.create(name.encode())
             if barrier is not None:
                 barrier.wait(timeout=self.remaining())
@@ -259,6 +261,7 @@ class FileDrainFixture(fixture.Fixture):
             "file": name,
             "bytes": size,
             "sha256": digest,
+            "io_chunk_bytes": client.io_chunk,
             "write_started_seconds": started,
             "write_acknowledged_seconds": acknowledged,
             "fsync_started_seconds": fsync_started,
@@ -449,6 +452,12 @@ class FileDrainFixture(fixture.Fixture):
                 raise RuntimeError("9P writer did not exit during cleanup")
 
 
+def configure_parser(parser):
+    parser.add_argument(
+        "--msize-kib", type=int, choices=(256, 1024, 4096, 10240), default=256
+    )
+
+
 def validate_args(parser, args):
     if not (
         1 <= args.files <= 8
@@ -465,6 +474,7 @@ if __name__ == "__main__":
     sys.exit(
         fixture.main(
             FileDrainFixture,
+            configure_parser=configure_parser,
             validate_args=validate_args,
             validate_mounts=validate_mounts,
             description=__doc__,

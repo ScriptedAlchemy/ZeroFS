@@ -7,7 +7,6 @@ import struct
 
 
 MSIZE = 256 * 1024
-CHUNK = MSIZE - 24
 
 
 def string(value):
@@ -15,7 +14,8 @@ def string(value):
 
 
 class NineP:
-    def __init__(self, path, timeout):
+    def __init__(self, path, timeout, msize=MSIZE):
+        self.msize = msize
         self.socket = socket.socket(socket.AF_UNIX)
         self.timeout = timeout
         self.tag = 0
@@ -23,8 +23,8 @@ class NineP:
             self.socket.settimeout(self.timeout())
             self.socket.connect(str(path))
             dialect = string(b"9P2000.L")
-            reply = self.call(100, struct.pack("<I", MSIZE) + dialect, tag=65535)
-            if reply != struct.pack("<I", MSIZE) + dialect:
+            reply = self.call(100, struct.pack("<I", self.msize) + dialect, tag=65535)
+            if reply != struct.pack("<I", self.msize) + dialect:
                 raise RuntimeError(f"unexpected 9P version response: {reply!r}")
             self.call(
                 104,
@@ -69,7 +69,7 @@ class NineP:
         else:
             self.socket.sendall(header)
         length, reply_kind, reply_tag = struct.unpack("<IBH", self.receive(7))
-        if not 7 <= length <= MSIZE or reply_tag != tag:
+        if not 7 <= length <= self.msize or reply_tag != tag:
             raise RuntimeError(f"invalid 9P response header for request {kind}")
         reply = self.receive(length - 7)
         if reply_kind == 7 and len(reply) == 4:
@@ -96,12 +96,12 @@ class NineP:
         )
         self.io_chunk = self.open_chunk(reply)
 
-    @staticmethod
-    def open_chunk(reply):
+    def open_chunk(self, reply):
         if len(reply) != 17:
             raise RuntimeError("invalid 9P open response")
         iounit = struct.unpack_from("<I", reply, 13)[0]
-        return min(iounit or CHUNK, CHUNK)
+        maximum = self.msize - 24
+        return min(iounit or maximum, maximum)
 
     def write(self, payload):
         payload = memoryview(payload)
