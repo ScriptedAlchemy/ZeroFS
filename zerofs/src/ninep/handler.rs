@@ -1216,8 +1216,7 @@ impl NinePHandler {
         let qid = inode_to_qid(&root_inode, root_id);
         let directory_pin = self.pin_walked_directory(root_id).await?;
 
-        crate::abandonment::pass_point_of_no_return().map_err(FsError::from)?;
-        let mut state = self.session_state();
+        let mut state = self.session_for_update()?;
         if state.fids.contains_key(&ta.fid) {
             return Err(P9Error::FidInUse);
         }
@@ -6542,6 +6541,36 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn disconnect_prevents_inflight_attach_from_repinning_directory() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let (directory_id, _) = fs
+            .mkdir(&test_creds(), 0, b"late-attach", &SetAttributes::default())
+            .await
+            .unwrap();
+        let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+        negotiate(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS).await;
+
+        // An attach can already be received when disconnect sweeps the
+        // session. Waiting for its subtree pin must not let it repopulate
+        // the retired session while other accepted work retains the handler.
+        let inode_guard = fs.lock_manager.acquire(directory_id).await;
+        let mut attaching = Box::pin(attach(&handler, 1, 1, b"test", b"late-attach", 1000));
+        assert!(futures::poll!(attaching.as_mut()).is_pending());
+        handler.close_for_disconnect();
+        drop(inode_guard);
+
+        let response = attaching.await;
+        assert!(matches!(
+            response.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::ESTALE
+        ));
+        assert!(handler.get_fid(1).is_err());
+        assert_eq!(fs.open_handle_count(directory_id), 0);
+        handler.close_for_disconnect();
+        assert_eq!(fs.open_handle_count(directory_id), 0);
     }
 
     #[tokio::test]
