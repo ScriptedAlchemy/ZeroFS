@@ -963,7 +963,13 @@ impl Journal {
             root_dir.sync()?;
         }
 
-        initialize_or_validate_identity(&database, &expected_identity)?;
+        initialize_or_validate_identity(&database, &expected_identity, !database_existed)
+            .with_context(|| {
+                format!(
+                    "failed to validate journal database {}",
+                    database_path.display()
+                )
+            })?;
         normalize_mutation_fences(&database, &expected_identity)?;
         backfill_local_payload_bytes(&database)?;
         backfill_remote_object_versions(&database)?;
@@ -2479,7 +2485,11 @@ fn record_local_publish_phase(phase: &'static str, elapsed: Duration) {
         .record(elapsed.as_secs_f64());
 }
 
-fn initialize_or_validate_identity(database: &Database, expected: &JournalIdentity) -> Result<()> {
+fn initialize_or_validate_identity(
+    database: &Database,
+    expected: &JournalIdentity,
+    initialize: bool,
+) -> Result<()> {
     let mut transaction = database
         .begin_write()
         .context("failed to initialize journal")?;
@@ -2496,13 +2506,20 @@ fn initialize_or_validate_identity(database: &Database, expected: &JournalIdenti
             .map(|value| value.value().to_vec());
         match existing {
             Some(encoded) => {
-                let actual: JournalIdentity =
-                    bincode::deserialize(&encoded).context("failed to decode journal identity")?;
+                let actual: JournalIdentity = bincode::deserialize(&encoded)
+                    .context("failed to decode journal identity")
+                    .map_err(operator_required)?;
                 if &actual != expected {
                     return Err(operator_required(anyhow!(
                         "writeback journal identity mismatch"
                     )));
                 }
+            }
+            None if !initialize => {
+                return Err(operator_required(anyhow!(
+                    "existing writeback journal database has no identity; refusing to initialize \
+                     it because resetting its durable watermarks could discard acknowledged writes"
+                )));
             }
             None => {
                 write_value(&mut meta, IDENTITY_KEY, expected)?;
@@ -3139,9 +3156,10 @@ fn validate_owner_only(
 #[cfg(test)]
 mod tests {
     use super::{
-        AnchoredDir, FENCE_CLASSIFICATION_VERSION, FENCE_CLASSIFICATION_VERSION_KEY, Journal,
-        JournalSnapshot, JournalWriteGate, META, PublicationFilesystem, REMOTE_OBJECT_VERSIONS,
-        blob_relative_path, read_optional, write_value,
+        AnchoredDir, FENCE_CLASSIFICATION_VERSION, FENCE_CLASSIFICATION_VERSION_KEY, IDENTITY_KEY,
+        Journal, JournalSnapshot, JournalWriteGate, META, MUTATIONS, PENDING_BLOBS,
+        PublicationFilesystem, REMOTE_OBJECT_VERSIONS, blob_relative_path, read_optional,
+        write_value,
     };
     use crate::writeback::model::{
         FenceClass, JournalIdentity, LocalEtag, MutationKind, MutationMode, MutationRecord,
@@ -3149,8 +3167,9 @@ mod tests {
     use crate::writeback::payload::VerifiedPayload;
     use bytes::Bytes;
     use futures::StreamExt;
-    use redb::ReadableDatabase;
+    use redb::{Database, ReadableDatabase, ReadableTable};
     use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -4455,6 +4474,111 @@ mod tests {
         assert_eq!(snapshot.remote_seq, 0);
         assert_eq!(snapshot.records.len(), 1);
         assert!(matches!(snapshot.records[0].kind, MutationKind::Delete));
+    }
+
+    fn journal_tables(database: &Database) -> BTreeMap<(String, String), Vec<u8>> {
+        let read = database.begin_read().unwrap();
+        let mut contents = BTreeMap::new();
+        for (name, definition) in [
+            ("meta", META),
+            ("pending_blobs", PENDING_BLOBS),
+            ("remote_object_versions", REMOTE_OBJECT_VERSIONS),
+        ] {
+            let table = read.open_table(definition).unwrap();
+            for entry in table.iter().unwrap() {
+                let (key, value) = entry.unwrap();
+                contents.insert(
+                    (name.to_owned(), key.value().to_owned()),
+                    value.value().to_vec(),
+                );
+            }
+        }
+        let table = read.open_table(MUTATIONS).unwrap();
+        for entry in table.iter().unwrap() {
+            let (key, value) = entry.unwrap();
+            contents.insert(
+                ("mutations".to_owned(), key.value().to_string()),
+                value.value().to_vec(),
+            );
+        }
+        contents
+    }
+
+    fn assert_damaged_identity_is_preserved(encoded: Option<&[u8]>) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let journal = open_temp_journal(&temp, "bucket-a");
+        journal
+            .commit_put(put_record(1, "segments/1", b"drained"), b"drained")
+            .unwrap();
+        journal.mark_remote(1, None).unwrap();
+        let committed = journal
+            .commit_put(put_record(2, "segments/2", b"pending"), b"pending")
+            .unwrap();
+        journal
+            .commit_metadata(delete_record(3, "obsolete"))
+            .unwrap();
+        let blob = blob_file(&journal, &committed);
+        let payload = fs::read(&blob).unwrap();
+        let pending_path = "blobs/0000/pending-payload";
+        fs::create_dir_all(root.join("blobs/0000")).unwrap();
+        fs::set_permissions(root.join("blobs/0000"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(root.join(pending_path), b"uncommitted").unwrap();
+        fs::set_permissions(root.join(pending_path), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(root.join("tmp/unfinished"), b"temporary").unwrap();
+        fs::set_permissions(
+            root.join("tmp/unfinished"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let transaction = journal.database.begin_write().unwrap();
+        {
+            let mut meta = transaction.open_table(META).unwrap();
+            match encoded {
+                Some(encoded) => {
+                    meta.insert(IDENTITY_KEY, encoded).unwrap();
+                }
+                None => {
+                    meta.remove(IDENTITY_KEY).unwrap();
+                }
+            }
+            transaction
+                .open_table(PENDING_BLOBS)
+                .unwrap()
+                .insert("pending", pending_path.as_bytes())
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        let before = journal_tables(&journal.database);
+        drop(journal);
+
+        let error = Journal::open(&root, identity("bucket-a"))
+            .expect_err("an existing journal cannot initialize a replacement identity");
+        assert_eq!(
+            crate::operator_required::ServerExit::of(error.as_ref()),
+            crate::operator_required::ServerExit::OperatorRequired,
+            "{error:#}"
+        );
+        assert!(format!("{error:#}").contains("identity"), "{error:#}");
+        assert_eq!(fs::read(&blob).unwrap(), payload);
+        assert_eq!(fs::read(root.join(pending_path)).unwrap(), b"uncommitted");
+        assert_eq!(fs::read(root.join("tmp/unfinished")).unwrap(), b"temporary");
+        let database = Database::open(root.join("journal.redb")).unwrap();
+        assert_eq!(
+            journal_tables(&database),
+            before,
+            "refusal must preserve watermarks, mutation records and pending cleanup intents"
+        );
+    }
+
+    #[test]
+    fn an_existing_journal_without_identity_keeps_its_watermarks_and_payloads() {
+        assert_damaged_identity_is_preserved(None);
+    }
+
+    #[test]
+    fn an_existing_journal_with_malformed_identity_keeps_its_watermarks_and_payloads() {
+        assert_damaged_identity_is_preserved(Some(&[0xff]));
     }
 
     /// A redb commit that trims surplus space makes its new header durable and
