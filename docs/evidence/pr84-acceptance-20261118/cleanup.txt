@@ -1,0 +1,9 @@
+reconnect-final.log:
+Removed owned fixture /evidence/zerofs-reconnect-x3kqcdsn, mount, client, and server.
+reuse.log:
+Removed owned fixture /evidence/zerofs-delete-reuse-2e597gb2, mounts, clients, and server.
+wire.log:
+owned mount/fixture removed; server/proxy stopped
+xattrs-fuse.log:
+The sensitive fixture and its processes were removed from /tmp/zerofs-xattrs-fuse-bhxbs5oq.
+The insensitive fixture and its processes were removed from /tmp/zerofs-xattrs-fuse-h5ezz0fs.

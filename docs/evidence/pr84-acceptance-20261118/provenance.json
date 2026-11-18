@@ -1,0 +1,14 @@
+{
+  "engine_commit": "9951d0f60feec3e2b8fe4dfbeef962000d6b594a",
+  "engine_zerofs_tree": "b33ce701f60b149ce258d86302baedf5c915bcce",
+  "executable_sha256": "e34814d3319450e00b5c349df60481ec5ccc4aab31917a584cfec07c7461901c",
+  "build": "cargo build --locked -p zerofs --bin zerofs",
+  "rustc": "1.100.0 (0ef1bc386 2026-11-09)",
+  "profile": "dev, unoptimized + debuginfo",
+  "probe_scripts_sha256": {
+    "scripts/probe-kernel-9p-xattr-wire.py": "175388196ed3030c6a9d4147457ddd4ff17f10da9817e0c9796464a278068c77",
+    "scripts/test-fuse-reconnect.py": "08a6f5d3e5fdc69e0a107026b0983911b4ae597c4311308807a78d54d64787f7",
+    "scripts/test-pool-delete-reuse.py": "2e240025da55ad2c943bc7e22105a60914092b3de58e9cfbcf5fd870174a4ada",
+    "scripts/ci/test-stress-metamix-eintr.py": "e15707acdeee35fc47b480423b10b0a8ec89ee7e45621b83812c867e08110282"
+  }
+}

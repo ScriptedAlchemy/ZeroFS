@@ -79,6 +79,14 @@ The ZeroFS FUSE client uses the private removal flag. Linux v6.18 implements its
 plain-session sequence in
 [`v9fs_fid_xattr_set`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/fs/9p/xattr.c?h=v6.18).
 
+Linux kernel 9P cannot distinguish an empty `XATTR_REPLACE` from removal:
+both encode size zero and flags `XATTR_REPLACE`, with no value write. Therefore
+empty replacement through that client removes the attribute. A server cannot
+preserve both operations from the identical request. The
+[Linux 7.0 wire receipt](evidence/pr84-acceptance-20261118/README.md)
+records the exact bytes and source path. This remains an incompatible acceptance
+requirement when kernel 9P is required; the FUSE result does not satisfy it.
+
 ZeroFS does not deduplicate xattr set and remove across HA failover. `Tclunk` has no
 operation id. Retrying a successful create-only set may return `EEXIST`; retrying a
 successful removal may return `ENODATA`. The `ninep-client` helpers keep each

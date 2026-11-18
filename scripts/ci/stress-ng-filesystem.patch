@@ -64,6 +64,20 @@
  		pr_fail("%s: open for read %s failed, errno=%d (%s)%s\n",
  			args->name, filename, errno, strerror(errno), fs_type);
  		rc = EXIT_FAILURE;
+@@ -243,8 +262,12 @@
+ 			goto err_close;
+ 		}
+ 
+-		rret = read(fd, buf, data_len);
++		do {
++			rret = read(fd, buf, data_len);
++		} while ((rret < 0) && (errno == EINTR) && stress_continue_flag());
+ 		if (UNLIKELY(rret < 0)) {
++			if ((errno == EINTR) && !stress_continue_flag())
++				goto err_close;
+ 			pr_fail("%s: read failure, errno=%d (%s)%s\n",
+ 				args->name, errno, strerror(errno), fs_type);
+ 			rc = EXIT_FAILURE;
 --- a/stress-open.c
 +++ b/stress-open.c
 @@ -1183,9 +1183,9 @@
