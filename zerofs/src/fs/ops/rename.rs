@@ -205,6 +205,7 @@ impl ZeroFS {
             to_name,
             [0; 16],
             true,
+            None,
             Some(expected),
         )
         .await?
@@ -335,6 +336,38 @@ impl ZeroFS {
             op_id,
             true,
             None,
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Rename the entry only if it still names the inode held by a protocol
+    /// fid. Its cached path may have been reused after another client moved
+    /// the original inode. The precondition and entry-cookie recheck stay
+    /// inside the ordinary rename's fence and inode-lock boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn rename_inode_idempotent(
+        &self,
+        auth: &AuthContext,
+        from_dirid: u64,
+        from_name: &[u8],
+        to_dirid: u64,
+        to_name: &[u8],
+        expected_source: InodeId,
+        op_id: crate::dedup::OpId,
+    ) -> Result<(), FsError> {
+        self.rename_with_options(
+            auth,
+            from_dirid,
+            from_name,
+            NameMatch::Folded,
+            to_dirid,
+            to_name,
+            op_id,
+            true,
+            Some(expected_source),
+            None,
         )
         .await
         .map(|_| ())
@@ -360,6 +393,7 @@ impl ZeroFS {
             op_id,
             false,
             None,
+            None,
         )
         .await
         .map(|_| ())
@@ -376,6 +410,7 @@ impl ZeroFS {
         to_name: &[u8],
         op_id: crate::dedup::OpId,
         replace_existing: bool,
+        expected_source: Option<InodeId>,
         verification: Option<VerifiedFileExpectation>,
     ) -> Result<Option<VerifiedRenameOutcome>, FsError> {
         if from_name.is_empty() || to_name.is_empty() {
@@ -445,6 +480,9 @@ impl ZeroFS {
             }
         };
 
+        if expected_source.is_some_and(|expected| expected != source_inode_id) {
+            return Err(FsError::StaleHandle);
+        }
         if verification.is_some_and(|expected| {
             expected.inode != source_inode_id || expected.entry_cookie != source_cookie
         }) {
@@ -518,7 +556,10 @@ impl ZeroFS {
             .directory_store
             .get_entry_matching(from_dirid, from_name, source_match)
             .await?;
-        if verified_source_id != source_inode_id || verified_source_cookie != source_cookie {
+        if verified_source_id != source_inode_id
+            || verified_source_cookie != source_cookie
+            || expected_source.is_some_and(|expected| expected != verified_source_id)
+        {
             return Err(FsError::StaleHandle);
         }
         if verification.is_some_and(|expected| {
@@ -1107,6 +1148,41 @@ mod tests {
             fs.lookup(&creds, 0, b"published").await,
             Err(FsError::NotFound)
         );
+    }
+
+    #[tokio::test]
+    async fn inode_rename_rejects_reused_names_but_replays_completed_operations() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let creds = test_creds();
+        let auth: AuthContext = (&test_auth()).into();
+        let original = fs
+            .create(&creds, 0, b"source", &SetAttributes::default())
+            .await
+            .unwrap()
+            .0;
+        let op_id = [0x62; 16];
+        fs.rename_inode_idempotent(&auth, 0, b"source", 0, b"target", original, op_id)
+            .await
+            .unwrap();
+        let replacement = fs
+            .create(&creds, 0, b"source", &SetAttributes::default())
+            .await
+            .unwrap()
+            .0;
+
+        // A lost reply may be retried after another caller reuses the name.
+        // Replay reports the original success without moving the replacement.
+        fs.rename_inode_idempotent(&auth, 0, b"source", 0, b"target", original, op_id)
+            .await
+            .unwrap();
+        // A fresh operation using the old fid must reject that same path.
+        assert_eq!(
+            fs.rename_inode_idempotent(&auth, 0, b"source", 0, b"target", original, [0x63; 16],)
+                .await,
+            Err(FsError::StaleHandle)
+        );
+        assert_eq!(fs.lookup(&creds, 0, b"source").await.unwrap(), replacement);
+        assert_eq!(fs.lookup(&creds, 0, b"target").await.unwrap(), original);
     }
 
     #[tokio::test]

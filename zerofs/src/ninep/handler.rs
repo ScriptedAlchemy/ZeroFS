@@ -2550,12 +2550,13 @@ impl NinePHandler {
         let auth = AuthContext::from(&creds);
 
         self.filesystem
-            .rename_idempotent(
+            .rename_inode_idempotent(
                 &auth,
                 source_parent_id,
                 source_name,
                 dest_parent_id,
                 &new_name_bytes,
+                source_fid.inode_id,
                 op_id,
             )
             .await?;
@@ -5414,6 +5415,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(data.as_ref(), b"later");
+    }
+
+    #[tokio::test]
+    async fn trename_does_not_move_a_replacement_at_the_fids_cached_path() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let creds = test_creds();
+        let auth = AuthContext::from(&creds);
+        let original = fs
+            .create(&creds, 0, b"source", &SetAttributes::default())
+            .await
+            .unwrap()
+            .0;
+        let destination = fs
+            .create(&creds, 0, b"destination", &SetAttributes::default())
+            .await
+            .unwrap()
+            .0;
+        let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+        expect_walk(&handler, 2, 1, 2, &[b"source"]).await;
+
+        // Another client moves the inode this fid identifies, then places a
+        // different inode at the cached path. Neither that replacement nor
+        // the destination may be changed by a rename of the original fid.
+        fs.rename(&auth, 0, b"source", 0, b"moved").await.unwrap();
+        let replacement = fs
+            .create(&creds, 0, b"source", &SetAttributes::default())
+            .await
+            .unwrap()
+            .0;
+        let response = request(
+            &handler,
+            3,
+            Message::Trename(Trename {
+                fid: 2,
+                dfid: 1,
+                name: P9String::new(b"destination".to_vec()),
+            }),
+        )
+        .await;
+        assert!(matches!(
+            response.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::ESTALE
+        ));
+        assert_eq!(fs.lookup(&creds, 0, b"source").await, Ok(replacement));
+        assert_eq!(fs.lookup(&creds, 0, b"moved").await, Ok(original));
+        assert_eq!(fs.lookup(&creds, 0, b"destination").await, Ok(destination));
     }
 
     #[tokio::test]
