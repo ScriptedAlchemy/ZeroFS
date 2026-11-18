@@ -73,6 +73,15 @@ def validate_mount(path):
     require(not any(path.iterdir()), f"member mount is not empty: {path}")
 
 
+def validate_tmpfs_members(args):
+    for path in args.member_mounts:
+        validate_mount(path)
+    require(
+        args.member_a.stat().st_dev != args.member_b.stat().st_dev,
+        "member tmpfs mounts must be distinct filesystems",
+    )
+
+
 def space(path):
     info = os.statvfs(path)
     return info.f_bavail * info.f_frsize
@@ -706,6 +715,7 @@ def main(
     fixture_type=Fixture,
     *,
     configure_parser=None,
+    validate_mounts=validate_tmpfs_members,
     validate_args=None,
     description=None,
     argv=None,
@@ -776,12 +786,7 @@ def main(
             for signum in (signal.SIGALRM, signal.SIGTERM, signal.SIGINT):
                 signal.signal(signum, interrupted)
             signal.setitimer(signal.ITIMER_REAL, args.timeout)
-            for path in args.member_mounts:
-                validate_mount(path)
-            require(
-                args.member_a.stat().st_dev != args.member_b.stat().st_dev,
-                "member tmpfs mounts must be distinct filesystems",
-            )
+            validate_mounts(args)
             with args.binary.open("rb") as binary:
                 receipt["binary_sha256"] = hashlib.file_digest(
                     binary, "sha256"
