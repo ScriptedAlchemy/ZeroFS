@@ -36,6 +36,7 @@ def wait_for(predicate, process, description):
         if process.poll() is not None:
             raise RuntimeError(f"{description}: process exited {process.returncode}")
         if time.monotonic() >= deadline:
+            stop(process, kill=True)
             raise TimeoutError(description)
         time.sleep(0.05)
 
@@ -66,13 +67,19 @@ def digest(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
-def run(binary, scratch, evidence):
+def run(binary, scratch, evidence, distinct_payload, protection):
     root = Path(tempfile.mkdtemp(prefix="zerofs-delete-reuse-", dir=scratch))
     mounted = []
     server = client = None
     pending = None
+    reader = None
     log = (evidence / "processes.log").open("wb")
-    result = {"kernel": os.uname().release, "binary_sha256": digest(binary)}
+    result = {
+        "kernel": os.uname().release,
+        "binary_sha256": digest(binary),
+        "protection": protection,
+        "distinct_payload": distinct_payload,
+    }
     try:
         for name in ("member-a", "member-b", "metadata", "catalog", "cache", "mount"):
             (root / name).mkdir(mode=0o700)
@@ -119,12 +126,20 @@ unix_socket = "{root / "9p.sock"}"
 [telemetry]
 enabled = false
 ''')
+        if protection == "checkpoint":
+            with config.open("a") as stream:
+                stream.write(
+                    f'\n[servers.rpc]\naddresses = []\nunix_socket = "{root / "rpc.sock"}"\n'
+                )
         command(str(binary), "pool", "init", "-c", str(config))
 
-        def start():
+        def start(*options):
             (root / "9p.sock").unlink(missing_ok=True)
+            (root / "rpc.sock").unlink(missing_ok=True)
             process = subprocess.Popen(
-                [str(binary), "run", "-c", str(config)], stdout=log, stderr=log
+                [str(binary), "run", "-c", str(config), *options],
+                stdout=log,
+                stderr=log,
             )
             wait_for((root / "9p.sock").exists, process, "server readiness")
             return process
@@ -153,6 +168,13 @@ enabled = false
         client = mount()
         previous = b"earlier flushed data"
         data = hashlib.shake_256(b"delete-space").digest(32 * MIB)
+        replacement = (
+            hashlib.shake_256(b"replacement").digest(len(data))
+            if distinct_payload
+            else data
+        )
+        result["deleted_sha256"] = hashlib.sha256(data).hexdigest()
+        result["expected_replacement_sha256"] = hashlib.sha256(replacement).hexdigest()
         for name, payload in (("previous", previous), ("delete-me", data)):
             with (root / "mount" / name).open("wb", buffering=0) as target:
                 for offset in range(0, len(payload), MIB):
@@ -160,9 +182,17 @@ enabled = false
                         payload[offset : offset + MIB]
                     )
                 os.fsync(target.fileno())
-        pending = os.open(root / "mount/replacement", os.O_WRONLY | os.O_CREAT, 0o600)
-        for offset in range(0, len(data), MIB):
-            assert os.write(pending, data[offset : offset + MIB]) == MIB
+        if protection == "open-reader":
+            reader = (root / "mount/delete-me").open("rb", buffering=0)
+        elif protection == "checkpoint":
+            command(
+                str(binary), "checkpoint", "create", "-c", str(config), "before-unlink"
+            )
+        pending = os.open(
+            root / "mount/replacement", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+        )
+        for offset in range(0, len(replacement), MIB):
+            assert os.write(pending, replacement[offset : offset + MIB]) == MIB
         try:
             os.fsync(pending)
         except OSError as error:
@@ -182,10 +212,18 @@ enabled = false
             result["reuse_errno"] = None
         result["delete_and_flush_seconds"] = time.monotonic() - started
         assert digest(root / "mount/previous") == result["earlier_sha256"]
+        if reader is not None:
+            result["unlinked_reader_sha256"] = hashlib.file_digest(
+                reader, "sha256"
+            ).hexdigest()
+            assert result["unlinked_reader_sha256"] == result["deleted_sha256"]
 
         # Kill before any graceful final seal/flush can change the evidence.
         stop(server, kill=True)
         stop(client, kill=True)
+        if reader is not None:
+            reader.close()
+            reader = None
         try:
             os.close(pending)
         except OSError as error:
@@ -198,9 +236,12 @@ enabled = false
         result["earlier_hash_after_sigkill"] = result["earlier_sha256"]
         if result["reuse_errno"] is None:
             assert (
-                digest(root / "mount/replacement") == hashlib.sha256(data).hexdigest()
+                digest(root / "mount/replacement")
+                == result["expected_replacement_sha256"]
             )
-            result["replacement_hash_after_sigkill"] = hashlib.sha256(data).hexdigest()
+            result["replacement_hash_after_sigkill"] = result[
+                "expected_replacement_sha256"
+            ]
         else:
             # The deletion was not fsynced: its old durable name may return.
             if (root / "mount/delete-me").exists():
@@ -210,14 +251,25 @@ enabled = false
                 result["old_target_hash_after_sigkill"] = hashlib.sha256(
                     data
                 ).hexdigest()
+        if protection == "checkpoint":
+            stop(client)
+            if is_mounted(root / "mount"):
+                command("fusermount3", "-u", str(root / "mount"))
+            stop(server)
+            server = start("--checkpoint", "before-unlink")
+            client = mount()
+            result["checkpoint_after_restart_sha256"] = digest(root / "mount/delete-me")
+            assert result["checkpoint_after_restart_sha256"] == result["deleted_sha256"]
+            assert digest(root / "mount/previous") == result["earlier_sha256"]
         print(json.dumps(result, sort_keys=True), flush=True)
         (evidence / "receipt.json").write_text(json.dumps(result, indent=2) + "\n")
-        assert result["reuse_errno"] is None, (
-            f"immediate reuse remains broken: {result}"
-        )
+        expected_errno = None if protection == "none" else errno.ENOSPC
+        assert result["reuse_errno"] == expected_errno, result
         assert result["delete_and_flush_seconds"] < 5, result
     finally:
         stop(client, kill=True)
+        if reader is not None:
+            reader.close()
         if pending is not None:
             try:
                 os.close(pending)
@@ -239,9 +291,28 @@ def main():
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--scratch", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
+    parser.add_argument(
+        "--distinct-payload",
+        action="store_true",
+        help="stage different bytes from the file being deleted",
+    )
+    parser.add_argument(
+        "--protection",
+        choices=("none", "open-reader", "checkpoint"),
+        default="none",
+        help="protect old bytes on the same quota-limited fixture and require ENOSPC",
+    )
     args = parser.parse_args()
     args.evidence.mkdir(parents=True, exist_ok=True)
-    run(args.binary.resolve(), args.scratch, args.evidence)
+    if not __debug__:
+        parser.error("acceptance assertions require Python without -O")
+    run(
+        args.binary.resolve(),
+        args.scratch,
+        args.evidence,
+        args.distinct_payload or args.protection != "none",
+        args.protection,
+    )
 
 
 if __name__ == "__main__":
