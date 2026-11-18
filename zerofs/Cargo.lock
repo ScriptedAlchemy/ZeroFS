@@ -639,15 +639,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bytestream"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04f720842a717d6afaf69fee2dc69b771edc165f12cc3eb1b0e8eeef53a86454"
-dependencies = [
- "byteorder",
-]
-
-[[package]]
 name = "camino"
 version = "1.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7728,21 +7719,19 @@ dependencies = [
 [[package]]
 name = "zerofs_nfsserve"
 version = "0.20.0"
-source = "git+https://github.com/ScriptedAlchemy/nfsserve.git?rev=4c817ecccc911c1f7f5179ed16034f01886ef8c1#4c817ecccc911c1f7f5179ed16034f01886ef8c1"
+source = "git+https://github.com/ScriptedAlchemy/nfsserve.git?branch=main#fdd04e0f5001457a87cdb23527dee6208cf34bfc"
 dependencies = [
  "anyhow",
  "async-trait",
  "byteorder",
- "bytestream",
  "filetime",
  "futures",
  "num-derive",
  "num-traits",
- "smallvec",
+ "rustix",
  "tokio",
  "tokio-util",
  "tracing",
- "tracing-attributes",
 ]
 
 [[package]]

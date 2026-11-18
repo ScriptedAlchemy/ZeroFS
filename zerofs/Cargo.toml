@@ -80,7 +80,7 @@ slatedb = { git = "https://github.com/Barre/slatedb.git", rev = "230ade681f1fdf0
     "foyer",
 ] }
 slatedb-common = { git = "https://github.com/Barre/slatedb.git", rev = "230ade681f1fdf0f85fc1c2cb6c118575a83ceb1" }
-zerofs_nfsserve = { git = "https://github.com/ScriptedAlchemy/nfsserve.git", rev = "4c817ecccc911c1f7f5179ed16034f01886ef8c1" }
+zerofs_nfsserve = { git = "https://github.com/ScriptedAlchemy/nfsserve.git", branch = "main" }
 tikv-jemallocator = "0.7"
 tikv-jemalloc-ctl = { version = "0.7", features = [
     "stats",
