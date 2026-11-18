@@ -261,6 +261,8 @@ class PressureFixture(Fixture):
             fsynced_bytes=len(acknowledged) * FILE_MIB * MIB,
         )
 
+        self.storage_account()
+
         self.stage = "verify-acknowledged-while-both-held"
         self.verify_hashes(acknowledged)
         active, completed, _ = self.writer.snapshot(blocked.ordinal)
