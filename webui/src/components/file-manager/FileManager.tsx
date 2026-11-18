@@ -281,9 +281,8 @@ export function FileManager({ path, onNavigate }: FileManagerProps) {
   );
 
   const handleMoveToDir = useCallback(
-    async (entryName: string, targetDir: string) => {
-      if (targetDir === path) return;
-      const oldPath = fullPath(entryName);
+    async (oldPath: string, targetDir: string) => {
+      const entryName = oldPath.split("/").pop()!;
       const newPath = joinPath(targetDir, entryName);
       if (oldPath === newPath) return;
       try {
@@ -295,7 +294,7 @@ export function FileManager({ path, onNavigate }: FileManagerProps) {
         toast.error(`Failed to move ${entryName}`, { description: formatError(err) });
       }
     },
-    [path, fullPath, renameMut],
+    [renameMut],
   );
 
   return (

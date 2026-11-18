@@ -254,6 +254,7 @@ impl ZeroFS {
             reclaim_shutdown: tokio_util::sync::CancellationToken::new(),
             reclaim_task: Arc::new(Mutex::new(None)),
             lock_manager,
+            directory_rename_lock: Arc::new(tokio::sync::Mutex::new(())),
             stats,
             global_stats,
             flush_coordinator,

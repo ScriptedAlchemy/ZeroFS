@@ -183,6 +183,36 @@ async fn cancelled_rename_holds_its_locks_until_apply() {
 }
 
 #[tokio::test]
+async fn cancelled_directory_rename_keeps_topology_locked_until_apply() {
+    let fs = new_fs().await;
+    let directory = fs
+        .mkdir(&test_creds(), 0, b"before", &SetAttributes::default())
+        .await
+        .unwrap()
+        .0;
+    let renaming = Arc::clone(&fs);
+    let block_apply = cancel_after_queue(&fs, async move {
+        renaming
+            .rename(&test_auth(), 0, b"before", 0, b"after")
+            .await
+    })
+    .await;
+    assert!(
+        fs.directory_rename_lock.try_lock().is_err(),
+        "cancelling a queued move must not expose its old topology to the next rename"
+    );
+    assert_locked_until_apply(&fs, "directory rename", &[0, directory], block_apply).await;
+    let _topology = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        fs.directory_rename_lock.lock(),
+    )
+    .await
+    .expect("the applied move must release its topology lock");
+    assert!(!entry_exists(&fs, 0, b"before").await);
+    assert!(entry_exists(&fs, 0, b"after").await);
+}
+
+#[tokio::test]
 async fn cancelled_unlink_holds_both_locks_until_apply() {
     let fs = new_fs().await;
     let file = file_with_data(&fs, b"doomed", 0).await;

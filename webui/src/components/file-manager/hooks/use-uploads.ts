@@ -96,20 +96,32 @@ export function useUploads(path: string) {
             },
             handle.signal,
           );
+          if (handle.signal.aborted) return;
           totalBytes = files.reduce((sum, f) => sum + f.data.length, 0);
           handle.update(0, 0, `Zipping ${collected} files (${formatSize(totalBytes)})...`);
-          const { zipSync } = await import("fflate");
-          const zipData: Record<string, Uint8Array> = {};
-          for (const f of files) zipData[f.path] = f.data;
-          const zipped = zipSync(zipData);
-          const blob = new Blob([new Uint8Array(zipped)], { type: "application/zip" });
+          const { Zip, ZipDeflate } = await import("fflate");
+          if (handle.signal.aborted) return;
+          const chunks: Uint8Array<ArrayBuffer>[] = [];
+          const zip = new Zip((error, chunk) => {
+            if (error) throw error;
+            chunks.push(new Uint8Array(chunk));
+          });
+          // zipSync flattens filenames through a plain object internally, so
+          // even a null-prototype input cannot safely preserve __proto__.
+          for (const file of files) {
+            const entry = new ZipDeflate(file.path);
+            zip.add(entry);
+            entry.push(file.data, true);
+          }
+          zip.end();
+          const blob = new Blob(chunks, { type: "application/zip" });
           const url = URL.createObjectURL(blob);
           const a = document.createElement("a");
           a.href = url;
           a.download = `${name}.zip`;
           a.click();
           URL.revokeObjectURL(url);
-          handle.update(zipped.length, zipped.length);
+          handle.update(blob.size, blob.size);
           handle.finish();
         } catch (err) {
           if (err instanceof DOMException && err.name === "AbortError") return;

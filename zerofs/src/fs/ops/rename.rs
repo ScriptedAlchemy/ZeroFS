@@ -52,6 +52,10 @@ struct VerifiedRenamePause {
 static VERIFIED_RENAME_PAUSE: std::sync::OnceLock<std::sync::Mutex<Option<VerifiedRenamePause>>> =
     std::sync::OnceLock::new();
 
+#[cfg(test)]
+static DIRECTORY_RENAME_PAUSE: std::sync::OnceLock<std::sync::Mutex<Option<VerifiedRenamePause>>> =
+    std::sync::OnceLock::new();
+
 fn set_rename_backpointer(inode: &mut Inode, parent: InodeId, name: &[u8]) {
     match inode {
         Inode::Directory(d) => {
@@ -407,6 +411,22 @@ impl ZeroFS {
 
         let creds = Credentials::from_auth_context(auth);
 
+        // Resolve names only after checking search permission on their parent
+        // directories. Otherwise ENOENT (source) or EEXIST (no-replace target)
+        // reveals names the caller cannot search. The locked checks below
+        // still revalidate search and write access before any mutation.
+        for dirid in std::iter::once(from_dirid).chain((to_dirid != from_dirid).then_some(to_dirid))
+        {
+            let dir_inode = self.inode_store.get(dirid).await?;
+            if !matches!(&dir_inode, Inode::Directory(_)) {
+                return Err(FsError::NotDirectory);
+            }
+            check_access(&dir_inode, &creds, AccessMode::Execute)?;
+            if matches!(&dir_inode, Inode::Directory(dir) if dir.nlink == 0) {
+                return Err(FsError::StaleHandle);
+            }
+        }
+
         // Look up all inode IDs without holding any locks
         let (source_inode_id, source_cookie) = match self
             .directory_store
@@ -445,6 +465,22 @@ impl ZeroFS {
             Err(e) => return Err(e),
         };
         let target_inode_id = target_entry.map(|(id, _)| id);
+
+        // Directory moves can form a cycle even when their immediate inode
+        // lock sets are disjoint: moving A beneath a descendant of C while C
+        // moves beneath a descendant of A. Serialize topology changes before
+        // taking any mutation fence or inode lock, and retain this guard until
+        // the queued commit applies. File renames do not change ancestry.
+        let directory_rename_guard = if self.inode_store.get(source_inode_id).await?.is_directory()
+        {
+            Some(
+                std::sync::Arc::clone(&self.directory_rename_lock)
+                    .lock_owned()
+                    .await,
+            )
+        } else {
+            None
+        };
 
         let mut all_inodes_to_lock = vec![from_dirid, source_inode_id];
         if from_dirid != to_dirid {
@@ -519,6 +555,28 @@ impl ZeroFS {
             && self.is_ancestor_of(source_inode_id, to_dirid).await?
         {
             return Err(FsError::InvalidArgument);
+        }
+
+        #[cfg(test)]
+        {
+            let pause = {
+                let mut slot = DIRECTORY_RENAME_PAUSE
+                    .get_or_init(|| std::sync::Mutex::new(None))
+                    .lock()
+                    .unwrap();
+                let filesystem = std::sync::Arc::as_ptr(&self.db) as usize;
+                if slot.as_ref().is_some_and(|pause| {
+                    pause.filesystem == filesystem && pause.inode == source_inode_id
+                }) {
+                    slot.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(pause) = pause {
+                let _ = pause.reached.send(());
+                let _ = pause.resume.await;
+            }
         }
 
         let mut from_dir = self.inode_store.get(from_dirid).await?;
@@ -948,7 +1006,7 @@ impl ZeroFS {
             )
         };
         self.write_coordinator
-            .commit_with_settlement(txn, settlement, (fence, guards))
+            .commit_with_settlement(txn, settlement, (directory_rename_guard, fence, guards))
             .await?;
 
         #[cfg(feature = "failpoints")]
@@ -963,7 +1021,9 @@ impl ZeroFS {
 #[cfg(test)]
 mod tests {
 
-    use super::{VerifiedFileExpectation, VerifiedRenameOutcome};
+    use super::{
+        DIRECTORY_RENAME_PAUSE, VerifiedFileExpectation, VerifiedRenameOutcome, VerifiedRenamePause,
+    };
     use crate::dedup::DedupResult;
     use crate::fs::inode::Inode;
     use crate::fs::key_codec::KeyCodec;
@@ -987,6 +1047,66 @@ mod tests {
             size: data.len() as u64,
             sha256: Some(sha2::Sha256::digest(data).into()),
         }
+    }
+
+    #[tokio::test]
+    async fn rename_requires_parent_search_before_resolving_names() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let creds = test_creds();
+        let restricted = fs
+            .mkdir(
+                &creds,
+                0,
+                b"restricted",
+                &SetAttributes {
+                    mode: SetMode::Set(0o700),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .0;
+        let secret = fs
+            .create(&creds, restricted, b"secret", &SetAttributes::default())
+            .await
+            .unwrap()
+            .0;
+        let source = fs
+            .create(&creds, 0, b"source", &SetAttributes::default())
+            .await
+            .unwrap()
+            .0;
+        let stranger = AuthContext {
+            uid: 2000,
+            gid: 2000,
+            gid_known: true,
+            gids: vec![],
+            groups_complete: true,
+        };
+
+        for name in [b"missing".as_slice(), b"secret".as_slice()] {
+            assert_eq!(
+                fs.rename(&stranger, restricted, name, 0, b"published")
+                    .await,
+                Err(FsError::PermissionDenied),
+                "source search permission must hide both present and missing names"
+            );
+            assert_eq!(
+                fs.rename_noreplace_idempotent(&stranger, 0, b"source", restricted, name, [0; 16])
+                    .await,
+                Err(FsError::PermissionDenied),
+                "target search permission must precede the no-replace existence check"
+            );
+        }
+        assert_eq!(fs.lookup(&creds, 0, b"source").await.unwrap(), source);
+        assert_eq!(
+            fs.lookup(&creds, restricted, b"secret").await.unwrap(),
+            secret
+        );
+        assert_eq!(
+            fs.lookup(&creds, 0, b"published").await,
+            Err(FsError::NotFound)
+        );
     }
 
     #[tokio::test]
@@ -1483,6 +1603,58 @@ mod tests {
             .expect("renamed symlink must be present");
         assert_eq!(renamed.fileid, symlink_id);
         assert_eq!(renamed.attr.mode & 0o777, 0o701);
+    }
+
+    #[tokio::test]
+    async fn concurrent_directory_moves_cannot_create_a_cycle_between_disjoint_subtrees() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let creds = test_creds();
+        let auth: AuthContext = (&test_auth()).into();
+        let attrs = SetAttributes::default();
+        let p = fs.mkdir(&creds, 0, b"P", &attrs).await.unwrap().0;
+        let q = fs.mkdir(&creds, 0, b"Q", &attrs).await.unwrap().0;
+        let a = fs.mkdir(&creds, p, b"A", &attrs).await.unwrap().0;
+        let c = fs.mkdir(&creds, q, b"C", &attrs).await.unwrap().0;
+        let d = fs.mkdir(&creds, a, b"D", &attrs).await.unwrap().0;
+        let b = fs.mkdir(&creds, c, b"B", &attrs).await.unwrap().0;
+
+        // A -> C/B and C -> A/D have disjoint immediate inode lock sets.
+        // Pause the first move after its ancestry check so the second would
+        // otherwise commit a now-invalidating topology change underneath it.
+        let (reached, waiting) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = tokio::sync::oneshot::channel();
+        let previous = DIRECTORY_RENAME_PAUSE
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap()
+            .replace(VerifiedRenamePause {
+                filesystem: Arc::as_ptr(&fs.db) as usize,
+                inode: a,
+                reached,
+                resume: resumed,
+            });
+        assert!(previous.is_none());
+
+        let moving = Arc::clone(&fs);
+        let moving_auth = auth.clone();
+        let first =
+            tokio::spawn(async move { moving.rename(&moving_auth, p, b"A", b, b"A").await });
+        waiting.await.unwrap();
+        let moving = Arc::clone(&fs);
+        let mut second = tokio::spawn(async move { moving.rename(&auth, q, b"C", d, b"C").await });
+        let early = tokio::time::timeout(std::time::Duration::from_secs(2), &mut second).await;
+        resume.send(()).unwrap();
+        assert_eq!(first.await.unwrap(), Ok(()));
+        let second = match early {
+            Ok(result) => result.unwrap(),
+            Err(_) => second.await.unwrap(),
+        };
+        assert_eq!(second, Err(FsError::InvalidArgument));
+        assert_eq!(fs.lookup(&creds, p, b"A").await, Err(FsError::NotFound));
+        assert_eq!(fs.lookup(&creds, q, b"C").await.unwrap(), c);
+        assert_eq!(fs.lookup(&creds, b, b"A").await.unwrap(), a);
+        assert_eq!(fs.lookup(&creds, a, b"D").await.unwrap(), d);
+        assert_eq!(fs.lookup(&creds, d, b"C").await, Err(FsError::NotFound));
     }
 
     #[tokio::test]

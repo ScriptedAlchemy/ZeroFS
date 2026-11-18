@@ -141,6 +141,10 @@ pub struct ZeroFS {
     /// The drainer's join handle, so shutdown can wait for its final drain.
     reclaim_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     pub lock_manager: Arc<KeyedLockManager<InodeId>>,
+    /// Serializes directory moves while their ancestry is checked and changed.
+    /// Immediate-parent inode locks alone cannot exclude a cycle formed by
+    /// two moves whose sources and destinations are in disjoint subtrees.
+    directory_rename_lock: Arc<tokio::sync::Mutex<()>>,
     pub stats: Arc<FileSystemStats>,
     pub global_stats: Arc<FileSystemGlobalStats>,
     pub flush_coordinator: FlushCoordinator,

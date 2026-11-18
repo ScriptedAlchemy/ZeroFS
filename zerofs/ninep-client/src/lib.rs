@@ -521,7 +521,13 @@ struct Conn {
     counters: Arc<TrafficCounters>,
 }
 
-type AdmissionPermit = Arc<OwnedSemaphorePermit>;
+struct RequestAdmission {
+    _permit: OwnedSemaphorePermit,
+    outage_generation: u64,
+    retirement_generation: u64,
+}
+
+type AdmissionPermit = Arc<RequestAdmission>;
 
 /// Response routing state kept until delivery or connection teardown. A
 /// dispatched request keeps its admission permit here, so cancelling the
@@ -1756,9 +1762,14 @@ impl NinePClient {
         'resend: loop {
             if let Some((_, request)) = stateful {
                 self.check_stateful_request(request)?;
+            } else {
+                self.check_admitted_request(admission)?;
             }
             self.validate_fids(body.request_fids())?;
             await_resend_bounded(attempt, self.wait_until_live()).await??;
+            if stateful.is_none() {
+                self.check_admitted_request(admission)?;
+            }
             let conn = self.conn.load_full();
             self.validate_fids(body.request_fids())?;
 
@@ -1810,7 +1821,15 @@ impl NinePClient {
             }
             let has_op_id = op_id != [0u8; 16];
             let connection_epoch = conn.writer_epoch.load(Ordering::Relaxed);
-            let (op_flags, mut send) =
+            let (op_flags, mut send) = {
+                // Keep the final check and enqueue atomic with failed/stale
+                // fid retirement. This section has no cancellation point.
+                let registry = self.stateful_requests.lock().unwrap();
+                if let Some((_, request)) = stateful {
+                    self.check_stateful_request(request)?;
+                } else {
+                    self.validate_admission_generation(admission, registry.retirement_generation)?;
+                }
                 attempt.dispatch_frame(has_op_id, connection_epoch, |op_flags, origin_epoch| {
                     let bytes = P9Message::new_with_op_id_flags_and_origin(
                         tag,
@@ -1830,7 +1849,8 @@ impl NinePClient {
                     }
                     permit.send(frame);
                     Ok(send)
-                })?;
+                })?
+            };
             let early_response = match Self::wait_for_send_or_response(&mut send, &mut orx).await {
                 Ok(response) => response,
                 Err(SendWaitError::Stalled) => {
@@ -1873,6 +1893,14 @@ impl NinePClient {
                 runtime::yield_now().await;
                 continue;
             }
+            // A retained reply must not publish an old mutation's durability
+            // obligation onto the fid's next owner after a retirement.
+            let registry = self.stateful_requests.lock().unwrap();
+            if let Some((_, request)) = stateful {
+                self.check_stateful_request(request)?;
+            } else {
+                self.validate_admission_generation(admission, registry.retirement_generation)?;
+            }
             // Successful mutations create per-fid durability obligations.
             if !matches!(msg.body, Message::Rlerror(_)) {
                 let token = conn.lineage_token.load(Ordering::Relaxed);
@@ -1882,6 +1910,28 @@ impl NinePClient {
             }
             return Ok((msg.body, conn));
         }
+    }
+
+    fn check_admitted_request(&self, admission: &RequestAdmission) -> ClientResult<()> {
+        let registry = self.stateful_requests.lock().unwrap();
+        self.validate_admission_generation(admission, registry.retirement_generation)
+    }
+
+    fn validate_admission_generation(
+        &self,
+        admission: &RequestAdmission,
+        retirement_generation: u64,
+    ) -> ClientResult<()> {
+        let terminal_errno = self.terminal_errno.load(Ordering::Acquire);
+        if terminal_errno != 0 {
+            return Err(ClientError::Errno(terminal_errno));
+        }
+        if self.outage_generation.load(Ordering::Acquire) != admission.outage_generation
+            || retirement_generation != admission.retirement_generation
+        {
+            return Err(ClientError::Disconnected);
+        }
+        Ok(())
     }
 
     /// Waits for a slot in the filesystem-RPC dispatch window. The permit is
@@ -1926,7 +1976,13 @@ impl NinePClient {
                     {
                         return Err(ClientError::Disconnected);
                     }
-                    return permit.map(Arc::new).map_err(|_| ClientError::Disconnected);
+                    return permit
+                        .map(|permit| Arc::new(RequestAdmission {
+                            _permit: permit,
+                            outage_generation,
+                            retirement_generation,
+                        }))
+                        .map_err(|_| ClientError::Disconnected);
                 }
                 () = notified => {}
                 () = async {
@@ -1937,10 +1993,7 @@ impl NinePClient {
                     // detect a silent peer even when those tags own every
                     // permit. Bound the probe-lock wait as well: its owner
                     // may itself have stopped polling after a reply arrived.
-                    if !matches!(
-                        runtime::timeout(PROBE_TIMEOUT, Self::conn_alive(&conn)).await,
-                        Ok(true)
-                    ) {
+                    if !Self::conn_alive(&conn).await {
                         self.force_reprobe(&conn);
                     }
                 } => {}
@@ -2211,17 +2264,22 @@ impl NinePClient {
         if conn.heard_within(LIVENESS_WINDOW) {
             return true;
         }
-        let _guard = conn.probe_lock.lock().await;
-        if conn.dead.load(Ordering::Acquire) {
-            return false;
-        }
-        if conn.heard_within(LIVENESS_WINDOW) {
-            return true;
-        }
-        matches!(
-            runtime::timeout(PROBE_TIMEOUT, query_lineage_token(conn)).await,
-            Ok(Ok(()))
-        )
+        // A different probe may retain this lock without being polled. Bound
+        // the entire check so admitted RPCs do not wait forever behind it.
+        runtime::timeout(PROBE_TIMEOUT, async {
+            let _guard = conn.probe_lock.lock().await;
+            if conn.dead.load(Ordering::Acquire) {
+                return false;
+            }
+            if conn.heard_within(LIVENESS_WINDOW) {
+                return true;
+            }
+            query_lineage_token(conn).await.is_ok()
+        })
+        .await
+        .unwrap_or_else(|_| {
+            !conn.dead.load(Ordering::Acquire) && conn.heard_within(LIVENESS_WINDOW)
+        })
     }
 
     /// Tears down `conn` and wakes the reconnect supervisor.
@@ -2289,7 +2347,7 @@ impl NinePClient {
         exact_tag: Option<u16>,
         body: Message,
         op_id_enabled: bool,
-        admission: Option<&AdmissionPermit>,
+        admission_context: Option<(&NinePClient, &AdmissionPermit)>,
         wait_for_reply: impl AsyncFnOnce(&Conn, oneshot::Receiver<Bytes>) -> ClientResult<Bytes>,
     ) -> ClientResult<Message> {
         let permit = conn
@@ -2301,6 +2359,7 @@ impl NinePClient {
             drop(permit);
             return Err(ClientError::Disconnected);
         }
+        let admission = admission_context.map(|(_, admission)| admission);
         let (otx, mut orx) = oneshot::channel();
         let tag = match exact_tag {
             Some(tag) => Self::register_tag(conn, tag, otx, admission.cloned())
@@ -2327,9 +2386,22 @@ impl NinePClient {
             Ok(b) => b,
             Err(e) => return Err(ClientError::Codec(e)),
         };
-        let (frame, mut send) = OutboundFrame::new(bytes, &conn.send_progress);
-        pending.mark_dispatched();
-        permit.send(frame);
+        let mut send = {
+            // Xattr exchanges can wait for writer capacity after admission.
+            // Recheck and enqueue under the same lock as fid retirement.
+            let registry =
+                admission_context.map(|(client, _)| client.stateful_requests.lock().unwrap());
+            if let Some((client, admission)) = admission_context {
+                client.validate_admission_generation(
+                    admission,
+                    registry.as_ref().unwrap().retirement_generation,
+                )?;
+            }
+            let (frame, send) = OutboundFrame::new(bytes, &conn.send_progress);
+            pending.mark_dispatched();
+            permit.send(frame);
+            send
+        };
         let response = match Self::wait_for_send_or_response(&mut send, &mut orx).await {
             Ok(Some(response)) => response,
             Ok(None) => wait_for_reply(conn, orx).await?,
@@ -7195,6 +7267,146 @@ mod session_transition_tests {
             retired_fid_with_unregistered_caller(true, true).await;
         }
 
+        #[tokio::test(start_paused = true)]
+        async fn an_admitted_write_cannot_resume_after_its_fid_is_retired() {
+            retired_fid_with_admitted_caller(false).await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn an_admitted_xattr_read_cannot_resume_after_its_fid_is_retired() {
+            retired_fid_with_admitted_caller(true).await;
+        }
+
+        #[tokio::test]
+        async fn an_xattr_waiting_for_writer_capacity_cannot_dispatch_after_retirement() {
+            let (conn, mut requests) = test_conn_with_receiver();
+            let client = test_client_with_limit(Arc::clone(&conn), 2);
+            client
+                .state
+                .lock()
+                .unwrap()
+                .fids
+                .insert(7, inode_fid(70, 0, 0, None));
+            let writer_capacity = conn.writer_tx.reserve().await.unwrap();
+            let mut attr = Box::pin(client.get_xattr(7, b"user.original"));
+            assert!(futures::poll!(attr.as_mut()).is_pending());
+            assert_eq!(client.request_admission.available_permits(), 1);
+
+            // A fid whose replay failed can be retired on a live replacement
+            // connection, even while an older xattr exchange waits to enqueue.
+            client.stale_fids.insert(7);
+            client.clunk(7).await.unwrap();
+            assert!(!client.state.lock().unwrap().fids.contains_key(&7));
+            drop(writer_capacity);
+            assert!(matches!(
+                futures::poll!(attr.as_mut()),
+                std::task::Poll::Ready(Err(ClientError::Disconnected))
+            ));
+            assert!(
+                requests.try_recv().is_err(),
+                "the retired xattr source reached the transport"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_retained_write_reply_cannot_mark_a_reused_fid_unsynced() {
+            let (client, conn, mut requests) = gone_client(2);
+            client
+                .state
+                .lock()
+                .unwrap()
+                .fids
+                .insert(7, inode_fid(70, 0, 0, None));
+            conn.lineage_token.store(41, Ordering::Relaxed);
+            let mut write = Box::pin(client.write(7, 0, b"old owner"));
+            assert!(futures::poll!(write.as_mut()).is_pending());
+            let sent = recv_op_request(&mut requests, "the original write").await;
+            answer(&conn, &sent);
+            assert!(client.unsynced.get(&7).is_none());
+            conn.connection_lost(&client.reconnect_notify);
+            let clunk_client = Arc::clone(&client);
+            settle(
+                tokio::spawn(async move { clunk_client.clunk(7).await }),
+                "retiring a fid with a retained write reply",
+            )
+            .await
+            .unwrap();
+
+            let (returned, mut returned_requests) = server_returns(&client);
+            let reuse_client = Arc::clone(&client);
+            let reuse = tokio::spawn(async move { reuse_client.rebind(7, 999, 0).await });
+            let sent = recv_op_request(&mut returned_requests, "reusing the retired fid").await;
+            reply(
+                &returned,
+                sent.tag,
+                Message::Rrebind(Rrebind { qid: qid(999) }),
+            );
+            reuse.await.unwrap().unwrap();
+
+            assert!(matches!(write.await, Err(ClientError::Disconnected)));
+            assert!(
+                client.unsynced.get(&7).is_none(),
+                "the new fid owner inherited the retired file's durability obligation"
+            );
+            assert_eq!(client.state.lock().unwrap().fids[&7].inode_id, 999);
+            assert!(returned_requests.try_recv().is_err());
+        }
+
+        async fn retired_fid_with_admitted_caller(xattr: bool) {
+            let (client, conn, _requests) = gone_client(2);
+            client
+                .state
+                .lock()
+                .unwrap()
+                .fids
+                .insert(7, inode_fid(70, 0, 0, None));
+            conn.connection_lost(&client.reconnect_notify);
+            tokio::task::yield_now().await;
+            assert!(!client.live.load(Ordering::Acquire));
+
+            // This caller already owns a permit. Leave it dormant inside the
+            // reconnect wait while another task retires and reuses its fid.
+            let mut earlier = Box::pin(async {
+                if xattr {
+                    client.get_xattr(7, b"user.original").await.map(|_| ())
+                } else {
+                    client.write(7, 0, b"old owner").await.map(|_| ())
+                }
+            });
+            assert!(futures::poll!(earlier.as_mut()).is_pending());
+            assert_eq!(client.request_admission.available_permits(), 1);
+            let clunk_client = Arc::clone(&client);
+            settle(
+                tokio::spawn(async move { clunk_client.clunk(7).await }),
+                "retiring a fid while its admitted caller is dormant",
+            )
+            .await
+            .unwrap();
+            assert!(!client.state.lock().unwrap().fids.contains_key(&7));
+
+            let (returned, mut returned_requests) = server_returns(&client);
+            let reuse_client = Arc::clone(&client);
+            let reuse = tokio::spawn(async move { reuse_client.rebind(7, 999, 0).await });
+            let sent = recv_op_request(&mut returned_requests, "reusing the retired fid").await;
+            reply(
+                &returned,
+                sent.tag,
+                Message::Rrebind(Rrebind { qid: qid(999) }),
+            );
+            reuse.await.unwrap().unwrap();
+
+            assert!(
+                matches!(
+                    futures::poll!(earlier.as_mut()),
+                    std::task::Poll::Ready(Err(ClientError::Disconnected))
+                ),
+                "an admitted operation resumed against its reused fid"
+            );
+            assert!(returned_requests.try_recv().is_err());
+            assert_eq!(client.state.lock().unwrap().fids[&7].inode_id, 999);
+            assert!(!returned.dead.load(Ordering::Acquire));
+        }
+
         async fn retired_fid_with_unregistered_caller(during_outage: bool, write: bool) {
             let (client, conn, mut requests) = gone_client(2);
             client
@@ -7276,6 +7488,43 @@ mod session_transition_tests {
         #[tokio::test(start_paused = true)]
         async fn silent_admission_is_bounded_when_another_probe_is_unpolled() {
             silent_quarantined_admission(true).await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn silent_reply_is_bounded_when_another_probe_is_unpolled() {
+            let (conn, mut requests) =
+                test_conn_with_receiver_at(runtime::Clock::ago(REQUEST_TIMEOUT));
+            let client = test_client_with_limit(Arc::clone(&conn), 2);
+            client.spawn_supervisor();
+            let _probe = conn.probe_lock.lock().await;
+            let request_client = Arc::clone(&client);
+            let request = tokio::spawn(async move { request_client.getattr(7, 0).await });
+            let _sent = recv_op_request(&mut requests, "the admitted request").await;
+            assert_eq!(client.request_admission.available_permits(), 1);
+
+            // No caller is waiting for admission to run its own liveness
+            // check. The admitted RPC must bound probe-lock acquisition too.
+            assert!(matches!(
+                settle(request, "an admitted reply behind an unpolled probe").await,
+                Err(ClientError::Disconnected)
+            ));
+            assert!(conn.dead.load(Ordering::Acquire));
+            assert!(conn.pending.is_empty());
+            assert_eq!(client.request_admission.available_permits(), 2);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn traffic_during_a_probe_lock_wait_keeps_the_connection_alive() {
+            let (conn, _requests) =
+                test_conn_with_receiver_at(runtime::Clock::ago(REQUEST_TIMEOUT));
+            let _owner = conn.probe_lock.lock().await;
+            let probe_conn = Arc::clone(&conn);
+            let probe = tokio::spawn(async move { NinePClient::conn_alive(&probe_conn).await });
+            tokio::task::yield_now().await;
+            tokio::time::advance(PROBE_TIMEOUT / 2).await;
+            conn.mark_alive();
+            assert!(probe.await.unwrap(), "recent peer traffic proves liveness");
+            assert!(!conn.dead.load(Ordering::Acquire));
         }
 
         async fn silent_quarantined_admission(hold_probe: bool) {
