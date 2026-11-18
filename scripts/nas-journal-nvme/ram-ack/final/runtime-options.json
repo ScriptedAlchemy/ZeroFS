@@ -1,0 +1,60 @@
+{
+  "zerofs-ram-ack-nvme-preflight-dzwdfvz5": {
+    "Binds": null,
+    "CapAdd": [
+      "CAP_SYS_ADMIN"
+    ],
+    "CgroupnsMode": "private",
+    "CpusetCpus": "0,1",
+    "Devices": [
+      {
+        "CgroupPermissions": "rwm",
+        "PathInContainer": "/dev/fuse",
+        "PathOnHost": "/dev/fuse"
+      }
+    ],
+    "Memory": 8589934592,
+    "MemorySwap": 8589934592,
+    "NetworkMode": "none",
+    "PortBindings": {},
+    "Privileged": false,
+    "SecurityOpt": [
+      "apparmor=unconfined"
+    ],
+    "Tmpfs": {
+      "/fixture/member-a": "rw,nodev,nosuid,noexec,size=256m",
+      "/fixture/member-b": "rw,nodev,nosuid,noexec,size=256m"
+    },
+    "container_id": "558f4ce533e494e7cc05a497767a907ea485a4d4b91377118c39996d524899f1",
+    "image_id": "sha256:7b6fa31033470c140a6bf54e3993691741502f090abb7b63046523b71a5c1c7b"
+  },
+  "zerofs-ram-ack-nvme-run-dzwdfvz5": {
+    "Binds": null,
+    "CapAdd": [
+      "CAP_SYS_ADMIN"
+    ],
+    "CgroupnsMode": "private",
+    "CpusetCpus": "0,1",
+    "Devices": [
+      {
+        "CgroupPermissions": "rwm",
+        "PathInContainer": "/dev/fuse",
+        "PathOnHost": "/dev/fuse"
+      }
+    ],
+    "Memory": 8589934592,
+    "MemorySwap": 8589934592,
+    "NetworkMode": "none",
+    "PortBindings": {},
+    "Privileged": false,
+    "SecurityOpt": [
+      "apparmor=unconfined"
+    ],
+    "Tmpfs": {
+      "/fixture/member-a": "rw,nodev,nosuid,noexec,size=256m",
+      "/fixture/member-b": "rw,nodev,nosuid,noexec,size=256m"
+    },
+    "container_id": "6969ac8f93a793c14dfdd3525793b6eaf5d70f98114b5dc2d2557cfa395e5be9",
+    "image_id": "sha256:7b6fa31033470c140a6bf54e3993691741502f090abb7b63046523b71a5c1c7b"
+  }
+}

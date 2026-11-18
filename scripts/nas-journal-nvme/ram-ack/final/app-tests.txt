@@ -1,0 +1,10 @@
+test_backing_fd_keeps_inode_when_path_is_replaced (test_target.TargetTest.test_backing_fd_keeps_inode_when_path_is_replaced) ... ok
+test_listener_follows_acl_auth_and_namespace (test_target.TargetTest.test_listener_follows_acl_auth_and_namespace) ... ok
+test_mount_requires_unique_9p_source (test_target.TargetTest.test_mount_requires_unique_9p_source) ... ok
+test_refuses_symlinks_and_insecure_key (test_target.TargetTest.test_refuses_symlinks_and_insecure_key) ... ok
+test_shared_engine_requires_exact_private_attach (test_target.TargetTest.test_shared_engine_requires_exact_private_attach) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.010s
+
+OK
