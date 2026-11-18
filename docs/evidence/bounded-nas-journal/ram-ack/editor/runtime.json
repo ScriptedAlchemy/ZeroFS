@@ -1,0 +1,60 @@
+{
+  "required_bytes_before": 5804916736,
+  "before": {
+    "active": {
+      "write_ack_mode": "materialized"
+    },
+    "desired": {
+      "write_ack_mode": "materialized"
+    },
+    "activation": "restart",
+    "pending_restart": false,
+    "editable": true
+  },
+  "served_sha256": {
+    "index.html": "b1c83773e57ce88890e08c649761fc1633efefebaebe1b0ad2b6994218d0e5cc",
+    "assets/index-HjMRrZuF.js": "37c6193812a875eb268092c429b41c57d53062ad5a4a8537ffd4b954d4d97b51",
+    "assets/storage-ViowJqDO.js": "8f66f9564585a66db2e4eb4c7caf4bc19f0023c41c22f1a735012762a25654be"
+  },
+  "unauthorized_put": 401,
+  "save": {
+    "active": {
+      "write_ack_mode": "materialized"
+    },
+    "desired": {
+      "write_ack_mode": "volatile_memory",
+      "volatile_memory_gb": 0.268435456,
+      "volatile_max_operations": 2048
+    },
+    "activation": "restart",
+    "pending_restart": true,
+    "editable": true
+  },
+  "required_bytes_after": 6341787648,
+  "restart": {
+    "active": {
+      "write_ack_mode": "volatile_memory",
+      "volatile_memory_gb": 0.268435456,
+      "volatile_max_operations": 2048
+    },
+    "desired": {
+      "write_ack_mode": "volatile_memory",
+      "volatile_memory_gb": 0.268435456,
+      "volatile_max_operations": 2048
+    },
+    "activation": "restart",
+    "pending_restart": false,
+    "editable": true
+  },
+  "memory_peak_bytes": 113274880,
+  "memory_events": [
+    "low 0",
+    "high 0",
+    "max 0",
+    "oom 0",
+    "oom_kill 0",
+    "oom_group_kill 0",
+    "sock_throttled 0"
+  ],
+  "memory_swap_peak": 0
+}
