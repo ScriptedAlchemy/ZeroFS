@@ -27,6 +27,7 @@ impl NinePClient {
         let admission = self.acquire_request_admission().await?;
         let conn = loop {
             self.wait_until_live().await?;
+            self.check_admitted_request(&admission)?;
             let conn = self.conn.load_full();
             if !conn.dead.load(Ordering::Acquire) {
                 break conn;
@@ -47,17 +48,19 @@ impl NinePClient {
     // An xattr fid exists only on this connection. A reconnect must abort the
     // whole exchange because staged bytes and the clunk result cannot replay.
     async fn xattr_rpc(attr: &XattrFid<'_>, body: Message) -> ClientResult<Message> {
+        attr.client.check_admitted_request(&attr.admission)?;
         let conn = &attr.conn;
-        match Self::send_raw_at_tag_ctx(
+        let response = Self::send_raw_at_tag_ctx(
             conn,
             None,
             body,
             true,
-            Some(&attr.admission),
+            Some((attr.client, &attr.admission)),
             Self::wait_for_live_reply,
         )
-        .await
-        {
+        .await;
+        attr.client.check_admitted_request(&attr.admission)?;
+        match response {
             Ok(Message::Rlerror(e)) if matches!(e.ecode, P9_ENOTLEADER | P9_ENOTLEADER_CLEAN) => {
                 conn.shutdown();
                 Err(ClientError::Disconnected)
@@ -233,6 +236,11 @@ impl NinePClient {
         attr.settled = matches!(&result, Ok(Message::Rclunk(_)) | Err(ClientError::Errno(_)));
         match result {
             Ok(Message::Rclunk(_)) => {
+                let registry = self.stateful_requests.lock().unwrap();
+                self.validate_admission_generation(
+                    &attr.admission,
+                    registry.retirement_generation,
+                )?;
                 let token = attr.conn.lineage_token.load(Ordering::Relaxed);
                 self.note_unsynced(fid, token);
                 Ok(())
