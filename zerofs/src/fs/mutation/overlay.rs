@@ -20,10 +20,10 @@ use crate::fs::inode::{Inode, InodeId};
 use crate::fs::mutation::config::FilesystemWriteAckMode;
 use crate::fs::mutation::request_cache::{RequestLookup, RetainedRequest};
 use crate::fs::mutation::types::{
-    ConflictKey, ConflictScope, MutationCutoff, MutationError, PrepareWriteMember,
+    ConflictKey, ConflictScope, MutationCutoff, MutationError, PendingAppend, PrepareWriteMember,
     PrepareWriteRequest, PreparedWriteBatch, RequestFingerprint, RequestIdentity, RequestLifetime,
 };
-use crate::fs::ops::write::{apply_prepared_batch, prepare_write};
+use crate::fs::ops::write::{apply_prepared_batch, prepare_write, prepare_write_with_append};
 use crate::fs::types::{AuthContext, FileAttributes};
 use bytes::Bytes;
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -1324,13 +1324,38 @@ impl ZeroFS {
             op_id,
             check_permissions,
         };
-        let batch = match prepare_write(&self.write_prepare_context(), request).await {
-            Ok(batch) => batch,
-            Err(error) => {
-                let _ = guard.abort(PreparationAbort::RequestFailure(error));
-                return Err(error);
-            }
-        };
+        let runtime = Arc::clone(
+            admission
+                .runtime
+                .runtime
+                .as_ref()
+                .expect("live runtime handle"),
+        );
+        // Serialize projection and publication for this one inode. Taking the
+        // hint first makes cancellation or failed publication fall back to the
+        // canonical lock. Other writers and striped batches acquire it normally.
+        let mut append = runtime.append.lock().await;
+        let (batch, writes) =
+            match prepare_write_with_append(&self.write_prepare_context(), request, append.take())
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ = guard.abort(PreparationAbort::RequestFailure(error));
+                    return Err(error);
+                }
+            };
+        let next_append = batch.members.first().and_then(|member| {
+            (member.offset == member.old_size && member.new_size > member.old_size).then(|| {
+                PendingAppend {
+                    inode: member.inode.clone(),
+                    id,
+                    end: member.new_size,
+                    writes,
+                    guards: Arc::downgrade(batch.guards.as_ref().expect("prepared inode lock")),
+                }
+            })
+        });
         let attrs = batch
             .replayed
             .as_ref()
@@ -1359,6 +1384,7 @@ impl ZeroFS {
             })
             .await
             .map_err(overlay_fs_error)?;
+        *append = next_append;
         Ok(WriteAckReceipt { attrs, cutoff })
     }
 

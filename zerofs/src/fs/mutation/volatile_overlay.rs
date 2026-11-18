@@ -316,6 +316,7 @@ impl Drop for RuntimeWorkerCompletion {
 }
 
 pub(crate) struct VolatileWriteRuntime {
+    pub(super) append: tokio::sync::Mutex<Option<super::types::PendingAppend>>,
     state: Mutex<State>,
     changed: Notify,
     /// Completion takes the write side before retiring entries.  A partial
@@ -348,6 +349,7 @@ impl VolatileWriteRuntime {
         let (ingress, mut ingress_rx) = mpsc::unbounded_channel::<AcceptedWrite>();
         let task_shutdown = CancellationToken::new();
         let runtime = Arc::new(Self {
+            append: tokio::sync::Mutex::new(None),
             state: Mutex::new(State {
                 accepting: true,
                 next_sequence: 0,
@@ -436,6 +438,7 @@ impl VolatileWriteRuntime {
         idle_hook: Option<IdleHook>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            append: tokio::sync::Mutex::new(None),
             state: Mutex::new(State {
                 accepting: true,
                 next_sequence: 0,

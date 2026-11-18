@@ -83,35 +83,32 @@ impl MemoryPolicy {
         tiers: StartupMemoryTiers,
         write_ack: crate::fs::mutation::config::FilesystemWriteAckSettings,
     ) -> Result<Self> {
-        let mut policy = match package_policy::exclusion(
-            settings,
-            tiers.clean_cache_bytes,
-            write_ack,
-        ) {
-            Some(reason) if settings.small_nas_journal() => {
-                bail!("small-nas-journal-v1 configuration rejected: {reason}")
-            }
-            Some(reason) => Self::legacy(reason),
-            None if settings.small_nas_journal() => Self {
-                profile: MemoryPolicyProfile::SmallNasJournal,
-                // Charge an extra two full journal budgets for metadata, redb and worker
-                // buffers, in addition to the accepted RAM tier and segment geometry.
-                residency_bytes: package_policy::RESIDENCY_BYTES + GIB,
-                headroom_bytes: package_policy::HEADROOM_BYTES,
-                residency_source: format!(
-                    "baseline plus 1 GiB journal workers/replay allowance; {}",
-                    package_policy::EVIDENCE
-                ),
-                headroom_source: package_policy::EVIDENCE.into(),
-            },
-            None => Self {
-                profile: MemoryPolicyProfile::SmallNasPackage,
-                residency_bytes: package_policy::RESIDENCY_BYTES,
-                headroom_bytes: package_policy::HEADROOM_BYTES,
-                residency_source: package_policy::EVIDENCE.into(),
-                headroom_source: package_policy::EVIDENCE.into(),
-            },
-        };
+        let mut policy =
+            match package_policy::exclusion(settings, tiers.clean_cache_bytes, write_ack) {
+                Some(reason) if settings.small_nas_journal() => {
+                    bail!("small-nas-journal-v1 configuration rejected: {reason}")
+                }
+                Some(reason) => Self::legacy(reason),
+                None if settings.small_nas_journal() => Self {
+                    profile: MemoryPolicyProfile::SmallNasJournal,
+                    // Charge an extra two full journal budgets for metadata, redb and worker
+                    // buffers, in addition to the accepted RAM tier and segment geometry.
+                    residency_bytes: package_policy::RESIDENCY_BYTES + GIB,
+                    headroom_bytes: package_policy::HEADROOM_BYTES,
+                    residency_source: format!(
+                        "baseline plus 1 GiB journal workers/replay allowance; {}",
+                        package_policy::EVIDENCE
+                    ),
+                    headroom_source: package_policy::EVIDENCE.into(),
+                },
+                None => Self {
+                    profile: MemoryPolicyProfile::SmallNasPackage,
+                    residency_bytes: package_policy::RESIDENCY_BYTES,
+                    headroom_bytes: package_policy::HEADROOM_BYTES,
+                    residency_source: package_policy::EVIDENCE.into(),
+                    headroom_source: package_policy::EVIDENCE.into(),
+                },
+            };
         let (residency, headroom) = settings.runtime_memory_reserve_bytes()?;
         for (configured, computed, source, field) in [
             (
