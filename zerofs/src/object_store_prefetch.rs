@@ -15,8 +15,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::ops::Range;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::task::{Context, Poll};
 
 use crate::alloc_rss;
 
@@ -588,7 +590,7 @@ impl ReadLease {
 }
 
 struct PrefetchingMultipartUpload {
-    inner: Box<dyn MultipartUpload>,
+    inner: Arc<tokio::sync::Mutex<Box<dyn MultipartUpload>>>,
     location: Path,
     heads: Cache<Path, Arc<CachedHead>>,
     generations: Cache<Path, CacheGeneration>,
@@ -605,45 +607,84 @@ impl Debug for PrefetchingMultipartUpload {
     }
 }
 
-struct InvalidateOnDrop<'a> {
-    location: &'a Path,
-    heads: &'a Cache<Path, Arc<CachedHead>>,
-    generations: &'a Cache<Path, CacheGeneration>,
+struct InvalidateOnDrop {
+    location: Path,
+    heads: Cache<Path, Arc<CachedHead>>,
+    generations: Cache<Path, CacheGeneration>,
     state: Arc<ObjectState>,
-    access_tracker: &'a Cache<Path, Arc<Mutex<AccessHistory>>>,
+    access_tracker: Cache<Path, Arc<Mutex<AccessHistory>>>,
 }
 
-impl Drop for InvalidateOnDrop<'_> {
+impl Drop for InvalidateOnDrop {
     fn drop(&mut self) {
         let mut revision = self.state.revision.lock().unwrap();
         *revision = uuid::Uuid::new_v4();
-        self.heads.remove(self.location);
-        self.generations.remove(self.location);
-        self.access_tracker.remove(self.location);
+        self.heads.remove(&self.location);
+        self.generations.remove(&self.location);
+        self.access_tracker.remove(&self.location);
+    }
+}
+
+/// Native backends may finish after their caller is cancelled. Keep the
+/// backend future and its final invalidation together until it settles, so a
+/// read during that interval cannot leave the previous bytes cached forever.
+/// A separate caller guard also invalidates immediately on cancellation.
+async fn settle_mutation<T: Send + 'static>(
+    invalidate: impl Send + 'static,
+    operation: impl std::future::Future<Output = object_store::Result<T>> + Send + 'static,
+) -> object_store::Result<T> {
+    tokio::spawn(async move {
+        let _invalidate = invalidate;
+        operation.await
+    })
+    .await
+    .map_err(|source| object_store::Error::Generic {
+        store: "PrefetchingObjectStore",
+        source: Box::new(source),
+    })?
+}
+
+impl PrefetchingMultipartUpload {
+    fn invalidation_guard(&self) -> InvalidateOnDrop {
+        InvalidateOnDrop {
+            location: self.location.clone(),
+            heads: self.heads.clone(),
+            generations: self.generations.clone(),
+            state: ReadLease::acquire(&self.states, &self.generations, &self.location).state,
+            access_tracker: self.access_tracker.clone(),
+        }
     }
 }
 
 #[async_trait]
 impl MultipartUpload for PrefetchingMultipartUpload {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
-        self.inner.put_part(data)
+        match self.inner.try_lock() {
+            // put_part returns an owned future. Release the upload mutex
+            // immediately so parts keep their existing parallelism.
+            Ok(mut inner) => inner.put_part(data),
+            Err(_) => futures::future::ready(Err(object_store::Error::Generic {
+                store: "PrefetchingObjectStore",
+                source: "multipart completion or abort is still settling".into(),
+            }))
+            .boxed(),
+        }
     }
 
     async fn complete(&mut self) -> object_store::Result<PutResult> {
         // Readers can refill the old head while this upload is in progress.
         // Invalidate on every completion outcome, including cancellation.
-        let _invalidate = InvalidateOnDrop {
-            location: &self.location,
-            heads: &self.heads,
-            generations: &self.generations,
-            state: ReadLease::acquire(&self.states, &self.generations, &self.location).state,
-            access_tracker: &self.access_tracker,
-        };
-        self.inner.complete().await
+        let _invalidate = self.invalidation_guard();
+        let settled = self.invalidation_guard();
+        // Transfer ownership before the spawn can yield. Otherwise cancelling
+        // this first poll could let put_part change the upload before the
+        // completion task has been scheduled and acquired its lock.
+        let mut inner = Arc::clone(&self.inner).lock_owned().await;
+        settle_mutation(settled, async move { inner.complete().await }).await
     }
 
     async fn abort(&mut self) -> object_store::Result<()> {
-        self.inner.abort().await
+        self.inner.lock().await.abort().await
     }
 }
 
@@ -832,11 +873,83 @@ struct DeleteStreamCleanup {
     eviction: EvictionCtx,
 }
 
+impl DeleteStreamCleanup {
+    fn invalidate_pending(&self) {
+        let pending: Vec<_> = self.pending.lock().unwrap().keys().cloned().collect();
+        for path in pending {
+            self.eviction.evict_location(&path);
+        }
+    }
+}
+
 impl Drop for DeleteStreamCleanup {
     fn drop(&mut self) {
         let pending = std::mem::take(&mut *self.pending.lock().unwrap());
         for (path, _) in pending {
             self.eviction.evict_location(&path);
+        }
+    }
+}
+
+/// Cancellation stops pulling new input paths, while a detached owner drains
+/// the backend's already-admitted batch and performs its final invalidations.
+/// This preserves backend batching and covers native deletes that finish only
+/// after the consumer drops its result stream.
+type DeleteInput = Arc<Mutex<Option<BoxStream<'static, object_store::Result<Path>>>>>;
+
+struct SettlingDeleteStream {
+    inner: Option<BoxStream<'static, object_store::Result<Path>>>,
+    input: DeleteInput,
+    pending: Arc<Mutex<HashMap<Path, usize>>>,
+    eviction: EvictionCtx,
+    runtime: Option<tokio::runtime::Handle>,
+}
+
+impl futures::Stream for SettlingDeleteStream {
+    type Item = object_store::Result<Path>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.runtime.is_none() {
+            this.runtime = tokio::runtime::Handle::try_current().ok();
+        }
+        let Some(inner) = this.inner.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let result = inner.poll_next_unpin(cx);
+        if matches!(result, Poll::Ready(None)) {
+            // Settle ambiguous error results even if the consumer retains the
+            // exhausted stream, and release its original source promptly.
+            this.inner.take();
+            let input = this.input.lock().unwrap().take();
+            drop(input);
+        }
+        result
+    }
+}
+
+impl Drop for SettlingDeleteStream {
+    fn drop(&mut self) {
+        // Drop the original source immediately. The retained backend sees
+        // EOF on its next input poll and cannot dispatch another path.
+        let input = self.input.lock().unwrap().take();
+        drop(input);
+        let pending: Vec<_> = self.pending.lock().unwrap().keys().cloned().collect();
+        if pending.is_empty() {
+            return;
+        }
+        // An operation may already have applied without an acknowledgement.
+        // Evict now as well as when the retained backend future settles.
+        for path in pending {
+            self.eviction.evict_location(&path);
+        }
+        if let Some(runtime) = self
+            .runtime
+            .take()
+            .or_else(|| tokio::runtime::Handle::try_current().ok())
+            && let Some(mut inner) = self.inner.take()
+        {
+            runtime.spawn(async move { while inner.next().await.is_some() {} });
         }
     }
 }
@@ -1083,13 +1196,13 @@ impl PrefetchingObjectStore {
 
     /// Keep invalidation ownership across an awaited backend mutation. A
     /// cancelled request may have committed remotely before its future drops.
-    fn invalidation_guard<'a>(&'a self, location: &'a Path) -> InvalidateOnDrop<'a> {
+    fn invalidation_guard(&self, location: &Path) -> InvalidateOnDrop {
         InvalidateOnDrop {
-            location,
-            heads: &self.heads,
-            generations: &self.generations,
+            location: location.clone(),
+            heads: self.heads.clone(),
+            generations: self.generations.clone(),
             state: self.read_lease(location).state,
-            access_tracker: &self.access_tracker,
+            access_tracker: self.access_tracker.clone(),
         }
     }
 
@@ -2209,7 +2322,13 @@ impl ObjectStore for PrefetchingObjectStore {
         // parts cache once the upload commits.
         let cached = payload.clone();
         let invalidate = self.invalidation_guard(location);
-        let result = self.inner.put_opts(location, payload, opts).await?;
+        let settled = self.invalidation_guard(location);
+        let inner = Arc::clone(&self.inner);
+        let target = location.clone();
+        let result = settle_mutation(settled, async move {
+            inner.put_opts(&target, payload, opts).await
+        })
+        .await?;
         drop(invalidate);
         self.write_through(location, cached, &result);
         Ok(result)
@@ -2223,7 +2342,7 @@ impl ObjectStore for PrefetchingObjectStore {
         self.invalidate(location);
         let inner = self.inner.put_multipart_opts(location, opts).await?;
         Ok(Box::new(PrefetchingMultipartUpload {
-            inner,
+            inner: Arc::new(tokio::sync::Mutex::new(inner)),
             location: location.clone(),
             heads: self.heads.clone(),
             generations: self.generations.clone(),
@@ -2241,6 +2360,12 @@ impl ObjectStore for PrefetchingObjectStore {
         // observed, and invalidate any unacknowledged paths when the stream
         // is dropped. Count repeated paths rather than losing a later delete.
         let pending = Arc::new(Mutex::new(HashMap::<Path, usize>::new()));
+        let input = Arc::new(Mutex::new(Some(locations)));
+        let source = Arc::clone(&input);
+        let locations = stream::poll_fn(move |cx| match source.lock().unwrap().as_mut() {
+            Some(locations) => locations.poll_next_unpin(cx),
+            None => Poll::Ready(None),
+        });
         let input_pending = Arc::clone(&pending);
         let input_eviction = self.eviction_ctx();
         let tracked = locations.map(move |result| {
@@ -2256,10 +2381,11 @@ impl ObjectStore for PrefetchingObjectStore {
             result
         });
         let cleanup = DeleteStreamCleanup {
-            pending,
+            pending: Arc::clone(&pending),
             eviction: self.eviction_ctx(),
         };
-        self.inner
+        let inner = self
+            .inner
             .delete_stream(tracked.boxed())
             .map(move |result| {
                 if let Ok(path) = &result {
@@ -2271,10 +2397,23 @@ impl ObjectStore for PrefetchingObjectStore {
                             pending.remove(path);
                         }
                     }
+                } else {
+                    // An error does not prove that deletion did not apply.
+                    // Its path may be unavailable, so invalidate every admitted
+                    // target now, even if the caller keeps the stream alive.
+                    cleanup.invalidate_pending();
                 }
                 result
             })
-            .boxed()
+            .boxed();
+        SettlingDeleteStream {
+            inner: Some(inner),
+            input,
+            pending,
+            eviction: self.eviction_ctx(),
+            runtime: tokio::runtime::Handle::try_current().ok(),
+        }
+        .boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
@@ -2300,7 +2439,13 @@ impl ObjectStore for PrefetchingObjectStore {
         options: CopyOptions,
     ) -> object_store::Result<()> {
         let invalidate = self.invalidation_guard(to);
-        let result = self.inner.copy_opts(from, to, options).await;
+        let settled = self.invalidation_guard(to);
+        let inner = Arc::clone(&self.inner);
+        let (from, to) = (from.clone(), to.clone());
+        let result = settle_mutation(settled, async move {
+            inner.copy_opts(&from, &to, options).await
+        })
+        .await;
         drop(invalidate);
         result
     }
@@ -2313,7 +2458,13 @@ impl ObjectStore for PrefetchingObjectStore {
     ) -> object_store::Result<()> {
         let invalidate_from = self.invalidation_guard(from);
         let invalidate_to = self.invalidation_guard(to);
-        let result = self.inner.rename_opts(from, to, options).await;
+        let settled = (self.invalidation_guard(from), self.invalidation_guard(to));
+        let inner = Arc::clone(&self.inner);
+        let (from, to) = (from.clone(), to.clone());
+        let result = settle_mutation(settled, async move {
+            inner.rename_opts(&from, &to, options).await
+        })
+        .await;
         drop(invalidate_to);
         drop(invalidate_from);
         result
@@ -2326,6 +2477,7 @@ mod tests {
     use foyer::{BlockEngineConfig, FsDeviceBuilder, HybridCacheBuilder, PsyncIoEngineConfig};
     use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
+    use std::sync::atomic::Ordering;
     use tempfile::TempDir;
 
     async fn make_store(
@@ -4360,7 +4512,9 @@ mod tests {
         for fail in [false, true] {
             store.head(&path).await.unwrap();
             let mut upload = PrefetchingMultipartUpload {
-                inner: Box::new(UnsuccessfulCompletion { fail }),
+                inner: Arc::new(tokio::sync::Mutex::new(Box::new(UnsuccessfulCompletion {
+                    fail,
+                }))),
                 location: path.clone(),
                 heads: store.heads.clone(),
                 generations: store.generations.clone(),
@@ -4377,6 +4531,40 @@ mod tests {
             assert!(store.read_head(&path).is_none());
             assert!(store.generations.get(&path).is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_multipart_completion_owns_upload_before_its_worker_runs() {
+        let (store, _, _dir) = make_store(DEFAULT_PART_SIZE_BYTES, MEM, DISK).await;
+        let mut upload = PrefetchingMultipartUpload {
+            inner: Arc::new(tokio::sync::Mutex::new(Box::new(UnsuccessfulCompletion {
+                fail: false,
+            }))),
+            location: Path::from("multipart-owned-completion"),
+            heads: store.heads.clone(),
+            generations: store.generations.clone(),
+            states: store.object_states.clone(),
+            access_tracker: store.access_tracker.clone(),
+        };
+        // One unpolled part must not prevent issuing the next parallel part.
+        let first = upload.put_part(Bytes::from_static(b"first").into());
+        let second = upload.put_part(Bytes::from_static(b"second").into());
+        let (first, second) = futures::join!(first, second);
+        first.unwrap();
+        second.unwrap();
+
+        let mut completion = Box::pin(upload.complete());
+        assert!(futures::poll!(&mut completion).is_pending());
+        drop(completion);
+        // No yield: the task has not run on this current-thread runtime.
+        // Completion must already own the upload at its first await boundary.
+        assert!(
+            upload
+                .put_part(Bytes::from_static(b"late").into())
+                .await
+                .is_err(),
+            "a cancelled completion admitted another part before its worker ran"
+        );
     }
 
     #[tokio::test]
@@ -6862,6 +7050,7 @@ mod tests {
         proceed: Arc<tokio::sync::Notify>,
         applied: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
+        fail_ack: bool,
     }
 
     impl Display for DelayedDeleteAckStore {
@@ -6902,6 +7091,7 @@ mod tests {
             let proceed = Arc::clone(&self.proceed);
             let applied = Arc::clone(&self.applied);
             let release = Arc::clone(&self.release);
+            let fail_ack = self.fail_ack;
             locations
                 .then(move |result| {
                     let inner = Arc::clone(&inner);
@@ -6916,7 +7106,14 @@ mod tests {
                         object_store::ObjectStoreExt::delete(inner.as_ref(), &path).await?;
                         applied.notify_one();
                         release.notified().await;
-                        Ok(path)
+                        if fail_ack {
+                            Err(object_store::Error::Generic {
+                                store: "DelayedDeleteAckStore",
+                                source: "deletion applied but acknowledgement failed".into(),
+                            })
+                        } else {
+                            Ok(path)
+                        }
                     }
                 })
                 .boxed()
@@ -6967,6 +7164,7 @@ mod tests {
             proceed: Arc::clone(&proceed),
             applied: Arc::clone(&applied),
             release: Arc::new(tokio::sync::Notify::new()),
+            fail_ack: false,
         });
         let (store, _dir) = store_over(backend, 64 * 1024).await;
         let path = Path::from("delete-cancel-after-apply");
@@ -7000,6 +7198,248 @@ mod tests {
         assert!(store.read_head(&path).is_none());
         assert!(store.cached_part(&path, 0).await.is_none());
         assert!(store.get(&path).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_delete_ack_invalidates_before_the_stream_is_dropped() {
+        let inner = Arc::new(InMemory::new());
+        let path = Path::from("delete-error-after-apply");
+        inner
+            .put(&path, Bytes::from_static(b"old").into())
+            .await
+            .unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let proceed = Arc::new(tokio::sync::Notify::new());
+        let applied = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let backend = Arc::new(DelayedDeleteAckStore {
+            inner: inner.clone(),
+            entered: entered.clone(),
+            proceed: proceed.clone(),
+            applied: applied.clone(),
+            release: release.clone(),
+            fail_ack: true,
+        });
+        let (store, _dir) = store_over(backend, DEFAULT_PART_SIZE_BYTES).await;
+        let mut deleting = store.delete_stream(stream::iter([Ok(path.clone())]).boxed());
+        assert!(futures::poll!(deleting.next()).is_pending());
+        entered.notified().await;
+        store.get(&path).await.unwrap().bytes().await.unwrap();
+        proceed.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let next = deleting.next();
+            tokio::pin!(next);
+            assert!(futures::poll!(&mut next).is_pending());
+            applied.notified().await;
+            release.notify_one();
+            next.await.unwrap()
+        })
+        .await
+        .expect("delete acknowledgement did not settle");
+        assert!(result.is_err());
+        assert!(inner.head(&path).await.is_err());
+        assert!(
+            store.get(&path).await.is_err(),
+            "a failed acknowledgement retained deleted bytes until stream drop"
+        );
+        assert!(deleting.next().await.is_none());
+        assert!(deleting.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_native_mutations_evict_after_backend_settles() {
+        use fs4::fs_std::FileExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let native = Arc::new(crate::local_object_store::LocalConditionalStore::new());
+        let (store, _cache_dir) = store_over(native.clone(), DEFAULT_PART_SIZE_BYTES).await;
+        for operation in [
+            "delete",
+            "delete_off_runtime",
+            "put",
+            "copy",
+            "rename",
+            "multipart",
+        ] {
+            let is_delete = operation.starts_with("delete");
+            let file = root.path().join(format!("target-{operation}"));
+            let target = Path::from_absolute_path(&file).unwrap();
+            let source =
+                Path::from_absolute_path(root.path().join(format!("source-{operation}"))).unwrap();
+            native
+                .put(&target, Bytes::from_static(b"old payload").into())
+                .await
+                .unwrap();
+            native
+                .put(&source, Bytes::from_static(b"replacement").into())
+                .await
+                .unwrap();
+            assert_eq!(
+                store.get(&target).await.unwrap().bytes().await.unwrap(),
+                Bytes::from_static(b"old payload")
+            );
+            store.head(&source).await.unwrap();
+            let mut upload = if operation == "multipart" {
+                let mut upload = store.put_multipart(&target).await.unwrap();
+                upload
+                    .put_part(Bytes::from_static(b"replacement").into())
+                    .await
+                    .unwrap();
+                Some(upload)
+            } else {
+                None
+            };
+
+            // The real native worker retains its parent lock and I/O after
+            // the async receiver disappears. Hold that lock to put caller
+            // cancellation before the actual mutation, not after publication.
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(root.path().join(crate::local_object_store::LOCK_FILE))
+                .unwrap();
+            FileExt::lock_exclusive(&lock).unwrap();
+            let mut pending: Pin<
+                Box<dyn std::future::Future<Output = object_store::Result<()>> + Send>,
+            > = match operation {
+                "delete" | "delete_off_runtime" => Box::pin(store.delete(&target)),
+                "put" => Box::pin(async {
+                    store
+                        .put(&target, Bytes::from_static(b"replacement").into())
+                        .await
+                        .map(|_| ())
+                }),
+                "copy" => Box::pin(store.copy(&source, &target)),
+                "rename" => Box::pin(store.rename(&source, &target)),
+                "multipart" => {
+                    Box::pin(async { upload.as_mut().unwrap().complete().await.map(|_| ()) })
+                }
+                _ => unreachable!(),
+            };
+            assert!(futures::poll!(&mut pending).is_pending());
+            if operation == "delete_off_runtime" {
+                std::thread::scope(|scope| scope.spawn(move || drop(pending)).join().unwrap());
+            } else {
+                drop(pending);
+            }
+
+            // Refill the predecessor after the caller's drop invalidation.
+            assert_eq!(std::fs::read(&file).unwrap(), b"old payload");
+            assert_eq!(
+                store.get(&target).await.unwrap().bytes().await.unwrap(),
+                Bytes::from_static(b"old payload")
+            );
+            if operation == "rename" {
+                store.head(&source).await.unwrap();
+            }
+            drop(lock);
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let visible = match store.get(&target).await {
+                        Ok(result) => Some(result.bytes().await.unwrap()),
+                        Err(object_store::Error::NotFound { .. }) => None,
+                        Err(error) => panic!("unexpected {operation} read failure: {error}"),
+                    };
+                    let settled = if is_delete {
+                        visible.is_none() && !file.exists()
+                    } else {
+                        visible.as_deref() == Some(b"replacement".as_slice())
+                            && std::fs::read(&file).unwrap() == b"replacement"
+                    };
+                    if settled {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("cancelled {operation} left the predecessor cached"));
+            if operation == "rename" {
+                assert!(
+                    store.head(&source).await.is_err(),
+                    "rename source stayed cached"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_delete_stream_settles_only_admitted_paths() {
+        let inner = Arc::new(InMemory::new());
+        let first = Path::from("admitted-delete");
+        let second = Path::from("unpolled-delete");
+        for path in [&first, &second] {
+            inner
+                .put(path, Bytes::from_static(b"payload").into())
+                .await
+                .unwrap();
+        }
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let proceed = Arc::new(tokio::sync::Notify::new());
+        let applied = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let backend = Arc::new(DelayedDeleteAckStore {
+            inner: inner.clone(),
+            entered: entered.clone(),
+            proceed: proceed.clone(),
+            applied: applied.clone(),
+            release: release.clone(),
+            fail_ack: false,
+        });
+        let (store, _dir) = store_over(backend, DEFAULT_PART_SIZE_BYTES).await;
+        let unpolled = store.delete_stream(stream::iter([Ok(second.clone())]).boxed());
+        drop(unpolled);
+        assert!(
+            inner.head(&second).await.is_ok(),
+            "an unpolled stream dispatched a delete"
+        );
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct InputDrop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for InputDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let source_drop = InputDrop(dropped.clone());
+        let pulled = count.clone();
+        let input = stream::iter([Ok(first.clone()), Ok(second.clone())]).inspect(move |_| {
+            let _source = &source_drop;
+            pulled.fetch_add(1, Ordering::SeqCst);
+        });
+        let mut deleting = store.delete_stream(input.boxed());
+        assert!(futures::poll!(deleting.next()).is_pending());
+        entered.notified().await;
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        drop(deleting);
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "cancelled stream retained its input source"
+        );
+        // The first delete is still pending. A refill must be evicted when
+        // its retained owner observes completion, without pulling `second`.
+        store.get(&first).await.unwrap().bytes().await.unwrap();
+        proceed.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), applied.notified())
+            .await
+            .expect("admitted deletion stopped when its caller was cancelled");
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while store.read_head(&first).is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("settled deletion failed to invalidate its refill");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "cancelled stream pulled a new path"
+        );
+        assert!(inner.head(&first).await.is_err());
+        assert!(inner.head(&second).await.is_ok());
+        assert!(store.get(&first).await.is_err());
     }
 
     #[tokio::test]
