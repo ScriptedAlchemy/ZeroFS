@@ -438,7 +438,7 @@ where
             submit_queue_size,
             submit_queue_size_threshold: self.submit_queue_size_threshold,
             sequence,
-            _spawner: runtime,
+            spawner: runtime,
             active: AtomicBool::new(true),
             metrics,
             #[cfg(any(test, feature = "test_utils"))]
@@ -516,7 +516,7 @@ where
 
     sequence: AtomicSequence,
 
-    _spawner: Spawner,
+    spawner: Spawner,
 
     active: AtomicBool,
 
@@ -772,8 +772,9 @@ where
             // Clean blocks.
             try_join_all((0..this.inner.block_manager.blocks() as BlockId).map(|id| {
                 let block = this.inner.block_manager.block(id).clone();
+                let spawner = this.inner.spawner.clone();
                 async move {
-                    let res = BlockCleaner::clean(&block).await;
+                    let res = BlockCleaner::clean(&block, &spawner).await;
                     block.statistics().reset();
                     res
                 }

@@ -171,7 +171,7 @@ where
             });
             indexer.remove_batch(unpicked);
 
-            if let Err(e) = BlockCleaner::clean(&block).await {
+            if let Err(e) = BlockCleaner::clean(&block, &spawner).await {
                 tracing::warn!("reclaimer]: mark block {id} clean error: {e}", id = block.id());
             }
 
@@ -190,12 +190,70 @@ where
 pub struct BlockCleaner;
 
 impl BlockCleaner {
-    pub async fn clean(block: &Block) -> Result<()> {
+    pub(crate) fn is_fs_partition(block: &Block) -> bool {
+        use std::any::Any;
+        use crate::io::device::fs::FsPartition;
+        (block.partition().as_ref() as &dyn Any).is::<FsPartition>()
+    }
+
+    /// Make a block read as zeros before it is written again.
+    ///
+    /// The next writer starts again at offset zero and rarely ends where the
+    /// previous generation did, so everything past its last blob would still
+    /// hold the previous generation's entries, padding and indices. Those
+    /// bytes have no index left to say where their padding is, so no reader
+    /// can check them. Punching the whole block leaves zeros there instead.
+    /// Where the filesystem cannot punch holes, only the first index page is
+    /// zeroed, as upstream does; recovery still stops there, but the bytes
+    /// past it stay as they were.
+    pub async fn clean(block: &Block, spawner: &Spawner) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if Self::is_fs_partition(block) {
+            match Self::punch(block, spawner).await {
+                Ok(()) => return Ok(()),
+                Err(e) => tracing::warn!(
+                    "[reclaimer]: cannot punch block {id}, zeroing its first page only, err: {e}",
+                    id = block.id()
+                ),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = spawner;
         let mut page = IoSliceMut::new(PAGE);
         page.fill(0);
         let (_, res) = block.write(Box::new(page), 0).await;
         res?;
         Ok(())
+    }
+
+    /// Deallocate the block's whole range; the filesystem reads it back as zeros.
+    #[cfg(target_os = "linux")]
+    async fn punch(block: &Block, spawner: &Spawner) -> Result<()> {
+        // The partition owns the file descriptor; keep it alive for the call.
+        let partition = block.partition().clone();
+        let len = block.size();
+        spawner
+            .spawn_blocking(move || {
+                let (raw, offset) = partition.translate(0);
+                // SAFETY: `partition` keeps the descriptor open for this call,
+                // and the range lies inside the partition.
+                let res = unsafe {
+                    libc::fallocate(
+                        raw.0,
+                        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                        offset as libc::off_t,
+                        len as libc::off_t,
+                    )
+                };
+                if res == 0 {
+                    Ok(())
+                } else {
+                    Err(foyer_common::error::Error::io_error(
+                        std::io::Error::last_os_error(),
+                    ))
+                }
+            })
+            .await?
     }
 }
 

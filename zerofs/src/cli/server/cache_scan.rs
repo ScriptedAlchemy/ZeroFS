@@ -5,7 +5,9 @@
 //! count, then one 24-byte record per entry) followed by its entries, each a
 //! 36-byte header, key and value padded up to the next 4 KiB page. The index
 //! tail past the last record and each entry's page padding carry no data, so
-//! with the patched foyer-storage they are zero. This is the only description
+//! with the patched foyer-storage they are zero. foyer rewrites a reused block
+//! from offset zero; the patched foyer-storage first punches the whole block,
+//! so every byte past the last blob is zero too. This is the only description
 //! of that layout in ZeroFS; the library tests and the scan report use it.
 
 use anyhow::{Context, Result};
@@ -52,23 +54,18 @@ pub(crate) fn blobs(block: &[u8]) -> Vec<BlobLayout> {
     inspect_blobs(block).0
 }
 
-/// Also report a recognizable index whose entries cannot be inspected. A
-/// valid prefix of a torn blob chain is not evidence for the whole block.
-fn inspect_blobs(block: &[u8]) -> (Vec<BlobLayout>, bool) {
+/// Also return where the chain of blobs ends. Nothing describes the bytes
+/// from there to the end of the block: a cleaned block holds zeros there,
+/// while a torn blob or bytes of an earlier generation do not.
+fn inspect_blobs(block: &[u8]) -> (Vec<BlobLayout>, usize) {
     let mut found = Vec::new();
     let mut blob = 0;
     while blob + BLOB_INDEX <= block.len() {
         let index = &block[blob..blob + BLOB_INDEX];
         let count = be_u32(index, 8);
         let capacity = (BLOB_INDEX - BLOB_INDEX_HEAD) / BLOB_INDEX_RECORD;
-        if count == 0 {
-            // Fresh or explicitly cleaned blocks end at a zero index page.
-            // Reused/torn bytes that merely decode a zero count do not prove
-            // that everything after the valid prefix was inspected.
-            return (found, index.iter().any(|byte| *byte != 0));
-        }
-        if count > capacity {
-            return (found, true);
+        if count == 0 || count > capacity {
+            return (found, blob);
         }
         let records = BLOB_INDEX_HEAD + count * BLOB_INDEX_RECORD;
         let (index_records, _) = index[BLOB_INDEX_HEAD..records].as_chunks::<BLOB_INDEX_RECORD>();
@@ -76,18 +73,18 @@ fn inspect_blobs(block: &[u8]) -> (Vec<BlobLayout>, bool) {
         let mut next = blob + BLOB_INDEX;
         for record in index_records {
             let Some(start) = blob.checked_add(be_u32(record, 16)) else {
-                return (found, true);
+                return (found, blob);
             };
             let len = be_u32(record, 20);
             // Foyer packs aligned entries consecutively after their index.
             // Refuse overlapping, out-of-order, and out-of-bounds records
             // before using any file-controlled value as a slice boundary.
             if start != next || len < ENTRY_HEADER || len > block.len().saturating_sub(start) {
-                return (found, true);
+                return (found, blob);
             }
             let data_end = start + len;
             let Some(end) = data_end.checked_add(PAGE - 1).map(|end| end / PAGE * PAGE) else {
-                return (found, true);
+                return (found, blob);
             };
             let header = &block[start..start + ENTRY_HEADER];
             let header_len = be_u32(header, 0)
@@ -98,7 +95,7 @@ fn inspect_blobs(block: &[u8]) -> (Vec<BlobLayout>, bool) {
                 || header_len != Some(len)
                 || header[8..24] != record[..16]
             {
-                return (found, true);
+                return (found, blob);
             }
             entries.push(EntryLayout {
                 data: start..data_end,
@@ -112,7 +109,7 @@ fn inspect_blobs(block: &[u8]) -> (Vec<BlobLayout>, bool) {
         });
         blob = next;
     }
-    (found, false)
+    (found, blob)
 }
 
 /// Counts of undefined bytes in one cache directory's partitions.
@@ -122,7 +119,8 @@ pub(crate) struct UndefinedBytes {
     pub(crate) partitions: usize,
     /// Partition files of another size, which were not read as data blocks.
     pub(crate) other_partitions: usize,
-    /// Partitions with invalid geometry or a blob that could not be fully inspected.
+    /// Partitions with invalid geometry, or with a non-zero byte past the
+    /// last blob, where no index says which bytes are data and which padding.
     pub(crate) incomplete_partitions: usize,
     pub(crate) blobs: usize,
     pub(crate) entries: usize,
@@ -130,6 +128,11 @@ pub(crate) struct UndefinedBytes {
     pub(crate) index_tail_nonzero: usize,
     pub(crate) padding_bytes: usize,
     pub(crate) padding_nonzero: usize,
+    /// Bytes from the end of each block's last blob to the end of the block.
+    pub(crate) trailing_bytes: usize,
+    /// Those of them that are not zero: a torn blob, or bytes of an earlier
+    /// generation that foyer did not clean before reusing the block.
+    pub(crate) trailing_nonzero: usize,
 }
 
 impl UndefinedBytes {
@@ -202,8 +205,11 @@ pub(crate) fn scan_partitions(
         file.read_exact(&mut block)
             .with_context(|| format!("reading cache partition {}", path.display()))?;
         counts.partitions += 1;
-        let (found, incomplete) = inspect_blobs(&block);
-        counts.incomplete_partitions += usize::from(incomplete);
+        let (found, chain_end) = inspect_blobs(&block);
+        let trailing_nonzero = count_nonzero(&block[chain_end..]);
+        counts.trailing_bytes += block.len() - chain_end;
+        counts.trailing_nonzero += trailing_nonzero;
+        counts.incomplete_partitions += usize::from(trailing_nonzero > 0);
         for blob in &found {
             counts.blobs += 1;
             let tail = &block[blob.index_tail.clone()];
@@ -281,13 +287,13 @@ pub(crate) struct CacheReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum ScanStatus {
-    /// Every inspected byte is zero, every cache had entries, and no
-    /// recognizable blob index was left incompletely inspected.
+    /// Every index tail, entry padding and byte past each block's last blob
+    /// is zero, and every cache had entries.
     Clean,
     /// Some index tail or padding byte is non-zero.
     UndefinedBytes,
     /// A cache had no entries on disk, was not scanned, or had invalid
-    /// geometry or an incomplete blob that could not be fully inspected.
+    /// geometry or non-zero bytes past a block's last blob.
     NothingScanned,
 }
 
@@ -628,6 +634,11 @@ pub(crate) fn render(report: &ScanReport) -> String {
             "  entry padding: {} bytes scanned, {} non-zero",
             counts.padding_bytes, counts.padding_nonzero
         );
+        let _ = writeln!(
+            out,
+            "  past the last blob: {} bytes scanned, {} non-zero",
+            counts.trailing_bytes, counts.trailing_nonzero
+        );
         if counts.entries == 0 {
             let _ = writeln!(
                 out,
@@ -638,16 +649,16 @@ pub(crate) fn render(report: &ScanReport) -> String {
         if counts.incomplete_partitions > 0 {
             let _ = writeln!(
                 out,
-                "  {} partitions have invalid geometry or an incomplete blob; their remaining \
-                 entries could not be scanned, so this is not evidence that the cache is clean",
+                "  {} partitions have invalid geometry or non-zero bytes past their last blob; \
+                 no index describes those bytes, so this is not evidence that the cache is clean",
                 counts.incomplete_partitions
             );
         }
     }
     let verdict = match report.status {
         ScanStatus::Clean => {
-            "clean: every scanned index-tail and padding byte is zero, and every cache had \
-             entries to scan with no incomplete blobs"
+            "clean: every index-tail, padding and past-the-last-blob byte is zero, and every \
+             cache had entries to scan"
         }
         ScanStatus::UndefinedBytes => {
             "undefined bytes found: some index-tail or padding bytes are not zero"

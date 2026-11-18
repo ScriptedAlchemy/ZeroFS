@@ -246,3 +246,94 @@ fn a_wrong_sized_partition_is_skipped_without_allocating_its_length() {
     );
     drop(root);
 }
+
+/// Write `bytes` as the first partition of the fixture and scan the parts cache.
+fn scan_parts_block(bytes: &[u8]) -> ScanReport {
+    let (root, _, partition) = parts_fixture();
+    let mut file = File::create(partition).unwrap();
+    file.write_all(bytes).unwrap();
+    file.set_len(super::super::PARTS_BLOCK_SIZE as u64).unwrap();
+    drop(file);
+    scan_cache_files(root.path(), ScanOptions::default()).unwrap()
+}
+
+#[test]
+fn zeros_past_the_last_blob_are_scanned_and_clean() {
+    let mut bytes = vec![0; 2 * PAGE];
+    blob(&mut bytes, 0);
+    let report = scan_parts_block(&bytes);
+    assert_eq!(report.status, ScanStatus::Clean, "{report:#?}");
+    let counts = report.caches[0].scanned.as_ref().unwrap();
+    assert_eq!(
+        (counts.trailing_bytes, counts.trailing_nonzero),
+        (super::super::PARTS_BLOCK_SIZE - 2 * PAGE, 0)
+    );
+}
+
+#[test]
+fn an_earlier_generation_past_the_last_blob_is_not_clean() {
+    // A reused block: the new chain is one blob, then the bytes an earlier
+    // generation left. Neither a zero index page nor a mid-entry page that
+    // happens to decode as no blob lets the scan stop before the block's end.
+    for stale_index_page_is_zero in [true, false] {
+        let mut bytes = vec![0; 6 * PAGE];
+        blob(&mut bytes, 0);
+        if !stale_index_page_is_zero {
+            bytes[2 * PAGE + 100] = 0x41;
+        }
+        bytes[5 * PAGE - 1] = 0x41;
+        let report = scan_parts_block(&bytes);
+        assert_eq!(report.status, ScanStatus::NothingScanned, "{report:#?}");
+        let counts = report.caches[0].scanned.as_ref().unwrap();
+        assert_eq!(counts.entries, 1);
+        assert_eq!(counts.incomplete_partitions, 1);
+        assert_eq!(
+            counts.trailing_nonzero,
+            if stale_index_page_is_zero { 1 } else { 2 }
+        );
+        assert_eq!(counts.padding_nonzero + counts.index_tail_nonzero, 0);
+    }
+}
+
+#[test]
+fn nonzero_padding_is_reported_as_undefined_even_beside_a_stale_tail() {
+    let mut bytes = vec![0; 4 * PAGE];
+    blob(&mut bytes, 0);
+    bytes[PAGE + ENTRY_HEADER + 3] = 0x5a;
+    bytes[3 * PAGE] = 0x41;
+    let report = scan_parts_block(&bytes);
+    assert_eq!(report.status, ScanStatus::UndefinedBytes, "{report:#?}");
+    assert_eq!(report.exit_status, 3);
+    let counts = report.caches[0].scanned.as_ref().unwrap();
+    assert_eq!((counts.padding_nonzero, counts.trailing_nonzero), (1, 1));
+}
+
+#[test]
+fn a_blob_cut_off_by_the_end_of_the_block_is_not_clean() {
+    use std::os::unix::fs::FileExt;
+    let block = super::super::PARTS_BLOCK_SIZE;
+    let last = block - PAGE;
+    let (root, _, partition) = parts_fixture();
+    // One entry fills the block up to its last page, so the chain reaches it.
+    let mut head = vec![0; 2 * PAGE];
+    let value = last - PAGE - ENTRY_HEADER;
+    put_u32(&mut head, 8, 1);
+    put_u32(&mut head, BLOB_INDEX_HEAD + 16, BLOB_INDEX);
+    put_u32(&mut head, BLOB_INDEX_HEAD + 20, ENTRY_HEADER + value);
+    put_u32(&mut head, PAGE + 4, value);
+    put_u32(&mut head, PAGE + 32, ENTRY_MAGIC as usize);
+    // The last page is an index whose entry would start at the end of the file.
+    let mut tail = vec![0; 2 * PAGE];
+    blob(&mut tail, 0);
+    let file = File::create(partition).unwrap();
+    file.set_len(block as u64).unwrap();
+    file.write_all_at(&head, 0).unwrap();
+    file.write_all_at(&tail[..PAGE], last as u64).unwrap();
+    drop(file);
+
+    let report = scan_cache_files(root.path(), ScanOptions::default()).unwrap();
+    assert_eq!(report.status, ScanStatus::NothingScanned, "{report:#?}");
+    let counts = report.caches[0].scanned.as_ref().unwrap();
+    assert_eq!((counts.entries, counts.incomplete_partitions), (1, 1));
+    assert_eq!(counts.trailing_bytes, PAGE);
+}

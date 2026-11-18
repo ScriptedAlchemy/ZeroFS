@@ -98,27 +98,38 @@ the scan finishes. Copied caches that have no ownership lock remain readable;
 pass `--live` to explicitly scan them without that exclusion. An offline scan
 refuses a missing ownership lock and never creates one.
 
-For each cache the report gives partitions, blobs, entries, and the index-tail
-and padding bytes scanned and found non-zero. A clean result reads
-`Result: clean: every scanned index-tail and padding byte is zero, and every
-cache had entries to scan with no incomplete blobs (exit status 0).`
+For each cache the report gives partitions, blobs, entries, and the index-tail,
+padding and past-the-last-blob bytes scanned and found non-zero. A clean
+result reads `Result: clean: every index-tail, padding and past-the-last-blob
+byte is zero, and every cache had entries to scan (exit status 0).`
 
 The scan checks that each recognized blob's index and entry headers agree on
 its bounds, lengths and identities. If a recognized index names an incomplete
 or inconsistent entry, the report counts that partition as incomplete and
 does not call a clean prefix proof that the cache is clean. Files of another
-partition size are counted separately without being loaded into memory. An
-all-zero index page marks the end of a blob chain; a nonzero page that cannot
-be parsed makes the result incomplete. This includes stale tails of reused
-blocks whose remaining bytes cannot be identified by the current index. Neither
-current cache layout uses auxiliary tombstone partitions, so a partition of
-another size makes the scan incomplete.
+partition size are counted separately without being loaded into memory.
+
+The blob chain ends at the first page that does not start a valid blob. No
+index describes the bytes from there to the end of the block, so every one of
+them must be zero; a single non-zero byte makes that partition incomplete.
+foyer writes a reused block again from offset zero. Upstream foyer zeroes only
+the block's first page first, so the earlier generation's entries stayed past
+the new chain, with nothing left to say which of their bytes were padding. The
+patched foyer-storage punches the whole block instead, each time it reclaims
+one and, at startup, for every block it will write again: with recovery
+disabled, as for the raw-parts cache, that is every block. A block of the
+decoded-block cache that a build without this change reused and that still
+holds entries keeps its stale tail, and scans incomplete, until foyer reclaims
+it. On a filesystem that cannot punch holes foyer zeroes only the first page,
+as upstream does, and its reused blocks scan incomplete. Neither current cache
+layout uses auxiliary tombstone partitions, so a partition of another size
+makes the scan incomplete.
 
 | Exit status | Meaning |
 |---|---|
 | 0 | Every scanned byte is zero, and every cache had entries to scan. |
 | 3 | Some index-tail or padding bytes are not zero. |
-| 4 | A cache had no entries on disk, was not scanned, or contained an incomplete blob. An incomplete scan is not evidence that the cache is clean. |
+| 4 | A cache had no entries on disk, was not scanned, had a partition of another size, or had a non-zero byte past a block's last blob. An incomplete scan is not evidence that the cache is clean. |
 | 1 | The scan could not run, for example because a server holds the cache. |
 
 A cache written by an earlier build (a `hybrid_cache` directory, or a

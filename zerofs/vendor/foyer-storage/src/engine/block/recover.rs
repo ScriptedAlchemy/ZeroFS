@@ -32,6 +32,7 @@ use crate::engine::{
     block::{
         indexer::HashedEntryAddress,
         manager::{Block, BlockId, BlockManager},
+        reclaimer::BlockCleaner,
         scanner::{BlockScanner, EntryInfo},
         serde::{AtomicSequence, Sequence},
         tombstone::Tombstone,
@@ -141,6 +142,16 @@ impl RecoverRunner {
             t = indices.len(),
             s = latest_sequence,
         );
+
+        // A block without recovered entries is written again from offset zero,
+        // like a reclaimed one, so clean it the same way. With recovery
+        // disabled that is every block, whatever the previous run left in it.
+        for id in &clean_blocks {
+            let block = block_manager.block(*id);
+            if BlockCleaner::is_fs_partition(block) {
+                BlockCleaner::clean(block, &spawner).await?;
+            }
+        }
 
         // Update components.
         indexer.insert_batch(indices);
