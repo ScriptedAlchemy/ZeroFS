@@ -331,7 +331,7 @@ class FileDrainFixture(fixture.Fixture):
             for row in responses:
                 self.event(**row)
             self.event(writeback=drained)
-            self.stop_server()
+            self.cut_after_remote_drain()
             self.receipt["staging_observation"] = watch.finish(
                 before, list(map(generations, paths))
             )
