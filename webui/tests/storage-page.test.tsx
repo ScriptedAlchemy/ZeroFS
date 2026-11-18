@@ -85,6 +85,7 @@ function rowValue(label: string): string {
 }
 
 beforeEach(() => {
+  vi.stubGlobal("fetch", vi.fn().mockImplementation(() => Promise.resolve(new Response(null, { status: 404 }))));
   client.getPoolStatus.mockResolvedValue({ json: pool([member]) });
   client.getPoolAffected.mockReset();
   client.streamStats.mockImplementation(openStream);
@@ -92,6 +93,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
   vi.clearAllMocks();
 });
 

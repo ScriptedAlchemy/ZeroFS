@@ -17,6 +17,7 @@ import {
 } from "../lib/storage-status";
 import type { AffectedStatus, AffectedView, MemberStatus, SegmentFault, Value } from "../lib/storage-status";
 import { Button } from "../components/ui/Button";
+import { WriteAckSettings } from "../components/WriteAckSettings";
 
 const MAX_PATHS_SHOWN = 200;
 // A member can carry thousands of fault records; drawing them all would stall the page.
@@ -529,8 +530,7 @@ export function StoragePage() {
         <div className="min-w-0">
           <h1 className="text-lg font-semibold">Storage</h1>
           <p className="mt-1 text-sm text-muted-foreground" aria-live="polite">
-            {lastSuccess ? `Pool read ${lastSuccess.toLocaleString()}` : "No successful pool response yet"}. Read-only;
-            refreshes on request.
+            {lastSuccess ? `Pool read ${lastSuccess.toLocaleString()}` : "No successful pool response yet"}. Refreshes on request.
           </p>
           {pool && (
             <p className="mt-1 break-all font-mono text-xs text-muted-foreground">
@@ -641,6 +641,8 @@ export function StoragePage() {
           receipts. {statsReceived && `Last sample received ${statsReceived.toLocaleString()}.`}
         </p>
       </div>
+
+      <WriteAckSettings />
 
       <section className="card-surface space-y-4 rounded-lg p-5">
         <h2 className={sectionTitle}>Placement</h2>
