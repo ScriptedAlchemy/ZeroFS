@@ -9,12 +9,13 @@
 //!
 //! [`LocalMetadataStore`] wraps the local metadata store and is the one place
 //! that decides which local errors are transient. An error whose errno is not
-//! transient on a local filesystem (EIO, ENODEV, EROFS, EACCES and the rest)
-//! leaves this store marked with `PermanentError`, so ZeroFS's retry layer
+//! transient on a local filesystem (EIO, ENODEV, EROFS, EACCES and the rest),
+//! or an unexpected end of a local metadata file, leaves this store marked
+//! with `PermanentError`, so ZeroFS's retry layer
 //! returns it at once. SlateDB cannot be told the same thing: it still retries
 //! the error. The wrapper therefore also records the first such failure in
 //! [`MetadataFault`]. Startup returns that failure as its error, and a serving
-//! process exits with it, naming the file and the errno.
+//! process exits with it, naming the file and the I/O failure.
 //!
 //! Errors that end on their own stay retryable: an interrupted or would-block
 //! call, a full disk or quota, and exhausted memory or descriptors. A full
@@ -79,19 +80,45 @@ fn errno_name(errno: i32) -> String {
     name.to_owned()
 }
 
-/// The errno of the first native I/O error in a `Generic` error's chain.
+#[derive(Debug)]
+enum LocalFailure {
+    Errno(i32),
+    UnexpectedEof,
+}
+
+impl LocalFailure {
+    fn transient(&self) -> bool {
+        matches!(self, Self::Errno(errno) if transient_local_errno(*errno))
+    }
+}
+
+impl Display for LocalFailure {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Errno(errno) => f.write_str(&errno_name(*errno)),
+            Self::UnexpectedEof => f.write_str("unexpected end of file"),
+        }
+    }
+}
+
+/// A native I/O failure in a `Generic` error's chain. A short read from a
+/// local metadata file is permanent too: Rust's `read_exact` and the lazy
+/// file-body check report `UnexpectedEof` without an OS errno.
 /// Typed errors (`NotFound`, `AlreadyExists`, `Precondition`) keep their
-/// meaning, and errors without an errno keep today's retry behavior.
-fn native_errno(error: &Error) -> Option<(i32, String)> {
+/// meaning, and other errors without an errno keep today's retry behavior.
+fn local_failure(error: &Error) -> Option<(LocalFailure, String)> {
     if !matches!(error, Error::Generic { .. }) {
         return None;
     }
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(cause) = current {
-        if let Some(io) = cause.downcast_ref::<std::io::Error>()
-            && let Some(errno) = io.raw_os_error()
-        {
-            return Some((errno, io.to_string()));
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            if let Some(errno) = io.raw_os_error() {
+                return Some((LocalFailure::Errno(errno), io.to_string()));
+            }
+            if io.kind() == std::io::ErrorKind::UnexpectedEof {
+                return Some((LocalFailure::UnexpectedEof, io.to_string()));
+            }
         }
         current = cause.source();
     }
@@ -103,7 +130,7 @@ fn native_errno(error: &Error) -> Option<(i32, String)> {
 pub(crate) struct LocalIoError {
     operation: &'static str,
     path: String,
-    errno: i32,
+    failure: LocalFailure,
     message: String,
     source: Error,
 }
@@ -113,10 +140,7 @@ impl Display for LocalIoError {
         write!(
             f,
             "metadata store {} of {} failed with {}: {}",
-            self.operation,
-            self.path,
-            errno_name(self.errno),
-            self.message
+            self.operation, self.path, self.failure, self.message
         )
     }
 }
@@ -199,16 +223,16 @@ impl MetadataFault {
         path: impl FnOnce() -> String,
         error: Error,
     ) -> Error {
-        let Some((errno, message)) = native_errno(&error) else {
+        let Some((failure, message)) = local_failure(&error) else {
             return error;
         };
-        if transient_local_errno(errno) {
+        if failure.transient() {
             return error;
         }
         let failure = LocalIoError {
             operation,
             path: path(),
-            errno,
+            failure,
             message,
             source: error,
         };
@@ -490,9 +514,10 @@ mod tests {
         let file = root.path().join("identity");
         let size = 128 * 1024;
         std::fs::write(&file, vec![0; size]).unwrap();
+        let fault = MetadataFault::default();
         let store = LocalMetadataStore::new(
             Arc::new(object_store::local::LocalFileSystem::new_with_prefix(root.path()).unwrap()),
-            MetadataFault::default(),
+            fault.clone(),
         );
         let result = store.get(&Path::from("identity")).await.unwrap();
         assert_eq!(result.meta.size, size as u64);
@@ -509,7 +534,48 @@ mod tests {
                 .to_string()
                 .contains("ended before the requested range")
         );
+        assert!(
+            has_permanent_source(&error),
+            "a truncated metadata file must not retry forever"
+        );
+        assert_eq!(ServerExit::of(&error), ServerExit::OperatorRequired);
+        assert!(fault.0.tripped.is_cancelled());
+        assert!(
+            fault
+                .0
+                .failure
+                .get()
+                .unwrap()
+                .contains("unexpected end of file")
+        );
         assert!(body.next().await.is_none());
+    }
+
+    #[test]
+    fn a_local_exact_read_with_no_errno_is_still_a_permanent_failure() {
+        let fault = MetadataFault::default();
+        let error = fault.classify(
+            "read",
+            || "/metadata/a.sst".to_owned(),
+            Error::Generic {
+                store: "LocalFileSystem",
+                source: std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                )
+                .into(),
+            },
+        );
+        assert!(has_permanent_source(&error));
+        assert_eq!(ServerExit::of(&error), ServerExit::OperatorRequired);
+        let recorded = fault
+            .0
+            .failure
+            .get()
+            .expect("the truncated file is recorded");
+        assert!(recorded.contains("/metadata/a.sst"));
+        assert!(recorded.contains("unexpected end of file"));
+        assert!(fault.0.tripped.is_cancelled());
     }
 
     #[test]
