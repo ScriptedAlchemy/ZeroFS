@@ -176,6 +176,10 @@ impl NFSAdapter {
 
 #[async_trait]
 impl NFSFileSystem for NFSAdapter {
+    fn case_insensitive(&self) -> bool {
+        self.fs.name_mode() == crate::fs::name_mode::NameMode::Insensitive
+    }
+
     fn root_dir(&self) -> fileid3 {
         0
     }

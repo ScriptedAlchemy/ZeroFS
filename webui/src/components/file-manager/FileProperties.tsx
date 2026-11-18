@@ -69,8 +69,11 @@ export function FileProperties({ path, onClose }: FilePropertiesProps) {
         abort.signal,
       );
       if (!abort.signal.aborted) setDirStats(stats);
-    } catch {
-      if (!abort.signal.aborted) toast.error("Failed to compute folder size");
+    } catch (error) {
+      if (!abort.signal.aborted) {
+        setDirStats(null);
+        toast.error("Failed to compute folder size", { description: formatError(error) });
+      }
     } finally {
       if (!abort.signal.aborted) setComputingSize(false);
     }

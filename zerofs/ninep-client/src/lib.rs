@@ -1839,25 +1839,12 @@ impl NinePClient {
             let frame = if let Some(frame) = early_response {
                 frame
             } else {
-                loop {
-                    match runtime::timeout(REQUEST_TIMEOUT, &mut orx).await {
-                        Ok(Ok(frame)) => break frame,
-                        Ok(Err(_)) => {
-                            // Lost the reply to a drop: wait for reconnect and resend.
-                            runtime::yield_now().await;
-                            continue 'resend;
-                        }
-                        Err(_) => {
-                            // A provably live peer extends the wait instead of
-                            // retiring a healthy connection. See REQUEST_TIMEOUT
-                            // for why this loop has no aggregate ceiling.
-                            if Self::conn_alive(&conn).await {
-                                continue;
-                            }
-                            self.force_reprobe(&conn);
-                            runtime::yield_now().await;
-                            continue 'resend;
-                        }
+                match Self::wait_for_live_reply(&conn, orx).await {
+                    Ok(frame) => frame,
+                    Err(_) => {
+                        self.reconnect_notify.notify_waiters();
+                        runtime::yield_now().await;
+                        continue 'resend;
                     }
                 }
             };
@@ -2130,6 +2117,23 @@ impl NinePClient {
         result
     }
 
+    /// Wait for a reply to a fully sent frame while the same peer is responsive.
+    async fn wait_for_live_reply(
+        conn: &Conn,
+        mut response: oneshot::Receiver<Bytes>,
+    ) -> ClientResult<Bytes> {
+        loop {
+            match runtime::timeout(REQUEST_TIMEOUT, &mut response).await {
+                Ok(frame) => return frame.map_err(|_| ClientError::Disconnected),
+                Err(_) if Self::conn_alive(conn).await => continue,
+                Err(_) => {
+                    conn.shutdown();
+                    return Err(ClientError::Disconnected);
+                }
+            }
+        }
+    }
+
     /// Tests recent traffic, then performs a single-flight lease-gated probe.
     async fn conn_alive(conn: &Conn) -> bool {
         if conn.dead.load(Ordering::Acquire) {
@@ -2204,7 +2208,10 @@ impl NinePClient {
         exact_tag: Option<u16>,
         body: Message,
     ) -> ClientResult<Message> {
-        Self::send_raw_at_tag_ctx(conn, exact_tag, body, false, None).await
+        Self::send_raw_at_tag_ctx(conn, exact_tag, body, false, None, async |_, response| {
+            response.await.map_err(|_| ClientError::Disconnected)
+        })
+        .await
     }
 
     /// `admission` stays with the response slot once the request is registered.
@@ -2214,6 +2221,7 @@ impl NinePClient {
         body: Message,
         op_id_enabled: bool,
         admission: Option<&AdmissionPermit>,
+        wait_for_reply: impl AsyncFnOnce(&Conn, oneshot::Receiver<Bytes>) -> ClientResult<Bytes>,
     ) -> ClientResult<Message> {
         let permit = conn
             .writer_tx
@@ -2255,7 +2263,7 @@ impl NinePClient {
         permit.send(frame);
         let response = match Self::wait_for_send_or_response(&mut send, &mut orx).await {
             Ok(Some(response)) => response,
-            Ok(None) => orx.await.map_err(|_| ClientError::Disconnected)?,
+            Ok(None) => wait_for_reply(conn, orx).await?,
             Err(SendWaitError::Stalled) => {
                 conn.shutdown();
                 return Err(ClientError::Disconnected);
@@ -6752,8 +6760,38 @@ mod session_transition_tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn slow_xattr_clunk_keeps_a_responsive_connection() {
+        let (conn, mut requests) = test_conn_with_receiver_at(runtime::Clock::ago(LIVENESS_WINDOW));
+        let client = test_client(Arc::clone(&conn));
+        let setter = Arc::clone(&client);
+        let set = tokio::spawn(async move { setter.set_xattr(7, b"user.key", b"x", 0).await });
+        for step in ["clone", "create", "write"] {
+            let message = recv_op_request(&mut requests, step).await;
+            answer(&conn, &message);
+        }
+        let clunk = recv_op_request(&mut requests, "clunk").await;
+        assert!(matches!(clunk.body, Message::Tclunk(_)));
+        tokio::task::yield_now().await;
+        conn.last_alive.store(0, Ordering::Relaxed);
+        tokio::time::advance(REQUEST_TIMEOUT + Duration::from_millis(1)).await;
+        let probe = recv_op_request(&mut requests, "liveness probe").await;
+        assert!(matches!(probe.body, Message::Tgetlineage(_)));
+        reply(
+            &conn,
+            probe.tag,
+            Message::Rgetlineage(Rgetlineage {
+                token: 1,
+                writer_epoch: 1,
+            }),
+        );
+        answer(&conn, &clunk);
+        set.await.unwrap().unwrap();
+        assert!(!conn.dead.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn xattr_timeout_returns_the_permit() {
-        let (conn, mut requests) = test_conn_with_receiver();
+        let (conn, mut requests) = test_conn_with_receiver_at(runtime::Clock::ago(LIVENESS_WINDOW));
         let client = test_client_with_limit(Arc::clone(&conn), 1);
 
         let get_client = Arc::clone(&client);

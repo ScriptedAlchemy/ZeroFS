@@ -43,6 +43,9 @@ a no-op. Renaming `x` onto `Y` when `x` and `y` are distinct hardlinks to the sa
 inode leaves both entries unchanged. POSIX requires this successful no-op when
 the two names already refer to the same file.
 
+NFSv3 PATHCONF reports the volume's case-insensitive lookup setting and
+case preservation. NFS LOOKUP uses the volume's lookup rule.
+
 Private 9P clients receive `9P2000.L.Z.CI` for an insensitive export and
 `9P2000.L.Z` for a sensitive export. The userspace client accepts both and
 retains the selected mode for the logical session. It rejects a reconnect

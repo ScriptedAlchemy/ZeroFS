@@ -41,7 +41,8 @@ bounded by the count cap.
 | --- | --- | --- |
 | `user.*` | The caller needs read permission on the inode. | The caller needs write permission on the inode. |
 | `trusted.*` | The caller must have uid 0. | The caller must have uid 0. |
-| `security.*` | Any caller may read or list these attributes. | The caller must have uid 0. |
+| `security.capability` | Reads return `ENODATA` and listings omit the name, including for pre-existing values. | Sets return `EOPNOTSUPP`. The caller must have uid 0 to remove a stored value. |
+| Other `security.*` | Any caller may read or list these attributes. | The caller must have uid 0. |
 | `system.*` | ZeroFS returns `EOPNOTSUPP`. | ZeroFS returns `EOPNOTSUPP`. |
 
 Only regular files and directories may carry `user.*` attributes. Access to that

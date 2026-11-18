@@ -2,13 +2,14 @@ import { Mermaid } from '@/components/Mermaid'
 
 export const metadata = {
   title: 'Web UI',
-  description: 'File manager over 9P WebSocket, stats dashboard over gRPC-web, and a terminal that boots a Linux VM in the browser.',
+  description: 'File manager over 9P WebSocket, filesystem and storage monitoring over gRPC-web, and a terminal that boots a Linux VM in the browser.',
 }
 
 export const sections = [
   { title: 'Configuration', id: 'configuration' },
   { title: 'File Manager', id: 'file-manager' },
   { title: 'Dashboard', id: 'dashboard' },
+  { title: 'Storage', id: 'storage' },
   { title: '9P on the Web', id: '9p-on-the-web' },
   { title: 'The Terminal', id: 'the-terminal' },
   { title: 'Security Considerations', id: 'security-considerations' },
@@ -16,7 +17,7 @@ export const sections = [
 
 # Web UI
 
-ZeroFS includes a web interface compiled into the binary: a file manager, a live dashboard, and a terminal that boots a Linux VM in the browser with the ZeroFS filesystem mounted inside it. {{ className: 'lead' }}
+ZeroFS includes a web interface compiled into the binary: a file manager, a live dashboard, a read-only Storage page, and a terminal that boots a Linux VM in the browser with the ZeroFS filesystem mounted inside it. {{ className: 'lead' }}
 
 ## Configuration {{ id: 'configuration' }}
 
@@ -35,7 +36,7 @@ Open `http://127.0.0.1:8080` after starting ZeroFS. All assets are embedded in t
 
 ![ZeroFS Web UI File Manager](https://raw.githubusercontent.com/Barre/ZeroFS/refs/heads/main/assets/webui/file_manager.png)
 
-The file manager supports multiple tabs, file and directory uploads, previews, and search.
+The file manager supports multiple tabs, file and directory uploads, previews, and search. Directory listings show the original bytes of names outside UTF-8 in hexadecimal. The browser can operate on UTF-8 names. Recursive operations report an incomplete traversal when they encounter a name they cannot address.
 
 ### Previews and Editing
 
@@ -60,6 +61,12 @@ Downloading a folder reads every file into browser memory and zips it client-sid
 Streams live stats over gRPC-web: I/O throughput, IOPS, storage usage, operation counters, GC activity, and a file access tracer showing recent operations.
 
 The tracer keeps the most recent 1000 events. Pausing discards events that arrive while paused rather than buffering them.
+
+## Storage {{ id: 'storage' }}
+
+Open **Storage** to inspect pool capacity, allocation, and member health. Refresh reads the latest pool observation. Select a member’s affected-path scan to see which file paths the server could associate with that member. A partial scan or an unavailable observation is labeled on the page.
+
+Storage and Monitor use the admin connection independently of the file manager’s 9P connection. For journal durability and backlog, use the [Prometheus metrics](/prometheus). For authority and failover, see [high availability](/high-availability). Placement policy changes, whole-file moves, and offline recovery operations have no browser controls.
 
 ## 9P on the Web {{ id: '9p-on-the-web' }}
 
@@ -114,7 +121,7 @@ The guest has no network device; files move in and out only through the mounted 
 The Web UI has no authentication on any route.
 
 - `/ws/9p` hands the connection to the same 9P handler that serves TCP clients. All operations run as the configured `uid`/`gid`, with full read/write access to the filesystem.
-- The gRPC-web endpoint exposes the complete `AdminService`: `CreateCheckpoint`, `ListCheckpoints`, `DeleteCheckpoint`, `GetCheckpointInfo`, `WatchFileAccess`, `WatchObjectAccess`, `Flush`, `StreamStats`, `CreateDirectory`, and `RemoveDirectory`, including methods the UI itself never calls.
+- The gRPC-web endpoint exposes the complete `AdminService`: `GetPoolStatus`, `GetPoolAffected`, `CreateCheckpoint`, `ListCheckpoints`, `DeleteCheckpoint`, `GetCheckpointInfo`, `WatchFileAccess`, `WatchObjectAccess`, `Flush`, `StreamStats`, `CreateDirectory`, and `RemoveDirectory`, including methods the UI itself never calls.
 - CORS on the gRPC-web routes reflects any request Origin and allows all headers, so a web page on any site can issue admin RPCs from a visitor's browser if that browser can reach the port.
 - The `/ws/9p` WebSocket performs no Origin check, and WebSocket connections are not subject to CORS.
 

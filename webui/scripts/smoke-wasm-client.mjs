@@ -43,12 +43,29 @@ await batchedB.writeAt(0n, new TextEncoder().encode("for both files"));
 const operationsBeforeSync = client.trafficStats().operations;
 await client.sync();
 assert.equal(client.trafficStats().operations - operationsBeforeSync, 1n);
+await assert.rejects(
+  client.renameNoReplace("/wasm-smoke/batched-a.txt", "/wasm-smoke/BATCHED-B.TXT"),
+  (error) => error.ecode === 17,
+);
+assert.deepEqual(await batchedB.readAt(0n, 128), new TextEncoder().encode("for both files"));
+const beforeEdit = await client.stat("/wasm-smoke/batched-a.txt");
+await batchedA.writeAt(0n, new TextEncoder().encode("edit"));
+await batchedA.setLen(4n);
+await batchedA.syncAll();
+const afterEdit = await client.stat("/wasm-smoke/batched-a.txt");
+assert.equal(afterEdit.ino, beforeEdit.ino);
+assert.equal(afterEdit.mode, beforeEdit.mode);
+assert.deepEqual(await batchedA.readAt(0n, 128), new TextEncoder().encode("edit"));
 await batchedA.close();
 await batchedB.close();
 await client.removeFile("/wasm-smoke/batched-a.txt");
 await client.removeFile("/wasm-smoke/batched-b.txt");
 
-await client.rename("/wasm-smoke/hello.txt", "/wasm-smoke/renamed.txt");
+await client.renameNoReplace("/wasm-smoke/hello.txt", "/wasm-smoke/Hello.txt");
+const caseRenamed = await client.readDir("/wasm-smoke");
+assert.deepEqual(caseRenamed.map((entry) => entry.name), ["Hello.txt"]);
+assert.equal(caseRenamed[0].ino, entries[0].ino);
+await client.rename("/wasm-smoke/Hello.txt", "/wasm-smoke/renamed.txt");
 await client.removeFile("/wasm-smoke/renamed.txt");
 await client.removeDir("/wasm-smoke");
 await client.close();

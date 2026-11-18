@@ -18,6 +18,7 @@ const member = {
   used_bytes: 3_000_000_000_000,
   reserved_bytes: 1024,
   available_bytes: 14_000_000_000_000,
+  space: { filesystem_total_bytes: 20_000_000_000_000, filesystem_free_bytes: 15_000_000_000_000, declared_exceeds_filesystem: false, full: null },
   objects: 3,
   pending_uploads: 1,
   cleanup_debts: 2,
@@ -32,11 +33,14 @@ const member = {
     warning: null,
     evacuation_error: null,
     kernel_coverage: "current boot kernel ring; unrecognized device/error forms are not attributed",
-    last_sample: { device: "synthetic", failed: false },
+    last_sample: { device: "synthetic", failed: false, reallocated: 0, pending: 0, uncorrectable: 0, crc: 0 },
+    crc_increases: 0,
     since_ms: null,
     observed_ms: null,
   },
-  evacuation_capacity: { sufficient: true, unavailable_members: [] },
+  evacuation_capacity: {
+    required_bytes: 0, reserved_destination_bytes: 0, available_bytes: 14_000_000_000_000, sufficient: true, unavailable_members: [],
+  },
 };
 // The server's clock when it assembled the status, one minute after the observations used below.
 const generatedMs = 1_800_000_060_000;
@@ -101,6 +105,55 @@ describe("Storage page pool section", () => {
     expect(document.body.textContent).not.toMatch(/\d TB\b/);
   });
 
+  it("shows the server's physical capacity and reason for refusing placement", async () => {
+    const since = 1_800_000_000_000;
+    client.getPoolStatus.mockResolvedValue({ json: pool([{
+      ...member, space: {
+        filesystem_total_bytes: 2_048, filesystem_free_bytes: 0, declared_exceeds_filesystem: true,
+        full: { reason: "write_returned_no_space", since_ms: since },
+      },
+      evacuation_capacity: {
+        sufficient: false, unavailable_members: [], required_bytes: 1_024, reserved_destination_bytes: 0, available_bytes: 0,
+      },
+    }]) });
+    render(<StoragePage />);
+    await screen.findByText("hdd-a");
+    expect(rowValue("Backing filesystem size")).toContain("2,048 bytes");
+    expect(rowValue("Backing filesystem free")).toBe("0 bytes");
+    expect(rowValue("Space constraint")).toContain(new Date(since).toLocaleString());
+    expect(screen.getByText(/Configured capacity exceeds/)).toBeTruthy();
+    expect(rowValue("Bytes still to reserve")).toContain("1,024 bytes");
+    expect(rowValue("Reserved at destinations")).toBe("0 bytes");
+    expect(rowValue("Healthy destination space")).toBe("0 bytes");
+  });
+
+  it("distinguishes remote space without a filesystem reading from a missing status field", async () => {
+    client.getPoolStatus.mockResolvedValue({ json: pool([{
+      ...member, space: { filesystem_free_bytes: null, full: { reason: "below_free_space_reserve" } },
+    }]) });
+    render(<StoragePage />);
+    await screen.findByText("hdd-a");
+    expect(rowValue("Backing filesystem free")).toBe("No measurement");
+    expect(rowValue("Backing filesystem size")).toMatch(/^Unavailable/);
+    expect(rowValue("Space constraint")).toBe("Below the free-space reserve");
+  });
+
+  it("shows the recorded SMART counters, including zero and absent readings", async () => {
+    client.getPoolStatus.mockResolvedValue({ json: pool([{
+      ...member, health: { ...member.health, crc_increases: 2, last_sample: {
+        device: "disk-id", failed: false, reallocated: 0, pending: null, crc: 7,
+      } },
+    }]) });
+    render(<StoragePage />);
+    await screen.findByText("hdd-a");
+    expect(rowValue("Device")).toBe("disk-id");
+    expect(rowValue("Reallocated sectors")).toBe("0");
+    expect(rowValue("Pending sectors")).toBe("No reading");
+    expect(rowValue("Uncorrectable sectors")).toMatch(/^Unavailable/);
+    expect(rowValue("UDMA CRC errors")).toBe("7");
+    expect(rowValue("Observed CRC increases")).toBe("2");
+  });
+
   it("renders a missing member counter as unavailable, never as 0", async () => {
     client.getPoolStatus.mockResolvedValue({ json: pool([without(member, "capacity_bytes", "used_bytes")]) });
     render(<StoragePage />);
@@ -116,6 +169,7 @@ describe("Storage page pool section", () => {
     render(<StoragePage />);
     expect(await screen.findByText(/No permanent pool configured/)).toBeTruthy();
     expect(screen.queryByText("Members")).toBeNull();
+    expect(document.body.textContent).not.toMatch(/Strict placement is disabled|NVMe journal|HDD payload/);
   });
 
   it("renders a pool RPC failure as unavailable, not as an empty or destroyed pool", async () => {
@@ -123,6 +177,7 @@ describe("Storage page pool section", () => {
     render(<StoragePage />);
     expect(await screen.findByText(/connection refused/)).toBeTruthy();
     expect(screen.queryByText("Members")).toBeNull();
+    expect(document.body.textContent).not.toMatch(/Strict placement is disabled|NVMe journal|HDD payload/);
     expect(screen.queryByText(/No permanent pool configured/)).toBeNull();
     expect(screen.queryByText(/reported no pool members/)).toBeNull();
   });
@@ -138,7 +193,7 @@ describe("Storage page controls", () => {
       expect(button.getAttribute("aria-describedby")).toBe("storage-edit-reason");
       fireEvent.click(button);
     }
-    expect(screen.getByText(/^Disabled: validated policy edits/)).toBeTruthy();
+    expect(screen.getByText(/^Placement controls are read-only here/)).toBeTruthy();
     expect(client.getPoolAffected).not.toHaveBeenCalled();
   });
 

@@ -8,6 +8,7 @@
     "build": "tsc -b && vite build",
     "generate": "buf generate",
     "lint": "eslint .",
+    "pretest": "npm run generate",
     "test": "node --experimental-strip-types --test tests/*.test.ts && vitest run",
     "preview": "vite preview"
   },

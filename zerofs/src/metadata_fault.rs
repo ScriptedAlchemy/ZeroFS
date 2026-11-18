@@ -260,6 +260,34 @@ fn classified_stream<T: Send + 'static>(
         .boxed()
 }
 
+fn metadata_body(result: GetResult) -> BoxStream<'static, Result<bytes::Bytes>> {
+    if let GetResultPayload::Stream(body) = result.payload {
+        return body;
+    }
+
+    // object_store's File stream yields empty chunks indefinitely if the file
+    // shrinks before the requested range is read.
+    let path = result.meta.location.clone();
+    stream::try_unfold(
+        (result.into_stream(), path),
+        |(mut body, path)| async move {
+            let chunk = body.try_next().await?;
+            if chunk.as_ref().is_some_and(|bytes| bytes.is_empty()) {
+                return Err(Error::Generic {
+                    store: STORE,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!("metadata file /{path} ended before the requested range"),
+                    )
+                    .into(),
+                });
+            }
+            Ok(chunk.map(|bytes| (bytes, (body, path))))
+        },
+    )
+    .boxed()
+}
+
 #[async_trait]
 impl ObjectStore for LocalMetadataStore {
     async fn put_opts(
@@ -301,43 +329,17 @@ impl ObjectStore for LocalMetadataStore {
         if head {
             return Ok(result);
         }
-        let GetResult {
-            payload,
-            meta,
-            range,
-            attributes,
-            extensions,
-        } = result;
-        let payload = match payload {
-            // The local backend reads a file body after `get_opts` returns.
-            // Read it here, with the same single read every caller already
-            // makes through `GetResult::bytes`, so its error is classified.
-            file @ GetResultPayload::File(..) => {
-                let bytes = GetResult {
-                    payload: file,
-                    meta: meta.clone(),
-                    range: range.clone(),
-                    attributes: attributes.clone(),
-                    extensions: extensions.clone(),
-                }
-                .bytes()
-                .await
-                .map_err(|error| self.fail("read", location, error))?;
-                GetResultPayload::Stream(stream::once(async move { Ok(bytes) }).boxed())
-            }
-            GetResultPayload::Stream(body) => GetResultPayload::Stream(classified_stream(
+        Ok(GetResult {
+            meta: result.meta.clone(),
+            range: result.range.clone(),
+            attributes: result.attributes.clone(),
+            extensions: result.extensions.clone(),
+            payload: GetResultPayload::Stream(classified_stream(
                 self.fault.clone(),
                 "read",
                 filesystem_path(location),
-                body,
+                metadata_body(result),
             )),
-        };
-        Ok(GetResult {
-            payload,
-            meta,
-            range,
-            attributes,
-            extensions,
         })
     }
 
@@ -480,6 +482,34 @@ mod tests {
             store: "LocalFileSystem",
             source: Box::new(std::io::Error::from_raw_os_error(errno)),
         }
+    }
+
+    #[tokio::test]
+    async fn local_file_get_keeps_the_body_lazy_and_chunked() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("identity");
+        let size = 128 * 1024;
+        std::fs::write(&file, vec![0; size]).unwrap();
+        let store = LocalMetadataStore::new(
+            Arc::new(object_store::local::LocalFileSystem::new_with_prefix(root.path()).unwrap()),
+            MetadataFault::default(),
+        );
+        let result = store.get(&Path::from("identity")).await.unwrap();
+        assert_eq!(result.meta.size, size as u64);
+        std::fs::write(&file, vec![1; size]).unwrap();
+        let mut body = result.into_stream();
+        let first = body.try_next().await.unwrap().unwrap();
+        assert!(first.len() < size && !first.is_empty());
+        assert!(first.iter().all(|&byte| byte == 1));
+
+        std::fs::File::create(file).unwrap();
+        let error = body.try_next().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ended before the requested range")
+        );
+        assert!(body.next().await.is_none());
     }
 
     #[test]

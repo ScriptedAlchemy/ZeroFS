@@ -127,6 +127,63 @@ async fn two_mib_roundtrip_and_ctime_changes() {
 }
 
 #[tokio::test]
+async fn file_capabilities_are_hidden_and_only_removable() {
+    let fs = ZeroFS::new_in_memory().await.unwrap();
+    let id = file(&fs, b"legacy").await;
+    let owner = Credentials {
+        uid: 1000,
+        ..test_creds()
+    };
+    let root = Credentials {
+        uid: 0,
+        ..test_creds()
+    };
+    let cap = name(b"security.capability");
+    let mut txn = fs.db.new_transaction().unwrap();
+    fs.xattr_store
+        .put(&mut txn, id, cap.as_bytes(), Bytes::from_static(b"legacy"));
+    fs.write_coordinator.commit(txn).await.unwrap();
+
+    for creds in [&root, &owner] {
+        assert_eq!(fs.get_xattr(creds, id, &cap).await, Err(FsError::NoData));
+        assert!(fs.list_xattrs(creds, id).await.unwrap().is_empty());
+    }
+    for mode in [
+        XattrSetMode::Either,
+        XattrSetMode::Create,
+        XattrSetMode::Replace,
+    ] {
+        assert_eq!(
+            fs.set_xattr(&root, id, &cap, value(b"replacement"), mode)
+                .await,
+            Err(FsError::NotSupported)
+        );
+    }
+    assert_eq!(
+        fs.remove_xattr(&owner, id, &cap).await,
+        Err(FsError::OperationNotPermitted)
+    );
+    assert_eq!(
+        fs.xattr_store
+            .get(id, cap.as_bytes())
+            .await
+            .unwrap()
+            .as_ref(),
+        b"legacy"
+    );
+    fs.remove_xattr(&root, id, &cap).await.unwrap();
+    assert_eq!(
+        fs.xattr_store.get(id, cap.as_bytes()).await,
+        Err(FsError::NoData)
+    );
+    assert_eq!(
+        fs.set_xattr(&root, id, &cap, value(b"new"), XattrSetMode::Create)
+            .await,
+        Err(FsError::NotSupported)
+    );
+}
+
+#[tokio::test]
 async fn namespace_permissions_and_list_visibility() {
     let fs = ZeroFS::new_in_memory().await.unwrap();
     let owner = Credentials {

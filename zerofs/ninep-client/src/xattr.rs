@@ -48,24 +48,22 @@ impl NinePClient {
     // whole exchange because staged bytes and the clunk result cannot replay.
     async fn xattr_rpc(attr: &XattrFid<'_>, body: Message) -> ClientResult<Message> {
         let conn = &attr.conn;
-        match runtime::timeout(
-            REQUEST_TIMEOUT,
-            Self::send_raw_at_tag_ctx(conn, None, body, true, Some(&attr.admission)),
+        match Self::send_raw_at_tag_ctx(
+            conn,
+            None,
+            body,
+            true,
+            Some(&attr.admission),
+            Self::wait_for_live_reply,
         )
         .await
         {
-            Ok(Ok(Message::Rlerror(e)))
-                if matches!(e.ecode, P9_ENOTLEADER | P9_ENOTLEADER_CLEAN) =>
-            {
+            Ok(Message::Rlerror(e)) if matches!(e.ecode, P9_ENOTLEADER | P9_ENOTLEADER_CLEAN) => {
                 conn.shutdown();
                 Err(ClientError::Disconnected)
             }
-            Ok(Ok(Message::Rlerror(e))) => Err(ClientError::Errno(e.ecode)),
-            Ok(result) => result,
-            Err(_) => {
-                conn.shutdown();
-                Err(ClientError::Disconnected)
-            }
+            Ok(Message::Rlerror(e)) => Err(ClientError::Errno(e.ecode)),
+            result => result,
         }
     }
 
@@ -124,6 +122,9 @@ impl NinePClient {
             Ok(value.freeze())
         }
         .await;
+        if matches!(result, Err(ClientError::Disconnected)) {
+            return result;
+        }
         let clunk = Self::xattr_rpc(&attr, Message::Tclunk(Tclunk { fid: attr.fid })).await;
         attr.settled = matches!(&clunk, Ok(Message::Rclunk(_)) | Err(ClientError::Errno(_)));
         match result {

@@ -2466,6 +2466,32 @@ mod tests {
             .unwrap();
         }
 
+        async fn dispatch_pending(&self, tag: u16, body: Message) {
+            let shutdown = CancellationToken::new();
+            let pending = P9PendingFrames::new(
+                self.admission
+                    .global
+                    .admit_receive(&shutdown)
+                    .await
+                    .unwrap(),
+            );
+            pending
+                .dispatch(
+                    frame(tag, body),
+                    &ConnectionContext {
+                        handler: &self.handler,
+                        tx: &self.tx,
+                        inflight: &self.inflight,
+                        admission: &self.admission,
+                        requests: &self.requests,
+                        connection_shutdown: &shutdown,
+                        process_shutdown: &shutdown,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
         async fn recv(&mut self, context: &str) -> (u16, P9Message) {
             let response = tokio::time::timeout(TEST_TIMEOUT, self.rx.recv())
                 .await
@@ -2571,7 +2597,7 @@ mod tests {
             }),
         )
         .await;
-        io.dispatch(followup_tag, followup).await;
+        io.dispatch_pending(followup_tag, followup).await;
         io.expect_quiet(quiet_message).await;
         drop(inode_lock);
 
@@ -3083,7 +3109,10 @@ mod tests {
         );
     }
 
-    async fn blocked_first_reserves_replay_before_admission(cancel_process: bool) {
+    async fn blocked_first_reserves_replay_before_admission(
+        cancel_process: bool,
+        full_websocket: bool,
+    ) {
         let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
         let old = Arc::new(NinePHandler::new(
             Arc::clone(&filesystem),
@@ -3114,16 +3143,44 @@ mod tests {
         let requests = TaskTracker::new();
         let connection_shutdown = CancellationToken::new();
         let process_shutdown = CancellationToken::new();
-        let dispatch = dispatch_9p_frame(
-            Bytes::from(first),
-            &old,
-            &tx,
-            &inflight,
-            &admission,
-            &requests,
-            &connection_shutdown,
-            &process_shutdown,
+        let context = ConnectionContext {
+            handler: &old,
+            tx: &tx,
+            inflight: &inflight,
+            admission: &admission,
+            requests: &requests,
+            connection_shutdown: &connection_shutdown,
+            process_shutdown: &process_shutdown,
+        };
+        let pending = P9PendingFrames::new(
+            global
+                .admit_websocket_receive(&process_shutdown)
+                .await
+                .unwrap(),
         );
+        if full_websocket {
+            pending
+                .dispatch(maximum_write(9, true), &context)
+                .await
+                .unwrap();
+        }
+        let dispatch = async {
+            if full_websocket {
+                pending.dispatch(Bytes::from(first), &context).await
+            } else {
+                dispatch_9p_frame(
+                    Bytes::from(first),
+                    &old,
+                    &tx,
+                    &inflight,
+                    &admission,
+                    &requests,
+                    &connection_shutdown,
+                    &process_shutdown,
+                )
+                .await
+            }
+        };
         tokio::pin!(dispatch);
         assert!(futures::poll!(&mut dispatch).is_pending());
         assert_eq!(
@@ -3131,7 +3188,10 @@ mod tests {
             1,
             "a fully received FIRST must reserve its identity before waiting for capacity"
         );
-        assert_eq!(admission.accepted_work.len(), 1);
+        assert_eq!(
+            admission.accepted_work.len(),
+            if full_websocket { 2 } else { 1 }
+        );
         assert_eq!(global.snapshot().active_requests, 1);
 
         if cancel_process {
@@ -3175,12 +3235,17 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn received_first_survives_disconnect_while_waiting_for_admission() {
-        blocked_first_reserves_replay_before_admission(false).await;
+        blocked_first_reserves_replay_before_admission(false, false).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn process_shutdown_releases_received_first_waiting_for_admission() {
-        blocked_first_reserves_replay_before_admission(true).await;
+        blocked_first_reserves_replay_before_admission(true, false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn websocket_first_survives_disconnect_with_a_full_pending_envelope() {
+        blocked_first_reserves_replay_before_admission(false, true).await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -3692,6 +3757,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn barriers_leave_admission_available_to_their_predecessors() {
+        for barrier in [
+            Message::Tclunk(Tclunk { fid: 1 }),
+            Message::Tversion(Tversion {
+                msize: P9_MAX_MSIZE,
+                version: P9String::new(VERSION_9P2000L.to_vec()),
+            }),
+        ] {
+            let mut io = DispatchFixture::in_memory(1).await;
+            let bytes = 64 * 1024 * 1024;
+            let global = P9GlobalAdmission::for_test(bytes, 1);
+            io.admission = global.connection_for_test(bytes, 1);
+            let earlier = io.inflight.register(7, FidFootprint::One(1)).unwrap();
+            io.dispatch_pending(8, barrier).await;
+            io.expect_quiet("the barrier must wait for its predecessor")
+                .await;
+            let predecessor_slot =
+                tokio::time::timeout(TEST_TIMEOUT, io.admission.admit_request(1, 0))
+                    .await
+                    .expect("the waiting barrier must leave the only slot for its predecessor")
+                    .unwrap();
+            drop(predecessor_slot);
+            drop(earlier);
+            assert_eq!(
+                io.recv("barrier response after predecessor completes")
+                    .await
+                    .0,
+                8
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn tclunk_does_not_wait_for_an_unrelated_fid() {
         let (filesystem, handler) = in_memory_handler().await;
         establish_session(&handler, 0, b"test", 1000, Some([0; 16])).await;
@@ -3774,7 +3872,7 @@ mod tests {
                 }),
             )
             .await;
-            io.dispatch(11, Message::Tclunk(Tclunk { fid: clunk_fid }))
+            io.dispatch_pending(11, Message::Tclunk(Tclunk { fid: clunk_fid }))
                 .await;
             io.expect_quiet("clunk must wait for the exact walk's fid installation")
                 .await;
@@ -4389,6 +4487,226 @@ mod tests {
             fid: 1,
             request_mask: GETATTR_ALL,
         })
+    }
+
+    fn maximum_write(tag: u16, private: bool) -> Bytes {
+        let header =
+            ninep_proto::P9_TWRITE_HDR as usize + if private { P9_OP_ENVELOPE_LEN } else { 0 };
+        let size = P9_MAX_MSIZE as usize - header;
+        let packet = P9Message::new(
+            tag,
+            Message::Twrite(Twrite {
+                fid: 1,
+                offset: 0,
+                count: size as u32,
+                data: DekuBytes::from(vec![0; size]),
+            }),
+        )
+        .to_bytes_ctx(private)
+        .unwrap();
+        assert_eq!(packet.len(), P9_MAX_MSIZE as usize);
+        Bytes::from(packet)
+    }
+
+    #[tokio::test]
+    async fn serial_stream_reaches_flush_behind_a_full_pending_envelope() {
+        for private in [false, true] {
+            let (fs, handler) = in_memory_handler().await;
+            if private {
+                establish_session(&handler, 1, b"root", 0, None).await;
+            } else {
+                plain_root_session(&handler).await;
+            }
+            let prior_id = [0x92; 16];
+            let applied = if private {
+                let Message::Rmkdir(response) = handler
+                    .handle_message_with_op_id(7, prior_id, plain_mkdir(b"already-applied"))
+                    .await
+                    .body
+                else {
+                    panic!("initial mkdir must succeed");
+                };
+                Some(response.qid)
+            } else {
+                None
+            };
+            let mut connection = SaturatedConnection::start(Arc::clone(&handler));
+            let held = connection.admission.admit_request(1, 0).await.unwrap();
+            connection
+                .client
+                .write_all(&maximum_write(10, private))
+                .await
+                .unwrap();
+            let stall = if private {
+                // A ledger-only result needs no local SlateDB write. Hold a
+                // preceding nonempty commit at its write permit to stall the
+                // same worker that will replicate and publish the refusal.
+                let barrier = fs.db.flush_barrier().write_owned().await;
+                let reached = fs.write_coordinator.probe_next_apply();
+                let marker_handler = Arc::clone(&handler);
+                let commit = tokio::spawn(async move {
+                    marker_handler
+                        .handle_message_with_op_id(8, [0x94; 16], plain_mkdir(b"queued-marker"))
+                        .await
+                });
+                tokio::time::timeout(TEST_TIMEOUT, reached)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                Some((barrier, commit))
+            } else {
+                None
+            };
+            let id = [0x91; 16];
+            let skipped = if private {
+                mkdir_frame(11, id, 0, b"retried-after-refusal")
+            } else {
+                frame(11, root_getattr())
+            };
+            connection.client.write_all(&skipped).await.unwrap();
+            if private {
+                connection
+                    .client
+                    .write_all(&mkdir_frame(
+                        13,
+                        prior_id,
+                        P9_OP_FLAG_RETRY,
+                        b"already-applied",
+                    ))
+                    .await
+                    .unwrap();
+            }
+            connection
+                .send(12, Message::Tflush(Tflush { oldtag: 10 }))
+                .await;
+            let bound = Duration::from_secs(3);
+            let mut replies = vec![
+                connection
+                    .recv_within(bound, "flush or overload refusal")
+                    .await,
+            ];
+            if let Some((barrier, commit)) = stall {
+                assert_eq!(
+                    replies[0].0, 12,
+                    "Tflush must pass the stalled refusal commit"
+                );
+                assert!(
+                    fs.dedup.get(&id).is_none(),
+                    "a refusal must not be visible before commit"
+                );
+                drop(barrier);
+                assert!(matches!(commit.await.unwrap().body, Message::Rmkdir(_)));
+            }
+            replies.push(
+                connection
+                    .recv_within(TEST_TIMEOUT, "remaining reply")
+                    .await,
+            );
+            replies.sort_by_key(|(tag, _)| *tag);
+            assert_eq!(replies[0].0, 11);
+            assert!(matches!(
+                replies[0].1.body,
+                Message::Rlerror(Rlerror {
+                    ecode: crate::linux_errno::EAGAIN
+                })
+            ));
+            assert_eq!(replies[1].0, 12);
+            assert!(matches!(replies[1].1.body, Message::Rflush(_)));
+            drop(held);
+            if let Some(first_qid) = applied {
+                let (tag, replay) = connection
+                    .recv_within(TEST_TIMEOUT, "prior success on the same connection")
+                    .await;
+                assert_eq!(tag, 13);
+                assert!(matches!(replay.body, Message::Rmkdir(ref r) if r.qid == first_qid));
+                // A caller that lost the refusal must be able to replay it
+                // on a replacement connection as well.
+                let replacement =
+                    NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+                establish_session(&replacement, 1, b"root", 0, None).await;
+                let refused = replacement
+                    .handle_message_with_op_envelope_origin(
+                        14,
+                        id,
+                        P9_OP_FLAG_RETRY,
+                        0,
+                        plain_mkdir(b"retried-after-refusal"),
+                    )
+                    .await;
+                assert!(matches!(
+                    refused.body,
+                    Message::Rlerror(Rlerror {
+                        ecode: crate::linux_errno::EAGAIN
+                    })
+                ));
+                connection
+                    .client
+                    .write_all(&mkdir_frame(15, [0x93; 16], 0, b"retried-after-refusal"))
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    connection
+                        .recv_within(TEST_TIMEOUT, "unrelated FIRST stays on the live connection")
+                        .await
+                        .1
+                        .body,
+                    Message::Rmkdir(_)
+                ));
+            }
+            drop(connection.client);
+            connection.reader.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_reaches_flush_behind_a_full_pending_envelope() {
+        let (_, handler) = in_memory_handler().await;
+        plain_root_session(&handler).await;
+        let mut io = DispatchFixture::new(handler, 8);
+        let global = P9GlobalAdmission::for_test(64 * 1024 * 1024, 1);
+        io.admission = global.connection_for_test(64 * 1024 * 1024, 1);
+        let held = io.admission.admit_request(1, 0).await.unwrap();
+        let shutdown = CancellationToken::new();
+        let pending =
+            P9PendingFrames::new(global.admit_websocket_receive(&shutdown).await.unwrap());
+        let context = ConnectionContext {
+            handler: &io.handler,
+            tx: &io.tx,
+            inflight: &io.inflight,
+            admission: &io.admission,
+            requests: &io.requests,
+            connection_shutdown: &shutdown,
+            process_shutdown: &shutdown,
+        };
+        pending
+            .dispatch(maximum_write(10, false), &context)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            pending
+                .dispatch(frame(11, root_getattr()), &context)
+                .await
+                .unwrap();
+            pending
+                .dispatch(frame(12, Message::Tflush(Tflush { oldtag: 10 })), &context)
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("the serial WebSocket must reach Tflush");
+        let (tag, reply) = io.recv("ordinary frame refused").await;
+        assert_eq!(tag, 11);
+        assert!(matches!(
+            reply.body,
+            Message::Rlerror(Rlerror {
+                ecode: crate::linux_errno::EAGAIN
+            })
+        ));
+        assert_eq!(
+            io.recv_flush("flush behind refused ordinary frame").await,
+            12
+        );
+        drop(held);
     }
 
     #[tokio::test]

@@ -236,13 +236,18 @@ impl RedbHeader {
         })
     }
 
-    fn read(file: &File) -> Result<Option<Self>> {
-        if file.metadata()?.len() < Self::LEN as u64 {
-            return Ok(None);
-        }
+    fn read_existing(file: &File, len: u64, path: &Path) -> Result<Self> {
         let mut bytes = [0; Self::LEN];
-        std::os::unix::fs::FileExt::read_exact_at(file, &mut bytes, 0)?;
-        Ok(Self::parse(&bytes))
+        let header_len = len.min(Self::LEN as u64) as usize;
+        std::os::unix::fs::FileExt::read_exact_at(file, &mut bytes[..header_len], 0)?;
+        let header = Self::parse(&bytes[..header_len]).ok_or_else(|| {
+            operator_required(anyhow!(
+                "writeback journal database {} is damaged: invalid or incomplete redb header",
+                path.display()
+            ))
+        })?;
+        header.ensure_openable(len, path)?;
+        Ok(header)
     }
 
     /// Refuse the two header states redb 4.1 asserts on before it reads
@@ -814,15 +819,13 @@ impl Journal {
         // open may recover an unclean database, never this identity read.
         let path = root_dir.display().join("journal.redb");
         let len = database_file.metadata()?.len();
-        if let Some(header) = RedbHeader::read(&database_file)? {
-            header.ensure_openable(len, &path)?;
-            if header.recovery_required || header.layout_len != len {
-                bail!(
-                    "writeback journal database {} was not closed cleanly and needs recovery, \
-                     which reading its identity does not perform",
-                    path.display()
-                );
-            }
+        let header = RedbHeader::read_existing(&database_file, len, &path)?;
+        if header.recovery_required || header.layout_len != len {
+            bail!(
+                "writeback journal database {} was not closed cleanly and needs recovery, \
+                 which reading its identity does not perform",
+                path.display()
+            );
         }
         let backend = JournalIdentityBackend::new(database_file)?;
         let database = open_journal_database(&path, || {
@@ -951,8 +954,8 @@ impl Journal {
                 database_path.display()
             )));
         }
-        if let Some(header) = RedbHeader::read(&database_file)? {
-            header.ensure_openable(database_len, &database_path)?;
+        if database_existed {
+            RedbHeader::read_existing(&database_file, database_len, &database_path)?;
         }
         let database =
             open_journal_database(&database_path, || Builder::new().create_file(database_file))?;
@@ -4521,11 +4524,15 @@ mod tests {
         drop(journal);
         let clean = fs::read(&database).unwrap();
 
+        let mut wrong_magic = clean.clone();
+        wrong_magic[0] ^= 0xff;
         let mut wrong_page_size = clean.clone();
         wrong_page_size[12..16].copy_from_slice(&8192_u32.to_le_bytes());
         let mut zero_region = clean;
         zero_region[20..24].copy_from_slice(&0_u32.to_le_bytes());
         for (case, damaged) in [
+            ("invalid magic", wrong_magic),
+            ("truncated header", vec![0; 8]),
             ("wrong page size", wrong_page_size),
             ("zero region size", zero_region),
         ] {
@@ -4534,7 +4541,13 @@ mod tests {
                 ("open", Journal::open(&root, identity("bucket-a")).map(drop)),
                 ("open_existing", Journal::open_existing(&root).map(drop)),
             ] {
-                let message = format!("{:#}", result.unwrap_err());
+                let error = result.unwrap_err();
+                assert_eq!(
+                    crate::operator_required::ServerExit::of(error.as_ref()),
+                    crate::operator_required::ServerExit::OperatorRequired,
+                    "{case}, {open}: {error:#}"
+                );
+                let message = format!("{error:#}");
                 assert!(
                     message.contains(&database.display().to_string()),
                     "{case}, {open}: {message}"

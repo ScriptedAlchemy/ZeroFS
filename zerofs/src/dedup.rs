@@ -1042,6 +1042,12 @@ pub struct DedupGuard {
     cache: Arc<DedupCache>,
 }
 
+impl DedupGuard {
+    pub(crate) fn is_new_attempt(&self) -> bool {
+        self.claim.is_some()
+    }
+}
+
 pub(crate) struct PendingWriteRequest {
     cache: Arc<DedupCache>,
     op_id: OpId,

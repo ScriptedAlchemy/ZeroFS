@@ -213,7 +213,7 @@ impl P9GlobalAdmission {
             .await
     }
 
-    async fn admit_receive_bytes(
+    pub(super) async fn admit_receive_bytes(
         self: &Arc<Self>,
         permits: u32,
         shutdown: &CancellationToken,
@@ -330,6 +330,17 @@ pub(crate) struct P9ConnectionAdmission {
 }
 
 impl P9ConnectionAdmission {
+    pub(super) async fn acquire_task_bytes(
+        &self,
+        bytes: u32,
+        shutdown: &CancellationToken,
+    ) -> anyhow::Result<(OwnedSemaphorePermit, OwnedSemaphorePermit)> {
+        let local = acquire_owned_or_shutdown(Arc::clone(&self.bytes), bytes, shutdown).await?;
+        let global =
+            acquire_owned_or_shutdown(Arc::clone(&self.global.bytes), bytes, shutdown).await?;
+        Ok((local, global))
+    }
+
     /// Admit one received frame, charged by what its request type can hold.
     pub(super) async fn admit_frame_or_shutdown(
         &self,
@@ -378,10 +389,7 @@ impl P9ConnectionAdmission {
             acquire_owned_or_shutdown(Arc::clone(&self.requests), 1, shutdown).await?;
         let global_request =
             acquire_owned_or_shutdown(Arc::clone(&self.global.requests), 1, shutdown).await?;
-        let local_bytes =
-            acquire_owned_or_shutdown(Arc::clone(&self.bytes), permits, shutdown).await?;
-        let global_bytes =
-            acquire_owned_or_shutdown(Arc::clone(&self.global.bytes), permits, shutdown).await?;
+        let (local_bytes, global_bytes) = self.acquire_task_bytes(permits, shutdown).await?;
 
         Ok(P9AdmissionPermit::shared(
             local_request,

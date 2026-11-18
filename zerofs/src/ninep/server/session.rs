@@ -3,8 +3,8 @@ use super::admission::{
     P9TransportPermit,
 };
 use super::frame_codec::{
-    FidFootprint, FrameHeader, TCLUNK_TYPE, TFLUSH_TYPE, TVERSION_TYPE, inspect_frame_metadata,
-    read_9p_frame_charged, shallow_epoch_zero_retry_write,
+    FidFootprint, FrameHeader, FramePlan, TCLUNK_TYPE, TFLUSH_TYPE, TVERSION_TYPE,
+    inspect_frame_metadata, read_9p_frame_charged, shallow_epoch_zero_retry_write,
 };
 use super::response_writer::{
     P9Response, ResponseAuthority, ResponseCredit, spawn_response_writer,
@@ -23,6 +23,7 @@ use ninep_proto::{
     P9_MIN_MESSAGE_SIZE, P9Message, Rlerror, T_WRITE,
 };
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -243,6 +244,7 @@ pub(super) struct InflightRegistryInner {
     flush_tails: DashMap<u16, Arc<RequestState>>,
     /// Reply credit for outstanding `Tflush` requests.
     flush_slots: Arc<Semaphore>,
+    refusal_slots: Arc<Semaphore>,
 }
 
 impl Default for InflightRegistryInner {
@@ -251,6 +253,7 @@ impl Default for InflightRegistryInner {
             entries: DashMap::new(),
             flush_tails: DashMap::new(),
             flush_slots: Arc::new(Semaphore::new(CONNECTION_FLUSH_SLOTS)),
+            refusal_slots: Arc::new(Semaphore::new(CONNECTION_FLUSH_SLOTS)),
         }
     }
 }
@@ -455,12 +458,22 @@ enum ReceiveCharge {
         // Accepted FIRST requests can outlive their disconnected reader.
         _receive: Arc<P9ReceivePermit>,
     },
+    // The WebSocket reader lends its current frame credit until admission or close.
+    #[cfg(any(feature = "webui", test))]
+    WebSocketFrame { _receive: Arc<P9ReceivePermit> },
+    // At most one overflow replay per connection, paid by spare receive bytes.
+    Replay {
+        _bytes: P9ReceivePermit,
+        _slot: OwnedSemaphorePermit,
+    },
     /// A `Tflush` reply slot.
     Flush(OwnedSemaphorePermit),
 }
 
 /// The bounded receive envelope shared by a reader and its unadmitted frames.
 pub(crate) struct P9PendingFrames {
+    overloaded: AtomicBool,
+    replay_slot: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
     receive: Arc<P9ReceivePermit>,
 }
@@ -468,9 +481,64 @@ pub(crate) struct P9PendingFrames {
 impl P9PendingFrames {
     pub(crate) fn new(receive: P9ReceivePermit) -> Self {
         Self {
+            overloaded: AtomicBool::new(false),
+            replay_slot: Arc::new(Semaphore::new(1)),
             bytes: Arc::new(Semaphore::new(P9_MAX_MSIZE as usize)),
             receive: Arc::new(receive),
         }
+    }
+
+    fn frame_permits(header: FrameHeader) -> u32 {
+        header
+            .len
+            .saturating_add(PENDING_REQUEST_TASK_BYTES)
+            .min(P9_MAX_MSIZE as usize) as u32
+    }
+
+    fn pending_charge(&self, bytes: OwnedSemaphorePermit) -> ReceiveCharge {
+        self.overloaded.store(false, Ordering::Relaxed);
+        ReceiveCharge::Pending {
+            _bytes: bytes,
+            _receive: Arc::clone(&self.receive),
+        }
+    }
+
+    fn try_charge(&self, header: FrameHeader) -> Option<ReceiveCharge> {
+        Arc::clone(&self.bytes)
+            .try_acquire_many_owned(Self::frame_permits(header))
+            .ok()
+            .map(|bytes| self.pending_charge(bytes))
+    }
+
+    async fn charge_replay(
+        &self,
+        header: FrameHeader,
+        context: &ConnectionContext<'_>,
+    ) -> anyhow::Result<ReceiveCharge> {
+        let ordinary = Arc::clone(&self.bytes).acquire_many_owned(Self::frame_permits(header));
+        let spare = async {
+            let slot = Arc::clone(&self.replay_slot).acquire_owned().await?;
+            let bytes = context
+                .admission
+                .global
+                .admit_receive_bytes(
+                    (header.len + PENDING_REQUEST_TASK_BYTES) as u32,
+                    context.connection_shutdown,
+                )
+                .await?;
+            Ok(ReceiveCharge::Replay {
+                _slot: slot,
+                _bytes: bytes,
+            })
+        };
+        tokio::time::timeout(PENDING_FRAME_GRACE, async {
+            tokio::select! {
+                biased;
+                charge = ordinary => Ok(self.pending_charge(charge?)),
+                charge = spare => charge,
+            }
+        })
+        .await?
     }
 
     /// Dispatch one complete WebSocket frame while retaining bounded receive
@@ -488,13 +556,44 @@ impl P9PendingFrames {
             len: frame.len(),
             type_byte: frame[4],
         };
+        if header.type_byte != TFLUSH_TYPE
+            && (is_fid_retirement(header.type_byte)
+                || (context.handler.zerofs_protocol_enabled()
+                    && P9Message::carries_op_id(header.type_byte)))
+        {
+            // Register before yielding: a fully received FIRST must own its
+            // operation even if the caller loses the socket or its idle timer
+            // fires while admission is blocked.
+            if let Some(charge) = self.try_charge(header) {
+                drop(start_9p_request(frame, context, charge)?);
+            } else {
+                let started = start_9p_request(
+                    frame,
+                    context,
+                    ReceiveCharge::WebSocketFrame {
+                        _receive: Arc::clone(&self.receive),
+                    },
+                )?;
+                // No further WebSocket frame may use this credit before this
+                // request reaches ordinary admission. On timeout close the
+                // transport; an accepted FIRST stays owned by its request.
+                if let Ok(result) = tokio::time::timeout(PENDING_FRAME_GRACE, started).await? {
+                    result?;
+                }
+            }
+            return Ok(());
+        }
         let charge = tokio::select! {
             biased;
             _ = context.connection_shutdown.cancelled() => anyhow::bail!("9P connection closed"),
             _ = context.process_shutdown.cancelled() => anyhow::bail!("9P request admission is sealed for shutdown"),
             charge = charge_received_frame(header, self, context.inflight) => charge?,
         };
-        drop(start_9p_request(frame, context, charge)?);
+        if let Some(charge) = charge {
+            drop(start_9p_request(frame, context, charge)?);
+        } else {
+            refuse_overload(&frame, context, crate::linux_errno::EAGAIN).await?;
+        }
         Ok(())
     }
 }
@@ -644,10 +743,15 @@ fn start_9p_request(
 
     let request = async move {
         let _accepted_work = accepted_work;
+        // A barrier's predecessors may still need every request slot. Retain
+        // only receive credit until they have enqueued their replies.
+        for waiter in prior_waiters {
+            waiter.wait().await;
+        }
         let credit = match charge {
             ReceiveCharge::Flush(slot) => {
                 let _ = admitted_tx.send(Ok(()));
-                ResponseCredit::Flush(slot)
+                ResponseCredit::Control(slot)
             }
             pending => {
                 match admission
@@ -678,11 +782,6 @@ fn start_9p_request(
         } else {
             P9Message::from_bytes_ctx(&frame, zerofs_protocol)
         };
-
-        // Barrier waiters were captured synchronously in receive order.
-        for waiter in prior_waiters {
-            waiter.wait().await;
-        }
 
         // Parse failures stay registered until their `Rlerror` is enqueued.
         let response_bytes = match parsed {
@@ -801,39 +900,144 @@ async fn abandoned(shutdown: &CancellationToken, abandonment: &Abandonment) {
     }
 }
 
-/// Charge for one frame read by the connection reader.
-///
-/// Frames that wait for request admission share one maximum frame of pending
-/// envelope, so the reader keeps reading while the connection's request
-/// slots are full. A `Tflush` takes a flush slot instead: it must stay
-/// readable when the envelope is full, because cancelling is how a client
-/// frees the capacity it is waiting for. An ordinary frame that cannot fit
-/// waits for the envelope. A client that pipelines large writes fills it in
-/// normal use, so closing the connection instead would fail every such upload.
+/// Let healthy pipelines drain. After a stalled envelope, keep reading control
+/// traffic without paying the grace period again for each queued ordinary frame.
+const PENDING_FRAME_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn is_fid_retirement(type_byte: u8) -> bool {
+    // Standard Tremove (122), like Tclunk and Tversion, retires fids even
+    // when it fails. Never claim such a frame completed without retiring them.
+    matches!(type_byte, TCLUNK_TYPE | TVERSION_TYPE | 122)
+}
+
+struct FirstRefusal {
+    id: crate::dedup::OpId,
+    operation: crate::dedup::DedupGuard,
+    bytes: (OwnedSemaphorePermit, OwnedSemaphorePermit),
+    slot: OwnedSemaphorePermit,
+}
+
+impl FirstRefusal {
+    async fn reserve(
+        id: crate::dedup::OpId,
+        operation: crate::dedup::DedupGuard,
+        context: &ConnectionContext<'_>,
+    ) -> anyhow::Result<Self> {
+        tokio::time::timeout(PENDING_FRAME_GRACE, async {
+            let slot = Arc::clone(&context.inflight.inner.refusal_slots)
+                .acquire_owned()
+                .await?;
+            let bytes = context
+                .admission
+                .acquire_task_bytes(
+                    PENDING_REQUEST_TASK_BYTES as u32,
+                    context.connection_shutdown,
+                )
+                .await?;
+            Ok(Self {
+                id,
+                operation,
+                bytes,
+                slot,
+            })
+        })
+        .await?
+    }
+
+    fn start(self, tag: u16, context: &ConnectionContext<'_>) -> anyhow::Result<()> {
+        let accepted = context
+            .admission
+            .accepted_work
+            .try_accept()
+            .ok_or_else(|| anyhow::anyhow!("9P request admission is sealed for shutdown"))?;
+        let lease =
+            context
+                .inflight
+                .register_with(tag, FidFootprint::None, Abandonment::committed())?;
+        let handler = Arc::clone(context.handler);
+        let tx = context.tx.clone();
+        let shutdown = context.connection_shutdown.clone();
+        let revoked = accepted.revoked();
+        let task = async move {
+            // Keep the claim and byte credit until the replicated terminal
+            // result is visible. Reconnect retries join this same operation.
+            let _ownership = (self.operation, self.bytes, accepted);
+            if let Err(error) = handler.persist_overload_refusal(self.id).await {
+                warn!("9P could not record overloaded FIRST for tag {tag}: {error:?}");
+                shutdown.cancel();
+                return;
+            }
+            let reply = P9Message::new(
+                tag,
+                Message::Rlerror(Rlerror {
+                    ecode: crate::linux_errno::EAGAIN,
+                }),
+            )
+            .to_bytes()
+            .expect("fixed Rlerror encodes");
+            let _ =
+                enqueue_terminal_response(&tx, reply, &lease, ResponseCredit::Control(self.slot))
+                    .await;
+        };
+        let tracked = context.requests.track_future(async move {
+            tokio::select! { biased; _ = revoked => {}, _ = task => {} }
+        });
+        debug_assert!(std::mem::size_of_val(&tracked) <= PENDING_REQUEST_TASK_BYTES);
+        drop(spawn_named("9p-refuse-first", tracked));
+        Ok(())
+    }
+}
+
+async fn refuse_overload(
+    header: &[u8],
+    context: &ConnectionContext<'_>,
+    ecode: u32,
+) -> anyhow::Result<()> {
+    let tag = u16::from_le_bytes([header[5], header[6]]);
+    let lease =
+        context
+            .inflight
+            .register_with(tag, FidFootprint::None, Abandonment::committed())?;
+    let bytes = P9Message::new(tag, Message::Rlerror(Rlerror { ecode })).to_bytes()?;
+    // A slow reply consumer must not use the slots reserved for Tflush or
+    // hold the reader indefinitely. Both waits share one deadline.
+    tokio::time::timeout(PENDING_FRAME_GRACE, async {
+        let slot = Arc::clone(&context.inflight.inner.refusal_slots)
+            .acquire_owned()
+            .await?;
+        enqueue_terminal_response(context.tx, bytes, &lease, ResponseCredit::Control(slot)).await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await?
+}
+
 async fn charge_received_frame(
     header: FrameHeader,
     pending: &P9PendingFrames,
     inflight: &InflightRegistry,
-) -> anyhow::Result<ReceiveCharge> {
+) -> anyhow::Result<Option<ReceiveCharge>> {
     if header.type_byte == TFLUSH_TYPE {
-        // Flush credit covers a fixed-size control frame. Reject any other
-        // length before the stream reader allocates and reads its body.
         if header.len != P9_HEADER_SIZE + 2 {
             anyhow::bail!("Tflush message must carry exactly one oldtag");
         }
-        return Ok(ReceiveCharge::Flush(inflight.flush_slot().await?));
+        let slot = tokio::time::timeout(PENDING_FRAME_GRACE, inflight.flush_slot()).await??;
+        return Ok(Some(ReceiveCharge::Flush(slot)));
     }
-    let bytes = header
-        .len
-        .saturating_add(PENDING_REQUEST_TASK_BYTES)
-        .min(P9_MAX_MSIZE as usize);
-    let permits = u32::try_from(bytes).expect("a 9P frame charge fits in u32");
-    Ok(ReceiveCharge::Pending {
-        _bytes: Arc::clone(&pending.bytes)
-            .acquire_many_owned(permits)
-            .await?,
-        _receive: Arc::clone(&pending.receive),
-    })
+    if let Some(charge) = pending.try_charge(header) {
+        return Ok(Some(charge));
+    }
+    if pending.overloaded.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    let acquire =
+        Arc::clone(&pending.bytes).acquire_many_owned(P9PendingFrames::frame_permits(header));
+    match tokio::time::timeout(PENDING_FRAME_GRACE, acquire).await {
+        Ok(result) => Ok(Some(pending.pending_charge(result?))),
+        Err(_) => {
+            pending.overloaded.store(true, Ordering::Relaxed);
+            Ok(None)
+        }
+    }
 }
 
 pub(super) async fn handle_client_loop<R>(
@@ -866,16 +1070,53 @@ where
     let pending = P9PendingFrames::new(admission.global.admit_receive(&connection_shutdown).await?);
 
     loop {
-        let Some((frame, charge)) =
-            read_9p_frame_charged(&mut read_stream, &connection_shutdown, async |header| {
-                charge_received_frame(header, &pending, &inflight).await
-            })
-            .await?
+        let Some((frame, plan)) = read_9p_frame_charged(
+            &mut read_stream,
+            &connection_shutdown,
+            || handler.zerofs_protocol_enabled(),
+            async |header, op| {
+                if let Some(charge) = charge_received_frame(header, &pending, &inflight).await? {
+                    return Ok(FramePlan::Read(charge));
+                }
+                anyhow::ensure!(
+                    !is_fid_retirement(header.type_byte),
+                    "9P pending frame capacity exhausted"
+                );
+                if let Some((id, flags, _)) = op
+                    && crate::dedup::has_op_id(&id)
+                {
+                    if let Some(guard) =
+                        handler.try_reserve_received_first(id, flags, header.type_byte)
+                        && guard.is_new_attempt()
+                    {
+                        let refusal = FirstRefusal::reserve(id, guard, &context).await?;
+                        return Ok(FramePlan::Refuse(Some(refusal)));
+                    }
+                    // A RETRY or duplicate FIRST needs its authoritative result.
+                    // Keep its full frame for normal replay, including write
+                    // fingerprint validation and promotion-epoch handling.
+                    let charge = pending.charge_replay(header, &context).await?;
+                    return Ok(FramePlan::Read(charge));
+                }
+                Ok(FramePlan::Refuse(None))
+            },
+        )
+        .await?
         else {
             debug!("Client disconnected");
             return Ok(());
         };
-        drop(start_9p_request(frame, &context, charge)?);
+        match plan {
+            FramePlan::Read(charge) => {
+                drop(start_9p_request(frame, &context, charge)?);
+            }
+            FramePlan::Refuse(Some(first)) => {
+                first.start(u16::from_le_bytes([frame[5], frame[6]]), &context)?
+            }
+            FramePlan::Refuse(None) => {
+                refuse_overload(&frame, &context, crate::linux_errno::EAGAIN).await?
+            }
+        }
     }
 }
 

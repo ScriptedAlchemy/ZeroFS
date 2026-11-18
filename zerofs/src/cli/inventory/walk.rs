@@ -78,7 +78,6 @@ pub(super) fn inventory_with_options(
     options: Options<'_>,
     writer: impl Write,
 ) -> Result<bool> {
-    let work = Workspace::new(root, options.work_dir, options.memory_bytes)?;
     // A trailing slash must not bypass O_NOFOLLOW on the final component.
     let raw = root.as_os_str().as_bytes();
     let end = raw
@@ -98,6 +97,11 @@ pub(super) fn inventory_with_options(
     if !same_version(&before, &opened) {
         bail!("inventory root changed while opening");
     }
+    #[cfg(target_os = "linux")]
+    let pinned_root = platform::proc_fd_path(&root_fd);
+    #[cfg(target_os = "linux")]
+    let root = pinned_root.as_path();
+    let work = Workspace::new(root, options.work_dir, options.memory_bytes)?;
     let mut output = Manifest::new(writer);
     let filesystem = match fs::fstatfs(&root_fd) {
         Ok(stats) => Field::Observed(platform::filesystem(&stats)),
