@@ -1,6 +1,6 @@
 # Bounded NAS journal qualification
 
-Engine source `bf1a9fb5319fbf3f01f94b8ea881d940767b3588` passed native file fsync and authenticated NVMe/TCP crash recovery on ubuntu-main. The engine executable SHA-256 is `a4318f24cae7b6f807f68711efb9ac5003fe85625d5e3265bbb68899cb201b11`. The base is PR #84 at `faddddc08151b9153dca6c74ffa7deaa0ed412cd`. The running physical trial uses the separate released engine at `27e72993`. [Build identity](build-id.json)
+Engine source `bf1a9fb5319fbf3f01f94b8ea881d940767b3588` passed native file fsync and authenticated NVMe/TCP crash recovery on ubuntu-main. The engine executable SHA-256 is `a4318f24cae7b6f807f68711efb9ac5003fe85625d5e3265bbb68899cb201b11`. The base is PR #84 at `faddddc08151b9153dca6c74ffa7deaa0ed412cd`. The running physical trial uses the separate released engine at `27e72993`. The later merge of six upstream commits has its own [requalification receipt](merged/README.md). [Build identity](build-id.json)
 
 ## App inputs
 
@@ -17,7 +17,7 @@ Use the bounded profile only for the operator-selected journal mode. Select `[ru
 
 Direct-to-HDD remains available for bulk writes. The selected journal receives the dirty object traffic for that engine. Per-file bypass, automatic media classification and configurable persistent hot-file pinning have no qualification in this profile. The storage UI exposes diagnostics and scan/refresh. Changing these policies currently requires application configuration. Journal sequence and admission gauges are available in Prometheus.
 
-Before app integration, bind and verify the dedicated persistent P3 journal volume by its expected mount identity. Keep it separate from disposable cache and the catalog, authority and file exports. Require the same journal on every writer restart. Treat an unexpected empty mount, switched backend or uncertain pending journal as a startup refusal. For a mode change, quiesce all writers, retain the journal, and verify the final remote sequence and the destination data through a separate reader. An ordinary local shutdown alone cannot authorize journal removal. Until drain a P3 failure can lose the only durable copy of an acknowledged mutation.
+Before app integration, bind and verify the dedicated persistent P3 journal volume by its expected mount identity. Keep it separate from disposable cache and the catalog, authority and file exports. Require the same journal on every writer restart. The engine validates the journal it opens. The app must detect an entirely missing or substituted journal volume before startup can create a new directory. Treat an unexpected empty mount, switched backend or uncertain pending journal as a startup refusal. For a mode change, quiesce all writers, retain the journal, and verify the final remote sequence and the destination data through a separate reader. An ordinary local shutdown alone cannot authorize journal removal. Until drain a P3 failure can lose the only durable copy of an acknowledged mutation.
 
 ## Durability, pressure and device participation
 
