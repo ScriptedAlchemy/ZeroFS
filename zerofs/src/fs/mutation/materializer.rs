@@ -737,6 +737,67 @@ mod tests {
             .0
     }
 
+    #[tokio::test]
+    async fn contiguous_appends_are_visible_while_apply_is_held_and_yield_to_lock_waiters() {
+        let (fs, auth) = filesystem().await;
+        let file = create_file(&fs, &auth, b"queued-appends").await;
+        let (acquired, ready) = oneshot::channel();
+        let (release, held) = oneshot::channel();
+        fs.materializer
+            .get()
+            .unwrap()
+            .enqueue_lane(
+                file,
+                LaneJob::Hold {
+                    acquired,
+                    release: held,
+                },
+            )
+            .unwrap();
+        ready.await.unwrap();
+        let payload: Vec<u8> = (0..=255).collect();
+        let queued = async {
+            for (i, byte) in payload.iter().enumerate() {
+                let attrs = fs
+                    .write_ack(&auth, file, i as u64, &Bytes::copy_from_slice(&[*byte]))
+                    .await
+                    .unwrap();
+                assert_eq!(attrs.size, (i + 1) as u64);
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(2), queued)
+            .await
+            .expect("appends waited for apply");
+        let (visible, eof) = fs.read_file(&auth, file, 0, 257).await.unwrap();
+        assert!(eof);
+        assert_eq!(visible.as_ref(), payload);
+        let extra = Bytes::from_static(b"x");
+        // The cap forces this request back through canonical lock acquisition.
+        // Cancelling that wait must leave the already acknowledged prefix intact.
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                fs.write_ack(&auth, file, 256, &extra)
+            )
+            .await
+            .is_err()
+        );
+        let mut flush = Box::pin(fs.wait_inode_durability(file));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut flush)
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), flush)
+            .await
+            .unwrap()
+            .unwrap();
+        let (stored, eof) = fs.read_file(&auth, file, 0, 257).await.unwrap();
+        assert!(eof);
+        assert_eq!(stored.as_ref(), payload);
+    }
+
     async fn prepare(
         fs: &ZeroFS,
         auth: AuthContext,

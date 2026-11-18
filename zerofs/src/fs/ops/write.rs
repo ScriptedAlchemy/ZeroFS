@@ -343,7 +343,11 @@ pub(crate) async fn prepare_write_with_append(
         let Inode::File(file) = &mut inode else {
             return Err(FsError::IsDirectory);
         };
-        let old_size = fs.overlay_visible_size(member.id, file.size);
+        let old_size = if previous_writes > 0 {
+            file.size
+        } else {
+            fs.overlay_visible_size(member.id, file.size)
+        };
         let end_offset = member
             .offset
             .checked_add(member.data.len() as u64)
