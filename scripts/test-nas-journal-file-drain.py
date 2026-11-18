@@ -10,6 +10,7 @@ from concurrent.futures import Future
 import ctypes
 import hashlib
 import importlib
+import json
 import os
 from pathlib import Path
 import re
@@ -229,9 +230,30 @@ class FileDrainFixture(fixture.Fixture):
     barrier = None
     writers = ()
 
+    def write_source(self, client, name, size):
+        offset = 0
+        with (self.args.input_dir / name).open("rb") as source:
+            while block := source.read(client.io_chunk):
+                payload = memoryview(block)
+                position = 0
+                while position < len(payload):
+                    chunk = payload[position:]
+                    reply = client.call(
+                        118, struct.pack("<IQI", 2, offset, len(chunk)), payload=chunk
+                    )
+                    (count,) = struct.unpack("<I", reply)
+                    require(0 < count <= len(chunk), f"invalid WRITE count at {offset}")
+                    offset += count
+                    position += count
+        require(offset == size, f"{name}: expected {size} bytes, sent {offset}")
+
     def write_file(self, name, size, barrier=None):
-        data = hashlib.shake_256(f"zerofs-file-drain:{name}".encode()).digest(size)
-        digest = hashlib.sha256(data).hexdigest()
+        file_backed = self.args.input_dir is not None and barrier is not None
+        if file_backed:
+            digest = self.args.input_hashes[name]
+        else:
+            data = hashlib.shake_256(f"zerofs-file-drain:{name}".encode()).digest(size)
+            digest = hashlib.sha256(data).hexdigest()
         with fixture.NineP(
             self.ninep, self.remaining, self.args.msize_kib * 1024
         ) as client:
@@ -239,7 +261,10 @@ class FileDrainFixture(fixture.Fixture):
             if barrier is not None:
                 barrier.wait(timeout=self.remaining())
             started = time.monotonic() - self.start
-            client.write(data)
+            if file_backed:
+                self.write_source(client, name, size)
+            else:
+                client.write(data)
             acknowledged = time.monotonic() - self.start
             if barrier is None:
                 # Check acknowledged visibility from an independent connection
@@ -320,6 +345,42 @@ class FileDrainFixture(fixture.Fixture):
             thread.start()
             self.writers.append((thread, result))
 
+    def member_allocations(self):
+        return {
+            name: fixture.account(path) for name, path in zip(MEMBERS, self.members)
+        }
+
+    def record_middle_window(self, baseline, samples, drained):
+        counter = "remote_bytes_completed_total"
+        total = drained[counter] - baseline[counter]
+        require(total > 0, "remote byte counter did not advance")
+        start, end = [
+            next(
+                row
+                for row in samples
+                if 100 * (row[counter] - baseline[counter]) >= total * percent
+            )
+            for percent in (25, 75)
+        ]
+        seconds = end["elapsed_seconds"] - start["elapsed_seconds"]
+        size = end[counter] - start[counter]
+        require(
+            seconds > 0 and size > 0,
+            "remote drain samples did not resolve the middle window",
+        )
+        self.receipt["middle_remote_drain"] = {
+            "counter": f"zerofs_writeback_{counter}",
+            "before_workload_bytes": baseline[counter],
+            "after_drain_bytes": drained[counter],
+            "start_percent_threshold": 25,
+            "end_percent_threshold": 75,
+            "start": start,
+            "end": end,
+            "delta_bytes": size,
+            "seconds": seconds,
+            "bytes_per_second": size / seconds,
+        }
+
     def run(self):
         self.receipt.update(
             scope="userspace 9P2000.L and two local directories on one ext4 device",
@@ -345,6 +406,8 @@ class FileDrainFixture(fixture.Fixture):
                 f"warm-up did not settle one data object on {name}: {baseline[name]}",
             )
         self.event(members=baseline)
+        if self.args.input_dir is not None:
+            self.receipt["baseline_member_allocations"] = self.member_allocations()
         paths = list(map(objects_dir, self.members))
         before = list(map(generations, paths))
 
@@ -376,6 +439,8 @@ class FileDrainFixture(fixture.Fixture):
             last_ack = max(row["write_acknowledged_seconds"] for row in responses)
             last_sync = max(row["fsync_completed_seconds"] for row in responses)
             self.receipt["writeback_samples"] = samples
+            if self.args.input_dir is not None:
+                self.record_middle_window(warm_status, samples, drained)
             self.receipt["transfer"] = {
                 "logical_bytes": sum(row["bytes"] for row in responses),
                 "write_seconds": last_ack - first_send,
@@ -410,6 +475,8 @@ class FileDrainFixture(fixture.Fixture):
                 == 0,
                 f"{name} did not settle new segments: {final[name]}",
             )
+        if self.args.input_dir is not None:
+            self.receipt["final_member_allocations"] = self.member_allocations()
         leftovers = fixture.journal_payloads(self.journal)
         require(not leftovers, f"journal payload remains after drain: {leftovers}")
         self.event(
@@ -454,11 +521,40 @@ class FileDrainFixture(fixture.Fixture):
 
 def configure_parser(parser):
     parser.add_argument(
+        "--input-dir", type=Path, help="pre-generated inputs and sha256.json"
+    )
+    parser.add_argument(
         "--msize-kib", type=int, choices=(256, 1024, 4096, 10240), default=256
     )
 
 
 def validate_args(parser, args):
+    if args.input_dir is not None:
+        if (args.files, args.file_mib, args.msize_kib) != (6, 768, 1024):
+            parser.error(
+                "file-backed workload requires six 768 MiB files and 1 MiB msize"
+            )
+        names = {f"ext4-drain-{index:02d}" for index in range(args.files)}
+        try:
+            hashes = json.loads((args.input_dir / "sha256.json").read_text())
+            if (
+                not isinstance(hashes, dict)
+                or set(hashes) != names
+                or len(set(hashes.values())) != args.files
+                or any(
+                    not re.fullmatch(r"[0-9a-f]{64}", value)
+                    for value in hashes.values()
+                )
+                or any(
+                    (args.input_dir / name).stat().st_size != args.file_mib * MIB
+                    for name in names
+                )
+            ):
+                raise ValueError("incorrect source sizes or invalid manifest")
+        except (OSError, TypeError, ValueError) as error:
+            parser.error(f"invalid file-backed inputs: {error}")
+        args.input_hashes = hashes
+        return
     if not (
         1 <= args.files <= 8
         and 1 <= args.file_mib <= 256

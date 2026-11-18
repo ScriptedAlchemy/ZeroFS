@@ -1,0 +1,21 @@
+{
+  "Binds": [
+    "/var/tmp/zerofs-sustained.6r8kRuYw/scripts:/fixtures:ro",
+    "/var/tmp/zerofs-sustained.6r8kRuYw/source:/source:ro",
+    "/var/tmp/zerofs-sustained.6r8kRuYw/zerofs:/bin/zerofs:ro",
+    "/var/tmp/zerofs-sustained-run.CAVaVCH2:/scratch",
+    "/var/tmp/zerofs-sustained.6r8kRuYw/evidence/materialized:/result"
+  ],
+  "CapDrop": [
+    "ALL"
+  ],
+  "CgroupnsMode": "private",
+  "CpusetCpus": "0,1",
+  "Memory": 8589934592,
+  "MemorySwap": 8589934592,
+  "NetworkMode": "none",
+  "Privileged": false,
+  "SecurityOpt": [
+    "no-new-privileges"
+  ]
+}
