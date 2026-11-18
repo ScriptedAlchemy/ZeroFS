@@ -1,5 +1,5 @@
-import { useState, useCallback, useEffect, useRef } from "react";
-import { useTitle } from "../hooks/use-title";
+import { useState, useCallback, useContext, useEffect, useRef } from "react";
+import { ActivePage, useTitle } from "../hooks/use-title";
 import { useLocation, useNavigate } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import { Plus, X, FolderOpen } from "lucide-react";
@@ -101,6 +101,7 @@ function SortableTab({
 
 export function FilesPage() {
   const location = useLocation();
+  const active = useContext(ActivePage);
   const navigate = useNavigate();
   const qc = useQueryClient();
 
@@ -121,6 +122,9 @@ export function FilesPage() {
   const urlPath = decodeURIComponent(location.pathname.replace(/^\/files/, "") || "/");
   const isTabSwitch = useRef(false);
   useEffect(() => {
+    // KeepAlive leaves this page mounted on Monitor, Storage and Terminal. Their
+    // route names are not filesystem paths and must not update the active tab.
+    if (!active) return;
     if (isTabSwitch.current) {
       isTabSwitch.current = false;
       return;
@@ -131,7 +135,7 @@ export function FilesPage() {
       if (!active || active.path === urlPath) return prev;
       return prev.map((t) => (t.id === activeTabId ? { ...t, path: urlPath, label: labelFromPath(urlPath) } : t));
     });
-  }, [urlPath, activeTabId]);
+  }, [active, urlPath, activeTabId]);
 
   const handleNavigate = useCallback(
     (newPath: string) => {

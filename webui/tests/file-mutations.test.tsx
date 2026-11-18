@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useUploads } from "../src/components/file-manager/hooks/use-uploads";
 import { p9client, ZeroFsClient } from "../src/lib/zerofs/client";
+import { TransferContext, type TransferHandle } from "../src/components/transfers/TransferContext";
 
 const connect = vi.hoisted(() => vi.fn());
 vi.mock("../src/generated/zerofs-client/zerofs_client", () => ({
@@ -111,6 +112,87 @@ describe("File Manager namespace mutations", () => {
       answer === "overwrite" ? { "/Report": true, "/new": false } : answer === "skip" ? { "/new": false } : {},
     );
     unmount();
+    queries.clear();
+  });
+
+  it.each(["overwrite", "skip", "cancel"] as const)("rechecks a published upload before retry and honors %s", async (answer) => {
+    const stat = vi.spyOn(p9client, "stat").mockRejectedValue(errno(2));
+    const upload = vi.spyOn(p9client, "uploadBlob").mockResolvedValue(undefined);
+    vi.spyOn(p9client, "finishUploadBatch").mockRejectedValue(new Error("durability barrier failed"));
+    const handles: (TransferHandle & { retry?: () => void })[] = [];
+    const startUpload = (_name: string, _total: number, retry?: () => void): TransferHandle => {
+      const handle = {
+        id: handles.length, signal: new AbortController().signal, retry,
+        setName: vi.fn(), update: vi.fn(), finish: vi.fn(), fail: vi.fn(),
+      };
+      handles.push(handle);
+      return handle;
+    };
+    const queries = new QueryClient();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={queries}>
+        <TransferContext value={{ startUpload, startDownload: () => { throw new Error("unexpected download"); }, startDelete: () => { throw new Error("unexpected delete"); } }}>
+          {children}
+        </TransferContext>
+      </QueryClientProvider>
+    );
+    const { result, unmount } = renderHook(() => useUploads("/"), { wrapper });
+    const transfer = new DataTransfer();
+    transfer.items.add(new File(["original"], "Report"));
+    await act(async () => result.current.uploadFiles(transfer.files));
+    expect(handles[0].fail).toHaveBeenCalledWith("durability barrier failed");
+    expect(upload).toHaveBeenCalledOnce();
+
+    // Publication was acknowledged before the barrier failed. The destination can
+    // now be this upload or a concurrent writer's replacement; require approval.
+    stat.mockResolvedValue({} as Awaited<ReturnType<typeof p9client.stat>>);
+    let done: Promise<void>;
+    act(() => {
+      done = Promise.resolve(handles[0].retry!());
+    });
+    await waitFor(() => expect(result.current.overwritePrompt?.existing).toEqual(["Report"]));
+    expect(upload).toHaveBeenCalledOnce();
+    await act(async () => {
+      result.current.overwritePrompt!.resolve(answer);
+      await done;
+    });
+    if (answer === "overwrite") {
+      expect(upload).toHaveBeenCalledTimes(2);
+      expect(upload.mock.calls[1][2]).toMatchObject({ replace: true, batch: undefined });
+      expect(handles[1].finish).toHaveBeenCalledOnce();
+    } else {
+      expect(upload).toHaveBeenCalledOnce();
+      expect(handles).toHaveLength(1);
+    }
+    unmount();
+    queries.clear();
+  });
+
+  it.each(["unmounts", "changes directory"] as const)("cancels an outstanding overwrite decision when its file tab %s", async (action) => {
+    vi.spyOn(p9client, "stat").mockResolvedValue({} as Awaited<ReturnType<typeof p9client.stat>>);
+    const upload = vi.spyOn(p9client, "uploadBlob").mockResolvedValue(undefined);
+    const queries = new QueryClient();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={queries}>{children}</QueryClientProvider>
+    );
+    const { result, unmount, rerender } = renderHook(({ path }) => useUploads(path), {
+      wrapper, initialProps: { path: "/" },
+    });
+    const transfer = new DataTransfer();
+    transfer.items.add(new File(["text"], "Report"));
+    let done: Promise<void>;
+    act(() => {
+      done = result.current.uploadFiles(transfer.files);
+    });
+    await waitFor(() => expect(result.current.overwritePrompt?.existing).toEqual(["Report"]));
+    if (action === "unmounts") unmount();
+    else rerender({ path: "/other" });
+    await done!;
+    expect(upload).not.toHaveBeenCalled();
+    if (action !== "unmounts") {
+      expect(result.current.overwritePrompt).toBeNull();
+      unmount();
+    }
     queries.clear();
   });
 });
