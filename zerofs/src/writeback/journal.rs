@@ -2490,61 +2490,147 @@ fn initialize_or_validate_identity(
     expected: &JournalIdentity,
     initialize: bool,
 ) -> Result<()> {
+    if !initialize {
+        // Existing journals must pass read-only validation before even an
+        // auxiliary-table migration commits. Identity comes first so an
+        // unrelated journal is never interpreted using our expected format.
+        {
+            let read = database
+                .begin_read()
+                .context("failed to read existing journal identity")?;
+            let meta = read
+                .open_table(META)
+                .context("failed to open existing journal metadata")
+                .map_err(operator_required)?;
+            let encoded = meta
+                .get(IDENTITY_KEY)
+                .context("failed to read journal identity")?
+                .ok_or_else(|| {
+                    operator_required(anyhow!(
+                        "existing writeback journal database has no identity; refusing to initialize \
+                         it because resetting its durable watermarks could discard acknowledged writes"
+                    ))
+                })?;
+            let actual: JournalIdentity = bincode::deserialize(encoded.value())
+                .context("failed to decode journal identity")
+                .map_err(operator_required)?;
+            if &actual != expected {
+                return Err(operator_required(anyhow!(
+                    "writeback journal identity mismatch"
+                )));
+            }
+        }
+        validate_recovery_metadata(database, expected.format_version)
+            .map_err(operator_required)
+            .context("failed to validate existing journal before recovery")?;
+    }
+
     let mut transaction = database
         .begin_write()
         .context("failed to initialize journal")?;
     transaction
         .set_durability(Durability::Immediate)
         .context("failed to set journal durability")?;
-    {
+    if initialize {
         let mut meta = transaction
             .open_table(META)
             .context("failed to open journal metadata")?;
-        let existing = meta
-            .get(IDENTITY_KEY)
-            .context("failed to read journal identity")?
-            .map(|value| value.value().to_vec());
-        match existing {
-            Some(encoded) => {
-                let actual: JournalIdentity = bincode::deserialize(&encoded)
-                    .context("failed to decode journal identity")
-                    .map_err(operator_required)?;
-                if &actual != expected {
-                    return Err(operator_required(anyhow!(
-                        "writeback journal identity mismatch"
-                    )));
-                }
-            }
-            None if !initialize => {
-                return Err(operator_required(anyhow!(
-                    "existing writeback journal database has no identity; refusing to initialize \
-                     it because resetting its durable watermarks could discard acknowledged writes"
-                )));
-            }
-            None => {
-                write_value(&mut meta, IDENTITY_KEY, expected)?;
-                write_value(&mut meta, INCARNATION_KEY, &Uuid::new_v4())?;
-                write_value(&mut meta, LOCAL_SEQ_KEY, &0_u64)?;
-                write_value(&mut meta, LOCAL_BYTES_COMPLETED_KEY, &0_u64)?;
-                write_value(&mut meta, REMOTE_SEQ_KEY, &0_u64)?;
-                write_value(&mut meta, REMOTE_BYTES_COMPLETED_KEY, &0_u64)?;
-                write_value(&mut meta, REMOTE_RETRIES_KEY, &0_u64)?;
-            }
-        }
-        drop(meta);
-        transaction
-            .open_table(MUTATIONS)
-            .context("failed to create journal mutations")?;
-        transaction
-            .open_table(PENDING_BLOBS)
-            .context("failed to create pending blob table")?;
-        transaction
-            .open_table(REMOTE_OBJECT_VERSIONS)
-            .context("failed to create remote object versions")?;
+        write_value(&mut meta, IDENTITY_KEY, expected)?;
+        write_value(&mut meta, INCARNATION_KEY, &Uuid::new_v4())?;
+        write_value(&mut meta, LOCAL_SEQ_KEY, &0_u64)?;
+        write_value(&mut meta, LOCAL_BYTES_COMPLETED_KEY, &0_u64)?;
+        write_value(&mut meta, REMOTE_SEQ_KEY, &0_u64)?;
+        write_value(&mut meta, REMOTE_BYTES_COMPLETED_KEY, &0_u64)?;
+        write_value(&mut meta, REMOTE_RETRIES_KEY, &0_u64)?;
     }
     transaction
+        .open_table(MUTATIONS)
+        .context("failed to create journal mutations")?;
+    transaction
+        .open_table(PENDING_BLOBS)
+        .context("failed to create pending blob table")?;
+    transaction
+        .open_table(REMOTE_OBJECT_VERSIONS)
+        .context("failed to create remote object versions")?;
+    transaction
         .commit()
-        .context("failed to commit journal identity")
+        .context("failed to commit journal identity")?;
+    if initialize {
+        validate_recovery_metadata(database, expected.format_version)
+            .map_err(operator_required)
+            .context("failed to validate new journal before recovery")?;
+    }
+    Ok(())
+}
+
+/// Prove that the durable mutation log agrees with its watermarks before
+/// recovery uses those watermarks to delete files or migrate records. Artifact
+/// validation still runs after cleanup, when genuinely uncommitted containers
+/// have been removed. A contradictory log cannot authorize that cleanup: a
+/// watermark behind a committed record would delete its acknowledged payload,
+/// and a remote watermark ahead of local would discard the entire dirty log.
+fn validate_recovery_metadata(database: &Database, format_version: u32) -> Result<()> {
+    let read = database
+        .begin_read()
+        .context("failed to read journal recovery metadata")?;
+    let meta = read
+        .open_table(META)
+        .context("failed to open journal recovery metadata")?;
+    let _: Uuid = read_required(&meta, INCARNATION_KEY)?;
+    let local_seq = read_required::<u64>(&meta, LOCAL_SEQ_KEY)?;
+    let remote_seq = read_required::<u64>(&meta, REMOTE_SEQ_KEY)?;
+    if remote_seq > local_seq {
+        bail!("remote journal watermark exceeds local watermark");
+    }
+    let mutations = read
+        .open_table(MUTATIONS)
+        .context("failed to open journal mutations before recovery")?;
+    let mut expected = remote_seq.saturating_add(1);
+    for entry in mutations
+        .iter()
+        .context("failed to scan journal mutations before recovery")?
+    {
+        let (sequence, encoded) =
+            entry.context("failed to read journal mutation before recovery")?;
+        let record: MutationRecord = bincode::deserialize(encoded.value())
+            .context("failed to decode journal mutation before recovery")?;
+        if sequence.value() != record.sequence {
+            bail!(
+                "journal mutation key {} does not match its recorded sequence {}",
+                sequence.value(),
+                record.sequence
+            );
+        }
+        if record.format_version != format_version {
+            bail!(
+                "mutation format version {} does not match journal format version {}",
+                record.format_version,
+                format_version
+            );
+        }
+        if record.sequence > local_seq {
+            bail!(
+                "committed journal mutation {} exceeds local watermark {local_seq}",
+                record.sequence
+            );
+        }
+        if record.sequence <= remote_seq {
+            continue;
+        }
+        if record.sequence != expected {
+            bail!(
+                "journal sequence gap: expected {expected}, found {}",
+                record.sequence
+            );
+        }
+        expected = expected
+            .checked_add(1)
+            .context("journal sequence overflow")?;
+    }
+    if expected != local_seq.saturating_add(1) {
+        bail!("journal sequence gap before local watermark {local_seq}");
+    }
+    Ok(())
 }
 
 /// Normalize persisted immutable-segment contracts before recovery can use them.
@@ -3157,9 +3243,9 @@ fn validate_owner_only(
 mod tests {
     use super::{
         AnchoredDir, FENCE_CLASSIFICATION_VERSION, FENCE_CLASSIFICATION_VERSION_KEY, IDENTITY_KEY,
-        Journal, JournalSnapshot, JournalWriteGate, META, MUTATIONS, PENDING_BLOBS,
-        PublicationFilesystem, REMOTE_OBJECT_VERSIONS, blob_relative_path, read_optional,
-        write_value,
+        Journal, JournalSnapshot, JournalWriteGate, LOCAL_SEQ_KEY, META, MUTATIONS, PENDING_BLOBS,
+        PublicationFilesystem, REMOTE_OBJECT_VERSIONS, REMOTE_SEQ_KEY, blob_relative_path,
+        read_optional, write_value,
     };
     use crate::writeback::model::{
         FenceClass, JournalIdentity, LocalEtag, MutationKind, MutationMode, MutationRecord,
@@ -4484,7 +4570,11 @@ mod tests {
             ("pending_blobs", PENDING_BLOBS),
             ("remote_object_versions", REMOTE_OBJECT_VERSIONS),
         ] {
-            let table = read.open_table(definition).unwrap();
+            let table = match read.open_table(definition) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => continue,
+                Err(error) => panic!("failed to inspect journal table {name}: {error}"),
+            };
             for entry in table.iter().unwrap() {
                 let (key, value) = entry.unwrap();
                 contents.insert(
@@ -4579,6 +4669,88 @@ mod tests {
     #[test]
     fn an_existing_journal_with_malformed_identity_keeps_its_watermarks_and_payloads() {
         assert_damaged_identity_is_preserved(Some(&[0xff]));
+    }
+
+    fn assert_inconsistent_watermarks_are_preserved(
+        local_seq: u64,
+        remote_seq: u64,
+        missing_auxiliary_table: bool,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let first = journal
+            .commit_put(put_record(1, "segments/1", b"first"), b"first")
+            .unwrap();
+        let second = journal
+            .commit_put(put_record(2, "segments/2", b"second"), b"second")
+            .unwrap();
+        let blobs = [blob_file(&journal, &first), blob_file(&journal, &second)];
+        let contents = blobs.each_ref().map(|path| fs::read(path).unwrap());
+        fs::write(root.join("tmp/unfinished"), b"temporary").unwrap();
+        fs::set_permissions(
+            root.join("tmp/unfinished"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let transaction = journal.database.begin_write().unwrap();
+        {
+            let mut meta = transaction.open_table(META).unwrap();
+            write_value(&mut meta, LOCAL_SEQ_KEY, &local_seq).unwrap();
+            write_value(&mut meta, REMOTE_SEQ_KEY, &remote_seq).unwrap();
+        }
+        if missing_auxiliary_table {
+            assert!(transaction.delete_table(REMOTE_OBJECT_VERSIONS).unwrap());
+        }
+        transaction.commit().unwrap();
+        let before = journal_tables(&journal.database);
+        drop(journal);
+
+        let error = Journal::open(&root, identity("bucket-a"))
+            .expect_err("contradictory journal watermarks require an operator");
+        assert_eq!(
+            crate::operator_required::ServerExit::of(error.as_ref()),
+            crate::operator_required::ServerExit::OperatorRequired,
+            "{error:#}"
+        );
+        for (path, expected) in blobs.iter().zip(contents) {
+            assert_eq!(
+                fs::read(path).expect("refusal must preserve acknowledged payloads"),
+                expected
+            );
+        }
+        assert_eq!(fs::read(root.join("tmp/unfinished")).unwrap(), b"temporary");
+        let database = Database::open(root.join("journal.redb")).unwrap();
+        assert_eq!(
+            journal_tables(&database),
+            before,
+            "refusal must happen before migrations or recovery mutate the journal"
+        );
+        if missing_auxiliary_table {
+            let read = database.begin_read().unwrap();
+            assert!(
+                matches!(
+                    read.open_table(REMOTE_OBJECT_VERSIONS),
+                    Err(redb::TableError::TableDoesNotExist(_))
+                ),
+                "refusal must not create auxiliary tables in a contradictory legacy journal"
+            );
+        }
+    }
+
+    #[test]
+    fn a_local_watermark_behind_committed_records_preserves_journal_state() {
+        assert_inconsistent_watermarks_are_preserved(1, 0, false);
+    }
+
+    #[test]
+    fn a_remote_watermark_ahead_of_local_preserves_journal_state() {
+        assert_inconsistent_watermarks_are_preserved(2, 3, false);
+    }
+
+    #[test]
+    fn a_contradictory_legacy_journal_is_not_migrated_before_refusal() {
+        assert_inconsistent_watermarks_are_preserved(1, 0, true);
     }
 
     /// A redb commit that trims surplus space makes its new header durable and
