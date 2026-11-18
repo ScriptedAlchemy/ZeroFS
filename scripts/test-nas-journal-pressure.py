@@ -329,7 +329,7 @@ class PressureFixture(Fixture):
         )
         self.event(writeback=settled, fsynced_bytes=len(expected) * FILE_MIB * MIB)
         self.storage_account()
-        self.stop_server()
+        self.cut_after_remote_drain()
 
         self.stage = "verify-destination-settlement"
         final = self.pool_status(offline=True)

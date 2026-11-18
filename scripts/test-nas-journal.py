@@ -312,6 +312,18 @@ class Fixture:
             f"engine exited unexpectedly: {code}",
         )
 
+    def cut_after_remote_drain(self):
+        # A graceful shutdown performs a new database flush. With local shutdown
+        # that flush can legitimately leave a new journal record for replay.
+        # Cut the service at the observed remote boundary, then check again offline.
+        def settled():
+            rows = self.metric_snapshot()
+            return rows if self.drained(rows) and not journal_payloads(self.journal) else None
+
+        rows = self.wait(settled)
+        self.stop_server(crash=True)
+        self.event(remote_cut_writeback=rows, exit_signal="SIGKILL")
+
     def wait(self, predicate):
         while True:
             self.remaining()
@@ -622,7 +634,7 @@ class Fixture:
         self.storage_account()
 
         self.stage = "offline-destination"
-        self.stop_server()
+        self.cut_after_remote_drain()
         final = self.pool_status(offline=True)
         distribution = {}
         for name, path in zip(MEMBERS, self.members):
