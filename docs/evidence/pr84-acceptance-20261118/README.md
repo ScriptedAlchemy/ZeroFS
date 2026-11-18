@@ -4,6 +4,12 @@ The engine is **not accepted for the NAS trial**. Kernel 9P empty replacement
 and immediate full-pool reuse remain unmet requirements. These receipts support
 separate, narrower outcomes; they do not complete the placement design.
 
+For the disposable NAS trial, Zack waived the extended SMART check on the
+18 TB WD (`3WH7H3BJ`) on November 18. The deployment owner reported SMART
+overall status PASSED, an extended self-test interrupted by host reset, and
+no self-test running at the time of the read. Engine and mounted-protocol
+qualification can proceed independently of that check.
+
 ## Source and executable
 
 Native host: `ubuntu-main`, x86_64, kernel `7.0.0-28-generic`. Containers used
