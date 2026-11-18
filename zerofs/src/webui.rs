@@ -1,3 +1,5 @@
+pub(crate) mod write_ack;
+
 use crate::config::WebUIConfig;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
@@ -1335,6 +1337,7 @@ fn serve_asset(path: &str) -> axum::response::Response {
 
 pub fn start(
     config: &WebUIConfig,
+    settings_router: Router,
     filesystem: Arc<ZeroFS>,
     lock_manager: Arc<FileLockManager>,
     rpc_service: AdminRpcServer,
@@ -1380,7 +1383,8 @@ pub fn start(
         // Static assets and SPA fallback
         .route("/{*path}", get(serve_spa))
         .route("/", get(serve_index))
-        .with_state(state);
+        .with_state(state)
+        .merge(settings_router);
 
     let mut handles = Vec::new();
     for &addr in &config.addresses {

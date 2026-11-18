@@ -1628,6 +1628,20 @@ pub async fn run_server(
     };
     let (settings, write_ack, memory_budget) =
         load_and_validate_server_settings(&config_path, access_mode)?;
+    #[cfg(feature = "webui")]
+    let write_ack_router = settings
+        .servers
+        .webui
+        .as_ref()
+        .map(|_| {
+            crate::webui::write_ack::router(
+                &config_path,
+                &settings,
+                write_ack,
+                access_mode == crate::writeback::config::WritebackAccessMode::ReadWrite,
+            )
+        })
+        .transpose()?;
     install_validated_rss_cap(memory_budget.as_ref());
 
     let db_mode = match &checkpoint_name {
@@ -1909,6 +1923,7 @@ pub async fn run_server(
             let webui_lock_manager = Arc::new(crate::ninep::lock_manager::FileLockManager::new());
             crate::webui::start(
                 webui_config,
+                write_ack_router.expect("configured WebUI settings route"),
                 Arc::clone(&fs),
                 webui_lock_manager,
                 webui_rpc_service,
@@ -2210,7 +2225,7 @@ fn load_and_validate_server_settings(
     crate::fs::mutation::config::FilesystemWriteAckSettings,
     Option<super::memory_budget::MemoryBudgetReceipt>,
 )> {
-    let settings = Settings::from_file(config_path)
+    let settings = Settings::from_runtime_file(config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
     settings
         .servers

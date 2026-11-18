@@ -513,7 +513,7 @@ fn gib(bytes: u64) -> f64 {
 }
 
 pub(crate) fn print_status(config: &Path) -> Result<()> {
-    let settings = Settings::from_file(config)?;
+    let settings = Settings::from_runtime_file(config)?;
     let receipt = validate_server_startup(&settings)?;
     println!("{}", serde_json::to_string_pretty(&receipt)?);
     Ok(())

@@ -503,8 +503,18 @@ fn bounded_journal_keeps_an_independent_budget_and_rejects_shape_changes() {
         receipt.required_bytes + (512 << 20)
     );
     assert!(ram_receipt.stored_state_qualification.is_none());
+    let minimum = ram_ack.replace("0.268435456", "0.016777216").replace(
+        "volatile_max_operations = 2048",
+        "volatile_max_operations = 1",
+    );
+    assert_eq!(
+        admission(temp.path(), &minimum).unwrap().required_bytes,
+        receipt.required_bytes + (32 << 20)
+    );
     for (before, after) in [
         ("0.268435456", "0.536870912"),
+        ("0.268435456", "0.016"),
+        ("0.268435456", "0.017"),
         (
             "volatile_max_operations = 2048",
             "volatile_max_operations = 2049",
