@@ -139,7 +139,7 @@ jobs:
 
           # Wait for ZeroFS to start
           echo "Waiting for ZeroFS to start..."
-          for i in {1..30}; do
+          for _ in {1..30}; do
             if nc -z 127.0.0.1 2049; then
               echo "ZeroFS is ready"
               break
@@ -318,7 +318,7 @@ jobs:
 
           # Wait for ZeroFS to start (9P runs on port 5564)
           echo "Waiting for ZeroFS 9P server to start..."
-          for i in {1..30}; do
+          for _ in {1..30}; do
             if nc -z 127.0.0.1 5564 2>/dev/null; then
               echo "ZeroFS 9P server is ready"
               break
@@ -481,7 +481,7 @@ jobs:
 
           # Wait for ZeroFS to start (9P runs on port 5564)
           echo "Waiting for ZeroFS 9P server to start..."
-          for i in {1..30}; do
+          for _ in {1..30}; do
             if nc -z 127.0.0.1 5564 2>/dev/null; then
               echo "ZeroFS 9P server is ready"
               break
@@ -504,7 +504,7 @@ jobs:
           sudo ./target/ci/zerofs mount --access all 127.0.0.1:5564 /mnt/zerofs-fuse &
 
           echo "Waiting for the FUSE mount..."
-          for i in {1..60}; do
+          for _ in {1..60}; do
             mountpoint -q /mnt/zerofs-fuse && break
             sleep 0.5
           done
