@@ -29,6 +29,7 @@ import sys
 import tempfile
 import time
 import tomllib
+from typing import NamedTuple
 
 
 sys.dont_write_bytecode = True
@@ -41,7 +42,9 @@ METRICS = (
     "remote_sequence",
     "dirty_ram_bytes",
     "dirty_ssd_reserved_bytes",
+    "dirty_ssd_capacity_bytes",
     "dirty_ssd_operations",
+    "ssd_admission_paced",
     "remote_bytes_completed_total",
     "retries_total",
     "terminal_error",
@@ -122,6 +125,14 @@ def loopback_addresses():
         return [
             f"127.0.0.1:{listener.getsockname()[1]}" for listener in (metrics, webui)
         ]
+
+
+class PreparedFixture(NamedTuple):
+    verify_config: Path
+    member_roots: tuple[Path, Path]
+    initial_writeback: dict
+    baseline_status: dict
+    baseline_accounting: dict
 
 
 class Fixture:
@@ -384,7 +395,9 @@ class Fixture:
             "catalog": self.root / "catalog",
             **dict(zip(MEMBERS, self.members)),
         }
-        self.event(accounting={role: account(path) for role, path in locations.items()})
+        snapshot = {role: account(path) for role, path in locations.items()}
+        self.event(accounting=snapshot)
+        return snapshot
 
     def ballast(self, parent):
         path = parent / "ballast"
@@ -439,9 +452,10 @@ class Fixture:
                 )
                 require(observed == digest, f"SHA-256 mismatch for {name}")
 
-    def run(self):
+    def prepare(self):
+        """Start the engine on empty destinations and capture the unloaded baseline."""
         self.root = self.owned_dir(self.args.scratch)
-        member_roots = [self.owned_dir(path) for path in self.args.member_mounts]
+        member_roots = tuple(self.owned_dir(path) for path in self.args.member_mounts)
         self.members = [root / "destination" for root in member_roots]
         self.cache = self.root / "cache"
         self.journal = self.root / "journal"
@@ -480,14 +494,18 @@ class Fixture:
         )
         self.event(writeback=status)
         baseline = self.pool_status()
-        member_start = {
-            name: account(path) for name, path in zip(MEMBERS, self.members)
-        }
         self.event(members=baseline)
-        self.storage_account()
+        accounting = self.storage_account()
+        return PreparedFixture(
+            verify_config, member_roots, status, baseline, accounting
+        )
+
+    def run(self):
+        prepared = self.prepare()
+        baseline = prepared.baseline_status
 
         self.stage = "hold"
-        ballast = [self.ballast(path) for path in member_roots]
+        ballast = [self.ballast(path) for path in prepared.member_roots]
         self.event(members=self.held(baseline))
         self.stage = "write-and-fsync"
         expected = {}
@@ -609,15 +627,16 @@ class Fixture:
         distribution = {}
         for name, path in zip(MEMBERS, self.members):
             physical = account(path)
+            initial = prepared.baseline_accounting[name]
             distribution[name] = {
                 "committed_bytes_delta": final[name]["used_bytes"]
                 - baseline[name]["used_bytes"],
                 "committed_objects_delta": final[name]["objects"]
                 - baseline[name]["objects"],
                 "allocated_bytes_delta": physical["allocated_bytes"]
-                - member_start[name]["allocated_bytes"],
+                - initial["allocated_bytes"],
                 "apparent_bytes_delta": physical["apparent_bytes"]
-                - member_start[name]["apparent_bytes"],
+                - initial["apparent_bytes"],
             }
         self.event(members=final, distribution=distribution)
         require(
@@ -646,7 +665,7 @@ class Fixture:
         )
 
         self.stage = "independent-read-only-verifier"
-        self.start_server(verify_config, read_only=True)
+        self.start_server(prepared.verify_config, read_only=True)
         self.verify_hashes(expected)
         self.stop_server()
         require(
@@ -671,8 +690,21 @@ class Fixture:
         self.receipt["cleanup_verified"] = True
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(
+    fixture_type=Fixture,
+    *,
+    configure_parser=None,
+    validate_args=None,
+    description=None,
+    argv=None,
+):
+    """Run a fixture subclass with shared argument handling, cleanup and receipts.
+
+    configure_parser(parser) can add scenario-specific arguments.
+    validate_args(parser, args) runs after shared paths and options are resolved.
+    A custom validator replaces the default workload size checks.
+    """
+    parser = argparse.ArgumentParser(description=description or __doc__)
     for flag in (
         "binary",
         "scratch",
@@ -688,24 +720,27 @@ def main():
     )
     parser.add_argument("--files", type=int, default=6)
     parser.add_argument("--file-mib", type=int, default=36)
-    args = parser.parse_args()
-    if not (
-        math.isfinite(args.timeout)
-        and 0 < args.timeout <= 1800
-        and 2 <= args.files <= 16
+    if configure_parser is not None:
+        configure_parser(parser)
+    args = parser.parse_args(argv)
+    if not (math.isfinite(args.timeout) and 0 < args.timeout <= 1800):
+        parser.error("expected a positive deadline up to 1800 s")
+    if validate_args is None and not (
+        2 <= args.files <= 16
         and 1 <= args.file_mib <= 64
         and args.files * args.file_mib <= 256
     ):
-        parser.error(
-            "expected a deadline up to 1800 s and 2–16 files of 1–64 MiB, up to 256 MiB total"
-        )
+        parser.error("expected 2–16 files of 1–64 MiB, up to 256 MiB total")
     for key, value in vars(args).items():
         if isinstance(value, Path):
             setattr(args, key, value.resolve())
     args.member_mounts = (args.member_a, args.member_b)
+    if validate_args is not None:
+        validate_args(parser, args)
     args.evidence.mkdir(mode=0o700)
     receipt = {
         "status": "failed",
+        "fixture": fixture_type.__name__,
         "timeline": [],
         "scope": "synthetic local tmpfs destinations, native userspace 9P2000.L file I/O",
         "accounting_scope": (
@@ -719,7 +754,7 @@ def main():
         "file_mib": args.file_mib,
         "kernel": os.uname().release,
     }
-    fixture = Fixture(args, receipt)
+    fixture = fixture_type(args, receipt)
 
     def interrupted(signum, _frame):
         raise TimeoutError(f"signal {signum} during {fixture.stage}")
