@@ -169,9 +169,9 @@ reserve_free_gb = {RESERVES[member] / 1e9:.9f}
     return config
 
 
-def append(path, digest, index):
+def append(path, digest, index, size=CHUNK):
     # Independently seeded incompressible chunks make quota pressure predictable.
-    body = random.Random(index).randbytes(CHUNK)
+    body = random.Random(index).randbytes(size)
     with path.open("ab") as file:
         assert file.write(body) == len(body)
         file.flush()
@@ -284,7 +284,7 @@ def sample_cgroup(phase):
     assert not any(int(events[key]) for key in ("oom", "oom_kill")), resources
 
 
-def render_nas_config(root, template, members, p3, *, held):
+def render_nas_config(root, template, members, p3, *, held_headroom=None):
     root.mkdir()
     (root / "mount").mkdir()
     manifest = tomllib.loads(template)
@@ -301,16 +301,16 @@ def render_nas_config(root, template, members, p3, *, held):
         assert round(member["capacity_gb"] * 1e9) == SIZES[member_id], member
         assert round(member["reserve_free_gb"] * 1e9) == normal, member
         replacements[member["url"]] = raw_url("raw+loop", members[member_id])
-        if held:
+        if held_headroom is not None:
             replacements[f"reserve_free_gb = {normal / 1e9:.9f}"] = (
-                f"reserve_free_gb = {(SIZES[member_id] - 256 * 1024) / 1e9:.9f}"
+                f"reserve_free_gb = {(SIZES[member_id] - held_headroom) / 1e9:.9f}"
             )
     for original, replacement in replacements.items():
         assert template.count(original) == 1, original
         template = template.replace(original, replacement, 1)
     rendered = root / "zerofs.toml"
     rendered.write_text(template)
-    record("runtime_manifest", phase=root.name, held_reserves=held, toml=template)
+    record("runtime_manifest", phase=root.name, held_headroom_bytes=held_headroom, toml=template)
     return rendered
 
 
@@ -370,12 +370,14 @@ def write_fsync_crash(path, server, body):
            signal=signal.SIGKILL)
 
 
-def qualify_nas_fit(root, members, memory_limit, p3):
+def qualify_nas_fit(root, members, memory_limit, p3, *, two_members):
     template = MANIFEST.read_text()
     record("manifest_source", sha256=hashlib.sha256(MANIFEST.read_bytes()).hexdigest())
     phases = ("initialize", "held_write", "held_replay", "destage", "destaged_cold")
+    headroom = 0 if two_members else 256 * 1024
+    payload_size = CHUNK if two_members else NAS_FIT_PAYLOAD
     configs = [render_nas_config(root / phase, template, members, p3,
-                                 held=phase in {"held_write", "held_replay"})
+                                 held_headroom=headroom if phase in {"held_write", "held_replay"} else None)
                for phase in phases]
     initial, held, replay, destage, cold = configs
     for config in (initial, held):
@@ -386,9 +388,12 @@ def qualify_nas_fit(root, members, memory_limit, p3):
     initialized = json.loads(run(ZEROFS, "pool", "init", "-c", initial))
     assert initialized["pool_id"] == p3[2] and initialized["mapped_objects"] == 0, initialized
     before, placements = snapshot(held, members, "held_before_write")
-    assert not placements and all(0 < m["available_bytes"] < NAS_FIT_PAYLOAD for m in before.values()), before
+    assert not placements, placements
+    for member in before.values():
+        assert 0 <= member["available_bytes"] <= headroom < payload_size, member
+    allocated = {key: binding[1].stat().st_blocks for key, binding in members.items()}
 
-    body = random.Random(0).randbytes(NAS_FIT_PAYLOAD)
+    body = random.Random(0).randbytes(payload_size)
     digest = hashlib.sha256(body)
     with mounted(held, crash=True) as (path, server):
         report_webui(held)
@@ -408,8 +413,13 @@ def qualify_nas_fit(root, members, memory_limit, p3):
         sample_cgroup("held_cold_replay")
     replayed = inspect_p3(p3, "held_cold_replay")
     assert replayed["journal_bytes"] > 0, replayed
-    _, placements = snapshot(replay, members, "held_cold_replay")
-    assert not placements, placements
+    replay_status, placements = snapshot(replay, members, "held_cold_replay")
+    assert not placements and all(replay_status[key]["space"] == m["space"]
+                                  for key, m in before.items()), replay_status
+    assert all(binding[1].stat().st_blocks == allocated[key] for key, binding in members.items())
+    record("held_payload_members_unchanged", available_bytes={
+        key: member["available_bytes"] for key, member in replay_status.items()
+    }, verified_zero_placements=True, verified_unchanged_physical_space=True)
 
     start = time.monotonic_ns()
     with mounted(destage) as (path, _):
@@ -422,6 +432,9 @@ def qualify_nas_fit(root, members, memory_limit, p3):
         sample_cgroup("after_destage")
     status, placed = snapshot(destage, members, "after_destage")
     assert placed and sum(entry["size"] for entry in placed.values()) >= len(body), placed
+    if two_members:
+        assert {entry["member_id"] for entry in placed.values()} == SIZES.keys(), placed
+        record("single_file_on_both_members", bytes=len(body), placements=list(placed.values()))
     for key, member in status.items():
         entries = [entry for entry in placed.values() if entry["member_id"] == key]
         physical_spent = (
@@ -441,7 +454,66 @@ def qualify_nas_fit(root, members, memory_limit, p3):
     assert roles["catalog_bytes"] > 0 and roles["authority_objects"] > 0, roles
     assert roles["keys_objects"] == 1 and roles["envelope_in_keys"], roles
     assert not roles["envelope_in_authority"] and roles["cache_objects"] == 0, roles
+    if two_members:
+        configs.extend(qualify_nas_spill(root, template, members, p3, digest, len(body), restarted))
     check_p3_shadows(root, configs)
+
+
+def qualify_nas_spill(root, template, members, p3, digest, initial_size, cross_member):
+    phases = ("fill_small", "spill_to_large", "spill_cold")
+    fill, spill, cold = configs = [
+        render_nas_config(root / phase, template, members, p3) for phase in phases
+    ]
+    payload_size = NAS_FIT_PAYLOAD
+    chunks = 0
+    with mounted(fill) as (path, _):
+        while chunks < 24:
+            append(path, digest, 1 + chunks, payload_size)
+            chunks += 1
+            run(ZEROFS, "flush", "-c", fill)
+            small = member_status("--endpoint", f"unix:{fill.parent / 'rpc.sock'}")["small"]
+            if small["available_bytes"] < payload_size:
+                break
+        else:
+            raise AssertionError("the smaller raw member did not reach the reserve")
+        verify(path, digest, initial_size + chunks * payload_size, "nas_fill_small")
+    before, at_reserve = snapshot(fill, members, "nas_reserve_boundary")
+    assert all(at_reserve.get(key) == entry for key, entry in cross_member.items()), at_reserve
+    small = before["small"]
+    floor = RESERVES["small"] + small["space"]["retirement_reserved_bytes"]
+    free = small["space"]["filesystem_free_bytes"]
+    assert small["capacity_bytes"] - small["used_bytes"] > payload_size, small
+    assert floor <= free < floor + payload_size, small
+    assert small["available_bytes"] == free - floor, small
+
+    with mounted(spill) as (path, _):
+        for _ in range(2):
+            append(path, digest, 1 + chunks, payload_size)
+            chunks += 1
+            run(ZEROFS, "flush", "-c", spill)
+        size = initial_size + chunks * payload_size
+        verify(path, digest, size, "nas_spill")
+    after, spilled = snapshot(spill, members, "nas_after_spill")
+    assert all(spilled.get(key) == entry for key, entry in at_reserve.items()), spilled
+    new = [entry for key, entry in spilled.items() if key not in at_reserve]
+    assert len(new) >= 2 and all(entry["member_id"] == "large" for entry in new), new
+    assert after["small"]["space"] == small["space"], after
+    assert after["small"]["used_bytes"] == small["used_bytes"], after
+    physical_spent = (before["large"]["space"]["filesystem_free_bytes"]
+                      - after["large"]["space"]["filesystem_free_bytes"])
+    assert physical_spent == sum(
+        RAW_BLOCK * (1 + (entry["size"] + RAW_BLOCK - 1) // RAW_BLOCK) for entry in new
+    ), (physical_spent, new)
+    record("nas_reserve_spill", smaller_allocatable_bytes=small["available_bytes"],
+           larger_raw_log_bytes=physical_spent, placements=new)
+
+    with mounted(cold) as (path, _):
+        verify(path, digest, size, "nas_spill_cold")
+        sample_cgroup("nas_spill_cold")
+    cold_status, restarted = snapshot(cold, members, "nas_spill_cold")
+    assert restarted == spilled, restarted
+    assert all(cold_status[key]["space"] == member["space"] for key, member in after.items())
+    return configs
 
 
 def qualify(root, members, memory_limit, p3):
@@ -565,8 +637,8 @@ def main():
             raise RuntimeError(f"missing parent-built Linux executable at {executable}")
     record("binaries", sha256=run("sha256sum", ZEROFS, PROBE).decode().splitlines())
     mode = os.environ["RAW_MOUNTED_MODE"]
-    assert mode in {"placement", "p3", "nas-fit"}, mode
-    nas_fit = mode == "nas-fit"
+    assert mode in {"placement", "p3", "nas-fit", "nas-fit-two-members"}, mode
+    nas_fit = mode.startswith("nas-fit")
     if nas_fit:
         sample_cgroup("start")
     with tempfile.TemporaryDirectory(dir="/dev/shm", prefix="zerofs-mounted-") as scratch:
@@ -597,7 +669,7 @@ def main():
             p3 = members.pop("p3", None)
             check_member_bindings(members)
             if nas_fit:
-                qualify_nas_fit(root, members, expected_memory, p3)
+                qualify_nas_fit(root, members, expected_memory, p3, two_members=mode == "nas-fit-two-members")
             else:
                 qualify(root, members, expected_memory, p3)
         assert all(not disk.exists() for disk in disks) and not nodes.exists()

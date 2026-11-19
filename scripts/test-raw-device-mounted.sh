@@ -10,13 +10,14 @@ mode=placement
 case ${1:-} in
     --p3) mode=p3; shift ;;
     --nas-fit) mode=nas-fit; shift ;;
+    --nas-fit-two-members) mode=nas-fit-two-members; shift ;;
 esac
 if [[ $# != 1 || ! -f $1/zerofs || ! -x $1/zerofs ||
       ! -f $1/zerofs-raw-device || ! -x $1/zerofs-raw-device ]]; then
-    echo "Usage: $0 [--spark] [--p3|--nas-fit] LINUX_EXECUTABLE_DIRECTORY" >&2
+    echo "Usage: $0 [--spark] [--p3|--nas-fit|--nas-fit-two-members] LINUX_EXECUTABLE_DIRECTORY" >&2
     exit 2
 fi
-if [[ $mode == nas-fit && ($suite != spark || ! -r $1/memory_raw_fixture.toml) ]]; then
+if [[ $mode == nas-fit* && ($suite != spark || ! -r $1/memory_raw_fixture.toml) ]]; then
     echo 'NAS-fit requires --spark and the pinned memory_raw_fixture.toml alongside the executables' >&2
     exit 2
 fi
@@ -41,7 +42,7 @@ if [[ $suite == spark ]]; then
     fi
     memory=44g
     memory_bytes=$((44 * 1024 ** 3))
-    if [[ $mode == nas-fit ]]; then
+    if [[ $mode == nas-fit* ]]; then
         memory=8g
         memory_bytes=$((8 * 1024 ** 3))
     fi

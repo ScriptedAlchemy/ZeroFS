@@ -97,3 +97,33 @@ trailing segment that fit below the held headroom. The passing retry used
 2 MiB to keep the encoded write below the seal threshold and retained the
 original held reserves. The receipts include the fixture's synthetic
 encryption password as part of the exact rendered manifest.
+
+## P3 NAS-fit same-file placement on both members
+
+[The two-member Spark run](spark-nas-fit-two-members-98e0081f-attempt-1.log)
+reused the exact `98e0081f` engine, probe, manifest and 8 GiB zero-swap
+cgroup. Each held reserve equaled its member's physical capacity. Both
+members consequently reported zero allocatable bytes. The 4 MiB FUSE write
+returned in 17.55 ms. Fsync took 32.25 ms and SIGKILL followed in 0.090 ms.
+After the kill and after the cold FUSE replay, the offline catalog remained
+empty and both members' raw free space and backing allocations matched the
+pre-write baseline. The held, destaged and cold destaged reads matched file
+SHA-256 `5a03416c32283454144268694d3046a63130e298b566f8ad6052cd70a6a7d1d1`.
+
+After reserves were restored, the administrative drain barrier returned in
+4.53 ms after mount readiness. Offline probe reads verified the two raw
+bodies by key and SHA-256. The large member held 4,315,998 bytes at key
+suffix `2bee288d-2008-402e-a0d9-6cf69d412703`; the small member held
+33,075 bytes at `e98866ba-b95c-449f-8a0c-c711087b6ea7`. The full keys and raw
+digests are in the receipt. The same file was extended until the smaller
+member had 1,429,504 allocatable bytes. It then accepted two more mounted
+appends through the larger member only, consuming 4,366,336 physical raw-log
+bytes on that member. The smaller member's space and existing placements
+stayed unchanged. A final cold mount read 35,651,584 bytes with SHA-256
+`e1cf4c8f1fcb45130998e80bdf3b359f4c3c1d7f25ef11deaf43afa7728023d1`,
+and the offline catalog and probe hashes matched the post-spill snapshot.
+
+The full fixture peaked at 716,378,112 bytes (683.2 MiB), with zero swap,
+memory limit events or OOMs. Its two-CPU quota recorded eight throttled
+periods. All seven mounts, three loop mappings, the container, and the
+transfer and scratch directories were removed.
