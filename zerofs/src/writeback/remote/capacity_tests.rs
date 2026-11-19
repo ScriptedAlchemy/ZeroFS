@@ -2,6 +2,7 @@ use super::*;
 use crate::retrying_object_store::{CapacityError, PermanentError, RetryingObjectStore};
 use crate::writeback::journaler::LocalJournaler;
 use crate::writeback::model::JournalIdentity;
+use crate::writeback::test_util::assert_journal_payload;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use object_store::{CopyOptions, ListResult, ObjectMeta, RenameOptions};
@@ -198,7 +199,7 @@ async fn full_pool_drain_keeps_queued_payload_and_recovers_without_restart() {
     .expect("the journal must retry a full pool");
     assert!(scheduler.terminal_error().is_none());
     assert_eq!(journal.progress().unwrap().remote_seq, 0);
-    assert_eq!(journal.read_blob(1).unwrap(), payload);
+    assert_journal_payload(&journal, 1, &payload);
     assert_eq!(ssd.used_bytes(), reservation.ssd_reservation_bytes);
 
     backend.full.store(false, Ordering::SeqCst);

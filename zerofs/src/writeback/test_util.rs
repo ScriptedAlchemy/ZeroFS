@@ -113,6 +113,21 @@ impl WriteAdmissionTestControl {
     }
 }
 
+#[track_caller]
+pub(super) fn assert_journal_payload(
+    journal: &super::journal::Journal,
+    sequence: u64,
+    expected: &[u8],
+) {
+    assert_eq!(
+        journal
+            .read_blob_bounded(sequence, expected.len() as u64)
+            .unwrap(),
+        expected,
+        "journal payload at sequence {sequence}",
+    );
+}
+
 /// Build a `Put` `MutationRecord`.
 ///
 /// `operation_id_base` and `accepted_at_base_ms` are added to `sequence` to
