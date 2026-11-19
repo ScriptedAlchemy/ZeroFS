@@ -68,8 +68,8 @@ def require_fuse():
         raise RuntimeError("FUSE device is unavailable in the isolated Docker container") from error
 
 
-def wait_for(predicate, process):
-    deadline = time.monotonic() + 40
+def wait_for(predicate, process, timeout=40):
+    deadline = time.monotonic() + timeout
     while not predicate():
         if process.poll() is not None:
             raise RuntimeError(f"{process.args[:2]} exited with {process.returncode}")
@@ -92,7 +92,7 @@ def stop(process, expected=0):
 
 
 @contextmanager
-def mounted(config, *, crash=False):
+def mounted(config, *, crash=False, startup_timeout=40):
     root = config.parent
     mount = root / "mount"
     endpoint = root / "ninep.sock"
@@ -101,14 +101,14 @@ def mounted(config, *, crash=False):
             with ExitStack() as cleanup:
                 server = subprocess.Popen([ZEROFS, "run", "-c", config], stdout=log, stderr=log)
                 cleanup.callback(stop, server, -signal.SIGKILL if crash else 0)
-                wait_for(endpoint.exists, server)
+                wait_for(endpoint.exists, server, startup_timeout)
                 client = subprocess.Popen(
                     [ZEROFS, "mount", "--writeback", "false", "--relaxed-consistency", "false",
                      "--reconnect-timeout", "1", f"unix:{endpoint}", mount],
                     stdout=log, stderr=log,
                 )
                 cleanup.callback(stop, client)
-                wait_for(lambda: os.path.ismount(mount), client)
+                wait_for(lambda: os.path.ismount(mount), client, startup_timeout)
                 mountinfo = Path("/proc/self/mountinfo").read_text().splitlines()
                 types = [line.split(" - ")[1].split()[0] for line in mountinfo
                          if line.split()[4] == str(mount)]
