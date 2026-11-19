@@ -1492,17 +1492,10 @@ impl ExtentStore {
         let mut tail: Option<Bytes> = None;
         for extent_idx in start_extent..=end_extent {
             let extent_start = extent_idx * EXTENT_SIZE as u64;
-            let extent_end = extent_start + EXTENT_SIZE as u64;
-            let write_start = if offset > extent_start {
-                (offset - extent_start) as usize
-            } else {
-                0
-            };
-            let write_end = if end_offset < extent_end {
-                (end_offset - extent_start) as usize
-            } else {
-                EXTENT_SIZE
-            };
+            // The final extent's mathematical end is 2^64. Relative bounds
+            // keep a valid write ending at u64::MAX representable.
+            let write_start = offset.saturating_sub(extent_start) as usize;
+            let write_end = (end_offset - extent_start).min(EXTENT_SIZE as u64) as usize;
             let write_len = write_end - write_start;
             let extent: Bytes = if write_start == 0 && write_end == EXTENT_SIZE {
                 data.slice(data_offset..data_offset + write_len)
@@ -1602,23 +1595,14 @@ impl ExtentStore {
         let mut edits: Vec<(u64, Option<Bytes>)> = Vec::new();
         for extent_idx in start_extent..=end_extent {
             let extent_start = extent_idx * EXTENT_SIZE as u64;
-            let extent_end = extent_start + EXTENT_SIZE as u64;
             if extent_start >= file_size {
                 continue;
             }
-            if offset <= extent_start && end_offset >= extent_end {
+            let zero_start = offset.saturating_sub(extent_start) as usize;
+            let zero_end = (end_offset - extent_start).min(EXTENT_SIZE as u64) as usize;
+            if zero_start == 0 && zero_end == EXTENT_SIZE {
                 edits.push((extent_idx, None));
             } else if let Some(existing_data) = self.get(id, extent_idx).await? {
-                let zero_start = if offset > extent_start {
-                    (offset - extent_start) as usize
-                } else {
-                    0
-                };
-                let zero_end = if end_offset < extent_end {
-                    (end_offset - extent_start) as usize
-                } else {
-                    EXTENT_SIZE
-                };
                 let mut extent_data = BytesMut::from(existing_data.as_ref());
                 extent_data[zero_start..zero_end].fill(0);
                 if extent_data.as_ref() == ZERO_EXTENT {
@@ -2262,6 +2246,71 @@ mod tests {
             live1 + ext1_len,
             "total - live is the dead-frame bytes (the fragmentation denominator)"
         );
+    }
+
+    #[tokio::test]
+    async fn sparse_final_extent_preserves_write_zero_and_truncate_bytes() {
+        let (store, db, objects) = make_with_compression(CompressionConfig::Lz4).await;
+        let offset = u64::MAX - 8;
+        write_committed(&store, &db, 1, offset, &Bytes::from_static(b"01234567"), 0).await;
+        assert_eq!(
+            store.read(1, offset - 2, 10).await.unwrap().as_ref(),
+            b"\0\001234567"
+        );
+        write_committed(
+            &store,
+            &db,
+            1,
+            u64::MAX - 4,
+            &Bytes::from_static(b"XY"),
+            u64::MAX,
+        )
+        .await;
+        assert_eq!(
+            store.read(1, offset, 8).await.unwrap().as_ref(),
+            b"0123XY67"
+        );
+
+        let mut zero = db.new_transaction().unwrap();
+        store
+            .zero_range(&mut zero, 1, u64::MAX - 6, 3, u64::MAX)
+            .await
+            .unwrap();
+        commit(&store, zero).await;
+        assert_eq!(
+            store.read(1, offset, 8).await.unwrap().as_ref(),
+            b"01\0\0\0Y67"
+        );
+
+        let mut truncate = db.new_transaction().unwrap();
+        store
+            .truncate(&mut truncate, 1, u64::MAX, u64::MAX - 2)
+            .await
+            .unwrap();
+        commit(&store, truncate).await;
+        assert_eq!(
+            store.read(1, offset, 8).await.unwrap().as_ref(),
+            b"01\0\0\0Y\0\0"
+        );
+        write_committed(
+            &store,
+            &db,
+            1,
+            u64::MAX - 2,
+            &Bytes::from_static(b"AB"),
+            u64::MAX - 2,
+        )
+        .await;
+        store.seal_open().await.unwrap();
+        let cold = make_store(objects, db, CompressionConfig::Lz4, 8);
+        assert_eq!(
+            cold.read(1, offset, 8).await.unwrap().as_ref(),
+            b"01\0\0\0YAB"
+        );
+        assert!(matches!(
+            cold.read(1, u64::MAX, 1).await,
+            Err(FsError::InvalidArgument)
+        ));
     }
 
     #[tokio::test]

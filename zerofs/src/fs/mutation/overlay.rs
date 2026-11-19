@@ -1585,6 +1585,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn volatile_write_at_maximum_file_size_materializes() {
+        let mut fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.write_ack = volatile_settings();
+        let fs = Arc::new(fs);
+        fs.install_volatile_overlay();
+        let auth = crate::fs::types::AuthContext::from(&test_creds());
+        let file = fs.create_exclusive(&auth, 0, b"last-extent").await.unwrap();
+        let release = fs
+            .materializer
+            .get()
+            .unwrap()
+            .hold_inode_lane_for_test(file)
+            .await;
+        let attrs = fs
+            .write_ack(&auth, file, u64::MAX - 4, &Bytes::from_static(b"edge"))
+            .await
+            .unwrap();
+        assert_eq!(attrs.size, u64::MAX);
+        let cutoff = fs.capture_mutation_cutoff();
+        assert_eq!(
+            fs.read_file(&auth, file, u64::MAX - 6, 6).await.unwrap(),
+            (Bytes::from_static(b"\0\0edge"), true)
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            fs.materialize_through_cutoff(cutoff),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        fs.quiesce_overlay_inode(file).await.unwrap();
+        assert_eq!(
+            fs.read_file(&auth, file, u64::MAX - 4, 4).await.unwrap(),
+            (Bytes::from_static(b"edge"), true)
+        );
+        fs.write_ack(&auth, file, u64::MAX - 1, &Bytes::from_static(b"!"))
+            .await
+            .unwrap();
+        fs.quiesce_overlay_inode(file).await.unwrap();
+        assert_eq!(
+            fs.read_file(&auth, file, u64::MAX - 4, 4).await.unwrap(),
+            (Bytes::from_static(b"edg!"), true)
+        );
+    }
+
+    #[tokio::test]
     async fn empty_volatile_write_preserves_metadata_and_replay() {
         use crate::fs::types::{InodeWithId, SetAttributes, SetMode, SetTime, Timestamp};
 
