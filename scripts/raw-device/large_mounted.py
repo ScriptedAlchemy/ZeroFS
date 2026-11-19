@@ -418,15 +418,26 @@ def verify_members(devices, baseline, final, entries):
                non_catalog_key=outside_catalog[0])
 
 
-def check_readiness(configuration, pool, phase, *, drained=False):
-    result = json.loads(command(ZEROFS, "pool", "verify-raw", "-c", configuration))
+def check_readiness(configuration, pool, phase, *, drained=False, held=False):
+    result = json.loads(command(ZEROFS, "pool", "verify-raw", "-c", configuration, timeout=300))
     assert result["pool_id"] == pool and result["profile"] == "raw-device-p3-nas-fit-v1", result
     assert all(result[f"{key}_verified"] for key in ("authority", "catalog", "key_envelope", "journal")), result
     assert result["memory"]["included_companion_bytes"] == COMPANION, result
     assert result["memory"]["hard_limit_bytes"] == MEMORY_LIMIT, result
+    allocation = result["journal_allocation"]
+    assert allocation["region_data_capacity_bytes"] == JOURNAL_RESIZE_CEILING + JOURNAL_PHYSICAL_RESERVE
+    assert allocation["resize_ceiling_bytes"] == JOURNAL_RESIZE_CEILING
+    assert allocation["physical_reserve_bytes"] == JOURNAL_PHYSICAL_RESERVE
+    allocated_pages_bytes = allocation["allocated_pages"] * allocation["page_size_bytes"]
+    assert 0 < allocated_pages_bytes <= allocation["database_length_bytes"] <= JOURNAL_RESIZE_CEILING
+    if held:
+        assert 0 < result["remote_seq"] < result["local_seq"], result
+        assert PAYLOAD <= allocation["dirty_blob_bytes"] <= allocation["stored_key_value_bytes"]
+        assert allocation["dirty_blob_bytes"] + allocation["dirty_metadata_reserved_bytes"] <= JOURNAL_BUDGET
     if drained:
         assert 0 < result["local_seq"] == result["remote_seq"], result
-    record("offline_readiness", phase=phase, **result)
+        assert allocation["dirty_blob_bytes"] == allocation["dirty_metadata_reserved_bytes"] == 0
+    record("offline_readiness", phase=phase, allocated_pages_bytes=allocated_pages_bytes, **result)
 
 
 @contextmanager
@@ -513,6 +524,7 @@ def qualify(root, devices, source, empty_headers):
     post_replay, replayed_entries = snapshot(configs["held_replay"], "after_held_restart")
     assert not replayed_entries
     assert all(post_replay[m]["space"] == baseline[m]["space"] for m in baseline)
+    check_readiness(configs["held_replay"], devices["p3"][2], "after_held_restart", held=True)
 
     second_hash = source_file(source, seed=1)
     assert second_hash != first_hash
@@ -570,6 +582,7 @@ def main():
     record("fixture_limits", cgroup_bytes=MEMORY_LIMIT, app_companion_allowance_bytes=COMPANION,
            swap_bytes=0, media_and_source_preallocation_bytes=required, host_free_bytes=free,
            binaries=command("sha256sum", ZEROFS, PROBE).decode().splitlines())
+    start_events = keyed_lines(CGROUP / "memory.events")
     sample_cgroup("start")
     with mmap.mmap(-1, COMPANION, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS) as companion:
         ones = b"\x01" * MIB
@@ -577,10 +590,10 @@ def main():
             companion[offset:offset + MIB] = ones
         assert keyed_lines(CGROUP / "memory.stat")["anon"] >= COMPANION
         sample_cgroup("companion_resident")
-        run_fixture()
+        run_fixture(start_events)
 
 
-def run_fixture():
+def run_fixture(start_events):
     with tempfile.TemporaryDirectory(dir=VOLUME, prefix="fixture-") as scratch, \
          tempfile.TemporaryDirectory(dir="/dev", prefix="zerofs-large-") as node_dir:
         root, nodes = Path(scratch), Path(node_dir)
@@ -618,11 +631,13 @@ def run_fixture():
     peak = int((CGROUP / "memory.peak").read_text())
     assert peak > 0, peak
     sample_cgroup("cleaned")
+    end_events = keyed_lines(CGROUP / "memory.events")
     record("large_raw_pass", scratch=str(root), nodes=str(nodes), runtime=str(run_root),
            exact_paths_removed=True, owned_loop_mappings_autocleared=len(SIZES),
            cgroup_peak_bytes=peak, cgroup_max_bytes=MEMORY_LIMIT,
            cgroup_headroom_at_peak_bytes=max(0, MEMORY_LIMIT - peak),
-           cgroup_peak_over_max_bytes=max(0, peak - MEMORY_LIMIT))
+           cgroup_peak_over_max_bytes=max(0, peak - MEMORY_LIMIT),
+           cgroup_memory_events_delta={k: end_events[k] - start_events[k] for k in end_events})
 
 
 if __name__ == "__main__":
