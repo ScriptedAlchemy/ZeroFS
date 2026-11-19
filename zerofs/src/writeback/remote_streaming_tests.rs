@@ -915,6 +915,59 @@ async fn remote_replay_at_the_window_boundary_keeps_atomic_put_semantics() {
 }
 
 #[tokio::test]
+async fn remote_small_replay_rejects_corrupt_journal_before_put() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    for truncate in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(temp.path().join("journal"), identity()).unwrap());
+        let payload = b"verified journal payload";
+        let record = crate::writeback::test_util::put_record(
+            1,
+            "small-object",
+            payload,
+            MutationMode::Create,
+            FenceClass::Fence,
+            0x1000,
+            1_786_435_200_000,
+        );
+        let record = journal.commit_put(record, payload).unwrap();
+        let (relative, slice) = record.blob_path().unwrap().split_once('#').unwrap();
+        let (offset, _) = slice.split_once('+').unwrap();
+        let offset = offset.parse::<u64>().unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(journal.root().join(relative))
+            .unwrap();
+        if truncate {
+            file.set_len(offset + payload.len() as u64 - 1).unwrap();
+        } else {
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            file.write_all(b"X").unwrap();
+        }
+        let remote_root = temp.path().join("remote");
+        std::fs::create_dir(&remote_root).unwrap();
+        let store = Arc::new(RecordingMultipartStore {
+            inner: Arc::new(LocalFileSystem::new_with_prefix(&remote_root).unwrap()),
+            put_opts_calls: AtomicUsize::new(0),
+            multipart_calls: AtomicUsize::new(0),
+            part_sizes: Arc::new(Mutex::new(Vec::new())),
+        });
+
+        let error = apply_record_with_tracked_cleanup(store.clone(), Arc::clone(&journal), record)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("mismatch"), "{error}");
+        assert_eq!(store.put_opts_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.multipart_calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            store.inner.head(&Path::from("small-object")).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+    }
+}
+
+#[tokio::test]
 async fn large_generated_create_preserves_writer_landing_at_multipart_complete() {
     let temp = tempfile::tempdir().unwrap();
     let journal = Arc::new(Journal::open(temp.path().join("journal"), identity()).unwrap());
