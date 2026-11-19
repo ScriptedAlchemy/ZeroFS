@@ -1,0 +1,120 @@
+Engine, probe and manifest provenance: exact Git archive 98e0081f33c63f66c5e91706c87bb231a26efc6d
+Spark command: scripts/test-raw-device-mounted.sh --spark --nas-fit-loss OWNED_TRANSFER_DIRECTORY/bin, 8192 MiB zero swap
+8d65f2e82af9f5e292e2f48c56c4e6a72cebd3d291fe2a8659b804dfb58161ba  zerofs
+19537c5d12ae1258c4639bbf963d7b1c365050b710ff28b9d9ef030331b13e12  zerofs-raw-device
+85bbf01684e6b4cd0ac6705121b6f4e54c37d9426b701a3be0875665da42362e  memory_raw_fixture.toml
+zerofs: OK
+zerofs-raw-device: OK
+memory_raw_fixture.toml: OK
+Docker host: gx10-6a8d aarch64 130594021376 (unix:///var/run/docker.sock)
+Docker image: linux/arm64 sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea rust@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
+{"case": "container_limits", "memory.max": 8589934592, "memory.swap.max": 0}
+{"case": "binaries", "sha256": ["8d65f2e82af9f5e292e2f48c56c4e6a72cebd3d291fe2a8659b804dfb58161ba  /input/zerofs", "19537c5d12ae1258c4639bbf963d7b1c365050b710ff28b9d9ef030331b13e12  /input/zerofs-raw-device"]}
+{"case": "cgroup_sample", "cpu.max": "200000 100000", "cpu.stat": "usage_usec 267670\nuser_usec 181776\nsystem_usec 85894\nnice_usec 0\ncore_sched.force_idle_usec 0\nnr_periods 3\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0", "memory.current": 29589504, "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\nsock_throttled 0", "memory.max": 8589934592, "memory.peak": 30052352, "memory.swap.current": 0, "memory.swap.max": 0, "phase": "start"}
+{"backing": "/dev/shm/zerofs-raw-4nsgm4rb/media-0", "backing_device": 133, "backing_inode": 5, "case": "initialized_loop", "loop_major": 7, "loop_minor": 11, "member": "small", "member_uuid": "791d6cf6-ae61-46f9-9524-d9ccfe9661f7", "node": "/dev/zerofs-raw-gaqo36d4/loop11", "pool_uuid": "32d9855b-bca7-468a-873d-528e301beb0d", "size_bytes": 33554432}
+{"backing": "/dev/shm/zerofs-raw-4nsgm4rb/media-1", "backing_device": 133, "backing_inode": 6, "case": "initialized_loop", "loop_major": 7, "loop_minor": 12, "member": "large", "member_uuid": "7b9ebf2d-c5d3-46d0-b986-97eb266df822", "node": "/dev/zerofs-raw-gaqo36d4/loop12", "pool_uuid": "32d9855b-bca7-468a-873d-528e301beb0d", "size_bytes": 100663296}
+{"backing": "/dev/shm/zerofs-raw-4nsgm4rb/media-2", "backing_device": 133, "backing_inode": 7, "case": "initialized_loop", "loop_major": 7, "loop_minor": 13, "member": "p3", "member_uuid": "33e2ccd1-4c00-4034-a372-8daf3b4a0cbf", "node": "/dev/zerofs-raw-gaqo36d4/loop13", "pool_uuid": "32d9855b-bca7-468a-873d-528e301beb0d", "size_bytes": 268435456}
+{"case": "rejected_loop_binding", "error": "loop backing identity mismatch", "member": "small", "substituted": "backing inode"}
+{"case": "rejected_loop_binding", "error": "device label binding mismatch (member): expected pool 32d9855b-bca7-468a-873d-528e301beb0d member 7b9ebf2d-c5d3-46d0-b986-97eb266df822 role data, label has pool 32d9855b-bca7-468a-873d-528e301beb0d member 791d6cf6-ae61-46f9-9524-d9ccfe9661f7 role data", "member": "small", "substituted": "member UUID"}
+{"case": "runtime_manifest", "held_headroom_bytes": null, "phase": "service", "toml": "[runtime]\nprofile = \"raw-device-p3-candidate-v1\"\n\n[cache]\ndir = \"/dev/shm/zerofs-mounted-mbaebt_n/service/unused-clean-cache\"\ndisk_size_gb = 0.0\nmemory_size_gb = 0.064\nwarm_metadata = \"off\"\n\n[storage]\nurl = \"raw+p3-v2:///dev/zerofs-raw-gaqo36d4/loop13?backing=%2Fdev%2Fshm%2Fzerofs-raw-4nsgm4rb%2Fmedia-2&pool=32d9855b-bca7-468a-873d-528e301beb0d&member=33e2ccd1-4c00-4034-a372-8daf3b4a0cbf&layout_mib=96%2C32%2C88%2C8%2C16%2C16\"\nencryption_password = \"disposable-raw-mounted-fixture\"\n\n[storage.pool]\nsegment_placement = \"round_robin_local\"\n\n[[storage.pool.members]]\nid = \"small\"\nurl = \"raw+loop:///dev/zerofs-raw-gaqo36d4/loop11?backing=%2Fdev%2Fshm%2Fzerofs-raw-4nsgm4rb%2Fmedia-0&pool=32d9855b-bca7-468a-873d-528e301beb0d&member=791d6cf6-ae61-46f9-9524-d9ccfe9661f7\"\ncapacity_gb = 0.033554432\nreserve_free_gb = 0.016777216\n\n[[storage.pool.members]]\nid = \"large\"\nurl = \"raw+loop:///dev/zerofs-raw-gaqo36d4/loop12?backing=%2Fdev%2Fshm%2Fzerofs-raw-4nsgm4rb%2Fmedia-1&pool=32d9855b-bca7-468a-873d-528e301beb0d&member=7b9ebf2d-c5d3-46d0-b986-97eb266df822\"\ncapacity_gb = 0.100663296\nreserve_free_gb = 0.008388608\n\n[writeback]\nenabled = true\ndir = \"/dev/shm/zerofs-mounted-mbaebt_n/service/unused-directory-journal\"\nack_mode = \"memory\"\nmemory_size_gb = 0.008388608\ndisk_size_gb = 0.016777216\nmin_free_gb = 0.008388608\nlocal_concurrency = 1\nupload_concurrency = 2\nshutdown_flush = \"local\"\n\n[filesystem]\nname_mode = \"insensitive\"\ncompression = \"lz4\"\nignore_fsync = false\nwrite_ack_mode = \"volatile_memory\"\nvolatile_memory_gb = 0.016777216\nvolatile_max_operations = 128\n\n[servers.ninep]\nunix_socket = \"/dev/shm/zerofs-mounted-mbaebt_n/service/ninep.sock\"\n\n[servers.rpc]\nunix_socket = \"/dev/shm/zerofs-mounted-mbaebt_n/service/rpc.sock\"\n\n[servers.webui]\naddresses = [\"127.0.0.1:8080\"]\nuid = 1000\ngid = 1000\n\n[telemetry]\nenabled = false\n"}
+{"accounting": "memory_policy=raw-device-p3-candidate-v1 reason=synthetic raw geometry candidate; end-to-end peak and event qualification pending; clean_cache_bytes=100663296 source=resolved cache split with three 32 MiB floors; object_writeback_bytes=8388608 source=resolved writeback RAM or disabled; volatile_write_bytes=33554432 source=resolved shared write-ack setting times two ownership stages; direct_segment_bytes=209715200 source=selected store geometry (open plus retained segments); unmodeled_residency_reserve_bytes=5771362304 source=directory package baseline input plus 2 GiB provisional raw recovery/index allowance; computed from ci+webui package-baseline-ci-limit64g-cache0.001-wb0-jobs8-primary/samples.jsonl; R=ceil64MiB(1.10*3241541632); H=ceil64MiB(0.15*3241541632+1.25*137129984); engine_headroom_bytes=1744830464 source=baseline kernel/allocator input plus 1 GiB provisional companion and loop-backing allowance; computed from ci+webui package-baseline-ci-limit64g-cache0.001-wb0-jobs8-primary/samples.jsonl; R=ceil64MiB(1.10*3241541632); H=ceil64MiB(0.15*3241541632+1.25*137129984); hard_limit_source=/sys/fs/cgroup/memory.max; companion_allowance_bytes=1073741824 included in headroom; clean_cache_disk_bytes=0; stored_state_qualification=unavailable for selected policy", "case": "memory_admission", "hard_limit_bytes": 8589934592, "phase": "service", "remaining_bytes": 721420288, "required_bytes": 7868514304, "rss_pressure_cap_bytes": 6845104128, "stored_state_qualification": null}
+{"case": "mounted", "filesystem_type": "fuse", "phase": "service", "transport": "userspace-fuse"}
+{"case": "unmounted", "phase": "service"}
+{"backing_allocated_bytes": {"large": 16384, "small": 2129920}, "case": "catalog_and_raw_objects", "phase": "payload-0", "placements": [{"location": "db/segments/01/0000000000000001/0000000000000001", "member_id": "small", "physical_key": ".zerofs-pool/32d9855b-bca7-468a-873d-528e301beb0d/objects/609d109f-5926-4d54-88d6-e00d891fb4a1", "raw_object_sha256": "f9a3db6b00a397a6ab4f71502e4f47c9c0a2e5825868254ed949e9ba25bfeb24", "size": 2109369}], "status": {"large": {"available_bytes": 92254208, "capacity_bytes": 100663296, "cleanup_debts": 0, "evacuation": "not_quarantined", "evacuation_capacity": {"available_bytes": 106893312, "required_bytes": 0, "reserved_destination_bytes": 0, "sufficient": true, "unavailable_members": []}, "health": {"crc_increases": 0, "evacuation_error": null, "kernel_coverage": null, "kernel_cursor": null, "last_sample": null, "monitoring_error": null, "observed_ms": null, "quarantine": null, "since_ms": null, "warning": null}, "id": "large", "objects": 0, "pending_uploads": 0, "readable_evacuated": false, "reserved_bytes": 0, "safe_to_pull_with_known_loss": false, "safe_to_remove": false, "space": {"declared_exceeds_filesystem": false, "filesystem_free_bytes": 100646912, "filesystem_total_bytes": 100663296, "full": null, "retirement_reserved_bytes": 4096}, "unreadable_objects": 0, "used_bytes": 0}, "small": {"available_bytes": 14639104, "capacity_bytes": 33554432, "cleanup_debts": 0, "evacuation": "not_quarantined", "evacuation_capacity": {"available_bytes": 106893312, "required_bytes": 0, "reserved_destination_bytes": 0, "sufficient": true, "unavailable_members": []}, "health": {"crc_increases": 0, "evacuation_error": null, "kernel_coverage": null, "kernel_cursor": null, "last_sample": null, "monitoring_error": null, "observed_ms": null, "quarantine": null, "since_ms": null, "warning": null}, "id": "small", "objects": 1, "pending_uploads": 0, "readable_evacuated": false, "reserved_bytes": 0, "safe_to_pull_with_known_loss": false, "safe_to_remove": false, "space": {"declared_exceeds_filesystem": false, "filesystem_free_bytes": 31424512, "filesystem_total_bytes": 33554432, "full": null, "retirement_reserved_bytes": 8192}, "unreadable_objects": 0, "used_bytes": 2109369}}}
+
+⠀⠀⠀⠀⠀⣠⣴⣶⣿⣿⣿⣿⣿⣷⣶⣤⣄
+⠀⠀⢀⣴⣿⣿⣿⠿⠛⠛⠋⠉⠙⠻⠿⣿⣿⣿⣦⡀
+⠀⣠⣿⣿⡿⠋⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠙⢿⣿⣿⡄
+⢰⣿⣿⡟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⢿⣿⣿⡄⠀⠀⠀⢸⣿⣿⣿⣿⣿⣿⣿⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿⠀⠀⢠⣶⣿⣿⣿⣿⣶⡆
+⣾⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠸⣿⣿⣷⠀⠀⠀⠀⠀⠀⠀⣠⣾⣿⠟⠁⠀⠀⣠⣴⣶⣶⣶⣤⡀⠀⠀⣶⣶⣆⣤⣶⣶⠀⢀⣤⣶⣶⣶⣦⣄⠀⠀⠀⣿⣿⡇⠀⠀⠀⠀⠀⠀⣿⣿⣏⠀⠀⠈⠉⠃
+⣿⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿⠀⠀⠀⠀⠀⢀⣼⣿⡟⠁⠀⠀⠀⣼⣿⣟⣁⣀⣙⣿⣿⡀⠀⣿⣿⣿⠋⠉⠙⢠⣿⣿⠏⠀⠈⢻⣿⣧⠀⠀⣿⣿⣿⣿⣿⣿⡇⠀⠀⠘⠻⠿⣿⣿⣶⣦⣄
+⢿⢿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣿⣿⡿⠀⠀⠀⢀⣴⣿⡿⠋⠀⠀⠀⠀⠀⢿⣿⣟⠛⠛⠛⠛⠛⠃⠀⣿⣿⡇⠀⠀⠀⠸⣿⣿⡄⠀⠀⣸⣿⡿⠀⠀⣿⣿⡇⠀⠀⠀⠀⠀⠀⣄⣀⠀⠀⠀⣹⣿⣿
+⠈⠈⢿⣇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣾⣿⣿⠃⠀⠀⠀⣾⣿⣿⣿⣿⣿⣿⣿⣿⠀⠈⠻⢿⣷⣶⣶⣶⠿⠀⠀⣿⣿⡇⠀⠀⠀⠀⠙⠿⣿⣶⣾⡿⠟⠁⠀⠀⣿⣿⡇⠀⠀⠀⠀⠀⠀⠻⠿⣿⣿⣿⣿⠿⠋
+⠀⠀⠀⠻⣷⣦⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢐⣽⣿⣿⠋
+⠀⠀⠀⠀⠙⢿⣿⣶⣤⣀⣀⣀⣀⣤⣤⣶⣿⣿⠟⠁
+⠀⠀⠀⠀⠀⠀⠉⠛⠿⢿⣿⣿⣿⣿⠿⠟⠋
+
+2026-11-19T09:24:54.233794Z  INFO zerofs::cli::server: ZeroFS v2.2.2
+✗ Error: connecting to 9P server(s) unix:/dev/shm/zerofs-mounted-mbaebt_n/service/ninep.sock: 9P connection lost
+2026-11-19T09:24:54.234708Z  INFO zerofs::cli::memory_budget: startup memory defense-in-depth admission passed hard_limit_bytes=8589934592 required_bytes=7868514304 remaining_bytes=721420288 rss_pressure_cap_bytes=6845104128 accounting="memory_policy=raw-device-p3-candidate-v1 reason=synthetic raw geometry candidate; end-to-end peak and event qualification pending; clean_cache_bytes=100663296 source=resolved cache split with three 32 MiB floors; object_writeback_bytes=8388608 source=resolved writeback RAM or disabled; volatile_write_bytes=33554432 source=resolved shared write-ack setting times two ownership stages; direct_segment_bytes=209715200 source=selected store geometry (open plus retained segments); unmodeled_residency_reserve_bytes=5771362304 source=directory package baseline input plus 2 GiB provisional raw recovery/index allowance; computed from ci+webui package-baseline-ci-limit64g-cache0.001-wb0-jobs8-primary/samples.jsonl; R=ceil64MiB(1.10*3241541632); H=ceil64MiB(0.15*3241541632+1.25*137129984); engine_headroom_bytes=1744830464 source=baseline kernel/allocator input plus 1 GiB provisional companion and loop-backing allowance; computed from ci+webui package-baseline-ci-limit64g-cache0.001-wb0-jobs8-primary/samples.jsonl; R=ceil64MiB(1.10*3241541632); H=ceil64MiB(0.15*3241541632+1.25*137129984); hard_limit_source=/sys/fs/cgroup/memory.max; companion_allowance_bytes=1073741824 included in headroom; clean_cache_disk_bytes=0; stored_state_qualification=unavailable for selected policy" source="/sys/fs/cgroup/memory.max"
+2026-11-19T09:24:54.234846Z  WARN zerofs::cli::server: volatile-memory write acknowledgement is enabled: ordinary writes are unsafe across process or power loss until a flush barrier completes volatile_memory_bytes=16777216 volatile_max_operations=128
+2026-11-19T09:24:54.239093Z  INFO zerofs::cli::init: Starting ZeroFS server with PoolObjectStore(32d9855b-bca7-468a-873d-528e301beb0d) backend
+2026-11-19T09:24:54.239109Z  INFO zerofs::cli::init: DB Path: db
+2026-11-19T09:24:54.239111Z  INFO zerofs::cli::init: Base Cache Directory: /dev/shm/zerofs-mounted-mbaebt_n/service/unused-clean-cache
+2026-11-19T09:24:54.239129Z  INFO zerofs::cli::init: Cache Size: 0 GB
+2026-11-19T09:24:54.239132Z  INFO zerofs::cli::init: Checking bucket identity...
+2026-11-19T09:24:54.239359Z  INFO zerofs::bucket_identity: Found existing bucket ID: 9a66989c-5c01-49fa-a353-2a15dd548a5f
+2026-11-19T09:24:54.239377Z  INFO zerofs::cli::init: Bucket ID: 9a66989c-5c01-49fa-a353-2a15dd548a5f, Cache directory: /dev/shm/zerofs-mounted-mbaebt_n/service/unused-clean-cache/bucket_9a66989c
+2026-11-19T09:24:54.240107Z  INFO zerofs::storage_compatibility: Checking storage provider compatibility...
+2026-11-19T09:24:54.241017Z  INFO zerofs::storage_compatibility: Storage provider compatibility check passed
+2026-11-19T09:24:54.241019Z  INFO zerofs::cli::init: Loading or initializing encryption key from object store
+2026-11-19T09:24:54.410997Z  INFO zerofs::writeback::bootstrap: using raw P3 Journal for writeback metadata and payloads capacity=100655104 ceiling=92266496
+2026-11-19T09:24:54.411300Z  INFO zerofs::writeback::bootstrap: attached a stable recovered writeback overlay; remote replay remains paused until filesystem initialization completes remote_sequence=13 local_sequence=14 pending_operations=1
+2026-11-19T09:24:54.411368Z  INFO zerofs::cli::server: Cache allocation - Disk: 0.00GB total (0 MB decoded-blocks + 0 MB raw-parts), Memory: 0.06GB total (33 MB extent-reads + 33 MB decoded-blocks + 33 MB raw-parts)
+2026-11-19T09:24:54.411463Z  INFO foyer_storage::store: [store builder]: No I/O engine builder is provided, use `PsyncIoEngineConfig` with default parameters as default.
+2026-11-19T09:24:54.411485Z  INFO foyer_storage::store: [store builder]: No engine builder is provided, run disk cache in mock mode that do nothing.
+2026-11-19T09:24:54.411513Z  INFO foyer_storage::store: [store builder]: No I/O engine builder is provided, use `PsyncIoEngineConfig` with default parameters as default.
+2026-11-19T09:24:54.411515Z  INFO foyer_storage::store: [store builder]: No engine builder is provided, run disk cache in mock mode that do nothing.
+2026-11-19T09:24:54.411519Z  INFO zerofs::cli::server: Resident-memory pressure cap: 6845 MB (configured clean cache: 64 MB)
+2026-11-19T09:24:54.411562Z  INFO zerofs::cli::server: Opening database in read-write mode
+2026-11-19T09:24:54.423983Z  INFO zerofs::cli::server: Starting 9P server on Unix socket: /dev/shm/zerofs-mounted-mbaebt_n/service/ninep.sock
+2026-11-19T09:24:54.424008Z  INFO zerofs::cli::server: Starting RPC server on Unix socket: /dev/shm/zerofs-mounted-mbaebt_n/service/rpc.sock
+2026-11-19T09:24:54.424035Z  INFO zerofs::fs::gc: Starting segment reclamation task (round budget 256 MiB, floor 4 batch(es); cadence base 60s / drain 15s (>= 20% dead) / idle 5s)
+2026-11-19T09:24:54.424042Z  INFO zerofs::fs::gc: Starting garbage collection task (runs continuously)
+2026-11-19T09:24:54.424093Z  INFO zerofs::cli::server: Starting stats reporting task (reports to debug every 5 seconds)
+2026-11-19T09:24:54.424109Z  INFO zerofs::cli::server: Starting periodic flush task (flushes every 30 seconds)
+2026-11-19T09:24:54.424148Z  INFO zerofs::cli::server: Received SIGTERM, initiating graceful shutdown...
+2026-11-19T09:24:54.424161Z  INFO zerofs::cli::server: Cancelling all servers and background tasks...
+2026-11-19T09:24:54.424165Z  INFO zerofs::cli::server: Waiting for servers to exit...
+2026-11-19T09:24:54.424169Z  INFO zerofs::fs::gc: GC task shutting down
+2026-11-19T09:24:54.424175Z  INFO zerofs::ninep::server: 9P server listening on Unix socket "/dev/shm/zerofs-mounted-mbaebt_n/service/ninep.sock"
+2026-11-19T09:24:54.424186Z  INFO zerofs::ninep::server: 9P Unix socket server shutting down at "/dev/shm/zerofs-mounted-mbaebt_n/service/ninep.sock"
+2026-11-19T09:24:54.424419Z  INFO zerofs::rpc::server: RPC server listening on Unix socket: "/dev/shm/zerofs-mounted-mbaebt_n/service/rpc.sock"
+2026-11-19T09:24:54.424499Z  INFO zerofs::webui: Web UI server listening on http://127.0.0.1:8080
+2026-11-19T09:24:54.424542Z  INFO zerofs::rpc::server: RPC Unix socket server shutting down at "/dev/shm/zerofs-mounted-mbaebt_n/service/rpc.sock"
+2026-11-19T09:24:54.424573Z  INFO zerofs::cli::server: Stats reporting task shutting down
+2026-11-19T09:24:54.424581Z  INFO zerofs::cli::server: Periodic flush task shutting down
+2026-11-19T09:24:54.424585Z  INFO zerofs::cli::server: Waiting for accepted 9P work to settle...
+2026-11-19T09:24:54.424595Z  INFO zerofs::cli::server: Waiting for background tasks to exit...
+2026-11-19T09:24:54.425295Z  INFO zerofs::fs::store::extent::reclaim: segment GC: 1 segments, 2.0 MiB appended (2.0 MiB live, ~0 B reclaimable, 0% dead); idle
+2026-11-19T09:24:54.425346Z  INFO zerofs::cli::server: Waiting for deferred orphan reclaims to finish...
+2026-11-19T09:24:54.425412Z  INFO zerofs::cli::server: Performing final flush and closing database...
+2026-11-19T09:24:54.427003Z  INFO zerofs::cli::server: Shutdown complete
+2026-11-19T09:24:54.428934Z  INFO foyer::hybrid::cache: [hybrid]: flush all in-memory cached entries to disk on close bytes=1590
+2026-11-19T09:24:54.428937Z  INFO foyer::hybrid::cache: [hybrid]: flush all in-memory cached entries to disk on close bytes=7628
+2026-11-19T09:24:54.428946Z  INFO foyer::hybrid::cache: [hybrid]: close consumes 13.808µs
+2026-11-19T09:24:54.428954Z  INFO foyer::hybrid::cache: [hybrid]: close consumes 18.96µs
+
+Traceback (most recent call last):
+  File "/h/mounted.py", line 111, in mounted
+    wait_for(lambda: os.path.ismount(mount), client)
+  File "/h/mounted.py", line 75, in wait_for
+    raise RuntimeError(f"{process.args[:2]} exited with {process.returncode}")
+RuntimeError: ['/input/zerofs', 'mount'] exited with 1
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/h/mounted.py", line 769, in <module>
+    main()
+  File "/h/mounted.py", line 755, in main
+    qualify_evacuation_and_loss(root, members, p3, expected_memory)
+  File "/h/mounted.py", line 635, in qualify_evacuation_and_loss
+    with mounted(config) as (path, _):
+  File "/usr/lib/python3.11/contextlib.py", line 137, in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+  File "/h/mounted.py", line 101, in mounted
+    with ExitStack() as cleanup:
+  File "/usr/lib/python3.11/contextlib.py", line 589, in __exit__
+    raise exc_details[1]
+  File "/usr/lib/python3.11/contextlib.py", line 574, in __exit__
+    if cb(*exc_details):
+       ^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/contextlib.py", line 457, in _exit_wrapper
+    callback(*args, **kwds)
+  File "/h/mounted.py", line 91, in stop
+    raise RuntimeError(f"{process.args[:2]} exited with {code}, expected {expected}")
+RuntimeError: ['/input/zerofs', 'mount'] exited with 1, expected 0
+Removed the owned Docker fixture and its CID directory.
+Removed owned Spark transfer directory /var/tmp/zerofs-raw-fixture.QnAg6d8z

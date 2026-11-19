@@ -2,6 +2,8 @@
 
 from collections import Counter
 from contextlib import ExitStack, contextmanager
+import errno
+import fcntl
 import hashlib
 import http.client
 import json
@@ -263,6 +265,9 @@ def check_p3_shadows(root, configs):
                      or path.name.startswith("bucket_"))
     for config in configs:
         settings = tomllib.loads(config.read_text())
+        cache = Path(settings["cache"]["dir"])
+        if cache.exists():
+            shadows.append(str(cache))
         if "writeback" in settings:
             journal = Path(settings["writeback"]["dir"])
             if journal.exists():
@@ -621,6 +626,101 @@ def qualify(root, members, memory_limit, p3):
         check_p3_shadows(root, configs)
 
 
+def qualify_evacuation_and_loss(root, members, p3, memory_limit):
+    configs = []
+
+    def phase(name):
+        config = render_nas_config(root / name, MANIFEST.read_text(), members, p3)
+        configs.append(config)
+        return config
+
+    config = phase("initialize_loss")
+    check_admission(config, memory_limit)
+    run(ZEROFS, "pool", "init", "-c", config)
+    files = {}
+    previous = {}
+    for index in range(2):
+        name = f"payload-{index}"
+        body = random.Random(index).randbytes(2 * MIB)
+        config = phase(name)
+        with mounted(config) as (path, _):
+            with path.with_name(name).open("xb") as f:
+                f.write(body)
+                f.flush()
+                os.fsync(f.fileno())
+            run(ZEROFS, "flush", "-c", config)
+        _, current = snapshot(config, members, name)
+        [location] = current.keys() - previous.keys()
+        files[name] = (location, hashlib.sha256(body))
+        previous = current
+
+    # Select a known source population even when independent server starts
+    # choose the same first-eligible member for both files.
+    def relocate(location, target):
+        result = json.loads(run(ZEROFS, "pool", "migrate", "-c", config,
+                                "--segment", location, "--to", target))
+        assert result["migrated_segments"] == 1, result
+
+    first, second = files.values()
+    for (location, _), target in [(first, "small"), (second, "large")]:
+        if previous[location]["member_id"] != target:
+            relocate(location, target)
+    _, before = snapshot(config, members, "before_evacuation")
+    result = json.loads(run(ZEROFS, "pool", "migrate", "-c", config,
+                            "--from", "small", "--to", "large"))
+    assert result["migrated_segments"] == 1, result
+    _, after = snapshot(config, members, "after_evacuation")
+    assert before.keys() == after.keys()
+    for location, entry in after.items():
+        assert entry["member_id"] == "large", entry
+        assert entry["raw_object_sha256"] == before[location]["raw_object_sha256"], entry
+    assert before[first[0]]["physical_key"] != after[first[0]]["physical_key"]
+    config = phase("evacuated")
+    with mounted(config) as (path, _):
+        for name, (_, digest) in files.items():
+            verify(path.with_name(name), digest, 2 * MIB, f"evacuated-{name}")
+    record("planned_evacuation", **result, remaining_source_placements=0)
+
+    # Restore a known split, then test absence and live loss independently.
+    relocate(first[0], "small")
+    _, split = snapshot(config, members, "before_loss")
+    assert [split[entry[0]]["member_id"] for entry in files.values()] == ["small", "large"]
+    node, backing, _, _ = members["small"]
+    absent = node.with_name("absent-member-node")
+    config = phase("missing_at_start")
+    node.rename(absent)
+    try:
+        error = run(ZEROFS, "run", "-c", config, refuse="claim raw member small")
+        for socket in ("rpc.sock", "ninep.sock"):
+            assert not (config.parent / socket).exists(), socket
+        record("cold_start_absent_member", diagnostic=error.split("Error: ")[-1],
+               rpc_bound=False, ninep_bound=False)
+    finally:
+        absent.rename(node)
+
+    # This is a cold service and cold FUSE client. Neither file has been
+    # read through them. Flush only the test loop's block cache after the cut.
+    config = phase("live_loss")
+    with mounted(config) as (path, server), node.open("rb", buffering=0) as controller:
+        assert backing.stat().st_size == SIZES["small"]
+        with backing.open("r+b", buffering=0) as media:
+            media.truncate(0)
+        fcntl.ioctl(controller, 0x1261)  # BLKFLSBUF
+        damaged = path.with_name("payload-0")
+        try:
+            data = damaged.read_bytes()
+        except OSError as failure:
+            record("live_member_read_failure", affected_file=damaged.name,
+                   errno=failure.errno, diagnostic=failure.strerror)
+            assert failure.errno == errno.EIO, failure
+        else:
+            raise AssertionError(f"missing member returned {len(data)} bytes")
+        verify(path.with_name("payload-1"), second[1], 2 * MIB, "healthy_after_member_loss")
+        assert server.poll() is None
+        sample_cgroup("live_member_loss")
+    check_p3_shadows(root, configs)
+
+
 def main():
     flags = Path("/sys/class/net").glob("*/flags")
     active = {flag.parent.name for flag in flags if int(flag.read_text(), 16) & 1}
@@ -637,7 +737,7 @@ def main():
             raise RuntimeError(f"missing parent-built Linux executable at {executable}")
     record("binaries", sha256=run("sha256sum", ZEROFS, PROBE).decode().splitlines())
     mode = os.environ["RAW_MOUNTED_MODE"]
-    assert mode in {"placement", "p3", "nas-fit", "nas-fit-two-members"}, mode
+    assert mode in {"placement", "p3", "nas-fit", "nas-fit-two-members", "nas-fit-loss"}, mode
     nas_fit = mode.startswith("nas-fit")
     if nas_fit:
         sample_cgroup("start")
@@ -668,7 +768,9 @@ def main():
                        loop_major=os.major(block_id), loop_minor=os.minor(block_id))
             p3 = members.pop("p3", None)
             check_member_bindings(members)
-            if nas_fit:
+            if mode == "nas-fit-loss":
+                qualify_evacuation_and_loss(root, members, p3, expected_memory)
+            elif nas_fit:
                 qualify_nas_fit(root, members, expected_memory, p3, two_members=mode == "nas-fit-two-members")
             else:
                 qualify(root, members, expected_memory, p3)

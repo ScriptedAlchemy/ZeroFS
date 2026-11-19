@@ -127,3 +127,13 @@ The full fixture peaked at 716,378,112 bytes (683.2 MiB), with zero swap,
 memory limit events or OOMs. Its two-CPU quota recorded eight throttled
 periods. All seven mounts, three loop mappings, the container, and the
 transfer and scratch directories were removed.
+
+## Planned evacuation and unexpected member loss
+
+The [final Spark run](spark-nas-fit-loss-98e0081f-final.log) used engine `98e0081f`, the 8 GiB zero-swap cgroup and two distinct 2 MiB files. The offline migration moved the smaller member's sole live segment onto the larger member. Raw GETs verified both object SHA-256 values before and after the locator switch. A fresh FUSE mount verified both files with zero source placements. The smaller member's append log still consumed physical space after deletion.
+
+For the loss control, the fixture moved one segment back to the smaller member and verified the split. Hiding that member's block node at cold startup caused a claim error (ENOENT) before the 9P or RPC socket appeared. With all devices present at startup, a fresh engine and FUSE client mounted successfully. The fixture then truncated only its own small loop's backing inode and invalidated that loop's block cache. Reading the affected file returned EIO. The distinct file on the surviving member still returned its correct SHA-256, and the server remained alive. Cold startup with an absent data device remains a release blocker for degraded availability.
+
+[Attempt 1](spark-nas-fit-loss-98e0081f-attempt-1.log) reached a stale Unix socket from an earlier stopped process. Each phase now has its own ephemeral socket and mount paths. [Attempt 2](spark-nas-fit-loss-98e0081f-attempt-2.log) passed the migration and both loss checks. The final run added assertions for the absence of both startup sockets and the configured clean-cache directory. All three runs removed their owned Docker and Spark transfer directories.
+
+[Linux unit receipt](p3-engine-tests.json) records 331 distinct passes, three ignored tests, exact executable and frontend fingerprints, and the read-only-working-directory failure preceding the successful journal rerun.
