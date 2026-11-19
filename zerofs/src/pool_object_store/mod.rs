@@ -164,6 +164,12 @@ pub struct PoolPlacement {
     pub physical_key: String,
 }
 
+#[derive(Default, serde::Serialize)]
+pub(crate) struct MemberVerification {
+    pub verified_segments: usize,
+    pub failures: BTreeMap<String, String>,
+}
+
 #[derive(Clone)]
 pub struct PoolObjectStore {
     inner: Arc<PoolInner>,
@@ -772,7 +778,7 @@ impl PoolObjectStore {
         self.inner.locks[hash.finish() as usize % KEY_LOCKS].clone()
     }
 
-    fn segment(&self, path: &Path) -> bool {
+    fn segment_id(&self, path: &Path) -> Option<Segid> {
         let prefix = self.inner.authority_prefix.as_ref();
         let relative = if prefix.is_empty() {
             path.as_ref()
@@ -782,11 +788,15 @@ impl PoolObjectStore {
                 .strip_prefix(prefix)
                 .and_then(|s| s.strip_prefix('/'))
             else {
-                return false;
+                return None;
             };
             relative
         };
-        Segid::from_object_key(relative).is_some()
+        Segid::from_object_key(relative)
+    }
+
+    fn segment(&self, path: &Path) -> bool {
+        self.segment_id(path).is_some()
     }
 
     fn internal(&self, path: &Path) -> bool {
@@ -1842,20 +1852,49 @@ impl PoolObjectStore {
         member: &str,
     ) -> object_store::Result<BTreeSet<Segid>> {
         self.member(member)?;
-        let prefix = format!("{}/", self.inner.authority_prefix);
         self.catalog(Catalog::placements)
             .await?
             .into_iter()
             .filter(|p| p.member_id == member)
-            .map(|p| {
-                let key = p
-                    .location
-                    .as_ref()
-                    .strip_prefix(&prefix)
-                    .ok_or_else(|| error("placement outside authority prefix"))?;
-                Segid::from_object_key(key).ok_or_else(|| error("invalid segment placement"))
-            })
+            .map(|p| self.segment_id(&p.location).ok_or_else(|| error("invalid segment placement")))
             .collect()
+    }
+
+    pub(crate) async fn verify_member(&self, member: &str) -> object_store::Result<MemberVerification> {
+        self.ensure_member(member, false).await?;
+        let mut report = MemberVerification::default();
+        let mut after = String::new();
+        loop {
+            let cursor = after;
+            let page = self.catalog(move |catalog| catalog.placement_page(&cursor)).await?;
+            let Some(last) = page.last() else {
+                return Ok(report);
+            };
+            after = last.location.to_string();
+            for placement in page.into_iter().filter(|placement| placement.member_id == member) {
+                let _guard = self.key_lock(&placement.location).read_owned().await;
+                let key = placement.location.to_string();
+                let entry = self.catalog(move |catalog| catalog.lookup(&key)).await?.entry;
+                let Some(entry) = entry.filter(|entry| entry.physical.key() == placement.physical_key) else {
+                    return Err(error("pool placement changed during offline verification"));
+                };
+                let result = async {
+                    self.validate_physical(&entry.physical)?;
+                    let expected = entry.sha256.ok_or_else(|| error("missing catalog SHA-256"))?;
+                    let observed = self.hash_physical(&entry.physical, entry.size).await?;
+                    if observed != expected {
+                        return Err(permanent(SourceChecksumMismatch));
+                    }
+                    Ok(())
+                }.await;
+                match result {
+                    Ok(()) => report.verified_segments += 1,
+                    Err(issue) => {
+                        report.failures.insert(placement.location.to_string(), issue.to_string());
+                    }
+                }
+            }
+        }
     }
 
     pub(crate) async fn kernel_observation(
