@@ -42,7 +42,10 @@ refuse mismatched-member 'mismatch' zerofs pool verify-raw -c /etc/wrong.toml
 start_engine() {
     zerofs run -c "$cfg" >> /state/engine.log 2>&1 &
     engine=$!
-    while ! test -S /state/9p.sock; do kill -0 "$engine"; sleep 0.1; done
+    until test -S /state/9p.sock && zerofs pool status --endpoint unix:/state/admin.sock >/state/live 2>/dev/null; do
+        kill -0 "$engine"
+        sleep 0.1
+    done
 }
 start_engine
 refuse exclusive 'busy|os error 16' zerofs pool verify-raw -c "$cfg"
