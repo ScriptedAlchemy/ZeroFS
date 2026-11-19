@@ -958,6 +958,7 @@ async fn remote_small_replay_rejects_corrupt_journal_before_put() {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("mismatch"), "{error}");
+        assert!(is_terminal_remote_error(&error), "{error}");
         assert_eq!(store.put_opts_calls.load(Ordering::SeqCst), 0);
         assert_eq!(store.multipart_calls.load(Ordering::SeqCst), 0);
         assert!(matches!(
@@ -965,6 +966,100 @@ async fn remote_small_replay_rejects_corrupt_journal_before_put() {
             Err(object_store::Error::NotFound { .. })
         ));
     }
+}
+
+#[tokio::test]
+async fn corrupt_local_journal_stops_scheduler_without_releasing_dirty_capacity() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let temp = tempfile::tempdir().unwrap();
+    let journal = Arc::new(Journal::open(temp.path().join("journal"), identity()).unwrap());
+    let payload = b"committed journal payload";
+    let record = crate::writeback::test_util::put_record(
+        1,
+        "corrupt-local-object",
+        payload,
+        MutationMode::Create,
+        FenceClass::Fence,
+        0x1000,
+        1_786_435_200_000,
+    );
+    let record = journal.commit_put(record, payload).unwrap();
+    let (relative, slice) = record.blob_path().unwrap().split_once('#').unwrap();
+    let (offset, _) = slice.split_once('+').unwrap();
+    let offset = offset.parse::<u64>().unwrap();
+    let path = journal.root().join(relative);
+    let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    file.write_all(b"X").unwrap();
+    let corrupted = std::fs::read(&path).unwrap();
+
+    let remote_root = temp.path().join("remote");
+    std::fs::create_dir(&remote_root).unwrap();
+    let store = Arc::new(RecordingMultipartStore {
+        inner: Arc::new(LocalFileSystem::new_with_prefix(&remote_root).unwrap()),
+        put_opts_calls: AtomicUsize::new(0),
+        multipart_calls: AtomicUsize::new(0),
+        part_sizes: Arc::new(Mutex::new(Vec::new())),
+    });
+    let remote: Arc<dyn ObjectStore> = store.clone();
+    let overlay = OverlayIndex::new(remote.clone());
+    let admission = Admission::new(64 * 1024 * 1024);
+    let space = Arc::new(PhysicalSpaceSampler::new(journal.root().to_path_buf()));
+    let sample = space.sample().await.unwrap();
+    let ssd = Arc::new(
+        SsdAdmission::recover(
+            64 * 1024 * 1024,
+            64,
+            95,
+            85,
+            0,
+            journal.pending_ssd_reservations().unwrap(),
+            Some(sample),
+        )
+        .unwrap(),
+    );
+    let reserved = ssd.snapshot();
+    let journaler = LocalJournaler::start_with_observer_and_space(
+        journal.clone(),
+        admission.clone(),
+        4,
+        1,
+        None,
+        space.clone(),
+    )
+    .unwrap();
+    let scheduler = RemoteScheduler::start(
+        remote,
+        journal.clone(),
+        overlay,
+        admission,
+        ssd.clone(),
+        space,
+        journaler.barrier(),
+        1,
+    )
+    .unwrap();
+
+    let error = tokio::time::timeout(Duration::from_secs(10), scheduler.barrier().wait_remote(1))
+        .await
+        .expect("known corrupt local bytes must stop replay, not retry forever")
+        .unwrap_err();
+    assert!(error.to_string().contains("hash mismatch"), "{error}");
+    assert_eq!(scheduler.barrier().progress.sequence(), 0);
+    assert!(scheduler.shutdown().await.is_err());
+    assert_eq!(journal.progress().unwrap().remote_seq, 0);
+    let retained = journal.mutation(1).unwrap().unwrap();
+    assert_eq!(
+        retained.retry_count, 1,
+        "one failure is persisted before terminalization"
+    );
+    assert_eq!(std::fs::read(path).unwrap(), corrupted);
+    assert_eq!(ssd.snapshot().used_ssd_bytes, reserved.used_ssd_bytes);
+    assert_eq!(ssd.snapshot().used_operations, reserved.used_operations);
+    assert_eq!(store.put_opts_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(store.multipart_calls.load(Ordering::SeqCst), 0);
+    journaler.shutdown().await.unwrap();
 }
 
 #[tokio::test]
