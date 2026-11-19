@@ -120,6 +120,8 @@ pub(crate) struct MutationLifecycle {
     started: Mutex<bool>,
     result: Mutex<Option<Result<ShutdownReceipt, ShutdownError>>>,
     done: Notify,
+    #[cfg(test)]
+    after_empty_snapshot: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl MutationLifecycle {
@@ -130,6 +132,8 @@ impl MutationLifecycle {
             started: Mutex::new(false),
             result: Mutex::new(None),
             done: Notify::new(),
+            #[cfg(test)]
+            after_empty_snapshot: Mutex::new(None),
         })
     }
 
@@ -170,11 +174,21 @@ impl MutationLifecycle {
     ) -> Result<ShutdownReceipt, ShutdownError> {
         self.ensure_owner(target);
         loop {
+            // Subscribe before checking completion. notify_waiters does not
+            // retain a permit for a future created after the owner finishes.
+            let done = self.done.notified();
             if let Some(result) = self.result_snapshot() {
                 return result;
             }
+            #[cfg(test)]
+            {
+                let after_snapshot = self.after_empty_snapshot.lock().unwrap().take();
+                if let Some(after_snapshot) = after_snapshot {
+                    after_snapshot();
+                }
+            }
             tokio::select! {
-                _ = self.done.notified() => {}
+                _ = done => {}
                 _ = tokio::time::sleep_until(deadline) => {
                     if let Some(result) = self.result_snapshot() {
                         return result;
@@ -892,6 +906,58 @@ mod tests {
             )
             .await
             .expect("replacement close");
+        assert_eq!(receipt.target, DurabilityTarget::LocalSsd);
+        assert_eq!(lifecycle.phase(), ShutdownPhase::Complete);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completion_between_snapshot_and_wait_is_not_lost() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let mut owners = owners_with(&order);
+        owners.stop_sftp = blocked_step(&order, "sftp", &entered, &release);
+        let lifecycle = MutationLifecycle::new(owners);
+        lifecycle.ensure_owner(DurabilityTarget::LocalSsd);
+        entered.notified().await;
+
+        // Pause the waiter after observing None, and let the real close owner
+        // finish before the waiter first polls its completion notification.
+        let (observed, waiting) = tokio::sync::oneshot::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        *lifecycle.after_empty_snapshot.lock().unwrap() = Some(Box::new(move || {
+            observed.send(()).unwrap();
+            let _ = paused.recv();
+        }));
+        let mut closing = tokio::spawn({
+            let lifecycle = Arc::clone(&lifecycle);
+            async move {
+                lifecycle
+                    .close(
+                        Instant::now() + Duration::from_secs(10),
+                        DurabilityTarget::LocalSsd,
+                    )
+                    .await
+            }
+        });
+        waiting.await.unwrap();
+        let finished = lifecycle.done.notified();
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), finished)
+            .await
+            .expect("close owner did not notify completion");
+        assert!(lifecycle.result_snapshot().is_some());
+        resume.send(()).unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), &mut closing).await;
+        if outcome.is_err() {
+            closing.abort();
+            let _ = closing.await;
+        }
+        let receipt = outcome
+            .expect("completed shutdown lost its wakeup and waited for the deadline")
+            .expect("join")
+            .expect("close");
         assert_eq!(receipt.target, DurabilityTarget::LocalSsd);
         assert_eq!(lifecycle.phase(), ShutdownPhase::Complete);
     }
