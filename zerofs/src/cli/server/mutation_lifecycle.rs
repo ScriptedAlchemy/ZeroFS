@@ -154,7 +154,10 @@ impl MutationLifecycle {
         self.result.lock().expect("lifecycle result").clone()
     }
 
-    fn ensure_owner(self: &Arc<Self>, target: DurabilityTarget) {
+    /// Transfer close work synchronously before a caller selects between its
+    /// completion, deadline, or authority loss. A losing select branch must
+    /// not leave the process believing an unpolled close owns its resources.
+    pub(super) fn start(self: &Arc<Self>, target: DurabilityTarget) {
         let mut started = self.started.lock().expect("lifecycle owner");
         if *started {
             return;
@@ -172,7 +175,7 @@ impl MutationLifecycle {
         deadline: Instant,
         target: DurabilityTarget,
     ) -> Result<ShutdownReceipt, ShutdownError> {
-        self.ensure_owner(target);
+        self.start(target);
         loop {
             // Subscribe before checking completion. notify_waiters does not
             // retain a permit for a future created after the owner finishes.
@@ -261,6 +264,54 @@ fn annotate(error: ShutdownError, phase: ShutdownPhase) -> ShutdownError {
 }
 
 impl LifecycleOwners {
+    fn with_finalizer(mut self, finish: Step) -> Self {
+        let stop_sftp = self.stop_sftp.clone();
+        self.stop_sftp = Arc::new(move || {
+            let stop_sftp = stop_sftp.clone();
+            let finish = finish.clone();
+            Box::pin(async move {
+                stop_sftp().await?;
+                finish().await
+            })
+        });
+        self
+    }
+
+    /// The detached close owner must retain authority and cache exclusion
+    /// after its caller stops waiting. Release authority only after database
+    /// close and dependency teardown have actually completed.
+    pub(super) fn with_process_ownership(
+        self,
+        authority: Option<crate::replication::lease::AuthoritySupervisor>,
+        cache_owner: Arc<super::CleanCacheOwner>,
+    ) -> Self {
+        let authority = Arc::new(Mutex::new(authority));
+        self.with_finalizer(Arc::new(move || {
+            let authority = authority.lock().expect("shutdown authority").take();
+            let cache_owner = Arc::clone(&cache_owner);
+            Box::pin(async move {
+                let _cache_owner = cache_owner;
+                if let Some(authority) = authority {
+                    tokio::time::timeout(
+                        super::SERVER_AUTHORITY_FINISH_TIMEOUT,
+                        authority.finish_after_close(),
+                    )
+                    .await
+                    .map_err(|_| {
+                        ShutdownError::failed(
+                            ShutdownPhase::StopSftp,
+                            format!(
+                                "authority shutdown timed out after {}s",
+                                super::SERVER_AUTHORITY_FINISH_TIMEOUT.as_secs()
+                            ),
+                        )
+                    })?;
+                }
+                Ok(())
+            })
+        }))
+    }
+
     pub(crate) fn with_pool(
         mut self,
         pool: Option<crate::pool_object_store::PoolObjectStore>,
@@ -918,7 +969,7 @@ mod tests {
         let mut owners = owners_with(&order);
         owners.stop_sftp = blocked_step(&order, "sftp", &entered, &release);
         let lifecycle = MutationLifecycle::new(owners);
-        lifecycle.ensure_owner(DurabilityTarget::LocalSsd);
+        lifecycle.start(DurabilityTarget::LocalSsd);
         entered.notified().await;
 
         // Pause the waiter after observing None, and let the real close owner
@@ -960,6 +1011,148 @@ mod tests {
             .expect("close");
         assert_eq!(receipt.target, DurabilityTarget::LocalSsd);
         assert_eq!(lifecycle.phase(), ShutdownPhase::Complete);
+    }
+
+    #[tokio::test]
+    async fn timed_out_waiter_retains_process_owner_until_database_close() {
+        use std::sync::atomic::AtomicBool;
+
+        struct AuthorityOwner(Arc<AtomicBool>);
+
+        impl Drop for AuthorityOwner {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let finished = Arc::new(Notify::new());
+        let closed = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut owners = owners_with(&order);
+        owners.close_database = {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            let closed = Arc::clone(&closed);
+            Arc::new(move || {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                let closed = Arc::clone(&closed);
+                Box::pin(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    closed.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+            })
+        };
+        let owners = owners.with_finalizer({
+            let authority = Arc::new(Mutex::new(Some(AuthorityOwner(Arc::clone(&dropped)))));
+            let closed = Arc::clone(&closed);
+            let finished = Arc::clone(&finished);
+            Arc::new(move || {
+                let authority = authority.lock().unwrap().take();
+                let closed = Arc::clone(&closed);
+                let finished = Arc::clone(&finished);
+                Box::pin(async move {
+                    assert!(closed.load(Ordering::SeqCst));
+                    drop(authority);
+                    finished.notify_one();
+                    Ok(())
+                })
+            })
+        });
+        let lifecycle = MutationLifecycle::new(owners);
+        lifecycle.start(DurabilityTarget::LocalSsd);
+        entered.notified().await;
+        let result = Arc::clone(&lifecycle)
+            .close(
+                Instant::now() + Duration::from_millis(10),
+                DurabilityTarget::LocalSsd,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(ShutdownError::Incomplete {
+                phase: ShutdownPhase::CloseDatabase
+            })
+        ));
+        drop(lifecycle);
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "a timed-out caller must not release the detached owner's authority"
+        );
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), finished.notified())
+            .await
+            .expect("the retained close owner did not finish");
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn timed_out_waiter_retains_clean_cache_exclusion() {
+        use fs4::fs_std::FileExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let cache_owner = Arc::new(super::super::acquire_clean_cache_owner(root.path()).unwrap());
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.path().join(super::super::CLEAN_CACHE_LOCK_FILE))
+            .unwrap();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let mut owners = owners_with(&order);
+        owners.close_database = blocked_step(&order, "db_close", &entered, &release);
+        let lifecycle = MutationLifecycle::new(owners.with_process_ownership(None, cache_owner));
+        lifecycle.start(DurabilityTarget::LocalSsd);
+        entered.notified().await;
+        assert!(
+            Arc::clone(&lifecycle)
+                .close(
+                    Instant::now() + Duration::from_millis(10),
+                    DurabilityTarget::LocalSsd,
+                )
+                .await
+                .is_err()
+        );
+        drop(lifecycle);
+        assert!(!FileExt::try_lock_exclusive(&contender).unwrap());
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            // Arc reaches a zero strong count before its fields finish
+            // dropping. Observe actual lock release, not Weak::upgrade.
+            while !FileExt::try_lock_exclusive(&contender).unwrap() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the detached close owner did not release its resources");
+        FileExt::unlock(&contender).unwrap();
+    }
+
+    #[tokio::test]
+    async fn process_finalization_failure_is_returned_by_close() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let owners = owners_with(&order).with_finalizer(Arc::new(|| {
+            Box::pin(async {
+                Err(ShutdownError::failed(
+                    ShutdownPhase::StopSftp,
+                    "authority finalization failed",
+                ))
+            })
+        }));
+        let error = MutationLifecycle::new(owners)
+            .close(
+                Instant::now() + Duration::from_secs(2),
+                DurabilityTarget::LocalSsd,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("authority finalization failed"));
     }
 
     #[tokio::test]

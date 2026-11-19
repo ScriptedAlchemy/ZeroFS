@@ -1687,10 +1687,10 @@ pub async fn run_server(
     let health_workers_after = health_workers.clone();
     let sftp_pool = init_result.sftp_pool.clone();
     let sftp_pool_for_close = sftp_pool.clone();
-    let lifecycle_completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let lifecycle_completed_after = std::sync::Arc::clone(&lifecycle_completed);
+    let lifecycle_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let lifecycle_started_after = std::sync::Arc::clone(&lifecycle_started);
     let server_result: anyhow::Result<()> = async move {
-        let _cache_owner = cache_owner;
+        let cache_owner_guard = cache_owner;
         if let Some(pool) = &pool_health {
             let monitor = init_result.disk_monitor.expect("pool startup prepared native monitoring").start(health_failure.clone()).await?;
             let recovery = if !db_mode.is_read_only() { Some(crate::pool_object_store::PoolRecovery::start(pool.clone(), health_failure.clone())) } else { None };
@@ -2114,10 +2114,12 @@ pub async fn run_server(
                 writeback_for_lifecycle.clone(),
                 sftp_pool_for_close.clone(),
                 db_mode.is_read_only(),
-            ).with_pool(pool_health.clone()));
+            ).with_pool(pool_health.clone()).with_process_ownership(authority, cache_owner_guard));
             let target = crate::fs::mutation::durability::DurabilityTarget::from(
                 fs.write_ack.client_durability_target,
             );
+            lifecycle.start(target);
+            lifecycle_started.store(true, std::sync::atomic::Ordering::SeqCst);
             let deadline =
                 tokio::time::Instant::now() + SFTP_FINAL_DATABASE_CLOSE_TIMEOUT.saturating_mul(2);
             tokio::select! {
@@ -2130,28 +2132,9 @@ pub async fn run_server(
                     let _receipt = result.map_err(|error| {
                         anyhow::anyhow!("unified writeback close failed: {error}")
                     })?;
-                    lifecycle_completed.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
             }
 
-            if leadership_deposed.is_cancelled() {
-                return Err(leadership_lost_error());
-            }
-
-            // Retain authority monitors until the database is closed.
-            if let Some(authority) = authority {
-                tokio::time::timeout(
-                    SERVER_AUTHORITY_FINISH_TIMEOUT,
-                    authority.finish_after_close(),
-                )
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "authority shutdown timed out after {}s",
-                        SERVER_AUTHORITY_FINISH_TIMEOUT.as_secs()
-                    )
-                })?;
-            }
             if leadership_deposed.is_cancelled() {
                 return Err(leadership_lost_error());
             }
@@ -2184,8 +2167,11 @@ pub async fn run_server(
             Ok(())
         };
     let server_result = server_result.and(recovery_result);
-    let writeback_shutdown = if lifecycle_completed_after.load(std::sync::atomic::Ordering::SeqCst)
-    {
+    // Once started, the single close owner retains these dependencies even
+    // when its waiter reports a deadline or authority loss. A second teardown
+    // here would close admission underneath its materialization or final flush.
+    let lifecycle_started = lifecycle_started_after.load(std::sync::atomic::Ordering::SeqCst);
+    let writeback_shutdown = if lifecycle_started {
         Ok(())
     } else {
         match writeback_for_shutdown {
@@ -2196,10 +2182,10 @@ pub async fn run_server(
             None => Ok(()),
         }
     };
-    if let Some(pool) = pool_settlement {
+    if !lifecycle_started && let Some(pool) = pool_settlement {
         pool.settle().await;
     }
-    let sftp_shutdown = if lifecycle_completed_after.load(std::sync::atomic::Ordering::SeqCst) {
+    let sftp_shutdown = if lifecycle_started {
         Ok(())
     } else {
         match sftp_pool {
