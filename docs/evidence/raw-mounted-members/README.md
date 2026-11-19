@@ -57,6 +57,11 @@ device rules, cgroup and capability limits. Studio retains its default profile.
 
 ## P3 NAS-fit crash, replay and destage
 
+These receipts retain the original 8 MiB writeback RAM configuration and its
+smaller fixture writes. The current manifest uses 16 MiB so a maximum-size
+negotiated 9P write can seal and reach local durability; that correction does
+not constitute a new mounted qualification run.
+
 [Spark NAS-fit attempt 2](spark-nas-fit-98e0081f-attempt-2.log) passed with the
 package-featured engine, probe and runtime manifest from exact source
 `98e0081f33c63f66c5e91706c87bb231a26efc6d`. The 8 GiB cgroup admitted the

@@ -28,7 +28,9 @@ The standalone v1 landing probe admits an immutable object for a named destinati
 
 The original small synthetic fixture uses a 96 MiB journal, 32 MiB catalog, 88 MiB metadata, 8 MiB keys, 16 MiB scratch and 16 MiB clean-cache layout for this fixture. A v1 region and a v2 transactional region have different labels. Opening an incompatible region fails. All-device blank verification applies to initialization of either format. A quick wipe does not establish that the device passes that check.
 
-The fixture manifest selects 16 MiB and 128 operations of volatile filesystem writes, 8 MiB of writeback RAM, and a 16 MiB dirty journal budget. The admission calculation charges two volatile ownership stages, open and retained segments, clean-cache floors, raw index and replay memory, and companion headroom. It resolves to 7,868,514,304 bytes. The 1 GiB companion allowance is provisional. [Exact manifest](../zerofs/src/cli/memory_raw_fixture.toml) · [Raw HDD mounted evidence](evidence/raw-mounted-members/README.md)
+The fixture manifest selects 16 MiB and 128 operations of volatile filesystem writes, 16 MiB of writeback RAM, and a 16 MiB dirty journal budget. A segment rotates after a complete write batch: a maximum negotiated 9P write can add almost 10 MiB to an open segment holding almost 4 MiB. The writeback RAM budget covers that complete segment and its framing so it can reach the journal and satisfy fsync. The admission calculation charges two volatile ownership stages, open and retained segments, clean-cache floors, raw index and replay memory, and companion headroom. It resolves to 7,876,902,912 bytes (7,512 MiB). The 1 GiB companion allowance is provisional. [Exact manifest](../zerofs/src/cli/memory_raw_fixture.toml) · [Raw HDD mounted evidence](evidence/raw-mounted-members/README.md)
+
+The historical mounted receipts used the earlier 8 MiB writeback RAM budget and smaller fixture writes. They do not cover a maximum-size negotiated 9P write; the current budget corrects that gap without changing the historical measurements.
 
 ## Reproduction
 

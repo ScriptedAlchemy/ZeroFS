@@ -1,6 +1,7 @@
-use super::{Claim, ErrorKind, File, OpenOptions, Path, PathBuf, checked, fs, io, require};
+use super::{Claim, ErrorKind, File, OpenOptions, Path, checked, fs, io, require};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::path::PathBuf;
 use std::str::FromStr;
 
 mod identity;

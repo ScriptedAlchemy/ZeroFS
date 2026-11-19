@@ -2759,16 +2759,35 @@ mod tests {
         let server = NinePServer::new_unix(filesystem, socket.clone());
         let shutdown = CancellationToken::new();
         let server_shutdown = shutdown.clone();
-        let task = tokio::spawn(async move { server.start(server_shutdown).await });
+        let mut task =
+            AbortOnDropHandle::new(tokio::spawn(
+                async move { server.start(server_shutdown).await },
+            ));
 
-        let client = loop {
-            match tokio::net::UnixStream::connect(&socket).await {
-                Ok(client) => break client,
-                Err(_) => tokio::task::yield_now().await,
+        let client = tokio::select! {
+            result = &mut task => {
+                panic!("listener stopped before a client connected: {result:?}");
+            }
+            result = tokio::time::timeout(TEST_TIMEOUT, async {
+                loop {
+                    match tokio::net::UnixStream::connect(&socket).await {
+                        Ok(client) => break client,
+                        Err(_) => tokio::task::yield_now().await,
+                    }
+                }
+            }) => {
+                match result {
+                    Ok(client) => client,
+                    Err(_) => {
+                        task.abort();
+                        let _ = task.await;
+                        panic!("listener must accept a client before the deadline");
+                    }
+                }
             }
         };
         shutdown.cancel();
-        tokio::time::timeout(TEST_TIMEOUT, task)
+        join_with_timeout(task, TEST_TIMEOUT)
             .await
             .expect("listener and accepted client must stop after shutdown")
             .unwrap()

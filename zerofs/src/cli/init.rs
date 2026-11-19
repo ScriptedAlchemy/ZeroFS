@@ -1354,7 +1354,7 @@ pub(super) async fn raw_pool_journal(
     initialize: bool,
 ) -> Result<crate::writeback::journal::Journal> {
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(pool.clone());
-    let identity = if initialize {
+    let (bucket, key) = if initialize {
         anyhow::ensure!(
             region.is_empty()?,
             "refusing to initialize an existing journal"
@@ -1368,14 +1368,19 @@ pub(super) async fn raw_pool_journal(
             false,
         )
         .await?;
-        writeback_journal_identity(settings, &bucket, path.as_ref(), &key)?
+        (bucket, key)
     } else {
         anyhow::ensure!(!region.is_empty()?, "original raw journal is missing");
-        load_existing_writeback_identity(settings, &store, path.as_ref()).await?
+        load_existing_bucket_and_key(settings, &store, path.as_ref()).await?
     };
+    let identity = writeback_journal_identity(settings, &bucket, path.as_ref(), &key)?;
     let writeback = settings
         .writeback_settings(crate::writeback::config::WritebackAccessMode::ReadWrite)?
         .context("raw journal settings are required")?;
+    crate::writeback::bootstrap::validate_raw_namespace(
+        &writeback,
+        &bucket.cache_directory_name(),
+    )?;
     let region = crate::writeback::bootstrap::apply_raw_budget(region, &writeback)?;
     tokio::task::spawn_blocking(move || {
         crate::writeback::journal::Journal::open_raw(region, identity)
@@ -1388,6 +1393,16 @@ pub(crate) async fn load_existing_writeback_identity(
     object_store: &Arc<dyn object_store::ObjectStore>,
     database_prefix: &str,
 ) -> Result<crate::writeback::model::JournalIdentity> {
+    let (bucket, encryption_key) =
+        load_existing_bucket_and_key(settings, object_store, database_prefix).await?;
+    writeback_journal_identity(settings, &bucket, database_prefix, &encryption_key)
+}
+
+async fn load_existing_bucket_and_key(
+    settings: &Settings,
+    object_store: &Arc<dyn object_store::ObjectStore>,
+    database_prefix: &str,
+) -> Result<(bucket_identity::BucketIdentity, [u8; 32])> {
     let bucket = bucket_identity::BucketIdentity::load(object_store, database_prefix)
         .await
         .context("failed to load existing bucket identity for writeback recovery")?;
@@ -1399,7 +1414,7 @@ pub(crate) async fn load_existing_writeback_identity(
     )
     .await
     .context("failed to load existing encryption key for writeback recovery")?;
-    writeback_journal_identity(settings, &bucket, database_prefix, &encryption_key)
+    Ok((bucket, encryption_key))
 }
 
 fn writeback_journal_identity(
@@ -1545,6 +1560,139 @@ mod role_decision_tests {
             assert!(startup.sftp_pool.is_none());
             drop(startup);
         }
+    }
+
+    #[tokio::test]
+    async fn raw_pool_verification_rejects_an_existing_directory_journal() {
+        use crate::pool_object_store::{PoolMember, PoolObjectStore};
+        use zerofs_raw_device::{Identity, Role, journal_region::TransactionRegion};
+
+        const CAPACITY: u64 = 64 << 20;
+        const REGION_ID: Identity = Identity {
+            pool_uuid: [1; 16],
+            member_uuid: [2; 16],
+            role: Role::Journal,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let path = Path::from("db");
+        let pool = PoolObjectStore::initialize(
+            Arc::new(InMemory::new()),
+            path.clone(),
+            root.join("catalog"),
+            vec![PoolMember {
+                id: "data".into(),
+                identity: "memory://data".into(),
+                store: Arc::new(InMemory::new()),
+                capacity_bytes: CAPACITY,
+                local_path: None,
+                min_free_bytes: 0,
+                health_device: None,
+                free_space: None,
+            }],
+        )
+        .await
+        .unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(pool.clone());
+        let mut settings = crate::config::Settings::generate_default();
+        settings.storage.url = "memory:///db".into();
+        settings.storage.encryption_password = "raw-preflight-password".into();
+        settings.aws = None;
+        settings.cache.dir = root.join("cache");
+        settings.writeback = Some(WritebackConfig {
+            enabled: true,
+            dir: root.join("writeback"),
+            ack_mode: AckMode::Memory,
+            memory_size_gb: 0.004,
+            disk_size_gb: 0.008,
+            min_free_gb: 0.001,
+            high_watermark_percent: 95,
+            resume_percent: 85,
+            upload_concurrency: Some(2),
+            local_concurrency: 1,
+            shutdown_flush: ShutdownFlush::Local,
+        });
+
+        // Exercise the real offline journal path on a regular temporary file;
+        // no loop device or physical-device claim is involved.
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(CAPACITY).unwrap();
+        let region = TransactionRegion::provision(
+            file.try_clone().unwrap(),
+            CAPACITY,
+            0,
+            CAPACITY,
+            REGION_ID,
+        )
+        .unwrap();
+        let journal = super::raw_pool_journal(&settings, &pool, &path, region, true)
+            .await
+            .unwrap();
+        let original_cursor = journal.startup_cursor().unwrap();
+        drop(journal);
+        let reopen_region = || {
+            TransactionRegion::open(file.try_clone().unwrap(), CAPACITY, 0, CAPACITY, REGION_ID)
+                .unwrap()
+        };
+        let bucket = crate::bucket_identity::BucketIdentity::load(&store, path.as_ref())
+            .await
+            .unwrap();
+        let namespace = bucket.cache_directory_name();
+        let writeback = settings
+            .writeback_settings(DatabaseMode::ReadWrite.into())
+            .unwrap()
+            .unwrap();
+        let previous = writeback.dir.join(&namespace);
+        std::fs::create_dir_all(&previous).unwrap();
+        let pending = previous.join("journal.redb");
+        std::fs::write(&pending, b"existing directory journal").unwrap();
+
+        // Existing key errors still take precedence over the new preflight.
+        let password = settings.storage.encryption_password.clone();
+        settings.storage.encryption_password = "wrong-password".into();
+        let error = super::raw_pool_journal(&settings, &pool, &path, reopen_region(), false)
+            .await
+            .expect_err("verification must reject the wrong encryption password");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to load existing encryption key for writeback recovery"),
+            "{error:#}"
+        );
+        settings.storage.encryption_password = password;
+
+        let offline_error =
+            super::raw_pool_journal(&settings, &pool, &path, reopen_region(), false)
+                .await
+                .expect_err("offline verification must refuse the directory journal");
+        let server_error = crate::writeback::bootstrap::attach_raw(
+            store,
+            writeback,
+            original_cursor.0.clone(),
+            &namespace,
+            reopen_region(),
+        )
+        .await
+        .err()
+        .expect("server attachment must refuse the directory journal");
+        assert!(
+            offline_error
+                .to_string()
+                .contains("drain and migrate it first"),
+            "{offline_error:#}"
+        );
+        assert_eq!(offline_error.to_string(), server_error.to_string());
+        assert_eq!(
+            std::fs::read(&pending).unwrap(),
+            b"existing directory journal"
+        );
+
+        std::fs::remove_file(pending).unwrap();
+        std::fs::remove_dir(previous).unwrap();
+        let journal = super::raw_pool_journal(&settings, &pool, &path, reopen_region(), false)
+            .await
+            .unwrap();
+        assert_eq!(journal.startup_cursor().unwrap(), original_cursor);
     }
 
     #[tokio::test]

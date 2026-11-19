@@ -115,9 +115,8 @@ pub struct RawStore {
     file: Arc<Region>,
     /// The last durable checkpoint.
     label: Label,
-    /// One label slot is damaged, blank, or behind; the next flush rewrites
-    /// both.
-    label_degraded: bool,
+    /// Damaged, blank, or older slot to repair before replacing the good copy.
+    stale_slot: Option<u64>,
     tail: u64,
     next_seq: u64,
     index: HashMap<Vec<u8>, Entry>,
@@ -130,7 +129,7 @@ impl fmt::Debug for RawStore {
             .field("identity", &self.label.identity)
             .field("geometry", &self.geometry())
             .field("objects", &self.index.len())
-            .field("label_degraded", &self.label_degraded)
+            .field("label_degraded", &self.label_degraded())
             .field("poisoned", &self.poisoned)
             .finish()
     }
@@ -175,7 +174,7 @@ impl RawStore {
         Ok(Self {
             file: Arc::new(file),
             label,
-            label_degraded: false,
+            stale_slot: None,
             tail: LOG_START,
             next_seq: 1,
             index: HashMap::new(),
@@ -196,7 +195,7 @@ impl RawStore {
         let device_size = file.len;
         expected.validate()?;
         check_device_size(device_size).map_err(Error::InvalidGeometry)?;
-        let (label, label_degraded) = select_label(read_slots(&file)?)?;
+        let (label, stale_slot) = select_label(read_slots(&file)?)?;
         if label.identity != expected {
             return Err(Error::IdentityMismatch {
                 expected,
@@ -247,7 +246,7 @@ impl RawStore {
             file: Arc::new(file),
             tail: label.durable_tail,
             label,
-            label_degraded,
+            stale_slot,
             next_seq: seq,
             index,
             poisoned: false,
@@ -314,24 +313,42 @@ impl RawStore {
 
     /// Make every append so far durable, and repair a degraded label.
     ///
+    /// Repairs and syncs any stale label slot before replacing the good copy.
     /// Syncs the log, then writes the next checkpoint to slot 0, syncs, writes
     /// it to slot 1, and syncs again. Returns only after both slots are
     /// durable, so damage to either one later cannot roll the store back past
     /// this flush. Any I/O failure poisons the store; reopen it to recover the
     /// last durable state.
     pub fn flush(&mut self) -> Result<()> {
+        self.flush_with_checkpoint(write_checkpoint)
+    }
+
+    fn flush_with_checkpoint(
+        &mut self,
+        checkpoint: impl FnOnce(&Region, &Label) -> io::Result<()>,
+    ) -> Result<()> {
         self.check_writable()?;
-        if self.tail == self.label.durable_tail && !self.label_degraded {
+        if self.tail == self.label.durable_tail && self.stale_slot.is_none() {
             return Ok(());
         }
         let next = self.next_checkpoint()?;
+        // Restore redundancy at the selected generation first. Otherwise a
+        // second interrupted flush can leave generations two apart, or tear
+        // the only usable copy while its peer is still damaged.
+        if let Some(slot) = self.stale_slot {
+            let repaired = self
+                .file
+                .write_all_at(&self.label.encode(slot)[..], slot * BLOCK_SIZE)
+                .and_then(|()| self.file.sync_data());
+            self.poison_on_err(repaired)?;
+            self.stale_slot = None;
+        }
         let synced = self
             .file
             .sync_data()
-            .and_then(|()| write_checkpoint(&self.file, &next));
+            .and_then(|()| checkpoint(&self.file, &next));
         self.poison_on_err(synced)?;
         self.label = next;
-        self.label_degraded = false;
         Ok(())
     }
 
@@ -432,7 +449,7 @@ impl RawStore {
     /// Data is intact, but a second fault could lose the label. The next
     /// `flush` rewrites both slots and clears this.
     pub fn label_degraded(&self) -> bool {
-        self.label_degraded
+        self.stale_slot.is_some()
     }
 
     pub fn geometry(&self) -> Geometry {
@@ -592,9 +609,9 @@ fn read_slots(file: &Region) -> Result<[SlotState; 2]> {
     Ok([first, second])
 }
 
-/// Choose the durable checkpoint and report whether the slots disagree. See
+/// Choose the durable checkpoint and identify the slot requiring repair. See
 /// the slot rules in `format.rs`.
-fn select_label(slots: [SlotState; 2]) -> Result<(Label, bool)> {
+fn select_label(slots: [SlotState; 2]) -> Result<(Label, Option<u64>)> {
     for state in &slots {
         if let SlotState::Unsupported(version) = state {
             return Err(Error::UnsupportedVersion(*version));
@@ -609,10 +626,10 @@ fn select_label(slots: [SlotState; 2]) -> Result<(Label, bool)> {
                 return Err(corrupt(0, "label slots describe different provisionings"));
             }
             if a == b {
-                Ok((a, false))
+                Ok((a, None))
             } else if a.generation.checked_sub(1) == Some(b.generation) {
                 // A flush wrote slot 0 and stopped before slot 1.
-                Ok((a, true))
+                Ok((a, Some(1)))
             } else {
                 Err(Error::Corrupt {
                     offset: 0,
@@ -623,8 +640,8 @@ fn select_label(slots: [SlotState; 2]) -> Result<(Label, bool)> {
                 })
             }
         }
-        (SlotState::Valid(a), _) => Ok((a, true)),
-        (_, SlotState::Valid(b)) => Ok((b, true)),
+        (SlotState::Valid(a), _) => Ok((a, Some(1))),
+        (_, SlotState::Valid(b)) => Ok((b, Some(0))),
         (SlotState::Absent, SlotState::Absent) => Err(Error::NotProvisioned),
         (first, second) => Err(Error::Corrupt {
             offset: 0,

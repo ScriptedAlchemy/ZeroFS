@@ -47,22 +47,31 @@ pub(crate) async fn attach_raw(
     namespace: &str,
     region: zerofs_raw_device::journal_region::TransactionRegion,
 ) -> anyhow::Result<AttachedWriteback> {
-    validate_namespace(namespace)?;
-    let previous = settings.dir.join(namespace);
-    match std::fs::symlink_metadata(&previous) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-        Ok(_) => anyhow::bail!(
-            "raw P3 writeback refuses an existing directory journal at {}; drain and migrate it first",
-            previous.display()
-        ),
-    }
+    validate_raw_namespace(&settings, namespace)?;
 
     let region = apply_raw_budget(region, &settings)?;
     let journal = Arc::new(Journal::open_raw(region, identity)?);
     let space = Arc::new(PhysicalSpaceSampler::new_raw(Arc::clone(&journal)));
     tracing::info!("using raw P3 Journal for writeback metadata and payloads");
     attach_journal(remote, settings, journal, space).await
+}
+
+/// Apply the same directory-journal migration guard to startup and offline
+/// verification before either opens the raw journal database.
+pub(crate) fn validate_raw_namespace(
+    settings: &WritebackSettings,
+    namespace: &str,
+) -> anyhow::Result<()> {
+    validate_namespace(namespace)?;
+    let previous = settings.dir.join(namespace);
+    match std::fs::symlink_metadata(&previous) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+        Ok(_) => anyhow::bail!(
+            "raw P3 writeback refuses an existing directory journal at {}; drain and migrate it first",
+            previous.display()
+        ),
+    }
 }
 
 pub(crate) fn apply_raw_budget(

@@ -823,6 +823,26 @@ impl Catalog {
                     .checked_add(record.reserved)
                     .context("local pool reservation overflow")?;
             }
+            let costed_members: BTreeMap<_, _> = members
+                .iter()
+                .filter(|member| member.free_space.is_some())
+                .map(|member| (member.id.as_str(), member))
+                .collect();
+            if !costed_members.is_empty() {
+                // Raw uploads own record/padding bytes and future deletion
+                // space in addition to their logical quota. UPLOADS is keyed
+                // by upload id, so derive this from the outstanding rows only
+                // for custom space sources; directory/SFTP admission never
+                // scans uploads. Keep the durable logical counters unchanged.
+                for row in tx.open_table(UPLOADS)?.iter()? {
+                    let upload: Upload = bincode::deserialize(row?.1.value())?;
+                    if let Some(member) = costed_members.get(upload.member_id.as_str()) {
+                        local_reserved = local_reserved
+                            .checked_add(member.put_cost(upload.size).saturating_sub(upload.size))
+                            .context("local pool physical reservation overflow")?;
+                    }
+                }
+            }
             let rotate = target.is_none() && placement == SegmentPlacement::RoundRobinLocal;
             let (locals, start) = if rotate {
                 let meta = tx.open_table(META)?;
@@ -1278,8 +1298,18 @@ impl Catalog {
         }
         let mut upload_counts = BTreeMap::<String, u64>::new();
         let mut evacuation_reservations = BTreeMap::<String, BTreeMap<String, u64>>::new();
+        let costed_members: BTreeMap<_, _> = order
+            .iter()
+            .filter(|member| member.free_space.is_some())
+            .map(|member| (member.id.as_str(), member))
+            .collect();
+        let mut reservation_overhead_bytes = 0_u64;
         for row in tx.open_table(UPLOADS)?.iter()? {
             let upload: Upload = bincode::deserialize(row?.1.value())?;
+            if let Some(member) = costed_members.get(upload.member_id.as_str()) {
+                reservation_overhead_bytes = reservation_overhead_bytes
+                    .saturating_add(member.put_cost(upload.size).saturating_sub(upload.size));
+            }
             let target_health: MemberHealth = health_table
                 .get(upload.member_id.as_str())?
                 .map(|v| bincode::deserialize(v.value()))
@@ -1431,7 +1461,13 @@ impl Catalog {
                 evacuation,
             });
         }
-        super::capacity::assess(order, &mut members, &evacuation_segments, full);
+        super::capacity::assess(
+            order,
+            &mut members,
+            &evacuation_segments,
+            full,
+            reservation_overhead_bytes,
+        );
         let multiple_failures = members
             .iter()
             .filter(|member| {
@@ -1594,6 +1630,157 @@ fn ensure_eligible(tx: &redb::WriteTransaction, member: &str) -> Result<()> {
         .into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod raw_reservation_tests {
+    use super::*;
+    use crate::pool_object_store::{FilesystemSpace, FreeSpace};
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct RawSpace(u64);
+
+    impl FreeSpace for RawSpace {
+        fn observe(&self) -> std::io::Result<FilesystemSpace> {
+            Ok(FilesystemSpace {
+                filesystem: 1,
+                committed: 0,
+                available: self.0,
+                total: 64 << 10,
+            })
+        }
+
+        fn put_cost(&self, payload: u64) -> u64 {
+            zerofs_raw_device::RawStore::put_cost(payload).unwrap()
+                + zerofs_raw_device::RawStore::delete_cost()
+        }
+    }
+
+    fn member(id: &str, available: Option<u64>) -> PoolMember {
+        PoolMember {
+            id: id.into(),
+            identity: format!("memory://{id}"),
+            store: Arc::new(object_store::memory::InMemory::new()),
+            capacity_bytes: 64 << 10,
+            local_path: None,
+            min_free_bytes: 0,
+            health_device: None,
+            free_space: available.map(|bytes| Arc::new(RawSpace(bytes)) as _),
+        }
+    }
+
+    fn reserve(
+        catalog: &Catalog,
+        members: &[PoolMember],
+        name: &str,
+        size: u64,
+        target: &str,
+    ) -> Result<Upload> {
+        catalog.reserve(
+            name,
+            size,
+            members,
+            Some(target),
+            &BTreeSet::new(),
+            SegmentPlacement::FirstFit,
+        )
+    }
+
+    #[test]
+    fn pending_raw_uploads_reserve_physical_cost_across_reopen() {
+        for (size, available, cost) in [(1, 16 << 10, 12 << 10), (0, 8 << 10, 8 << 10)] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("catalog");
+            let catalog = Catalog::open(&path, "db", true, None).unwrap();
+            let members = vec![member("raw", Some(available))];
+            catalog.configure_members_except(&members, None).unwrap();
+            catalog.finish_initialization().unwrap();
+            let marker = catalog.identity.marker().unwrap();
+            let first = reserve(&catalog, &members, "first", size, "raw").unwrap();
+            assert_eq!(members[0].put_cost(size), cost);
+
+            let second = reserve(&catalog, &members, "second", size, "raw");
+            assert!(
+                second.unwrap_err().downcast_ref::<NoCapacity>().is_some(),
+                "each upload must own its record, padding, and future deletion space"
+            );
+            drop(catalog);
+
+            let catalog = Catalog::open(&path, "db", false, Some(&marker)).unwrap();
+            let status = catalog
+                .status(&members, None, &BTreeMap::new(), None)
+                .unwrap();
+            assert_eq!(status.members[0].reserved_bytes, size);
+            assert_eq!(status.members[0].pending_uploads, 1);
+            assert_eq!(status.members[0].available_bytes, available - cost);
+            assert!(reserve(&catalog, &members, "second", size, "raw").is_err());
+
+            catalog.forget_upload(&first.id).unwrap();
+            reserve(&catalog, &members, "after-cleanup", size, "raw").unwrap();
+        }
+    }
+
+    #[test]
+    fn evacuation_capacity_excludes_pending_raw_upload_overhead() {
+        let root = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(&root.path().join("catalog"), "db", true, None).unwrap();
+        let members = vec![member("source", None), member("raw", Some(16 << 10))];
+        catalog.configure_members_except(&members, None).unwrap();
+        catalog.finish_initialization().unwrap();
+        let source = reserve(&catalog, &members, "source-data", 1, "source").unwrap();
+        let entry = Entry {
+            physical: Physical::Member {
+                member_id: "source".into(),
+                key: source.physical_key.clone(),
+                e_tag: None,
+                version: None,
+            },
+            size: 1,
+            last_modified_secs: 0,
+            last_modified_nanos: 0,
+            e_tag: None,
+            version: None,
+            sha256: None,
+            attributes: Vec::new(),
+        };
+        catalog
+            .publish_for_migration(&source.id, &entry, None, false, None)
+            .unwrap();
+        catalog
+            .observe_health("source", None, Some("media failure".into()), None)
+            .unwrap();
+        assert!(
+            catalog
+                .status(&members, None, &BTreeMap::new(), None)
+                .unwrap()
+                .members[0]
+                .evacuation_capacity
+                .sufficient
+        );
+
+        let pending = reserve(&catalog, &members, "unpublished", 1, "raw").unwrap();
+        let status = catalog
+            .status(&members, None, &BTreeMap::new(), None)
+            .unwrap();
+        assert_eq!(status.members[1].reserved_bytes, 1);
+        assert_eq!(status.members[1].available_bytes, 4 << 10);
+        assert_eq!(
+            status.members[0].evacuation_capacity.available_bytes,
+            4 << 10
+        );
+        assert!(!status.members[0].evacuation_capacity.sufficient);
+
+        catalog.forget_upload(&pending.id).unwrap();
+        assert!(
+            catalog
+                .status(&members, None, &BTreeMap::new(), None)
+                .unwrap()
+                .members[0]
+                .evacuation_capacity
+                .sufficient
+        );
+    }
 }
 
 #[cfg(test)]

@@ -25,13 +25,21 @@ pub(super) fn assess(
     members: &mut [PoolMemberStatus],
     segments: &BTreeMap<String, Vec<u64>>,
     full: &BTreeMap<String, i64>,
+    reservation_overhead_bytes: u64,
 ) {
-    assess_with(config, members, segments, full, |member| {
-        member.validate_binding()?;
-        member
-            .filesystem_space()
-            .expect("assess_with asks only local members")
-    });
+    assess_with(
+        config,
+        members,
+        segments,
+        full,
+        reservation_overhead_bytes,
+        |member| {
+            member.validate_binding()?;
+            member
+                .filesystem_space()
+                .expect("assess_with asks only local members")
+        },
+    );
 }
 
 fn assess_with(
@@ -39,6 +47,7 @@ fn assess_with(
     members: &mut [PoolMemberStatus],
     segments: &BTreeMap<String, Vec<u64>>,
     full: &BTreeMap<String, i64>,
+    reservation_overhead_bytes: u64,
     mut space: impl FnMut(&PoolMember) -> std::io::Result<FilesystemSpace>,
 ) {
     // Match reserve(): unpublished local bytes may not yet appear in statvfs.
@@ -46,7 +55,9 @@ fn assess_with(
         .iter()
         .zip(members.iter())
         .filter(|(config, _)| config.is_local())
-        .fold(0_u64, |sum, (_, m)| sum.saturating_add(m.reserved_bytes));
+        .fold(reservation_overhead_bytes, |sum, (_, m)| {
+            sum.saturating_add(m.reserved_bytes)
+        });
     let mut filesystems = BTreeMap::<u64, Budget>::new();
     let mut available = 0_u64;
     let mut unavailable = Vec::new();
@@ -233,6 +244,7 @@ mod tests {
             &mut statuses,
             &BTreeMap::new(),
             &BTreeMap::new(),
+            0,
             |_| {
                 Ok(FilesystemSpace {
                     filesystem: 1,
@@ -259,6 +271,7 @@ mod tests {
             &mut statuses,
             &BTreeMap::new(),
             &BTreeMap::new(),
+            0,
             |_| {
                 Ok(FilesystemSpace {
                     filesystem: 1,
@@ -282,6 +295,7 @@ mod tests {
             &mut statuses,
             &BTreeMap::new(),
             &BTreeMap::new(),
+            0,
             |_| Err(std::io::Error::other("unmounted")),
         );
         assert_eq!(statuses[0].evacuation_capacity.available_bytes, 0);
@@ -299,6 +313,7 @@ mod tests {
             &mut statuses,
             &BTreeMap::new(),
             &BTreeMap::new(),
+            0,
             |member| {
                 Ok(FilesystemSpace {
                     filesystem: if member.id == "a" { 1 } else { 2 },
@@ -328,6 +343,7 @@ mod tests {
                 &mut statuses,
                 &segments,
                 &BTreeMap::new(),
+                0,
                 |member| {
                     Ok(FilesystemSpace {
                         filesystem: if member.id == "c" { 2 } else { 1 },
@@ -356,6 +372,7 @@ mod tests {
                 &mut statuses,
                 &segments,
                 &BTreeMap::new(),
+                0,
                 |_| {
                     Ok(FilesystemSpace {
                         filesystem: 1,

@@ -391,6 +391,57 @@ async fn every_acknowledged_mutation_is_durable_on_reopen() {
 }
 
 #[tokio::test]
+async fn delete_stream_preserves_input_order_and_reports_batch_failures() {
+    for fail_deletes in [false, true] {
+        let scratch = Scratch::new(SIZE);
+        let store = scratch.member(scratch.provision(), 0);
+        for name in ["first", "kept", "last"] {
+            store.put(&path(name), name.into()).await.unwrap();
+        }
+        drop(store);
+        let raw = if fail_deletes {
+            RawStore::open(File::open(&scratch.path).unwrap(), SIZE, id()).unwrap()
+        } else {
+            scratch.reopen()
+        };
+        let store = scratch.member(raw, 0);
+        let input = vec![
+            Ok(path("first")),
+            Err(Error::NotFound {
+                path: "upstream-error".to_owned(),
+                source: "upstream listing failed".into(),
+            }),
+            Ok(path("last")),
+        ];
+        let results: Vec<_> = store
+            .delete_stream(stream::iter(input).boxed())
+            .collect()
+            .await;
+        assert_eq!(results.len(), 3);
+        assert!(matches!(
+            &results[1],
+            Err(Error::NotFound { path, .. }) if path == "upstream-error"
+        ));
+        for (index, expected) in [(0, "first"), (2, "last")] {
+            if fail_deletes {
+                assert!(matches!(&results[index], Err(Error::Generic { .. })));
+            } else {
+                assert_eq!(results[index].as_ref().unwrap(), &path(expected));
+            }
+        }
+        drop(store);
+
+        // Successful batch results are durable; upstream errors never turn
+        // into deletion requests, and a failed batch reports no successes.
+        let store = scratch.member(scratch.reopen(), 0);
+        assert_eq!(read(&store, "kept").await, "kept");
+        for name in ["first", "last"] {
+            assert_eq!(store.head(&path(name)).await.is_ok(), fail_deletes);
+        }
+    }
+}
+
+#[tokio::test]
 async fn costs_and_capacity_are_exact() {
     let scratch = Scratch::new(SIZE);
     let store = scratch.member(scratch.provision(), 1);

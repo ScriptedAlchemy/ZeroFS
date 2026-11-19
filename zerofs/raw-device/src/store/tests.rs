@@ -585,6 +585,54 @@ fn crash_during_slot_1_write_takes_the_completed_checkpoint() {
 }
 
 #[test]
+fn consecutive_interrupted_checkpoints_preserve_recoverability() {
+    let (scratch, _, first) = interrupted_flush();
+    scratch.write_label(0, &first);
+    let mut store = reopen(&scratch);
+    assert_new_state(&store);
+    store.put(b"later", b"second interrupted flush").unwrap();
+
+    let result = store.flush_with_checkpoint(|file, next| {
+        file.write_all_at(&next.encode(0)[..], 0)?;
+        file.sync_data()?;
+        Err(io::Error::other("crash after checkpoint slot 0"))
+    });
+    assert!(matches!(result, Err(Error::Io(_))));
+    drop(store);
+
+    let store = reopen(&scratch);
+    assert_new_state(&store);
+    assert_eq!(
+        store.get(b"later").unwrap().unwrap(),
+        b"second interrupted flush"
+    );
+    assert!(store.label_degraded());
+}
+
+#[test]
+fn torn_checkpoint_after_single_slot_recovery_preserves_acknowledged_data() {
+    let scratch = two_acknowledged_flushes();
+    Damage::Torn.apply(&scratch, 1);
+    let mut store = reopen(&scratch);
+    assert_latest(&store);
+    store.put(b"later", b"not acknowledged").unwrap();
+
+    let result = store.flush_with_checkpoint(|file, next| {
+        file.write_all_at(&next.encode(0)[..2048], 0)?;
+        file.write_all_at(&[0xa5; 2048], 2048)?;
+        file.sync_data()?;
+        Err(io::Error::other("crash during checkpoint slot 0"))
+    });
+    assert!(matches!(result, Err(Error::Io(_))));
+    drop(store);
+
+    let store = reopen(&scratch);
+    assert_latest(&store);
+    assert_eq!(store.get(b"later").unwrap(), None);
+    assert!(store.label_degraded());
+}
+
+#[test]
 fn slot_states_no_checkpoint_sequence_produces_are_corrupt() {
     // Slot 1 ahead of slot 0.
     let (scratch, _, next) = interrupted_flush();

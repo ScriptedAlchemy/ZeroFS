@@ -293,7 +293,10 @@ def monitor(configuration, server):
                 ):
                     samples.append(error)
                     return
-            except (AssertionError, ValueError) as error:
+            except Exception as error:
+                # Thread.join() does not propagate sampler failures. Retain
+                # every unexpected error so a partial sample history cannot
+                # qualify a run whose monitoring stopped early.
                 samples.append(error)
                 return
             stopped.wait(0.1)

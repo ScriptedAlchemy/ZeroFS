@@ -347,10 +347,23 @@ def report_webui(config):
     references = set(re.findall(rb'(?:src|href)=["\'](/assets/[^"\']+)["\']', body))
     assets = {path.decode(): fetch(path.decode())[0] for path in sorted(references)}
     served = index["status"] == 200 and any(
-        asset["status"] == 200 and "javascript" in (asset["content_type"] or "")
+        asset["status"] == 200 and "javascript" in (asset["content_type"] or "").lower()
         and asset["bytes"] > 0 for asset in assets.values()
     )
     record("webui_assets", index=index, assets=assets, javascript_served=served)
+    assert served, ("WebUI index and JavaScript entrypoint must be available", index, assets)
+    expected_types = {
+        ".js": {"application/javascript", "text/javascript"},
+        ".mjs": {"application/javascript", "text/javascript"},
+        ".css": {"text/css"},
+    }
+    for path, asset in assets.items():
+        suffix = Path(path.partition("?")[0]).suffix
+        content_type = (asset["content_type"] or "").partition(";")[0].strip().lower()
+        assert (
+            asset["status"] == 200 and asset["bytes"] > 0
+            and (suffix not in expected_types or content_type in expected_types[suffix])
+        ), ("WebUI referenced asset must be available with its expected type", path, asset)
 
 
 def write_fsync_crash(path, server, body):

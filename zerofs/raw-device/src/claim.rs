@@ -3,7 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 mod physical;
 pub use physical::PhysicalRole;
@@ -107,7 +107,7 @@ impl Claim {
         )?;
         let sys = fs::canonicalize(format!("/sys/dev/block/{major}:{minor}"))?;
         require(
-            sys == PathBuf::from(format!("/sys/devices/virtual/block/loop{minor}")),
+            sys == Path::new(&format!("/sys/devices/virtual/block/loop{minor}")),
             "expected a whole loop device",
         )?;
         let device = OpenOptions::new()
@@ -143,7 +143,7 @@ impl Claim {
             (1 << 20..=256 << 20).contains(&size)
         };
         require(
-            size == meta.len() && valid_size && size % 4096 == 0,
+            size == meta.len() && valid_size && size.is_multiple_of(4096),
             "unexpected qualification geometry",
         )?;
         require(

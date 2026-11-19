@@ -608,7 +608,7 @@ mod raw_candidate {
         let baseline = validate(root, &config, Some(8 * GIB), "0\n").unwrap();
         let receipt = validate(root, &raised, Some(8 * GIB), "0\n").unwrap();
         assert_eq!(receipt, baseline);
-        assert_eq!(receipt.required_bytes, 7_504 * MIB);
+        assert_eq!(receipt.required_bytes, 7_512 * MIB);
         assert_eq!(receipt.included_companion_bytes, GIB);
         assert!(receipt.required_bytes < 8 * GIB);
         assert_eq!(receipt.hard_limit_bytes, 8 * GIB);
@@ -618,7 +618,7 @@ mod raw_candidate {
             "companion_allowance_bytes=1073741824",
             "clean_cache_disk_bytes=0",
             "clean_cache_bytes=100663296",
-            "object_writeback_bytes=8388608",
+            "object_writeback_bytes=16777216",
             "volatile_write_bytes=33554432",
         ] {
             assert!(receipt.accounting.contains(field), "{}", receipt.accounting);
@@ -649,7 +649,7 @@ mod raw_candidate {
             .replace("/fixture/", &format!("{}/", root.display()));
         let receipt = validate(root, &config, Some(8 * GIB), "0").unwrap();
         assert_eq!(receipt.included_companion_bytes, 3 * GIB / 2);
-        assert_eq!(receipt.required_bytes, 6_992 * MIB);
+        assert_eq!(receipt.required_bytes, 7_000 * MIB);
         assert!(receipt.stored_state_qualification.is_none());
         assert!(
             receipt
@@ -677,7 +677,12 @@ mod raw_candidate {
         let read = |toml: &str| validate(temp.path(), toml, Some(8 * GIB), "0");
         let receipt = read(config).unwrap();
         assert_eq!(receipt.included_companion_bytes, 1536 * MIB);
+        assert_eq!(receipt.required_bytes, 7_000 * MIB);
         for (old, new) in [
+            (
+                "memory_size_gb = 0.016777216",
+                "memory_size_gb = 0.008388608",
+            ),
             ("/hdd6?", "/hdd18?"),
             ("/hdd6?", "/dev/sda?"),
             ("/hdd18?", "/ZL213G03?"),
@@ -737,9 +742,9 @@ mod raw_candidate {
                 "16 MiB disk",
             ),
             (
+                "memory_size_gb = 0.016777216",
                 "memory_size_gb = 0.008388608",
-                "memory_size_gb = 0.009",
-                "8 MiB journal RAM",
+                "16 MiB journal RAM",
             ),
             (
                 "local_concurrency = 1",

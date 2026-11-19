@@ -1650,6 +1650,141 @@ mod tests {
     use slatedb::object_store::memory::InMemory;
     use tokio::sync::Semaphore;
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn raw_candidate_can_durably_seal_a_maximum_ninep_write() {
+        use crate::config::Settings;
+        use crate::frame_codec::FrameCodec;
+        use crate::fs::key_codec::KeyCodec;
+        use crate::fs::lock_manager::KeyedLockManager;
+        use crate::segment::SEGMENT_INFO;
+        use crate::segment_store::SegmentStore;
+        use crate::writeback::config::WritebackAccessMode;
+        use crate::writeback::model::JournalIdentity;
+        use object_store::{ObjectStoreExt, path::Path, prefix::PrefixStore};
+        use zerofs_raw_device::{Identity, Role, journal_region::TransactionRegion};
+
+        let temp = tempfile::tempdir().unwrap();
+        let config = include_str!("../../../cli/memory_raw_fixture.toml")
+            .replace("/fixture/", &format!("{}/", temp.path().display()));
+        let config_path = temp.path().join("raw.toml");
+        std::fs::write(&config_path, config).unwrap();
+        let settings = Settings::from_file(config_path).unwrap();
+        let profile = settings.store_profile().unwrap();
+        let writeback_settings = settings
+            .writeback_settings(WritebackAccessMode::ReadWrite)
+            .unwrap()
+            .unwrap();
+        let binding =
+            crate::storage_backend::raw::RawBinding::parse(&settings.storage.url.parse().unwrap())
+                .unwrap();
+        let capacity = binding.layout.unwrap()[0];
+        // Exercise the production raw journal without claiming any device.
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(capacity).unwrap();
+        let region = TransactionRegion::provision(
+            file,
+            capacity,
+            0,
+            capacity,
+            Identity {
+                pool_uuid: *binding.pool.as_bytes(),
+                member_uuid: *binding.member.as_bytes(),
+                role: Role::Journal,
+            },
+        )
+        .unwrap();
+        let remote = Arc::new(InMemory::new());
+        let attached = crate::writeback::bootstrap::attach_raw(
+            remote.clone(),
+            writeback_settings,
+            JournalIdentity {
+                format_version: 1,
+                bucket_id: "raw-large-write-fixture".to_owned(),
+                backend_endpoint: "raw+p3-v2://".to_owned(),
+                database_prefix: "db".to_owned(),
+                backend_kind: "raw+p3-v2".to_owned(),
+                encryption_key_identity_sha256: [1; 32],
+            },
+            "bucket_fixture",
+            region,
+        )
+        .await
+        .unwrap();
+        let backing: Arc<dyn ObjectStore> =
+            Arc::new(PrefixStore::new(attached.store.clone(), "db"));
+        let (unused_store, db) = make().await;
+        drop(unused_store);
+        let store = ExtentStore::new(
+            db.clone(),
+            Arc::new(KeyCodec::new()),
+            Arc::new(SegmentStore::new(
+                backing.clone(),
+                FrameCodec::new(&[1; 32], SEGMENT_INFO, settings.compression()),
+                7,
+                None,
+            )),
+            Arc::new(KeyedLockManager::new()),
+            profile.seal_threshold.unwrap(),
+            profile.max_inflight_seals.unwrap(),
+            32 << 20,
+        );
+
+        // Leave the same lane just below its rotation threshold, then append
+        // the largest standard 9P write. Each whole request claims one batch,
+        // so the resulting object is larger than the former 8 MiB RAM tier.
+        let prefix = Bytes::from(incompressible(
+            41,
+            profile.seal_threshold.unwrap() - 2 * EXTENT_SIZE,
+        ));
+        write_committed(&store, &db, 1, 0, &prefix, 0).await;
+        assert_eq!(attached.lifecycle.accepted_sequence(), 0);
+        let data = Bytes::from(incompressible(
+            42,
+            (ninep_proto::P9_MAX_MSIZE - ninep_proto::P9_TWRITE_HDR) as usize,
+        ));
+        write_committed(
+            &store,
+            &db,
+            1,
+            prefix.len() as u64,
+            &data,
+            prefix.len() as u64,
+        )
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            store.seal_open().await.unwrap();
+            attached
+                .lifecycle
+                .wait_local_through_accepted()
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("maximum 9P write must reach local durability within the raw profile");
+        let loc = frameloc_of(&store, &db, 1, 0).await.unwrap();
+        let object = Path::from(format!("db/{}", loc.segid.object_key()));
+        assert!(attached.store.head(&object).await.unwrap().size > 8 << 20);
+        assert!(
+            remote.head(&object).await.is_err(),
+            "remote replay stays paused"
+        );
+        drop(store);
+
+        // A fresh extent store has no plaintext or open-segment cache. Its
+        // read must recover the exact bytes from the raw journal's payload.
+        let reopened = make_store(backing, db.clone(), settings.compression(), 8);
+        let actual = reopened
+            .read(1, 0, (prefix.len() + data.len()) as u64)
+            .await
+            .unwrap();
+        assert_eq!(&actual[..prefix.len()], prefix.as_ref());
+        assert_eq!(&actual[prefix.len()..], data.as_ref());
+        drop(reopened);
+        attached.lifecycle.shutdown().await.unwrap();
+        db.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn cached_write_extent_does_not_retain_the_entire_request() {
         use std::sync::atomic::{AtomicBool, Ordering};

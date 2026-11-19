@@ -35,8 +35,10 @@ Whole-media zero verification on successful provisioning reads at least 6,001,17
 | P3 placement catalog / namespace authority / key envelopes | 128 MiB / 3 GiB / 16 MiB |
 | P3 scratch / remaining clean-cache extent | 32 MiB / 932,374,601,728 B on the physical P3 |
 | Filesystem volatile memory / operations | 16 MiB / 128 |
-| Object writeback RAM / journal redb cache | 8 MiB / 64 MiB |
+| Object writeback RAM / journal redb cache | 16 MiB / 64 MiB |
 | Aggregate cgroup / included app companions | 8 GiB, zero swap / 1,610,612,736 B |
+
+The total memory admission charge is 7,340,032,000 bytes (7,000 MiB), including companions. The 16 MiB writeback RAM budget admits a complete seal containing a maximum negotiated 9P write after a partially filled segment. Earlier qualification receipts used an 8 MiB RAM budget and smaller writes.
 
 Scratch and the large clean-cache extent are currently unused. The engine runs the clean read caches in RAM. It caps outstanding journal operations and raw-index key counts independently of device capacity. The two 4 KiB length checkpoints and 4 GiB free reserve leave 60,129,533,952 B under the redb resize ceiling. Startup limits the logical dirty budget to one quarter of that ceiling for allocator growth, copy-on-write and pinned pages. On the 8 GiB held fixture at `143fb0c8`, redb reported 2,332,338 allocated 4 KiB pages (9,553,256,448 B) and a file length of 10,737,586,176 B. The measured length includes space for reuse. Freshly provisioned regions checkpoint the highest extent ever exposed. On growth the engine can skip redundant zero writes beyond that extent. Regrowth clears any previously exposed bytes. Older, ambiguous or incomplete checkpoint histories fall back to zeroing the full growth range. Pacing begins at 95% of the logical dirty budget and resumes below the configured 85% watermark. The HDDs require a physical reserve of at least 1% of their respective byte capacities. Round-robin placement distributes sealed segments among eligible devices.
 

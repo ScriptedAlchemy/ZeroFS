@@ -6,8 +6,10 @@ pub(super) fn verify_fs(path: &Path, expected: i64) -> io::Result<()> {
     let directory = File::open(path)?;
     let mut fs_type = std::mem::MaybeUninit::<libc::statfs>::uninit();
     checked(unsafe { libc::fstatfs(directory.as_raw_fd(), fs_type.as_mut_ptr()) })?;
+    // libc uses signed or unsigned 32/64-bit fields across Linux targets.
+    let actual = i128::from(unsafe { fs_type.assume_init() }.f_type);
     require(
-        unsafe { fs_type.assume_init() }.f_type as i64 == expected,
+        actual == i128::from(expected),
         "physical claim requires kernel procfs and sysfs",
     )
 }

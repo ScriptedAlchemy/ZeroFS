@@ -140,17 +140,20 @@ pub(super) fn validate(
             "16 MiB disk and up to 8 MiB free reserve",
         )
     };
+    // Sealing rotates after one whole write batch. A maximum 10 MiB 9P
+    // request can join almost 4 MiB already buffered, plus frame metadata.
+    // The RAM tier must admit that complete object before it can reach P3.
     ensure!(
         wb.ack_mode == AckMode::Memory
             && wb.shutdown_flush == ShutdownFlush::Local
-            && wb.memory_bytes == 8 * MIB
+            && wb.memory_bytes == 16 * MIB
             && wb.disk_bytes == disk_bytes
             && reserve.contains(&wb.min_free_bytes)
             && wb.local_concurrency == 1
             && wb.upload_concurrency == 2
             && wb.high_watermark_percent == 95
             && wb.resume_percent == 85,
-        "requires memory ack, local shutdown, 8 MiB journal RAM, {disk_label}, one local and two upload workers, and 95/85 watermarks"
+        "requires memory ack, local shutdown, 16 MiB journal RAM, {disk_label}, one local and two upload workers, and 95/85 watermarks"
     );
     ensure!(
         write_ack.mode == FilesystemWriteAckMode::VolatileMemory

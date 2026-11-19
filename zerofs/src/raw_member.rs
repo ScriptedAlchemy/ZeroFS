@@ -675,39 +675,35 @@ impl ObjectStore for RawMemberStore {
         let this = self.clone();
         locations
             .ready_chunks(DELETE_BATCH)
-            .then(move |batch| {
+            .then(move |mut batch| {
                 let this = this.clone();
                 async move {
-                    let mut out = Vec::with_capacity(batch.len());
-                    let mut paths = Vec::with_capacity(batch.len());
-                    for item in batch {
-                        match item {
-                            Ok(path) => paths.push(path),
-                            Err(err) => out.push(Err(err)),
-                        }
-                    }
-                    if !paths.is_empty() {
-                        let deleting = paths.clone();
-                        match this.blocking(move |inner| inner.delete(&deleting)).await {
-                            Ok(()) => out.extend(paths.into_iter().map(Ok)),
-                            Err(err) => {
-                                // One flush covers the batch: report the
-                                // failure against every path in it.
-                                let reason = err.to_string();
-                                out.push(Err(err));
-                                out.extend(paths.into_iter().skip(1).map(|path| {
-                                    Err(Error::Generic {
-                                        store: STORE,
-                                        source: format!(
-                                            "delete of {path} failed with its batch: {reason}"
-                                        )
-                                        .into(),
-                                    })
+                    let paths: Vec<_> = batch
+                        .iter()
+                        .filter_map(|item| item.as_ref().ok().cloned())
+                        .collect();
+                    if !paths.is_empty()
+                        && let Err(err) = this.blocking(move |inner| inner.delete(&paths)).await
+                    {
+                        // One flush covers the batch: report the failure
+                        // against every requested path. Keep upstream
+                        // errors in their original positions, as required
+                        // by ObjectStore::delete_stream's ordered contract.
+                        let reason = err.to_string();
+                        let mut first_error = Some(err);
+                        for item in &mut batch {
+                            if let Ok(path) = item {
+                                *item = Err(first_error.take().unwrap_or_else(|| Error::Generic {
+                                    store: STORE,
+                                    source: format!(
+                                        "delete of {path} failed with its batch: {reason}"
+                                    )
+                                    .into(),
                                 }));
                             }
                         }
                     }
-                    stream::iter(out)
+                    stream::iter(batch)
                 }
             })
             .flatten()
