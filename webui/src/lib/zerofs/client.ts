@@ -437,12 +437,6 @@ export class ZeroFsClient {
     const result = { applied: 0, failed: 0 };
     const visit = async (path: string): Promise<void> => {
       const children = await this.listDirectory(path, signal);
-      try {
-        await this.setattr(path, opts);
-        result.applied++;
-      } catch {
-        result.failed++;
-      }
       await pooled(children, 8, async (entry) => {
         if (signal?.aborted) return;
         const child = join(path, entry.name);
@@ -462,6 +456,15 @@ export class ZeroFsClient {
           }
         }
       });
+      if (signal?.aborted) return;
+      // Descendants still need to search this directory by path. Apply its
+      // attributes last so a restrictive mode cannot block the remaining work.
+      try {
+        await this.setattr(path, opts);
+        result.applied++;
+      } catch {
+        result.failed++;
+      }
     };
     await visit(dirPath);
     return result;
