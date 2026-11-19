@@ -4,7 +4,7 @@ export PATH=/bin:/usr/bin:/sbin:/usr/sbin
 exec </dev/console >/dev/console 2>&1
 failed() {
     echo BROKER_VM_FAIL
-    cat /app/state/driver.log /app/state/error /app/state/engine.log /run/broker.log 2>/dev/null | tail -80 || true
+    tail -30 /app/state/driver.log /app/state/error /app/state/engine.log /run/broker.log 2>/dev/null || true
     poweroff -f
 }
 trap failed EXIT
@@ -34,9 +34,13 @@ start_broker() {
 }
 start_broker
 while ! test -S /run/claim/claim.sock; do kill -0 "$broker"; sleep 0.1; done
+for namespace in pid mount; do
+    /bin/unshare "--$namespace" --fork /bin/setpriv --reuid 20001 --regid 20001 --clear-groups --bounding-set=-all --no-new-privs /bin/fault /run/claim/claim.sock denied-namespace
+    echo "BROKER_VM_REFUSED isolated-$namespace-only"
+done
 for mode in file sequence disconnect missing; do /bin/fault "/run/claim/$mode" "$mode" & done
 echo "BROKER_VM_HOST pidns=$(readlink /proc/self/ns/pid) mntns=$(readlink /proc/self/ns/mnt) socket=$(stat -c '%u:%g:%a' /run/claim/claim.sock)"
-(echo 0 >/sys/fs/cgroup/app/cgroup.procs; exec unshare --pid --mount --net --cgroup --fork --kill-child --propagation private /isolate) >/app/state/driver.log 2>&1 &
+(echo 0 >/sys/fs/cgroup/app/cgroup.procs; exec /bin/unshare --pid --mount --net --cgroup --fork --kill-child --propagation private /isolate) >/app/state/driver.log 2>&1 &
 client=$!
 wait_marker() {
     while ! test -f "/app/state/$1"; do kill -0 "$client" || return 1; sleep 0.1; done
@@ -52,7 +56,8 @@ while ! test -S /run/claim/claim.sock || test "$(stat -c %i /run/claim/claim.soc
 touch /app/state/restarted
 wait "$client"
 grep '^BROKER_VM_' /app/state/driver.log
-echo "BROKER_VM_CGROUP peak=$(cat /sys/fs/cgroup/app/memory.peak) events=$(cat /sys/fs/cgroup/app/memory.events | sed ':a;N;$!ba;s/\n/,/g')"
+echo "BROKER_VM_SOCKET_REPLACED old=$(cat /app/state/old-inode) new=$(stat -c %i /run/claim/claim.sock)"
+echo "BROKER_VM_CGROUP limit=$(cat /sys/fs/cgroup/app/memory.max) swap_limit=$(cat /sys/fs/cgroup/app/memory.swap.max) swap_peak=$(cat /sys/fs/cgroup/app/memory.swap.peak) peak=$(cat /sys/fs/cgroup/app/memory.peak) events=$(while read -r field value; do printf '%s=%s ' "$field" "$value"; done </sys/fs/cgroup/app/memory.events)"
 echo BROKER_VM_PASS
 trap - EXIT
 poweroff -f

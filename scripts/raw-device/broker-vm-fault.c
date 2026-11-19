@@ -25,7 +25,16 @@ int main(int argc, char **argv) {
     if (strlen(path) >= sizeof(addr.sun_path)) return 2;
     strcpy(addr.sun_path, path);
     int sock = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
-    if (sock < 0 || bind(sock, (struct sockaddr *)&addr, sizeof(addr)) ||
+    if (sock < 0) fail("socket");
+    if (!strcmp(mode, "denied-uid") || !strcmp(mode, "denied-namespace")) {
+        const char *expected = !strcmp(mode, "denied-uid") ? "ERR1claim client credentials rejected"
+            : "ERR1claim client must have distinct PID and mount namespaces";
+        if (connect(sock, (struct sockaddr *)&addr, sizeof(addr))) fail("connect");
+        char packet[256];
+        ssize_t bytes = recv(sock, packet, sizeof(packet), 0);
+        return bytes < (ssize_t)strlen(expected) || memcmp(packet, expected, strlen(expected));
+    }
+    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) ||
         chmod(path, 0666) || listen(sock, 1)) fail("test endpoint");
     int peer = accept(sock, NULL, NULL);
     if (peer < 0) fail("accept");

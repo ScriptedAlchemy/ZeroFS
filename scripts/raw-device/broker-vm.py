@@ -63,6 +63,7 @@ def run(scratch, kernel, release, engine, probe, manifest):
     vm.stage_binary(app, engine, "/bin/zerofs")
     vm.stage_binary(app, "/usr/bin/setpriv", "/bin/setpriv")
     vm.stage_binary(root, probe, "/bin/zerofs-raw-device")
+    vm.stage_binary(root, "/usr/bin/setpriv", "/bin/setpriv")
     vm.stage_binary(root, "/usr/bin/unshare", "/bin/unshare")
     vm.stage_binary(root, "/usr/bin/udevadm", "/bin/udevadm")
     vm.stage_binary(root, "/usr/lib/systemd/systemd-udevd", "/usr/lib/systemd/systemd-udevd")

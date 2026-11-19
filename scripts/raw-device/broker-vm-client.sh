@@ -16,7 +16,7 @@ refuse() {
     match=$2
     shift 2
     if "$@" >/state/error 2>&1; then cat /state/error; exit 1; fi
-    grep -Ei "$match" /state/error >/dev/null
+    grep -Ei "$match" /state/error >/dev/null || { cat /state/error; return 1; }
     echo "BROKER_VM_REFUSED $name"
 }
 env -u ZEROFS_RAW_CLAIM_SOCKET zerofs memory-status -c "$cfg" >/state/memory
@@ -34,6 +34,10 @@ refuse run-before-pool-init 'original raw P3 journal is missing' zerofs run -c "
 zerofs pool init -c "$cfg" >/state/init
 zerofs pool verify-raw -c "$cfg" >/state/verify
 grep -q '"journal_verified": true' /state/verify
+for field in authority_verified catalog_verified key_envelope_verified journal_verified; do grep -q "\"$field\": true" /state/verify; done
+grep -q '"included_companion_bytes": 1610612736' /state/verify
+grep -q '"journal_allocation": {' /state/verify
+echo BROKER_VM_READY authority=true catalog=true key_envelope=true journal=true included_companion_bytes=1610612736
 refuse mismatched-member 'mismatch' zerofs pool verify-raw -c /etc/wrong.toml
 start_engine() {
     zerofs run -c "$cfg" >> /state/engine.log 2>&1 &
