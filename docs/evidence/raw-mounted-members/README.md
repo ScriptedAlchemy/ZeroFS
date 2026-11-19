@@ -22,4 +22,35 @@ identified loop devices backed by owned tmpfs inodes.
   post-spill catalog and final cold-restart checks. Docker removed the owned
   container. The runner uses the original 2 GiB limit again.
 
-There is no completed acceptance receipt.
+## Pinned Spark result
+
+[Spark attempt 4](spark-056d4158-attempt-4.log) passed with exact
+Git-archive binaries from `056d41586ee925479e21d169294123a2acb8f565`.
+Spark's arm64 Docker container used a 47,244,640,256-byte cgroup limit and
+zero swap. The engine admitted its 43,050,336,256-byte startup requirement.
+The probe rejected a swapped backing inode and a swapped member UUID.
+
+The 32 MiB and 96 MiB members each held one segment of the initial 8 MiB file,
+whose mounted hash matched after restart. At the reserve boundary the smaller
+member had 20,537,344 raw bytes free, a 16,777,216-byte reserve, and 16,384
+bytes reserved for retirement, leaving 3,743,744 bytes allocatable. Both
+following fsyncs succeeded and added two placements to the larger member.
+Their 8,651,123 catalog bytes occupied 8,667,136 physical log bytes as predicted
+by raw v1 header and alignment costs. The larger member also reserved 8,192
+more bytes for retirement. The smaller member's physical space and placements
+stayed unchanged.
+
+The final cold mount read 29,360,128 bytes with SHA-256
+`d86adf06785b7ddb6654db261aaba2ddb51abff325cc139b501d2ba05c52b54f`.
+The final catalog, raw object hashes and physical space matched the
+post-overflow snapshot. The receipt verifies all four unmounts, two loop
+autoclears, and removal of the backing files, scratch, Docker container and
+transfer directory.
+
+Spark [attempt 1](spark-056d4158-attempt-1.log) and
+[attempt 2](spark-056d4158-attempt-2.log) exposed transfer-directory permission
+errors. [Attempt 3](spark-056d4158-attempt-3.log) passed admission but Docker's
+default AppArmor profile refused the FUSE mount syscall. The passing run
+disabled that profile only for the disposable Spark container. It kept its
+read-only image and fixture binds, private network namespace, narrowly scoped
+device rules, cgroup and capability limits. Studio retains its default profile.

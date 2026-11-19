@@ -29,8 +29,12 @@ def record(case, **fields):
     print(json.dumps({"case": case, **fields}, sort_keys=True), flush=True)
 
 
-def run(*args):
+def run(*args, refuse=None):
     result = subprocess.run(args, capture_output=True, timeout=60)
+    if refuse is not None:
+        error = result.stderr.decode(errors="replace").strip()
+        assert result.returncode and refuse in error, (args, result.returncode, error)
+        return error
     if result.returncode:
         raise RuntimeError(f"{args}: {result.stderr.decode(errors='replace')}")
     return result.stdout
@@ -99,7 +103,9 @@ def mounted(config):
                 record("mounted", transport="userspace-fuse", filesystem_type=types[0],
                        phase=root.name)
                 yield mount / "payload"
-            assert not os.path.ismount(mount), mount
+            assert not any(line.split()[4] == str(mount)
+                           for line in Path("/proc/self/mountinfo").read_text().splitlines()), mount
+            record("unmounted", phase=root.name)
         except BaseException:
             log.seek(0)
             print(log.read().decode(errors="replace"), flush=True)
@@ -207,12 +213,28 @@ def snapshot(config, members, phase):
     return status, placements
 
 
-def qualify(root, members):
+def check_member_bindings(members):
+    # The kernel inode and the label UUID are independent requirements.
+    node, backing, pool_id, member_id = members["small"]
+    _, other_backing, _, other_member = members["large"]
+    error = run(PROBE, "get", node, other_backing, pool_id, member_id, "payload", "unused",
+                refuse="loop backing identity mismatch")
+    record("rejected_loop_binding", member="small", substituted="backing inode", error=error)
+    error = run(PROBE, "get", node, backing, pool_id, other_member, "payload", "unused",
+                refuse="device label binding mismatch (member)")
+    record("rejected_loop_binding", member="small", substituted="member UUID", error=error)
+
+
+def qualify(root, members, memory_limit):
     authority = root / "authority"
     authority.mkdir()
     catalog = root / "catalog"
     configs = [write_config(root / phase, authority, catalog, members)
                for phase in ("initial", "fill", "overflow", "cold_restart")]
+    admission = json.loads(run(ZEROFS, "memory-status", "-c", configs[0]))
+    assert admission["hard_limit_bytes"] == memory_limit, admission
+    assert 0 < admission["required_bytes"] < memory_limit, admission
+    record("memory_admission", **admission)
     initialized = json.loads(run(ZEROFS, "pool", "init", "-c", configs[0]))
     assert initialized["mapped_objects"] == 0, initialized
     digest = hashlib.sha256()
@@ -300,6 +322,11 @@ def main():
         raise RuntimeError("disposable Docker fixture with only loopback networking required")
     os.umask(0o077)
     require_fuse()
+    cgroup = Path("/sys/fs/cgroup")
+    expected_memory = int(os.environ["RAW_MOUNTED_MEMORY_BYTES"])
+    limits = {name: int((cgroup / name).read_text()) for name in ("memory.max", "memory.swap.max")}
+    assert limits == {"memory.max": expected_memory, "memory.swap.max": 0}, limits
+    record("container_limits", **limits)
     for executable in (ZEROFS, PROBE):
         if not os.access(executable, os.X_OK):
             raise RuntimeError(f"missing parent-built Linux executable at {executable}")
@@ -316,10 +343,13 @@ def main():
                 run(PROBE, "init-blank", node, disk, pool_id, member_id, "payload")
                 members[member] = (node, disk, pool_id, member_id)
                 backing = disk.stat()
+                block_id = node.stat().st_rdev
                 record("initialized_loop", member=member, member_uuid=member_id,
                        pool_uuid=pool_id, size_bytes=size, node=str(node), backing=str(disk),
-                       backing_device=backing.st_dev, backing_inode=backing.st_ino)
-            qualify(root, members)
+                       backing_device=backing.st_dev, backing_inode=backing.st_ino,
+                       loop_major=os.major(block_id), loop_minor=os.minor(block_id))
+            check_member_bindings(members)
+            qualify(root, members, expected_memory)
         assert all(not disk.exists() for disk in disks) and not nodes.exists()
         record("fixture_cleanup", autocleared_loops=len(disks), backing_files_removed=True)
     assert not root.exists()
