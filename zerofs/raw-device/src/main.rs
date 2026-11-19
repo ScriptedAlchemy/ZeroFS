@@ -16,6 +16,7 @@ mod probe {
     fn uuid(text: &str) -> Result<[u8; 16]> {
         let digits: String = text.chars().filter(|&c| c != '-').collect();
         if !text.is_ascii()
+            || !digits.bytes().all(|b| b.is_ascii_hexdigit())
             || digits.len() != 32
             || text.len() != 36
             || [8, 13, 18, 23].iter().any(|&i| text.as_bytes()[i] != b'-')

@@ -54,7 +54,10 @@ impl Claim {
             .open(backing)?;
         let meta = backing_lock.metadata()?;
         require(
-            meta.is_file() && meta.nlink() == 1 && meta.mode() & 0o077 == 0,
+            meta.is_file()
+                && meta.nlink() == 1
+                && meta.mode() & 0o077 == 0
+                && meta.uid() == unsafe { libc::geteuid() },
             "expected private, singly linked backing inode",
         )?;
         let backing_parent = backing

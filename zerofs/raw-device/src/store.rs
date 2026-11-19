@@ -515,12 +515,12 @@ fn random_nonce() -> Result<[u8; 16]> {
     Ok(nonce)
 }
 
-#[cfg(test)]
-mod tests;
-
 pub(crate) fn require_blank(file: &Region) -> Result<()> {
     if let Some(offset) = first_nonzero(file, file.len)? {
         return Err(Error::NotBlank { offset });
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
