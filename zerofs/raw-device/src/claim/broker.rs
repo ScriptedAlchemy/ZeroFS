@@ -9,7 +9,7 @@ use rustix::net::{
 use std::fs::{self, File};
 use std::io::{self, IoSlice, IoSliceMut};
 use std::mem::MaybeUninit;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::time::Duration;
@@ -162,12 +162,52 @@ fn send(socket: &OwnedFd, data: &[u8], file: Option<&File>) -> io::Result<()> {
     require(n == data.len(), "incomplete claim send")
 }
 
-fn grant(connection: &OwnedFd, uid: u32, gid: u32) -> io::Result<()> {
+fn authorize(connection: &OwnedFd, uid: u32, gid: u32) -> io::Result<()> {
     let cred = peer(connection)?;
     require(
         cred.uid == uid && cred.gid == gid && cred.pid > 0,
         "claim client credentials rejected",
     )?;
+    // Bind the namespace lookup to this connection's original process, even
+    // if a PID exits and its number is reused during the lookup.
+    let mut raw = -1i32;
+    let mut len = size_of::<i32>() as libc::socklen_t;
+    checked(unsafe {
+        libc::getsockopt(
+            connection.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERPIDFD,
+            (&mut raw as *mut i32).cast(),
+            &mut len,
+        )
+    })?;
+    require(
+        raw >= 0 && len as usize == size_of::<i32>(),
+        "missing peer pidfd",
+    )?;
+    let process = unsafe { OwnedFd::from_raw_fd(raw) };
+    let dir = File::open(format!("/proc/{}", cred.pid))?;
+    let namespaces = std::path::PathBuf::from(format!("/proc/self/fd/{}/ns", dir.as_raw_fd()));
+    for (kind, shared) in [("pid", false), ("mnt", false), ("user", true)] {
+        let remote = fs::metadata(namespaces.join(kind))?;
+        let local = fs::metadata(Path::new("/proc/self/ns").join(kind))?;
+        require(
+            ((remote.dev(), remote.ino()) == (local.dev(), local.ino())) == shared,
+            "claim client must have distinct PID and mount namespaces and share the broker's user namespace",
+        )?;
+    }
+    let mut poll = libc::pollfd {
+        fd: process.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let state = unsafe { libc::poll(&mut poll, 1, 0) };
+    checked(state)?;
+    require(state == 0, "claim peer exited during authentication")
+}
+
+fn grant(connection: &OwnedFd, uid: u32, gid: u32) -> io::Result<()> {
+    authorize(connection, uid, gid)?;
     configure_timeout(connection, 2)?;
     let mut bytes = [0; REQUEST_LEN];
     let (n, supplied_fd) = receive(connection, &mut bytes)?;
