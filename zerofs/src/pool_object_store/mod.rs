@@ -1186,6 +1186,20 @@ impl PoolObjectStore {
         outcome
     }
 
+    pub(crate) async fn register_segment_target(
+        &self,
+        location: &Path,
+        target: &SegmentTarget,
+    ) -> object_store::Result<()> {
+        if !self.segment(location) {
+            return Err(unsupported("segment targets require a canonical segment key"));
+        }
+        let _guard = self.key_lock(location).write_owned().await;
+        let previous = self.visible(location).await?;
+        Self::check_mode(location, &PutMode::Create, previous.as_ref())?;
+        self.bind_segment_target(location, &target.0).await
+    }
+
     async fn bind_segment_target(&self, location: &Path, member: &str) -> object_store::Result<()> {
         self.member(member)?;
         let location = location.to_string();

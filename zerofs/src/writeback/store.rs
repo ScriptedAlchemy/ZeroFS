@@ -1,3 +1,4 @@
+use crate::pool_object_store::{PoolObjectStore, SegmentTarget};
 use crate::segment_store::{
     AuthoritativeSegmentRead, ConditionalMultipartCreate, GeneratedSegmentCreate,
 };
@@ -42,7 +43,7 @@ use std::hash::{Hash, Hasher};
 #[cfg(not(unix))]
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::sync::{Mutex, Notify, OwnedMutexGuard};
 use uuid::Uuid;
 
@@ -72,6 +73,7 @@ struct WritebackStoreInner {
     space_refresher: Arc<SpaceRefresher>,
     journaler: LocalJournaler,
     remote: RemoteScheduler,
+    pool: OnceLock<PoolObjectStore>,
     database_prefix: String,
     incarnation: Uuid,
     next_sequence: AtomicU64,
@@ -242,6 +244,7 @@ impl WritebackObjectStore {
                 space_refresher: SpaceRefresher::start(Arc::clone(&ssd), Arc::clone(&space)),
                 journaler,
                 remote,
+                pool: OnceLock::new(),
                 database_prefix,
                 incarnation: snapshot.incarnation,
                 next_sequence: AtomicU64::new(snapshot.local_seq),
@@ -435,6 +438,10 @@ impl WritebackObjectStore {
             control,
         )
         .await
+    }
+
+    pub(crate) fn set_pool(&self, pool: PoolObjectStore) {
+        self.inner.pool.set(pool).expect("writeback pool already configured");
     }
 
     /// Start remote writeback after callers have finished opening over the
@@ -701,6 +708,17 @@ impl WritebackObjectStore {
                 "mutation metadata exceeds its bounded SSD reservation: {error}"
             ))
         })?;
+        if let Some(target) = options.extensions.get::<SegmentTarget>() {
+            if mode != MutationMode::Create || !trusted_segment_create {
+                return Err(generic_error("writeback segment targets require generated conditional create"));
+            }
+            let pool = self.inner.pool.get().ok_or_else(|| {
+                generic_error("writeback cannot persist a segment target without its pool catalog")
+            })?;
+            // Replay uses the same canonical key. Commit the target before the
+            // journal can acknowledge the payload, so replay needs no extension.
+            pool.register_segment_target(&location, target).await?;
+        }
         // Wait for journal-queue capacity before taking the global order lock,
         // so a full queue cannot convoy unrelated writers behind this one.
         let slot =

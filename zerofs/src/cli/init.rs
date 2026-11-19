@@ -291,6 +291,9 @@ impl StartupContext {
                     )
                     .await
                     .context("Failed to attach persistent writeback")?;
+                    if let Some(pool) = &pool {
+                        attached.lifecycle.set_pool(pool.clone());
+                    }
                     (attached.store, Some(attached.lifecycle))
                 }
                 None => (retried_remote, None),
