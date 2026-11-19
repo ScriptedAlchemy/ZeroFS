@@ -7,10 +7,12 @@ import json
 import os
 from pathlib import Path
 import random
+import signal
 import stat
 import subprocess
 import tempfile
 import time
+import tomllib
 from urllib.parse import urlencode
 from uuid import uuid4
 
@@ -18,6 +20,8 @@ from fixture import device, pool
 
 ZEROFS = "/input/zerofs"
 PROBE = "/input/zerofs-raw-device"
+MANIFEST = Path("/input/memory_raw_fixture.toml")
+CGROUP = Path("/sys/fs/cgroup")
 MIB = 1 << 20
 CHUNK = 4 * MIB
 RAW_BLOCK = 4096  # Raw v1 record header and payload alignment.
@@ -54,7 +58,7 @@ def require_fuse():
             pass
     except (OSError, RuntimeError) as error:
         record("mount_unavailable", transport="userspace-fuse", error=str(error))
-        raise RuntimeError("FUSE device is unavailable in Studio Docker") from error
+        raise RuntimeError("FUSE device is unavailable in the isolated Docker container") from error
 
 
 def wait_for(predicate, process):
@@ -67,7 +71,7 @@ def wait_for(predicate, process):
         time.sleep(0.1)
 
 
-def stop(process):
+def stop(process, expected=0):
     if process.poll() is None:
         process.terminate()
     try:
@@ -76,12 +80,12 @@ def stop(process):
         process.kill()
         process.wait(timeout=10)
         raise
-    if code:
-        raise RuntimeError(f"{process.args[:2]} exited with {code}")
+    if code != expected:
+        raise RuntimeError(f"{process.args[:2]} exited with {code}, expected {expected}")
 
 
 @contextmanager
-def mounted(config):
+def mounted(config, *, crash=False):
     root = config.parent
     mount = root / "mount"
     endpoint = root / "ninep.sock"
@@ -89,7 +93,7 @@ def mounted(config):
         try:
             with ExitStack() as cleanup:
                 server = subprocess.Popen([ZEROFS, "run", "-c", config], stdout=log, stderr=log)
-                cleanup.callback(stop, server)
+                cleanup.callback(stop, server, -signal.SIGKILL if crash else 0)
                 wait_for(endpoint.exists, server)
                 client = subprocess.Popen(
                     [ZEROFS, "mount", "--writeback", "false", "--relaxed-consistency", "false",
@@ -104,7 +108,7 @@ def mounted(config):
                 assert len(types) == 1 and types[0] in {"fuse", "fuse.zerofs"}, types
                 record("mounted", transport="userspace-fuse", filesystem_type=types[0],
                        phase=root.name)
-                yield mount / "payload"
+                yield mount / "payload", server
             assert not any(line.split()[4] == str(mount)
                            for line in Path("/proc/self/mountinfo").read_text().splitlines()), mount
             record("unmounted", phase=root.name)
@@ -125,9 +129,10 @@ def write_config(root, authority_url, catalog, members):
     (root / "mount").mkdir()
     config = root / "zerofs.toml"
     catalog_setting = f'catalog_dir = "{catalog}"\n' if catalog is not None else ""
+    disk_size = 0 if catalog is None else 0.064
     content = f"""[cache]
 dir = "{root / 'cache'}"
-disk_size_gb = 0.064
+disk_size_gb = {disk_size}
 memory_size_gb = 0.064
 warm_metadata = "off"
 
@@ -239,6 +244,166 @@ def inspect_p3(binding, phase):
     return stats
 
 
+def check_admission(config, memory_limit):
+    admission = json.loads(run(ZEROFS, "memory-status", "-c", config))
+    assert admission and admission["hard_limit_bytes"] == memory_limit, admission
+    assert 0 < admission["required_bytes"] < memory_limit, admission
+    record("memory_admission", phase=config.parent.name, **admission)
+    return admission
+
+
+def check_p3_shadows(root, configs):
+    shadows = sorted(str(path.relative_to(root)) for path in root.rglob("*")
+                     if path.name in {"pool.redb", "pool.lock", "zerofs.key"}
+                     or path.name.startswith("bucket_"))
+    for config in configs:
+        settings = tomllib.loads(config.read_text())
+        if "writeback" in settings:
+            journal = Path(settings["writeback"]["dir"])
+            if journal.exists():
+                shadows.append(str(journal))
+    assert not shadows and not (root / "authority").exists(), shadows
+    record("p3_no_directory_shadows", catalog=True, authority=True, key_envelope=True,
+           cache=True, journal=True)
+
+
+def sample_cgroup(phase):
+    resources = {}
+    for name in ("memory.current", "memory.peak", "memory.events", "memory.swap.current",
+                 "memory.swap.max", "memory.max", "cpu.stat", "cpu.max"):
+        value = (CGROUP / name).read_text().strip()
+        resources[name] = int(value) if value.isdigit() else value
+    record("cgroup_sample", phase=phase, **resources)
+    events = dict(line.split() for line in resources["memory.events"].splitlines())
+    assert resources["memory.swap.current"] == resources["memory.swap.max"] == 0, resources
+    assert not any(int(events[key]) for key in ("oom", "oom_kill")), resources
+
+
+def render_nas_config(root, template, members, p3, *, held):
+    root.mkdir()
+    (root / "mount").mkdir()
+    manifest = tomllib.loads(template)
+    replacements = {
+        manifest["cache"]["dir"]: str(root / "unused-clean-cache"),
+        manifest["writeback"]["dir"]: str(root / "unused-directory-journal"),
+        manifest["storage"]["url"]: raw_url("raw+p3-v2", p3, layout_mib=P3_LAYOUT),
+        manifest["servers"]["ninep"]["unix_socket"]: str(root / "ninep.sock"),
+        manifest["servers"]["rpc"]["unix_socket"]: str(root / "rpc.sock"),
+    }
+    for member in manifest["storage"]["pool"]["members"]:
+        member_id = member["id"]
+        normal = RESERVES[member_id]
+        assert round(member["capacity_gb"] * 1e9) == SIZES[member_id], member
+        assert round(member["reserve_free_gb"] * 1e9) == normal, member
+        replacements[member["url"]] = raw_url("raw+loop", members[member_id])
+        if held:
+            replacements[f"reserve_free_gb = {normal / 1e9:.9f}"] = (
+                f"reserve_free_gb = {(SIZES[member_id] - 256 * 1024) / 1e9:.9f}"
+            )
+    for original, replacement in replacements.items():
+        assert template.count(original) == 1, original
+        template = template.replace(original, replacement, 1)
+    rendered = root / "zerofs.toml"
+    rendered.write_text(template)
+    record("runtime_manifest", phase=root.name, held_reserves=held, toml=template)
+    return rendered
+
+
+def write_fsync_crash(path, server, body):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        start = time.monotonic_ns()
+        unwritten = memoryview(body)
+        while unwritten:
+            written = os.write(fd, unwritten)
+            assert written > 0, written
+            unwritten = unwritten[written:]
+        written_at = time.monotonic_ns()
+        os.fsync(fd)
+        synced_at = time.monotonic_ns()
+        server.kill()
+        signalled_at = time.monotonic_ns()
+        assert server.wait(timeout=10) == -signal.SIGKILL
+    finally:
+        os.close(fd)
+    record("mounted_fsync_sigkill", bytes=len(body), write_ns=written_at - start,
+           fsync_ns=synced_at - written_at, fsync_to_signal_ns=signalled_at - synced_at,
+           signal=signal.SIGKILL)
+
+
+def qualify_nas_fit(root, members, memory_limit, p3):
+    template = MANIFEST.read_text()
+    record("manifest_source", sha256=hashlib.sha256(MANIFEST.read_bytes()).hexdigest())
+    phases = ("initialize", "held_write", "held_replay", "destage", "destaged_cold")
+    configs = [render_nas_config(root / phase, template, members, p3,
+                                 held=phase in {"held_write", "held_replay"})
+               for phase in phases]
+    initial, held, replay, destage, cold = configs
+    for config in (initial, held):
+        admission = check_admission(config, memory_limit)
+        assert "memory_policy=raw-device-p3-candidate-v1" in admission["accounting"], admission
+    blank = inspect_p3(p3, "blank")
+    assert blank["journal_bytes"] == blank["catalog_bytes"] == 0, blank
+    initialized = json.loads(run(ZEROFS, "pool", "init", "-c", initial))
+    assert initialized["pool_id"] == p3[2] and initialized["mapped_objects"] == 0, initialized
+    before, placements = snapshot(held, members, "held_before_write")
+    assert not placements and all(0 < m["available_bytes"] < CHUNK for m in before.values()), before
+
+    body = random.Random(0).randbytes(CHUNK)
+    digest = hashlib.sha256(body)
+    with mounted(held, crash=True) as (path, server):
+        sample_cgroup("before_volatile_write")
+        write_fsync_crash(path, server, body)
+        sample_cgroup("after_sigkill")
+    crashed = inspect_p3(p3, "after_sigkill")
+    assert crashed["journal_bytes"] > 0, crashed
+    after, placements = snapshot(held, members, "after_sigkill")
+    assert not placements and all(after[key]["space"] == m["space"]
+                                  for key, m in before.items()), after
+
+    with mounted(replay) as (path, _):
+        start = time.monotonic_ns()
+        verify(path, digest, 1, "held_cold_replay")
+        record("mounted_replay_read_timing", read_verify_ns=time.monotonic_ns() - start)
+        sample_cgroup("held_cold_replay")
+    replayed = inspect_p3(p3, "held_cold_replay")
+    assert replayed["journal_bytes"] > 0, replayed
+    _, placements = snapshot(replay, members, "held_cold_replay")
+    assert not placements, placements
+
+    start = time.monotonic_ns()
+    with mounted(destage) as (path, _):
+        ready = time.monotonic_ns()
+        run(ZEROFS, "flush", "-c", destage)
+        drained = time.monotonic_ns()
+        record("mounted_destage_timing", startup_ns=ready - start, drain_barrier_ns=drained - ready,
+               total_ns=drained - start)
+        verify(path, digest, 1, "after_destage")
+        sample_cgroup("after_destage")
+    status, placed = snapshot(destage, members, "after_destage")
+    assert placed and sum(entry["size"] for entry in placed.values()) >= CHUNK, placed
+    for key, member in status.items():
+        entries = [entry for entry in placed.values() if entry["member_id"] == key]
+        physical_spent = (
+            before[key]["space"]["filesystem_free_bytes"]
+            - member["space"]["filesystem_free_bytes"]
+        )
+        expected = sum(RAW_BLOCK * (1 + (entry["size"] + RAW_BLOCK - 1) // RAW_BLOCK)
+                       for entry in entries)
+        assert physical_spent == expected, (key, physical_spent, expected)
+    with mounted(cold) as (path, _):
+        verify(path, digest, 1, "destaged_cold_restart")
+        sample_cgroup("destaged_cold_restart")
+    cold_status, restarted = snapshot(cold, members, "destaged_cold_restart")
+    assert restarted == placed, restarted
+    assert all(cold_status[key]["space"] == member["space"] for key, member in status.items())
+    roles = inspect_p3(p3, "destaged_cold_restart")
+    assert roles["catalog_bytes"] > 0 and roles["authority_objects"] > 0, roles
+    assert roles["keys_objects"] == 1 and roles["envelope_in_keys"], roles
+    assert not roles["envelope_in_authority"] and roles["cache_objects"] == 0, roles
+    check_p3_shadows(root, configs)
+
+
 def qualify(root, members, memory_limit, p3):
     authority = root / "authority"
     catalog = None
@@ -253,10 +418,7 @@ def qualify(root, members, memory_limit, p3):
         assert blank["keys_objects"] == blank["authority_objects"] == 0, blank
     configs = [write_config(root / phase, authority_url, catalog, members)
                for phase in ("initial", "fill", "overflow", "cold_restart")]
-    admission = json.loads(run(ZEROFS, "memory-status", "-c", configs[0]))
-    assert admission["hard_limit_bytes"] == memory_limit, admission
-    assert 0 < admission["required_bytes"] < memory_limit, admission
-    record("memory_admission", **admission)
+    check_admission(configs[0], memory_limit)
     initialized = json.loads(run(ZEROFS, "pool", "init", "-c", configs[0]))
     assert initialized["mapped_objects"] == 0, initialized
     if p3 is not None:
@@ -265,7 +427,7 @@ def qualify(root, members, memory_limit, p3):
         assert initialized_roles["catalog_bytes"] > 0, initialized_roles
     digest = hashlib.sha256()
     chunks = 0
-    with mounted(configs[0]) as path:
+    with mounted(configs[0]) as (path, _):
         for _ in range(2):
             append(path, digest, chunks)
             chunks += 1
@@ -273,7 +435,7 @@ def qualify(root, members, memory_limit, p3):
     _, initial = snapshot(configs[0], members, "initial")
     assert {entry["member_id"] for entry in initial.values()} == SIZES.keys(), initial
 
-    with mounted(configs[1]) as path:
+    with mounted(configs[1]) as (path, _):
         verify(path, digest, chunks, "first_restart")
         while chunks < 16:
             append(path, digest, chunks)
@@ -295,7 +457,7 @@ def qualify(root, members, memory_limit, p3):
 
     # Two appends with a barrier each force round-robin to reconsider the
     # smaller member even if the first append would naturally go to large.
-    with mounted(configs[2]) as path:
+    with mounted(configs[2]) as (path, _):
         for _ in range(2):
             append(path, digest, chunks)
             chunks += 1
@@ -333,7 +495,7 @@ def qualify(root, members, memory_limit, p3):
            larger_raw_log_bytes=physical_spent,
            larger_retirement_reserved_bytes_added=retirement_added)
 
-    with mounted(configs[3]) as path:
+    with mounted(configs[3]) as (path, _):
         verify(path, digest, chunks, "cold_restart")
     restarted_status, restarted = snapshot(configs[3], members, "cold_restart")
     assert restarted == final, restarted
@@ -344,10 +506,7 @@ def qualify(root, members, memory_limit, p3):
         assert roles["catalog_bytes"] > 0 and roles["authority_objects"] > 0, roles
         assert roles["keys_objects"] == 1 and roles["envelope_in_keys"], roles
         assert not roles["envelope_in_authority"] and roles["journal_bytes"] == 0, roles
-        shadows = sorted(str(path.relative_to(root)) for path in root.rglob("*")
-                         if path.name in {"pool.redb", "pool.lock", "zerofs.key"})
-        assert not shadows and not authority.exists(), shadows
-        record("p3_no_directory_shadows", catalog=True, authority=True, key_envelope=True)
+        check_p3_shadows(root, configs)
 
 
 def main():
@@ -357,23 +516,26 @@ def main():
         raise RuntimeError("disposable Docker fixture with only loopback networking required")
     os.umask(0o077)
     require_fuse()
-    cgroup = Path("/sys/fs/cgroup")
     expected_memory = int(os.environ["RAW_MOUNTED_MEMORY_BYTES"])
-    limits = {name: int((cgroup / name).read_text()) for name in ("memory.max", "memory.swap.max")}
+    limits = {name: int((CGROUP / name).read_text()) for name in ("memory.max", "memory.swap.max")}
     assert limits == {"memory.max": expected_memory, "memory.swap.max": 0}, limits
     record("container_limits", **limits)
     for executable in (ZEROFS, PROBE):
         if not os.access(executable, os.X_OK):
             raise RuntimeError(f"missing parent-built Linux executable at {executable}")
     record("binaries", sha256=run("sha256sum", ZEROFS, PROBE).decode().splitlines())
-    p3_enabled = os.environ["RAW_MOUNTED_P3"] == "1"
+    mode = os.environ["RAW_MOUNTED_MODE"]
+    assert mode in {"placement", "p3", "nas-fit"}, mode
+    nas_fit = mode == "nas-fit"
+    if nas_fit:
+        sample_cgroup("start")
     with tempfile.TemporaryDirectory(dir="/dev/shm", prefix="zerofs-mounted-") as scratch:
         root = Path(scratch)
         temp = root / "tmp"
         temp.mkdir()
         os.environ["TMPDIR"] = str(temp)
         pool_id = str(uuid4())
-        sizes = SIZES | ({"p3": P3_SIZE} if p3_enabled else {})
+        sizes = SIZES | ({"p3": P3_SIZE} if mode != "placement" else {})
         with pool(count=len(sizes)) as (disks, nodes), ExitStack() as opened:
             members = {}
             for (member, size), disk in zip(sizes.items(), disks, strict=True):
@@ -394,11 +556,16 @@ def main():
                        loop_major=os.major(block_id), loop_minor=os.minor(block_id))
             p3 = members.pop("p3", None)
             check_member_bindings(members)
-            qualify(root, members, expected_memory, p3)
+            if nas_fit:
+                qualify_nas_fit(root, members, expected_memory, p3)
+            else:
+                qualify(root, members, expected_memory, p3)
         assert all(not disk.exists() for disk in disks) and not nodes.exists()
         record("fixture_cleanup", autocleared_loops=len(disks), backing_files_removed=True)
     assert not root.exists()
-    record("mounted_raw_members_pass", scratch_removed=True)
+    if nas_fit:
+        sample_cgroup("cleaned")
+    record("mounted_raw_members_pass", mode=mode, scratch_removed=True)
 
 
 if __name__ == "__main__":

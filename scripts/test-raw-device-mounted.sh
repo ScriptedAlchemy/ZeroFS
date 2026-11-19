@@ -6,14 +6,18 @@ if [[ ${1:-} == --spark ]]; then
     suite=spark
     shift
 fi
-p3=0
-if [[ ${1:-} == --p3 ]]; then
-    p3=1
-    shift
-fi
+mode=placement
+case ${1:-} in
+    --p3) mode=p3; shift ;;
+    --nas-fit) mode=nas-fit; shift ;;
+esac
 if [[ $# != 1 || ! -f $1/zerofs || ! -x $1/zerofs ||
       ! -f $1/zerofs-raw-device || ! -x $1/zerofs-raw-device ]]; then
-    echo "Usage: $0 [--spark] [--p3] LINUX_EXECUTABLE_DIRECTORY" >&2
+    echo "Usage: $0 [--spark] [--p3|--nas-fit] LINUX_EXECUTABLE_DIRECTORY" >&2
+    exit 2
+fi
+if [[ $mode == nas-fit && ($suite != spark || ! -r $1/memory_raw_fixture.toml) ]]; then
+    echo 'NAS-fit requires --spark and the pinned memory_raw_fixture.toml alongside the executables' >&2
     exit 2
 fi
 engine_root=$(cd "$(dirname "$0")/.." && pwd)
@@ -35,8 +39,16 @@ if [[ $suite == spark ]]; then
         echo 'Spark gx10-6a8d arm64 with its default local Docker socket and at least 48 GiB required' >&2
         exit 1
     fi
-    memory=44g
-    memory_bytes=$((44 * 1024 ** 3))
+    gib=44
+    if [[ $mode == nas-fit ]]; then
+        gib=${RAW_MOUNTED_NAS_GIB:-10}
+        if [[ $gib != 10 && $gib != 12 ]]; then
+            echo 'The Spark NAS-fit cgroup must be 10 or 12 GiB' >&2
+            exit 2
+        fi
+    fi
+    memory="${gib}g"
+    memory_bytes=$((gib * 1024 ** 3))
     platform=linux/arm64
     # Spark's docker-default AppArmor profile denies the FUSE mount syscall.
     security=(--security-opt apparmor=unconfined)
@@ -101,5 +113,5 @@ trap 'exit 143' TERM
     --mount "type=bind,src=$binaries,dst=/input,readonly" \
     --mount "type=bind,src=$engine_root/scripts/raw-device,dst=/h,readonly" \
     -e PYTHONDONTWRITEBYTECODE=1 -e TMPDIR=/dev/shm \
-    -e "RAW_MOUNTED_MEMORY_BYTES=$memory_bytes" -e "RAW_MOUNTED_P3=$p3" "$image_id" \
+    -e "RAW_MOUNTED_MEMORY_BYTES=$memory_bytes" -e "RAW_MOUNTED_MODE=$mode" "$image_id" \
     timeout --kill-after=15s 12m python3 -u /h/mounted.py
