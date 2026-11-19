@@ -106,7 +106,10 @@ pub(crate) fn check_access(
     let (uid, gid, file_mode) = (inode.uid(), inode.gid(), inode.mode());
 
     if creds.uid == 0 {
+        // Root can search a directory even when none of its mode bits grant
+        // search access. The execute-bit requirement applies to files only.
         if let AccessMode::Execute = mode
+            && !inode.is_directory()
             && file_mode & 0o111 == 0
         {
             return Err(FsError::PermissionDenied);
@@ -181,4 +184,67 @@ pub(crate) fn can_set_times(
     }
 
     Err(FsError::OperationNotPermitted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::inode::test_file_inode;
+
+    fn directory(mode: u32) -> Inode {
+        Inode::Directory(DirectoryInode {
+            mtime: 0,
+            mtime_nsec: 0,
+            ctime: 0,
+            ctime_nsec: 0,
+            atime: 0,
+            atime_nsec: 0,
+            mode,
+            uid: 1000,
+            gid: 1000,
+            entry_count: 0,
+            parent: 0,
+            name: Some(b"restricted".to_vec()),
+            nlink: 2,
+        })
+    }
+
+    #[test]
+    fn root_can_search_directories_without_execute_bits() {
+        let root = Credentials::from_auth_context(&AuthContext::default());
+        let owner = Credentials::from_auth_context(&AuthContext {
+            uid: 1000,
+            gid: 1000,
+            ..AuthContext::default()
+        });
+        for mode in [0o000, 0o444, 0o600, 0o666] {
+            let inode = directory(mode);
+            assert_eq!(check_access(&inode, &root, AccessMode::Execute), Ok(()));
+            assert_eq!(
+                check_access(&inode, &owner, AccessMode::Execute),
+                Err(FsError::PermissionDenied),
+                "an ordinary owner still needs directory search permission"
+            );
+        }
+    }
+
+    #[test]
+    fn root_still_needs_an_execute_bit_for_regular_files() {
+        let root = Credentials::from_auth_context(&AuthContext::default());
+        for mode in [0o000, 0o444, 0o600, 0o666, 0o100, 0o010, 0o001] {
+            let mut inode = test_file_inode(0);
+            let Inode::File(file) = &mut inode else {
+                unreachable!()
+            };
+            file.mode = mode;
+            let expected = if mode & 0o111 == 0 {
+                Err(FsError::PermissionDenied)
+            } else {
+                Ok(())
+            };
+            assert_eq!(check_access(&inode, &root, AccessMode::Execute), expected);
+            assert_eq!(check_access(&inode, &root, AccessMode::Read), Ok(()));
+            assert_eq!(check_access(&inode, &root, AccessMode::Write), Ok(()));
+        }
+    }
 }
