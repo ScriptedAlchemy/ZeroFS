@@ -18,6 +18,11 @@ HERE = Path(__file__).resolve().parent
 STOCK_NVME_MODEL = b"QEMU NVMe Ctrl\0"
 P3_NVME_MODEL = b"CT1000P3SSD8\0".ljust(len(STOCK_NVME_MODEL), b"\0")
 
+DUPLICATE_DRIVE = (
+    "duplicate", 128 << 20,
+    "ide-hd,bus=ide.2,model=ZeroFS duplicate,serial=WF203KQ8,wwn=0x5000c500ac8aed0b,rotation_rate=7200",
+)
+
 DRIVES = (
     ("hdd6", 6_001_175_126_016, "ide-hd,bus=ide.0,model=ST6000DM003-2CY186,serial=WF203KQ8,wwn=0x5000c500ac8aed0a,rotation_rate=7200"),
     ("hdd18", 18_000_207_937_536, "ide-hd,bus=ide.1,model=WDC WD180EMFZ-11AFXA0,serial=3WH7H3BJ,wwn=0x5000cca284d17ed1,rotation_rate=7200"),
@@ -140,10 +145,10 @@ def boot(qemu, vm, model, environment):
 
 def run(scratch, kernel, probe, release):
     root = scratch / "root"
-    for directory in ("bin", "dev", "proc", "sys", "run", "etc", "usr/lib/udev/rules.d"):
+    for directory in ("bin", "dev", "proc", "sys", "run", "etc", "claim-mount", "usr/lib/udev/rules.d"):
         (root / directory).mkdir(parents=True, exist_ok=True)
     shutil.copy2("/usr/bin/busybox", root / "bin/busybox")
-    for applet in ("sh", "mount", "insmod", "poweroff", "grep", "basename", "readlink", "ln"):
+    for applet in ("sh", "mount", "umount", "insmod", "poweroff", "grep", "basename", "readlink", "ln", "cat", "rm"):
         (root / "bin" / applet).symlink_to("busybox")
     shutil.copy2(HERE / "physical-vm-init.sh", root / "init")
     (root / "init").chmod(0o755)
@@ -156,6 +161,13 @@ def run(scratch, kernel, probe, release):
         shutil.copy2("/usr/lib/udev/rules.d/" + name, root / "usr/lib/udev/rules.d" / name)
     subprocess.run(
         ["cc", "-static", "-O2", "-Wall", "-Wextra", "-o", root / "bin/hold-exclusive", HERE / "physical-vm-hold.c"],
+        check=True, timeout=30,
+    )
+    for command in ("dmsetup", "mkfs.ext4"):
+        stage_binary(root, "/usr/sbin/" + command, "/usr/sbin/" + command)
+    shutil.copy2("/etc/mke2fs.conf", root / "etc/mke2fs.conf")
+    subprocess.run(
+        ["cc", "-static", "-O2", "-Wall", "-Wextra", "-o", root / "bin/guest-partition", HERE / "physical-vm-partition.c"],
         check=True, timeout=30,
     )
     stage_modules(root, release)
@@ -174,19 +186,25 @@ def run(scratch, kernel, probe, release):
         "-bios", "/usr/share/seabios/bios-256k.bin", "-snapshot",
     ]
     backing = {}
-    for role, bytes_, controller in DRIVES:
+    control_drive = []
+    for role, bytes_, controller in (*DRIVES, DUPLICATE_DRIVE):
         image = scratch / (role + ".qcow2")
         subprocess.run(
             ["qemu-img", "create", "-q", "-f", "qcow2", "-o", "preallocation=off", image, str(bytes_)],
             check=True, timeout=20,
         )
         backing[image] = digest(image)
-        vm.extend(["-drive", f"if=none,format=qcow2,id={role},file={image}", "-device", f"{controller},drive={role}"])
+        options = ["-drive", f"if=none,format=qcow2,id={role},file={image}", "-device", f"{controller},drive={role}"]
+        if role == "duplicate":
+            control_drive = options
+        else:
+            vm.extend(options)
 
     environment = os.environ.copy()
     environment["TMPDIR"] = str(scratch)
     stock_guest = boot(qemu, vm, "stock", environment)
     p3_guest = boot(model_qemu, vm, "p3", environment)
+    controls_guest = boot(qemu, vm + control_drive, "controls", environment)
     if digest(qemu) != model_patch["stock_sha256"]:
         raise RuntimeError("system QEMU changed")
     if any(digest(image) != before for image, before in backing.items()):
@@ -201,6 +219,7 @@ def run(scratch, kernel, probe, release):
         "backing_images_unchanged": True,
         "stock_guest": stock_guest,
         "p3_guest": p3_guest,
+        "controls_guest": controls_guest,
     }
 
 

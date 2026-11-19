@@ -40,5 +40,31 @@
     "RAW_PHYSICAL_VM_PASS role=nvme {\"schema_version\":1,\"designation\":\"nvme\",\"held_device_bytes\":1000204886016,\"exclusive_claim_verified\":true}",
     "RAW_PHYSICAL_VM_COMPLETE"
   ],
-  "scratch_removed": "/var/tmp/zerofs-physical-vm-guest-hd2q5249"
+  "controls_guest": [
+    "RAW_PHYSICAL_VM_ALIAS ata-ST6000DM003-2CY186_WF203KQ8=../../sda",
+    "RAW_PHYSICAL_VM_ALIAS ata-WDC_WD180EMFZ-11AFXA0_3WH7H3BJ=../../sdb",
+    "RAW_PHYSICAL_VM_ALIAS ata-ZeroFS_duplicate_WF203KQ8=../../sdc",
+    "RAW_PHYSICAL_VM_ALIAS nvme-QEMU_NVMe_Ctrl_2318E6D18CE7=../../nvme0n1",
+    "RAW_PHYSICAL_VM_ALIAS nvme-QEMU_NVMe_Ctrl_2318E6D18CE7_1=../../nvme0n1",
+    "RAW_PHYSICAL_VM_ALIAS nvme-nvme.1b36-323331384536443138434537-51454d55204e564d65204374726c-00000001=../../nvme0n1",
+    "RAW_PHYSICAL_VM_ALIAS wwn-0x5000c500ac8aed0a=../../sda",
+    "RAW_PHYSICAL_VM_ALIAS wwn-0x5000c500ac8aed0b=../../sdc",
+    "RAW_PHYSICAL_VM_ALIAS wwn-0x5000cca284d17ed1=../../sdb",
+    "RAW_PHYSICAL_VM_REFUSAL control=duplicate-serial-alias by-id directory has ambiguous physical identity",
+    "RAW_PHYSICAL_VM_REFUSAL control=duplicate-kernel-serial physical serial or WWN is claimed by multiple whole disks",
+    "RAW_PHYSICAL_VM_PASS role=hdd6 {\"schema_version\":1,\"designation\":\"hdd6\",\"held_device_bytes\":6001175126016,\"exclusive_claim_verified\":true}",
+    "RAW_PHYSICAL_VM_REFUSAL control=protected-storage-alias physical claim intersects a protected disk alias",
+    "RAW_PHYSICAL_VM_REFUSAL control=real-partition-alias by-id directory has ambiguous physical identity",
+    "RAW_PHYSICAL_VM_REFUSAL control=protected-partition-alias physical claim intersects a protected disk alias",
+    "RAW_PHYSICAL_VM_REFUSAL control=real-kernel-partition physical disk has partitions",
+    "RAW_PHYSICAL_VM_WITNESS holder=dm-0 backing=8:0",
+    "RAW_PHYSICAL_VM_REFUSAL control=device-mapper-holder physical disk has holders or slaves, or is a partition",
+    "RAW_PHYSICAL_VM_PASS role=hdd6 {\"schema_version\":1,\"designation\":\"hdd6\",\"held_device_bytes\":6001175126016,\"exclusive_claim_verified\":true}",
+    "RAW_PHYSICAL_VM_WITNESS mountinfo=31 2 8:0 / /claim-mount ro,relatime - ext4 /dev/disk/by-id/ata-ST6000DM003-2CY186_WF203KQ8 ro,norecovery",
+    "RAW_PHYSICAL_VM_REFUSAL control=mounted-ext4 physical disk is mounted",
+    "RAW_PHYSICAL_VM_WITNESS ext4=64MiB mounted_then_unmounted udev_record_has_no_signature",
+    "RAW_PHYSICAL_VM_REFUSAL control=held-fd-foreign-ext4 physical disk has a recognized foreign storage signature",
+    "RAW_PHYSICAL_VM_COMPLETE"
+  ],
+  "scratch_removed": "/var/tmp/zerofs-physical-vm-guest-oxnx9tbw"
 }
