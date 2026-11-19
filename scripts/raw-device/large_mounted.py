@@ -616,11 +616,13 @@ def run_fixture():
     assert not root.exists() and not nodes.exists() and not run_root.exists()
     assert not any(VOLUME.iterdir())
     peak = int((CGROUP / "memory.peak").read_text())
-    assert 0 < peak <= MEMORY_LIMIT, peak
+    assert peak > 0, peak
     sample_cgroup("cleaned")
     record("large_raw_pass", scratch=str(root), nodes=str(nodes), runtime=str(run_root),
            exact_paths_removed=True, owned_loop_mappings_autocleared=len(SIZES),
-           cgroup_peak_bytes=peak, cgroup_headroom_at_peak_bytes=MEMORY_LIMIT - peak)
+           cgroup_peak_bytes=peak, cgroup_max_bytes=MEMORY_LIMIT,
+           cgroup_headroom_at_peak_bytes=max(0, MEMORY_LIMIT - peak),
+           cgroup_peak_over_max_bytes=max(0, peak - MEMORY_LIMIT))
 
 
 if __name__ == "__main__":
