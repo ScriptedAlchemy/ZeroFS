@@ -1028,12 +1028,17 @@ impl PoolObjectStore {
             if cancelled.load(Ordering::Acquire) {
                 return Err(error("pool publication was cancelled before upload"));
             }
-            let digest_payload = payload.clone();
-            let sha256: [u8; 32] = tokio::task::spawn_blocking(move || {
-                let mut hash = Sha256::new();
-                for bytes in digest_payload { hash.update(&bytes); }
-                hash.finalize().into()
-            }).await.map_err(|e| error(format!("pool checksum task failed: {e}")))?;
+            let sha256: [u8; 32] = match options.extensions.get::<KnownPayloadSha256>() {
+                Some(known) => known.0,
+                None => {
+                    let digest_payload = payload.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let mut hash = Sha256::new();
+                        for bytes in digest_payload { hash.update(&bytes); }
+                        hash.finalize().into()
+                    }).await.map_err(|e| error(format!("pool checksum task failed: {e}")))?
+                }
+            };
             if let Some(expected) = preserve.as_ref().and_then(|entry| entry.sha256)
                 && expected != sha256 {
                 let key = location.to_string();
@@ -2074,6 +2079,12 @@ fn hold_read_lease(
         extensions,
     }
 }
+
+/// SHA-256 of a put payload that the caller has already computed over exactly
+/// the bytes it passes. The writeback drain hashes each journal payload while
+/// reading it, so the pool records that digest instead of hashing again.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KnownPayloadSha256(pub(crate) [u8; 32]);
 
 #[async_trait]
 impl ObjectStore for PoolObjectStore {

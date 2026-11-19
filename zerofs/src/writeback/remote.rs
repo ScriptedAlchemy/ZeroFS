@@ -1477,6 +1477,7 @@ async fn stream_record_to_remote(
         // streaming path below verifies the whole file before streaming and
         // hashes the stream again, which doubled journal reads for every
         // segment the drain moved.
+        let digest = record.payload().map(|(_, sha256)| sha256);
         let payload =
             tokio::task::spawn_blocking(move || blob_journal.read_verified_payload(sequence))
                 .await
@@ -1486,6 +1487,12 @@ async fn stream_record_to_remote(
         options
             .extensions
             .insert(crate::retrying_object_store::CallerOwnsRetries);
+        if let Some(digest) = digest {
+            // `read_verified_payload` matched this digest over exactly `payload`.
+            options
+                .extensions
+                .insert(crate::pool_object_store::KnownPayloadSha256(digest));
+        }
         let result = bounded_remote_step_with_timeout(
             record,
             "bounded atomic put",
