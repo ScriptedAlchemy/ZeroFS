@@ -6,7 +6,6 @@ use crate::fs::CacheConfig;
 use crate::fs::key_codec::{EXTENT_DOMAIN, KeyCodec, KeyPrefix, META_DOMAIN, ParsedKey};
 use crate::key_management;
 #[cfg(test)]
-use crate::parse_object_store::parse_url_opts;
 use crate::storage_backend::{OpenedStorage, open_storage};
 use crate::storage_class_object_store::with_storage_class;
 use anyhow::{Context, Result};
@@ -687,17 +686,12 @@ mod tests {
             shutdown_flush: ShutdownFlush::Local,
         });
         settings.validate().unwrap();
-        let crate::parse_object_store::ParsedStore {
+        let OpenedStorage {
             store,
             path,
             sftp_pool,
-        } = parse_url_opts(
-            &settings.storage.url.parse().unwrap(),
-            settings.cloud_provider_env_vars(),
-            settings.sftp.as_ref(),
-        )
-        .await
-        .unwrap();
+            ..
+        } = open_storage(&settings).await.unwrap();
         assert!(sftp_pool.is_none());
         let remote =
             with_storage_class(Arc::from(store), settings.storage.storage_class.as_deref());
