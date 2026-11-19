@@ -1,0 +1,468 @@
+{
+  "scope": "PR84 shared correctness fixes; local production-source regression harness and production-library lint checks",
+  "baseline_commit": "8509886dfd61e077c186afec767eaa3f2d643a4f",
+  "environment": {
+    "os": "Linux",
+    "architecture": "x86_64",
+    "profile": "developer"
+  },
+  "selected_source_sha256": {
+    "zerofs/Cargo.toml": "08f6eb4ae820a66e611e7de2c60345e2bf25ed1d4f16dcd1551a9fd9424085cf",
+    "zerofs/Cargo.lock": "17addcd757a633b26fa039255b5a6cd0b1a7c59b6829b1ac4e94d20a8030ab9c",
+    "zerofs/src/writeback/remote.rs": "97c1ab8dba31cb6528d24af9cda9aeb9019bc140c13e236e6563d1d1d60e3897",
+    "zerofs/src/writeback/remote_streaming_tests.rs": "6fc617a7ee1e727be10ea8ebc460f389a29d02df57c63d3c1dcf3eea64f05801",
+    "zerofs/src/fs/mod.rs": "cb35fcd81136fb7a4045bebbf8db3c12fcf15964137d46bf0580604041bfcd39",
+    "zerofs/src/fs/types.rs": "9291114fd51fdd6ab6a6699fa019940da6ba828373a04b37233c65662b8f20d9",
+    "zerofs/src/fs/permissions.rs": "61a337e834005dd20ac497a8f6e198b622caec4373d0f389c2848ae93516d593",
+    "zerofs/src/fs/mutation/overlay_helpers.rs": "83b6620d11ed88d3a97e01e5de09c035f3bd8e714d78e7a8ab47a80f58e641f5",
+    "zerofs/src/fs/ops/rename.rs": "d8458959d6192758eba7488258b3f300a88a5935d03fb0ab2ee37271aafd632f",
+    "zerofs/src/fs/ops/setattr.rs": "bde204e90e4ae2220227da7ed18fdcbbc68caefa207521e775ba3edfb55fccb4",
+    "zerofs/src/nfs.rs": "c9f785812a27180887e10f967ecf5b45114bda50f7a3e9de11961de5f84314f2",
+    "zerofs/src/nfs/access_tests.rs": "9f38c1dbabec65c1fdb15c167098917ed3f0e53513da7bef0aacd51ef40ce841",
+    "zerofs/src/ninep/handler.rs": "560bd7849cac8d84cb1900eaacf16ca30ea2b031384723315dea489fdf8c8497",
+    "zerofs/src/ninep/handler/io_context_tests.rs": "8bd26beb69a5950d76549c8cc4e28954c1ab7af8328d6627aecb3e33fee8ceab",
+    "zerofs/src/ninep/handler/creation_gid_tests.rs": "1d3af764fd3fd83d43d57b4d8d5442ff2e4783d54e4940c8f7a436e59ace60c0",
+    "zerofs/src/ninep/handler/rename_fid_tests.rs": "7b7e41a7a7638a59803b482a3d3dad5cd60dde0a8af9860ce35b0d8d93680be2"
+  },
+  "harness": {
+    "source_files_checked_against_current_production": 279,
+    "original_source_manifest_sha256": "06c4931480c01ce4000040f058df91b783e34a5c0d82db913aeb6788ca9c4e05",
+    "compiled_source_manifest_sha256": "008fa373493d84b7b5c720aeb7ef4e02d4d9a417d9740d23b97931886917a754",
+    "prepare_script_sha256": "a018f13bedccc56199db4a40301d77ad178c4eeafe052210d837d62e369fa03f",
+    "build": {
+      "stage": "build",
+      "exit_code": 0,
+      "seconds": 149.09044502000324
+    },
+    "selected_test_count": 41,
+    "results": [
+      {
+        "selector": "cache_retention",
+        "exit_code": 0,
+        "seconds": 0.11582202399586095
+      },
+      {
+        "selector": "cache_budget",
+        "exit_code": 0,
+        "seconds": 0.06558766200032551
+      },
+      {
+        "selector": "cache_shards",
+        "exit_code": 0,
+        "seconds": 0.1205249510021531
+      },
+      {
+        "selector": "extent_edges",
+        "exit_code": 0,
+        "seconds": 0.49523433500144165
+      },
+      {
+        "selector": "extent_read_error",
+        "exit_code": 0,
+        "seconds": 0.12009159199806163
+      },
+      {
+        "selector": "extent_maximum",
+        "exit_code": 0,
+        "seconds": 0.11803002799570095
+      },
+      {
+        "selector": "extent_mixed",
+        "exit_code": 0,
+        "seconds": 0.06612200100062182
+      },
+      {
+        "selector": "extent_append",
+        "exit_code": 0,
+        "seconds": 0.2165045959991403
+      },
+      {
+        "selector": "extent_sparse",
+        "exit_code": 0,
+        "seconds": 0.1153506050031865
+      },
+      {
+        "selector": "extent_zero",
+        "exit_code": 0,
+        "seconds": 0.06472664700413588
+      },
+      {
+        "selector": "ninep_detached_root_path",
+        "exit_code": 0,
+        "seconds": 0.2669724879960995
+      },
+      {
+        "selector": "ninep_dot_path",
+        "exit_code": 0,
+        "seconds": 0.03299410400359193
+      },
+      {
+        "selector": "ninep_dot_rename",
+        "exit_code": 0,
+        "seconds": 0.1156265420067939
+      },
+      {
+        "selector": "ninep_io_snapshot",
+        "exit_code": 0,
+        "seconds": 0.06477784000162501
+      },
+      {
+        "selector": "ninep_open_inode",
+        "exit_code": 0,
+        "seconds": 0.0669209889965714
+      },
+      {
+        "selector": "ninep_create_gid_authorization",
+        "exit_code": 0,
+        "seconds": 0.06507711700396612
+      },
+      {
+        "selector": "ninep_create_gid_inheritance",
+        "exit_code": 0,
+        "seconds": 0.11603273999935482
+      },
+      {
+        "selector": "ninep_create_gid_setattr",
+        "exit_code": 0,
+        "seconds": 0.06610245000047144
+      },
+      {
+        "selector": "groups_mode_authority",
+        "exit_code": 0,
+        "seconds": 0.03325394300190965
+      },
+      {
+        "selector": "groups_roundtrip_identity",
+        "exit_code": 0,
+        "seconds": 0.03245085100206779
+      },
+      {
+        "selector": "groups_kernel_fallback",
+        "exit_code": 0,
+        "seconds": 0.06462694599758834
+      },
+      {
+        "selector": "groups_chgrp_authority",
+        "exit_code": 0,
+        "seconds": 0.0650060920015676
+      },
+      {
+        "selector": "ninep_rename_repeated",
+        "exit_code": 0,
+        "seconds": 0.06599774699861882
+      },
+      {
+        "selector": "ninep_rename_hardlink_noop",
+        "exit_code": 0,
+        "seconds": 0.11987068400048884
+      },
+      {
+        "selector": "ninep_rename_destination_path",
+        "exit_code": 0,
+        "seconds": 0.06482550500368234
+      },
+      {
+        "selector": "ninep_rename_failure",
+        "exit_code": 0,
+        "seconds": 0.06505083799856948
+      },
+      {
+        "selector": "ninep_rename_replay",
+        "exit_code": 0,
+        "seconds": 0.2617760180000914
+      },
+      {
+        "selector": "ninep_rename_case_only",
+        "exit_code": 0,
+        "seconds": 0.13878961599402828
+      },
+      {
+        "selector": "remote_reconciliation_integrity",
+        "exit_code": 0,
+        "seconds": 3.51737851100188
+      },
+      {
+        "selector": "remote_small_corruption",
+        "exit_code": 0,
+        "seconds": 0.06500308899558149
+      },
+      {
+        "selector": "remote_atomic_boundary",
+        "exit_code": 0,
+        "seconds": 2.6320201310008997
+      },
+      {
+        "selector": "remote_multipart_boundary",
+        "exit_code": 0,
+        "seconds": 3.95504104399879
+      },
+      {
+        "selector": "remote_corruption_terminal",
+        "exit_code": 0,
+        "seconds": 0.11519645899534225
+      },
+      {
+        "selector": "remote_corruption_classifier",
+        "exit_code": 0,
+        "seconds": 0.03285355100524612
+      },
+      {
+        "selector": "sequential_overwrites",
+        "exit_code": 0,
+        "seconds": 0.06464471299841534
+      },
+      {
+        "selector": "sequential_fallback",
+        "exit_code": 0,
+        "seconds": 0.16507045800244668
+      },
+      {
+        "selector": "sequential_fairness",
+        "exit_code": 0,
+        "seconds": 0.668790285999421
+      },
+      {
+        "selector": "append_fairness",
+        "exit_code": 0,
+        "seconds": 0.9783792890011682
+      },
+      {
+        "selector": "ninep_directory_pin",
+        "exit_code": 0,
+        "seconds": 0.11602691000007326
+      },
+      {
+        "selector": "ninep_dot_directory_pin",
+        "exit_code": 0,
+        "seconds": 0.11485307499970077
+      },
+      {
+        "selector": "nfs_access_modes",
+        "exit_code": 0,
+        "seconds": 0.06523366100009298
+      }
+    ],
+    "provenance_summaries": {
+      "test-provenance.json": {
+        "receipt_sha256": "94bedff5b716281ebc8a35ebe0f208080f1e5829b53de80b68ddd1f285dc596f",
+        "transformations": [
+          "Exact production source copied; no test cfg for the entire server.",
+          "Identical in-memory fixture constructor exposed; CLI entrypoint excluded.",
+          "Exact checked-in test bodies exposed as standalone selectors; exact extent test fixture module enabled.",
+          "Remote and protocol helper transformations recorded by their own provenance manifests."
+        ]
+      },
+      "check-now-remote-provenance.json": {
+        "receipt_sha256": "ead182552aa0d15d4f218cb21ac7e17bdd1805c4de5e9fd6424a1faab97315b4",
+        "transformations": [
+          "Expose exact cfg(test) Journal::open, Journal::open_with_root_hook, Journal::commit_put and SequenceBarrier::sequence fixtures/accessor; anchored open implementation remains production code.",
+          "Expose exact writeback::test_util fixture module.",
+          "Append selected exact test function bodies and RecordingMultipartStore/RecordingUpload/identity/apply_record_with_tracked_cleanup fixtures in audit_check_now_remote child module.",
+          "Add selector dispatcher; no production operation, backend, error policy or byte verification implementation is mocked."
+        ],
+        "selectors": {
+          "remote_small_corruption": "remote_small_replay_rejects_corrupt_journal_before_put",
+          "remote_reconciliation_integrity": "reconciliation_rehashes_compared_bytes_before_retiring_journal",
+          "remote_atomic_boundary": "remote_replay_at_the_window_boundary_keeps_atomic_put_semantics",
+          "remote_multipart_boundary": "remote_replay_streams_payload_larger_than_the_window_in_bounded_parts",
+          "remote_corruption_terminal": "corrupt_local_journal_stops_scheduler_without_releasing_dirty_capacity",
+          "remote_corruption_classifier": "scheduler_classifier_rejects_typed_journal_corruption_but_retries_io_errors"
+        }
+      },
+      "check-now-creation-gid-provenance.json": {
+        "receipt_sha256": "33189ad361a4eff0506f5c2ae7939071da6f24d692eb2f271b4ce8db1fe2d60e",
+        "transformations": [
+          "Expose the exact checked-in creation GID regression module and its test entrypoints.",
+          "Use the identical exposed in-memory constructor; no production authorization, inheritance or creation implementation changes."
+        ],
+        "selectors": {
+          "ninep_create_gid_authorization": "requested_creation_gid_never_changes_parent_authorization",
+          "ninep_create_gid_inheritance": "creation_gid_selection_preserves_inheritance_and_listener_override",
+          "ninep_create_gid_setattr": "creation_group_hint_is_rejected_by_setattr"
+        },
+        "module": "crate::ninep::handler::creation_gid_tests"
+      },
+      "check-now-group-provenance.json": {
+        "receipt_sha256": "01abc10f1604d1844f819168640ae3021d3cf0f1205482dcb13074646d5faa2c",
+        "transformations": [
+          "Copy exact four checked-in mode/group-provenance regression functions and directory fixture into a child module; expose function names for the driver.",
+          "Use the identical exposed in-memory constructor in the chgrp fixture; all production permission, credential and fingerprint algorithms unchanged."
+        ],
+        "selectors": {
+          "groups_mode_authority": {
+            "name": "locally_truncated_groups_do_not_gain_mode_or_group_authority",
+            "async": false
+          },
+          "groups_roundtrip_identity": {
+            "name": "truncated_group_provenance_survives_roundtrip_and_changes_replay_identity",
+            "async": false
+          },
+          "groups_kernel_fallback": {
+            "name": "upstream_kernel_authorized_unknown_groups_keep_the_existing_fallback",
+            "async": false
+          },
+          "groups_chgrp_authority": {
+            "name": "truncated_groups_cannot_change_ownership_to_an_unproven_group",
+            "async": true
+          }
+        },
+        "module": "crate::fs::permissions::group_provenance_probe"
+      },
+      "check-now-rename-fid-provenance.json": {
+        "receipt_sha256": "55cc151b4c3cb57d446f5cda781064f513ebc10fb495c8ce7c699cf1a40170d4",
+        "transformations": [
+          "Expose the exact checked-in Trename regression module and its test entrypoints.",
+          "Use the identical exposed in-memory constructor; no production rename or path reconstruction implementation changes."
+        ],
+        "selectors": {
+          "ninep_rename_repeated": "trename_updates_the_fid_for_repeated_file_and_directory_moves",
+          "ninep_rename_hardlink_noop": "trename_hardlink_noop_keeps_the_original_entry_bound",
+          "ninep_rename_destination_path": "trename_reconstructs_a_renamed_destination_directory_path",
+          "ninep_rename_failure": "failed_trename_keeps_the_fid_path_and_both_entries",
+          "ninep_rename_replay": "trename_replay_does_not_rewind_a_later_fid_path",
+          "ninep_rename_case_only": "case_only_trename_updates_the_fid_before_the_next_rename"
+        },
+        "module": "crate::ninep::handler::rename_fid_tests"
+      },
+      "pass7-io-context-provenance.json": {
+        "receipt_sha256": "a02dc522224f89242f05dd88bd775928be7d389d413f22eb0c7908d3c040b338",
+        "transformations": [
+          "Expose the isolated production regression module and test entrypoints without tokio test attributes.",
+          "Use the identical exposed in-memory constructor.",
+          "Production handler methods and regression assertions remain unchanged."
+        ]
+      },
+      "pass7-dot-pin-provenance.json": {
+        "receipt_sha256": "6923a3a8d822ff8f71b8ce94fe295e635aadbe45cc74f8fc68d96ce76901a68c",
+        "transformations": [
+          "Extract exact dot and non-dot paused directory replacement regressions, ExactWalkSession, and their setup/request fixtures; expose only selected test entry points.",
+          "Map the cfg(test) in-memory constructor to the identical audit_new_in_memory(false, NameMode::Insensitive) constructor.",
+          "Expose the existing exact-lookup/exact-pin pause type, fields, initialization, and call sites in the copied handler only.",
+          "Expose the four existing cfg(test) dispatch wrappers used by the unchanged request fixture; requests execute the full production handle_message_with_received_admission dispatcher.",
+          "Expose the read-only lock-manager is_locked_for_test accessor; all production handler methods and regression assertions remain otherwise unchanged."
+        ]
+      },
+      "pass7-sequential-write-provenance.json": {
+        "receipt_sha256": "80048ca04622284bdc397c333764116a1b53ccf366fbd9b2ccfc60624d286401",
+        "transformations": [
+          "Expose the exact three checked-in sequential-write test bodies and module without tokio test attributes.",
+          "Use the identical exposed in-memory constructor and exact test credential/NFS identity fixtures with only local namespace relocation.",
+          "Enable the existing cfg(test) tokio::sync::oneshot import, Hold lane variant, its exact match arm, and the existing hold_inode_lane_for_test helper; production scheduling and application remain unchanged.",
+          "Expose the existing append fairness test with its exact settings/filesystem/create_file fixtures."
+        ]
+      }
+    }
+  },
+  "journal_original_body_control": {
+    "build": {
+      "stage": "build",
+      "exit_code": 0,
+      "seconds": 135.68484614199406
+    },
+    "result": {
+      "selector": "remote_reconciliation_integrity",
+      "exit_code": 101,
+      "expected_assertion_failed": true,
+      "seconds": 2.4330843570060097
+    },
+    "provenance": {
+      "baseline": "8509886dfd61e077c186afec767eaa3f2d643a4f",
+      "replacement": "Only verify_existing restored to baseline body in copied source; new regression and full other production code unchanged.",
+      "baseline_fn_sha256": "8c29696fd7081653a0735115a4b428dd84be105af4bb933d8ff1f830df4a0807",
+      "fixed_fn_sha256": "d707039e5e6462837038ba296eba095ee4e0e8f9cdb559fac099a50d62020ac3"
+    },
+    "log": {
+      "sha256": "b6fc858e057236ab3f04aae704e02e1052635e30b0ef5c5c3b70294808a597f6",
+      "bytes": 258
+    }
+  },
+  "nfs_dependency": {
+    "repository": "ScriptedAlchemy/nfsserve",
+    "pull_request": "https://github.com/ScriptedAlchemy/nfsserve/pull/2",
+    "revision": "0f7d4f6666979d9ba683ae3288b2c8ee19cc3634",
+    "tests_passed": 55,
+    "example_targets_built": [
+      "demo",
+      "mirrorfs"
+    ],
+    "strict_release_clippy": "all targets and all features",
+    "original_handler_control": {
+      "expected_failures": 5,
+      "passing_invalid_handle_control": 1
+    },
+    "verification": {
+      "fixed_handler_sha256": "24d03f277885dc4099d5f7c4b1bab91b5d3285c8a9a49d0a2e304bcce5a4afe1",
+      "red_exit": 101,
+      "red_denial_failed": true,
+      "restored_handler_sha256": "24d03f277885dc4099d5f7c4b1bab91b5d3285c8a9a49d0a2e304bcce5a4afe1",
+      "green_exit": 0,
+      "clippy_exit": 0,
+      "source_sha256": {
+        "README.md": "5ffb68e4869ed5300d32a917711640d0f3c7ef4caa3a2935f76f80445b801da1",
+        "src/nfs.rs": "5b840405a2a9bafeb94d0d14545fb0d15c05845052d2c712d527b3daab7c40c1",
+        "src/vfs.rs": "4f8a3c625331558e258c4e3dc9f652a8ff84e988b04e08fbb02ac239fe4cbc4c",
+        "src/nfs_handlers.rs": "24d03f277885dc4099d5f7c4b1bab91b5d3285c8a9a49d0a2e304bcce5a4afe1"
+      }
+    },
+    "logs": {
+      "access-final-green.log": {
+        "sha256": "dd1ca132d4fd8d6364f74d6d78c31a558592bb8bd3678af7223545662abcd236",
+        "bytes": 5478
+      },
+      "access-mutation-red.log": {
+        "sha256": "d61a48db48a11b87cf35bdf48c1b11542dc182957b534a278925a4d004866012",
+        "bytes": 5820
+      },
+      "access-clippy.log": {
+        "sha256": "dbab6de67d58ebf48eaaa49b628edaac3194e9f9fb924998961cc95d28cb3a88",
+        "bytes": 2429
+      }
+    }
+  },
+  "production_checks": {
+    "fmt": {
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "exit_code": 0,
+      "seconds": 3.914904696997837,
+      "log": {
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "bytes": 0
+      }
+    },
+    "clippy": {
+      "command": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "webui",
+        "-p",
+        "zerofs",
+        "--lib",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "seconds": 95.06808171600278,
+      "log": {
+        "sha256": "24723ca63952be7012c9da026b78d65429a5c15bd0777b23adc96efc80416de9",
+        "bytes": 568
+      }
+    }
+  },
+  "limits": [
+    "Selected production-source tests, not a complete workspace test run.",
+    "No fresh mounted-client qualification, NAS deployment or network throughput measurement.",
+    "Current-head hosted CI remains required before merge.",
+    "Whole-file placement is optional; it is neither the default nor an acceptance gate for the existing storage path.",
+    "Trename bookkeeping does not establish global path coherence after external ancestor renames or change the existing post-commit cancellation boundary."
+  ]
+}

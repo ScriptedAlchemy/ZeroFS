@@ -8,6 +8,7 @@ fn credentials() -> Credentials {
         groups: [456; 16],
         groups_count: 2,
         groups_complete: false,
+        groups_truncated: false,
     }
 }
 
@@ -148,6 +149,205 @@ async fn dot_then_parent_walk_keeps_rename_source_consistent() {
             fs.lookup(&creds, 0, b"a").await,
             Err(FsError::NotFound)
         ));
+    }
+}
+
+#[tokio::test]
+async fn detached_parent_walk_restores_root_path_before_rename() {
+    async fn walk(
+        handler: &NinePHandler,
+        fid: u32,
+        newfid: u32,
+        names: &[&[u8]],
+        compound: bool,
+        rule: NameMatch,
+    ) -> Vec<Qid> {
+        let wnames = names
+            .iter()
+            .map(|name| P9String::new(name.to_vec()))
+            .collect();
+        let reply = if compound {
+            handler
+                .walk_getattr(
+                    Twalkgetattr {
+                        fid,
+                        newfid,
+                        nwname: names.len() as u16,
+                        wnames,
+                    },
+                    rule,
+                )
+                .await
+                .unwrap()
+        } else {
+            handler
+                .walk(
+                    Twalk {
+                        fid,
+                        newfid,
+                        nwname: names.len() as u16,
+                        wnames,
+                    },
+                    rule,
+                )
+                .await
+                .unwrap()
+        };
+        match reply {
+            Message::Rwalk(reply) => reply.wqids,
+            Message::Rwalkgetattr(reply) => {
+                assert_eq!(reply.stat.qid, *reply.wqids.last().unwrap());
+                reply.wqids
+            }
+            _ => panic!("expected a walk reply"),
+        }
+    }
+
+    for compound in [false, true] {
+        for rule in [NameMatch::Folded, NameMatch::Exact] {
+            for rename_root in [false, true] {
+                let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+                let creds = credentials();
+                let auth = AuthContext::from(&creds);
+                let (exports, _) = fs
+                    .mkdir(&creds, 0, b"exports", &SetAttributes::default())
+                    .await
+                    .unwrap();
+                let (root, _) = fs
+                    .mkdir(&creds, exports, b"tenant", &SetAttributes::default())
+                    .await
+                    .unwrap();
+                let (parent, _) = fs
+                    .mkdir(&creds, root, b"a", &SetAttributes::default())
+                    .await
+                    .unwrap();
+                let (child, _) = fs
+                    .mkdir(&creds, parent, b"b", &SetAttributes::default())
+                    .await
+                    .unwrap();
+                let (inside, _) = fs
+                    .create(&creds, root, b"file", &SetAttributes::default())
+                    .await
+                    .unwrap();
+                let (outside, _) = fs
+                    .create(&creds, parent, b"file", &SetAttributes::default())
+                    .await
+                    .unwrap();
+                let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+                handler
+                    .attach(Tattach {
+                        fid: 1,
+                        afid: u32::MAX,
+                        uname: P9String::new(b"test".to_vec()),
+                        aname: P9String::new(b"exports/tenant".to_vec()),
+                        n_uname: creds.uid,
+                    })
+                    .await
+                    .unwrap();
+                let initial = walk(&handler, 1, 2, &[b"a", b"b"], compound, rule).await;
+                assert_eq!(initial.last().unwrap().path, child);
+
+                // The fid still names b, but its parent chain now misses the
+                // attach root entirely. The next '..' must jump to that root.
+                fs.rename(&auth, root, b"a", 0, b"escaped").await.unwrap();
+                let mut root_path = vec![
+                    Bytes::from_static(b"exports"),
+                    Bytes::from_static(b"tenant"),
+                ];
+                let mut root_parent = exports;
+                let mut root_name = b"tenant".as_slice();
+                if rename_root {
+                    let (relocated, _) = fs
+                        .mkdir(&creds, 0, b"relocated", &SetAttributes::default())
+                        .await
+                        .unwrap();
+                    let (new_parent, _) = fs
+                        .mkdir(&creds, relocated, b"parent", &SetAttributes::default())
+                        .await
+                        .unwrap();
+                    fs.rename(&auth, exports, b"tenant", new_parent, b"rebased")
+                        .await
+                        .unwrap();
+                    root_path = vec![
+                        Bytes::from_static(b"relocated"),
+                        Bytes::from_static(b"parent"),
+                        Bytes::from_static(b"rebased"),
+                    ];
+                    root_parent = new_parent;
+                    root_name = b"rebased";
+                }
+
+                let clamped = walk(&handler, 2, 3, &[b"..", b".", b".."], compound, rule).await;
+                assert_eq!(clamped.len(), 3);
+                assert!(clamped.iter().all(|qid| qid.path == root));
+                let root_fid = handler.get_fid(3).unwrap();
+                assert_eq!(root_fid.inode_id, root);
+                assert_eq!(root_fid.root, root);
+
+                let file = walk(&handler, 3, 4, &[b"file"], compound, rule).await;
+                assert_eq!(file.last().unwrap().path, inside);
+                let mut file_path = root_path.clone();
+                file_path.push(Bytes::from_static(b"file"));
+                assert_eq!(handler.get_fid(4).unwrap().path, file_path);
+                handler
+                    .rename(
+                        Trename {
+                            fid: 4,
+                            dfid: 3,
+                            name: P9String::new(b"renamed-file".to_vec()),
+                        },
+                        [0; 16],
+                    )
+                    .await
+                    .expect("a clamped walk must retain the correct absolute rename source");
+                assert_eq!(root_fid.path, root_path);
+                *file_path.last_mut().unwrap() = Bytes::from_static(b"renamed-file");
+                assert_eq!(handler.get_fid(4).unwrap().path, file_path);
+                assert_eq!(
+                    fs.lookup(&creds, root, b"renamed-file").await.unwrap(),
+                    inside
+                );
+                assert!(matches!(
+                    fs.lookup(&creds, root, b"file").await,
+                    Err(FsError::NotFound)
+                ));
+                assert_eq!(fs.lookup(&creds, parent, b"file").await.unwrap(), outside);
+
+                // A pinned but removed root no longer has an absolute name.
+                // Fail the clamp without installing a fid with a stale path.
+                fs.remove(&auth, root, b"renamed-file").await.unwrap();
+                fs.remove(&auth, root_parent, root_name).await.unwrap();
+                let wnames = vec![P9String::new(b"..".to_vec())];
+                let failed = if compound {
+                    handler
+                        .walk_getattr(
+                            Twalkgetattr {
+                                fid: 2,
+                                newfid: 5,
+                                nwname: 1,
+                                wnames,
+                            },
+                            rule,
+                        )
+                        .await
+                } else {
+                    handler
+                        .walk(
+                            Twalk {
+                                fid: 2,
+                                newfid: 5,
+                                nwname: 1,
+                                wnames,
+                            },
+                            rule,
+                        )
+                        .await
+                };
+                assert!(matches!(failed, Err(P9Error::Fs(FsError::StaleHandle))));
+                assert!(handler.get_fid(5).is_err());
+                assert_eq!(handler.get_fid(2).unwrap().inode_id, child);
+            }
+        }
     }
 }
 

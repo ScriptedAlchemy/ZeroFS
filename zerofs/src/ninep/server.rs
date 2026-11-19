@@ -2193,6 +2193,7 @@ mod tests {
             groups: [0; 16],
             groups_count: 0,
             groups_complete: true,
+            groups_truncated: false,
         };
         let (id, _) = filesystem
             .create(&root, 0, b"Foo", &Default::default())
@@ -2362,6 +2363,7 @@ mod tests {
             groups: [0; 16],
             groups_count: 0,
             groups_complete: true,
+            groups_truncated: false,
         };
         let inode_id = filesystem.lookup(&root, 0, b"shared-owner").await.unwrap();
         let Inode::Directory(inode) = filesystem.inode_store.get(inode_id).await.unwrap() else {
@@ -3099,6 +3101,7 @@ mod tests {
             groups: [0; 16],
             groups_count: 0,
             groups_complete: true,
+            groups_truncated: false,
         };
         assert_eq!(
             filesystem

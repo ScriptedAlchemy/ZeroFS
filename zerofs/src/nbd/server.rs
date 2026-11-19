@@ -1364,6 +1364,7 @@ mod tests {
             groups: [0; 16],
             groups_count: 1,
             groups_complete: true,
+            groups_truncated: false,
         }
     }
 

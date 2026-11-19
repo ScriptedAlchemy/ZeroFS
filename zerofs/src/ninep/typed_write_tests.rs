@@ -142,6 +142,7 @@ fn test_creds() -> Credentials {
         groups: [1000; 16],
         groups_count: 1,
         groups_complete: true,
+        groups_truncated: false,
     }
 }
 
@@ -722,6 +723,7 @@ async fn framed_fast_materializer_failure_cannot_publish_applied_fallback() {
                 groups: [0; 16],
                 groups_count: 0,
                 groups_complete: false,
+                groups_truncated: false,
             },
             0,
             b"fast-failure",

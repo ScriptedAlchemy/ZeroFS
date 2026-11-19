@@ -133,6 +133,9 @@ impl ZeroFS {
         op_id: crate::dedup::OpId,
         size_authorization: SizeAuthorization,
     ) -> Result<FileAttributes, FsError> {
+        if matches!(setattr.gid, SetGid::InheritOr(_)) {
+            return Err(FsError::InvalidArgument);
+        }
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_setattr)? {
             return Ok(result);
         }
@@ -885,6 +888,7 @@ mod tests {
             groups: [0; 16],
             groups_count: 0,
             groups_complete: true,
+            groups_truncated: false,
         };
         let result = fs
             .setattr_opened_idempotent(
@@ -964,6 +968,7 @@ mod tests {
             groups: [0; 16],
             groups_count: 0,
             groups_complete: true,
+            groups_truncated: false,
         };
         let atime = Timestamp {
             seconds: 1_234_567_890,

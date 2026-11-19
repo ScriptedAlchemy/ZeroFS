@@ -1007,6 +1007,7 @@ mod tests {
             gid_known: true,
             gids: Vec::new(),
             groups_complete: true,
+            groups_truncated: false,
         };
         let attrs = fs
             .fallocate_opened(&non_owner, file_id, 0, 1, FallocateMode::PunchHole)

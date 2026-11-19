@@ -20,7 +20,8 @@ pub(crate) fn direct_write_fingerprint(
     let gid = auth.gid.to_le_bytes();
     let flags = [
         u8::from(auth.gid_known),
-        u8::from(auth.groups_complete),
+        // Keep existing fingerprints when no local truncation occurred.
+        u8::from(auth.groups_complete) | (u8::from(auth.groups_truncated) << 1),
         u8::from(check_permissions),
     ];
     let mut gids = Vec::with_capacity(auth.gids.len() * std::mem::size_of::<u32>());

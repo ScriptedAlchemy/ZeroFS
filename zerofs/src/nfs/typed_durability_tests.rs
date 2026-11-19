@@ -621,6 +621,7 @@ async fn commit_covers_prior_cross_adapter_cutoff() {
         gid_known: true,
         gids: vec![100, 20],
         groups_complete: true,
+        groups_truncated: false,
     };
     let direct_file = fs
         .create_exclusive(&auth, 0, b"direct-writer")
@@ -873,6 +874,7 @@ async fn shipping_tcp_write_commit_survive_writeback_restart_with_new_verifier()
         gid_known: true,
         gids: vec![0],
         groups_complete: true,
+        groups_truncated: false,
     };
     let (bytes, _) = recovered
         .read_file(&auth, file, 0, payload.len() as u32)

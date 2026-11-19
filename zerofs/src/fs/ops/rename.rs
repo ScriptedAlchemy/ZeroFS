@@ -40,6 +40,13 @@ pub(crate) enum VerifiedRenameOutcome {
     Mismatch(VerifiedFileContent),
 }
 
+/// In-memory completion details; the durable replay result remains `Rename`.
+#[derive(Default)]
+struct RenameCompletion {
+    moved: bool,
+    verification: Option<VerifiedRenameOutcome>,
+}
+
 #[cfg(test)]
 struct VerifiedRenamePause {
     filesystem: usize,
@@ -209,6 +216,7 @@ impl ZeroFS {
             Some(expected),
         )
         .await?
+        .verification
         .ok_or(FsError::IoError)
     }
 
@@ -346,6 +354,8 @@ impl ZeroFS {
     /// fid. Its cached path may have been reused after another client moved
     /// the original inode. The precondition and entry-cookie recheck stay
     /// inside the ordinary rename's fence and inode-lock boundary.
+    /// Returns whether this call moved the entry; replay and same-inode
+    /// hard-link no-ops return false so callers do not retarget their fid.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn rename_inode_idempotent(
         &self,
@@ -356,7 +366,7 @@ impl ZeroFS {
         to_name: &[u8],
         expected_source: InodeId,
         op_id: crate::dedup::OpId,
-    ) -> Result<(), FsError> {
+    ) -> Result<bool, FsError> {
         self.rename_with_options(
             auth,
             from_dirid,
@@ -370,7 +380,7 @@ impl ZeroFS {
             None,
         )
         .await
-        .map(|_| ())
+        .map(|result| result.moved)
     }
 
     /// Atomic no-replace rename tagged with an idempotency op-id.
@@ -412,7 +422,7 @@ impl ZeroFS {
         replace_existing: bool,
         expected_source: Option<InodeId>,
         verification: Option<VerifiedFileExpectation>,
-    ) -> Result<Option<VerifiedRenameOutcome>, FsError> {
+    ) -> Result<RenameCompletion, FsError> {
         if from_name.is_empty() || to_name.is_empty() {
             return Err(FsError::InvalidArgument);
         }
@@ -429,7 +439,7 @@ impl ZeroFS {
             .replay_dedup_result(&op_id, DedupResult::into_rename)?
             .is_some()
         {
-            return Ok(None);
+            return Ok(RenameCompletion::default());
         }
 
         if from_name == b"." || from_name == b".." {
@@ -475,7 +485,7 @@ impl ZeroFS {
                     .replay_dedup_result(&op_id, DedupResult::into_rename)?
                     .is_some()
                 {
-                    return Ok(None);
+                    return Ok(RenameCompletion::default());
                 }
                 return Err(error);
             }
@@ -547,7 +557,7 @@ impl ZeroFS {
             .replay_dedup_result(&op_id, DedupResult::into_rename)?
             .is_some()
         {
-            return Ok(None);
+            return Ok(RenameCompletion::default());
         }
 
         // Re-verify inside lock that entries still point to same inodes. An
@@ -700,9 +710,12 @@ impl ZeroFS {
                     VerifiedRenameOutcome::Published(actual)
                 }
             } else {
-                return Ok(None);
+                return Ok(RenameCompletion::default());
             };
-            return Ok(Some(outcome));
+            return Ok(RenameCompletion {
+                moved: false,
+                verification: Some(outcome),
+            });
         }
 
         // Capture old path before rename for tracing (name will change after)
@@ -751,7 +764,10 @@ impl ZeroFS {
             self.pause_verified_rename_after_hash_if_requested(source_inode_id)
                 .await;
             if actual.size != expected.size || expected.sha256 != Some(actual.sha256) {
-                return Ok(Some(VerifiedRenameOutcome::Mismatch(actual)));
+                return Ok(RenameCompletion {
+                    moved: false,
+                    verification: Some(VerifiedRenameOutcome::Mismatch(actual)),
+                });
             }
             Some(actual)
         } else {
@@ -1069,7 +1085,10 @@ impl ZeroFS {
 
         self.record_rename(&source_inode, trace_old_path, to_dirid, to_name);
 
-        Ok(verified_content.map(VerifiedRenameOutcome::Published))
+        Ok(RenameCompletion {
+            moved: true,
+            verification: verified_content.map(VerifiedRenameOutcome::Published),
+        })
     }
 }
 
@@ -1137,6 +1156,7 @@ mod tests {
             gid_known: true,
             gids: vec![],
             groups_complete: true,
+            groups_truncated: false,
         };
 
         for name in [b"missing".as_slice(), b"secret".as_slice()] {
