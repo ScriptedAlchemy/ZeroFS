@@ -83,6 +83,23 @@ describe("File Manager namespace mutations", () => {
     }
   });
 
+  it("closes completed batch handles if the connection closes before the durability barrier", async () => {
+    const { client, file } = await openSession();
+    const batch = client.beginUploadBatch();
+    try {
+      await client.uploadBlob("/Report", new Blob(["text"]), { batch });
+      expect(file.close).not.toHaveBeenCalled();
+      await client.close();
+      await expect(client.finishUploadBatch(batch)).rejects.toThrow("ZeroFS client is not connected");
+      expect(file.close).toHaveBeenCalledOnce();
+      expect(batch.files.size).toBe(0);
+      await client.finishUploadBatch(batch);
+      expect(file.close).toHaveBeenCalledOnce();
+    } finally {
+      await client.close();
+    }
+  });
+
   it.each(["overwrite", "skip", "cancel"] as const)("honors %s for server-reported name collisions", async (answer) => {
     vi.spyOn(p9client, "stat").mockImplementation(async (path) => {
       if (path === "/Report") return {} as Awaited<ReturnType<typeof p9client.stat>>;

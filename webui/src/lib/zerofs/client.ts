@@ -549,9 +549,9 @@ export class ZeroFsClient {
   async finishUploadBatch(batch: UploadBatch): Promise<void> {
     if (batch.finished) return;
     batch.finished = true;
-    const fs = await this.fs();
     const files = [...batch.files];
     try {
+      const fs = await this.fs();
       await fs.sync();
     } finally {
       batch.files.clear();
