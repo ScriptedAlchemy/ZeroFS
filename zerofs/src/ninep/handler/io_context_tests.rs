@@ -288,6 +288,7 @@ async fn detached_parent_walk_restores_root_path_before_rename() {
                 assert_eq!(file.last().unwrap().path, inside);
                 let mut file_path = root_path.clone();
                 file_path.push(Bytes::from_static(b"file"));
+                assert_eq!(handler.get_fid(4).unwrap().path, file_path);
                 handler
                     .rename(
                         Trename {
@@ -300,6 +301,7 @@ async fn detached_parent_walk_restores_root_path_before_rename() {
                     .await
                     .expect("a clamped walk must retain the correct absolute rename source");
                 assert_eq!(root_fid.path, root_path);
+                *file_path.last_mut().unwrap() = Bytes::from_static(b"renamed-file");
                 assert_eq!(handler.get_fid(4).unwrap().path, file_path);
                 assert_eq!(
                     fs.lookup(&creds, root, b"renamed-file").await.unwrap(),
