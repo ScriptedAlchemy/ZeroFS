@@ -237,6 +237,12 @@ impl ZeroFS {
                         }
 
                         file.size = new_size;
+                        // Resizing changes file contents just like write or
+                        // fallocate. An unprivileged non-owner must not leave
+                        // the modified file carrying its previous set-ID bits.
+                        if creds.uid != file.uid && creds.uid != 0 {
+                            file.mode &= !0o6000;
+                        }
                         let (now_sec, now_nsec) = get_current_time();
                         file.mtime = now_sec;
                         file.mtime_nsec = now_nsec;
@@ -621,6 +627,7 @@ impl ZeroFS {
 mod tests {
 
     use crate::fs::errors::FsError;
+    use crate::fs::inode::InodeAttrs;
     use crate::fs::permissions::Credentials;
     use crate::fs::test_util::test_creds;
     use crate::fs::*;
@@ -631,6 +638,81 @@ mod tests {
         SetUid, Timestamp,
     };
     use bytes::Bytes;
+
+    #[tokio::test]
+    async fn non_owner_resize_clears_setid_bits_in_inode_and_directory_entry() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let root_auth = AuthContext::default();
+        let root = Credentials::from_auth_context(&root_auth);
+        let other = Credentials::from_auth_context(&AuthContext {
+            uid: 1001,
+            gid: 1001,
+            ..AuthContext::default()
+        });
+
+        for opened in [false, true] {
+            for size in [8, 48] {
+                let name = format!("setid-{opened}-{size}");
+                let (id, _) = fs
+                    .create(
+                        &root,
+                        0,
+                        name.as_bytes(),
+                        &SetAttributes {
+                            uid: SetUid::Set(1000),
+                            gid: SetGid::Set(1000),
+                            mode: SetMode::Set(0o6777),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                fs.write(&root_auth, id, 0, &Bytes::from_static(b"0123456789abcdef"))
+                    .await
+                    .unwrap();
+                let resize = SetAttributes {
+                    size: SetSize::Set(size),
+                    ..Default::default()
+                };
+                let attrs = if opened {
+                    fs.setattr_opened_idempotent(&other, id, &resize, [0; 16])
+                        .await
+                } else {
+                    fs.setattr(&other, id, &resize).await
+                }
+                .unwrap();
+                assert_eq!(attrs.size, size);
+                assert_eq!(attrs.mode, 0o777, "non-owner resize retained set-ID bits");
+                assert_eq!(fs.inode_store.get(id).await.unwrap().mode(), 0o777);
+                let listing = fs.readdir(&root_auth, 0, 0, 16).await.unwrap();
+                let entry = listing
+                    .entries
+                    .iter()
+                    .find(|entry| entry.fileid == id)
+                    .unwrap();
+                assert_eq!(
+                    entry.attr.mode, 0o777,
+                    "directory entry retained set-ID bits"
+                );
+
+                // A privileged caller can explicitly restore the mode while
+                // resizing; keep ordinary combined-setattr semantics intact.
+                let restored = fs
+                    .setattr(
+                        &root,
+                        id,
+                        &SetAttributes {
+                            mode: SetMode::Set(0o6777),
+                            size: SetSize::Set(64),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(restored.mode, 0o6777);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn test_process_setattr_file_size() {
