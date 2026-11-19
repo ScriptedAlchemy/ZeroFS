@@ -63,8 +63,9 @@ pub(crate) struct PreparedWriteBatch {
     pub(crate) commit_ownership: crate::fs::write_coordinator::CommitOwnership,
 }
 
-/// The last published EOF projection. Only an outstanding prepared batch can
-/// keep the canonical inode lock alive. The hint alone never retains a lock.
+/// The last published single-inode write projection, including its byte-range
+/// end (which may precede EOF). Only an outstanding prepared batch can keep the
+/// canonical inode lock alive. The hint alone never retains a lock.
 pub(crate) struct PendingAppend {
     pub(crate) inode: Inode,
     pub(crate) id: InodeId,

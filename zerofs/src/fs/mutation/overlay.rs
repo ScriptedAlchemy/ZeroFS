@@ -1426,17 +1426,22 @@ impl ZeroFS {
                     return Err(error);
                 }
             };
-        let next_append = batch.members.first().and_then(|member| {
-            (member.offset == member.old_size && member.new_size > member.old_size).then(|| {
-                PendingAppend {
-                    inode: member.inode.clone(),
-                    id,
-                    end: member.new_size,
-                    writes,
-                    guards: Arc::downgrade(batch.guards.as_ref().expect("prepared inode lock")),
-                }
-            })
-        });
+        // The same guarded projection also covers contiguous overwrites
+        // inside an existing file. Track the written range's end rather
+        // than EOF so gaps and overlaps still acquire the canonical lock.
+        let next_append = match batch.members.as_slice() {
+            [member] if !member.data.is_empty() => Some(PendingAppend {
+                inode: member.inode.clone(),
+                id,
+                end: member
+                    .offset
+                    .checked_add(member.data.len() as u64)
+                    .expect("prepared write end was checked"),
+                writes,
+                guards: Arc::downgrade(batch.guards.as_ref().expect("prepared inode lock")),
+            }),
+            _ => None,
+        };
         let attrs = batch
             .replayed
             .as_ref()
@@ -1560,6 +1565,9 @@ async fn canonical_read_base(
     data[..canonical.len()].copy_from_slice(&canonical);
     Ok(Bytes::from(data))
 }
+
+#[cfg(test)]
+mod sequential_write_tests;
 
 #[cfg(test)]
 mod tests {

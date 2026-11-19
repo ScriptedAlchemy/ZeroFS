@@ -223,9 +223,10 @@ pub(crate) async fn prepare_write(
         .map(|(batch, _)| batch)
 }
 
-/// Consecutive appends on a volatile inode may prepare against the previous
-/// published inode while its exact canonical mutation lock is still held.
-/// The same inode lane applies them in publication order through commit.
+/// Contiguous non-overlapping writes on a volatile inode may prepare against
+/// the previous published inode while its exact canonical mutation lock is
+/// still held. The same inode lane applies them in publication order through
+/// commit, including read-modify-write of shared partial extents.
 pub(crate) async fn prepare_write_with_append(
     context: &WritePrepareContext<'_>,
     request: PrepareWriteRequest,
