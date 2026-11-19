@@ -26,14 +26,53 @@ impl P3Layout {
     /// Check the NAS-fit region contract. The final role owns exactly the
     /// remaining bytes and must still meet the minimum and alignment bounds.
     pub fn validate_nas_fit(device_len: u64, lengths: [u64; 6]) -> Result<()> {
-        const MIB: u64 = 1 << 20;
-        const FIXED: [u64; 5] = [61_440 * MIB, 128 * MIB, 3072 * MIB, 16 * MIB, 32 * MIB];
-        if lengths[..FIXED.len()] != FIXED {
-            return Err(Error::InvalidGeometry(
-                "NAS-fit P3 layout requires 61440/128/3072/16/32 MiB before the remainder".into(),
-            ));
+        if Self::nas_fit(device_len)?.lengths != lengths {
+            return Err(Error::InvalidGeometry("incorrect NAS-fit P3 layout".into()));
         }
-        Self::new(device_len, lengths)?;
+        Ok(())
+    }
+
+    pub(crate) fn nas_fit(device_len: u64) -> Result<Self> {
+        const MIB: u64 = 1 << 20;
+        let mut lengths = [61_440 * MIB, 128 * MIB, 3072 * MIB, 16 * MIB, 32 * MIB, 0];
+        lengths[5] = device_len
+            .checked_sub(lengths.iter().sum())
+            .ok_or_else(|| {
+                Error::InvalidGeometry("device is too small for NAS-fit P3 layout".into())
+            })?;
+        Self::new(device_len, lengths)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn verify_labels(
+        &self,
+        file: &File,
+        pool: [u8; 16],
+        member: [u8; 16],
+    ) -> Result<()> {
+        let mut offset = 0;
+        for (len, role) in self.lengths.into_iter().zip(ROLES) {
+            let identity = Identity {
+                pool_uuid: pool,
+                member_uuid: member,
+                role,
+            };
+            if matches!(role, Role::Journal | Role::Catalog) {
+                crate::journal_region::TransactionRegion::open(
+                    file.try_clone()?,
+                    self.device_len,
+                    offset,
+                    len,
+                    identity,
+                )?;
+            } else {
+                RawStore::binding(
+                    &Region::new(file.try_clone()?, self.device_len, offset, len)?,
+                    identity,
+                )?;
+            }
+            offset += len;
+        }
         Ok(())
     }
 

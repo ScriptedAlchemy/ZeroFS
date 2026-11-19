@@ -68,6 +68,13 @@ mod probe {
 
     pub(super) fn run() -> Result<()> {
         let args: Vec<_> = std::env::args().skip(1).collect();
+        if let [mode, command, socket, uid, gid] = args.as_slice()
+            && mode == "physical"
+            && command == "serve-claims"
+        {
+            zerofs_raw_device::claim::broker::serve(Path::new(socket), uid.parse()?, gid.parse()?)?;
+            return Ok(());
+        }
         if let [mode, command, designation] = args.as_slice()
             && mode == "physical"
             && command == "check-claim"

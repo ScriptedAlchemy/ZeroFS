@@ -143,12 +143,18 @@ impl RawBinding {
     fn claim(&self) -> Result<zerofs_raw_device::claim::Claim> {
         use zerofs_raw_device::claim::Claim;
         Ok(match self.kind {
-            RawKind::Physical => Claim::physical(
+            RawKind::Physical => Claim::from_broker(
+                &PathBuf::from(
+                    std::env::var_os("ZEROFS_RAW_CLAIM_SOCKET")
+                        .context("physical storage requires ZEROFS_RAW_CLAIM_SOCKET")?,
+                ),
                 self.node
                     .to_str()
                     .context("invalid designation")?
                     .trim_start_matches('/')
                     .parse()?,
+                *self.pool.as_bytes(),
+                *self.member.as_bytes(),
             )?,
             RawKind::LargeLoop => Claim::allocated_fixture(
                 &self.node,
