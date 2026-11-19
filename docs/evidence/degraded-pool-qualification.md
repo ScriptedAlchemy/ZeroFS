@@ -1,5 +1,9 @@
 # Degraded local pool qualification
 
+The commands in the historical receipt describe completed runs. The current
+runner is the Mac Studio's local Docker Desktop. The former remote host is
+permanently forbidden for new activity.
+
 Linux host `ubuntu-main`, source `ff25c08e40aa772d283410c17c6874d4e5952946`.
 The build and fixtures lived under `/var/tmp/zerofs-degraded.0LKO2HNj`.
 The resumed run confirmed the staged crate matched the pushed source and reused
