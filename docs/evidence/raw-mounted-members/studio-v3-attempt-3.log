@@ -1,0 +1,22 @@
+Build v3 from working snapshot as implementation finalized. Integration reference 056d4158.
+Command: scripts/test-raw-device-mounted.sh /var/tmp/zerofs-run-raw.cJVsClYD
+{"case": "binaries", "sha256": ["b08591babfd4f723c4d5cae545645607851fc0fde9490d82e1ff5e94f105233e  /input/zerofs", "18ba094a1d6446f722b31c87e5b40a5105c5c9017e2374ee3096f5f3e6023a7c  /input/zerofs-raw-device"]}
+{"backing": "/dev/shm/zerofs-raw-znxr6ih7/media-0", "backing_device": 95, "backing_inode": 4, "case": "initialized_loop", "member": "small", "member_uuid": "65fee826-0a4e-4a1f-877a-11c6c535ff1c", "node": "/dev/zerofs-raw-em0mzq7q/loop0", "pool_uuid": "c1c6faeb-a8eb-4949-89f9-704c8252a6bd", "size_bytes": 33554432}
+{"backing": "/dev/shm/zerofs-raw-znxr6ih7/media-1", "backing_device": 95, "backing_inode": 5, "case": "initialized_loop", "member": "large", "member_uuid": "5ed523a2-8d50-40e7-b306-88de0a732a7c", "node": "/dev/zerofs-raw-em0mzq7q/loop1", "pool_uuid": "c1c6faeb-a8eb-4949-89f9-704c8252a6bd", "size_bytes": 100663296}
+{"case": "mounted", "filesystem_type": "fuse", "phase": "initial", "transport": "userspace-fuse"}
+{"bytes": 8388608, "case": "mounted_hash", "phase": "initial", "sha256": "7e15c65fa248a35fe17af72e0b0ad492ed9c951ce8a38e239122aee83718bc9e"}
+Traceback (most recent call last):
+  File "/h/mounted.py", line 328, in <module>
+    main()
+  File "/h/mounted.py", line 320, in main
+    qualify(root, members)
+  File "/h/mounted.py", line 223, in qualify
+    _, initial = snapshot(configs[0], members, "initial")
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/h/mounted.py", line 184, in snapshot
+    status = member_status("--config", config)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/h/mounted.py", line 176, in member_status
+    assert space["retirement_reserved_bytes"] == RAW_BLOCK * member["objects"], member
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: {'id': 'small', 'capacity_bytes': 33554432, 'used_bytes': 4319494, 'reserved_bytes': 0, 'objects': 1, 'health': {'quarantine': None, 'monitoring_error': None, 'kernel_coverage': None, 'evacuation_error': None, 'kernel_cursor': None, 'since_ms': None, 'last_sample': None, 'crc_increases': 0, 'warning': None, 'observed_ms': None}, 'safe_to_remove': False, 'safe_to_pull_with_known_loss': False, 'readable_evacuated': False, 'unreadable_objects': 0, 'pending_uploads': 0, 'cleanup_debts': 0, 'evacuation': 'not_quarantined', 'available_bytes': 12427264, 'evacuation_capacity': {'required_bytes': 0, 'reserved_destination_bytes': 0, 'available_bytes': 100339712, 'sufficient': True, 'unavailable_members': []}, 'space': {'filesystem_free_bytes': 29212672, 'retirement_reserved_bytes': 8192, 'filesystem_total_bytes': 33554432, 'declared_exceeds_filesystem': False, 'full': None}}

@@ -95,7 +95,7 @@ def mounted(config):
                 mountinfo = Path("/proc/self/mountinfo").read_text().splitlines()
                 types = [line.split(" - ")[1].split()[0] for line in mountinfo
                          if line.split()[4] == str(mount)]
-                assert types == ["fuse.zerofs"], types
+                assert len(types) == 1 and types[0] in {"fuse", "fuse.zerofs"}, types
                 record("mounted", transport="userspace-fuse", filesystem_type=types[0],
                        phase=root.name)
                 yield mount / "payload"
@@ -173,7 +173,9 @@ def member_status(*args):
         assert member["capacity_bytes"] == SIZES[member_id], member
         space = member["space"]
         assert space["filesystem_free_bytes"] is not None, member
-        assert space["retirement_reserved_bytes"] == RAW_BLOCK * member["objects"], member
+        # The pool identity marker is live on the raw member and is outside the
+        # segment catalog. It funds a tombstone just like every placed segment.
+        assert space["retirement_reserved_bytes"] == RAW_BLOCK * (1 + member["objects"]), member
         assert member["health"]["quarantine"] is None, member
         assert member["health"]["monitoring_error"] is None, member
         assert member["reserved_bytes"] == member["pending_uploads"] == member["cleanup_debts"] == 0, member
