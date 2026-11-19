@@ -712,6 +712,9 @@ pub struct StoragePoolConfig {
     /// Placement policy for newly created immutable segments.
     #[serde(default, skip_serializing_if = "SegmentPlacement::is_first_fit")]
     pub(crate) segment_placement: SegmentPlacement,
+    /// Allow one initialized local data member to be unavailable at open.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) allow_degraded_start: bool,
     pub(crate) members: Vec<StoragePoolMemberConfig>,
 }
 

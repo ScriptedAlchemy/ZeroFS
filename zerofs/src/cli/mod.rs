@@ -273,6 +273,13 @@ pub enum PoolCommands {
         #[arg(short, long)]
         config: PathBuf,
     },
+    /// Verify every committed segment on a member against its catalog SHA-256
+    Verify {
+        #[arg(short, long)]
+        config: PathBuf,
+        #[arg(long)]
+        member: String,
+    },
     /// Move verified segments to another member, retaining the same filesystem
     Migrate {
         #[arg(short, long)]

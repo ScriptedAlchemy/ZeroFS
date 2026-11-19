@@ -1,3 +1,4 @@
+use crate::pool_object_store::{PoolObjectStore, SegmentTarget};
 use crate::segment_store::{
     AuthoritativeSegmentRead, ConditionalMultipartCreate, GeneratedSegmentCreate,
 };
@@ -42,7 +43,7 @@ use std::hash::{Hash, Hasher};
 #[cfg(not(unix))]
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::sync::{Mutex, Notify, OwnedMutexGuard};
 use uuid::Uuid;
 
@@ -72,6 +73,7 @@ struct WritebackStoreInner {
     space_refresher: Arc<SpaceRefresher>,
     journaler: LocalJournaler,
     remote: RemoteScheduler,
+    pool: OnceLock<PoolObjectStore>,
     database_prefix: String,
     incarnation: Uuid,
     next_sequence: AtomicU64,
@@ -242,6 +244,7 @@ impl WritebackObjectStore {
                 space_refresher: SpaceRefresher::start(Arc::clone(&ssd), Arc::clone(&space)),
                 journaler,
                 remote,
+                pool: OnceLock::new(),
                 database_prefix,
                 incarnation: snapshot.incarnation,
                 next_sequence: AtomicU64::new(snapshot.local_seq),
@@ -435,6 +438,13 @@ impl WritebackObjectStore {
             control,
         )
         .await
+    }
+
+    pub(crate) fn set_pool(&self, pool: PoolObjectStore) {
+        self.inner
+            .pool
+            .set(pool)
+            .expect("writeback pool already configured");
     }
 
     /// Start remote writeback after callers have finished opening over the
@@ -667,13 +677,44 @@ impl WritebackObjectStore {
         let lock = self.key_lock(&location);
         let key_guard = lock.lock_owned().await;
         let trusted_segment_create = options.extensions.get::<GeneratedSegmentCreate>().is_some();
+        if let Some(target) = options.extensions.get::<SegmentTarget>() {
+            if !matches!(options.mode, PutMode::Create) || !trusted_segment_create {
+                return Err(generic_error(
+                    "writeback segment targets require generated conditional create",
+                ));
+            }
+            let pool = self.inner.pool.get().ok_or_else(|| {
+                generic_error("writeback cannot persist a segment target without its pool catalog")
+            })?;
+            // Check the target before an overlay-visible create can return
+            // AlreadyExists: byte-only reconciliation must not bless a retry
+            // that names another member. Replay uses the same canonical key;
+            // commit the target before acknowledging its journal payload.
+            pool.register_segment_target(&location, target).await?;
+        }
         let (mode, expected_visible_version, predecessor) = match &options.mode {
             PutMode::Overwrite => (MutationMode::Overwrite, None, None),
             PutMode::Create if trusted_segment_create => {
-                if self.inner.overlay.has_visible_local_object(&location).await {
-                    return Err(object_store::Error::AlreadyExists {
-                        path: location.to_string(),
-                        source: "overlay-visible object already exists".into(),
+                if let Some((sequence, local_etag)) = self
+                    .inner
+                    .overlay
+                    .matching_local_create(&location, &payload)
+                    .await?
+                {
+                    // The accepted create may not exist remotely yet. Return
+                    // its original identity instead of forcing the segment
+                    // publisher's authoritative remote-conflict readback.
+                    // Target validation above must precede this idempotency.
+                    drop(key_guard);
+                    drop(payload);
+                    drop(ram);
+                    drop(disk);
+                    self.await_ack(&self.inner.journaler.barrier(), sequence)
+                        .await?;
+                    return Ok(PutResult {
+                        e_tag: Some(local_etag.as_str().to_owned()),
+                        version: Some(local_etag.as_str().to_owned()),
+                        extensions: Extensions::new(),
                     });
                 }
                 (MutationMode::Create, None, None)
@@ -2623,7 +2664,7 @@ mod tests {
         );
 
         segments
-            .put_segment(segid, Bytes::from(vec![2u8; size]))
+            .put_segment(segid, Bytes::from(vec![2u8; size]), None)
             .await
             .expect_err("remote immutable-key collision must remain fatal");
         assert_eq!(
@@ -5155,7 +5196,7 @@ mod tests {
             async move {
                 let segid = segments.next_segid();
                 segments
-                    .put_segment(segid, Bytes::from(vec![index; 1024]))
+                    .put_segment(segid, Bytes::from(vec![index; 1024]), None)
                     .await
                     .unwrap();
             }
@@ -5196,7 +5237,7 @@ mod tests {
 
         let accepted = tokio::time::timeout(
             Duration::from_secs(1),
-            segments.put_segment(segments.next_segid(), Bytes::from_static(b"segment")),
+            segments.put_segment(segments.next_segid(), Bytes::from_static(b"segment"), None),
         )
         .await;
         controls.release_heads();

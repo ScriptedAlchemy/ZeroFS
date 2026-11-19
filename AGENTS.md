@@ -1,11 +1,40 @@
 # ZeroFS agent notes
 
+## Active runner
+
+Use Zack's Mac Studio and its local Docker Desktop context by default for
+Linux builds and software tests, including Rust. Before starting
+a container, check `docker context show`, its endpoint, and `docker info`.
+Use native `linux/arm64` on the arm64 Studio when the image supports it. Record
+the image platform and whether any emulation was used with each result.
+
+Use disposable, uniquely named containers and keep Cargo targets and scratch
+inside the container or in a uniquely named task-owned volume. Mount the source
+read-only at `/checkout` for the commands below and set `CARGO_TARGET_DIR`
+to task-owned scratch. Limit Cargo
+parallelism to four jobs. Publish no ports beyond loopback. Remove only objects
+created for the task. The production NAS trial is owned by the app owner.
+
+When needed, `ubuntu-main` may run software tests and build native x86-64
+artifacts or Docker images. Use a new task-owned directory under `/var/tmp`
+without sudo. Record the host, architecture, and shared-host caveat with each
+result, and remove only what the task creates. Deployment, persistent services,
+and inspection or cleanup of scratch from before the earlier ban are outside
+this authorization. The Spark is the alternate Linux test host.
+
+Physical-disk testing belongs to the app owner on the N5 NAS, on designated
+trial drives under separate commissioning authorization. This runner note
+authorizes no worker NAS action. See `truenas-storage-union` commit `10a3729`.
+
 ## Performance and benchmark map
+
+The VM100 entries below document the historical workflow. Use the container
+commands for active qualification.
 
 - `scripts/vm100-pilot.py benchmark` is the maintained end-to-end VM100 tier runner. It measures foreground acknowledgement, local SSD durability, remote durability, and reads against an already-running isolated pilot. It does not deploy or tear down the pilot itself.
 - `scripts/vm100-pilot.py protocol-matrix --protocol nfs --idle-read` is the separate mounted NFS long-idle recovery probe. It requires the explicit `ZEROFS_BENCH_NFS_SERVICE_ISOLATED=true` operator authority tied to the metrics `server_instance_id`, writes and remotely drains one owned 64 MiB file, idles for 61 minutes, invalidates the NFS client's page cache, applies a 30-second fio userspace deadline, and verifies exact I/O and SHA-256. `zerofs_sftp_object_read_bytes_total` is service-global interval activity, not request attribution: its delta must cover at least the logical read, and any other protocol/client/export or internal SFTP-reading maintenance in that service instance invalidates the receipt. A returned userspace timeout writes a failed receipt and runs cleanup; an uninterruptible hard-NFS D-state can prevent the timeout from returning, so it cannot guarantee receipt finalization or teardown. The scenario neither deploys nor restarts the server and does not prove a pool session rotated.
 - `scripts/vm100-pilot.py setup|teardown|profile` owns the legacy isolated-pilot lifecycle. `profile` temporarily installs a symbolized binary and is intentionally much slower than `benchmark`; do not substitute it for an ordinary throughput run.
-- `scripts/vm100_pilot/` contains the benchmark implementation, receipts, metrics sampling, matrices, raw-SFTP comparison, and cleanup logic. Historical receipts normally live under `/var/tmp/zerofs-pilot-results` on `ubuntu-main`.
+- `scripts/vm100_pilot/` contains the benchmark implementation, receipts, metrics sampling, matrices, raw-SFTP comparison, and cleanup logic.
 - `scripts/tiered-writeback-e2e.py` and `scripts/tiered_writeback_e2e/` describe UUID-scoped RAM/SSD/remote scenarios. Real scenarios currently fail closed until the typed durability collector is wired; `--plan-only` is not performance evidence.
 - `zerofs/src/writeback/sftp_bench.rs` is the direct real-SFTP/writeback microbenchmark. It constructs the production SFTP transport, pool, object store, journal, and remote scheduler without launching the CLI or protocol servers. It uses the normal dev/CI test profile, not `--release`.
 - `zerofs/src/writeback/tier_bench.rs` is the direct host-local read/write microbenchmark. It measures RAM acknowledgement through the production writeback store, RAM reads through the production overlay, SSD durability through the production journaler, and page-cache-served SSD-journal reads verified per object against the payload each object actually got. It also uses the normal dev/CI test profile.
@@ -19,10 +48,10 @@
 
 ## Direct SFTP/writeback benchmark
 
-Run the real benchmark on Linux, normally `ubuntu-main`; do not run it on macOS. It is ignored by default and uses the configured SFTP transport and writeback concurrency. It creates one UUID-scoped child under the configured SFTP prefix, verifies every payload, deletes every object, removes the owned remote directories, shuts down its pool, and removes its local temporary journal.
+Run the benchmark only inside a disposable Linux container on the Mac Studio. It is ignored by default and uses the configured SFTP transport and writeback concurrency. It creates one UUID-scoped child under the configured SFTP prefix, verifies every payload, deletes every object, removes the owned remote directories, shuts down its pool, and removes its local temporary journal.
 
 ```bash
-cd /fast/projects/ZeroFS/zerofs
+cd /checkout/zerofs
 set -a
 source /secure/zerofs-prod.env
 set +a
@@ -30,7 +59,7 @@ ZEROFS_SFTP_WRITEBACK_BENCH_CONFIG=/secure/zerofs-prod.toml \
 ZEROFS_BENCH_DIR=/var/tmp \
 ZEROFS_BENCH_SFTP_IDENTITY_FILE=/secure/storage-key \
 ZEROFS_BENCH_SFTP_KNOWN_HOSTS=/secure/known_hosts \
-cargo test --locked -p zerofs --lib \
+cargo test --locked -j4 -p zerofs --lib \
   writeback::sftp_bench::bench_sftp_writeback_remote_drain \
   -- --exact --ignored --nocapture
 ```
@@ -51,7 +80,7 @@ ZEROFS_BENCH_SFTP_FENCE_EVERY=4 \
 ZEROFS_BENCH_SFTP_WRITERS=8 \
 ZEROFS_BENCH_SFTP_MAX_CONNECTIONS=2 \
 ZEROFS_BENCH_SFTP_SSD_MIB=32 \
-cargo test --locked -p zerofs --lib \
+cargo test --locked -j4 -p zerofs --lib \
   writeback::sftp_bench::bench_sftp_writeback_full_ssd_pacing \
   -- --exact --ignored --nocapture
 ```
@@ -62,12 +91,12 @@ ZeroFS uses the in-process native Rust `russh` transport. Production configs and
 
 ## Direct RAM/SSD read/write benchmark
 
-Run the host-local benchmark in the normal dev profile. It does not need an SFTP configuration, launch ZeroFS, or touch a remote backend. Use a scratch parent on the SSD being measured; the benchmark creates a unique temporary child, shuts down the writeback workers, removes that child, and verifies it is absent before emitting JSON.
+Run the host-local benchmark in the normal dev profile inside a disposable Linux container on the Mac Studio. It does not need an SFTP configuration, launch ZeroFS, or touch a remote backend. Use a scratch parent on the SSD being measured; the benchmark creates a unique temporary child, shuts down the writeback workers, removes that child, and verifies it is absent before emitting JSON.
 
 ```bash
-cd /fast/projects/ZeroFS/zerofs
+cd /checkout/zerofs
 ZEROFS_BENCH_DIR=/var/tmp \
-cargo test --locked -p zerofs --lib \
+cargo test --locked -j4 -p zerofs --lib \
   writeback::tier_bench::bench_writeback_local_tier_read_write \
   -- --exact --ignored --nocapture
 ```

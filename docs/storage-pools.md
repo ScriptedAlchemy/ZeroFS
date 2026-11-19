@@ -105,6 +105,25 @@ committed data, pending uploads, and superseded data still awaiting deletion.
 Adding another permanent member adds capacity without changing filesystem paths
 or remapping previously written segments.
 
+Placement currently operates on sealed segments. A file can span segments,
+and a segment can carry extents from several files. Whole-file placement across
+multiple members requires binding an inode before frame packing, carrying the
+binding through upload and recovery, and keeping compaction and reclaim within
+that binding. The allocator has no complete file length or inode ownership at
+admission, so the current placement modes provide segment-level capacity
+admission.
+
+The pool has an internal exact-target contract for new conditional segment
+uploads. A caller that provides a target persists it in the catalog before
+capacity admission. Writeback registers explicit generated-segment targets in
+the same catalog before it can acknowledge the journal entry. Replay uses
+the same logical key and inherits the persisted target even when no earlier
+pool put occurred. Later puts honor the target after reclaim or restart. The
+allocator checks the target's health, quota and filesystem reserve and
+refuses allocations it cannot satisfy. Segment migration cannot move a
+targeted segment to another member. There is currently no filesystem placement
+mode that emits these targets.
+
 Set `segment_placement = "round_robin_local"` in `[storage.pool]` to rotate new
 immutable segment reservations across eligible local members. Rotation follows
 configuration order and resumes after restart from the last local reservation
@@ -172,6 +191,34 @@ including a read-only or checkpoint server when the writer is stopped, and
 rejects HA replication. Adding members and maintenance require a server restart
 or a stopped server. It does not perform background cold-data migration or
 per-file pinning; explicit migration controls placement.
+
+## Raw member interface
+
+At raw-device commit `b615aace`, `RawStore` is an object log keyed by name.
+The pool still routes by logical member ID. The existing directory adapter
+uses mount and path checks, marker files, `statvfs`, and staging-file rename.
+Raw-member integration and qualification are pending.
+
+- **Degraded start.** `open` validates size and the on-device
+  `Identity { pool_uuid, member_uuid, role }` without writing. Provisioning
+  requires a blank device and is separate from startup. The adapter must
+  discover and exclusively claim the device, check its serial or WWN, and
+  distinguish an absent device from a mismatched or corrupt one. It must
+  exclude an unavailable data member and return bounded read errors while
+  still requiring the authority and catalog.
+- **Admission and reclaim.** Use `geometry().free` at the append tail, including
+  unflushed appends, and charge record and alignment overhead, reserve, quota,
+  and outstanding reservations. Ask for an exact append-cost and reservation
+  interface plus allocation health. Write or sync failures poison the store
+  until reopen. Deletes append tombstones and overwrites append new records.
+  There is no reclamation, so logical deletion never restores capacity.
+  Binding-preserving compaction needs explicit reclamation semantics.
+- **Publication and verification.** `put` becomes durable after successful
+  `flush`. The adapter must enforce immutable conditional creation and flush
+  before publishing a catalog locator. `get` verifies whole-object SHA-256 and
+  `scrub` detects corruption. The pool still needs length and bounded
+  exact-generation reads with typed failures for its member verifier.
+  Affected-file reporting already uses only catalog and extent metadata.
 
 ## SFTP members
 
@@ -350,6 +397,30 @@ Inspect a running server through its existing admin RPC socket:
 zerofs pool status --endpoint unix:/run/zerofs/admin.sock
 zerofs pool affected --endpoint unix:/run/zerofs/admin.sock --member disk1
 ```
+
+For an existing pool, set `allow_degraded_start = true` in `[storage.pool]` to
+open with one initialized local data member unavailable. Keep its member
+declaration. The authority, its identity marker, the catalog, and the other
+readiness roles are still required. With strict readiness configured, the
+mount and device identity checks apply to every remaining role. A directory
+at the missing mount path without the matching pool member marker cannot
+receive segments. Status sets `unavailable_at_startup` for the excluded member.
+Its mapped segments return I/O errors on cold reads. Restart after restoring
+the member to have it checked again.
+
+Run a full check of the committed segment bodies on one member with the
+server stopped:
+
+```sh
+zerofs pool verify --config zerofs.toml --member disk1
+```
+
+The command reads the exact catalog generations in bounded ranges and compares
+their SHA-256 digests with the committed catalog digests. It outputs a JSON
+count and failures keyed by logical segment path, and exits unsuccessfully if
+any committed body fails verification. Use `pool affected` on the running
+server to identify live and retained-checkpoint file references for the member,
+including when its bodies cannot be read.
 
 Offline `pool status --config zerofs.toml` still takes the catalog's exclusive
 lock and requires a stopped server. Opening storage or running an offline command
