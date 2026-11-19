@@ -180,7 +180,9 @@ let wasmReady: Promise<unknown> | undefined;
 export class ZeroFsClient {
   private client: SharedClient | null = null;
   private connectPromise: Promise<void> | null = null;
+  private connectionGeneration = 0;
   private reconnectUrl: string | null = null;
+  private restoreUrl: string | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private monitorTimer: ReturnType<typeof setInterval> | null = null;
   private stateListeners = new Set<(state: ConnectionState) => void>();
@@ -189,6 +191,20 @@ export class ZeroFsClient {
   private previousStats: WireTrafficStats = { bytes_sent: 0, bytes_received: 0, operations: 0 };
   private maxReadChunk = 1024 * 1024;
   private maxWriteChunk = 1024 * 1024;
+
+  constructor(pageLifetime?: Window) {
+    pageLifetime?.addEventListener("pagehide", (event) => {
+      const restoreUrl = event.persisted ? this.reconnectUrl : null;
+      void this.close();
+      this.restoreUrl = restoreUrl;
+    });
+    pageLifetime?.addEventListener("pageshow", (event) => {
+      if (!event.persisted) return;
+      const url = this.restoreUrl;
+      this.restoreUrl = null;
+      if (url) this.enableAutoReconnect(url);
+    });
+  }
 
   get state(): ConnectionState {
     return this._state;
@@ -244,30 +260,46 @@ export class ZeroFsClient {
   async connect(url: string): Promise<void> {
     if (this.client) return;
     if (this.connectPromise) return this.connectPromise;
+    const generation = this.connectionGeneration;
     this.setState("connecting");
-    this.connectPromise = (async () => {
+    const connecting = (async () => {
       wasmReady ??= initWasm().catch((error) => {
         wasmReady = undefined;
         throw error;
       });
       await wasmReady;
-      this.client = await SharedClient.connect(url);
-      const capabilities = this.client.capabilities() as WireCapabilities;
+      if (generation !== this.connectionGeneration) throw new DOMException("Connection closed", "AbortError");
+      const client = await SharedClient.connect(url);
+      if (generation !== this.connectionGeneration) {
+        // A WASM Promise cannot be cancelled from JS. It still owns its result
+        // after close(), so retire that result without touching a newer session.
+        try {
+          await client.close();
+        } catch (error) {
+          console.warn("ZeroFsClient: error closing superseded wasm client", error);
+        }
+        throw new DOMException("Connection closed", "AbortError");
+      }
+      this.client = client;
+      const capabilities = client.capabilities() as WireCapabilities;
       this.maxReadChunk = capabilities.max_read_chunk;
       this.maxWriteChunk = capabilities.max_write_chunk;
-      this.previousStats = this.client.trafficStats() as WireTrafficStats;
-      this.setState("connected");
+      this.previousStats = client.trafficStats() as WireTrafficStats;
       this.startMonitor();
+      this.setState("connected");
     })();
+    if (generation === this.connectionGeneration) this.connectPromise = connecting;
     try {
-      await this.connectPromise;
+      await connecting;
     } catch (error) {
-      this.client = null;
-      this.setState("disconnected");
-      this.scheduleInitialReconnect();
+      if (generation === this.connectionGeneration) {
+        this.client = null;
+        this.setState("disconnected");
+        this.scheduleInitialReconnect();
+      }
       throw error;
     } finally {
-      this.connectPromise = null;
+      if (this.connectPromise === connecting) this.connectPromise = null;
     }
   }
 
@@ -285,7 +317,10 @@ export class ZeroFsClient {
    * Safe to call even if never connected, and safe to call more than once.
    */
   async close(): Promise<void> {
+    this.connectionGeneration++;
+    this.connectPromise = null;
     this.reconnectUrl = null;
+    this.restoreUrl = null;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -748,19 +783,10 @@ export class ZeroFsClient {
   }
 }
 
-export const p9client = new ZeroFsClient();
-
 // `p9client` is a page-lifetime singleton: it is created once here and never
 // replaced or discarded during normal use (the underlying wasm session
 // reconnects itself internally rather than being swapped out from JS). The
-// only real teardown seam is the page going away, so close it best-effort
-// there rather than leaking the session until the transport times out.
-// `pagehide` fires reliably (including on bfcache navigation); `beforeunload`
-// is kept as a fallback for environments where `pagehide` is unavailable.
-if (typeof window !== "undefined") {
-  const closeOnTeardown = () => {
-    void p9client.close();
-  };
-  window.addEventListener("pagehide", closeOnTeardown);
-  window.addEventListener("beforeunload", closeOnTeardown);
-}
+// page lifecycle closes it on departure and resumes an enabled connection
+// after a back-forward-cache restore, when mounted hooks do not run again.
+// Avoid beforeunload: navigation can still be cancelled at that point.
+export const p9client = new ZeroFsClient(typeof window === "undefined" ? undefined : window);
