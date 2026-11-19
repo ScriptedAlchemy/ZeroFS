@@ -670,6 +670,31 @@ mod raw_candidate {
     }
 
     #[test]
+    fn physical_contract_requires_distinct_designations_exact_geometry_and_nas_fit_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = include_str!("memory_raw_physical_test.toml");
+        // This is config admission only. No host inventory or device is opened.
+        let read = |toml: &str| validate(temp.path(), toml, Some(8 * GIB), "0");
+        let receipt = read(config).unwrap();
+        assert_eq!(receipt.included_companion_bytes, 1536 * MIB);
+        for (old, new) in [
+            ("/hdd6?", "/hdd18?"),
+            ("/hdd6?", "/dev/sda?"),
+            ("/hdd18?", "/ZL213G03?"),
+            ("/nvme?", "/hdd18?"),
+            ("raw+disk:///hdd6", "raw+loop:///hdd6"),
+            ("raw+disk:///hdd6?", "raw+disk:///hdd6?backing=/tmp/unused&"),
+            ("layout_bytes=", "layout_mib="),
+            ("6001.175126016", "6001.174126016"),
+            ("reserve_free_gb = 181.0", "reserve_free_gb = 1.0"),
+        ] {
+            let changed = config.replace(old, new);
+            assert_ne!(config, changed);
+            assert!(read(&changed).is_err(), "{changed}");
+        }
+    }
+
+    #[test]
     fn raw_candidate_rejects_unbounded_or_incompatible_geometry() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();

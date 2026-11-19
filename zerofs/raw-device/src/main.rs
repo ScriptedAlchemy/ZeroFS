@@ -68,6 +68,18 @@ mod probe {
 
     pub(super) fn run() -> Result<()> {
         let args: Vec<_> = std::env::args().skip(1).collect();
+        if let [mode, command, designation] = args.as_slice()
+            && mode == "physical"
+            && command == "check-claim"
+        {
+            let role = designation.parse()?;
+            let claim = Claim::physical(role)?;
+            println!(
+                r#"{{"schema_version":1,"designation":"{designation}","held_device_bytes":{},"exclusive_claim_verified":true}}"#,
+                claim.size
+            );
+            return Ok(());
+        }
         let (op, claim, pool, member, role, tail, physical) = match args.as_slice() {
             [mode, op, designation, pool, member, role, tail @ ..] if mode == "physical" => {
                 use zerofs_raw_device::claim::PhysicalRole;
