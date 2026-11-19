@@ -70,6 +70,9 @@ def run(scratch, kernel, release, engine, probe, manifest):
         vm.stage_binary(root, "/usr/lib/udev/" + name, "/usr/lib/udev/" + name)
     for name in ("50-udev-default.rules", "60-persistent-storage.rules"):
         shutil.copy2("/usr/lib/udev/rules.d/" + name, root / "usr/lib/udev/rules.d" / name)
+    subprocess.run(["cc", "-static", "-O2", "-Wall", "-Wextra", "-Werror", "-o", root / "bin/fault",
+                    HERE / "broker-vm-fault.c"], check=True, timeout=30)
+    shutil.copy2(root / "bin/fault", app / "bin/fault")
     vm.stage_modules(root, release)
     for script, dest in (("broker-vm-init.sh", root / "init"), ("broker-vm-isolate.sh", root / "isolate"),
                          ("broker-vm-client.sh", app / "client")):

@@ -21,6 +21,15 @@ refuse() {
 }
 env -u ZEROFS_RAW_CLAIM_SOCKET zerofs memory-status -c "$cfg" >/state/memory
 refuse missing-transport 'ZEROFS_RAW_CLAIM_SOCKET' env -u ZEROFS_RAW_CLAIM_SOCKET zerofs pool verify-raw -c "$cfg"
+refuse premature-disconnect 'incomplete claim packet|reset by peer' env ZEROFS_RAW_CLAIM_SOCKET=/run/claims/disconnect zerofs pool verify-raw -c "$cfg"
+refuse missing-fd 'missing exclusive claim descriptor' env ZEROFS_RAW_CLAIM_SOCKET=/run/claims/missing zerofs pool verify-raw -c "$cfg"
+refuse substituted-file 'must be a block device' env ZEROFS_RAW_CLAIM_SOCKET=/run/claims/file zerofs pool verify-raw -c "$cfg"
+refuse substituted-sequence 'descriptor identity mismatch' env ZEROFS_RAW_CLAIM_SOCKET=/run/claims/sequence zerofs pool verify-raw -c "$cfg"
+/bin/fault /state/untrusted.sock disconnect &
+rogue=$!
+while ! test -S /state/untrusted.sock; do kill -0 "$rogue"; sleep 0.1; done
+refuse substituted-broker 'requires a root broker outside its PID namespace' env ZEROFS_RAW_CLAIM_SOCKET=/state/untrusted.sock zerofs pool verify-raw -c "$cfg"
+wait "$rogue"
 refuse run-before-pool-init 'original raw P3 journal is missing' zerofs run -c "$cfg"
 zerofs pool init -c "$cfg" >/state/init
 zerofs pool verify-raw -c "$cfg" >/state/verify

@@ -33,6 +33,7 @@ start_broker() {
 }
 start_broker
 while ! test -S /run/claim/claim.sock; do kill -0 "$broker"; sleep 0.1; done
+for mode in file sequence disconnect missing; do /bin/fault "/run/claim/$mode" "$mode" & done
 echo "BROKER_VM_HOST pidns=$(readlink /proc/self/ns/pid) mntns=$(readlink /proc/self/ns/mnt) socket=$(stat -c '%u:%g:%a' /run/claim/claim.sock)"
 (echo 0 >/sys/fs/cgroup/app/cgroup.procs; exec unshare --pid --mount --net --cgroup --fork --kill-child --propagation private /isolate) >/app/state/driver.log 2>&1 &
 client=$!
