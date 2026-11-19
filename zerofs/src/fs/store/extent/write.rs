@@ -3,15 +3,18 @@
 //! barrier), delete/truncate/zero-range staging with segment-counter
 //! debits, and the tail cache for sequential appends.
 //!
-//! # The codec sits on the acknowledgement path
+//! # Codec cost and acknowledgement
 //!
 //! [`ExtentStore::stage_edits`] compresses and AEAD-seals every frame before
-//! the transaction it stages can commit, and under `ack_mode = memory` that
-//! commit is what the client's write is acknowledged behind. So the cipher is
-//! synchronous with the ACK even though nothing durable depends on it yet.
+//! the transaction it stages can commit. This precedes a materialized
+//! filesystem acknowledgement even when object writeback uses memory ACKs.
+//! Filesystem `volatile_memory` acknowledges bounded raw bytes before this
+//! work runs, but the same codec remains a cost of the materializer's drain:
+//! it can extend capacity waits and the final durability barrier.
 //!
-//! What that costs, from `bench_distinct_inode_write_scaling` (release, one
-//! writer, canonical 256 KiB NBD member chunks, incompressible payloads):
+//! Historical `bench_distinct_inode_write_scaling` results (release, one
+//! writer, canonical 256 KiB NBD member chunks, incompressible payloads;
+//! these are not measurements of the current NAS workload):
 //!
 //! ```text
 //! old_debit  35 us   compress   67 us   protect_ref   1 us
@@ -19,9 +22,10 @@
 //! open_lock   0 us   append     10 us   txn_stage    13 us
 //! ```
 //!
-//! 345 us of a 546 us staging call is codec — 63%, and it scales with bytes,
-//! not with the number of writers. At ~1 GB/s per core for compress + seal,
-//! that is the per-stream ceiling the NBD ACK path runs into.
+//! In that measurement, codec took 345 us of a 546 us staging call — 63%.
+//! The measured compress + seal rate was about 1 GB/s per core. This is
+//! historical evidence of byte-processing cost, not a current throughput
+//! prediction for a different CPU, profile, or acknowledgement mode.
 //!
 //! ## Fanning the codec out does not work at this size
 //!
@@ -33,7 +37,8 @@
 //! frames. `block_in_place` plus rayon dispatch costs more than the ~33 us per
 //! frame the cipher itself takes. The existing 1 MiB gates are already right;
 //! the win has to come from removing the codec from this path, not spreading
-//! it.
+//! it. Those crossover results are also historical, not a qualification of
+//! the current NAS configuration.
 //!
 //! ## Removing it: plaintext open segments
 //!
@@ -124,6 +129,24 @@ const OLD_DEBIT_POINT_LOOKUPS_MAX: usize = 1024 * 1024 / EXTENT_SIZE;
 #[inline]
 fn should_parallel_compress(frame_count: usize) -> bool {
     frame_count >= PARALLEL_COMPRESS_MIN_FRAMES
+}
+
+/// Only the partial edge extents can need old bytes for a contiguous write.
+/// Fully overwritten extents and extents beyond the old EOF have no preimage
+/// to collect. Returning the two candidates directly also avoids walking every
+/// full extent just to discover that it needs no read-modify-write preparation.
+fn partial_old_extents(offset: u64, end_offset: u64, old_size: u64) -> impl Iterator<Item = u64> {
+    debug_assert!(offset < end_offset);
+    let extent_size = EXTENT_SIZE as u64;
+    let first = offset / extent_size;
+    let last = (end_offset - 1) / extent_size;
+    let head =
+        (!offset.is_multiple_of(extent_size) && first * extent_size < old_size).then_some(first);
+    let tail = (!end_offset.is_multiple_of(extent_size)
+        && last * extent_size < old_size
+        && head != Some(last))
+    .then_some(last);
+    [head, tail].into_iter().flatten()
 }
 
 /// Injectable stand-in for a batch AEAD failure, so tests can abandon a
@@ -1439,31 +1462,27 @@ impl ExtentStore {
 
         // Read the existing content of any partially-overwritten extent (full
         // overwrites and extents past EOF need no read).
-        let existing_extents: HashMap<u64, Bytes> = stream::iter(start_extent..=end_extent)
-            .map(|extent_idx| {
-                let extent_start = extent_idx * EXTENT_SIZE as u64;
-                let extent_end = extent_start + EXTENT_SIZE as u64;
-                let will_overwrite_fully = offset <= extent_start && end_offset >= extent_end;
-                let beyond_eof = extent_start >= old_size;
-                let store = self.clone();
-                let cached = cached.clone();
-                async move {
-                    let data = if will_overwrite_fully || beyond_eof {
-                        Bytes::from_static(ZERO_EXTENT)
-                    } else if let Some((_, bytes)) = cached.filter(|(ci, _)| *ci == extent_idx) {
-                        bytes
-                    } else {
-                        store
-                            .get(id, extent_idx)
-                            .await?
-                            .unwrap_or_else(|| Bytes::from_static(ZERO_EXTENT))
-                    };
-                    Ok::<(u64, Bytes), FsError>((extent_idx, data))
-                }
-            })
-            .buffer_unordered(PARALLEL_EXTENT_OPS)
-            .try_collect()
-            .await?;
+        let existing_extents: HashMap<u64, Bytes> =
+            stream::iter(partial_old_extents(offset, end_offset, old_size))
+                .map(|extent_idx| {
+                    let store = self.clone();
+                    let cached = cached.clone();
+                    async move {
+                        let data =
+                            if let Some((_, bytes)) = cached.filter(|(ci, _)| *ci == extent_idx) {
+                                bytes
+                            } else {
+                                store
+                                    .get(id, extent_idx)
+                                    .await?
+                                    .unwrap_or_else(|| Bytes::from_static(ZERO_EXTENT))
+                            };
+                        Ok::<(u64, Bytes), FsError>((extent_idx, data))
+                    }
+                })
+                .buffer_unordered(PARALLEL_EXTENT_OPS)
+                .try_collect()
+                .await?;
 
         let cache_tail = end_offset >= old_size && !end_offset.is_multiple_of(EXTENT_SIZE as u64);
 
@@ -1488,7 +1507,11 @@ impl ExtentStore {
             let extent: Bytes = if write_start == 0 && write_end == EXTENT_SIZE {
                 data.slice(data_offset..data_offset + write_len)
             } else {
-                let mut buf = BytesMut::from(existing_extents[&extent_idx].as_ref());
+                let mut buf = if extent_start >= old_size {
+                    BytesMut::zeroed(EXTENT_SIZE)
+                } else {
+                    BytesMut::from(existing_extents[&extent_idx].as_ref())
+                };
                 buf[write_start..write_end]
                     .copy_from_slice(&data[data_offset..data_offset + write_len]);
                 buf.freeze()
@@ -2239,6 +2262,111 @@ mod tests {
             live1 + ext1_len,
             "total - live is the dead-frame bytes (the fragmentation denominator)"
         );
+    }
+
+    #[tokio::test]
+    async fn partial_write_edges_preserve_old_bytes_and_sparse_gaps() {
+        let (store, db) = make().await;
+        let mut model = Vec::new();
+        let seed = incompressible(73, 2 * EXTENT_SIZE + 17);
+        write_and_check(&store, &db, &mut model, 0, &seed).await;
+        let sparse_tail = model.len() + 11;
+        write_and_check(&store, &db, &mut model, sparse_tail, b"tail gap").await;
+        write_and_check(
+            &store,
+            &db,
+            &mut model,
+            EXTENT_SIZE,
+            &vec![0x42; EXTENT_SIZE],
+        )
+        .await;
+        write_and_check(
+            &store,
+            &db,
+            &mut model,
+            EXTENT_SIZE - 7,
+            &vec![0x53; EXTENT_SIZE + 19],
+        )
+        .await;
+        let old_eof = model.len();
+        write_and_check(
+            &store,
+            &db,
+            &mut model,
+            old_eof,
+            &vec![0x64; EXTENT_SIZE + 7],
+        )
+        .await;
+        write_and_check(
+            &store,
+            &db,
+            &mut model,
+            5 * EXTENT_SIZE + 11,
+            &vec![0x75; EXTENT_SIZE + 3],
+        )
+        .await;
+        write_and_check(&store, &db, &mut model, 4 * EXTENT_SIZE + 7, b"hole edge").await;
+        write_and_check(&store, &db, &mut model, EXTENT_SIZE - 1, b"x").await;
+        write_and_check(&store, &db, &mut model, EXTENT_SIZE, b"yz").await;
+    }
+
+    #[tokio::test]
+    async fn partial_write_keeps_errors_for_required_old_bytes() {
+        let (store, db) = make().await;
+        let mut corrupt = db.new_transaction().unwrap();
+        corrupt.put_bytes(
+            &store.key_codec.extent_key(1, 0),
+            Bytes::from_static(b"invalid frame location"),
+        );
+        commit(&store, corrupt).await;
+
+        let mut txn = db.new_transaction().unwrap();
+        let result = store
+            .write(
+                &mut txn,
+                1,
+                1,
+                &Bytes::from_static(b"x"),
+                EXTENT_SIZE as u64,
+            )
+            .await;
+        assert!(matches!(result, Err(FsError::IoError)));
+        assert!(store.open_lane(1).open.lock().unwrap().dir.is_empty());
+    }
+
+    #[test]
+    fn old_extent_preparation_visits_only_partial_existing_edges() {
+        let e = EXTENT_SIZE as u64;
+        for (label, offset, end, old_size, expected) in [
+            ("aligned append", 0, 32 * e, 0, vec![]),
+            ("aligned overwrite", 0, 32 * e, 64 * e, vec![]),
+            ("both old edges", 7, 32 * e + 13, 64 * e, vec![0, 32]),
+            ("same old edge", 7, 13, 64 * e, vec![0]),
+            ("old head only", 7, 32 * e, 64 * e, vec![0]),
+            ("old tail only", 0, 32 * e + 13, 64 * e, vec![32]),
+            (
+                "unaligned append",
+                2 * e - 7,
+                4 * e + 11,
+                2 * e - 7,
+                vec![1],
+            ),
+            ("gap within old tail", e + 7, 3 * e + 11, e + 5, vec![1]),
+            ("sparse append", 5 * e + 7, 6 * e + 11, e + 5, vec![]),
+            (
+                "starts beyond aligned EOF",
+                2 * e + 1,
+                3 * e + 7,
+                2 * e,
+                vec![],
+            ),
+        ] {
+            assert_eq!(
+                partial_old_extents(offset, end, old_size).collect::<Vec<_>>(),
+                expected,
+                "{label}"
+            );
+        }
     }
 
     #[tokio::test]
