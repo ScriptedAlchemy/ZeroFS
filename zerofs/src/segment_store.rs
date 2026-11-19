@@ -1660,7 +1660,10 @@ mod tests {
             Err(slatedb::object_store::Error::NotFound { .. })
         ));
 
-        store.put_segment_multipart(&path, &wanted, None).await.unwrap();
+        store
+            .put_segment_multipart(&path, &wanted, None)
+            .await
+            .unwrap();
         assert_eq!(
             object_store
                 .get(&path)
