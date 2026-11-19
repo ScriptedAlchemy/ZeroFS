@@ -181,6 +181,8 @@ enum RuntimeProfile {
     SmallNasJournal,
     #[serde(rename = "raw-device-p3-candidate-v1")]
     RawDeviceP3Candidate,
+    #[serde(rename = "raw-device-p3-nas-fit-v1")]
+    RawDeviceP3NasFit,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -829,7 +831,7 @@ fn path_is_empty(path: &std::path::Path) -> bool {
 impl StoragePoolConfig {
     fn validate(&self, settings: &Settings) -> Result<()> {
         let authority = url::Url::parse(&settings.storage.url)?;
-        let p3 = if authority.scheme() == "raw+p3-v2" {
+        let p3 = if crate::storage_backend::raw::is_p3(authority.scheme()) {
             anyhow::ensure!(
                 settings.cache.disk_size_gb == 0.0,
                 "raw P3 requires cache.disk_size_gb=0 until persistent raw clean caching is supported"
@@ -875,6 +877,22 @@ impl StoragePoolConfig {
         }
         let mut ids = HashSet::new();
         let mut urls = HashSet::new();
+        let mut designations = HashSet::new();
+        let deployed_raw = p3
+            .as_ref()
+            .is_some_and(|b| b.kind != crate::storage_backend::raw::RawKind::SmallLoop);
+        anyhow::ensure!(
+            deployed_raw == settings.raw_device_p3_nas_fit(),
+            "large or physical raw devices require the raw-device-p3-nas-fit-v1 profile"
+        );
+        if deployed_raw {
+            anyhow::ensure!(
+                self.members.len() == 2
+                    && settings.writeback.as_ref().is_some_and(|w| w.enabled)
+                    && settings.wal.is_none(),
+                "raw NAS-fit requires two raw payloads, the P3 journal and no external WAL"
+            );
+        }
         let mut raw_pool = p3.as_ref().map(|binding| binding.pool);
         let mut account_connections =
             std::collections::HashMap::<(String, u16, String), usize>::new();
@@ -896,8 +914,22 @@ impl StoragePoolConfig {
             member.reserve_free_bytes()?;
             let url = url::Url::parse(&member.url)
                 .with_context(|| format!("invalid URL for pool member {}", member.id))?;
-            if url.scheme() == "raw+loop" {
+            if crate::storage_backend::raw::is_payload(url.scheme()) {
                 let binding = crate::storage_backend::raw::RawBinding::parse(&url)?;
+                anyhow::ensure!(
+                    p3.as_ref().map_or(
+                        binding.kind == crate::storage_backend::raw::RawKind::SmallLoop,
+                        |a| a.kind == binding.kind
+                    ),
+                    "mixed raw claim types are not supported"
+                );
+                if binding.kind == crate::storage_backend::raw::RawKind::Physical {
+                    anyhow::ensure!(
+                        binding.node == std::path::Path::new("/").join(&member.id)
+                            && designations.insert(binding.node.clone()),
+                        "duplicate or mismatched HDD designation"
+                    );
+                }
                 if p3.as_ref().is_some_and(|p3| p3.member == binding.member) {
                     anyhow::bail!("raw P3 and payload devices require different member UUIDs");
                 }
@@ -2354,7 +2386,8 @@ impl Settings {
     }
 
     pub(crate) fn raw_p3_authority(&self) -> bool {
-        url_scheme(&self.storage.url).is_some_and(|scheme| scheme.eq_ignore_ascii_case("raw+p3-v2"))
+        url_scheme(&self.storage.url)
+            .is_some_and(|scheme| crate::storage_backend::raw::is_p3(&scheme.to_ascii_lowercase()))
     }
 
     pub(crate) fn raw_device_p3_candidate(&self) -> bool {
@@ -2362,10 +2395,15 @@ impl Settings {
             == Some(RuntimeProfile::RawDeviceP3Candidate)
     }
 
+    pub(crate) fn raw_device_p3_nas_fit(&self) -> bool {
+        self.runtime.as_ref().and_then(|runtime| runtime.profile)
+            == Some(RuntimeProfile::RawDeviceP3NasFit)
+    }
+
     /// Data-plane tuning for the configured backend. SFTP publishes its own
     /// profile; every other backend runs on the defaults.
     pub(crate) fn store_profile(&self) -> Result<StoreProfile> {
-        if self.raw_device_p3_candidate() {
+        if self.raw_device_p3_candidate() || self.raw_device_p3_nas_fit() {
             return Ok(StoreProfile {
                 seal_threshold: Some(StoreProfile::RAW_CANDIDATE_SEAL_BYTES),
                 max_inflight_seals: Some(StoreProfile::RAW_CANDIDATE_INFLIGHT),

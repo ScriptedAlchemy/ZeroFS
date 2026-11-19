@@ -88,7 +88,7 @@ fn guard_local_metadata(
     store: Box<dyn ObjectStore>,
     fault: &MetadataFault,
 ) -> Box<dyn ObjectStore> {
-    if !matches!(url.scheme(), "file" | "raw+p3-v2") {
+    if url.scheme() != "file" && !raw::is_p3(url.scheme()) {
         return store;
     }
     #[cfg(test)]
@@ -152,8 +152,8 @@ pub(crate) async fn open_pool_storage(
     crate::storage_readiness::verify(settings)?;
     validate_directories(settings)?;
     let authority_url: url::Url = settings.storage.url.parse()?;
-    let (authority, catalog_source, raw_journal) = if authority_url.scheme() == "raw+p3-v2" {
-        let opened = raw::open_p3(raw::RawBinding::parse(&authority_url)?).await?;
+    let (authority, catalog_source, raw_journal) = if raw::is_p3(authority_url.scheme()) {
+        let opened = raw::open_p3(raw::RawBinding::parse(&authority_url)?, initialize).await?;
         let journal = if settings
             .writeback
             .as_ref()
@@ -211,7 +211,7 @@ pub(crate) async fn open_pool_storage(
         let mut members = Vec::with_capacity(config.members.len());
         for member in &config.members {
             let url: url::Url = member.url.parse()?;
-            if url.scheme() == "raw+loop" {
+            if raw::is_payload(url.scheme()) {
                 let binding = raw::RawBinding::parse(&url)?;
                 members.push(
                     raw::open_member(member, binding, settings.raw_device_p3_candidate()).await?,

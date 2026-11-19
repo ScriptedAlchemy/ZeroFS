@@ -59,6 +59,7 @@ enum MemoryPolicyProfile {
     SmallNasPackage,
     SmallNasJournal,
     RawDeviceP3Candidate,
+    RawDeviceP3NasFit,
 }
 
 struct MemoryPolicy {
@@ -99,6 +100,24 @@ impl MemoryPolicy {
                 ),
                 headroom_source: format!(
                     "baseline kernel/allocator input plus 1 GiB provisional companion and loop-backing allowance; {}",
+                    package_policy::EVIDENCE
+                ),
+            }
+        } else if settings.raw_device_p3_nas_fit() {
+            raw_policy::validate(settings, tiers.clean_cache_bytes, write_ack)
+                .with_context(|| format!("{} configuration rejected", raw_policy::NAS_FIT_NAME))?;
+            Self {
+                profile: MemoryPolicyProfile::RawDeviceP3NasFit,
+                residency_bytes: package_policy::RESIDENCY_BYTES
+                    + raw_policy::NAS_FIT_RESIDENCY_BYTES,
+                headroom_bytes: package_policy::HEADROOM_BYTES
+                    + raw_policy::NAS_FIT_COMPANION_BYTES,
+                residency_source: format!(
+                    "directory package baseline plus 1 GiB for bounded live indexes, redb caches and replay staging; {}",
+                    package_policy::EVIDENCE
+                ),
+                headroom_source: format!(
+                    "baseline kernel/allocator input plus 1.5 GiB app allowance; {}",
                     package_policy::EVIDENCE
                 ),
             }
@@ -168,6 +187,7 @@ impl MemoryPolicy {
             MemoryPolicyProfile::SmallNasPackage => "small-nas-package-v1",
             MemoryPolicyProfile::SmallNasJournal => "small-nas-journal-v1",
             MemoryPolicyProfile::RawDeviceP3Candidate => raw_policy::NAME,
+            MemoryPolicyProfile::RawDeviceP3NasFit => raw_policy::NAS_FIT_NAME,
         }
     }
 
@@ -175,6 +195,9 @@ impl MemoryPolicy {
         match self.profile {
             MemoryPolicyProfile::RawDeviceP3Candidate => {
                 "synthetic raw geometry candidate; end-to-end peak and event qualification pending"
+            }
+            MemoryPolicyProfile::RawDeviceP3NasFit => {
+                "bounded file-backed fixture or designated hardware geometry; hardware qualification pending"
             }
             MemoryPolicyProfile::Legacy { reason } => reason,
             MemoryPolicyProfile::SmallNasJournal => {
@@ -188,7 +211,7 @@ impl MemoryPolicy {
 
     fn direct_segment_bytes(&self) -> u64 {
         match self.profile {
-            MemoryPolicyProfile::RawDeviceP3Candidate => {
+            MemoryPolicyProfile::RawDeviceP3Candidate | MemoryPolicyProfile::RawDeviceP3NasFit => {
                 use crate::config::StoreProfile;
                 // A claim can carry the open lane past the threshold.
                 // Charge two allocation stages and the full volatile write
@@ -214,7 +237,9 @@ impl MemoryPolicy {
     fn headroom_label(&self) -> &'static str {
         match self.profile {
             MemoryPolicyProfile::Legacy { .. } => "companion/process reserve",
-            MemoryPolicyProfile::RawDeviceP3Candidate => "engine/companion headroom",
+            MemoryPolicyProfile::RawDeviceP3Candidate | MemoryPolicyProfile::RawDeviceP3NasFit => {
+                "engine/companion headroom"
+            }
             MemoryPolicyProfile::SmallNasPackage | MemoryPolicyProfile::SmallNasJournal => {
                 "engine kernel/allocator headroom"
             }
@@ -229,7 +254,8 @@ impl MemoryPolicy {
                 .context("startup memory policy reserves overflowed"),
             MemoryPolicyProfile::SmallNasPackage
             | MemoryPolicyProfile::SmallNasJournal
-            | MemoryPolicyProfile::RawDeviceP3Candidate => Ok(self.headroom_bytes),
+            | MemoryPolicyProfile::RawDeviceP3Candidate
+            | MemoryPolicyProfile::RawDeviceP3NasFit => Ok(self.headroom_bytes),
         }
     }
 
@@ -237,12 +263,23 @@ impl MemoryPolicy {
         match self.profile {
             MemoryPolicyProfile::Legacy { .. }
             | MemoryPolicyProfile::SmallNasJournal
-            | MemoryPolicyProfile::RawDeviceP3Candidate => None,
+            | MemoryPolicyProfile::RawDeviceP3Candidate
+            | MemoryPolicyProfile::RawDeviceP3NasFit => None,
             MemoryPolicyProfile::SmallNasPackage => Some(StoredStateQualification {
                 logical_bytes: package_policy::QUALIFIED_LOGICAL_BYTES,
                 regular_files: package_policy::QUALIFIED_REGULAR_FILES,
                 enforcement: "empirical_not_enforced",
             }),
+        }
+    }
+
+    fn included_companion_bytes(&self) -> u64 {
+        match self.profile {
+            MemoryPolicyProfile::RawDeviceP3Candidate => raw_policy::COMPANION_BYTES,
+            MemoryPolicyProfile::RawDeviceP3NasFit => raw_policy::NAS_FIT_COMPANION_BYTES,
+            // Legacy headroom mixes process and companion use without an
+            // independently identifiable companion allocation.
+            _ => 0,
         }
     }
 
@@ -257,8 +294,13 @@ impl MemoryPolicy {
         let companions = match self.profile {
             MemoryPolicyProfile::RawDeviceP3Candidate => format!(
                 "companion_allowance_bytes={} included in headroom; clean_cache_disk_bytes=0",
-                raw_policy::COMPANION_BYTES,
+                self.included_companion_bytes(),
             ),
+            MemoryPolicyProfile::RawDeviceP3NasFit => format!(
+                "companion_allowance_bytes={} included in headroom; clean_cache_disk_bytes=0; raw_backing=block or non-RAM file-backed loops; kernel file cache is reclaimable",
+                self.included_companion_bytes(),
+            ),
+            MemoryPolicyProfile::Legacy { .. } => "external_companions=mixed legacy reserve with no separately creditable companion allowance".into(),
             _ => "external_companions=excluded from measured engine reserves, subtract FUSE/smbd and file cache from container limit before runtime.memory_limit_gb".into(),
         };
         format!(
@@ -307,6 +349,7 @@ pub(crate) struct MemoryBudgetReceipt {
     pub(crate) required_bytes: u64,
     pub(crate) remaining_bytes: u64,
     pub(crate) rss_pressure_cap_bytes: u64,
+    pub(crate) included_companion_bytes: u64,
     pub(crate) accounting: String,
     pub(crate) stored_state_qualification: Option<StoredStateQualification>,
 }
@@ -326,18 +369,23 @@ fn validate_server_startup_with_limits(
     let tiers = StartupMemoryTiers::from_settings(settings, write_ack.volatile_memory_bytes)?;
     let policy = MemoryPolicy::from_settings(settings, tiers, write_ack)?;
     let configured = settings.runtime_memory_limit_bytes()?;
-    if settings.raw_device_p3_candidate() {
+    if settings.raw_device_p3_candidate() || settings.raw_device_p3_nas_fit() {
+        let name = policy.name();
         let dedicated = detected
             .dedicated
             .as_ref()
-            .context("raw-device-p3-candidate-v1 requires a dedicated cgroup-v2 memory.max")?;
-        if !(raw_policy::MIN_CGROUP_BYTES..=raw_policy::MAX_CGROUP_BYTES)
+            .with_context(|| format!("{name} requires a dedicated cgroup-v2 memory.max"))?;
+        if settings.raw_device_p3_nas_fit() {
+            if dedicated.hard_limit_bytes != 8 * GIB {
+                bail!("{name} requires cgroup memory.max of exactly 8 GiB");
+            }
+        } else if !(raw_policy::MIN_CGROUP_BYTES..=raw_policy::MAX_CGROUP_BYTES)
             .contains(&dedicated.hard_limit_bytes)
         {
-            bail!("raw-device-p3-candidate-v1 requires cgroup memory.max from 8 through 16 GiB");
+            bail!("{name} requires cgroup memory.max from 8 through 16 GiB");
         }
         if configured.is_some_and(|value| value < dedicated.hard_limit_bytes) {
-            bail!("raw-device-p3-candidate-v1 uses the dedicated cgroup limit as its envelope");
+            bail!("{name} uses the dedicated cgroup limit as its envelope");
         }
         let swap_path = dedicated.source.with_file_name("memory.swap.max");
         let swap = std::fs::read_to_string(&swap_path).with_context(|| {
@@ -347,7 +395,7 @@ fn validate_server_startup_with_limits(
             )
         })?;
         if swap.trim() != "0" {
-            bail!("raw-device-p3-candidate-v1 requires memory.swap.max = 0");
+            bail!("{name} requires memory.swap.max = 0");
         }
     }
     let Some(envelope) = select_memory_limit(detected, configured)? else {
@@ -407,7 +455,9 @@ fn validate_resolved_memory_budget(
     let accounting = policy.accounting(tiers, source);
     if required_bytes > hard_limit_bytes {
         let residency_label = match policy.profile {
-            MemoryPolicyProfile::RawDeviceP3Candidate => "provisional residency reserve",
+            MemoryPolicyProfile::RawDeviceP3Candidate | MemoryPolicyProfile::RawDeviceP3NasFit => {
+                "provisional residency reserve"
+            }
             _ => "observed-unmodeled reserve",
         };
         bail!(
@@ -434,6 +484,7 @@ fn validate_resolved_memory_budget(
         required_bytes,
         remaining_bytes: hard_limit_bytes - required_bytes,
         rss_pressure_cap_bytes,
+        included_companion_bytes: policy.included_companion_bytes(),
         accounting,
         stored_state_qualification: policy.qualification(),
     })

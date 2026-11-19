@@ -244,6 +244,11 @@ fn parse_transfer_jobs(value: &str) -> std::result::Result<usize, String> {
 
 #[derive(Subcommand)]
 pub enum PoolCommands {
+    /// Offline NAS-fit readiness, including held devices, original journal, and finite memory admission
+    VerifyRaw {
+        #[arg(short, long)]
+        config: PathBuf,
+    },
     /// Report live and retained-checkpoint affected paths without reading data disks
     Affected {
         #[arg(long)]

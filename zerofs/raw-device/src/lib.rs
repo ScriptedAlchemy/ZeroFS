@@ -186,6 +186,8 @@ pub enum Error {
     Io(io::Error),
     /// The append does not fit. Nothing was written.
     NoSpace { needed: u64, available: u64 },
+    /// A live-key insert exceeds the bounded in-memory index. Nothing was written.
+    IndexFull { limit: usize },
     /// The label binds the device to a different pool, member, or role.
     IdentityMismatch { expected: Identity, found: Identity },
     /// The label records a different device size than the caller supplied.
@@ -218,6 +220,9 @@ impl fmt::Display for Error {
             Self::Io(err) => write!(f, "device I/O error: {err}"),
             Self::NoSpace { needed, available } => {
                 write!(f, "no space: need {needed} bytes, {available} available")
+            }
+            Self::IndexFull { limit } => {
+                write!(f, "raw index holds its limit of {limit} live keys")
             }
             Self::IdentityMismatch { expected, found } => {
                 let mut fields = Vec::new();
@@ -282,7 +287,7 @@ impl From<Error> for io::Error {
     fn from(err: Error) -> Self {
         let kind = match &err {
             Error::Io(inner) => return io::Error::new(inner.kind(), err.to_string()),
-            Error::NoSpace { .. } => io::ErrorKind::StorageFull,
+            Error::NoSpace { .. } | Error::IndexFull { .. } => io::ErrorKind::StorageFull,
             Error::IdentityMismatch { .. }
             | Error::DeviceSizeMismatch { .. }
             | Error::NotProvisioned

@@ -68,12 +68,30 @@ mod probe {
 
     pub(super) fn run() -> Result<()> {
         let args: Vec<_> = std::env::args().skip(1).collect();
-        let [op, node, backing, pool, member, role, tail @ ..] = args.as_slice() else {
-            return Err("usage: zerofs-raw-device OP LOOP_NODE PRIVATE_TMPFS_INODE POOL_UUID MEMBER_UUID ROLE [KEY]".into());
+        let (op, claim, pool, member, role, tail, physical) = match args.as_slice() {
+            [mode, op, designation, pool, member, role, tail @ ..] if mode == "physical" => {
+                use zerofs_raw_device::claim::PhysicalRole;
+                let target: PhysicalRole = designation.parse()?;
+                match (target, op.as_str(), role.as_str(), tail) {
+                    (PhysicalRole::Nvme, "p3-v2-init-blank" | "p3-v2-inspect", "p3", [_])
+                    | (PhysicalRole::Hdd6 | PhysicalRole::Hdd18, "init-blank", "payload", []) => (),
+                    _ => return Err("physical operation and storage role must match the fixed designation".into()),
+                }
+                (op, Claim::physical(target)?, pool, member, role, tail, true)
+            }
+            [mode, op, node, backing, pool, member, role, tail @ ..] if mode == "fixture" => {
+                (op, Claim::allocated_fixture(Path::new(node), Path::new(backing))?, pool, member, role, tail, false)
+            }
+            [op, node, backing, pool, member, role, tail @ ..] if op != "physical" && op != "fixture" => {
+                (op, Claim::synthetic(Path::new(node), Path::new(backing))?, pool, member, role, tail, false)
+            }
+            _ => return Err("usage: [fixture] OP LOOP_NODE BACKING POOL_UUID MEMBER_UUID ROLE [ARGS], or physical OP DESIGNATION POOL_UUID MEMBER_UUID ROLE [LAYOUT_BYTES]".into()),
         };
         let pool_uuid = uuid(pool)?;
         let member_uuid = uuid(member)?;
-        let claim = Claim::synthetic(Path::new(node), Path::new(backing))?;
+        if member_uuid == pool_uuid {
+            return Err("pool and member UUIDs must be distinct".into());
+        }
         let (op, layout, tail) = if let Some(op) = op.strip_prefix("p3-") {
             let (plan, rest) = tail
                 .split_first()
@@ -82,13 +100,16 @@ mod probe {
                 .split(',')
                 .map(|s| {
                     s.parse::<u64>()?
-                        .checked_mul(1 << 20)
+                        .checked_mul(if physical { 1 } else { 1 << 20 })
                         .ok_or("P3 size overflow".into())
                 })
                 .collect::<Result<Vec<_>>>()?;
             let lengths = sizes
                 .try_into()
                 .map_err(|_| "expected six P3 region sizes")?;
+            if physical {
+                P3Layout::validate_nas_fit(claim.size, lengths)?;
+            }
             (op, Some(P3Layout::new(claim.size, lengths)?), rest)
         } else {
             (op.as_str(), None, tail)
@@ -155,6 +176,25 @@ mod probe {
         } else {
             RawStore::open(claim.device, claim.size, identity)?
         };
+        if op == "verify" && tail.is_empty() && role == Role::Data {
+            let reader = store.reader();
+            let mut output = io::BufWriter::new(io::stdout().lock());
+            for key in store.keys() {
+                let object = store.handle(key)?.ok_or("missing indexed object")?;
+                reader.read_ranges(&object, &[])?;
+                write!(output, "{} ", object.info.len)?;
+                for byte in object.info.sha256 {
+                    write!(output, "{byte:02x}")?;
+                }
+                write!(output, " ")?;
+                for byte in key {
+                    write!(output, "{byte:02x}")?;
+                }
+                writeln!(output)?;
+            }
+            output.flush()?;
+            return Ok(());
+        }
         if op == "pending" && tail.is_empty() {
             for (member, digest) in LandingJournal::new(store)?.pending_segments() {
                 println!("{:032x} {digest}", u128::from_be_bytes(member));

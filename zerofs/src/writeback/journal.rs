@@ -171,6 +171,18 @@ const REMOTE_RETRIES_KEY: &str = "remote_retries";
 const FENCE_CLASSIFICATION_VERSION_KEY: &str = "fence_classification_version";
 const FENCE_CLASSIFICATION_VERSION: u32 = 2;
 
+/// The large raw disk budget may hold many metadata-only mutations. Keep
+/// replay and overlay residency bounded separately from dirty payload bytes.
+pub(crate) const LARGE_RAW_MAX_PENDING_OPERATIONS: u64 = 8192;
+const DEFAULT_MAX_PENDING_OPERATIONS: u64 = 1 << 20;
+
+fn max_pending_operations(raw_capacity: Option<u64>) -> u64 {
+    match raw_capacity {
+        Some(capacity) if capacity > (256 << 20) => LARGE_RAW_MAX_PENDING_OPERATIONS,
+        _ => DEFAULT_MAX_PENDING_OPERATIONS,
+    }
+}
+
 pub struct Journal {
     root: PathBuf,
     root_dir: Option<AnchoredDir>,
@@ -1037,6 +1049,16 @@ impl Journal {
                 .create_with_backend(crate::raw_database::RawDatabase(Arc::clone(&region)))
         })?;
         initialize_or_validate_identity(&database, &expected_identity, initialize, true)?;
+        {
+            let read = database.begin_read()?;
+            let count = read.open_table(MUTATIONS)?.len()?;
+            let limit = max_pending_operations(Some(region.capacity()));
+            if count > limit {
+                return Err(operator_required(anyhow!(
+                    "raw journal holds {count} mutations, above its bounded replay limit of {limit}"
+                )));
+            }
+        }
         normalize_mutation_fences(&database, &expected_identity)?;
         let journal = Self {
             root,
@@ -1063,6 +1085,10 @@ impl Journal {
         Ok(journal)
     }
 
+    pub(crate) fn max_pending_operations(&self) -> u64 {
+        max_pending_operations(self.raw_region.as_ref().map(|region| region.capacity()))
+    }
+
     pub(crate) fn is_raw(&self) -> bool {
         self.raw_region.is_some()
     }
@@ -1072,8 +1098,15 @@ impl Journal {
         // Match the allocator counts to one on-disk layout. A write
         // transaction excludes writers while we inspect these read-only stats.
         let transaction = self.database.begin_write()?;
-        let stats = transaction.stats()?;
         let len = region.len()?;
+        let unallocated = region.resize_ceiling().saturating_sub(len);
+        let reserve = region.capacity() - region.resize_ceiling();
+        // A large virgin region can fund the configured dirty budget without
+        // counting any reusable pages. Avoid a redb tree walk on every PUT.
+        if region.capacity() > 256 << 20 && unallocated >= region.resize_ceiling() / 4 {
+            return Ok(unallocated + reserve);
+        }
+        let stats = transaction.stats()?;
         let mut bytes = [0; RedbHeader::LEN];
         region.read(0, &mut bytes)?;
         let header = RedbHeader::parse(&bytes).context("invalid raw writeback redb header")?;
@@ -1083,8 +1116,6 @@ impl Journal {
             "raw allocator page size mismatch"
         );
 
-        let unallocated = region.resize_ceiling().saturating_sub(len);
-        let reserve = region.capacity() - region.resize_ceiling();
         // Free allocator pages exclude live and snapshot-pinned pages. Use
         // half of the free arena as an estimate to allow for buddy fragmentation
         // and copy-on-write work. The resize ceiling is the physical limit.
@@ -1264,6 +1295,16 @@ impl Journal {
                 .wait(released)
                 .unwrap_or_else(|error| error.into_inner());
         }
+    }
+
+    pub(crate) fn startup_cursor(&self) -> Result<(JournalIdentity, Uuid, Sequence)> {
+        let tx = self.database.begin_read()?;
+        let meta = tx.open_table(META)?;
+        Ok((
+            read_required(&meta, IDENTITY_KEY)?,
+            read_required(&meta, INCARNATION_KEY)?,
+            read_required(&meta, LOCAL_SEQ_KEY)?,
+        ))
     }
 
     pub(crate) fn progress(&self) -> Result<JournalProgress> {

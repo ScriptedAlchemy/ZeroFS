@@ -1,11 +1,12 @@
-//! Linux-only qualification claim. An ordinary drive cannot pass this gate.
-//! The operator supplies the private tmpfs backing inode of their synthetic
-//! loop device independently of the device node. All object I/O uses the node.
+//! Linux-only exclusive claims for trial disks and synthetic qualification loops.
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+
+mod physical;
+pub use physical::PhysicalRole;
 
 #[repr(C)]
 struct LoopInfo {
@@ -43,11 +44,23 @@ fn checked(rc: i32) -> io::Result<()> {
 pub struct Claim {
     pub device: File,
     pub size: u64,
-    _backing_lock: File,
+    _backing_lock: Option<File>,
 }
+
+#[path = "claim/allocated_fixture.rs"]
+mod allocated_fixture;
 
 impl Claim {
     pub fn synthetic(node: &Path, backing: &Path) -> io::Result<Self> {
+        Self::loop_device(node, backing, false)
+    }
+
+    /// A separately selected, fully allocated ext4-backed software fixture.
+    pub fn allocated_fixture(node: &Path, backing: &Path) -> io::Result<Self> {
+        Self::loop_device(node, backing, true)
+    }
+
+    fn loop_device(node: &Path, backing: &Path, allocated: bool) -> io::Result<Self> {
         let backing_lock = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -70,10 +83,18 @@ impl Claim {
         )?;
         let mut fs_type = std::mem::MaybeUninit::<libc::statfs>::uninit();
         checked(unsafe { libc::fstatfs(backing_lock.as_raw_fd(), fs_type.as_mut_ptr()) })?;
-        require(
-            unsafe { fs_type.assume_init() }.f_type == libc::TMPFS_MAGIC,
-            "synthetic backing inode must be on tmpfs",
-        )?;
+        let fs_type = unsafe { fs_type.assume_init() }.f_type;
+        if allocated {
+            require(
+                fs_type == libc::EXT4_SUPER_MAGIC,
+                "large fixture backing must be on ext4",
+            )?;
+        } else {
+            require(
+                fs_type == libc::TMPFS_MAGIC,
+                "synthetic backing inode must be on tmpfs",
+            )?;
+        }
         // LOCK_EX | LOCK_NB serializes our own callers, including loop aliases.
         checked(unsafe { libc::flock(backing_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) })?;
 
@@ -116,8 +137,13 @@ impl Claim {
         )?;
         #[cfg(target_pointer_width = "64")]
         checked(unsafe { libc::ioctl(device.as_raw_fd(), 0x80081272, &mut size) })?; // BLKGETSIZE64
+        let valid_size = if allocated {
+            matches!(size, 68_719_476_736 | 12_884_901_888 | 17_179_869_184)
+        } else {
+            (1 << 20..=256 << 20).contains(&size)
+        };
         require(
-            size == meta.len() && (1 << 20..=256 << 20).contains(&size) && size % 4096 == 0,
+            size == meta.len() && valid_size && size % 4096 == 0,
             "unexpected qualification geometry",
         )?;
         require(
@@ -131,6 +157,9 @@ impl Claim {
                 "device has partitions",
             )?;
         }
+        if allocated {
+            allocated_fixture::require_allocated(&backing_lock, size)?;
+        }
         let id = format!("{major}:{minor}");
         require(
             !fs::read_to_string("/proc/self/mountinfo")?
@@ -141,7 +170,7 @@ impl Claim {
         Ok(Self {
             device,
             size,
-            _backing_lock: backing_lock,
+            _backing_lock: Some(backing_lock),
         })
     }
 }

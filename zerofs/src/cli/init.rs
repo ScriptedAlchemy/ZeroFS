@@ -74,7 +74,7 @@ async fn resolve_startup_bucket_identity(
         .as_ref()
         .and_then(|prometheus| prometheus.benchmark_authority.as_ref())
         .is_some();
-    if authority_enabled {
+    if authority_enabled || settings.raw_device_p3_nas_fit() {
         bucket_identity::BucketIdentity::load(object_store, db_path).await
     } else {
         bucket_identity::BucketIdentity::get_or_create(object_store, db_path).await
@@ -244,7 +244,7 @@ impl StartupContext {
                 &db_path,
                 &password,
                 name_mode,
-                db_mode.is_read_only(),
+                db_mode.is_read_only() || settings.raw_device_p3_nas_fit(),
             )
             .await
             .context("Failed to load or initialize encryption key")?;
@@ -1339,6 +1339,45 @@ pub async fn initialize_filesystem(
             .await
         }
     }
+}
+
+/// Initialize the bucket, wrapped key and writeback identity once while pool
+/// init holds all three exclusive claims. A partial init requires recovery.
+pub(super) async fn raw_pool_journal(
+    settings: &Settings,
+    pool: &crate::pool_object_store::PoolObjectStore,
+    path: &Path,
+    region: zerofs_raw_device::journal_region::TransactionRegion,
+    initialize: bool,
+) -> Result<crate::writeback::journal::Journal> {
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(pool.clone());
+    let identity = if initialize {
+        anyhow::ensure!(
+            region.is_empty()?,
+            "refusing to initialize an existing journal"
+        );
+        let bucket = bucket_identity::BucketIdentity::get_or_create(&store, path.as_ref()).await?;
+        let key = key_management::load_or_init_encryption_key_with_mode(
+            &store,
+            path,
+            &settings.storage.encryption_password,
+            settings.name_mode(),
+            false,
+        )
+        .await?;
+        writeback_journal_identity(settings, &bucket, path.as_ref(), &key)?
+    } else {
+        anyhow::ensure!(!region.is_empty()?, "original raw journal is missing");
+        load_existing_writeback_identity(settings, &store, path.as_ref()).await?
+    };
+    let writeback = settings
+        .writeback_settings(crate::writeback::config::WritebackAccessMode::ReadWrite)?
+        .context("raw journal settings are required")?;
+    let region = crate::writeback::bootstrap::apply_raw_budget(region, &writeback)?;
+    tokio::task::spawn_blocking(move || {
+        crate::writeback::journal::Journal::open_raw(region, identity)
+    })
+    .await?
 }
 
 pub(crate) async fn load_existing_writeback_identity(

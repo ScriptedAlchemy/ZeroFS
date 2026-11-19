@@ -2445,6 +2445,7 @@ mod tests {
             required_bytes: 88 * gib,
             remaining_bytes: 8 * gib,
             rss_pressure_cap_bytes: validated_service_cap,
+            included_companion_bytes: 0,
             accounting: "memory_policy=legacy reason=server test fixture".into(),
             stored_state_qualification: None,
         };

@@ -21,6 +21,9 @@ const SCAN_CHUNK: usize = 1 << 20;
 const COALESCE_LIMIT: u64 = 256 << 10;
 /// Read size for verified range reads, which hash the whole payload.
 const VERIFY_CHUNK: u64 = 1 << 20;
+/// Bounds hash buckets and owned key bytes independently of device capacity.
+/// A 256 MiB device cannot hit this limit, even with header-only records.
+const MAX_INDEX_KEYS: usize = 65_536;
 
 #[derive(Debug, Clone, Copy)]
 struct Entry {
@@ -222,6 +225,9 @@ impl RawStore {
                 .checked_add(header.span())
                 .filter(|end| *end <= label.durable_tail)
                 .ok_or_else(|| corrupt(offset, "record extends past the durable tail"))?;
+            if header.kind == Kind::Put {
+                reserve_index(&mut index, &header.key)?;
+            }
             apply(&mut index, offset, header);
             offset = end;
             seq += 1;
@@ -265,6 +271,7 @@ impl RawStore {
             modified_unix_nanos: now_unix_nanos(),
         };
         let span = self.reserve(&header)?;
+        reserve_index(&mut self.index, key)?;
         let at = self.tail;
         let encoded = header.encode(&self.label.nonce);
         let written = self.write_record(at, &encoded, value, span);
@@ -516,6 +523,19 @@ fn write_checkpoint(file: &Region, label: &Label) -> io::Result<()> {
         file.write_all_at(&label.encode(slot)[..], slot * BLOCK_SIZE)?;
         file.sync_data()?;
     }
+    Ok(())
+}
+
+fn reserve_index(index: &mut HashMap<Vec<u8>, Entry>, key: &[u8]) -> Result<()> {
+    if index.contains_key(key) {
+        return Ok(());
+    }
+    if index.len() >= MAX_INDEX_KEYS {
+        return Err(Error::IndexFull {
+            limit: MAX_INDEX_KEYS,
+        });
+    }
+    index.try_reserve(1).map_err(io::Error::other)?;
     Ok(())
 }
 

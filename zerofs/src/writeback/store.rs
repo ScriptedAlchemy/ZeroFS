@@ -172,8 +172,7 @@ impl WritebackObjectStore {
         if settings.memory_bytes == 0 {
             anyhow::bail!("writeback requires a positive independent dirty RAM budget");
         }
-        let snapshot = journal.snapshot()?;
-        let database_prefix = snapshot.identity.database_prefix.clone();
+        let (identity, incarnation, local_seq) = journal.startup_cursor()?;
         let (space, ssd) = match owners {
             Some((space, ssd)) => (space, ssd),
             None => {
@@ -182,7 +181,7 @@ impl WritebackObjectStore {
                 let pending = journal.pending_ssd_reservations()?;
                 let ssd = Arc::new(SsdAdmission::recover(
                     settings.disk_bytes,
-                    1 << 20,
+                    journal.max_pending_operations(),
                     settings.high_watermark_percent,
                     settings.resume_percent,
                     settings.min_free_bytes,
@@ -242,9 +241,9 @@ impl WritebackObjectStore {
                 space_refresher: SpaceRefresher::start(Arc::clone(&ssd), Arc::clone(&space)),
                 journaler,
                 remote,
-                database_prefix,
-                incarnation: snapshot.incarnation,
-                next_sequence: AtomicU64::new(snapshot.local_seq),
+                database_prefix: identity.database_prefix,
+                incarnation,
+                next_sequence: AtomicU64::new(local_seq),
                 key_locks: (0..KEY_LOCK_SHARDS)
                     .map(|_| Arc::new(Mutex::new(())))
                     .collect(),

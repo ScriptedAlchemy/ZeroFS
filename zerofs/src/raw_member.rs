@@ -137,7 +137,9 @@ impl RawMemberError {
     fn kind(&self) -> io::ErrorKind {
         use zerofs_raw_device::Error as Raw;
         match self {
-            Self::NoSpace { .. } | Self::Device(Raw::NoSpace { .. }) => io::ErrorKind::StorageFull,
+            Self::NoSpace { .. } | Self::Device(Raw::NoSpace { .. } | Raw::IndexFull { .. }) => {
+                io::ErrorKind::StorageFull
+            }
             Self::InvalidKey(_) | Self::TooLarge { .. } => io::ErrorKind::InvalidInput,
             Self::Unsupported(_) => io::ErrorKind::Unsupported,
             Self::Poisoned | Self::LockPoisoned => io::ErrorKind::Other,
@@ -207,6 +209,7 @@ impl RawCapacity {
 /// An [`ObjectStore`] over one raw member. Clones share the store.
 #[derive(Clone)]
 pub struct RawMemberStore {
+    pub(crate) fixture_put_delay: std::time::Duration,
     inner: Arc<Inner>,
 }
 
@@ -255,6 +258,7 @@ impl RawMemberStore {
                     zerofs_raw_device::Error::InvalidArgument("reserve overflows"),
                 ))?;
         Ok(Self {
+            fixture_put_delay: std::time::Duration::ZERO,
             inner: Arc::new(Inner {
                 reader: store.reader(),
                 identity: store.identity(),
@@ -618,6 +622,9 @@ impl ObjectStore for RawMemberStore {
     ) -> Result<PutResult> {
         reject_unstored(opts.attributes.is_empty(), opts.tags.encoded().is_empty())?;
         let location = location.clone();
+        if !self.fixture_put_delay.is_zero() {
+            tokio::time::sleep(self.fixture_put_delay).await;
+        }
         self.blocking(move |inner| inner.put(&location, payload, opts.mode))
             .await
     }
