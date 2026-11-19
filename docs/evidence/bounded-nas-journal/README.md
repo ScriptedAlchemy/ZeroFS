@@ -65,3 +65,17 @@ Build on Linux from the engine source above with the matching WebUI dist and the
 For the normal-profile microbenchmark use `ZEROFS_BENCH_DIR` set to the canonical absolute private scratch path, `ZEROFS_BENCH_TIER_TOTAL_MIB=64`, `ZEROFS_BENCH_TIER_PAYLOAD_KIB=1024`, `ZEROFS_BENCH_TIER_WRITERS=2`, `ZEROFS_BENCH_TIER_READERS=2`, and `ZEROFS_BENCH_LOCAL_CONCURRENCY=1`. Run `cargo test --locked --no-default-features --features webui --lib writeback::tier_bench::bench_writeback_local_tier_read_write -- --exact --ignored --nocapture`.
 
 Removed the verified owned native root `/var/tmp/zerofs-nas-journal.1XHScyY3`, with its compiler outputs, Cargo download cache, staged protobuf tools, extracted WebUI, fixture scratch, and unredacted logs. All fixture containers and their tmpfs mounts were removed. The SPDK tag, exact build history and six attributable reclaimable cache records were removed. All 734 unrelated builder records remained. The retained artifacts are this local Git worktree, its committed sources, and these sanitized receipts. NAS actions, release and pin changes were zero. [Exact cache IDs](cache-cleanup.json)
+
+## Physical NAS file copies on November 19, 2026 UTC
+
+A Mac Studio copied incompressible files over wired 10 GbE to the N5 Air running engine `560eaae7` in app release `fuse-trial-20261119.2`. The disposable trial used a 256 MiB volatile file-write limit, a 512 MiB persistent Crucial P3 journal and two HDD members. The app had an eight-CPU quota. Native macOS SMB copy timings include the final fsync and close. A fresh SMB session with client data caching disabled verified each complete file by SHA-256. Rates are decimal MB/s from individual runs. Later engine changes require their own measurements.
+
+| Native SMB file size | SSD-backed FLUSH | RAM-only SMB FLUSH |
+|---|---:|---:|
+| 512 MiB | 201.8 MB/s | 201.8 MB/s |
+| 2 GiB | 142.9 MB/s | — |
+| 8 GiB | 89.7 MB/s | — |
+
+For the native 512 MiB copy, SSD-backed FLUSH measured 192.2 MB/s with four CPUs. The earlier direct-to-HDD profile on engine `27e72993` measured 70.9 MB/s at the same four-CPU limit. With eight outstanding requests and eight CPUs, signed SMB measured 428.4 MB/s and NFSv3 measured 227.9 MB/s through flush and close on 512 MiB files. Authenticated NVMe/TCP measured 7.80 MB/s through FLUSH over an 8 MiB block window with 128 KiB requests and per-write synchronization. The initiator restored and reverified the original zero window.
+
+The Studio measured 9.406 Gb/s on a single TCP stream. In the 1 GiB queued SMB test, WRITE acknowledged the first 768 MiB in 1.681 s and the final 256 MiB in 2.667 s, followed by 1.597 s for FLUSH. Both HDDs recorded writes during these intervals. The app owner restored SSD-backed FLUSH after the RAM-only comparison and verified the running trial. [Physical trial report](https://github.com/ScriptedAlchemy/truenas-storage-union/blob/1847540923023fc82829c99717fd5abb21a19b1d/docs/evidence/n5-zerofs-tiered-20261119/README.md) · [Machine-readable measurements](https://github.com/ScriptedAlchemy/truenas-storage-union/blob/1847540923023fc82829c99717fd5abb21a19b1d/docs/evidence/n5-zerofs-tiered-20261119/measurements.json) · [App release code](https://github.com/ScriptedAlchemy/truenas-storage-union/commit/2904181)
