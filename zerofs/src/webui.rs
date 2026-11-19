@@ -2064,6 +2064,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_in_place_commit_does_not_require_namespace_mutation_access() {
+        use crate::fs::types::SetMode;
+
+        // An existing writable file remains writable in a non-writable parent,
+        // or in a sticky directory where this identity cannot remove it.
+        for parent_mode in [0o555, 0o1777] {
+            let (filesystem, app, parent, file) = upload_private_source_fixture().await;
+            let root = AuthContext::default();
+            let root_creds = Credentials::from_auth_context(&root);
+            for (inode, mode) in [(parent, parent_mode), (file, 0o666)] {
+                filesystem
+                    .setattr(
+                        &root_creds,
+                        inode,
+                        &SetAttributes {
+                            mode: SetMode::Set(mode),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            let payload = b"replacement contents";
+            let (status, body) = upload_request(
+                &app,
+                "PUT",
+                "/api/v1/upload/private/secret?offset=0",
+                payload.to_vec(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "parent={parent_mode:o}: {body}");
+
+            let auth = AuthContext {
+                uid: 1000,
+                gid: 1000,
+                gid_known: true,
+                gids: Vec::new(),
+                groups_complete: true,
+            };
+            assert!(
+                matches!(
+                    filesystem
+                        .rename(&auth, parent, b"secret", parent, b"secret")
+                        .await,
+                    Err(FsError::PermissionDenied | FsError::OperationNotPermitted)
+                ),
+                "ordinary same-name rename must retain namespace authorization"
+            );
+            let mut commit = serde_json::json!({
+                "size": payload.len(),
+                "sha256": sha256_hex(payload),
+                "publish_to": "/private/published",
+            });
+            let (status, body) = upload_request(
+                &app,
+                "POST",
+                "/api/v1/upload/private/secret/commit",
+                serde_json::to_vec(&commit).unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert_eq!(
+                filesystem.lookup(&root_creds, parent, b"published").await,
+                Err(FsError::NotFound)
+            );
+
+            commit.as_object_mut().unwrap().remove("publish_to");
+            let (status, body) = upload_request(
+                &app,
+                "POST",
+                "/api/v1/upload/private/secret/commit",
+                serde_json::to_vec(&commit).unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "parent={parent_mode:o}: {body}");
+            assert_eq!(body["verified"], true);
+            assert_eq!(body["sha256"], sha256_hex(payload));
+            assert_eq!(
+                filesystem.lookup(&root_creds, parent, b"secret").await,
+                Ok(file)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_in_place_commit_requires_parent_search_and_file_read() {
+        use crate::fs::types::SetMode;
+
+        for (parent_mode, file_mode) in [(0o700, 0o666), (0o555, 0o222)] {
+            let (filesystem, app, parent, file) = upload_private_source_fixture().await;
+            let creds = Credentials::from_auth_context(&AuthContext::default());
+            for (inode, mode) in [(parent, parent_mode), (file, file_mode)] {
+                filesystem
+                    .setattr(
+                        &creds,
+                        inode,
+                        &SetAttributes {
+                            mode: SetMode::Set(mode),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            let commit = serde_json::json!({
+                "size": b"private payload".len(),
+                "sha256": sha256_hex(b"private payload"),
+            });
+            let (status, body) = upload_request(
+                &app,
+                "POST",
+                "/api/v1/upload/private/secret/commit",
+                serde_json::to_vec(&commit).unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(
+                body.get("sha256").is_none(),
+                "denied contents must not be hashed"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn known_storage_pressure_returns_retryable_upload_response_before_path_work() {
         let (writeback, _temp) = writeback_with_min_free(u64::MAX).await;
         let error = upload_writeback_preflight(Some(&writeback))

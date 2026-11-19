@@ -633,14 +633,23 @@ impl ZeroFS {
             return Err(FsError::StaleHandle);
         }
 
-        check_access(&from_dir, &creds, AccessMode::Write)?;
+        // A verification-only upload commit reads this exact entry without
+        // changing its name. It needs parent search and file read access,
+        // not authority to remove the entry. Ordinary same-name renames,
+        // hard-link aliases and every actual publication retain the normal
+        // write and sticky-directory checks.
+        let verify_in_place = verification.is_some() && same_entry && from_name == to_name;
+        if !verify_in_place {
+            check_access(&from_dir, &creds, AccessMode::Write)?;
+        }
         check_access(&from_dir, &creds, AccessMode::Execute)?;
         if let Some(ref to_dir) = to_dir {
             check_access(to_dir, &creds, AccessMode::Write)?;
             check_access(to_dir, &creds, AccessMode::Execute)?;
         }
-
-        check_sticky_bit_delete(&from_dir, &source_inode, &creds)?;
+        if !verify_in_place {
+            check_sticky_bit_delete(&from_dir, &source_inode, &creds)?;
+        }
 
         // POSIX: Moving directories in sticky directories requires ownership of the moved directory
         if from_dirid != to_dirid
