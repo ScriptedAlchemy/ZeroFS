@@ -101,7 +101,7 @@ jobs:
           elif [ "${{ matrix.test }}" = "fuse" ]; then
             sudo apt-get install -y fuse3
           elif [ "${{ matrix.test }}" = "zfs-on-zerofs" ]; then
-            sudo apt-get install -y nbd-client zfsutils-linux wget pigz pixz parallel
+            sudo apt-get install -y nbd-client zfsutils-linux pigz pixz parallel
             # The runner's NBD module is not guaranteed to be loaded already.
             sudo modprobe nbd
             test -b "$ZEROFS_CI_NBD_DEVICE"
@@ -150,6 +150,11 @@ jobs:
           elif [ "${{ matrix.test }}" = "nfs-kernel-compile" ]; then
             mc mb myminio/pgo-nfs-test
           fi
+
+      - name: Fetch Linux profiling fixture
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/ci/fetch-linux-source.py" \
+            --version 7.2-rc1 --output "$RUNNER_TEMP/linux-7.2-rc1.tar.gz"
 
       - name: Run profiling workloads
         env:
@@ -202,7 +207,7 @@ jobs:
             sudo mkdir -p /mnt/zerofs
             sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,cache=mmap,access=user 127.0.0.1 /mnt/zerofs
             cd /mnt/zerofs
-            wget -q https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/snapshot/linux-7.2-rc1.tar.gz
+            cp "$RUNNER_TEMP/linux-7.2-rc1.tar.gz" .
             tar -xf linux-7.2-rc1.tar.gz
             cd linux-7.2-rc1
             make tinyconfig
@@ -258,7 +263,7 @@ jobs:
               sleep 0.5
             done
             cd /mnt/zerofs
-            wget -q https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/snapshot/linux-7.2-rc1.tar.gz
+            cp "$RUNNER_TEMP/linux-7.2-rc1.tar.gz" .
             tar -xf linux-7.2-rc1.tar.gz
             cd linux-7.2-rc1
             make tinyconfig
@@ -325,7 +330,7 @@ jobs:
             sudo zfs create testpool/data
             sudo zfs set mountpoint=/mnt/zfsdata testpool/data
             cd /mnt/zfsdata
-            sudo wget -q https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/snapshot/linux-7.2-rc1.tar.gz
+            sudo cp "$RUNNER_TEMP/linux-7.2-rc1.tar.gz" .
             sudo tar -xf linux-7.2-rc1.tar.gz
             sudo zfs snapshot testpool/data@snapshot1
             kill -TERM $ZEROFS_PID || true
@@ -373,8 +378,7 @@ jobs:
             KERNEL_SOURCE=$(mktemp -d /tmp/zerofs-pgo-kernel.XXXXXX)
             cd "$KERNEL_SOURCE"
             echo "Preparing Linux sources on the runner's local disk"
-            wget -q https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/snapshot/linux-7.2-rc1.tar.gz
-            tar -xf linux-7.2-rc1.tar.gz
+            tar -xf "$RUNNER_TEMP/linux-7.2-rc1.tar.gz"
             cd linux-7.2-rc1
             echo "Compiling Linux with all build output on ZeroFS NFS"
             mkdir /mnt/zerofs/linux-build
@@ -654,6 +658,12 @@ jobs:
           mc alias set myminio http://localhost:9000 minioadmin minioadmin
           mc mb myminio/bolt-profile
 
+      - name: Fetch Linux BOLT fixture
+        if: matrix.bolt
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/ci/fetch-linux-source.py" \
+            --version 7.2-rc1 --output "$RUNNER_TEMP/linux-7.2-rc1.tar.gz"
+
       - name: Collect BOLT profile on PGO binary
         if: matrix.bolt
         run: |
@@ -707,7 +717,7 @@ jobs:
           done
 
           cd /mnt/zerofs
-          wget -q https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/snapshot/linux-7.2-rc1.tar.gz
+          cp "$RUNNER_TEMP/linux-7.2-rc1.tar.gz" .
           tar -xf linux-7.2-rc1.tar.gz
           cd linux-7.2-rc1
           make tinyconfig

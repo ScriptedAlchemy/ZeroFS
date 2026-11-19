@@ -2,9 +2,11 @@
 
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import gzip
+import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import io
+import lzma
 import os
 from pathlib import Path
 import re
@@ -93,6 +95,29 @@ class LinuxSourceDownloadTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, serve([(200, valid[:-8]), (200, valid)]) as (url, requests):
             output = Path(directory) / "linux.tar.gz"
             self.fetch(output, [url])
+            self.assertEqual(output.read_bytes(), valid)
+            self.assertEqual(len(requests), 2)
+
+    def test_stable_xz_archive_retries_a_truncated_download(self):
+        version = "6.18"
+        valid = lzma.compress(gzip.decompress(archive_bytes(prefix=f"linux-{version}")))
+        with tempfile.TemporaryDirectory() as directory, serve([(200, valid[:-8]), (200, valid)]) as (url, requests):
+            output = Path(directory) / "linux.tar"
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                FETCH.fetch_archive(version, output, urls=[url], backoff=0)
+            self.assertEqual(output.read_bytes(), valid)
+            self.assertEqual(len(requests), 2)
+
+    def test_digest_mismatch_keeps_the_existing_archive(self):
+        valid = archive_bytes()
+        with tempfile.TemporaryDirectory() as directory, serve([(200, valid)]) as (url, requests):
+            output = Path(directory) / "linux.tar.gz"
+            output.write_bytes(b"previous fixture")
+            with self.assertRaisesRegex(RuntimeError, "could not fetch a valid"):
+                self.fetch(output, [url], sha256="0" * 64, attempts=1)
+            self.assertEqual(output.read_bytes(), b"previous fixture")
+            self.assertEqual(list(Path(directory).iterdir()), [output])
+            self.fetch(output, [url], sha256=hashlib.sha256(valid).hexdigest(), attempts=1)
             self.assertEqual(output.read_bytes(), valid)
             self.assertEqual(len(requests), 2)
 
