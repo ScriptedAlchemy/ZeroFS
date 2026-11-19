@@ -299,8 +299,10 @@ export function WriteAckSettings() {
               : "Changes take effect after restart."}
           </p>
           <p className="text-muted-foreground">
+            Materialized confirms that the filesystem has applied the write; local journaling may still be pending.
             Volatile memory can acknowledge an ordinary WRITE while its data is still in RAM. A crash can lose those
-            writes. Explicit fsync and protocol durability requests still wait for their configured durability boundary.
+            writes. When the RAM limit is reached, new writes wait for space. Explicit fsync and protocol durability
+            requests still wait for their configured durability boundary.
           </p>
           {load.status.editable && secure ? (
             <SettingsForm

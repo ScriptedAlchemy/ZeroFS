@@ -9,6 +9,58 @@ On the Storage page, **Active** describes the running engine. An administrator c
 
 HDD drain continues asynchronously. A full journal or unavailable destination can delay durability through backpressure. For the bounded journal profile the editor accepts 16–256 whole MiB and 1–2048 operations. Startup memory admission charges two ownership stages. Throughput qualification uses 256 MiB and 2048 operations.
 
+## What the acknowledgement modes can accelerate
+
+`Materialized` is the default filesystem policy. It means that the filesystem
+transaction has been applied; it does not by itself mean that every ordinary
+write has reached the NVMe journal. The Storage editor selects this policy or
+`Volatile memory`. It does not currently expose a third filesystem policy that
+acknowledges each write only after local SSD durability.
+
+The filesystem RAM queue and the object writeback queue are separate. A volatile
+filesystem write must pass admission, reserve both byte and operation capacity,
+and prepare its ordered update before it can respond. Contiguous appends can
+share a pending inode update, while conflicting overwrites may wait for earlier
+materialization. When the RAM queue fills, new writes wait for materialization
+to release capacity. They do not bypass it through a separate direct-to-NVMe
+acknowledgement path. Sustained throughput therefore follows the drain rate once
+the bounded burst capacity is exhausted.
+
+With writeback enabled, the filesystem resolves client durability requests to
+the local journal. Without it, they wait for the remote backend. The bounded NAS
+profile uses object writeback memory acknowledgement, but that does not weaken
+fsync, NFS stable writes or COMMIT, or block FLUSH/FUA. A fast transfer followed
+by a long final flush means that durability work remains after the ordinary
+write responses; measure both phases when comparing policies.
+
+### Packaged NVMe/TCP target
+
+The target is maintained in the separate TrueNAS app repository. The fixture's
+[pinned AIO patch](https://github.com/ScriptedAlchemy/truenas-storage-union/blob/08d4f95067b0445e2193dd26937fc3801819b660/deploy/truenas-zerofs/nvme-tcp/spdk-zerofs-aio.patch)
+calls `fsync` synchronously from the AIO completion loop for **every** successful
+block write. This includes ordinary writes, because the patch enforces FUA by
+syncing all writes. Enabling filesystem RAM acknowledgement cannot remove that
+extra target barrier. Increasing queue depth also does not remove the serial
+fsync calls from the completion loop.
+
+The [pinned launcher](https://github.com/ScriptedAlchemy/truenas-storage-union/blob/08d4f95067b0445e2193dd26937fc3801819b660/deploy/truenas-zerofs/nvme-tcp/target.py)
+starts one SPDK reactor without interrupt mode. SPDK's
+[TCP target](https://spdk.io/doc/nvmf_interrupt_mode.html) and
+[AIO backend at the pinned revision](https://github.com/spdk/spdk/blob/0bbb7fe4dccfb31e8d446da8822360704949d1e9/module/bdev/aio/bdev_aio.c)
+support interrupt-driven completion. Adding `--interrupt-mode` to the app
+launcher is a separate packaging change to qualify for lower idle CPU use; it
+does not change write durability or eliminate synchronous flush latency.
+Removing the per-write sync requires an explicit cache policy and a verified
+FUA path before ordinary completions can safely acknowledge volatile data.
+
+For a protocol comparison, retain the engine and app revisions, active
+acknowledgement settings, effective CPU quota, target polling mode, I/O size,
+queue depth, transfer time, final flush time, CPU time and throttling counters.
+Compare the same workload with one variable changed. An idle polling reactor
+can consume CPU budget shared with encryption, compression and filesystem work;
+a larger quota can reduce that contention while leaving the per-write sync
+bottleneck intact.
+
 ## Package contract
 
 Select `[runtime] profile = "small-nas-journal-v1"` with its required local pool, bounded writeback geometry and dedicated memory limit. Pass `ZEROFS_WRITE_ACK_SETTINGS_FILE=/state/private/write-ack-settings.json` to both `zerofs memory-status -c ...` and `zerofs run -c ...`. Both load the same override before memory admission. A missing document selects the base TOML. Invalid or unreadable configured documents fail startup. Configure `ZEROFS_WRITE_ACK_ADMIN_TOKEN_FILE` separately to enable saves on a writable engine with WebUI.
