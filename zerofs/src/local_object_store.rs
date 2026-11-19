@@ -22,6 +22,7 @@
 
 mod listing;
 pub(crate) mod pool;
+mod worker;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -39,13 +40,14 @@ use std::fmt::{self, Display, Formatter};
 use std::fs::{File, OpenOptions};
 use std::ops::Range;
 use std::path::{Path as FsPath, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
-use tokio::sync::{Semaphore, oneshot};
+#[cfg(test)]
+use tokio::sync::oneshot;
+use worker::run_local;
 
 const STORE: &str = "LocalConditionalStore";
 pub(crate) const LOCK_FILE: &str = ".zerofs-local-mutations#0";
-const MAX_WORKERS: usize = 32;
 
 /// The same absolute object paths as `LocalFileSystem::new()`, with durable CAS.
 #[derive(Clone, Debug)]
@@ -155,33 +157,6 @@ fn lock_parents(paths: &[PathBuf]) -> Result<Vec<File>> {
         locks.push(lock);
     }
     Ok(locks)
-}
-
-/// The detached worker owns the admission permit, operation, and any lock guards
-/// until I/O actually finishes, even when its result receiver is dropped.
-async fn run_local<T, F>(operation: F) -> Result<T>
-where
-    T: Send + 'static,
-    F: FnOnce() -> Result<T> + Send + 'static,
-{
-    static WORKERS: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    let permit = WORKERS
-        .get_or_init(|| Arc::new(Semaphore::new(MAX_WORKERS)))
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(generic)?;
-    let (sender, receiver) = oneshot::channel();
-    let _worker = std::thread::Builder::new()
-        .name("zerofs-local-store".into())
-        .spawn(move || {
-            let _permit = permit;
-            let _ = sender.send(operation());
-        })
-        .map_err(generic)?;
-    receiver
-        .await
-        .map_err(|_| generic("local storage worker stopped before returning a result"))?
 }
 
 #[async_trait]

@@ -1,6 +1,13 @@
 mod xattr;
 use xattr::XattrFid;
 
+#[cfg(test)]
+mod creation_gid_tests;
+#[cfg(test)]
+mod io_context_tests;
+#[cfg(test)]
+mod rename_fid_tests;
+
 use super::errors::{P9Error, P9Result};
 use super::lock_manager::{FileLock, FileLockManager, LockGuard};
 #[cfg(feature = "failpoints")]
@@ -167,6 +174,10 @@ impl SuccessDedupOwner {
 /// clamp/deny. The bound is far above any real directory depth.
 const MAX_ANCESTOR_HOPS: u32 = 100_000;
 
+/// A reconstructed attach-root path must fit the wire's u16-sized aname.
+/// Bound both names and separators before retaining a repaired fid path.
+const MAX_WALK_ROOT_PATH_BYTES: usize = u16::MAX as usize;
+
 // Represents an open file handle
 #[derive(Debug, Clone)]
 pub struct Fid {
@@ -244,6 +255,15 @@ struct SetattrFidContext {
     creds: Credentials,
     state: SetattrFidState,
     allows_read: bool,
+}
+
+/// Read/write state copied under the session lock. The fid slot retains its
+/// open-handle pin; bulk I/O does not need an owned copy of the pathname.
+struct IoFidContext {
+    inode_id: InodeId,
+    creds: Credentials,
+    allows_read: bool,
+    allows_write: bool,
 }
 
 struct OpenFidContext {
@@ -358,6 +378,7 @@ fn parse_rebind_credentials(n_uname: u32, payload: &[u8]) -> P9Result<Option<Cre
         groups,
         groups_count,
         groups_complete,
+        groups_truncated: false,
     }))
 }
 
@@ -429,10 +450,28 @@ pub struct ListenerPolicy {
     pub standard_lookup: NameMatch,
 }
 
+/// The inode selected by a walk component. A detached ancestor chain can
+/// jump directly to the attach root instead of traversing one parent.
+#[derive(Debug)]
+struct WalkTarget {
+    id: InodeId,
+    replacement_path: Option<Vec<Bytes>>,
+}
+
+impl WalkTarget {
+    fn relative(id: InodeId) -> Self {
+        Self {
+            id,
+            replacement_path: None,
+        }
+    }
+}
+
 /// One resolved walk component.
 struct WalkStep {
     id: InodeId,
     inode: Inode,
+    replacement_path: Option<Vec<Bytes>>,
     /// A directory pin taken under the parent lock by an exact match.
     exact_pin: Option<OpenHandle>,
 }
@@ -754,8 +793,9 @@ impl NinePHandler {
 
     /// Returns the effective GID for a create-type operation. When a credential
     /// override is active, the server-configured GID is used instead of
-    /// whatever the client sent. Creates pass it in the credentials rather
-    /// than as an explicit group, so a setgid parent's group still wins.
+    /// whatever the client sent. This is only a new-entry group hint: parent
+    /// authorization keeps the fid's original credentials, and a setgid
+    /// parent's group still wins.
     fn effective_gid(&self, client_gid: u32, fid_creds: &Credentials) -> u32 {
         if self.credential_override.is_some() {
             fid_creds.gid
@@ -777,6 +817,20 @@ impl NinePHandler {
             .filter(|slot| slot.xattr.is_none())
             .ok_or(P9Error::BadFid)
             .map(|s| s.fid.clone())
+    }
+
+    fn get_fid_io_context(&self, fid: u32) -> P9Result<IoFidContext> {
+        self.session_state()
+            .fids
+            .get(&fid)
+            .filter(|slot| slot.xattr.is_none())
+            .ok_or(P9Error::BadFid)
+            .map(|slot| IoFidContext {
+                inode_id: slot.fid.inode_id,
+                creds: slot.fid.creds,
+                allows_read: fid_allows_read(&slot.fid),
+                allows_write: fid_allows_write(&slot.fid),
+            })
     }
 
     /// Snapshot only the fid fields needed by attribute mutations. Unlike
@@ -1161,6 +1215,7 @@ impl NinePHandler {
             groups,
             groups_count,
             groups_complete: gid_known,
+            groups_truncated: false,
         }
     }
 
@@ -1401,24 +1456,30 @@ impl NinePHandler {
     /// directory's parent pointer, clamped at `root_id` (the fid's attach
     /// root): walking `..` at the subtree root yields the subtree root itself,
     /// exactly mirroring the inode-0 clamp readdir applies at the filesystem
-    /// root. Everything else is a plain lookup.
+    /// root. `.` stays on the current searchable directory; other names use
+    /// the directory-entry lookup.
     async fn walk_component(
         &self,
         creds: &Credentials,
         root_id: InodeId,
         current_id: InodeId,
         name: &[u8],
-    ) -> P9Result<InodeId> {
-        if name != b".." {
-            return Ok(self.filesystem.lookup(creds, current_id, name).await?);
+    ) -> P9Result<WalkTarget> {
+        if !matches!(name, b"." | b"..") {
+            return Ok(WalkTarget::relative(
+                self.filesystem.lookup(creds, current_id, name).await?,
+            ));
         }
         let inode = self.filesystem.inode_store.get(current_id).await?;
         let Inode::Directory(dir) = &inode else {
             return Err(P9Error::NotADirectory);
         };
         check_access(&inode, creds, AccessMode::Execute)?;
+        if name == b"." {
+            return Ok(WalkTarget::relative(current_id));
+        }
         if current_id == root_id {
-            return Ok(current_id);
+            return Ok(WalkTarget::relative(current_id));
         }
         // On an aname-rooted fid the parent pointer alone is not enough: a
         // concurrent rename can re-point an ancestor outside the subtree, so
@@ -1435,28 +1496,92 @@ impl NinePHandler {
                     // concurrently re-pointed chain) without passing the attach
                     // root: clamp to the root, the same safe direction as a
                     // detached chain.
-                    return Ok(root_id);
+                    return self.clamped_walk_root(root_id).await;
                 }
                 hops += 1;
                 let Inode::Directory(d) = self.filesystem.inode_store.get(ancestor).await? else {
-                    return Ok(root_id);
+                    return self.clamped_walk_root(root_id).await;
                 };
                 ancestor = d.parent;
             }
         }
-        Ok(dir.parent)
+        Ok(WalkTarget::relative(dir.parent))
+    }
+
+    /// Rebuild the absolute path only when a detached walk jumps to its
+    /// attach root. Popping one component would leave the old subtree's path
+    /// attached to the root inode and break later pathname-based rename.
+    /// Following parent pointers also accounts for a renamed attach root;
+    /// ordinary walk steps do not perform this extra ancestry read.
+    async fn clamped_walk_root(&self, root_id: InodeId) -> P9Result<WalkTarget> {
+        // Dot components hold no inode or parent guard here, preserving the
+        // rename lock order. Keep parent/name pairs stable across this walk.
+        let _topology_guard = self.filesystem.directory_rename_lock.lock().await;
+        let mut path = Vec::new();
+        let mut path_bytes = 0usize;
+        let mut ancestor = root_id;
+        let mut hops = 0u32;
+        while ancestor != 0 {
+            if hops >= MAX_ANCESTOR_HOPS {
+                return Err(FsError::StaleHandle.into());
+            }
+            hops += 1;
+            let inode =
+                self.filesystem
+                    .inode_store
+                    .get(ancestor)
+                    .await
+                    .map_err(|error| match error {
+                        FsError::NotFound => FsError::StaleHandle,
+                        other => other,
+                    })?;
+            let Inode::Directory(dir) = inode else {
+                return Err(FsError::StaleHandle.into());
+            };
+            if dir.nlink == 0 {
+                return Err(FsError::StaleHandle.into());
+            }
+            let name = dir.name.ok_or(FsError::StaleHandle)?;
+            path_bytes = path_bytes
+                .checked_add(name.len())
+                .and_then(|length| length.checked_add(usize::from(!path.is_empty())))
+                .filter(|length| *length <= MAX_WALK_ROOT_PATH_BYTES)
+                .ok_or(FsError::NameTooLong)?;
+            // Rmdir is not a topology move and can still detach an empty
+            // root. Refuse a missing/replaced link instead of caching a path
+            // that no longer identifies this inode; preserve real I/O errors.
+            match self
+                .filesystem
+                .directory_store
+                .get_exact(dir.parent, &name)
+                .await
+            {
+                Ok(id) if id == ancestor => {}
+                Ok(_) | Err(FsError::NotFound) => return Err(FsError::StaleHandle.into()),
+                Err(error) => return Err(error.into()),
+            }
+            path.push(Bytes::from(name));
+            ancestor = dir.parent;
+        }
+        path.reverse();
+        Ok(WalkTarget {
+            id: root_id,
+            replacement_path: Some(path),
+        })
     }
 
     /// Keep a fid's absolute path in step with a walk: `..` pops a component
-    /// (unless clamped at the attach root, where `current_id == root`), any
-    /// other name appends. Shared by `walk` and `walk_getattr`.
+    /// (unless clamped at the attach root, where `current_id == root`), `.`
+    /// stays in place, and other names append. Shared by `walk` and
+    /// `walk_getattr`.
     fn step_path(path: &mut Vec<Bytes>, name: Bytes, current_id: InodeId, root: InodeId) {
-        if name.as_ref() == b".." {
-            if current_id != root {
+        match name.as_ref() {
+            b"." => {}
+            b".." if current_id != root => {
                 path.pop();
             }
-        } else {
-            path.push(name);
+            b".." => {}
+            _ => path.push(name),
         }
     }
 
@@ -1482,9 +1607,10 @@ impl NinePHandler {
         } else {
             None
         };
-        let id = self
+        let target = self
             .walk_component(creds, root_id, current_id, name)
             .await?;
+        let id = target.id;
         #[cfg(test)]
         if rule == NameMatch::Exact {
             let pause = self.exact_lookup_pause.lock().unwrap().take();
@@ -1518,6 +1644,7 @@ impl NinePHandler {
         Ok(WalkStep {
             id,
             inode,
+            replacement_path: target.replacement_path,
             exact_pin,
         })
     }
@@ -1586,11 +1713,20 @@ impl NinePHandler {
                 }
             };
 
-            Self::step_path(&mut current_path, name_bytes, current_id, src_fid.root);
+            if let Some(path) = step.replacement_path {
+                current_path = path;
+            } else {
+                Self::step_path(&mut current_path, name_bytes, current_id, src_fid.root);
+            }
             wqids.push(inode_to_qid(&step.inode, step.id));
+            // A self step such as `.` must keep the previous exact lookup's
+            // directory pin until final validation takes its own. A different
+            // target always replaces or clears the previous pin.
+            if step.id != current_id || step.exact_pin.is_some() {
+                pending_directory_pin = step.exact_pin;
+            }
             current_id = step.id;
             walked_directory = Some(step.inode.is_directory());
-            pending_directory_pin = step.exact_pin;
         }
 
         // Only create newfid if the walk fully succeeded
@@ -1636,11 +1772,17 @@ impl NinePHandler {
             let step = self
                 .resolve_walk_component(&src_fid.creds, src_fid.root, current_id, &name_bytes, rule)
                 .await?;
-            Self::step_path(&mut current_path, name_bytes, current_id, src_fid.root);
+            if let Some(path) = step.replacement_path {
+                current_path = path;
+            } else {
+                Self::step_path(&mut current_path, name_bytes, current_id, src_fid.root);
+            }
             wqids.push(inode_to_qid(&step.inode, step.id));
+            if step.id != current_id || step.exact_pin.is_some() {
+                pending_directory_pin = step.exact_pin;
+            }
             current_id = step.id;
             last_inode = Some(step.inode);
-            pending_directory_pin = step.exact_pin;
         }
 
         #[cfg(test)]
@@ -2027,13 +2169,13 @@ impl NinePHandler {
         Ok(self
             .filesystem
             .create_idempotent(
-                &parent_fid.creds.with_gid(gid),
+                &parent_fid.creds,
                 parent_fid.inode_id,
                 name,
                 &SetAttributes {
                     mode: SetMode::Set(mode),
                     uid: SetUid::Set(parent_fid.creds.uid),
-                    gid: SetGid::NoChange,
+                    gid: SetGid::InheritOr(gid),
                     ..Default::default()
                 },
                 op_id,
@@ -2140,9 +2282,9 @@ impl NinePHandler {
         if let Some(result) = self.read_xattr(&tr) {
             return result;
         }
-        let fid_entry = self.get_fid(tr.fid)?;
+        let fid_entry = self.get_fid_io_context(tr.fid)?;
 
-        if !fid_allows_read(&fid_entry) {
+        if !fid_entry.allows_read {
             return Err(P9Error::BadFid);
         }
 
@@ -2171,9 +2313,9 @@ impl NinePHandler {
         if let Some(result) = self.write_xattr(&tw) {
             return result;
         }
-        let fid_entry = self.get_fid(tw.fid)?;
+        let fid_entry = self.get_fid_io_context(tw.fid)?;
 
-        if !fid_allows_write(&fid_entry) {
+        if !fid_entry.allows_write {
             return Err(P9Error::BadFid);
         }
 
@@ -2363,13 +2505,13 @@ impl NinePHandler {
         Ok(self
             .filesystem
             .mkdir_idempotent(
-                &parent_fid.creds.with_gid(gid),
+                &parent_fid.creds,
                 parent_fid.inode_id,
                 &tm.name.data,
                 &SetAttributes {
                     mode: SetMode::Set(tm.mode),
                     uid: SetUid::Set(parent_fid.creds.uid),
-                    gid: SetGid::NoChange,
+                    gid: SetGid::InheritOr(gid),
                     ..Default::default()
                 },
                 op_id,
@@ -2404,14 +2546,14 @@ impl NinePHandler {
         Ok(self
             .filesystem
             .symlink_idempotent(
-                &parent_fid.creds.with_gid(gid),
+                &parent_fid.creds,
                 parent_fid.inode_id,
                 &ts.name.data,
                 &ts.symtgt.data,
                 &SetAttributes {
                     mode: SetMode::Set(SYMLINK_DEFAULT_MODE),
                     uid: SetUid::Set(parent_fid.creds.uid),
-                    gid: SetGid::NoChange,
+                    gid: SetGid::InheritOr(gid),
                     ..Default::default()
                 },
                 op_id,
@@ -2459,14 +2601,14 @@ impl NinePHandler {
         Ok(self
             .filesystem
             .mknod_idempotent(
-                &parent_fid.creds.with_gid(gid),
+                &parent_fid.creds,
                 parent_fid.inode_id,
                 &tm.name.data,
                 device_type,
                 &SetAttributes {
                     mode: SetMode::Set(tm.mode & 0o7777),
                     uid: SetUid::Set(parent_fid.creds.uid),
-                    gid: SetGid::NoChange,
+                    gid: SetGid::InheritOr(gid),
                     ..Default::default()
                 },
                 rdev,
@@ -2578,9 +2720,27 @@ impl NinePHandler {
 
         let new_name_bytes = Bytes::copy_from_slice(&tr.name.data);
 
+        // Preserve ENOTDIR for a valid non-directory destination fid rather
+        // than classifying it as a broken directory ancestry chain below.
+        if dest_fid.qid.type_ & QID_TYPE_DIR == 0 {
+            return Err(P9Error::NotADirectory);
+        }
+
+        // A directory fid remains bound to its inode after another client
+        // renames that directory. Reconstruct its current parent chain rather
+        // than copying the destination fid's possibly stale cached path.
+        // Do all fallible path work before committing the namespace change.
+        let mut renamed_path = self
+            .clamped_walk_root(dest_parent_id)
+            .await?
+            .replacement_path
+            .ok_or(FsError::StaleHandle)?;
+        renamed_path.push(new_name_bytes.clone());
+
         let auth = AuthContext::from(&creds);
 
-        self.filesystem
+        let moved = self
+            .filesystem
             .rename_inode_idempotent(
                 &auth,
                 source_parent_id,
@@ -2591,6 +2751,20 @@ impl NinePHandler {
                 op_id,
             )
             .await?;
+
+        if moved {
+            // Do not overwrite a fid concurrently walked/rebound to another
+            // object. A successful same-inode hard-link rename leaves the
+            // source entry intact and must not switch this fid to its alias.
+            if let Some(slot) = self.session_state().fids.get_mut(&tr.fid)
+                && slot.xattr.is_none()
+                && slot.fid.inode_id == source_fid.inode_id
+                && slot.fid.root == source_fid.root
+                && slot.fid.path == source_fid.path
+            {
+                slot.fid.path = renamed_path;
+            }
+        }
 
         Ok(Message::Rrename(Rrename))
     }
@@ -3962,6 +4136,7 @@ mod tests {
             groups: [0; P9_MAX_GROUPS],
             groups_count: 1,
             groups_complete: true,
+            groups_truncated: false,
         };
         let contents = b"open capability";
         let (file_id, _) = fs
@@ -4786,6 +4961,7 @@ mod tests {
         before_pin: bool,
         directory: bool,
         volatile: bool,
+        trailing_dot: bool,
     ) {
         use crate::fs::mutation::config::{
             ClientDurabilityTarget, FilesystemWriteAckMode, FilesystemWriteAckSettings,
@@ -4835,12 +5011,25 @@ mod tests {
             resume: resume_rx,
         });
         let lookup_handler = handler.clone();
-        let lookup =
-            tokio::spawn(async move { request(&lookup_handler, 2, session.walk(&[b"Foo"])).await });
+        let lookup = tokio::spawn(async move {
+            let names: &[&[u8]] = if trailing_dot {
+                &[b"Foo", b"."]
+            } else {
+                &[b"Foo"]
+            };
+            request(&lookup_handler, 2, session.walk(names)).await
+        });
         tokio::time::timeout(std::time::Duration::from_secs(10), reached_rx)
             .await
             .unwrap()
             .unwrap();
+        if before_pin && directory {
+            assert_eq!(
+                fs.open_handle_count(original),
+                1,
+                "the resolved directory must stay pinned across trailing self steps"
+            );
+        }
         // Without the directory lock, complete the replacement between the
         // lookup and spelling read. With it, rename must wait for this walk.
         let directory_locked = fs.lock_manager.is_locked_for_test(0);
@@ -4887,7 +5076,7 @@ mod tests {
     async fn exact_walk_survives_atomic_replacement() {
         for session in ExactWalkSession::ALL {
             for directory in [false, true] {
-                exact_walk_replacement_at_pause(session, false, directory, false).await;
+                exact_walk_replacement_at_pause(session, false, directory, false, false).await;
             }
         }
     }
@@ -4896,7 +5085,7 @@ mod tests {
     async fn exact_file_walk_survives_replacement_before_pin() {
         for session in ExactWalkSession::ALL {
             for volatile in [false, true] {
-                exact_walk_replacement_at_pause(session, true, false, volatile).await;
+                exact_walk_replacement_at_pause(session, true, false, volatile, false).await;
             }
         }
     }
@@ -4904,7 +5093,14 @@ mod tests {
     #[tokio::test]
     async fn exact_directory_walk_survives_replacement_before_pin() {
         for session in ExactWalkSession::ALL {
-            exact_walk_replacement_at_pause(session, true, true, false).await;
+            exact_walk_replacement_at_pause(session, true, true, false, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_directory_dot_walk_survives_replacement_before_pin() {
+        for session in ExactWalkSession::ALL {
+            exact_walk_replacement_at_pause(session, true, true, false, true).await;
         }
     }
 
@@ -6358,6 +6554,7 @@ mod tests {
             groups: [1000; 16],
             groups_count: 1,
             groups_complete: true,
+            groups_truncated: false,
         };
         for i in 0..10 {
             fs.create(
@@ -6427,6 +6624,7 @@ mod tests {
             groups: [1000; 16],
             groups_count: 1,
             groups_complete: true,
+            groups_truncated: false,
         };
         for i in 0..5 {
             fs.create(
@@ -6484,6 +6682,7 @@ mod tests {
             groups: [1000; 16],
             groups_count: 1,
             groups_complete: true,
+            groups_truncated: false,
         };
 
         for i in 0..1002 {
@@ -6623,6 +6822,7 @@ mod tests {
             groups: [1000; 16],
             groups_count: 1,
             groups_complete: true,
+            groups_truncated: false,
         };
         let (_empty_dir_id, _) = fs
             .mkdir(&creds, 0, b"emptydir", &SetAttributes::default())
@@ -7796,6 +7996,7 @@ mod tests {
             groups: [root.gid(); P9_MAX_GROUPS],
             groups_count: 1,
             groups_complete: true,
+            groups_truncated: false,
         };
         fs.setattr(
             &root_owner,
@@ -8963,6 +9164,7 @@ mod tests {
             groups: [1000; 16],
             groups_count: 1,
             groups_complete: true,
+            groups_truncated: false,
         }
     }
 }

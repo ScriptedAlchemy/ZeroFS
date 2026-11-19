@@ -1716,32 +1716,55 @@ impl Journal {
     }
 
     pub(crate) fn read_blob(&self, sequence: Sequence) -> Result<Vec<u8>> {
-        let blob = self.open_verified_blob(sequence)?;
-        let capacity = usize::try_from(blob.len).context("blob is too large to read")?;
-        let mut collected = Vec::with_capacity(capacity);
-        let mut file = blob.file.lock().expect("verified blob file lock poisoned");
-        file.seek(std::io::SeekFrom::Start(blob.offset))?;
-        (&mut *file).take(blob.len).read_to_end(&mut collected)?;
-        if collected.len() as u64 != blob.len {
-            bail!("committed blob length mismatch");
+        self.read_blob_bounded(sequence, u64::MAX)
+    }
+
+    /// Read and verify the exact bytes returned to the caller in one pass.
+    /// The caller's bound is checked against the durable record before any
+    /// payload allocation. This lets bounded atomic uploads avoid verifying a
+    /// file, then reading and hashing the same file again through a stream.
+    pub(crate) fn read_blob_bounded(
+        &self,
+        sequence: Sequence,
+        maximum_bytes: u64,
+    ) -> Result<Vec<u8>> {
+        let record = self.blob_record(sequence)?;
+        let (payload_len, payload_sha256) = record
+            .payload()
+            .context("journal record does not reference a payload blob")?;
+        if payload_len > maximum_bytes {
+            bail!("committed blob exceeds bounded read limit");
         }
-        Ok(collected)
+        let (file, path, slice) = self.open_blob_file(&record)?;
+        let (mut file, _) = validate_file_payload(file, &path, slice, payload_len)?;
+        collect_verified_payload(&mut file, payload_len, payload_sha256)
     }
 
     pub(crate) fn open_verified_blob(&self, sequence: Sequence) -> Result<VerifiedBlob> {
-        let record = self
-            .mutation(sequence)?
-            .with_context(|| format!("journal mutation {sequence} does not exist"))?;
+        let record = self.blob_record(sequence)?;
+        let (file, path, slice) = self.open_blob_file(&record)?;
+        open_verified_blob(file, &path, slice, &record)
+    }
+
+    fn blob_record(&self, sequence: Sequence) -> Result<MutationRecord> {
+        self.mutation(sequence)?
+            .with_context(|| format!("journal mutation {sequence} does not exist"))
+    }
+
+    fn open_blob_file(
+        &self,
+        record: &MutationRecord,
+    ) -> Result<(File, PathBuf, Option<BlobSlice>)> {
         let reference = record
             .blob_path()
-            .with_context(|| format!("journal mutation {sequence} has no blob"))?;
+            .with_context(|| format!("journal mutation {} has no blob", record.sequence))?;
         let reference = BlobRef::parse(reference)?;
         let location = self.blob_location(reference.relative, false)?;
         let file = location
             .parent
             .open_file(&location.name, OFlags::RDONLY, 0)
             .with_context(|| format!("missing committed blob {}", location.display.display()))?;
-        open_verified_blob(file, &location.display, reference.slice, &record)
+        Ok((file, location.display, reference.slice))
     }
 
     #[cfg(test)]
@@ -2937,6 +2960,20 @@ struct BlobSlice {
     len: u64,
 }
 
+/// A durable record's bytes no longer match the payload it committed.
+/// Preserve this type through replay so a known corrupt local source cannot
+/// become an endlessly retried remote failure. Ordinary filesystem errors do
+/// not carry this marker and keep their existing retry policy.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum JournalBlobIntegrityError {
+    #[error("committed blob length mismatch")]
+    LengthMismatch,
+    #[error("committed blob hash mismatch")]
+    HashMismatch,
+    #[error("committed blob changed while streaming")]
+    ChangedWhileStreaming,
+}
+
 #[derive(Clone)]
 pub(crate) struct VerifiedBlob {
     file: Arc<Mutex<File>>,
@@ -2977,7 +3014,7 @@ impl VerifiedBlob {
                 if let Some(hasher) = state.hasher.take() {
                     let actual: [u8; 32] = hasher.finalize().into();
                     if actual != state.expected_sha256 {
-                        bail!("committed blob changed while streaming");
+                        bail!(JournalBlobIntegrityError::ChangedWhileStreaming);
                     }
                 }
                 return Ok(None);
@@ -3005,7 +3042,7 @@ impl VerifiedBlob {
             .await
             .context("verified blob stream task failed")??;
             if bytes.is_empty() {
-                bail!("committed blob length mismatch");
+                bail!(JournalBlobIntegrityError::LengthMismatch);
             }
             state.absolute = state
                 .absolute
@@ -3017,7 +3054,7 @@ impl VerifiedBlob {
                 if state.remaining == 0 {
                     let actual: [u8; 32] = hasher.clone().finalize().into();
                     if actual != state.expected_sha256 {
-                        bail!("committed blob changed while streaming");
+                        bail!(JournalBlobIntegrityError::ChangedWhileStreaming);
                     }
                     state.hasher = None;
                 }
@@ -3163,24 +3200,20 @@ fn verify_record_blob(
     verify_file_payload(file, path, slice, payload_len, payload_sha256).map(drop)
 }
 
-/// Verify (and optionally collect) one record's payload.
-///
-/// Verification is always per record, never per file: a container member is
-/// hashed over exactly its own slice, so a neighbour's bytes can never satisfy
-/// it. A whole-file reference still demands an exact file length, while a
-/// container only requires that it be long enough to hold the slice.
-fn verify_file_payload(
+/// Validate a record's file and position it at the beginning of its payload.
+/// A whole-file reference demands an exact file length, while a container only
+/// requires that it be long enough to hold this record's slice.
+fn validate_file_payload(
     mut file: File,
     path: &Path,
     slice: Option<BlobSlice>,
     expected_len: u64,
-    expected_sha256: [u8; 32],
 ) -> Result<(File, u64)> {
     let offset = slice.map_or(0, |slice| slice.offset);
     if let Some(slice) = slice
         && slice.len != expected_len
     {
-        bail!("committed blob length mismatch");
+        bail!(JournalBlobIntegrityError::LengthMismatch);
     }
     let required_len = offset
         .checked_add(expected_len)
@@ -3201,14 +3234,26 @@ fn verify_file_payload(
         metadata.len() == expected_len
     };
     if !length_matches {
-        bail!("committed blob length mismatch");
+        bail!(JournalBlobIntegrityError::LengthMismatch);
     }
 
     if offset > 0 {
         file.seek(std::io::SeekFrom::Start(offset))
             .with_context(|| format!("failed to seek blob {}", path.display()))?;
     }
+    Ok((file, offset))
+}
 
+/// Verification is always per record, never per file: a container member is
+/// hashed over exactly its own slice, so a neighbour's bytes cannot satisfy it.
+fn verify_file_payload(
+    file: File,
+    path: &Path,
+    slice: Option<BlobSlice>,
+    expected_len: u64,
+    expected_sha256: [u8; 32],
+) -> Result<(File, u64)> {
+    let (mut file, offset) = validate_file_payload(file, path, slice, expected_len)?;
     let mut hasher = Sha256::new();
     let mut remaining = expected_len;
     let mut buffer = vec![0_u8; 1024 * 1024];
@@ -3219,16 +3264,38 @@ fn verify_file_payload(
             .read(&mut buffer[..want])
             .with_context(|| format!("failed to read blob {}", path.display()))?;
         if read == 0 {
-            bail!("committed blob length mismatch");
+            bail!(JournalBlobIntegrityError::LengthMismatch);
         }
         remaining -= read as u64;
         hasher.update(&buffer[..read]);
     }
     let actual_sha256: [u8; 32] = hasher.finalize().into();
     if actual_sha256 != expected_sha256 {
-        bail!("committed blob hash mismatch");
+        bail!(JournalBlobIntegrityError::HashMismatch);
     }
     Ok((file, offset))
+}
+
+fn collect_verified_payload(
+    reader: &mut impl Read,
+    expected_len: u64,
+    expected_sha256: [u8; 32],
+) -> Result<Vec<u8>> {
+    let capacity = usize::try_from(expected_len).context("blob is too large to read")?;
+    let mut collected = vec![0_u8; capacity];
+    if let Err(error) = reader.read_exact(&mut collected) {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            return Err(
+                anyhow::Error::new(error).context(JournalBlobIntegrityError::LengthMismatch)
+            );
+        }
+        return Err(error).context("failed to read committed blob");
+    }
+    let actual_sha256: [u8; 32] = Sha256::digest(&collected).into();
+    if actual_sha256 != expected_sha256 {
+        bail!(JournalBlobIntegrityError::HashMismatch);
+    }
+    Ok(collected)
 }
 
 fn validate_owner_only(
@@ -5856,6 +5923,240 @@ mod tests {
         }
         assert_eq!(journal.read_blob(2).unwrap(), second);
         assert!(journal.open_verified_blob(1).is_err());
+    }
+
+    #[test]
+    fn bounded_blob_read_verifies_only_its_container_slice() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let committed = journal
+            .publish_batch(prepare_puts(&journal, 1..=2))
+            .unwrap();
+        let expected = b"payload-2";
+        assert_eq!(
+            journal.read_blob_bounded(2, expected.len() as u64).unwrap(),
+            expected
+        );
+
+        let first_ref = super::BlobRef::parse(committed[0].blob_path().unwrap()).unwrap();
+        let first_slice = first_ref.slice.unwrap();
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(journal.root().join(first_ref.relative))
+            .unwrap();
+        file.seek(SeekFrom::Start(first_slice.offset)).unwrap();
+        file.write_all(b"X").unwrap();
+
+        assert_eq!(
+            journal.read_blob_bounded(2, expected.len() as u64).unwrap(),
+            expected,
+            "a neighboring record is outside this payload's checksum"
+        );
+        let error = journal.read_blob_bounded(1, 64).unwrap_err();
+        assert!(format!("{error:#}").contains("hash mismatch"), "{error:#}");
+    }
+
+    #[test]
+    fn bounded_blob_read_checks_limit_before_opening_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let record = journal
+            .commit_put(put_record(1, "segments/1", b"payload"), b"payload")
+            .unwrap();
+        let reference = super::BlobRef::parse(record.blob_path().unwrap()).unwrap();
+        fs::remove_file(journal.root().join(reference.relative)).unwrap();
+
+        let error = journal.read_blob_bounded(1, 6).unwrap_err();
+        assert!(
+            error.to_string().contains("exceeds bounded read limit"),
+            "limit must be rejected before touching the missing payload: {error:#}"
+        );
+    }
+
+    #[test]
+    fn bounded_blob_read_returns_owned_verified_bytes_and_rejects_truncation() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let record = journal
+            .commit_put(put_record(1, "segments/1", b"payload"), b"payload")
+            .unwrap();
+        let original = journal.read_blob_bounded(1, 7).unwrap();
+        let reference = super::BlobRef::parse(record.blob_path().unwrap()).unwrap();
+        let slice = reference.slice.unwrap();
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(journal.root().join(reference.relative))
+            .unwrap();
+        file.seek(SeekFrom::Start(slice.offset)).unwrap();
+        file.write_all(b"changed").unwrap();
+        assert_eq!(
+            original, b"payload",
+            "returned bytes own their verified snapshot"
+        );
+        assert!(
+            format!("{:#}", journal.read_blob_bounded(1, 7).unwrap_err()).contains("hash mismatch")
+        );
+
+        file.set_len(slice.offset + slice.len - 1).unwrap();
+        assert!(
+            format!("{:#}", journal.read_blob_bounded(1, 7).unwrap_err())
+                .contains("length mismatch")
+        );
+    }
+
+    #[test]
+    fn bounded_blob_read_accepts_an_empty_payload_at_zero_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        journal
+            .commit_put(put_record(1, "segments/empty", b""), b"")
+            .unwrap();
+        assert!(journal.read_blob_bounded(1, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn collected_payload_reads_each_byte_once_and_checks_the_returned_bytes() {
+        use std::io::{Cursor, Read};
+
+        struct CountedReader {
+            bytes: Cursor<Vec<u8>>,
+            read_bytes: usize,
+        }
+
+        impl Read for CountedReader {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                // Deliberately exercise short reads, including a final read
+                // that must stop before the neighboring payload.
+                let limit = output.len().min(3);
+                let count = self.bytes.read(&mut output[..limit])?;
+                self.read_bytes += count;
+                Ok(count)
+            }
+        }
+
+        let expected = b"verified payload";
+        let digest = Sha256::digest(expected).into();
+        let mut reader = CountedReader {
+            bytes: Cursor::new([expected.as_slice(), b"neighbor"].concat()),
+            read_bytes: 0,
+        };
+        let bytes =
+            super::collect_verified_payload(&mut reader, expected.len() as u64, digest).unwrap();
+        assert_eq!(bytes, expected);
+        assert_eq!(reader.read_bytes, expected.len());
+        assert_eq!(reader.bytes.position(), expected.len() as u64);
+
+        let error =
+            super::collect_verified_payload(&mut &b"different bytes!"[..], 16, digest).unwrap_err();
+        assert!(error.to_string().contains("hash mismatch"));
+        let error =
+            super::collect_verified_payload(&mut &expected[..expected.len() - 1], 16, digest)
+                .unwrap_err();
+        assert!(error.to_string().contains("length mismatch"));
+        let error = super::collect_verified_payload(&mut &b""[..], 0, digest).unwrap_err();
+        assert!(error.to_string().contains("hash mismatch"));
+    }
+
+    #[test]
+    fn collected_payload_distinguishes_truncation_from_transient_read_errors() {
+        use std::io::{ErrorKind, Read};
+
+        struct FailingReader(ErrorKind);
+
+        impl Read for FailingReader {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(self.0))
+            }
+        }
+
+        let digest = Sha256::digest(b"x").into();
+        let error = super::collect_verified_payload(
+            &mut FailingReader(ErrorKind::PermissionDenied),
+            1,
+            digest,
+        )
+        .unwrap_err();
+        assert!(!error.is::<super::JournalBlobIntegrityError>());
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            ErrorKind::PermissionDenied
+        );
+
+        let error = super::collect_verified_payload(
+            &mut FailingReader(ErrorKind::UnexpectedEof),
+            1,
+            digest,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<super::JournalBlobIntegrityError>(),
+            Some(super::JournalBlobIntegrityError::LengthMismatch)
+        ));
+
+        let mut interrupted = true;
+        let mut reader = &b"x"[..];
+        struct InterruptOnce<'a> {
+            interrupted: &'a mut bool,
+            reader: &'a mut dyn Read,
+        }
+        impl Read for InterruptOnce<'_> {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                if std::mem::replace(self.interrupted, false) {
+                    return Err(ErrorKind::Interrupted.into());
+                }
+                self.reader.read(output)
+            }
+        }
+        assert_eq!(
+            super::collect_verified_payload(
+                &mut InterruptOnce {
+                    interrupted: &mut interrupted,
+                    reader: &mut reader,
+                },
+                1,
+                digest,
+            )
+            .unwrap(),
+            b"x"
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_blob_stream_reports_integrity_failure_after_open() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        for truncate in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let journal = open_temp_journal(&temp, "bucket-a");
+            let record = journal
+                .commit_put(put_record(1, "segments/1", b"payload"), b"payload")
+                .unwrap();
+            let blob = journal.open_verified_blob(1).unwrap();
+            let reference = super::BlobRef::parse(record.blob_path().unwrap()).unwrap();
+            let slice = reference.slice.unwrap();
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .open(journal.root().join(reference.relative))
+                .unwrap();
+            if truncate {
+                file.set_len(slice.offset).unwrap();
+            } else {
+                file.seek(SeekFrom::Start(slice.offset)).unwrap();
+                file.write_all(b"X").unwrap();
+            }
+            let error = blob
+                .range_stream(0..blob.len(), 16)
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(error.is::<super::JournalBlobIntegrityError>(), "{error:#}");
+        }
     }
 
     #[tokio::test]

@@ -516,6 +516,7 @@ fn upload_auth(state: &AppState) -> AuthContext {
         gid_known: true,
         gids: Vec::new(),
         groups_complete: true,
+        groups_truncated: false,
     }
 }
 
@@ -2102,6 +2103,7 @@ mod tests {
                 gid_known: true,
                 gids: Vec::new(),
                 groups_complete: true,
+                groups_truncated: false,
             };
             assert!(
                 matches!(

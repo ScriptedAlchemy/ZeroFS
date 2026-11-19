@@ -1,7 +1,7 @@
 use crate::segment_store::ConditionalMultipartCreate;
 use crate::writeback::admission::Admission;
 use crate::writeback::barrier::{BarrierError, SequenceBarrier, SequenceProgress};
-use crate::writeback::journal::Journal;
+use crate::writeback::journal::{Journal, JournalBlobIntegrityError};
 use crate::writeback::journaler::{LocalBarrier, LocalBarrierError};
 use crate::writeback::model::{
     FenceClass, LocalEtag, MutationKind, MutationMode, MutationRecord, Sequence,
@@ -1468,21 +1468,20 @@ async fn stream_record_to_remote(
     }
 
     let sequence = record.sequence;
-    let blob_journal = Arc::clone(&journal);
-    let blob = tokio::task::spawn_blocking(move || blob_journal.open_verified_blob(sequence))
+    if record
+        .payload()
+        .is_some_and(|(payload_len, _)| payload_len <= REMOTE_SINGLE_PUT_BYTES)
+    {
+        // Keep the complete, already-bounded payload in the same buffer that
+        // was hashed. Both file I/O and SHA-256 stay on the blocking worker,
+        // and corrupt bytes are rejected before backend publication.
+        let blob_journal = Arc::clone(&journal);
+        let collected = tokio::task::spawn_blocking(move || {
+            blob_journal.read_blob_bounded(sequence, REMOTE_SINGLE_PUT_BYTES)
+        })
         .await
-        .map_err(|error| generic_error(format!("journal open task failed: {error}")))?
-        .map_err(|error| generic_error(format!("journal blob open failed: {error:#}")))?;
-    let mut chunks = blob
-        .range_stream(0..blob.len(), REMOTE_STREAM_CHUNK_BYTES)
-        .map_err(|error| generic_error(format!("journal blob stream failed: {error:#}")))?;
-    if blob.len() <= REMOTE_SINGLE_PUT_BYTES {
-        let mut collected = Vec::new();
-        while let Some(chunk) = chunks.next().await {
-            collected.push(chunk.map_err(|error| {
-                generic_error(format!("journal blob stream failed: {error:#}"))
-            })?);
-        }
+        .map_err(|error| generic_error(format!("journal read task failed: {error}")))?
+        .map_err(|error| journal_blob_error("journal blob read failed", error))?;
         let mut options = PutOptions::from(mode.clone());
         options
             .extensions
@@ -1491,7 +1490,7 @@ async fn stream_record_to_remote(
             record,
             "bounded atomic put",
             REMOTE_PUBLICATION_TIMEOUT,
-            remote.put_opts(target, PutPayload::from_iter(collected), options),
+            remote.put_opts(target, collected.into(), options),
         )
         .await;
         return match result {
@@ -1505,6 +1504,14 @@ async fn stream_record_to_remote(
             Err(error) => Err(error),
         };
     }
+    let blob_journal = Arc::clone(&journal);
+    let blob = tokio::task::spawn_blocking(move || blob_journal.open_verified_blob(sequence))
+        .await
+        .map_err(|error| generic_error(format!("journal open task failed: {error}")))?
+        .map_err(|error| journal_blob_error("journal blob open failed", error))?;
+    let mut chunks = blob
+        .range_stream(0..blob.len(), REMOTE_STREAM_CHUNK_BYTES)
+        .map_err(|error| journal_blob_error("journal blob stream failed", error))?;
     if matches!(mode, PutMode::Update(_)) {
         return Err(object_store::Error::NotSupported {
             source: Box::new(crate::retrying_object_store::PermanentError::new(
@@ -1550,7 +1557,7 @@ async fn stream_record_to_remote(
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(error) => {
-                let source = generic_error(format!("journal blob stream failed: {error:#}"));
+                let source = journal_blob_error("journal blob stream failed", error);
                 return abort_remote_multipart(&mut owner, record, source).await;
             }
         };
@@ -1774,13 +1781,20 @@ async fn verify_existing(
     let blob = tokio::task::spawn_blocking(move || blob_journal.open_verified_blob(sequence))
         .await
         .map_err(|error| generic_error(format!("journal open task failed: {error}")))?
-        .map_err(|error| generic_error(format!("journal blob open failed: {error:#}")))?;
+        .map_err(|error| journal_blob_error("journal blob open failed", error))?;
     if meta.size != blob.len() {
         return Err(object_store::Error::AlreadyExists {
             path: target.to_string(),
             source: Box::new(RemoteContentDivergence),
         });
     }
+    // Keep one cursor over the entire committed payload. Independent partial
+    // range streams do not rehash their bytes, so a journal changed after the
+    // initial verification could otherwise reconcile against the same wrong
+    // remote contents and then be retired as durable.
+    let mut local_stream = blob
+        .range_stream(0..blob.len(), REMOTE_STREAM_CHUNK_BYTES)
+        .map_err(|error| journal_blob_error("journal range failed", error))?;
     let mut offset = 0u64;
     while offset < blob.len() {
         let end = offset
@@ -1796,22 +1810,33 @@ async fn verify_existing(
             remote.get_opts(target, options).await?.bytes().await
         })
         .await?;
-        let mut local_stream = blob
-            .range_stream(offset..end, REMOTE_STREAM_CHUNK_BYTES)
-            .map_err(|error| generic_error(format!("journal range failed: {error:#}")))?;
         let local_range = local_stream
             .next()
             .await
             .transpose()
-            .map_err(|error| generic_error(format!("journal range read failed: {error:#}")))?
+            .map_err(|error| journal_blob_error("journal range read failed", error))?
             .unwrap_or_default();
-        if local_stream.next().await.is_some() || remote_range != local_range {
+        if local_range.len() as u64 != end - offset || remote_range != local_range {
             return Err(object_store::Error::AlreadyExists {
                 path: target.to_string(),
                 source: Box::new(RemoteContentDivergence),
             });
         }
         offset = end;
+    }
+    // Exhaust the verifier even for an empty payload, and propagate a final
+    // integrity error rather than treating any extra item as mere divergence.
+    if local_stream
+        .next()
+        .await
+        .transpose()
+        .map_err(|error| journal_blob_error("journal range read failed", error))?
+        .is_some()
+    {
+        return Err(object_store::Error::AlreadyExists {
+            path: target.to_string(),
+            source: Box::new(RemoteContentDivergence),
+        });
     }
     Ok(PutResult {
         e_tag: meta.e_tag,
@@ -1880,6 +1905,34 @@ fn generic_error(message: impl Into<String>) -> object_store::Error {
     object_store::Error::Generic {
         store: "ZeroFSWritebackRemote",
         source: message.into().into(),
+    }
+}
+
+#[derive(Debug)]
+struct JournalBlobFailure(anyhow::Error);
+
+impl std::fmt::Display for JournalBlobFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for JournalBlobFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+fn journal_blob_error(context: &'static str, error: anyhow::Error) -> object_store::Error {
+    let corrupt = error.is::<JournalBlobIntegrityError>();
+    let source = JournalBlobFailure(error.context(context));
+    object_store::Error::Generic {
+        store: "ZeroFSWritebackRemote",
+        source: if corrupt {
+            Box::new(crate::retrying_object_store::PermanentError::new(source))
+        } else {
+            Box::new(source)
+        },
     }
 }
 
@@ -2542,6 +2595,43 @@ mod tests {
             )),
         };
         assert!(is_terminal_remote_error(&permanent));
+    }
+
+    #[test]
+    fn scheduler_classifier_rejects_typed_journal_corruption_but_retries_io_errors() {
+        use crate::writeback::journal::JournalBlobIntegrityError;
+
+        for source in [
+            JournalBlobIntegrityError::HashMismatch,
+            JournalBlobIntegrityError::LengthMismatch,
+            JournalBlobIntegrityError::ChangedWhileStreaming,
+        ] {
+            let message = source.to_string();
+            let error = super::journal_blob_error(
+                "journal blob read failed",
+                anyhow::Error::new(source).context("nested read context"),
+            );
+            assert!(is_terminal_remote_error(&error), "{error}");
+            assert!(error.to_string().contains(&message), "{error}");
+        }
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Interrupted,
+        ] {
+            let error = super::journal_blob_error(
+                "journal blob read failed",
+                std::io::Error::from(kind).into(),
+            );
+            assert!(!is_terminal_remote_error(&error), "{error}");
+        }
+        let error = super::journal_blob_error(
+            "journal blob read failed",
+            anyhow::anyhow!("committed blob hash mismatch"),
+        );
+        assert!(
+            !is_terminal_remote_error(&error),
+            "untyped message text must not determine the retry contract"
+        );
     }
 
     #[tokio::test]

@@ -1,0 +1,241 @@
+use super::*;
+
+const NAMES: [&[u8]; 4] = [b"file", b"directory", b"symlink", b"fifo"];
+
+fn test_creds() -> Credentials {
+    Credentials::from_auth_context(&AuthContext {
+        uid: 1000,
+        gid: 1000,
+        ..AuthContext::default()
+    })
+}
+
+async fn bind_parent(handler: &NinePHandler, parent: InodeId, creds: Credentials) {
+    let inode = handler.filesystem.visible_inode(parent).await.unwrap();
+    handler.session_state().fids.insert(
+        1,
+        FidSlot::unopened(Fid {
+            path: vec![Bytes::copy_from_slice(inode.name().unwrap())],
+            inode_id: parent,
+            root: 0,
+            qid: inode_to_qid(&inode, parent),
+            opened: false,
+            mode: None,
+            creds,
+        }),
+    );
+}
+
+async fn create_kind(
+    handler: &NinePHandler,
+    kind: usize,
+    gid: u32,
+) -> P9Result<(InodeId, FileAttributes)> {
+    let name = P9String::new(NAMES[kind].to_vec());
+    match kind {
+        0 => {
+            handler
+                .create_child(&handler.get_fid(1)?, &name.data, 0o600, gid, [0; 16])
+                .await
+        }
+        1 => {
+            handler
+                .make_dir(
+                    &Tmkdir {
+                        dfid: 1,
+                        name,
+                        mode: 0o700,
+                        gid,
+                    },
+                    [0; 16],
+                )
+                .await
+        }
+        2 => {
+            handler
+                .make_symlink(
+                    &Tsymlink {
+                        dfid: 1,
+                        name,
+                        symtgt: P9String::new(b"target".to_vec()),
+                        gid,
+                    },
+                    [0; 16],
+                )
+                .await
+        }
+        3 => {
+            handler
+                .make_node(
+                    &Tmknod {
+                        dfid: 1,
+                        name,
+                        mode: S_IFIFO | 0o600,
+                        major: 0,
+                        minor: 0,
+                        gid,
+                    },
+                    [0; 16],
+                )
+                .await
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn requested_creation_gid_never_changes_parent_authorization() {
+    struct Case {
+        name: &'static [u8],
+        mode: u32,
+        parent_gid: u32,
+        complete: bool,
+        supplementary: &'static [u32],
+    }
+    let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+    let owner = test_creds();
+    for case in [
+        Case {
+            name: b"mode-missing-group",
+            mode: 0o731,
+            parent_gid: 300,
+            complete: true,
+            supplementary: &[],
+        },
+        Case {
+            name: b"mode-primary-group",
+            mode: 0o703,
+            parent_gid: 2000,
+            complete: true,
+            supplementary: &[300],
+        },
+        Case {
+            name: b"mode-unknown-primary-group",
+            mode: 0o703,
+            parent_gid: 2000,
+            complete: false,
+            supplementary: &[],
+        },
+    ] {
+        let (parent, _) = fs
+            .mkdir(
+                &owner,
+                0,
+                case.name,
+                &SetAttributes {
+                    mode: SetMode::Set(case.mode),
+                    gid: SetGid::Set(case.parent_gid),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let actor = Credentials::from_auth_context(&AuthContext {
+            uid: 2000,
+            gid: 2000,
+            gids: case.supplementary.to_vec(),
+            groups_complete: case.complete,
+            groups_truncated: false,
+            ..AuthContext::default()
+        });
+        let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+        bind_parent(&handler, parent, actor).await;
+        for (kind, name) in NAMES.iter().enumerate() {
+            let result = create_kind(&handler, kind, 300).await;
+            assert_eq!(
+                result.unwrap_err().to_errno(),
+                crate::linux_errno::EACCES,
+                "case {:?}, kind {kind}",
+                case.name
+            );
+            assert_eq!(
+                fs.lookup(&owner, parent, name).await,
+                Err(FsError::NotFound)
+            );
+        }
+        assert_eq!(handler.get_fid(1).unwrap().creds.gid, actor.gid);
+    }
+}
+
+#[tokio::test]
+async fn creation_gid_selection_preserves_inheritance_and_listener_override() {
+    let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+    let owner = test_creds();
+    for (index, inherit, override_credentials) in [
+        (0, false, false),
+        (1, true, false),
+        (2, false, true),
+        (3, true, true),
+    ] {
+        let (parent, _) = fs
+            .mkdir(
+                &owner,
+                0,
+                format!("creation-gid-{index}").as_bytes(),
+                &SetAttributes {
+                    mode: SetMode::Set(if inherit { 0o2777 } else { 0o777 }),
+                    gid: SetGid::Set(4000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+        let (handler, actor) = if override_credentials {
+            let handler = handler.with_credential_override(2000, 2000);
+            let actor = handler.creds_for(9999, "untrusted");
+            (handler, actor)
+        } else {
+            (
+                handler,
+                Credentials::from_auth_context(&AuthContext {
+                    uid: 2000,
+                    gid: 2000,
+                    gids: vec![300],
+                    ..AuthContext::default()
+                }),
+            )
+        };
+        bind_parent(&handler, parent, actor).await;
+        let expected_gid = if inherit {
+            4000
+        } else if override_credentials {
+            2000
+        } else {
+            300
+        };
+        for kind in 0..NAMES.len() {
+            let (_, attrs) = create_kind(&handler, kind, 300).await.unwrap();
+            assert_eq!(attrs.uid, 2000);
+            assert_eq!(attrs.gid, expected_gid, "case {index}, kind {kind}");
+            if kind == 1 {
+                assert_eq!(attrs.mode & 0o2000 != 0, inherit);
+            }
+        }
+        assert_eq!(handler.get_fid(1).unwrap().creds.gid, actor.gid);
+    }
+}
+
+#[tokio::test]
+async fn creation_group_hint_is_rejected_by_setattr() {
+    let fs = ZeroFS::new_in_memory().await.unwrap();
+    let owner = test_creds();
+    let (id, _) = fs
+        .create(&owner, 0, b"setattr", &SetAttributes::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        fs.setattr(
+            &owner,
+            id,
+            &SetAttributes {
+                gid: SetGid::InheritOr(300),
+                ..Default::default()
+            }
+        )
+        .await
+        .map(|_| ()),
+        Err(FsError::InvalidArgument)
+    );
+    assert_eq!(fs.inode_store.get(id).await.unwrap().gid(), owner.gid);
+}

@@ -242,6 +242,9 @@ pub enum SetUid {
 #[derive(Debug, Clone)]
 pub enum SetGid {
     Set(u32),
+    /// Creation only: inherit a setgid parent's group, otherwise use this
+    /// requested group without changing the caller's authorization identity.
+    InheritOr(u32),
     NoChange,
 }
 
@@ -293,7 +296,9 @@ impl From<SetAttributes> for sattr3 {
                 SetUid::NoChange => set_uid3::Void,
             },
             gid: match attrs.gid {
-                SetGid::Set(g) => set_gid3::gid(g),
+                // The wire field carries the requested group. Parent
+                // inheritance policy belongs to the receiving create path.
+                SetGid::Set(g) | SetGid::InheritOr(g) => set_gid3::gid(g),
                 SetGid::NoChange => set_gid3::Void,
             },
             size: match attrs.size {
@@ -370,9 +375,12 @@ pub struct AuthContext {
     pub gid: u32,
     pub gid_known: bool,
     pub gids: Vec<u32>,
-    /// False only when group DAC was already checked before this context was
-    /// created and the complete supplementary-group list was unavailable.
+    /// Whether the complete supplementary-group list is present. An upstream
+    /// incomplete list may rely on prior kernel DAC; local truncation may not.
     pub groups_complete: bool,
+    /// Preserves local truncation through Credentials-to-AuthContext roundtrips
+    /// so lost groups cannot acquire the upstream kernel-authorized fallback.
+    pub groups_truncated: bool,
 }
 
 impl Default for AuthContext {
@@ -383,6 +391,7 @@ impl Default for AuthContext {
             gid_known: true,
             gids: Vec::new(),
             groups_complete: true,
+            groups_truncated: false,
         }
     }
 }
@@ -395,6 +404,7 @@ impl From<&zerofs_nfsserve::vfs::AuthContext> for AuthContext {
             gid_known: true,
             gids: auth.gids.clone(),
             groups_complete: true,
+            groups_truncated: false,
         }
     }
 }
@@ -407,6 +417,7 @@ impl From<&super::permissions::Credentials> for AuthContext {
             gid_known: creds.gid_known,
             gids: creds.groups[..creds.groups_count].to_vec(),
             groups_complete: creds.groups_complete,
+            groups_truncated: creds.groups_truncated,
         }
     }
 }
