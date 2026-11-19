@@ -41,7 +41,8 @@ pub async fn run(command: PoolCommands) -> Result<()> {
     }
     let config = match &command {
         PoolCommands::Affected { .. } => unreachable!(),
-        PoolCommands::Init { config }
+        PoolCommands::VerifyRaw { config }
+        | PoolCommands::Init { config }
         | PoolCommands::List { config }
         | PoolCommands::Migrate { config, .. }
         | PoolCommands::Verify { config, .. } => config,
@@ -49,14 +50,42 @@ pub async fn run(command: PoolCommands) -> Result<()> {
             config.as_ref().context("--config required offline")?
         }
     };
-    let settings = Settings::from_file(config)?;
+    let settings = Settings::from_runtime_file(config)?;
+    let verify = matches!(command, PoolCommands::VerifyRaw { .. });
+    anyhow::ensure!(
+        !verify || settings.raw_device_p3_nas_fit(),
+        "pool verify-raw requires the NAS-fit raw-device profile"
+    );
+    let admission = if settings.raw_device_p3_nas_fit() {
+        Some(
+            super::memory_budget::validate_server_startup(&settings)?
+                .context("raw pool maintenance requires finite cgroup admission")?,
+        )
+    } else {
+        None
+    };
     let initialize = matches!(command, PoolCommands::Init { .. });
-    let (opened, pool) = open_pool_storage(&settings, initialize)
+    let (mut opened, pool) = open_pool_storage(&settings, initialize)
         .await
         .context("cannot open storage pool; stop the ZeroFS server before maintenance")?;
     let sessions = opened.sftp_pool.clone();
     let result: Result<()> = async {
+        let journal = if admission.is_some() && (initialize || verify) {
+            let region = opened.raw_journal.take().context("missing held raw journal region")?;
+            Some(super::init::raw_pool_journal(&settings, &pool, &opened.path, region, initialize).await?)
+        } else { None };
         match command {
+            PoolCommands::VerifyRaw { .. } => {
+                let progress = journal.context("raw journal was not verified")?.progress()?;
+                let status = pool.status().await?;
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                    "schema_version": 1, "profile": "raw-device-p3-nas-fit-v1",
+                    "pool_id": status.pool_id, "members": status.members,
+                    "authority_verified": true, "catalog_verified": true, "key_envelope_verified": true,
+                    "journal_verified": true, "local_seq": progress.local_seq, "remote_seq": progress.remote_seq,
+                    "memory": admission
+                }))?);
+            }
             PoolCommands::Affected { .. } => unreachable!(),
             PoolCommands::Init { .. } | PoolCommands::Status { .. } => {
                 println!("{}", serde_json::to_string_pretty(&pool.status().await?)?);

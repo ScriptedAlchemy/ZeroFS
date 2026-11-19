@@ -1043,3 +1043,50 @@ fn handles_are_refused_once_poisoned() {
     assert!(store.put(b"x", b"v").is_err());
     assert!(matches!(store.handle(b"k"), Err(Error::Poisoned)));
 }
+
+#[test]
+fn live_index_refusal_leaves_tail_and_checkpoint_unchanged() {
+    let scratch = Scratch::new(SIZE);
+    let mut store = provision(&scratch);
+    let existing = 0u64.to_le_bytes();
+    store.put(&existing, b"first").unwrap();
+    store.flush().unwrap();
+    let entry = store.index[existing.as_slice()];
+    for i in 1..MAX_INDEX_KEYS as u64 {
+        store.index.insert(i.to_le_bytes().to_vec(), entry);
+    }
+    let before = store.geometry();
+    for _ in 0..2 {
+        assert!(matches!(
+            store.put(b"new key", b"never appended"),
+            Err(Error::IndexFull {
+                limit: MAX_INDEX_KEYS
+            })
+        ));
+        assert_eq!(store.geometry(), before);
+        assert!(!store.is_poisoned());
+    }
+    store.put(&existing, b"replacement").unwrap();
+    assert!(store.delete(&existing).unwrap());
+    store.put(b"new key", b"now fits").unwrap();
+    store.flush().unwrap();
+    let reopened = reopen(&scratch);
+    assert_eq!(reopened.get(b"new key").unwrap().unwrap(), b"now fits");
+    assert!(reopened.get(&existing).unwrap().is_none());
+}
+
+#[test]
+fn subregion_io_preserves_offsets_above_four_gibibytes() {
+    let start = 12 << 30;
+    let device_size = start + SIZE;
+    let scratch = Scratch::new(device_size);
+    let region = Region::new(scratch.file(), device_size, start, SIZE).unwrap();
+    let mut store = RawStore::provision_region(region, id()).unwrap();
+    store.put(b"key", b"high-offset value").unwrap();
+    store.flush().unwrap();
+    drop(store);
+    let region = Region::new(scratch.file(), device_size, start, SIZE).unwrap();
+    let reopened = RawStore::open_region(region, id()).unwrap();
+    assert_eq!(reopened.get(b"key").unwrap().unwrap(), b"high-offset value");
+    assert_eq!(scratch.read_at(0, BLOCK), vec![0; BLOCK]);
+}

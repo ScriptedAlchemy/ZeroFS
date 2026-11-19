@@ -12,11 +12,7 @@ pub(crate) struct Region {
 impl Region {
     pub(crate) fn whole(file: File, len: u64) -> Result<Self> {
         crate::format::check_device_size(len).map_err(Error::InvalidGeometry)?;
-        let mut probe = [0; 1];
-        if len == 0
-            || file.read_at(&mut probe, len - 1)? != 1
-            || file.read_at(&mut probe, len)? != 0
-        {
+        if device_size(&file)? != len {
             return Err(Error::InvalidGeometry(
                 "device must end exactly at the supplied size".into(),
             ));
@@ -25,6 +21,7 @@ impl Region {
     }
 
     pub(crate) fn new(file: File, device_len: u64, start: u64, len: u64) -> Result<Self> {
+        crate::format::check_device_size(device_len).map_err(Error::InvalidGeometry)?;
         if !start.is_multiple_of(BLOCK_SIZE)
             || !len.is_multiple_of(BLOCK_SIZE)
             || len == 0
@@ -63,4 +60,28 @@ impl Region {
     pub(crate) fn sync_data(&self) -> io::Result<()> {
         self.file.sync_data()
     }
+}
+
+fn device_size(file: &File) -> Result<u64> {
+    let metadata = file.metadata()?;
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::{fd::AsRawFd, unix::fs::FileTypeExt};
+
+        if metadata.file_type().is_block_device() {
+            let mut size = 0u64;
+            // BLKGETSIZE64 returns the size of this descriptor's block device.
+            let result = unsafe { libc::ioctl(file.as_raw_fd(), 0x80081272, &mut size) };
+            if result < 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            return Ok(size);
+        }
+    }
+    Err(Error::InvalidGeometry(
+        "raw descriptor must be a regular file or a Linux block device".into(),
+    ))
 }

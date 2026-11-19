@@ -609,6 +609,7 @@ mod raw_candidate {
         let receipt = validate(root, &raised, Some(8 * GIB), "0\n").unwrap();
         assert_eq!(receipt, baseline);
         assert_eq!(receipt.required_bytes, 7_504 * MIB);
+        assert_eq!(receipt.included_companion_bytes, GIB);
         assert!(receipt.required_bytes < 8 * GIB);
         assert_eq!(receipt.hard_limit_bytes, 8 * GIB);
         assert!(receipt.stored_state_qualification.is_none());
@@ -631,6 +632,65 @@ mod raw_candidate {
         assert_eq!(store.max_inflight_seals, Some(1));
         for unused in ["unused-clean-cache", "unused-directory-journal"] {
             assert!(!root.join(unused).exists());
+        }
+    }
+
+    #[test]
+    fn raw_nas_fit_admits_sparse_disk_geometry_at_eight_gib_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for (name, size) in [("p3", 64 * GIB), ("small", 12 * GIB), ("large", 16 * GIB)] {
+            File::create(root.join(name))
+                .unwrap()
+                .set_len(size)
+                .unwrap();
+        }
+        let config = include_str!("memory_raw_nas_fit_fixture.toml")
+            .replace("/fixture/", &format!("{}/", root.display()));
+        let receipt = validate(root, &config, Some(8 * GIB), "0").unwrap();
+        assert_eq!(receipt.included_companion_bytes, 3 * GIB / 2);
+        assert_eq!(receipt.required_bytes, 6_992 * MIB);
+        assert!(receipt.stored_state_qualification.is_none());
+        assert!(
+            receipt
+                .accounting
+                .contains("memory_policy=raw-device-p3-nas-fit-v1")
+        );
+
+        let error = validate(root, &config, Some(9 * GIB), "0").unwrap_err();
+        assert!(format!("{error:#}").contains("exactly 8 GiB"), "{error:#}");
+        let error = validate(root, &config, Some(8 * GIB), "1").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("memory.swap.max = 0"),
+            "{error:#}"
+        );
+        let legacy = config.replace("raw-device-p3-nas-fit-v1", "raw-device-p3-candidate-v1");
+        let error = validate(root, &legacy, Some(8 * GIB), "0").unwrap_err();
+        assert!(format!("{error:#}").contains("profile"), "{error:#}");
+    }
+
+    #[test]
+    fn physical_contract_requires_distinct_designations_exact_geometry_and_nas_fit_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = include_str!("memory_raw_physical_test.toml");
+        // This is config admission only. No host inventory or device is opened.
+        let read = |toml: &str| validate(temp.path(), toml, Some(8 * GIB), "0");
+        let receipt = read(config).unwrap();
+        assert_eq!(receipt.included_companion_bytes, 1536 * MIB);
+        for (old, new) in [
+            ("/hdd6?", "/hdd18?"),
+            ("/hdd6?", "/dev/sda?"),
+            ("/hdd18?", "/ZL213G03?"),
+            ("/nvme?", "/hdd18?"),
+            ("raw+disk:///hdd6", "raw+loop:///hdd6"),
+            ("raw+disk:///hdd6?", "raw+disk:///hdd6?backing=/tmp/unused&"),
+            ("layout_bytes=", "layout_mib="),
+            ("6001.175126016", "6001.174126016"),
+            ("reserve_free_gb = 181.0", "reserve_free_gb = 1.0"),
+        ] {
+            let changed = config.replace(old, new);
+            assert_ne!(config, changed);
+            assert!(read(&changed).is_err(), "{changed}");
         }
     }
 

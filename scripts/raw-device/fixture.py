@@ -8,6 +8,7 @@ from pathlib import Path
 import stat
 import struct
 import tempfile
+import time
 
 
 @contextlib.contextmanager
@@ -47,19 +48,21 @@ def device(backing, nodes):
             finally:
                 handle.close()  # kernel autoclear on last close
                 try:
-                    with node.open("rb", buffering=0) as probe:
-                        remaining = bytearray(232)
-                        try:
-                            fcntl.ioctl(probe, 0x4C05, remaining, True)
-                        except OSError as error:
-                            if error.errno != errno.ENXIO:
-                                raise
-                        else:
-                            if struct.unpack_from("=QQ", remaining) == (
-                                meta.st_dev,
-                                meta.st_ino,
-                            ):
-                                raise RuntimeError("owned loop mapping remained active")
+                    deadline = time.monotonic() + 5
+                    while True:
+                        with node.open("rb", buffering=0) as probe:
+                            remaining = bytearray(232)
+                            try:
+                                fcntl.ioctl(probe, 0x4C05, remaining, True)
+                            except OSError as error:
+                                if error.errno != errno.ENXIO:
+                                    raise
+                                break
+                            if struct.unpack_from("=QQ", remaining) != (meta.st_dev, meta.st_ino):
+                                break
+                        if time.monotonic() >= deadline:
+                            raise RuntimeError("owned loop mapping remained active")
+                        time.sleep(0.05)
                 finally:
                     node.unlink()
             return

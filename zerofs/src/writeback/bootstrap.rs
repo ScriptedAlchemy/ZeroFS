@@ -58,6 +58,17 @@ pub(crate) async fn attach_raw(
         ),
     }
 
+    let region = apply_raw_budget(region, &settings)?;
+    let journal = Arc::new(Journal::open_raw(region, identity)?);
+    let space = Arc::new(PhysicalSpaceSampler::new_raw(Arc::clone(&journal)));
+    tracing::info!("using raw P3 Journal for writeback metadata and payloads");
+    attach_journal(remote, settings, journal, space).await
+}
+
+pub(crate) fn apply_raw_budget(
+    region: zerofs_raw_device::journal_region::TransactionRegion,
+    settings: &WritebackSettings,
+) -> anyhow::Result<zerofs_raw_device::journal_region::TransactionRegion> {
     let capacity = region.capacity();
     let ceiling = capacity
         .checked_sub(settings.min_free_bytes)
@@ -68,15 +79,7 @@ pub(crate) async fn attach_raw(
         settings.disk_bytes <= ceiling / 4,
         "raw writeback disk budget exceeds one quarter of the usable P3 Journal bytes ({ceiling})"
     );
-    let region = region.with_resize_ceiling(ceiling)?;
-    let journal = Arc::new(Journal::open_raw(region, identity)?);
-    let space = Arc::new(PhysicalSpaceSampler::new_raw(Arc::clone(&journal)));
-    tracing::info!(
-        capacity,
-        ceiling,
-        "using raw P3 Journal for writeback metadata and payloads"
-    );
-    attach_journal(remote, settings, journal, space).await
+    Ok(region.with_resize_ceiling(ceiling)?)
 }
 
 async fn attach_journal(
@@ -90,7 +93,7 @@ async fn attach_journal(
     let pending = journal.pending_ssd_reservations()?;
     let ssd = Arc::new(SsdAdmission::recover(
         settings.disk_bytes,
-        1 << 20,
+        journal.max_pending_operations(),
         settings.high_watermark_percent,
         settings.resume_percent,
         settings.min_free_bytes,

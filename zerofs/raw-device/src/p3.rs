@@ -20,7 +20,25 @@ pub struct P3Layout {
 }
 
 impl P3Layout {
+    /// Whole-device size used by the bounded file-backed NAS-fit fixture.
+    pub const NAS_FIT_FIXTURE_BYTES: u64 = 64 << 30;
+
+    /// Check the NAS-fit region contract. The final role owns exactly the
+    /// remaining bytes and must still meet the minimum and alignment bounds.
+    pub fn validate_nas_fit(device_len: u64, lengths: [u64; 6]) -> Result<()> {
+        const MIB: u64 = 1 << 20;
+        const FIXED: [u64; 5] = [61_440 * MIB, 128 * MIB, 3072 * MIB, 16 * MIB, 32 * MIB];
+        if lengths[..FIXED.len()] != FIXED {
+            return Err(Error::InvalidGeometry(
+                "NAS-fit P3 layout requires 61440/128/3072/16/32 MiB before the remainder".into(),
+            ));
+        }
+        Self::new(device_len, lengths)?;
+        Ok(())
+    }
+
     pub fn new(device_len: u64, lengths: [u64; 6]) -> Result<Self> {
+        crate::format::check_device_size(device_len).map_err(Error::InvalidGeometry)?;
         let total = lengths.iter().try_fold(0u64, |sum, &n| sum.checked_add(n));
         if total != Some(device_len)
             || lengths

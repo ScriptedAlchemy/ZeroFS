@@ -1,14 +1,30 @@
 //! Explicit synthetic device binding. The persisted locator is independent
 //! of Linux's ephemeral loop number and tmpfs staging paths.
 use anyhow::{Context, Result, bail, ensure};
-use std::path::{Component, PathBuf};
+use std::path::{Component, Path as FsPath, PathBuf};
 use url::Url;
 use uuid::Uuid;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RawKind {
+    SmallLoop,
+    LargeLoop,
+    Physical,
+}
+
+pub(crate) fn is_p3(scheme: &str) -> bool {
+    matches!(scheme, "raw+p3-v2" | "raw+p3-fixture" | "raw+p3-disk")
+}
+
+pub(crate) fn is_payload(scheme: &str) -> bool {
+    matches!(scheme, "raw+loop" | "raw+fixture-loop" | "raw+disk")
+}
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct RawBinding {
     pub node: PathBuf,
-    pub backing: PathBuf,
+    pub kind: RawKind,
+    backing: Option<PathBuf>,
     pub pool: Uuid,
     pub member: Uuid,
     pub layout: Option<[u64; 6]>,
@@ -30,28 +46,58 @@ impl RawBinding {
     pub(crate) fn parse(url: &Url) -> Result<Self> {
         ensure!(
             cfg!(target_os = "linux")
-                && matches!(url.scheme(), "raw+loop" | "raw+p3-v2")
+                && (is_payload(url.scheme()) || is_p3(url.scheme()))
                 && url.host().is_none()
                 && url.fragment().is_none()
                 && !url.path().contains('%'),
             "raw+loop requires an absolute Linux device path without host or fragment"
         );
         let node = path(url.path())?;
+        let kind = match url.scheme() {
+            "raw+disk" | "raw+p3-disk" => RawKind::Physical,
+            "raw+fixture-loop" | "raw+p3-fixture" => RawKind::LargeLoop,
+            _ => RawKind::SmallLoop,
+        };
+        if kind == RawKind::Physical {
+            ensure!(
+                matches!(
+                    (url.scheme(), url.path()),
+                    ("raw+p3-disk", "/nvme") | ("raw+disk", "/hdd6" | "/hdd18")
+                ),
+                "physical role does not match the designated disk"
+            );
+        }
         let mut backing = None;
         let mut layout = None;
         let mut pool = None;
         let mut member = None;
         for (key, value) in url.query_pairs() {
             match key.as_ref() {
-                "backing" if backing.is_none() => backing = Some(path(&value)?),
+                "backing" if kind != RawKind::Physical && backing.is_none() => {
+                    backing = Some(path(&value)?)
+                }
                 "pool" if pool.is_none() => pool = Some(Uuid::parse_str(&value)?),
                 "member" if member.is_none() => member = Some(Uuid::parse_str(&value)?),
-                "layout_mib" if url.scheme() == "raw+p3-v2" && layout.is_none() => {
+                field
+                    if is_p3(url.scheme())
+                        && layout.is_none()
+                        && field
+                            == if kind == RawKind::Physical {
+                                "layout_bytes"
+                            } else {
+                                "layout_mib"
+                            } =>
+                {
+                    let unit = if kind == RawKind::Physical {
+                        1
+                    } else {
+                        1 << 20
+                    };
                     let lengths = value
                         .split(',')
                         .map(|n| -> Result<_> {
                             n.parse::<u64>()?
-                                .checked_mul(1 << 20)
+                                .checked_mul(unit)
                                 .filter(|len| *len > 0)
                                 .context("invalid P3 role length")
                         })
@@ -72,15 +118,48 @@ impl RawBinding {
             "nil raw device binding UUID"
         );
         ensure!(
-            url.scheme() != "raw+p3-v2" || layout.is_some(),
-            "missing explicit P3 layout_mib"
+            !is_p3(url.scheme()) || layout.is_some(),
+            "missing explicit P3 region lengths"
+        );
+        ensure!(
+            kind == RawKind::Physical || backing.is_some(),
+            "missing raw backing path"
         );
         Ok(Self {
+            kind,
             layout,
             node,
-            backing: backing.context("missing raw backing path")?,
+            backing,
             pool,
             member,
+        })
+    }
+
+    pub(crate) fn backing_path(&self) -> Option<&FsPath> {
+        self.backing.as_deref()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn claim(&self) -> Result<zerofs_raw_device::claim::Claim> {
+        use zerofs_raw_device::claim::Claim;
+        Ok(match self.kind {
+            RawKind::Physical => Claim::physical(
+                self.node
+                    .to_str()
+                    .context("invalid designation")?
+                    .trim_start_matches('/')
+                    .parse()?,
+            )?,
+            RawKind::LargeLoop => Claim::allocated_fixture(
+                &self.node,
+                self.backing_path()
+                    .context("missing allocated fixture backing")?,
+            )?,
+            RawKind::SmallLoop => Claim::synthetic(
+                &self.node,
+                self.backing_path()
+                    .context("missing tmpfs fixture backing")?,
+            )?,
         })
     }
 
@@ -99,7 +178,7 @@ pub(super) async fn open_member(
     use crate::raw_member::RawMemberStore;
     use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
-    use zerofs_raw_device::{Identity, RawStore, Role, claim::Claim};
+    use zerofs_raw_device::{Identity, RawStore, Role};
 
     #[derive(Debug)]
     struct RawSpace {
@@ -129,10 +208,11 @@ pub(super) async fn open_member(
     let capacity = config.capacity_bytes()?;
     let reserve = config.reserve_free_bytes()?;
     tokio::task::spawn_blocking(move || {
-        let claim = Claim::synthetic(&binding.node, &binding.backing)
+        let claim = binding
+            .claim()
             .with_context(|| format!("claim raw member {id}"))?;
         ensure!(
-            !exact_size || claim.size == capacity,
+            (!exact_size && binding.kind == RawKind::SmallLoop) || claim.size == capacity,
             "held raw device for {id} does not match admitted capacity"
         );
         let device = claim.device.metadata()?.rdev();
@@ -149,7 +229,14 @@ pub(super) async fn open_member(
         // The raw log is append-only. A logical overwrite or a catalog delete
         // cannot make already-appended physical bytes available for reuse.
         let physical_floor = reserve.max(claim.size.saturating_sub(capacity));
-        let store = RawMemberStore::new(store, claim, physical_floor)?;
+        let mut store = RawMemberStore::new(store, claim, physical_floor)?;
+        if binding.kind == RawKind::LargeLoop
+            && let Some(value) = std::env::var_os("ZEROFS_FIXTURE_MEMBER_PUT_DELAY_MS")
+        {
+            let ms: u64 = value.to_str().context("invalid fixture pacing")?.parse()?;
+            ensure!(ms <= 5000, "fixture PUT delay exceeds five seconds");
+            store.fixture_put_delay = std::time::Duration::from_millis(ms);
+        }
         let min_free_bytes = store.capacity()?.reserve_bytes;
         Ok(PoolMember {
             id,
@@ -208,21 +295,35 @@ pub(super) struct OpenP3 {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) async fn open_p3(binding: RawBinding) -> Result<OpenP3> {
+pub(super) async fn open_p3(binding: RawBinding, initialize: bool) -> Result<OpenP3> {
     use crate::parse_object_store::ParsedStore;
     use crate::pool_object_store::CatalogSource;
     use crate::raw_member::RawMemberStore;
     use object_store::path::Path;
     use std::sync::Arc;
-    use zerofs_raw_device::{claim::Claim, p3::P3Layout};
+    use zerofs_raw_device::p3::P3Layout;
     tokio::task::spawn_blocking(move || {
-        let claim = Arc::new(Claim::synthetic(&binding.node, &binding.backing)?);
+        let claim = Arc::new(binding.claim()?);
         let layout = P3Layout::new(claim.size, binding.layout.context("missing raw P3 layout")?)?;
         let roles = layout.open_v2(
             claim.device.try_clone()?,
             *binding.pool.as_bytes(),
             *binding.member.as_bytes(),
         )?;
+        if binding.kind != RawKind::SmallLoop {
+            if initialize {
+                ensure!(
+                    roles.journal.is_empty()? && roles.catalog.is_empty()?
+                        && roles.metadata.is_empty() && roles.keys.is_empty()
+                        && roles.scratch.is_empty() && roles.cache.is_empty(),
+                    "explicit raw pool initialization requires freshly provisioned, unused P3 roles; refusing to initialize over existing or partial state"
+                );
+            } else {
+                ensure!(!roles.journal.is_empty()?, "original raw P3 journal is missing; recovery required");
+                ensure!(!roles.catalog.is_empty()?, "original raw P3 catalog is missing; recovery required");
+                ensure!(!roles.metadata.is_empty(), "original raw P3 authority is missing; recovery required");
+            }
+        }
         let path = Path::from("db");
         let envelope = path
             .clone()
@@ -232,6 +333,9 @@ pub(super) async fn open_p3(binding: RawBinding) -> Result<OpenP3> {
             !roles.metadata.contains_key(key) && roles.keys.keys().all(|stored| stored == key),
             "raw authority and key-envelope regions contain misplaced objects"
         );
+        if binding.kind != RawKind::SmallLoop && !initialize {
+            ensure!(roles.keys.contains_key(key), "original raw key envelope is missing; recovery required");
+        }
         let store = super::raw_authority::RawAuthority {
             envelope,
             metadata: RawMemberStore::new(roles.metadata, claim.clone(), 0)?,
@@ -251,6 +355,6 @@ pub(super) async fn open_p3(binding: RawBinding) -> Result<OpenP3> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(super) async fn open_p3(_: RawBinding) -> Result<OpenP3> {
+pub(super) async fn open_p3(_: RawBinding, _: bool) -> Result<OpenP3> {
     bail!("raw+p3-v2 requires Linux")
 }
