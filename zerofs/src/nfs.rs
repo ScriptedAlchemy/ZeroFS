@@ -5,7 +5,7 @@ use crate::fs::inode::Inode;
 use crate::fs::mutation::durability::DurabilityTarget;
 use crate::fs::mutation::overlay::IdentifiedWrite;
 use crate::fs::mutation::types::{RequestIdentity, RequestLifetime};
-use crate::fs::permissions::{AccessMode, Credentials, check_access};
+use crate::fs::permissions::{AccessMode, Credentials, check_access_with_acl};
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{AuthContext, FileType, InodeWithId, SetAttributes, SetGid, SetUid};
 use async_trait::async_trait;
@@ -15,10 +15,10 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 use zerofs_nfsserve::nfs::{
-    ACCESS3_DELETE, ACCESS3_EXECUTE, ACCESS3_EXTEND, ACCESS3_LOOKUP, ACCESS3_MODIFY, ACCESS3_READ,
-    FSF_CANSETTIME, FSF_HOMOGENEOUS, FSF_LINK, FSF_SYMLINK, fattr3, fileid3, filename3, fsinfo3,
-    fsstat3, ftype3, nfspath3, nfsstat3, nfstime3, post_op_attr, sattr3, specdata3, stable_how,
-    writeverf3,
+    ACCESS3_ALL, ACCESS3_DELETE, ACCESS3_EXECUTE, ACCESS3_EXTEND, ACCESS3_LOOKUP, ACCESS3_MODIFY,
+    ACCESS3_READ, FSF_CANSETTIME, FSF_HOMOGENEOUS, FSF_LINK, FSF_SYMLINK, fattr3, fileid3,
+    filename3, fsinfo3, fsstat3, ftype3, nfspath3, nfsstat3, nfstime3, post_op_attr, sattr3,
+    specdata3, stable_how, writeverf3,
 };
 use zerofs_nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use zerofs_nfsserve::vfs::{
@@ -227,8 +227,14 @@ impl NFSFileSystem for NFSAdapter {
     ) -> Result<AccessResult, nfsstat3> {
         let auth = self.auth_context(auth);
         let creds = Credentials::from_auth_context(&auth);
+        let _guard = self.fs.lock_manager.acquire(id).await;
         let inode = self.fs.visible_inode(id).await?;
-        let allows = |mode| check_access(&inode, &creds, mode).is_ok();
+        let acl = if requested & ACCESS3_ALL != 0 {
+            self.fs.access_acl(id, &inode, &creds).await?
+        } else {
+            None
+        };
+        let allows = |mode| check_access_with_acl(&inode, &creds, mode, acl.as_ref()).is_ok();
         // NFS ACCESS reports each requested right independently. Directory
         // mutations require both write and search permission.
         let mut access = 0;

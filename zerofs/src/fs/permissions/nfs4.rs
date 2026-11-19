@@ -250,6 +250,7 @@ impl Caller {
             groups,
             groups_count: self.groups.len(),
             groups_complete: true,
+            groups_truncated: false,
         }
     }
 }

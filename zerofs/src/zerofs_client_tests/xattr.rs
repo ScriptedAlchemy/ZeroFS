@@ -447,6 +447,7 @@ async fn xattr_wire_plain_dialect_carries_linux_v9fs_acl_frames() {
         gid_known: true,
         gids: vec![],
         groups_complete: true,
+        groups_truncated: false,
     };
     assert!(fs.read_file(&named, id, 0, 1).await.is_ok());
     let list = c.read_named(4, b"").await.unwrap();

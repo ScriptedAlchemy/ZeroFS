@@ -108,18 +108,6 @@ pub enum AccessMode {
     Execute,
 }
 
-#[cfg(test)]
-/// Mode-bit check for an inode the caller has not looked up an ACL for.
-/// Paths that can reach an inode carrying a POSIX access ACL must use
-/// `ZeroFS::check_inode_access` instead.
-pub(crate) fn check_access(
-    inode: &Inode,
-    creds: &Credentials,
-    mode: AccessMode,
-) -> Result<(), FsError> {
-    check_access_with_acl(inode, creds, mode, None)
-}
-
 /// Linux `generic_permission` with an optional access ACL. `acl` is the
 /// stored ACL; owner, mask and other permissions come from the inode mode.
 pub(crate) fn check_access_with_acl(
@@ -261,9 +249,12 @@ mod tests {
         });
         for mode in [0o000, 0o444, 0o600, 0o666] {
             let inode = directory(mode);
-            assert_eq!(check_access(&inode, &root, AccessMode::Execute), Ok(()));
             assert_eq!(
-                check_access(&inode, &owner, AccessMode::Execute),
+                check_access_with_acl(&inode, &root, AccessMode::Execute, None),
+                Ok(())
+            );
+            assert_eq!(
+                check_access_with_acl(&inode, &owner, AccessMode::Execute, None),
                 Err(FsError::PermissionDenied),
                 "an ordinary owner still needs directory search permission"
             );
@@ -284,9 +275,18 @@ mod tests {
             } else {
                 Ok(())
             };
-            assert_eq!(check_access(&inode, &root, AccessMode::Execute), expected);
-            assert_eq!(check_access(&inode, &root, AccessMode::Read), Ok(()));
-            assert_eq!(check_access(&inode, &root, AccessMode::Write), Ok(()));
+            assert_eq!(
+                check_access_with_acl(&inode, &root, AccessMode::Execute, None),
+                expected
+            );
+            assert_eq!(
+                check_access_with_acl(&inode, &root, AccessMode::Read, None),
+                Ok(())
+            );
+            assert_eq!(
+                check_access_with_acl(&inode, &root, AccessMode::Write, None),
+                Ok(())
+            );
         }
     }
     #[test]
@@ -305,18 +305,18 @@ mod tests {
         // The caller really belongs to the denied owning group, but its ID
         // fell beyond the inline list. Falling through to OTHER would allow.
         assert_eq!(
-            check_access(&omitted_group_inode, &creds, AccessMode::Read),
+            check_access_with_acl(&omitted_group_inode, &creds, AccessMode::Read, None),
             Err(FsError::PermissionDenied)
         );
         for mode in [0o640, 0o604] {
             assert_eq!(
-                check_access(&directory(mode), &creds, AccessMode::Read),
+                check_access_with_acl(&directory(mode), &creds, AccessMode::Read, None),
                 Err(FsError::PermissionDenied)
             );
         }
         // If both possible classes allow the request, truncation is harmless.
         assert_eq!(
-            check_access(&directory(0o644), &creds, AccessMode::Read),
+            check_access_with_acl(&directory(0o644), &creds, AccessMode::Read, None),
             Ok(())
         );
         assert!(!creds.is_member_of_group(1000));
@@ -350,7 +350,7 @@ mod tests {
         let roundtrip = Credentials::from_auth_context(&auth);
         assert!(roundtrip.groups_truncated);
         assert_eq!(
-            check_access(&directory(0o640), &roundtrip, AccessMode::Read),
+            check_access_with_acl(&directory(0o640), &roundtrip, AccessMode::Read, None),
             Err(FsError::PermissionDenied)
         );
         assert!(!roundtrip.is_member_of_group(1000));
@@ -378,7 +378,7 @@ mod tests {
         });
         assert!(!creds.groups_truncated);
         assert_eq!(
-            check_access(&directory(0o640), &creds, AccessMode::Read),
+            check_access_with_acl(&directory(0o640), &creds, AccessMode::Read, None),
             Ok(())
         );
         assert!(creds.is_member_of_group(1000));
@@ -386,7 +386,7 @@ mod tests {
         assert!(!roundtrip.groups_complete);
         assert!(!roundtrip.groups_truncated);
         assert_eq!(
-            check_access(&directory(0o604), &roundtrip, AccessMode::Read),
+            check_access_with_acl(&directory(0o604), &roundtrip, AccessMode::Read, None),
             Ok(())
         );
     }

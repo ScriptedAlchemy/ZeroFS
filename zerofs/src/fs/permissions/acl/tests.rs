@@ -11,6 +11,7 @@ fn creds(uid: u32, groups: &[u32]) -> Credentials {
         gid_known: true,
         gids: groups.to_vec(),
         groups_complete: true,
+        groups_truncated: false,
     })
 }
 

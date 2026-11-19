@@ -1,6 +1,5 @@
 use super::*;
 use crate::fs::types::SetMode;
-use zerofs_nfsserve::nfs::ACCESS3_ALL;
 
 fn auth(uid: u32, gid: u32, gids: &[u32]) -> NfsAuthContext {
     NfsAuthContext {
@@ -82,4 +81,35 @@ async fn access_honors_modes_shared_identity_and_requested_rights() {
             .access,
         writable
     );
+}
+
+#[tokio::test]
+async fn access_honors_named_user_acl_and_owning_group_entry() {
+    use crate::fs::permissions::acl::PosixAcl;
+    use crate::fs::{XattrName, XattrSetMode, XattrValue};
+
+    let (fs, owner, file) = fixture().await;
+    let acl = PosixAcl::from_text("u::rw-,u:2000:r--,g::---,m::r--,o::---");
+    fs.set_xattr(
+        &owner,
+        file,
+        &XattrName::new(b"system.posix_acl_access").unwrap(),
+        XattrValue::new(acl.to_bytes()).unwrap(),
+        XattrSetMode::Either,
+    )
+    .await
+    .unwrap();
+
+    let adapter = NFSAdapter::new(fs);
+    let named = adapter
+        .access(&auth(2000, 2000, &[]), file, ACCESS3_ALL)
+        .await
+        .unwrap();
+    assert_eq!(named.access, ACCESS3_READ);
+    assert_eq!(named.attributes.mode, 0o640);
+    let owning_group = adapter
+        .access(&auth(3000, 1000, &[]), file, ACCESS3_ALL)
+        .await
+        .unwrap();
+    assert_eq!(owning_group.access, 0);
 }
