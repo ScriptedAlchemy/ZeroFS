@@ -1521,8 +1521,12 @@ impl ExtentStore {
             }
         }
 
-        self.stage_edits(txn, id, &edits, old_size.div_ceil(EXTENT_SIZE as u64))
-            .await?;
+        // All frame locations and the inode update still publish in one
+        // transaction, even when the data spans several sealed objects.
+        for batch in edits.chunks(self.max_append_extents) {
+            self.stage_edits(txn, id, batch, old_size.div_ceil(EXTENT_SIZE as u64))
+                .await?;
+        }
 
         Ok(match tail {
             Some(data) => TailUpdate::Set {

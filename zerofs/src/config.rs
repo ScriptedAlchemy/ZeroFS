@@ -324,6 +324,8 @@ pub struct StoreProfile {
     pub seal_threshold: Option<usize>,
     /// Segment seals allowed in flight at once.
     pub max_inflight_seals: Option<usize>,
+    /// Maximum plaintext in one segment reservation within a file transaction.
+    pub max_segment_append_bytes: Option<usize>,
     /// Clean-cache budget for decoded plaintext extents.
     pub decoded_extent_cache_bytes: Option<usize>,
     /// Cold segment-read prefetch geometry.
@@ -342,6 +344,7 @@ impl From<SftpDataProfile> for StoreProfile {
         Self {
             seal_threshold: Some(profile.segment_size_bytes),
             max_inflight_seals: Some(profile.max_inflight_seals),
+            max_segment_append_bytes: None,
             decoded_extent_cache_bytes: None,
             prefetch: crate::object_store_prefetch::PrefetchProfile::tuned(
                 profile.read_cache_part_size_bytes,
@@ -2407,6 +2410,10 @@ impl Settings {
             return Ok(StoreProfile {
                 seal_threshold: Some(StoreProfile::RAW_CANDIDATE_SEAL_BYTES),
                 max_inflight_seals: Some(StoreProfile::RAW_CANDIDATE_INFLIGHT),
+                // A single protocol WRITE can exceed the whole 8 MiB object
+                // budget. Allow rotation within it, leaving room for the open
+                // segment, frame encoding and sealed directory.
+                max_segment_append_bytes: Some(StoreProfile::RAW_CANDIDATE_SEAL_BYTES / 2),
                 ..StoreProfile::default()
             });
         }
