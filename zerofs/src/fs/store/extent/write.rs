@@ -1675,6 +1675,7 @@ mod tests {
         std::fs::write(&config_path, config).unwrap();
         let settings = Settings::from_file(config_path).unwrap();
         let profile = settings.store_profile().unwrap();
+        assert_eq!(profile.max_segment_append_bytes, Some(2 << 20));
         let writeback_settings = settings
             .writeback_settings(WritebackAccessMode::ReadWrite)
             .unwrap()
@@ -1732,11 +1733,12 @@ mod tests {
             profile.seal_threshold.unwrap(),
             profile.max_inflight_seals.unwrap(),
             32 << 20,
-        );
+        )
+        .with_max_segment_append_bytes(profile.max_segment_append_bytes);
 
         // Leave the same lane just below its rotation threshold, then append
-        // the largest standard 9P write. Each whole request claims one batch,
-        // so the resulting object is larger than the former 8 MiB RAM tier.
+        // the largest standard 9P write. The production append limit must
+        // rotate within that request and keep every resulting object bounded.
         let prefix = Bytes::from(incompressible(
             41,
             profile.seal_threshold.unwrap() - 2 * EXTENT_SIZE,
@@ -1747,16 +1749,16 @@ mod tests {
             42,
             (ninep_proto::P9_MAX_MSIZE - ninep_proto::P9_TWRITE_HDR) as usize,
         ));
-        write_committed(
-            &store,
-            &db,
-            1,
-            prefix.len() as u64,
-            &data,
-            prefix.len() as u64,
-        )
-        .await;
         tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            write_committed(
+                &store,
+                &db,
+                1,
+                prefix.len() as u64,
+                &data,
+                prefix.len() as u64,
+            )
+            .await;
             store.seal_open().await.unwrap();
             attached
                 .lifecycle
@@ -1766,13 +1768,23 @@ mod tests {
         })
         .await
         .expect("maximum 9P write must reach local durability within the raw profile");
-        let loc = frameloc_of(&store, &db, 1, 0).await.unwrap();
-        let object = Path::from(format!("db/{}", loc.segid.object_key()));
-        assert!(attached.store.head(&object).await.unwrap().size > 8 << 20);
+        let mut segids = HashSet::new();
+        for extent in 0..(prefix.len() + data.len()).div_ceil(EXTENT_SIZE) {
+            let loc = frameloc_of(&store, &db, 1, extent as u64).await.unwrap();
+            segids.insert(loc.segid);
+        }
         assert!(
-            remote.head(&object).await.is_err(),
-            "remote replay stays paused"
+            segids.len() > 1,
+            "the maximum write must span several objects"
         );
+        for segid in segids {
+            let object = Path::from(format!("db/{}", segid.object_key()));
+            assert!(attached.store.head(&object).await.unwrap().size < 8 << 20);
+            assert!(
+                remote.head(&object).await.is_err(),
+                "remote replay stays paused"
+            );
+        }
         drop(store);
 
         // A fresh extent store has no plaintext or open-segment cache. Its
@@ -1786,6 +1798,119 @@ mod tests {
         assert_eq!(&actual[prefix.len()..], data.as_ref());
         drop(reopened);
         attached.lifecycle.shutdown().await.unwrap();
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bounded_append_batches_publish_atomically_and_preserve_accounting() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let (store, db) = make().await;
+        let store = store
+            .with_seal_threshold(2 * EXTENT_SIZE)
+            .with_max_segment_append_bytes(Some(2 * EXTENT_SIZE));
+        let old = Bytes::from(incompressible(51, 6 * EXTENT_SIZE));
+        write_committed(&store, &db, 1, 0, &old, 0).await;
+        store.seal_open().await.unwrap();
+        let before = store.sample_footprint().await.unwrap();
+        let mut expected_live = HashMap::new();
+        for extent in 0..6 {
+            let loc = frameloc_of(&store, &db, 1, extent).await.unwrap();
+            expected_live.insert(loc.segid, 0_u64);
+        }
+        assert!(expected_live.len() > 1);
+
+        // Partial head and tail extents and whole holes cross three batches.
+        let offset = EXTENT_SIZE / 2;
+        let mut replacement = incompressible(52, 5 * EXTENT_SIZE);
+        replacement[EXTENT_SIZE / 2..3 * EXTENT_SIZE / 2].fill(0);
+        replacement[5 * EXTENT_SIZE / 2..7 * EXTENT_SIZE / 2].fill(0);
+        let mut expected = old.to_vec();
+        expected[offset..offset + replacement.len()].copy_from_slice(&replacement);
+        let mut txn = db.new_transaction().unwrap();
+        let tail = store
+            .write(
+                &mut txn,
+                1,
+                offset as u64,
+                &Bytes::from(replacement),
+                old.len() as u64,
+            )
+            .await
+            .unwrap();
+        assert!(txn.has_extent_ref_guard());
+        assert!(store.extent_ref_barrier.try_write().is_err());
+        assert_eq!(store.read(1, 0, old.len() as u64).await.unwrap(), old);
+        assert_eq!(store.sample_footprint().await.unwrap(), before);
+
+        commit(&store, txn).await;
+        store.apply_tail_update(1, tail);
+        assert!(store.extent_ref_barrier.try_write().is_ok());
+        assert_read_matches(&store, &expected).await;
+        for extent in 0..6 {
+            let loc = frameloc_of(&store, &db, 1, extent).await;
+            if matches!(extent, 1 | 3) {
+                assert!(loc.is_none(), "an all-zero extent must become a hole");
+            } else {
+                let loc = loc.unwrap();
+                *expected_live.entry(loc.segid).or_default() += u64::from(loc.byte_len);
+            }
+        }
+        for (&segid, &live) in &expected_live {
+            assert_eq!(segcount_of(&store, &db, segid).await, live);
+        }
+        let committed = store.sample_footprint().await.unwrap();
+        assert_eq!(committed.live_bytes, expected_live.values().sum::<u64>());
+        assert!(committed.reclaimable_bytes > 0);
+        let gauges = store.segment_gc_stats();
+        assert_eq!(gauges.segment_count.load(Relaxed), committed.segment_count);
+        assert_eq!(
+            gauges.appended_bytes.load(Relaxed),
+            committed.appended_bytes
+        );
+        assert_eq!(gauges.live_bytes.load(Relaxed), committed.live_bytes);
+        assert_eq!(
+            gauges.reclaimable_bytes.load(Relaxed),
+            committed.reclaimable_bytes
+        );
+
+        store.seal_open().await.unwrap();
+        // Fail rotation after the first chunk has staged. The next chunk must
+        // fail the whole write without publishing that first chunk or its deltas.
+        store.seal_residency_sem.close();
+        let mut txn = db.new_transaction().unwrap();
+        let error = store
+            .write(
+                &mut txn,
+                1,
+                0,
+                &Bytes::from(incompressible(53, old.len())),
+                old.len() as u64,
+            )
+            .await
+            .err()
+            .expect("the closed seal residency budget must stop the next chunk");
+        assert_eq!(error, FsError::IoError);
+        assert!(
+            !txn.is_empty(),
+            "the first chunk must have staged before failure"
+        );
+        assert!(store.extent_ref_barrier.try_write().is_err());
+        drop(txn);
+        assert!(store.extent_ref_barrier.try_write().is_ok());
+        assert_read_matches(&store, &expected).await;
+        assert_eq!(store.sample_footprint().await.unwrap(), committed);
+        assert_eq!(gauges.segment_count.load(Relaxed), committed.segment_count);
+        assert_eq!(
+            gauges.appended_bytes.load(Relaxed),
+            committed.appended_bytes
+        );
+        assert_eq!(gauges.live_bytes.load(Relaxed), committed.live_bytes);
+        assert_eq!(
+            gauges.reclaimable_bytes.load(Relaxed),
+            committed.reclaimable_bytes
+        );
+        drop(store);
         db.close().await.unwrap();
     }
 

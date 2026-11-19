@@ -341,8 +341,10 @@ impl Claim {
         let device =
             File::from(fd.ok_or_else(|| io::Error::other("missing exclusive claim descriptor"))?);
         let mut fields = response[REQUEST_LEN..]
-            .chunks_exact(8)
-            .map(|b| u64::from_le_bytes(b.try_into().unwrap()));
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| u64::from_le_bytes(*b));
         let actual = super::physical::held_geometry(&device, role.expected_bytes())?;
         require(
             actual.into_iter().all(|v| fields.next() == Some(v)),

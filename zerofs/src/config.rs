@@ -2413,9 +2413,9 @@ impl Settings {
             return Ok(StoreProfile {
                 seal_threshold: Some(StoreProfile::RAW_CANDIDATE_SEAL_BYTES),
                 max_inflight_seals: Some(StoreProfile::RAW_CANDIDATE_INFLIGHT),
-                // A single protocol WRITE can exceed the whole 8 MiB object
-                // budget. Allow rotation within it, leaving room for the open
-                // segment, frame encoding and sealed directory.
+                // Split large protocol writes into bounded reservations so a
+                // seal exceeds its threshold by at most one append plus frame
+                // and directory encoding.
                 max_segment_append_bytes: Some(StoreProfile::RAW_CANDIDATE_SEAL_BYTES / 2),
                 ..StoreProfile::default()
             });
