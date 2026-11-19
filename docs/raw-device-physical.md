@@ -75,3 +75,15 @@ Scratch and the large clean-cache extent are currently unused. The engine runs t
 Ordinary WRITE can complete in volatile memory. Explicit FLUSH waits for local durability, which can leave the only recoverable copy on the P3 until HDD drain. Sustained throughput after the dirty window fills depends on destination progress. The 512 MiB journal proposal has been superseded. Physical link speed, actual HDD/SSD throughput and power-loss persistence require separate measurements.
 
 Payload and authority logs append. Overwrites and deletion do not reclaim their old physical records. A 65,536-live-key index limit can stop allocation well before reaching a multi-terabyte device's nominal capacity. Catalog capacity, degraded cold startup and recovery after P3 loss remain release gates. Physical qualification still needs actual-device exclusivity, sustained drain, power-loss and restart evidence. [Emulated claim tests](evidence/raw-physical-claim-vm/README.md) · [Large loop fixture](evidence/large-raw/README.md)
+
+## Per-file drain observation
+
+After fsync and remote drain, query the running engine once for each test file.
+
+```sh
+zerofs pool file-placement --endpoint unix:/run/zerofs-app/engine/rpc.sock /copy.bin
+```
+
+The reply identifies the resolved inode and file size. Each member receives an extent count and logical byte count clipped to EOF. The engine reads that inode's indexed extents and size from one metadata snapshot, then looks up their segment owners in one catalog read transaction. The report retains one counter per distinct segment, up to 65,536 segments, and returns one counter pair per member. It reads placement metadata without reading file payloads.
+
+Use a quiescent file for acceptance. Sparse or as-yet unindexed data contributes to `unindexed_bytes`. Indexed bytes without a committed member identity contribute to `unattributed`. For a fully drained, dense test file, both values should be zero and the member bytes should sum to the verified file size. A concurrent rename can change which path names the reported inode after lookup. Member counts describe the recorded placement. Cold readback verifies the payload, and host device counters measure physical traffic including metadata and padding.

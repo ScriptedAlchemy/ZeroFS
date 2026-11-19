@@ -635,6 +635,18 @@ def smoke(binary: Path, root: Path) -> dict:
             command(binary, deadline, "upload", server.target, root / "sources" / name,
                     f"/{name}", "--jobs", "1")
         download_and_verify(binary, deadline, server, root, "before", expected)
+        reported_members = set()
+        for name in expected:
+            placement = command_json(binary, deadline, "pool", "file-placement",
+                                     "--endpoint", f"unix:{root / 'admin.sock'}", f"/{name}")
+            members = placement["members"]
+            require(placement["file_bytes"] == PAYLOAD_BYTES and placement["unindexed_bytes"] == 0
+                    and placement["unattributed"]["logical_bytes"] == 0
+                    and sum(row["logical_bytes"] for row in members.values()) == PAYLOAD_BYTES
+                    and sum(row["extents"] for row in members.values()) == PAYLOAD_BYTES // 32768,
+                    f"incomplete placement after synced upload of {name}: {placement}")
+            reported_members.update(members)
+        require(reported_members == {"disk1", "disk2"}, "file reports missed quota spill")
 
     original = placement_snapshot(binary, deadline, root, config)
     before = original["status"]

@@ -8,6 +8,7 @@
 
 mod capacity;
 mod catalog;
+mod file_placement;
 mod health;
 mod recovery;
 mod space;

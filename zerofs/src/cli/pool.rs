@@ -7,7 +7,16 @@ use anyhow::{Context, Result};
 use object_store::path::Path;
 
 pub async fn run(command: PoolCommands) -> Result<()> {
-    if let PoolCommands::Affected { endpoint, member } = &command {
+    let endpoint = match &command {
+        PoolCommands::Affected { endpoint, .. }
+        | PoolCommands::FilePlacement { endpoint, .. }
+        | PoolCommands::Status {
+            endpoint: Some(endpoint),
+            ..
+        } => Some(endpoint),
+        _ => None,
+    };
+    if let Some(endpoint) = endpoint {
         let mut client = if let Some(path) = endpoint.strip_prefix("unix:") {
             crate::rpc::client::RpcClient::connect_unix(path.into()).await?
         } else {
@@ -18,29 +27,22 @@ pub async fn run(command: PoolCommands) -> Result<()> {
             )
             .await?
         };
-        println!("{}", client.pool_affected(member.clone()).await?);
-        return Ok(());
-    }
-    if let PoolCommands::Status {
-        endpoint: Some(endpoint),
-        ..
-    } = &command
-    {
-        let mut client = if let Some(path) = endpoint.strip_prefix("unix:") {
-            crate::rpc::client::RpcClient::connect_unix(path.into()).await?
-        } else {
-            crate::rpc::client::RpcClient::connect_tcp(
-                endpoint
-                    .parse()
-                    .context("endpoint must be unix:/path or IP:port")?,
-            )
-            .await?
+        let report = match command {
+            PoolCommands::Affected { member, .. } => client.pool_affected(member).await?,
+            PoolCommands::FilePlacement { path, .. } => {
+                use std::os::unix::ffi::OsStringExt;
+                client
+                    .file_placement(path.into_os_string().into_vec())
+                    .await?
+            }
+            PoolCommands::Status { .. } => client.pool_status().await?,
+            _ => unreachable!(),
         };
-        println!("{}", client.pool_status().await?);
+        println!("{report}");
         return Ok(());
     }
     let config = match &command {
-        PoolCommands::Affected { .. } => unreachable!(),
+        PoolCommands::Affected { .. } | PoolCommands::FilePlacement { .. } => unreachable!(),
         PoolCommands::VerifyRaw { config }
         | PoolCommands::Init { config }
         | PoolCommands::List { config }
@@ -88,7 +90,7 @@ pub async fn run(command: PoolCommands) -> Result<()> {
                     "journal_allocation": allocation, "memory": admission
                 }))?);
             }
-            PoolCommands::Affected { .. } => unreachable!(),
+            PoolCommands::Affected { .. } | PoolCommands::FilePlacement { .. } => unreachable!(),
             PoolCommands::Init { .. } | PoolCommands::Status { .. } => {
                 println!("{}", serde_json::to_string_pretty(&pool.status().await?)?);
             }

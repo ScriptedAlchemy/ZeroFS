@@ -299,6 +299,47 @@ fn delete_dir_contents<'a>(
 
 #[tonic::async_trait]
 impl AdminService for AdminRpcServer {
+    async fn get_file_placement(
+        &self,
+        request: Request<proto::GetFilePlacementRequest>,
+    ) -> Result<Response<proto::GetFilePlacementResponse>, Status> {
+        let pool = self
+            .pool
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("no permanent pool configured"))?;
+        let path = request.into_inner().path;
+        if path.len() > 4096 || path.first() != Some(&b'/') || path.last() == Some(&b'/') {
+            return Err(Status::invalid_argument(
+                "expected an absolute regular-file path of at most 4096 bytes",
+            ));
+        }
+        let creds = Credentials::from_auth_context(&root_auth());
+        let mut inode = 0;
+        for component in path[1..].split(|b| *b == b'/') {
+            if component.is_empty()
+                || component == b"."
+                || component == b".."
+                || component.contains(&0)
+            {
+                return Err(Status::invalid_argument("invalid file path component"));
+            }
+            inode = self
+                .fs
+                .lookup(&creds, inode, component)
+                .await
+                .map_err(|e| match e {
+                    FsError::NotFound => Status::not_found("file path does not exist"),
+                    _ => Status::failed_precondition(e.to_string()),
+                })?;
+        }
+        let report = pool
+            .file_placement(&self.fs, inode)
+            .await
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        let json = serde_json::to_string(&report).map_err(|e| Status::internal(e.to_string()))?;
+        self.success_response(proto::GetFilePlacementResponse { json })
+    }
+
     async fn get_pool_affected(
         &self,
         request: Request<proto::GetPoolAffectedRequest>,

@@ -1169,6 +1169,37 @@ impl Catalog {
         Ok(Snapshot { entries, hidden })
     }
 
+    pub(super) fn attribute_file_segments(
+        &self,
+        prefix: &str,
+        segments: BTreeMap<crate::segment::Segid, super::file_placement::ExtentCount>,
+        report: &mut super::file_placement::FilePlacement,
+    ) -> Result<()> {
+        let read = self.database.begin_read()?;
+        let table = read.open_table(OBJECTS)?;
+        for (id, count) in segments {
+            let relative = id.object_key();
+            let key = if prefix.is_empty() {
+                relative
+            } else {
+                format!("{prefix}/{relative}")
+            };
+            let bucket = if let Some(value) = table.get(key.as_str())? {
+                let entry: Entry = bincode::deserialize(value.value())?;
+                if let Some(member) = entry.physical.member_id() {
+                    report.members.entry(member.to_owned()).or_default()
+                } else {
+                    &mut report.unattributed
+                }
+            } else {
+                &mut report.unattributed
+            };
+            bucket.extents += count.extents;
+            bucket.logical_bytes += count.logical_bytes;
+        }
+        Ok(())
+    }
+
     pub fn placement_page(&self, after: &str) -> Result<Vec<PoolPlacement>> {
         let tx = self.database.begin_read()?;
         let table = tx.open_table(OBJECTS)?;

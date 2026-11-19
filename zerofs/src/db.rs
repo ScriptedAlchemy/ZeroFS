@@ -783,23 +783,7 @@ impl Db {
     pub(crate) async fn scan_metadata_snapshot(
         &self,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<(Bytes, Bytes)>> + Send + '_>>> {
-        self.check_lease()?;
-        let options = ScanOptions {
-            read_ahead_bytes: 1,
-            cache_blocks: false,
-            max_fetch_tasks: 1,
-            ..Default::default()
-        };
-        let (iter, snapshot) = match &self.inner {
-            SlateDbHandle::ReadWrite(db) => {
-                let snapshot = db.snapshot().await?;
-                let iter = snapshot.scan_with_options(.., &options).await?;
-                (iter, Some(snapshot))
-            }
-            SlateDbHandle::ReadOnly(reader) => {
-                (reader.load().scan_with_options(.., &options).await?, None)
-            }
-        };
+        let (iter, snapshot) = self.metadata_snapshot_range(..).await?;
         Ok(Box::pin(futures::stream::try_unfold(
             (iter, snapshot),
             |(mut iter, snapshot)| async move {
@@ -809,6 +793,30 @@ impl Db {
                 }
             },
         )))
+    }
+
+    pub(crate) async fn metadata_snapshot_range<R: slatedb::ByteRangeBounds + Send>(
+        &self,
+        range: R,
+    ) -> Result<(slatedb::DbIterator, Option<Arc<slatedb::DbSnapshot>>)> {
+        self.check_lease()?;
+        let options = ScanOptions {
+            read_ahead_bytes: 1,
+            cache_blocks: false,
+            max_fetch_tasks: 1,
+            ..Default::default()
+        };
+        Ok(match &self.inner {
+            SlateDbHandle::ReadWrite(db) => {
+                let snapshot = db.snapshot().await?;
+                let iter = snapshot.scan_with_options(range, &options).await?;
+                (iter, Some(snapshot))
+            }
+            SlateDbHandle::ReadOnly(reader) => (
+                reader.load().scan_with_options(range, &options).await?,
+                None,
+            ),
+        })
     }
 
     pub(crate) async fn scan_bounded<R: slatedb::ByteRangeBounds + Send>(

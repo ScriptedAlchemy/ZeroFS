@@ -16,6 +16,15 @@ pub struct RpcClient {
 }
 
 impl RpcClient {
+    pub async fn file_placement(&mut self, path: Vec<u8>) -> Result<String> {
+        Ok(self
+            .client
+            .get_file_placement(proto::GetFilePlacementRequest { path })
+            .await?
+            .into_inner()
+            .json)
+    }
+
     pub async fn pool_affected(&mut self, member: String) -> Result<String> {
         Ok(self
             .client

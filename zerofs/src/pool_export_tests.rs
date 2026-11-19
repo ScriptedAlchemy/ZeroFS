@@ -547,6 +547,36 @@ async fn affected_paths(fs: &ZeroFS, pool: &PoolObjectStore, member: &str) -> Ve
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_placement_counts_only_the_named_inode_and_clips_its_last_extent() {
+    let root = tempfile::tempdir().unwrap();
+    let mut settings = settings(root.path());
+    settings.storage.pool.as_mut().unwrap().segment_placement =
+        crate::config::SegmentPlacement::RoundRobinLocal;
+    let (fs, pool) = open(&settings, true).await;
+    let inode = write_sealed_file(&fs, b"target", 0x31).await;
+    let offset = 3 * crate::fs::EXTENT_SIZE;
+    fs.write(
+        &(&credentials()).into(),
+        inode,
+        offset as u64,
+        &bytes::Bytes::from_static(b"tail"),
+    )
+    .await
+    .unwrap();
+    fs.client_fsync().await.unwrap();
+    write_sealed_file(&fs, b"other", 0x33).await;
+    let report = pool.file_placement(&fs, inode).await.unwrap();
+    assert_eq!(report.file_bytes, (offset + 4) as u64);
+    assert_eq!(report.unindexed_bytes, crate::fs::EXTENT_SIZE as u64);
+    assert_eq!(report.unattributed.logical_bytes, 0);
+    assert_eq!(report.members["disk-a"].extents, 2);
+    assert_eq!(report.members["disk-a"].logical_bytes, PAYLOAD_SIZE as u64);
+    assert_eq!(report.members["disk-b"].logical_bytes, 4);
+    assert!(pool.file_placement(&fs, 0).await.is_err());
+    close(fs, pool).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn degraded_cold_start_serves_survivor_and_reports_missing_files() {
     use crate::config::SegmentPlacement;
     use crate::fs::errors::FsError;

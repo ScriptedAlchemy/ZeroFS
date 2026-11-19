@@ -249,6 +249,13 @@ pub enum PoolCommands {
         #[arg(short, long)]
         config: PathBuf,
     },
+    /// Count one file's indexed logical bytes per committed pool member
+    FilePlacement {
+        #[arg(long)]
+        endpoint: String,
+        /// Absolute path in the ZeroFS namespace
+        path: PathBuf,
+    },
     /// Report live and retained-checkpoint affected paths without reading data disks
     Affected {
         #[arg(long)]
