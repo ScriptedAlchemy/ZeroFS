@@ -3014,9 +3014,13 @@ async fn segment_target_survives_capacity_refusal_reopen_and_replay() {
     let occupant = segment(701);
     let mut options = create_options();
     options.extensions.insert(SegmentTarget("hdd-b".into()));
-    pool.put_opts(&occupant, Bytes::from_static(b"occupied").into(), options.clone())
-        .await
-        .unwrap();
+    pool.put_opts(
+        &occupant,
+        Bytes::from_static(b"occupied").into(),
+        options.clone(),
+    )
+    .await
+    .unwrap();
 
     let pending = segment(702);
     let failure = pool
@@ -3029,7 +3033,11 @@ async fn segment_target_survives_capacity_refusal_reopen_and_replay() {
 
     let pool = fixture.reopen().await.unwrap();
     let failure = pool
-        .put_opts(&pending, Bytes::from_static(b"payload").into(), create_options())
+        .put_opts(
+            &pending,
+            Bytes::from_static(b"payload").into(),
+            create_options(),
+        )
         .await
         .unwrap_err();
     assert!(crate::retrying_object_store::is_no_space(&failure));
@@ -3053,7 +3061,9 @@ async fn quarantined_segment_target_refuses_creation_without_spilling() {
     let fixture = Fixture::new(32);
     let pool = fixture.initialize().await;
     let location = segment(703);
-    pool.quarantine("hdd-b", "synthetic offline member").await.unwrap();
+    pool.quarantine("hdd-b", "synthetic offline member")
+        .await
+        .unwrap();
     let mut options = PutMultipartOptions::default();
     let capability = ConditionalMultipartCreate::for_payload_len(4);
     options.extensions.insert(capability.clone());
@@ -3061,11 +3071,39 @@ async fn quarantined_segment_target_refuses_creation_without_spilling() {
     assert!(pool.put_multipart_opts(&location, options).await.is_err());
     assert!(!capability.is_acknowledged());
     assert!(
-        pool.put_opts(&location, Bytes::from_static(b"data").into(), create_options())
-            .await
-            .is_err()
+        pool.put_opts(
+            &location,
+            Bytes::from_static(b"data").into(),
+            create_options()
+        )
+        .await
+        .is_err()
     );
     assert!(pool.placements().await.unwrap().is_empty());
     create(&pool, &segment(704), b"healthy").await;
     assert_eq!(pool.placements().await.unwrap()[0].member_id, "hdd-a");
+}
+
+#[tokio::test]
+async fn segment_target_cannot_override_an_inflight_multipart_reservation() {
+    let fixture = Fixture::new(32);
+    let pool = fixture.initialize().await;
+    let location = segment(705);
+    let mut upload = multipart(&pool, &location, 4).await;
+    let mut options = create_options();
+    options.extensions.insert(SegmentTarget("hdd-b".into()));
+    assert!(
+        pool.put_opts(
+            &location,
+            Bytes::from_static(b"data").into(),
+            options.clone()
+        )
+        .await
+        .is_err()
+    );
+    upload.abort().await.unwrap();
+    pool.put_opts(&location, Bytes::from_static(b"data").into(), options)
+        .await
+        .unwrap();
+    assert_eq!(placement(&pool, &location).await, "hdd-b");
 }
