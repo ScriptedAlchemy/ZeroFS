@@ -4,7 +4,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 #[repr(C)]
@@ -122,8 +122,9 @@ impl Claim {
             "device has holders",
         )?;
         for child in fs::read_dir(&sys)? {
+            let child = child?;
             require(
-                !child?.path().join("partition").exists(),
+                !child.file_type()?.is_dir() || !child.path().join("partition").try_exists()?,
                 "device has partitions",
             )?;
         }
@@ -139,18 +140,5 @@ impl Claim {
             size,
             _backing_lock: backing_lock,
         })
-    }
-
-    pub fn verify_blank(&self) -> io::Result<()> {
-        let mut buf = vec![0; 1 << 20];
-        for offset in (0..self.size).step_by(buf.len()) {
-            let n = (self.size - offset).min(buf.len() as u64) as usize;
-            self.device.read_exact_at(&mut buf[..n], offset)?;
-            require(
-                buf[..n].iter().all(|&b| b == 0),
-                "explicit init requires every byte to be zero",
-            )?;
-        }
-        Ok(())
     }
 }

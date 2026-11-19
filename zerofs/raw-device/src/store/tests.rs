@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
+use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -94,7 +95,7 @@ fn open_err(scratch: &Scratch) -> Error {
 }
 
 fn durable_label(scratch: &Scratch) -> Label {
-    select_label(read_slots(&scratch.file()).unwrap())
+    select_label(read_slots(&Region::new(scratch.file(), SIZE, 0, SIZE).unwrap()).unwrap())
         .unwrap()
         .0
 }
@@ -248,7 +249,7 @@ fn every_flush_leaves_both_slots_identical() {
             .unwrap();
         if i % 3 == 0 {
             store.flush().unwrap();
-            match read_slots(&scratch.file()).unwrap() {
+            match read_slots(&Region::new(scratch.file(), SIZE, 0, SIZE).unwrap()).unwrap() {
                 [SlotState::Valid(a), SlotState::Valid(b)] => {
                     assert_eq!(a, b);
                     assert_eq!(a, store.label);

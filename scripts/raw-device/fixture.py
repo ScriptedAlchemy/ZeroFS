@@ -14,7 +14,10 @@ import tempfile
 def device(backing, nodes):
     # The loop driver atomically assigns this *open backing descriptor*. No
     # scan, global detach, or pre-existing loop mapping is used.
-    with backing.open("r+b", buffering=0) as disk, open("/dev/loop-control", "rb") as ctl:
+    with (
+        backing.open("r+b", buffering=0) as disk,
+        open("/dev/loop-control", "rb") as ctl,
+    ):
         for _ in range(32):
             minor = fcntl.ioctl(ctl, 0x4C82)  # LOOP_CTL_GET_FREE
             node = nodes / f"loop{minor}"
@@ -52,7 +55,10 @@ def device(backing, nodes):
                             if error.errno != errno.ENXIO:
                                 raise
                         else:
-                            if struct.unpack_from("=QQ", remaining) == (meta.st_dev, meta.st_ino):
+                            if struct.unpack_from("=QQ", remaining) == (
+                                meta.st_dev,
+                                meta.st_ino,
+                            ):
                                 raise RuntimeError("owned loop mapping remained active")
                 finally:
                     node.unlink()

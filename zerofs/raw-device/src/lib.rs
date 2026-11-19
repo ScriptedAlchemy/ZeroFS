@@ -45,6 +45,9 @@
 #![cfg_attr(not(unix), allow(unused))]
 
 mod format;
+pub mod landing;
+pub mod p3;
+mod region;
 mod store;
 
 use std::fmt;
@@ -72,6 +75,10 @@ pub enum Role {
     Data = 1,
     Metadata = 2,
     Journal = 3,
+    Catalog = 4,
+    KeyEnvelope = 5,
+    Scratch = 6,
+    Cache = 7,
 }
 
 impl Role {
@@ -80,6 +87,10 @@ impl Role {
             1 => Some(Self::Data),
             2 => Some(Self::Metadata),
             3 => Some(Self::Journal),
+            4 => Some(Self::Catalog),
+            5 => Some(Self::KeyEnvelope),
+            6 => Some(Self::Scratch),
+            7 => Some(Self::Cache),
             _ => None,
         }
     }
@@ -89,6 +100,10 @@ impl Role {
             Self::Data => "data",
             Self::Metadata => "metadata",
             Self::Journal => "journal",
+            Self::Catalog => "catalog",
+            Self::KeyEnvelope => "key-envelope",
+            Self::Scratch => "scratch",
+            Self::Cache => "cache",
         }
     }
 }

@@ -1,10 +1,10 @@
 //! The store: label handling, log replay, appends, and the flush barrier.
 
+use crate::region::Region;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
-use std::os::unix::fs::FileExt;
 
 use crate::format::{
     BLOCK, Block, Kind, LABEL_SLOTS, LOG_START, Label, RecordHeader, SlotState, blocks_for,
@@ -29,7 +29,7 @@ struct Entry {
 /// `get` takes `&self` and may run concurrently from several threads. Appends
 /// and `flush` take `&mut self`. Dropping the store does not flush.
 pub struct RawStore {
-    file: File,
+    file: Region,
     /// The last durable checkpoint.
     label: Label,
     /// One label slot is damaged, blank, or behind; the next flush rewrites
@@ -63,8 +63,13 @@ impl RawStore {
     /// unless the whole device is zero. The scan costs one full sequential
     /// read of the device.
     pub fn provision(file: File, device_size: u64, identity: Identity) -> Result<Self> {
+        Self::provision_region(Region::whole(file, device_size)?, identity)
+    }
+
+    pub(crate) fn provision_region(file: Region, identity: Identity) -> Result<Self> {
+        let device_size = file.len;
         identity.validate()?;
-        checked_geometry(&file, device_size)?;
+        check_device_size(device_size).map_err(Error::InvalidGeometry)?;
         for state in read_slots(&file)? {
             if let SlotState::Valid(label) = state {
                 return Err(Error::AlreadyProvisioned {
@@ -72,9 +77,7 @@ impl RawStore {
                 });
             }
         }
-        if let Some(offset) = first_nonzero(&file, device_size)? {
-            return Err(Error::NotBlank { offset });
-        }
+        require_blank(&file)?;
 
         let label = Label {
             generation: 1,
@@ -103,8 +106,13 @@ impl RawStore {
     /// appended after the last durable checkpoint is ignored and will be
     /// overwritten by later appends. Open never writes to the device.
     pub fn open(file: File, device_size: u64, expected: Identity) -> Result<Self> {
+        Self::open_region(Region::whole(file, device_size)?, expected)
+    }
+
+    pub(crate) fn open_region(file: Region, expected: Identity) -> Result<Self> {
+        let device_size = file.len;
         expected.validate()?;
-        checked_geometry(&file, device_size)?;
+        check_device_size(device_size).map_err(Error::InvalidGeometry)?;
         let (label, label_degraded) = select_label(read_slots(&file)?)?;
         if label.identity != expected {
             return Err(Error::IdentityMismatch {
@@ -303,11 +311,6 @@ impl RawStore {
         }
     }
 
-    /// Give the device back without flushing.
-    pub fn into_file(self) -> File {
-        self.file
-    }
-
     fn next_checkpoint(&self) -> Result<Label> {
         // u64::MAX is never a valid generation, so the next one must stay
         // below it.
@@ -380,7 +383,7 @@ impl RawStore {
 
 /// Write `label` to slot 0, sync, then slot 1, sync. The fixed order is what
 /// lets open recognise an interrupted checkpoint: slot 1 is never ahead.
-fn write_checkpoint(file: &File, label: &Label) -> io::Result<()> {
+fn write_checkpoint(file: &Region, label: &Label) -> io::Result<()> {
     for slot in 0..LABEL_SLOTS {
         file.write_all_at(&label.encode(slot)[..], slot * BLOCK_SIZE)?;
         file.sync_data()?;
@@ -423,35 +426,12 @@ fn corrupt(offset: u64, reason: &str) -> Error {
     }
 }
 
-/// Require an in-bounds, block-aligned size that is exactly the device's
-/// size: the last block reads in full and nothing reads past it.
-fn checked_geometry(file: &File, device_size: u64) -> Result<()> {
-    check_device_size(device_size).map_err(Error::InvalidGeometry)?;
-    let mut block = zero_block();
-    match file.read_exact_at(&mut block[..], device_size - BLOCK_SIZE) {
-        Ok(()) => {}
-        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
-            return Err(Error::InvalidGeometry(format!(
-                "device ends before the supplied size {device_size}"
-            )));
-        }
-        Err(err) => return Err(err.into()),
-    }
-    let mut probe = [0u8; 1];
-    if file.read_at(&mut probe, device_size)? != 0 {
-        return Err(Error::InvalidGeometry(format!(
-            "device extends past the supplied size {device_size}"
-        )));
-    }
-    Ok(())
-}
-
-fn read_block(file: &File, offset: u64, block: &mut Block) -> Result<()> {
+fn read_block(file: &Region, offset: u64, block: &mut Block) -> Result<()> {
     file.read_exact_at(&mut block[..], offset)?;
     Ok(())
 }
 
-fn read_slots(file: &File) -> Result<[SlotState; 2]> {
+fn read_slots(file: &Region) -> Result<[SlotState; 2]> {
     let mut block = zero_block();
     read_block(file, 0, &mut block)?;
     let first = Label::decode(&block, 0);
@@ -515,7 +495,7 @@ fn describe(state: &SlotState) -> String {
 }
 
 /// Offset of the first nonzero byte anywhere on the device.
-fn first_nonzero(file: &File, device_size: u64) -> Result<Option<u64>> {
+fn first_nonzero(file: &Region, device_size: u64) -> Result<Option<u64>> {
     let mut buf = vec![0u8; SCAN_CHUNK];
     let mut offset = 0;
     while offset < device_size {
@@ -537,3 +517,10 @@ fn random_nonce() -> Result<[u8; 16]> {
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) fn require_blank(file: &Region) -> Result<()> {
+    if let Some(offset) = first_nonzero(file, file.len)? {
+        return Err(Error::NotBlank { offset });
+    }
+    Ok(())
+}
