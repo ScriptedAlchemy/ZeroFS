@@ -135,13 +135,9 @@ jobs:
           # filesystem; the complete kernel source is still unpacked onto NFS
           # and compiled there, with no change to the workload or assertions.
           archive="${RUNNER_TEMP}/linux-7.2-rc1.tar.gz"
-          url="https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/snapshot/linux-7.2-rc1.tar.gz"
           echo "Fetching kernel archive to runner-local scratch"
-          curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
-            --connect-timeout 30 --output "$archive" "$url"
-          test -s "$archive"
-          gzip -t "$archive"
-          echo "Kernel archive verified: $(stat -c %s "$archive") bytes"
+          python3 "$GITHUB_WORKSPACE/scripts/ci/fetch-linux-source.py" \
+            --version 7.2-rc1 --output "$archive"
           echo "Extracting complete kernel source on the ZeroFS NFS mount"
 
           # The previous NFS extraction ran silently for nearly six hours
