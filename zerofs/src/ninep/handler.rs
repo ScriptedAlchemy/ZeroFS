@@ -647,6 +647,16 @@ impl NinePHandler {
             if source != newfid && state.fids.contains_key(&newfid) {
                 return Err(P9Error::FidInUse);
             }
+            // A walk may have snapshotted an ordinary fid before a concurrent
+            // xattrcreate converted it. Never discard that staged value or its
+            // inode pin when publishing the old walk's result.
+            if state
+                .fids
+                .get(&newfid)
+                .is_some_and(|slot| slot.xattr.is_some())
+            {
+                return Err(P9Error::BadFid);
+            }
             state.fids.insert(
                 newfid,
                 FidSlot {
@@ -1493,7 +1503,11 @@ impl NinePHandler {
         {
             return Err(FsError::NotFound.into());
         }
-        let inode = self.filesystem.inode_store.get(id).await?;
+        // Resolve data and metadata in one snapshot while the exact lookup
+        // still owns its parent lock. Rereading after releasing that lock can
+        // lose the original inode to an atomic replacement and turn a
+        // continuously present name into ENOENT.
+        let inode = self.filesystem.visible_inode(id).await?;
         // Pin under the parent lock so final validation can wait for the
         // child lock without losing this directory to a replacement.
         let exact_pin = if check_spelling && inode.is_directory() {
@@ -1629,11 +1643,11 @@ impl NinePHandler {
             pending_directory_pin = step.exact_pin;
         }
 
-        // Complete fallible reads before publishing `newfid`.
+        #[cfg(test)]
+        self.pause_before_exact_walk_pin(rule).await;
+        // A named walk already owns its visible snapshot from resolution.
+        // Only an empty clone needs a fresh read before publishing `newfid`.
         let stat_inode = match last_inode {
-            Some(Inode::File(_)) if self.filesystem.volatile_overlay.get().is_some() => {
-                self.filesystem.visible_inode(current_id).await?
-            }
             Some(inode) => inode,
             None => self.filesystem.visible_inode(current_id).await?,
         };
@@ -1643,8 +1657,6 @@ impl NinePHandler {
         if let Some(qid) = wqids.last_mut() {
             *qid = final_qid;
         }
-        #[cfg(test)]
-        self.pause_before_exact_walk_pin(rule).await;
         let directory_pin = self
             .pin_walk_target(
                 current_id,
@@ -4318,6 +4330,229 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn walk_publication_preserves_a_concurrently_staged_xattr() {
+        for (compound, empty) in [(false, false), (true, false), (true, true)] {
+            let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+            let creds = test_creds();
+            let (source, _) = fs
+                .mkdir(&creds, 0, b"source", &SetAttributes::default())
+                .await
+                .unwrap();
+            let (target, _) = fs
+                .mkdir(&creds, source, b"target", &SetAttributes::default())
+                .await
+                .unwrap();
+            let handler = NinePHandler::new(fs.clone(), Arc::new(FileLockManager::new()));
+            start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+            handler
+                .walk(
+                    Twalk {
+                        fid: 1,
+                        newfid: 2,
+                        nwname: 1,
+                        wnames: vec![P9String::new(b"source".to_vec())],
+                    },
+                    NameMatch::Folded,
+                )
+                .await
+                .unwrap();
+
+            // The old walk has resolved its target but has not published its
+            // result. Converting that same fid to an xattr must survive it.
+            let (reached, reached_rx) = tokio::sync::oneshot::channel();
+            let (resume, resume_rx) = tokio::sync::oneshot::channel();
+            *handler.exact_pin_pause.lock().unwrap() = Some(SuccessTerminalPause {
+                reached,
+                resume: resume_rx,
+            });
+            let walking_handler = handler.clone();
+            let walking = tokio::spawn(async move {
+                let wnames = if empty {
+                    Vec::new()
+                } else {
+                    vec![P9String::new(b"target".to_vec())]
+                };
+                if compound {
+                    walking_handler
+                        .walk_getattr(
+                            Twalkgetattr {
+                                fid: 2,
+                                newfid: 2,
+                                nwname: wnames.len() as u16,
+                                wnames,
+                            },
+                            NameMatch::Exact,
+                        )
+                        .await
+                } else {
+                    walking_handler
+                        .walk(
+                            Twalk {
+                                fid: 2,
+                                newfid: 2,
+                                nwname: wnames.len() as u16,
+                                wnames,
+                            },
+                            NameMatch::Exact,
+                        )
+                        .await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(2), reached_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            handler
+                .xattrcreate(Txattrcreate {
+                    fid: 2,
+                    name: P9String::new(b"user.race".to_vec()),
+                    size: 1,
+                    flags: 0,
+                })
+                .await
+                .unwrap();
+            handler
+                .write(
+                    Twrite {
+                        fid: 2,
+                        offset: 0,
+                        count: 1,
+                        data: Bytes::from_static(b"x").into(),
+                    },
+                    [0; 16],
+                    0,
+                )
+                .await
+                .unwrap();
+            resume.send(()).unwrap();
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(2), walking)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                Err(P9Error::BadFid)
+            ));
+            assert_eq!(fs.open_handle_count(source), 1);
+            assert_eq!(fs.open_handle_count(target), 0);
+            handler.clunk(Tclunk { fid: 2 }).await.unwrap();
+            let name = crate::fs::XattrName::new(b"user.race").unwrap();
+            assert_eq!(fs.get_xattr(&creds, source, &name).await.unwrap(), b"x"[..]);
+            assert_eq!(
+                fs.get_xattr(&creds, target, &name).await,
+                Err(FsError::NoData)
+            );
+            assert_eq!(fs.open_handle_count(source), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn volatile_empty_writes_preserve_open_file_attributes() {
+        use crate::fs::mutation::config::{
+            ClientDurabilityTarget, FilesystemWriteAckMode, FilesystemWriteAckSettings,
+            FilesystemWriteAckSource,
+        };
+
+        let mut fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.write_ack = FilesystemWriteAckSettings {
+            mode: FilesystemWriteAckMode::VolatileMemory,
+            volatile_memory_bytes: 8 * 1024 * 1024,
+            volatile_max_operations: 1024,
+            source: FilesystemWriteAckSource::Filesystem,
+            client_durability_target: ClientDurabilityTarget::LocalSsd,
+        };
+        let fs = Arc::new(fs);
+        let handler = NinePHandler::new(fs.clone(), Arc::new(FileLockManager::new()));
+        let creds = test_creds();
+        let auth = AuthContext::from(&creds);
+        let (file, _) = fs
+            .create(&creds, 0, b"empty-write", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.write(&auth, file, 0, &Bytes::from_static(b"payload"))
+            .await
+            .unwrap();
+        fs.setattr(
+            &creds,
+            file,
+            &SetAttributes {
+                mode: SetMode::Set(0o6777),
+                mtime: SetTime::SetToClientTime(Timestamp {
+                    seconds: 1,
+                    nanoseconds: 2,
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        handler
+            .attach(Tattach {
+                fid: 1,
+                afid: u32::MAX,
+                uname: P9String::new(b"test".to_vec()),
+                aname: P9String::new(Vec::new()),
+                n_uname: 1000,
+            })
+            .await
+            .unwrap();
+        handler
+            .walk(
+                Twalk {
+                    fid: 1,
+                    newfid: 2,
+                    nwname: 1,
+                    wnames: vec![P9String::new(b"empty-write".to_vec())],
+                },
+                NameMatch::Folded,
+            )
+            .await
+            .unwrap();
+        handler
+            .lopen(Tlopen {
+                fid: 2,
+                flags: O_WRONLY as u32,
+            })
+            .await
+            .unwrap();
+        let before = inode_to_stat(&fs.visible_inode(file).await.unwrap(), file).unwrap();
+
+        for offset in [0, u64::MAX] {
+            let response = handler
+                .write(
+                    Twrite {
+                        fid: 2,
+                        offset,
+                        count: 0,
+                        data: DekuBytes::default(),
+                    },
+                    [0; 16],
+                    0,
+                )
+                .await
+                .expect("a zero-byte 9P write is a successful no-op");
+            assert!(matches!(response, Message::Rwrite(Rwrite { count: 0 })));
+            assert_eq!(
+                inode_to_stat(&fs.visible_inode(file).await.unwrap(), file).unwrap(),
+                before,
+                "empty write at {offset} changed visible attributes"
+            );
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), fs.quiesce_overlay_inode(file))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            inode_to_stat(&fs.inode_store.get(file).await.unwrap(), file).unwrap(),
+            before
+        );
+        assert_eq!(
+            fs.read_file(&auth, file, 0, 7).await.unwrap().0,
+            Bytes::from_static(b"payload")
+        );
+    }
+
+    #[tokio::test]
     async fn walk_getattr_projects_pending_write_metadata_and_matching_qids() {
         use crate::fs::mutation::config::{
             ClientDurabilityTarget, FilesystemWriteAckMode, FilesystemWriteAckSettings,
@@ -4550,14 +4785,27 @@ mod tests {
         session: ExactWalkSession,
         before_pin: bool,
         directory: bool,
+        volatile: bool,
     ) {
+        use crate::fs::mutation::config::{
+            ClientDurabilityTarget, FilesystemWriteAckMode, FilesystemWriteAckSettings,
+            FilesystemWriteAckSource,
+        };
         use crate::fs::name_mode::NameMode;
 
-        let fs = Arc::new(
-            ZeroFS::new_in_memory_with_name_mode(NameMode::Insensitive)
-                .await
-                .unwrap(),
-        );
+        let mut fs = ZeroFS::new_in_memory_with_name_mode(NameMode::Insensitive)
+            .await
+            .unwrap();
+        if volatile {
+            fs.write_ack = FilesystemWriteAckSettings {
+                mode: FilesystemWriteAckMode::VolatileMemory,
+                volatile_memory_bytes: 8 * 1024 * 1024,
+                volatile_max_operations: 1024,
+                source: FilesystemWriteAckSource::Filesystem,
+                client_durability_target: ClientDurabilityTarget::LocalSsd,
+            };
+        }
+        let fs = Arc::new(fs);
         let creds = test_creds();
         let (original, _) = if directory {
             fs.mkdir(&creds, 0, b"Foo", &SetAttributes::default()).await
@@ -4639,7 +4887,7 @@ mod tests {
     async fn exact_walk_survives_atomic_replacement() {
         for session in ExactWalkSession::ALL {
             for directory in [false, true] {
-                exact_walk_replacement_at_pause(session, false, directory).await;
+                exact_walk_replacement_at_pause(session, false, directory, false).await;
             }
         }
     }
@@ -4647,14 +4895,16 @@ mod tests {
     #[tokio::test]
     async fn exact_file_walk_survives_replacement_before_pin() {
         for session in ExactWalkSession::ALL {
-            exact_walk_replacement_at_pause(session, true, false).await;
+            for volatile in [false, true] {
+                exact_walk_replacement_at_pause(session, true, false, volatile).await;
+            }
         }
     }
 
     #[tokio::test]
     async fn exact_directory_walk_survives_replacement_before_pin() {
         for session in ExactWalkSession::ALL {
-            exact_walk_replacement_at_pause(session, true, true).await;
+            exact_walk_replacement_at_pause(session, true, true, false).await;
         }
     }
 
