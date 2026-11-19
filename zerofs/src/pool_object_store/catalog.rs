@@ -55,6 +55,8 @@ const FAULTS: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_segment_
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_meta");
 const LAST_LOCAL_RESERVATION: &str = "last_local_reservation";
 const MEMBERS: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_members");
+const SEGMENT_TARGETS: TableDefinition<&str, &str> =
+    TableDefinition::new("pool_segment_targets_v1");
 const OBJECTS: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_objects");
 const UPLOADS: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_uploads");
 const GARBAGE: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_garbage");
@@ -354,6 +356,7 @@ impl Catalog {
         tx.open_table(FAULTS)?;
         tx.open_table(MEMBERS)?;
         tx.open_table(OBJECTS)?;
+        tx.open_table(SEGMENT_TARGETS)?;
         tx.open_table(UPLOADS)?;
         tx.open_table(GARBAGE)?;
         tx.open_table(HIDDEN_LEGACY)?;
@@ -687,6 +690,29 @@ impl Catalog {
         })
     }
 
+    pub fn bind_segment_target(&self, location: &str, member: &str) -> Result<()> {
+        let mut tx = self.database.begin_write()?;
+        tx.set_durability(Durability::Immediate)?;
+        {
+            let mut targets = tx.open_table(SEGMENT_TARGETS)?;
+            if let Some(existing) = targets.get(location)? {
+                require_segment_target(existing.value(), member)?;
+                return Ok(());
+            }
+            // Multipart upload handles outlive the logical-key lease used
+            // during admission. They must not publish against a newer target.
+            for row in tx.open_table(UPLOADS)?.iter()? {
+                let upload: Upload = bincode::deserialize(row?.1.value())?;
+                if upload.location == location {
+                    require_segment_target(&upload.member_id, member)?;
+                }
+            }
+            targets.insert(location, member)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn reserve(
         &self,
         location: &str,
@@ -698,6 +724,12 @@ impl Catalog {
     ) -> Result<Upload> {
         let mut tx = self.database.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
+        let targets = tx.open_table(SEGMENT_TARGETS)?;
+        let bound = targets.get(location)?;
+        if let (Some(bound), Some(target)) = (&bound, target) {
+            require_segment_target(bound.value(), target)?;
+        }
+        let target = bound.as_ref().map(|bound| bound.value()).or(target);
         let upload = {
             let mut table = tx.open_table(MEMBERS)?;
             // Conservatively share the reservation budget across all local
@@ -813,6 +845,8 @@ impl Catalog {
         };
         tx.open_table(UPLOADS)?
             .insert(upload.id.as_str(), bincode::serialize(&upload)?.as_slice())?;
+        drop(bound);
+        drop(targets);
         tx.commit()?;
         Ok(upload)
     }
@@ -1443,6 +1477,17 @@ impl Catalog {
         }
         Ok(())
     }
+}
+
+fn require_segment_target(expected: &str, requested: &str) -> Result<()> {
+    if expected != requested {
+        return Err(AllocationBlocked {
+            member: requested.to_owned(),
+            reason: format!("segment is bound to {expected}"),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 fn ensure_eligible(tx: &redb::WriteTransaction, member: &str) -> Result<()> {

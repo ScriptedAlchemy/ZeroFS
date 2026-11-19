@@ -170,6 +170,11 @@ pub(crate) struct MemberVerification {
     pub failures: BTreeMap<String, String>,
 }
 
+/// Exact member for a new segment. The pool persists this before admission so
+/// retries using the same logical key continue to use that member.
+#[derive(Clone, Debug)]
+pub(crate) struct SegmentTarget(pub String);
+
 #[derive(Clone)]
 pub struct PoolObjectStore {
     inner: Arc<PoolInner>,
@@ -1181,6 +1186,14 @@ impl PoolObjectStore {
         outcome
     }
 
+    async fn bind_segment_target(&self, location: &Path, member: &str) -> object_store::Result<()> {
+        self.member(member)?;
+        let location = location.to_string();
+        let member = member.to_owned();
+        self.catalog(move |catalog| catalog.bind_segment_target(&location, &member))
+            .await
+    }
+
     async fn put_owned(
         &self,
         location: Path,
@@ -1191,6 +1204,12 @@ impl PoolObjectStore {
         let _guard = self.key_lock(&location).write_owned().await;
         let previous = self.visible(&location).await?;
         Self::check_mode(&location, &options.mode, previous.as_ref())?;
+        if let Some(SegmentTarget(member)) = options.extensions.get::<SegmentTarget>() {
+            if !matches!(options.mode, PutMode::Create) {
+                return Err(unsupported("segment targets require conditional creation"));
+            }
+            self.bind_segment_target(&location, member).await?;
+        }
         self.put_spilling(location, payload, options, previous, None, cancelled)
             .await
     }
@@ -1266,6 +1285,9 @@ impl PoolObjectStore {
         let _guard = self.key_lock(&location).write_owned().await;
         let previous = self.visible(&location).await?;
         Self::check_mode(&location, &PutMode::Create, previous.as_ref())?;
+        if let Some(SegmentTarget(member)) = options.extensions.get::<SegmentTarget>() {
+            self.bind_segment_target(&location, member).await?;
+        }
         let upload = self
             .reserve_excluding(
                 &location,
@@ -2208,6 +2230,11 @@ impl ObjectStore for PoolObjectStore {
             return Err(unsupported("pool identity metadata is reserved"));
         }
         if !self.segment(location) {
+            if options.extensions.get::<SegmentTarget>().is_some() {
+                return Err(unsupported(
+                    "segment targets require a canonical segment key",
+                ));
+            }
             return self
                 .inner
                 .authority
@@ -2234,6 +2261,11 @@ impl ObjectStore for PoolObjectStore {
             return Err(unsupported("pool identity metadata is reserved"));
         }
         if !self.segment(location) {
+            if options.extensions.get::<SegmentTarget>().is_some() {
+                return Err(unsupported(
+                    "segment targets require a canonical segment key",
+                ));
+            }
             return self
                 .inner
                 .authority

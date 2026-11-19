@@ -1,4 +1,4 @@
-use super::{MemberPreflight, PoolMember, PoolObjectStore};
+use super::{MemberPreflight, PoolMember, PoolObjectStore, SegmentTarget};
 use crate::config::SegmentPlacement;
 use crate::segment::Segid;
 use crate::segment_store::{ConditionalMultipartCreate, GeneratedSegmentCreate};
@@ -3005,4 +3005,68 @@ async fn evacuation_capacity_ignores_already_moved_bodies_awaiting_source_cleanu
     let status = pool.status().await.unwrap();
     assert_eq!(status.members[0].objects, 0);
     assert_eq!(status.members[1].objects, 2);
+}
+
+#[tokio::test]
+async fn segment_target_survives_capacity_refusal_reopen_and_replay() {
+    let fixture = Fixture::new(8);
+    let pool = fixture.initialize().await;
+    let occupant = segment(701);
+    let mut options = create_options();
+    options.extensions.insert(SegmentTarget("hdd-b".into()));
+    pool.put_opts(&occupant, Bytes::from_static(b"occupied").into(), options.clone())
+        .await
+        .unwrap();
+
+    let pending = segment(702);
+    let failure = pool
+        .put_opts(&pending, Bytes::from_static(b"payload").into(), options)
+        .await
+        .unwrap_err();
+    assert!(crate::retrying_object_store::is_no_space(&failure));
+    pool.settle().await;
+    drop(pool);
+
+    let pool = fixture.reopen().await.unwrap();
+    let failure = pool
+        .put_opts(&pending, Bytes::from_static(b"payload").into(), create_options())
+        .await
+        .unwrap_err();
+    assert!(crate::retrying_object_store::is_no_space(&failure));
+    assert_eq!(pool.placements().await.unwrap().len(), 1);
+
+    pool.delete(&occupant).await.unwrap();
+    create(&pool, &pending, b"payload").await;
+    let placements = pool.placements().await.unwrap();
+    assert_eq!(placements.len(), 1);
+    assert_eq!(placements[0].member_id, "hdd-b");
+    assert_eq!(
+        pool.get(&pending).await.unwrap().bytes().await.unwrap(),
+        Bytes::from_static(b"payload")
+    );
+    assert!(pool.migrate(&pending, "hdd-a").await.is_err());
+    assert_eq!(pool.placements().await.unwrap()[0].member_id, "hdd-b");
+}
+
+#[tokio::test]
+async fn quarantined_segment_target_refuses_creation_without_spilling() {
+    let fixture = Fixture::new(32);
+    let pool = fixture.initialize().await;
+    let location = segment(703);
+    pool.quarantine("hdd-b", "synthetic offline member").await.unwrap();
+    let mut options = create_options();
+    options.extensions.insert(SegmentTarget("hdd-b".into()));
+    assert!(
+        pool.put_opts(&location, Bytes::from_static(b"data").into(), options)
+            .await
+            .is_err()
+    );
+    assert!(
+        pool.put_opts(&location, Bytes::from_static(b"data").into(), create_options())
+            .await
+            .is_err()
+    );
+    assert!(pool.placements().await.unwrap().is_empty());
+    create(&pool, &segment(704), b"healthy").await;
+    assert_eq!(pool.placements().await.unwrap()[0].member_id, "hdd-a");
 }
