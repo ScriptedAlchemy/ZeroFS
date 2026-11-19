@@ -1,6 +1,9 @@
 mod xattr;
 use xattr::XattrFid;
 
+#[cfg(test)]
+mod io_context_tests;
+
 use super::errors::{P9Error, P9Result};
 use super::lock_manager::{FileLock, FileLockManager, LockGuard};
 #[cfg(feature = "failpoints")]
@@ -244,6 +247,15 @@ struct SetattrFidContext {
     creds: Credentials,
     state: SetattrFidState,
     allows_read: bool,
+}
+
+/// Read/write state copied under the session lock. The fid slot retains its
+/// open-handle pin; bulk I/O does not need an owned copy of the pathname.
+struct IoFidContext {
+    inode_id: InodeId,
+    creds: Credentials,
+    allows_read: bool,
+    allows_write: bool,
 }
 
 struct OpenFidContext {
@@ -777,6 +789,20 @@ impl NinePHandler {
             .filter(|slot| slot.xattr.is_none())
             .ok_or(P9Error::BadFid)
             .map(|s| s.fid.clone())
+    }
+
+    fn get_fid_io_context(&self, fid: u32) -> P9Result<IoFidContext> {
+        self.session_state()
+            .fids
+            .get(&fid)
+            .filter(|slot| slot.xattr.is_none())
+            .ok_or(P9Error::BadFid)
+            .map(|slot| IoFidContext {
+                inode_id: slot.fid.inode_id,
+                creds: slot.fid.creds,
+                allows_read: fid_allows_read(&slot.fid),
+                allows_write: fid_allows_write(&slot.fid),
+            })
     }
 
     /// Snapshot only the fid fields needed by attribute mutations. Unlike
@@ -1401,7 +1427,8 @@ impl NinePHandler {
     /// directory's parent pointer, clamped at `root_id` (the fid's attach
     /// root): walking `..` at the subtree root yields the subtree root itself,
     /// exactly mirroring the inode-0 clamp readdir applies at the filesystem
-    /// root. Everything else is a plain lookup.
+    /// root. `.` stays on the current searchable directory; other names use
+    /// the directory-entry lookup.
     async fn walk_component(
         &self,
         creds: &Credentials,
@@ -1409,7 +1436,7 @@ impl NinePHandler {
         current_id: InodeId,
         name: &[u8],
     ) -> P9Result<InodeId> {
-        if name != b".." {
+        if !matches!(name, b"." | b"..") {
             return Ok(self.filesystem.lookup(creds, current_id, name).await?);
         }
         let inode = self.filesystem.inode_store.get(current_id).await?;
@@ -1417,6 +1444,9 @@ impl NinePHandler {
             return Err(P9Error::NotADirectory);
         };
         check_access(&inode, creds, AccessMode::Execute)?;
+        if name == b"." {
+            return Ok(current_id);
+        }
         if current_id == root_id {
             return Ok(current_id);
         }
@@ -1448,15 +1478,17 @@ impl NinePHandler {
     }
 
     /// Keep a fid's absolute path in step with a walk: `..` pops a component
-    /// (unless clamped at the attach root, where `current_id == root`), any
-    /// other name appends. Shared by `walk` and `walk_getattr`.
+    /// (unless clamped at the attach root, where `current_id == root`), `.`
+    /// stays in place, and other names append. Shared by `walk` and
+    /// `walk_getattr`.
     fn step_path(path: &mut Vec<Bytes>, name: Bytes, current_id: InodeId, root: InodeId) {
-        if name.as_ref() == b".." {
-            if current_id != root {
+        match name.as_ref() {
+            b"." => {}
+            b".." if current_id != root => {
                 path.pop();
             }
-        } else {
-            path.push(name);
+            b".." => {}
+            _ => path.push(name),
         }
     }
 
@@ -1588,9 +1620,14 @@ impl NinePHandler {
 
             Self::step_path(&mut current_path, name_bytes, current_id, src_fid.root);
             wqids.push(inode_to_qid(&step.inode, step.id));
+            // A self step such as `.` must keep the previous exact lookup's
+            // directory pin until final validation takes its own. A different
+            // target always replaces or clears the previous pin.
+            if step.id != current_id || step.exact_pin.is_some() {
+                pending_directory_pin = step.exact_pin;
+            }
             current_id = step.id;
             walked_directory = Some(step.inode.is_directory());
-            pending_directory_pin = step.exact_pin;
         }
 
         // Only create newfid if the walk fully succeeded
@@ -1638,9 +1675,11 @@ impl NinePHandler {
                 .await?;
             Self::step_path(&mut current_path, name_bytes, current_id, src_fid.root);
             wqids.push(inode_to_qid(&step.inode, step.id));
+            if step.id != current_id || step.exact_pin.is_some() {
+                pending_directory_pin = step.exact_pin;
+            }
             current_id = step.id;
             last_inode = Some(step.inode);
-            pending_directory_pin = step.exact_pin;
         }
 
         #[cfg(test)]
@@ -2140,9 +2179,9 @@ impl NinePHandler {
         if let Some(result) = self.read_xattr(&tr) {
             return result;
         }
-        let fid_entry = self.get_fid(tr.fid)?;
+        let fid_entry = self.get_fid_io_context(tr.fid)?;
 
-        if !fid_allows_read(&fid_entry) {
+        if !fid_entry.allows_read {
             return Err(P9Error::BadFid);
         }
 
@@ -2171,9 +2210,9 @@ impl NinePHandler {
         if let Some(result) = self.write_xattr(&tw) {
             return result;
         }
-        let fid_entry = self.get_fid(tw.fid)?;
+        let fid_entry = self.get_fid_io_context(tw.fid)?;
 
-        if !fid_allows_write(&fid_entry) {
+        if !fid_entry.allows_write {
             return Err(P9Error::BadFid);
         }
 
@@ -4786,6 +4825,7 @@ mod tests {
         before_pin: bool,
         directory: bool,
         volatile: bool,
+        trailing_dot: bool,
     ) {
         use crate::fs::mutation::config::{
             ClientDurabilityTarget, FilesystemWriteAckMode, FilesystemWriteAckSettings,
@@ -4835,12 +4875,25 @@ mod tests {
             resume: resume_rx,
         });
         let lookup_handler = handler.clone();
-        let lookup =
-            tokio::spawn(async move { request(&lookup_handler, 2, session.walk(&[b"Foo"])).await });
+        let lookup = tokio::spawn(async move {
+            let names: &[&[u8]] = if trailing_dot {
+                &[b"Foo", b"."]
+            } else {
+                &[b"Foo"]
+            };
+            request(&lookup_handler, 2, session.walk(names)).await
+        });
         tokio::time::timeout(std::time::Duration::from_secs(10), reached_rx)
             .await
             .unwrap()
             .unwrap();
+        if before_pin && directory {
+            assert_eq!(
+                fs.open_handle_count(original),
+                1,
+                "the resolved directory must stay pinned across trailing self steps"
+            );
+        }
         // Without the directory lock, complete the replacement between the
         // lookup and spelling read. With it, rename must wait for this walk.
         let directory_locked = fs.lock_manager.is_locked_for_test(0);
@@ -4887,7 +4940,7 @@ mod tests {
     async fn exact_walk_survives_atomic_replacement() {
         for session in ExactWalkSession::ALL {
             for directory in [false, true] {
-                exact_walk_replacement_at_pause(session, false, directory, false).await;
+                exact_walk_replacement_at_pause(session, false, directory, false, false).await;
             }
         }
     }
@@ -4896,7 +4949,7 @@ mod tests {
     async fn exact_file_walk_survives_replacement_before_pin() {
         for session in ExactWalkSession::ALL {
             for volatile in [false, true] {
-                exact_walk_replacement_at_pause(session, true, false, volatile).await;
+                exact_walk_replacement_at_pause(session, true, false, volatile, false).await;
             }
         }
     }
@@ -4904,7 +4957,14 @@ mod tests {
     #[tokio::test]
     async fn exact_directory_walk_survives_replacement_before_pin() {
         for session in ExactWalkSession::ALL {
-            exact_walk_replacement_at_pause(session, true, true, false).await;
+            exact_walk_replacement_at_pause(session, true, true, false, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_directory_dot_walk_survives_replacement_before_pin() {
+        for session in ExactWalkSession::ALL {
+            exact_walk_replacement_at_pause(session, true, true, false, true).await;
         }
     }
 
