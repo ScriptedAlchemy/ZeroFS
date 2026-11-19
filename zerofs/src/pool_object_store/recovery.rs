@@ -14,7 +14,7 @@ const MULTIPLE_SICK_MEMBERS: &str = "multiple_sick_members";
 /// single-device failure into a permanent multi-device stop. Count unfinished
 /// zero-byte operations too: their physical ownership still has to settle.
 fn active_failure(member: &PoolMemberStatus) -> bool {
-    member.health.quarantine.is_some()
+    (member.health.quarantine.is_some() || member.unavailable_at_startup)
         && (member.objects != 0
             || member.used_bytes != 0
             || member.reserved_bytes != 0

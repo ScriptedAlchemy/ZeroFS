@@ -677,13 +677,44 @@ impl WritebackObjectStore {
         let lock = self.key_lock(&location);
         let key_guard = lock.lock_owned().await;
         let trusted_segment_create = options.extensions.get::<GeneratedSegmentCreate>().is_some();
+        if let Some(target) = options.extensions.get::<SegmentTarget>() {
+            if !matches!(options.mode, PutMode::Create) || !trusted_segment_create {
+                return Err(generic_error(
+                    "writeback segment targets require generated conditional create",
+                ));
+            }
+            let pool = self.inner.pool.get().ok_or_else(|| {
+                generic_error("writeback cannot persist a segment target without its pool catalog")
+            })?;
+            // Check the target before an overlay-visible create can return
+            // AlreadyExists: byte-only reconciliation must not bless a retry
+            // that names another member. Replay uses the same canonical key;
+            // commit the target before acknowledging its journal payload.
+            pool.register_segment_target(&location, target).await?;
+        }
         let (mode, expected_visible_version, predecessor) = match &options.mode {
             PutMode::Overwrite => (MutationMode::Overwrite, None, None),
             PutMode::Create if trusted_segment_create => {
-                if self.inner.overlay.has_visible_local_object(&location).await {
-                    return Err(object_store::Error::AlreadyExists {
-                        path: location.to_string(),
-                        source: "overlay-visible object already exists".into(),
+                if let Some((sequence, local_etag)) = self
+                    .inner
+                    .overlay
+                    .matching_local_create(&location, &payload)
+                    .await?
+                {
+                    // The accepted create may not exist remotely yet. Return
+                    // its original identity instead of forcing the segment
+                    // publisher's authoritative remote-conflict readback.
+                    // Target validation above must precede this idempotency.
+                    drop(key_guard);
+                    drop(payload);
+                    drop(ram);
+                    drop(disk);
+                    self.await_ack(&self.inner.journaler.barrier(), sequence)
+                        .await?;
+                    return Ok(PutResult {
+                        e_tag: Some(local_etag.as_str().to_owned()),
+                        version: Some(local_etag.as_str().to_owned()),
+                        extensions: Extensions::new(),
                     });
                 }
                 (MutationMode::Create, None, None)
@@ -711,19 +742,6 @@ impl WritebackObjectStore {
                 "mutation metadata exceeds its bounded SSD reservation: {error}"
             ))
         })?;
-        if let Some(target) = options.extensions.get::<SegmentTarget>() {
-            if mode != MutationMode::Create || !trusted_segment_create {
-                return Err(generic_error(
-                    "writeback segment targets require generated conditional create",
-                ));
-            }
-            let pool = self.inner.pool.get().ok_or_else(|| {
-                generic_error("writeback cannot persist a segment target without its pool catalog")
-            })?;
-            // Replay uses the same canonical key. Commit the target before the
-            // journal can acknowledge the payload, so replay needs no extension.
-            pool.register_segment_target(&location, target).await?;
-        }
         // Wait for journal-queue capacity before taking the global order lock,
         // so a full queue cannot convoy unrelated writers behind this one.
         let slot =

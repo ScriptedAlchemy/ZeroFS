@@ -846,16 +846,21 @@ impl Catalog {
         Ok(upload)
     }
 
-    pub fn require_automatic_evacuation(&self) -> Result<()> {
+    pub fn require_automatic_evacuation(&self, unavailable: Option<&str>) -> Result<()> {
         let tx = self.database.begin_write()?;
-        self.ensure_single_active_failure(&tx)
+        self.ensure_single_active_failure(&tx, unavailable)
     }
 
-    pub fn mark_started_for_migration(&self, id: &str, automatic: bool) -> Result<()> {
+    pub fn mark_started_for_migration(
+        &self,
+        id: &str,
+        automatic: bool,
+        unavailable: Option<&str>,
+    ) -> Result<()> {
         let mut tx = self.database.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
         if automatic {
-            self.ensure_single_active_failure(&tx)?;
+            self.ensure_single_active_failure(&tx, unavailable)?;
         }
         {
             let mut table = tx.open_table(UPLOADS)?;
@@ -879,11 +884,12 @@ impl Catalog {
         entry: &Entry,
         previous: Option<&Entry>,
         automatic: bool,
+        unavailable: Option<&str>,
     ) -> Result<Option<Garbage>> {
         let mut tx = self.database.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
         if automatic {
-            self.ensure_single_active_failure(&tx)?;
+            self.ensure_single_active_failure(&tx, unavailable)?;
         }
         let upload: Upload = {
             let table = tx.open_table(UPLOADS)?;
@@ -1346,7 +1352,7 @@ impl Catalog {
         let multiple_failures = members
             .iter()
             .filter(|member| {
-                member.health.quarantine.is_some()
+                (member.health.quarantine.is_some() || member.unavailable_at_startup)
                     && (member.objects > 0
                         || member.used_bytes > 0
                         || member.reserved_bytes > 0
@@ -1356,7 +1362,9 @@ impl Catalog {
             .count()
             > 1;
         for member in &mut members {
-            if member.health.quarantine.is_none() || member.safe_to_remove {
+            if (member.health.quarantine.is_none() && !member.unavailable_at_startup)
+                || member.safe_to_remove
+            {
                 continue;
             }
             if multiple_failures {
@@ -1397,9 +1405,15 @@ fn health_in(tx: &redb::WriteTransaction, member: &str) -> Result<MemberHealth> 
 
 impl Catalog {
     /// Runs before any writes in the same transaction as automatic upload-start
-    /// or remap. Zero-byte operations count, while an empty historic quarantine
-    /// needs a full ownership scan only once per catalog open.
-    fn ensure_single_active_failure(&self, tx: &redb::WriteTransaction) -> Result<()> {
+    /// or remap. The immutable startup exclusion counts alongside quarantine,
+    /// without turning a missing member into a persisted health mutation.
+    /// Zero-byte operations count, while an empty failed member needs a full
+    /// ownership scan only once per catalog open.
+    fn ensure_single_active_failure(
+        &self,
+        tx: &redb::WriteTransaction,
+        unavailable: Option<&str>,
+    ) -> Result<()> {
         let mut known_empty = self
             .verified_empty_quarantined
             .lock()
@@ -1408,7 +1422,9 @@ impl Catalog {
         let mut unchecked = BTreeSet::new();
         for row in tx.open_table(MEMBERS)?.iter()? {
             let member: MemberRecord = bincode::deserialize(row?.1.value())?;
-            if health_in(tx, &member.id)?.quarantine.is_none() {
+            if health_in(tx, &member.id)?.quarantine.is_none()
+                && unavailable != Some(member.id.as_str())
+            {
                 known_empty.remove(&member.id);
                 continue;
             }
@@ -1460,10 +1476,10 @@ impl Catalog {
                     }
                 }
             }
-            // Every remaining member is quarantined and has no object, upload,
+            // Every remaining member is unavailable and has no object, upload,
             // or garbage row. Existing ownership never disappears before its
             // successor debt is recorded, and no new target is admitted after
-            // quarantine. Since this check precedes transaction mutations,
+            // quarantine or startup exclusion. Since this check precedes transaction mutations,
             // aborting the caller cannot invalidate the observed emptiness.
             known_empty.extend(unchecked);
         }
@@ -1787,7 +1803,7 @@ mod empty_quarantine_tests {
             attributes: Vec::new(),
         };
         catalog
-            .publish_for_migration(&upload.id, &entry, None, false)
+            .publish_for_migration(&upload.id, &entry, None, false, None)
             .unwrap();
         entry
     }
@@ -1805,7 +1821,7 @@ mod empty_quarantine_tests {
         let (root, catalog, members) = fixture();
         insert(&catalog, &members, "current-data", "current", 8);
         quarantine(&catalog);
-        catalog.require_automatic_evacuation().unwrap();
+        catalog.require_automatic_evacuation(None).unwrap();
         assert!(
             catalog
                 .verified_empty_quarantined
@@ -1815,7 +1831,7 @@ mod empty_quarantine_tests {
         );
         assert_eq!(catalog.empty_ownership_scans.load(Ordering::Relaxed), 1);
         for _ in 0..32 {
-            catalog.require_automatic_evacuation().unwrap();
+            catalog.require_automatic_evacuation(None).unwrap();
         }
         assert_eq!(catalog.empty_ownership_scans.load(Ordering::Relaxed), 1);
         assert!(
@@ -1842,9 +1858,9 @@ mod empty_quarantine_tests {
                 .is_empty()
         );
         assert_eq!(reopened.empty_ownership_scans.load(Ordering::Relaxed), 0);
-        reopened.require_automatic_evacuation().unwrap();
+        reopened.require_automatic_evacuation(None).unwrap();
         assert_eq!(reopened.empty_ownership_scans.load(Ordering::Relaxed), 1);
-        reopened.require_automatic_evacuation().unwrap();
+        reopened.require_automatic_evacuation(None).unwrap();
         assert_eq!(reopened.empty_ownership_scans.load(Ordering::Relaxed), 1);
     }
 
@@ -1864,7 +1880,7 @@ mod empty_quarantine_tests {
             .unwrap();
         insert(&catalog, &members, "current-data", "current", 8);
         quarantine(&catalog);
-        assert!(catalog.require_automatic_evacuation().is_err());
+        assert!(catalog.require_automatic_evacuation(None).is_err());
         assert!(
             !catalog
                 .verified_empty_quarantined
@@ -1874,7 +1890,7 @@ mod empty_quarantine_tests {
         );
         let garbage = catalog.retire("zero-data", &zero).unwrap();
         // The upload is now the first remaining zero-byte owner encountered.
-        assert!(catalog.require_automatic_evacuation().is_err());
+        assert!(catalog.require_automatic_evacuation(None).is_err());
         assert!(
             !catalog
                 .verified_empty_quarantined
@@ -1884,7 +1900,7 @@ mod empty_quarantine_tests {
         );
         catalog.forget_upload(&upload.id).unwrap();
         // Only a cleanup debt remains; byte counters alone still say zero.
-        assert!(catalog.require_automatic_evacuation().is_err());
+        assert!(catalog.require_automatic_evacuation(None).is_err());
         assert!(
             !catalog
                 .verified_empty_quarantined
@@ -1893,7 +1909,7 @@ mod empty_quarantine_tests {
                 .contains("old")
         );
         catalog.forget_garbage(&garbage.id).unwrap();
-        catalog.require_automatic_evacuation().unwrap();
+        catalog.require_automatic_evacuation(None).unwrap();
         assert!(
             catalog
                 .verified_empty_quarantined
@@ -1903,7 +1919,7 @@ mod empty_quarantine_tests {
         );
         let scans = catalog.empty_ownership_scans.load(Ordering::Relaxed);
         assert_eq!(scans, 4);
-        catalog.require_automatic_evacuation().unwrap();
+        catalog.require_automatic_evacuation(None).unwrap();
         assert_eq!(catalog.empty_ownership_scans.load(Ordering::Relaxed), scans);
     }
 }

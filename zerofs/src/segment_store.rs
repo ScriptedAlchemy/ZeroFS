@@ -326,7 +326,7 @@ impl SegmentStore {
         };
         if capability.is_acknowledged() {
             return self
-                .complete_segment_upload(path, bytes, upload, true)
+                .complete_segment_upload(path, bytes, upload, true, target.is_some())
                 .await
                 .map(SegmentPublication::Multipart);
         }
@@ -346,6 +346,7 @@ impl SegmentStore {
         bytes: &Bytes,
         mut upload: Box<dyn MultipartUpload>,
         reconcile_completion: bool,
+        exact_target: bool,
     ) -> Result<PutResult> {
         // Parts run as spawned tasks, so upload progress never waits on this
         // future being polled.
@@ -383,7 +384,10 @@ impl SegmentStore {
                 if let Err(abort_err) = abort_segment_upload(upload).await {
                     tracing::warn!("segment seal: aborting failed upload of {path}: {abort_err}");
                 }
-                if reconcile_completion && !crate::retrying_object_store::is_no_space(&e) {
+                if reconcile_completion
+                    && !crate::retrying_object_store::is_no_space(&e)
+                    && !(exact_target && crate::retrying_object_store::has_permanent_source(&e))
+                {
                     match self.verify_existing_segment_bytes(path, bytes).await {
                         Ok(result) => return Ok(result),
                         Err(conflict)
@@ -1815,7 +1819,7 @@ mod tests {
         let upload = os.put_multipart(&path).await.unwrap();
         let bytes = noise(1, 2 * SEAL_PART_SIZE + 1024);
         let res = store
-            .complete_segment_upload(&path, &bytes, upload, false)
+            .complete_segment_upload(&path, &bytes, upload, false, false)
             .await;
         assert!(res.is_err(), "the seal error must surface");
         assert!(
@@ -1834,7 +1838,7 @@ mod tests {
         let upload = os.put_multipart(&path).await.unwrap();
         let bytes = noise(1, 2 * SEAL_PART_SIZE + 1024);
         let res = store
-            .complete_segment_upload(&path, &bytes, upload, false)
+            .complete_segment_upload(&path, &bytes, upload, false, false)
             .await;
         assert!(res.is_err(), "the seal error must surface");
         assert!(

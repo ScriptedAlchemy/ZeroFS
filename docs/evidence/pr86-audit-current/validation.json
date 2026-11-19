@@ -1,0 +1,234 @@
+{
+  "head": "3c9564a7bb8b39311f13b3918e49da22f20c39f5",
+  "commits": [
+    "4db69ebf07d562795f8c99e3bb81aa9923a3f7ee",
+    "3c9564a7bb8b39311f13b3918e49da22f20c39f5"
+  ],
+  "source_manifest_matches_head": true,
+  "host": "isolated ChatGPT cloud executor",
+  "architecture": "x86_64",
+  "test_kind": "Focused executable built from exact current source and extracted exact regression functions; test-only constructors/hooks explicitly exposed; no whole-crate cfg(test).",
+  "build": {
+    "stage": "build",
+    "exit_code": 0,
+    "seconds": 189.58619267899485
+  },
+  "tests_passed": 25,
+  "runtime_seconds": 22.421991306000564,
+  "check_results": {
+    "rustfmt": "pass",
+    "git_diff_check": "pass",
+    "independent_pending_retry_review": "PR89 reviewer: no blocker",
+    "cargo_fmt_all": "pass"
+  },
+  "limitations": [
+    "Not the full cargo test suite or ordinary Clippy.",
+    "Not the Mac Studio Docker runner and not physical-disk, mounted protocol, or production acceptance.",
+    "Integration/PR89 combined tree still needs combined validation."
+  ],
+  "regression_proof": "The earlier 4db69eb exact-source executable failed two pending-original-target retry selectors, which pass after 3c9564a. The original failure receipts are retained in the task harness.",
+  "reviewed_remote_head": "81d56a6cab5a8b5bc2013daf32497c452e61ecb0",
+  "integration_base": "daad582926801f5a107a75141d4ab7325d343fc7",
+  "date_utc": "2026-11-19",
+  "rustc": "1.100.0 (0ef1bc386 2026-11-09)",
+  "results": [
+    {
+      "selector": "verification_generations",
+      "exit_code": 0,
+      "seconds": 0.11702608300402062
+    },
+    {
+      "selector": "legacy_native_garbage",
+      "exit_code": 0,
+      "seconds": 1.1247430889998213
+    },
+    {
+      "selector": "member_native_garbage",
+      "exit_code": 0,
+      "seconds": 1.2273883630041382
+    },
+    {
+      "selector": "native_upload_recovery",
+      "exit_code": 0,
+      "seconds": 1.1409737409994705
+    },
+    {
+      "selector": "native_staging_recovery",
+      "exit_code": 0,
+      "seconds": 0.1685217849953915
+    },
+    {
+      "selector": "same_generation_retry",
+      "exit_code": 0,
+      "seconds": 0.11970907600334613
+    },
+    {
+      "selector": "legacy_migration",
+      "exit_code": 0,
+      "seconds": 0.11803448599675903
+    },
+    {
+      "selector": "target_replay",
+      "exit_code": 0,
+      "seconds": 0.1793939280032646
+    },
+    {
+      "selector": "target_quarantine",
+      "exit_code": 0,
+      "seconds": 0.06549547200120287
+    },
+    {
+      "selector": "target_multipart_conflict",
+      "exit_code": 0,
+      "seconds": 0.06974962600361323
+    },
+    {
+      "selector": "target_cold_writeback_replay",
+      "exit_code": 0,
+      "seconds": 0.3189215989987133
+    },
+    {
+      "selector": "target_existing_wrong_member",
+      "exit_code": 0,
+      "seconds": 0.06582358299783664
+    },
+    {
+      "selector": "target_pending_wrong_member",
+      "exit_code": 0,
+      "seconds": 0.11554813600378111
+    },
+    {
+      "selector": "target_pending_multipart_wrong_member",
+      "exit_code": 0,
+      "seconds": 10.557097609998891
+    },
+    {
+      "selector": "target_remote_multipart_wrong_member",
+      "exit_code": 0,
+      "seconds": 3.6821502029997646
+    },
+    {
+      "selector": "target_retry_remote_ack",
+      "exit_code": 0,
+      "seconds": 0.11728377400140744
+    },
+    {
+      "selector": "degraded_failure_fences",
+      "exit_code": 0,
+      "seconds": 0.31985251900186995
+    },
+    {
+      "selector": "bound_segment_recovery",
+      "exit_code": 0,
+      "seconds": 0.11759781300497707
+    },
+    {
+      "selector": "two_sick_members",
+      "exit_code": 0,
+      "seconds": 0.11603977499908069
+    },
+    {
+      "selector": "empty_historical_quarantine",
+      "exit_code": 0,
+      "seconds": 0.11601918499945896
+    },
+    {
+      "selector": "zero_byte_failure_ownership",
+      "exit_code": 0,
+      "seconds": 0.11669236199668376
+    },
+    {
+      "selector": "second_failure_at_reservation",
+      "exit_code": 0,
+      "seconds": 0.11543752599391155
+    },
+    {
+      "selector": "second_failure_at_publication",
+      "exit_code": 0,
+      "seconds": 0.14718633300071815
+    },
+    {
+      "selector": "degraded_cold_start",
+      "exit_code": 0,
+      "seconds": 1.713606418998097
+    },
+    {
+      "selector": "sealed_corruption",
+      "exit_code": 0,
+      "seconds": 0.4716988199943444
+    }
+  ],
+  "test_provenance": {
+    "pool_test_sha256": {
+      "member_verification_rejects_replaced_empty_and_nonempty_generations": "91c3cdaa94f9af53f934aad215fc8c58eadb91e0f704231a763462a908fce939",
+      "legacy_native_garbage_reconciles_after_startup_wait_times_out": "19cb9013626bbacf3ab9d2d8f8e8a874658285664caa1e81f484666bd0dbda4e",
+      "native_garbage_reconciles_after_startup_wait_times_out": "d79ab5c3557a7aadc244a08ea556d8e6fb9b84792b51981cdb37849d9bd6bf22",
+      "native_recovery_timeout_keeps_cleanup_owned_until_catalog_settlement": "dfeccedf707ea47322308710079ce31be6b2014b7de69bf429e05f48b955064f",
+      "native_staging_recovery_reclaims_owned_files_before_releasing_reservation": "17154d60c478ba7c98a6eaa2298b12ce4cb4500e1b94bd9055113e735a014d83",
+      "disk_health_verified_same_generation_retry_clears_source_fault": "ad7196b9121d47b70b336db4d6fe8cd7b3c917dd8cb8f479b6a022810c8a0e6a",
+      "legacy_authority_segments_can_be_read_and_migrated_without_changing_identity": "be58dd13112ee43b397d1d9b76951414a1e385a21260185e7ad3807a492512f5",
+      "segment_target_survives_capacity_refusal_reopen_and_replay": "78b5174555b75336f61351656c43c50870256e39345fb939317e4695b48e2e1d",
+      "quarantined_segment_target_refuses_creation_without_spilling": "239547c2ee64e7e64e29ee04acfe49e25ae4d81804c60c0b04d7c7ae61844325",
+      "segment_target_cannot_override_an_inflight_multipart_reservation": "f463d59ec2c529c08620c4428991f2ac9c368cbcc64c047043707c9d303d9ee9",
+      "writeback_replays_segment_to_persisted_member_before_any_pool_put": "5bff3f4509a87c082e47d9689801ac3c863f4109e83c03dae58b29c55520d350",
+      "targeted_seal_refuses_identical_bytes_already_on_another_member": "90aa63d3b62e748c7a3d79bf35486deb9bfb1721019cf5efc945f6d578fb461a",
+      "writeback_target_retry_does_not_reconcile_pending_bytes_on_another_member": "24c630bae7a20659dc4a255844a2cda383416fa7a57a05afcd3b11413b199b3b",
+      "writeback_multipart_target_retry_does_not_reconcile_pending_bytes_on_another_member": "d5d07bd0380816736ade7e7f2bcd71c51635682a1c3143d039d7f227540f1996",
+      "writeback_multipart_target_refusal_does_not_reconcile_remote_bytes": "935d225089fd4bc7eb19169169bbaccfc8b8e67677fc916fb21df7956279cf26",
+      "writeback_segment_retry_waits_for_original_remote_ack": "b116bbeda50744279c2de03f2006c5f5a985731e1bf8eecae2cd27ccaec7207d",
+      "degraded_member_counts_once_in_automatic_evacuation_fences": "4461c823613ad7e3a4a7cb208cf7926e873df3c06079697a6878ac1da8fe910c",
+      "bound_segment_refusal_does_not_stop_other_automatic_evacuation": "b246bf65adba09ef5ec064b39098c2996416db17bec5be39b5b44c6ccec8ac47"
+    },
+    "pool_export_test_sha256": {
+      "degraded_cold_start_serves_survivor_and_reports_missing_files": "87c7dd34f99bcff4327ae976c4a6f977691e189965c9dfcfceaf07e2fa2171ae",
+      "sealed_body_corruption_fails_authentication_and_verification": "7a3d380a9ba07ec28ccefeb25ac8716b41e1e8d702298c864369cca072344618"
+    },
+    "recovery_test_sha256": {
+      "two_sick_members_stop_new_copies_and_report_failure_across_restart": "9a1bde2d34cab1f4cc72c4acfe5681016d76a2737db2f5e89f0d9dcc264ce625",
+      "emptied_historical_quarantine_does_not_block_later_single_failure": "f9eb19bda117299ad040ef6abdf08d74046153111a0aec2cbdeb1275d32780f8",
+      "zero_byte_pending_upload_counts_as_an_active_failed_member": "1296aaff5b0671931a6b3fa5e62e7fbadf120aa82dc6e3442e7df2d0ac67afab",
+      "second_failure_during_reserved_copy_fences_remap_and_keeps_committed_copy": "d19eff2127fa91926c7b8a9078f99eddd2cdca9317f448c07485f9f7bc4ec391",
+      "running_copy_rechecks_two_disk_policy_at_publication": "f83ab48e609baa39ec80ebb2e141ffe1d431d7e6677ad8f4d298dad204d3314c"
+    },
+    "transformations": [
+      "Copy exact production source; no whole-server cfg(test). Exclude CLI entrypoint and preserve the required exact CLI error helper/constants.",
+      "Extract exact selected pool test bodies, original setup/Fixture/FaultStore definitions, and persistent_pool helper into a child module; expose selected entrypoint names.",
+      "Expose existing pool initialize/open test constructors and MemberPreflight::Lazy variant/match arm; all production startup and recovery algorithms are unchanged.",
+      "Expose the existing reserve_pause test field/initializer/pause block and exact selected recovery tests/fixtures to verify upload-start and publication fences under concurrent failures.",
+      "Extract exact degraded-cold-start and sealed-corruption pool-export test bodies and their fixtures; copy only their needed original imports and PAYLOAD_SIZE constant.",
+      "Expose existing ZeroFS::new_with_slatedb wrapper, flush close method, and write coordinator worker handle/accessor for exact pool-export fixture shutdown/reopen; preserve production worker algorithm."
+    ],
+    "intentional_baseline_restorations": []
+  },
+  "source_sha256": {
+    "pool_object_store/catalog.rs": "6bfbcf459f346677e4bf0c5b6fbdc8f992de7972290e65e37e4eb6ce316a6c50",
+    "pool_object_store/catalog/survival_test_support.rs": "2f3b2faa43ccbfb57f59415fa127cd27109e2dcf4eefc916d56d2f0708a94a3d",
+    "pool_object_store/mod.rs": "cc87b859fb39d1c328699484793494c59dd192e95a94e5ccee959bdfe9bc21d5",
+    "pool_object_store/recovery.rs": "42589ad6158256a4386e5004967e7ac95da4693fb6ed8be5175e3cabd60aa6d3",
+    "pool_object_store/recovery/tests.rs": "bf2c80a1a34507741f36730e32a672c59f5206ad8e993dc84ba300730bc3e66b",
+    "pool_object_store/tests.rs": "6b2e1e5b0c2bae3157d75f3f8c395ef98f7bd1f9d43e766e30e81e5415e50481",
+    "segment_store.rs": "4f9d5786fa8b0e1913daf6b878b5c4d5db4b673a617c96f32be3b5c52c8b3722",
+    "writeback/overlay.rs": "ec8fe99dbbc181788b07b183f7e8b04202d3ac510485b5baa3a4c3883c048028",
+    "writeback/store.rs": "b96994b09e571b98fb4b6eaf68ac86e40b78b07d7c1a141d119867a5f42e5ac9"
+  },
+  "whole_source_manifest_sha256": "9552bb6cca2b5467dd729fe9600711314f4216ead7ae1a971662f0703cd0964f",
+  "historical_behavior_controls": {
+    "status": "compile_timeout",
+    "timeout_seconds": 180,
+    "compiler_diagnostics": [],
+    "tests_executed": 0,
+    "selected_controls": [
+      "verification_generations",
+      "legacy_native_garbage",
+      "degraded_failure_fences",
+      "bound_segment_recovery"
+    ],
+    "restorations": [
+      "Restore zero-length physical HEAD without committed ETag/version conditions.",
+      "Restore native garbage ownership classification based only on data-member ID.",
+      "Restore quarantine-only scheduler/status/transactional evacuation fences, excluding the absent-at-startup member.",
+      "Restore target-related AllocationBlocked reservation refusal as a fatal recovery control error."
+    ],
+    "note": "This optional control build is not passing validation. The production-source executable and all25 selected production regressions passed separately."
+  }
+}

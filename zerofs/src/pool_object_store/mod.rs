@@ -1115,7 +1115,8 @@ impl PoolObjectStore {
                 return Err(permanent(SourceChecksumMismatch));
             }
             let id = upload.id.clone();
-            self.catalog(move |catalog| catalog.mark_started_for_migration(&id, automatic)).await?;
+            let unavailable = self.inner.unavailable.clone();
+            self.catalog(move |catalog| catalog.mark_started_for_migration(&id, automatic, unavailable.as_deref())).await?;
             #[cfg(test)] crash_cutpoint("after_started");
             options.mode = PutMode::Create;
             let member = self.member(&upload.member_id)?;
@@ -1166,7 +1167,8 @@ impl PoolObjectStore {
             let member_id = upload.member_id.clone();
             self.catalog(move |c| c.require_eligible(&member_id)).await?;
             self.ensure_member(&upload.member_id, true).await?;
-            let garbage = self.catalog(move |catalog| catalog.publish_for_migration(&id, &entry, previous.as_ref(), automatic)).await?;
+            let unavailable = self.inner.unavailable.clone();
+            let garbage = self.catalog(move |catalog| catalog.publish_for_migration(&id, &entry, previous.as_ref(), automatic, unavailable.as_deref())).await?;
             #[cfg(test)] crash_cutpoint("after_remap");
             #[cfg(test)] if garbage.is_some() { crash_cutpoint("before_source_delete"); }
             if let Some(garbage) = garbage
@@ -1500,11 +1502,14 @@ impl PoolObjectStore {
         size: u64,
     ) -> object_store::Result<[u8; 32]> {
         if size == 0 {
+            let (e_tag, version) = physical.versions();
             let result = self
                 .physical_get(
                     physical,
                     GetOptions {
                         head: true,
+                        if_match: e_tag,
+                        version,
                         ..Default::default()
                     },
                 )
@@ -1802,7 +1807,10 @@ impl PoolObjectStore {
             let attempt_deadline =
                 deadline.min(tokio::time::Instant::now() + std::time::Duration::from_secs(1));
             let garbage_id = garbage.id.clone();
-            let result = if is_local(&member_id) {
+            // The authority is local too. Legacy generations have no data-member
+            // ID, but their native deletes can also outlive a cancelled waiter.
+            let native = garbage.entry.physical.member_id().is_none_or(is_local);
+            let result = if native {
                 let pool = self.clone();
                 let cleaning = self.inner.tasks.spawn(async move {
                     let _guard = _guard;
@@ -2149,9 +2157,12 @@ impl PoolObjectStore {
                 // and old-body cleanup, not only while a single GET is active.
                 let _source_activity = pool.track_member(&previous.physical);
                 let _active = if automatic {
-                    pool.catalog(Catalog::require_automatic_evacuation)
-                        .await
-                        .map_err(MoveFailure::destination)?;
+                    let unavailable = pool.inner.unavailable.clone();
+                    pool.catalog(move |catalog| {
+                        catalog.require_automatic_evacuation(unavailable.as_deref())
+                    })
+                    .await
+                    .map_err(MoveFailure::destination)?;
                     *pool.inner.evacuating.lock().unwrap() = Some(EvacuationProgress {
                         member_id: expected_source.clone().expect("automatic source"),
                         location: location.to_string(),
@@ -2168,6 +2179,7 @@ impl PoolObjectStore {
                     .map_err(|e| {
                         if has_cause::<catalog::NoCapacity>(&e)
                             || has_cause::<catalog::NoAvailableMember>(&e)
+                            || has_cause::<catalog::AllocationBlocked>(&e)
                         {
                             MoveFailure::Admission(e)
                         } else {

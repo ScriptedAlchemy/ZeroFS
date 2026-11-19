@@ -434,7 +434,7 @@ async fn abandoned_upload_debt_is_not_credited_as_evacuation_progress() {
         .await
         .unwrap();
     let id = upload.id.clone();
-    pool.catalog(move |catalog| catalog.mark_started_for_migration(&id, false))
+    pool.catalog(move |catalog| catalog.mark_started_for_migration(&id, false, None))
         .await
         .unwrap();
     pool.ensure_member("disk-1", true).await.unwrap();
