@@ -667,7 +667,10 @@ mod tests {
     #[tokio::test]
     async fn test_create_with_specific_attributes() {
         let fs = create_test_fs().await;
-        let creds = test_creds();
+        let creds = Credentials {
+            uid: 0,
+            ..test_creds()
+        };
 
         let attr = SetAttributes {
             mode: SetMode::Set(0o640),

@@ -11,7 +11,7 @@ use crate::fs::mutation::types::{
     PendingAppend, PrepareWriteMember, PrepareWriteRequest, PreparedBatchResult,
     PreparedWriteBatch, PreparedWriteMember,
 };
-use crate::fs::permissions::{AccessMode, Credentials};
+use crate::fs::permissions::{AccessMode, Credentials, mode_after_content_change};
 use crate::fs::store::ExtentStore;
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{AuthContext, FileAttributes, InodeWithId};
@@ -363,7 +363,8 @@ pub(crate) async fn prepare_write_with_append(
         }
 
         let (now_sec, now_nsec) = get_current_time();
-        let clears_setid = creds.uid != file.uid && creds.uid != 0 && file.mode & 0o6000 != 0;
+        let mode = mode_after_content_change(file.mode, &creds);
+        let clears_setid = mode != file.mode;
         let republish_metadata =
             new_size != old_size || clears_setid || file.mtime != now_sec || file.ctime != now_sec;
 
@@ -373,9 +374,7 @@ pub(crate) async fn prepare_write_with_append(
             file.mtime_nsec = now_nsec;
             file.ctime = now_sec;
             file.ctime_nsec = now_nsec;
-            if clears_setid {
-                file.mode &= !0o6000;
-            }
+            file.mode = mode;
         }
 
         let parent_name_for_update = republish_metadata

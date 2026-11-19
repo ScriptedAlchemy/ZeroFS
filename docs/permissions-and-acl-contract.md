@@ -37,6 +37,14 @@ The checks follow Linux `generic_permission`.
 
 - Mode bits, ownership, the sticky bit and setgid inheritance, as before this
   change.
+- Create requests may explicitly choose the caller's uid and a group the
+  caller belongs to. A setgid parent's inherited group is also allowed, even
+  when the caller can create there through an ACL rather than group membership.
+  Only root may assign a different owner or an otherwise unrelated group.
+- Unprivileged writes, truncation (including a same-size truncate), and
+  allocation/zeroing discard setuid and executable setgid bits, including when
+  the caller owns the file. Root retains them, an empty write changes nothing,
+  and setgid without group execute is preserved, matching Linux.
 - POSIX access ACLs stored in `system.posix_acl_access`. A caller who is not
   root and not the owner is checked against the ACL: a matching named-user
   entry, else every matching group entry (owning group and named groups), else

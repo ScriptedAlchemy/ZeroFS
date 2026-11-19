@@ -26,6 +26,7 @@ use crate::fs::mutation::types::{
 use crate::fs::ops::write::{apply_prepared_batch, prepare_write, prepare_write_with_append};
 use crate::fs::permissions::Credentials;
 use crate::fs::permissions::acl::PosixAcl;
+use crate::fs::tracing::FileOperation;
 use crate::fs::types::{AuthContext, FileAttributes};
 use bytes::Bytes;
 use std::borrow::Cow;
@@ -1558,6 +1559,11 @@ impl ZeroFS {
         };
         let visible_size = file.size;
         if offset >= visible_size {
+            self.tracer.emit(
+                &self.inode_store,
+                id,
+                FileOperation::Read { offset, length: 0 },
+            );
             return Ok((Bytes::new(), true));
         }
         let read_len = std::cmp::min(count as u64, visible_size - offset) as usize;
@@ -1570,6 +1576,21 @@ impl ZeroFS {
             })
             .await
             .map_err(overlay_fs_error)?;
+        // Extent reads do not perform filesystem-level accounting. Count the
+        // combined canonical/volatile payload once, as the canonical path does.
+        self.stats
+            .bytes_read
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        self.stats.read_operations.fetch_add(1, Ordering::Relaxed);
+        self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+        self.tracer.emit(
+            &self.inode_store,
+            id,
+            FileOperation::Read {
+                offset,
+                length: read_len as u64,
+            },
+        );
         Ok((data, offset + read_len as u64 >= visible_size))
     }
 }
@@ -1632,6 +1653,139 @@ mod tests {
             source: FilesystemWriteAckSource::Filesystem,
             client_durability_target: ClientDurabilityTarget::LocalSsd,
         }
+    }
+
+    #[tokio::test]
+    async fn volatile_reads_record_bytes_operations_and_access_events() {
+        use crate::fs::tracing::FileOperation;
+        use crate::fs::types::{SetAttributes, SetMode};
+
+        let mut fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.write_ack = volatile_settings();
+        let fs = Arc::new(fs);
+        fs.install_volatile_overlay();
+        let auth = AuthContext::from(&test_creds());
+        let file = fs
+            .create_exclusive(&auth, 0, b"observed-read")
+            .await
+            .unwrap();
+        fs.write(&auth, file, 0, &Bytes::from_static(b"base"))
+            .await
+            .unwrap();
+        fs.setattr(
+            &test_creds(),
+            file,
+            &SetAttributes {
+                mode: SetMode::Set(0o600),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let release = fs
+            .materializer
+            .get()
+            .unwrap()
+            .hold_inode_lane_for_test(file)
+            .await;
+        fs.write_ack(&auth, file, 4, &Bytes::from_static(b"tail"))
+            .await
+            .unwrap();
+
+        // Both credential-checked and already-opened reads must count the
+        // bytes returned across the canonical/volatile boundary exactly once.
+        let baseline = (
+            fs.stats.bytes_read.load(Ordering::Relaxed),
+            fs.stats.read_operations.load(Ordering::Relaxed),
+            fs.stats.total_operations.load(Ordering::Relaxed),
+        );
+        let mut events = fs.tracer.subscribe();
+        assert_eq!(
+            fs.read_file(&auth, file, 2, 8).await.unwrap(),
+            (Bytes::from_static(b"setail"), true)
+        );
+        assert_eq!(fs.stats.bytes_read.load(Ordering::Relaxed), baseline.0 + 6);
+        assert_eq!(
+            fs.stats.read_operations.load(Ordering::Relaxed),
+            baseline.1 + 1
+        );
+        assert_eq!(
+            fs.stats.total_operations.load(Ordering::Relaxed),
+            baseline.2 + 1
+        );
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.path, "/observed-read");
+        assert!(matches!(
+            event.operation,
+            FileOperation::Read {
+                offset: 2,
+                length: 6
+            }
+        ));
+
+        assert_eq!(
+            fs.read_file_opened(file, 0, 8).await.unwrap(),
+            (Bytes::from_static(b"basetail"), true)
+        );
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.path, "/observed-read");
+        assert!(matches!(
+            event.operation,
+            FileOperation::Read {
+                offset: 0,
+                length: 8
+            }
+        ));
+
+        // Match canonical EOF behavior: emit the access, but record no
+        // successful data operation or payload bytes at/past EOF.
+        assert_eq!(
+            fs.read_file(&auth, file, 8, 8).await.unwrap(),
+            (Bytes::new(), true)
+        );
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event.operation,
+            FileOperation::Read {
+                offset: 8,
+                length: 0
+            }
+        ));
+
+        let denied = AuthContext {
+            uid: 1001,
+            gid: 1001,
+            gids: vec![],
+            ..auth.clone()
+        };
+        assert_eq!(
+            fs.read_file(&denied, file, 0, 8).await,
+            Err(FsError::PermissionDenied)
+        );
+        assert_eq!(fs.stats.bytes_read.load(Ordering::Relaxed), baseline.0 + 14);
+        assert_eq!(
+            fs.stats.read_operations.load(Ordering::Relaxed),
+            baseline.1 + 2
+        );
+        assert_eq!(
+            fs.stats.total_operations.load(Ordering::Relaxed),
+            baseline.2 + 2
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        release.send(()).unwrap();
+        fs.quiesce_overlay_inode(file).await.unwrap();
     }
 
     #[tokio::test]

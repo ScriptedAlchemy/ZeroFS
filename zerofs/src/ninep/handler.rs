@@ -3552,14 +3552,33 @@ mod tests {
             gid: SetGid::Set(group),
             ..Default::default()
         };
-        fs.create(&test_creds(), 0, b"group-file", &attrs)
-            .await
-            .unwrap();
-        fs.mkdir(&test_creds(), 0, b"group-directory", &attrs)
-            .await
-            .unwrap();
         fs.create(
-            &test_creds(),
+            &Credentials {
+                uid: 0,
+                ..test_creds()
+            },
+            0,
+            b"group-file",
+            &attrs,
+        )
+        .await
+        .unwrap();
+        fs.mkdir(
+            &Credentials {
+                uid: 0,
+                ..test_creds()
+            },
+            0,
+            b"group-directory",
+            &attrs,
+        )
+        .await
+        .unwrap();
+        fs.create(
+            &Credentials {
+                uid: 0,
+                ..test_creds()
+            },
             0,
             b"denied",
             &SetAttributes {
@@ -3572,7 +3591,10 @@ mod tests {
         .await
         .unwrap();
         fs.create(
-            &test_creds(),
+            &Credentials {
+                uid: 0,
+                ..test_creds()
+            },
             0,
             b"other-readable",
             &SetAttributes {
@@ -4087,16 +4109,35 @@ mod tests {
             ..Default::default()
         };
         let (file_id, _) = fs
-            .create(&test_creds(), 0, b"group-file", &attrs)
+            .create(
+                &Credentials {
+                    uid: 0,
+                    ..test_creds()
+                },
+                0,
+                b"group-file",
+                &attrs,
+            )
             .await
             .unwrap();
         let (directory_id, _) = fs
-            .mkdir(&test_creds(), 0, b"group-directory", &attrs)
+            .mkdir(
+                &Credentials {
+                    uid: 0,
+                    ..test_creds()
+                },
+                0,
+                b"group-directory",
+                &attrs,
+            )
             .await
             .unwrap();
         let (known_group_denied_id, _) = fs
             .create(
-                &test_creds(),
+                &Credentials {
+                    uid: 0,
+                    ..test_creds()
+                },
                 0,
                 b"known-group-denied",
                 &SetAttributes {
@@ -9129,11 +9170,15 @@ mod tests {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
         let (parent, _) = fs
             .mkdir(
-                &test_creds(),
+                &Credentials {
+                    uid: 0,
+                    ..test_creds()
+                },
                 0,
                 b"shared",
                 &SetAttributes {
                     mode: SetMode::Set(parent_mode),
+                    uid: SetUid::Set(test_creds().uid),
                     gid: SetGid::Set(2000),
                     ..Default::default()
                 },

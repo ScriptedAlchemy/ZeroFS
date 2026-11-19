@@ -12,7 +12,8 @@ use crate::fs::inode::{
 };
 use crate::fs::mutation::types::{ConflictKey, ConflictScope};
 use crate::fs::permissions::{
-    AccessMode, Credentials, new_entry_gid, strip_sgid_unless_member, validate_mode,
+    AccessMode, Credentials, check_create_ownership, new_entry_gid, strip_sgid_unless_member,
+    validate_mode,
 };
 #[cfg(test)]
 use crate::fs::store::directory::COOKIE_FIRST_ENTRY;
@@ -112,6 +113,7 @@ impl ZeroFS {
                     return Err(FsError::Exists);
                 }
 
+                check_create_ownership(dir, attr, creds)?;
                 let file_id = self.inode_store.allocate();
                 debug!(
                     "Allocated inode {} for file {}",
@@ -305,6 +307,7 @@ impl ZeroFS {
                     return Err(FsError::Exists);
                 }
 
+                check_create_ownership(dir, attr, creds)?;
                 let new_dir_id = self.inode_store.allocate();
 
                 let (now_sec, now_nsec) = get_current_time();
@@ -516,6 +519,7 @@ impl ZeroFS {
                     return Err(FsError::Exists);
                 }
 
+                check_create_ownership(dir, attr, creds)?;
                 let special_id = self.inode_store.allocate();
                 let (now_sec, now_nsec) = get_current_time();
 
@@ -641,6 +645,7 @@ impl ZeroFS {
 
 #[cfg(test)]
 mod tests {
+    use crate::fs::permissions::Credentials;
 
     use crate::fs::test_util::test_creds;
     use crate::fs::*;
@@ -874,7 +879,15 @@ mod tests {
         };
 
         let (_dir_id, fattr) = fs
-            .mkdir(&test_creds(), 0, b"customdir", &custom_attrs)
+            .mkdir(
+                &Credentials {
+                    uid: 0,
+                    ..test_creds()
+                },
+                0,
+                b"customdir",
+                &custom_attrs,
+            )
             .await
             .unwrap();
 
@@ -933,11 +946,15 @@ mod tests {
     async fn setgid_dir(fs: &ZeroFS, name: &[u8]) -> InodeId {
         let (id, _) = fs
             .mkdir(
-                &test_creds(),
+                &Credentials {
+                    uid: 0,
+                    ..test_creds()
+                },
                 0,
                 name,
                 &SetAttributes {
                     mode: SetMode::Set(0o2775),
+                    uid: SetUid::Set(test_creds().uid),
                     gid: SetGid::Set(SETGID_PARENT_GID),
                     ..Default::default()
                 },
@@ -986,13 +1003,6 @@ mod tests {
                 true,
             ),
             ("explicit_member", non_member, SetGid::Set(1000), 1000, true),
-            (
-                "explicit_non_member",
-                primary_member,
-                SetGid::Set(4242),
-                4242,
-                false,
-            ),
         ];
 
         for (name, creds, gid, expected_gid, keep_sgid) in cases {
@@ -1019,6 +1029,29 @@ mod tests {
                 assert_eq!(inode.gid(), expected_gid, "stored {entry}");
                 assert_eq!(inode.mode(), expected_mode, "stored {entry}");
             }
+        }
+
+        // Dropping SGID is not sufficient when the requested group itself is
+        // unauthorized: ordinary group-owned files also carry access rights.
+        let attr = SetAttributes {
+            mode: SetMode::Set(0o2755),
+            gid: SetGid::Set(4242),
+            ..Default::default()
+        };
+        for is_mknod in [false, true] {
+            let name = if is_mknod {
+                b"foreign-node".as_slice()
+            } else {
+                b"foreign-file"
+            };
+            let result = if is_mknod {
+                fs.mknod(&primary_member, dir, name, FileType::Fifo, &attr, None)
+                    .await
+            } else {
+                fs.create(&primary_member, dir, name, &attr).await
+            };
+            assert_eq!(result.map(|_| ()), Err(FsError::OperationNotPermitted));
+            assert!(!fs.directory_store.exists(dir, name).await.unwrap());
         }
     }
 

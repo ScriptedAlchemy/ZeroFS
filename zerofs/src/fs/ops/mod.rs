@@ -18,6 +18,8 @@ mod queued_commit_lock_tests;
 mod remove;
 mod rename;
 mod setattr;
+#[cfg(test)]
+mod setid_tests;
 mod xattr;
 pub(crate) use xattr::AclState;
 pub use xattr::{XATTR_VALUE_MAX, XattrName, XattrSetMode, XattrValue};

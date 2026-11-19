@@ -3,7 +3,7 @@ pub(crate) mod nfs4;
 
 use super::errors::FsError;
 use super::inode::{DirectoryInode, Inode, InodeAttrs};
-use super::types::{AuthContext, SetGid};
+use super::types::{AuthContext, SetAttributes, SetGid, SetUid};
 
 const S_ISVTX: u32 = 0o1000;
 
@@ -78,6 +78,32 @@ pub(crate) fn new_entry_gid(
     }
 }
 
+/// Authorize ownership supplied with a create request under the parent lock.
+/// NFS carries explicit uid/gid attributes, while 9P supplies a group hint.
+/// Neither grants the caller authority to give files to another identity.
+pub(crate) fn check_create_ownership(
+    parent: &DirectoryInode,
+    attr: &SetAttributes,
+    creds: &Credentials,
+) -> Result<(), FsError> {
+    if creds.uid == 0 {
+        return Ok(());
+    }
+    if let SetUid::Set(uid) = attr.uid
+        && uid != creds.uid
+    {
+        return Err(FsError::OperationNotPermitted);
+    }
+    let gid = new_entry_gid(parent, &attr.gid, creds);
+    // The inherited group is allowed even for an ACL-authorized creator who
+    // is not a member. Explicitly repeating it in an NFS request is harmless.
+    let inherits_group = parent.mode & 0o2000 != 0 && gid == parent.gid;
+    if !inherits_group && !creds.is_member_of_group(gid) {
+        return Err(FsError::OperationNotPermitted);
+    }
+    Ok(())
+}
+
 /// Clears the setgid bit on a new non-directory entry unless the caller is
 /// root or a member of the entry's group. An inherited group follows Linux
 /// `mode_strip_sgid`, which keeps the bit when group execute is clear.
@@ -93,6 +119,17 @@ pub(crate) fn strip_sgid_unless_member(
     } else {
         mode & !0o2000
     }
+}
+
+/// Linux `should_remove_suid` for a content-changing operation. An owner
+/// may lack the file's group privilege, so ownership does not exempt writes.
+/// SGID without group execute is not an executable privilege bit.
+pub(crate) fn mode_after_content_change(mode: u32, creds: &Credentials) -> u32 {
+    if creds.uid == 0 {
+        return mode;
+    }
+    let kill = 0o4000 | if mode & 0o0010 != 0 { 0o2000 } else { 0 };
+    mode & !kill
 }
 
 #[derive(Debug, Clone, Copy)]

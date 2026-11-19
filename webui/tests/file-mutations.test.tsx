@@ -100,6 +100,73 @@ describe("File Manager namespace mutations", () => {
     }
   });
 
+  it.each([false, true])("does not publish an old upload through a replacement session (replace=%s)", async (replace) => {
+    const { client, fs, file } = await openSession();
+    let finishWrite!: () => void;
+    file.writeAt.mockReturnValueOnce(new Promise<void>((resolve) => { finishWrite = resolve; }));
+    const uploading = client.uploadBlob("/Report", new Blob(["text"]), { replace });
+    const outcome = uploading.catch((error: unknown) => error);
+    try {
+      await waitFor(() => expect(file.writeAt).toHaveBeenCalledOnce());
+      await client.close();
+      const replacement = {
+        ...fs,
+        rename: vi.fn().mockResolvedValue(undefined),
+        renameNoReplace: vi.fn().mockResolvedValue(undefined),
+      };
+      connect.mockResolvedValue(replacement);
+      await client.connect("ws://restored/ws/9p");
+      finishWrite();
+      expect(await outcome).toBeInstanceOf(Error);
+      expect(await outcome).toHaveProperty("message", expect.stringMatching(/session/i));
+      expect(replacement.rename).not.toHaveBeenCalled();
+      expect(replacement.renameNoReplace).not.toHaveBeenCalled();
+      expect(fs.rename).not.toHaveBeenCalled();
+      expect(fs.renameNoReplace).not.toHaveBeenCalled();
+      expect(file.close).toHaveBeenCalledOnce();
+      expect(fs.removeFile).toHaveBeenCalledWith(fs.openFile.mock.calls[0][0]);
+    } finally {
+      finishWrite?.();
+      await outcome;
+      await client.close();
+    }
+  });
+
+  it("does not acknowledge an old batch using a replacement session's durability barrier", async () => {
+    const { client, fs, file } = await openSession();
+    const batch = client.beginUploadBatch();
+    try {
+      await client.uploadBlob("/Report", new Blob(["text"]), { batch });
+      await client.close();
+      const replacement = { ...fs, sync: vi.fn().mockResolvedValue(undefined) };
+      connect.mockResolvedValue(replacement);
+      await client.connect("ws://restored/ws/9p");
+      await expect(client.finishUploadBatch(batch)).rejects.toThrow(/session/i);
+      expect(replacement.sync).not.toHaveBeenCalled();
+      expect(file.close).toHaveBeenCalledOnce();
+      expect(batch.files.size).toBe(0);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("rejects adding a replacement session's upload to an unfinished old batch", async () => {
+    const { client, fs } = await openSession();
+    const batch = client.beginUploadBatch();
+    try {
+      await client.uploadBlob("/Report", new Blob(["text"]), { batch });
+      await client.close();
+      const replacement = { ...fs, openFile: vi.fn() };
+      connect.mockResolvedValue(replacement);
+      await client.connect("ws://restored/ws/9p");
+      await expect(client.uploadBlob("/Other", new Blob(["text"]), { batch })).rejects.toThrow(/session/i);
+      expect(replacement.openFile).not.toHaveBeenCalled();
+    } finally {
+      await client.finishUploadBatch(batch).catch(() => {});
+      await client.close();
+    }
+  });
+
   it.each(["overwrite", "skip", "cancel"] as const)("honors %s for server-reported name collisions", async (answer) => {
     vi.spyOn(p9client, "stat").mockImplementation(async (path) => {
       if (path === "/Report") return {} as Awaited<ReturnType<typeof p9client.stat>>;

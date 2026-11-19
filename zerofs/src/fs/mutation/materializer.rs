@@ -908,8 +908,7 @@ mod tests {
         acknowledged_metadata_handoff(b"base", false, true).await;
     }
 
-    #[tokio::test]
-    async fn volatile_write_projects_mode_and_times_before_apply() {
+    async fn volatile_write_projects_mode_and_times(owner_writes: bool) {
         use crate::fs::types::{FileAttributes, InodeWithId, SetMode, SetTime, Timestamp};
         let (fs, auth) = filesystem().await;
         let file = create_file(&fs, &auth, b"setid-visibility").await;
@@ -931,10 +930,14 @@ mod tests {
         .await
         .unwrap();
         let release_apply = hold_inode_lane(&fs, file).await;
-        let writer = AuthContext {
-            uid: 1001,
-            gid: 1001,
-            ..auth.clone()
+        let writer = if owner_writes {
+            auth.clone()
+        } else {
+            AuthContext {
+                uid: 1001,
+                gid: 1001,
+                ..auth.clone()
+            }
         };
         let acknowledged = fs
             .write_ack(&writer, file, 0, &Bytes::from_static(b"wxyz"))
@@ -970,6 +973,16 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn volatile_write_projects_mode_and_times_before_apply() {
+        volatile_write_projects_mode_and_times(false).await;
+    }
+
+    #[tokio::test]
+    async fn volatile_owner_write_clears_setid_before_apply() {
+        volatile_write_projects_mode_and_times(true).await;
     }
 
     #[tokio::test]

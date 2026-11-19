@@ -26,6 +26,7 @@ interface UploadOptions {
 interface UploadBatch {
   files: Set<SharedFile>;
   finished: boolean;
+  session: SharedClient | null;
 }
 
 interface WireTimestamp {
@@ -543,7 +544,7 @@ export class ZeroFsClient {
   }
 
   beginUploadBatch(): UploadBatch {
-    return { files: new Set(), finished: false };
+    return { files: new Set(), finished: false, session: null };
   }
 
   async finishUploadBatch(batch: UploadBatch): Promise<void> {
@@ -552,9 +553,15 @@ export class ZeroFsClient {
     const files = [...batch.files];
     try {
       const fs = await this.fs();
+      // A replacement logical session has none of the original session's
+      // lineage obligations. Its successful barrier cannot acknowledge them.
+      if (fs !== this.client || (batch.session && batch.session !== fs)) {
+        throw new Error("Upload session changed before its durability barrier");
+      }
       await fs.sync();
     } finally {
       batch.files.clear();
+      batch.session = null;
       await Promise.all(files.map((file) => file.close()));
     }
   }
@@ -676,6 +683,13 @@ export class ZeroFsClient {
   async uploadBlob(targetPath: string, blob: Blob, { onProgress, signal, batch, replace = false }: UploadOptions = {}): Promise<void> {
     if (batch?.finished) throw new Error("Upload batch has already finished");
     const fs = await this.fs();
+    if (fs !== this.client || (batch?.session && batch.session !== fs)) {
+      throw new Error("Upload session is no longer current");
+    }
+    if (batch) {
+      if (batch.finished) throw new Error("Upload batch has already finished");
+      batch.session = fs;
+    }
     const temporary = await this.createTemporaryFile(fs, targetPath, 0o644);
     const file = temporary.file;
     let offset = 0;
@@ -690,7 +704,12 @@ export class ZeroFsClient {
         onProgress?.(offset, blob.size);
       }
       if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-      await this.rename(temporary.path, targetPath, replace);
+      if (fs !== this.client) throw new Error("Upload session is no longer current");
+      if (batch?.finished) throw new Error("Upload batch finished while a file was still uploading");
+      // Retain the session that created the staged file through publication.
+      // Page restoration can install a new session while file I/O is awaited.
+      if (replace) await fs.rename(temporary.path, targetPath);
+      else await fs.renameNoReplace(temporary.path, targetPath);
       renamed = true;
       if (batch) {
         if (batch.finished) throw new Error("Upload batch finished while a file was still uploading");

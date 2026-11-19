@@ -10,7 +10,8 @@ use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId};
 use crate::fs::mutation::types::{ConflictKey, ConflictScope};
 use crate::fs::permissions::{
-    AccessMode, Credentials, can_set_times, check_access_with_acl, check_ownership, validate_mode,
+    AccessMode, Credentials, can_set_times, check_access_with_acl, check_ownership,
+    mode_after_content_change, validate_mode,
 };
 use crate::fs::quota::QuotaSettlement;
 use crate::fs::tracing::FileOperation;
@@ -233,6 +234,9 @@ impl ZeroFS {
             Inode::File(file) => {
                 let mut growth_reservation = None;
                 let size_change = if let SetSize::Set(new_size) = setattr.size {
+                    // Even a same-size truncate discards executable privilege,
+                    // and owning the file does not grant its group privilege.
+                    file.mode = mode_after_content_change(file.mode, creds);
                     let old_size = file.size;
                     if new_size != old_size {
                         if new_size > old_size {
@@ -241,12 +245,6 @@ impl ZeroFS {
                         }
 
                         file.size = new_size;
-                        // Resizing changes file contents just like write or
-                        // fallocate. An unprivileged non-owner must not leave
-                        // the modified file carrying its previous set-ID bits.
-                        if creds.uid != file.uid && creds.uid != 0 {
-                            file.mode &= !0o6000;
-                        }
                         let (now_sec, now_nsec) = get_current_time();
                         file.mtime = now_sec;
                         file.mtime_nsec = now_nsec;

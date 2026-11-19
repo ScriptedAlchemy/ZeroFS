@@ -753,6 +753,10 @@ struct StatefulRequest {
     registry: Arc<Mutex<StatefulRequests>>,
     id: u64,
     admission: AdmissionPermit,
+    // Clunk still has to retire the fid after expiry, including when replay
+    // already recreated it on a replacement connection. Other state changes
+    // must not resume after their original outage bound has expired.
+    retires_fid: bool,
     predecessors: Vec<watch::Receiver<()>>,
     // The registry owns the sender. Retirement can close it even while the
     // caller keeps this future unpolled; that caller must never resume dispatch
@@ -2171,6 +2175,7 @@ impl NinePClient {
                 registry: Arc::clone(&self.stateful_requests),
                 id,
                 admission,
+                retires_fid: matches!(body, Message::Tclunk(_)),
                 predecessors: waiters,
                 completed: waiter,
             }
@@ -2183,7 +2188,11 @@ impl NinePClient {
         if terminal_errno != 0 {
             return Err(ClientError::Errno(terminal_errno));
         }
-        if request.completed.has_changed().is_err() {
+        if request.completed.has_changed().is_err()
+            || (!request.retires_fid
+                && self.outage_generation.load(Ordering::Acquire)
+                    != request.admission.outage_generation)
+        {
             return Err(ClientError::Disconnected);
         }
         Ok(())
@@ -7542,6 +7551,106 @@ mod session_transition_tests {
                 .expect_err("no server answered the getattr");
             assert!(matches!(error, ClientError::Disconnected), "{error}");
             assert_eq!(error.to_errno(), linux::EIO);
+        }
+
+        #[tokio::test]
+        async fn an_admitted_stateful_request_cannot_resume_after_an_expired_outage() {
+            let (conn, mut requests) = test_conn_with_receiver();
+            let client = test_client(Arc::clone(&conn));
+            client
+                .state
+                .lock()
+                .unwrap()
+                .fids
+                .insert(1, attach_fid(10, 42));
+            let names: &[&[u8]] = &[b"child"];
+            let mut walk = Box::pin(client.walk(1, 2, names));
+            assert!(futures::poll!(walk.as_mut()).is_pending());
+            let sent = recv_op_request(&mut requests, "the original walk").await;
+            assert!(matches!(sent.body, Message::Twalk(_)));
+
+            // Leave the admitted caller unpolled while the supervisor declares
+            // its outage expired and then restores the session. Clearing the
+            // current unavailable flag must not revive this old request.
+            conn.connection_lost(&client.reconnect_notify);
+            client.live.store(false, Ordering::Release);
+            client.declare_unavailable();
+            let (returned, mut returned_requests) = server_returns(&client);
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(1), walk).await,
+                Ok(Err(ClientError::Disconnected))
+            ));
+            assert!(returned_requests.try_recv().is_err());
+            assert!(!client.state.lock().unwrap().fids.contains_key(&2));
+            assert!(!returned.dead.load(Ordering::Acquire));
+        }
+
+        #[tokio::test]
+        async fn a_stateful_predecessor_wait_cannot_outlive_an_expired_outage() {
+            let (conn, mut requests) = test_conn_with_receiver();
+            let client = test_client(Arc::clone(&conn));
+            let first = client.lopen(7, 0);
+            tokio::pin!(first);
+            assert!(futures::poll!(&mut first).is_pending());
+            let sent = recv_op_request(&mut requests, "the earlier open").await;
+            reply(
+                &conn,
+                sent.tag,
+                Message::Rlopen(Rlopen {
+                    qid: qid(70),
+                    iounit: 0,
+                }),
+            );
+            let mut later = Box::pin(client.lopen(7, 0));
+            assert!(futures::poll!(later.as_mut()).is_pending());
+            assert!(requests.try_recv().is_err());
+
+            conn.connection_lost(&client.reconnect_notify);
+            client.live.store(false, Ordering::Release);
+            client.declare_unavailable();
+            let (returned, mut returned_requests) = server_returns(&client);
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(1), later).await,
+                Ok(Err(ClientError::Disconnected))
+            ));
+            assert!(returned_requests.try_recv().is_err());
+            assert!(!returned.dead.load(Ordering::Acquire));
+        }
+
+        #[tokio::test]
+        async fn a_clunk_still_retires_its_replayed_fid_after_an_expired_outage() {
+            let (conn, mut requests) = test_conn_with_receiver();
+            let client = test_client(Arc::clone(&conn));
+            client
+                .state
+                .lock()
+                .unwrap()
+                .fids
+                .insert(7, inode_fid(70, 0, 0, Some(0)));
+            let mut clunk = Box::pin(client.clunk(7));
+            assert!(futures::poll!(clunk.as_mut()).is_pending());
+            let sent = recv_op_request(&mut requests, "the original clunk").await;
+            assert!(matches!(sent.body, Message::Tclunk(_)));
+
+            conn.connection_lost(&client.reconnect_notify);
+            client.live.store(false, Ordering::Release);
+            client.declare_unavailable();
+            let (returned, mut returned_requests) = server_returns(&client);
+            let settle = async {
+                tokio::join!(clunk, async {
+                    let sent =
+                        recv_op_request(&mut returned_requests, "retiring the replayed fid").await;
+                    assert!(matches!(sent.body, Message::Tclunk(Tclunk { fid: 7 })));
+                    reply(&returned, sent.tag, Message::Rclunk(Rclunk));
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(1), settle)
+                .await
+                .expect("clunk did not settle on the replacement connection")
+                .0
+                .unwrap();
+            assert!(!client.state.lock().unwrap().fids.contains_key(&7));
+            assert!(!returned.dead.load(Ordering::Acquire));
         }
 
         #[tokio::test(start_paused = true)]

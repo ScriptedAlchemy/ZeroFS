@@ -9,7 +9,7 @@ use crate::dedup::DedupResult;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId, SymlinkInode};
 use crate::fs::mutation::types::{ConflictKey, ConflictScope};
-use crate::fs::permissions::{AccessMode, Credentials, new_entry_gid};
+use crate::fs::permissions::{AccessMode, Credentials, check_create_ownership, new_entry_gid};
 use crate::fs::store::inode::MAX_HARDLINKS_PER_INODE;
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{AuthContext, FileAttributes, InodeWithId, SetAttributes, SetMode, SetUid};
@@ -83,6 +83,7 @@ impl ZeroFS {
             return Err(FsError::Exists);
         }
 
+        check_create_ownership(dir, attr, creds)?;
         let new_id = self.inode_store.allocate();
 
         let mode = match &attr.mode {
@@ -434,12 +435,13 @@ impl ZeroFS {
 mod tests {
 
     use crate::fs::inode::Inode;
+    use crate::fs::permissions::Credentials;
     use crate::fs::test_util::test_creds;
     use crate::fs::*;
     use crate::test_helpers::test_helpers_mod::test_auth;
 
     use crate::fs::store::inode::MAX_HARDLINKS_PER_INODE;
-    use crate::fs::types::{FileType, SetAttributes, SetGid, SetMode};
+    use crate::fs::types::{FileType, SetAttributes, SetGid, SetMode, SetUid};
     use futures::StreamExt;
 
     async fn readlink_at(fs: &ZeroFS, dirid: InodeId, name: &[u8]) -> Vec<u8> {
@@ -880,11 +882,15 @@ mod tests {
         let fs = ZeroFS::new_in_memory().await.unwrap();
         let (dir, _) = fs
             .mkdir(
-                &test_creds(),
+                &Credentials {
+                    uid: 0,
+                    ..test_creds()
+                },
                 0,
                 b"sgid",
                 &SetAttributes {
                     mode: SetMode::Set(0o2775),
+                    uid: SetUid::Set(test_creds().uid),
                     gid: SetGid::Set(2000),
                     ..Default::default()
                 },
@@ -924,10 +930,14 @@ mod tests {
             .unwrap();
         let (src, _) = fs
             .create(
-                &test_creds(),
+                &Credentials {
+                    uid: 0,
+                    ..test_creds()
+                },
                 0,
                 b"src",
                 &SetAttributes {
+                    uid: SetUid::Set(test_creds().uid),
                     gid: SetGid::Set(555),
                     ..Default::default()
                 },

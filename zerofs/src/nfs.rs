@@ -955,6 +955,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn creates_reject_forged_ownership_and_preserve_authorized_groups() {
+        async fn create_kind(
+            adapter: &NFSAdapter,
+            auth: &NfsAuthContext,
+            parent: fileid3,
+            name: &filename3,
+            attr: sattr3,
+            kind: usize,
+        ) -> Result<(fileid3, fattr3), nfsstat3> {
+            match kind {
+                0 => adapter.create(auth, parent, name, attr).await,
+                1 => adapter.mkdir(auth, parent, name, &attr).await,
+                2 => {
+                    adapter
+                        .symlink(
+                            auth,
+                            parent,
+                            name,
+                            &nfspath3 {
+                                0: b"target".to_vec(),
+                            },
+                            &attr,
+                        )
+                        .await
+                }
+                3 => {
+                    adapter
+                        .mknod(auth, parent, name, ftype3::NF3FIFO, &attr, None)
+                        .await
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let adapter = NFSAdapter::new(Arc::clone(&fs));
+        let actor = NfsAuthContext {
+            uid: 1000,
+            gid: 1000,
+            gids: vec![3000],
+        };
+        let root = NfsAuthContext {
+            uid: 0,
+            gid: 0,
+            gids: vec![],
+        };
+        for kind in 0..4 {
+            for (index, attr) in [
+                sattr3 {
+                    uid: set_uid3::uid(0),
+                    ..sattr3::default()
+                },
+                sattr3 {
+                    gid: set_gid3::gid(0),
+                    ..sattr3::default()
+                },
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let name = filename(format!("forged-{kind}-{index}").as_bytes());
+                assert!(matches!(
+                    create_kind(&adapter, &actor, 0, &name, attr, kind).await,
+                    Err(nfsstat3::NFS3ERR_PERM)
+                ));
+                assert!(matches!(
+                    adapter.lookup(&actor, 0, &name).await,
+                    Err(nfsstat3::NFS3ERR_NOENT)
+                ));
+            }
+            for gid in [1000, 3000] {
+                let (_, attrs) = create_kind(
+                    &adapter,
+                    &actor,
+                    0,
+                    &filename(format!("allowed-{kind}-{gid}").as_bytes()),
+                    sattr3 {
+                        uid: set_uid3::uid(1000),
+                        gid: set_gid3::gid(gid),
+                        ..sattr3::default()
+                    },
+                    kind,
+                )
+                .await
+                .unwrap();
+                assert_eq!((attrs.uid, attrs.gid), (1000, gid));
+            }
+            let (_, attrs) = create_kind(
+                &adapter,
+                &root,
+                0,
+                &filename(format!("root-{kind}").as_bytes()),
+                sattr3 {
+                    uid: set_uid3::uid(1001),
+                    gid: set_gid3::gid(4000),
+                    ..sattr3::default()
+                },
+                kind,
+            )
+            .await
+            .unwrap();
+            assert_eq!((attrs.uid, attrs.gid), (1001, 4000));
+        }
+
+        let (parent, _) = adapter
+            .mkdir(
+                &root,
+                0,
+                &filename(b"foreign-setgid-parent"),
+                &sattr3 {
+                    mode: set_mode3::mode(0o2777),
+                    gid: set_gid3::gid(4000),
+                    ..sattr3::default()
+                },
+            )
+            .await
+            .unwrap();
+        for kind in 0..4 {
+            for explicit in [false, true] {
+                let attr = sattr3 {
+                    gid: if explicit {
+                        set_gid3::gid(4000)
+                    } else {
+                        set_gid3::Void
+                    },
+                    ..sattr3::default()
+                };
+                let (_, attrs) = create_kind(
+                    &adapter,
+                    &actor,
+                    parent,
+                    &filename(format!("inherited-{kind}-{explicit}").as_bytes()),
+                    attr,
+                    kind,
+                )
+                .await
+                .unwrap();
+                assert_eq!((attrs.uid, attrs.gid), (1000, 4000));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_lookup() {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
         let fs = NFSAdapter::new(fs);

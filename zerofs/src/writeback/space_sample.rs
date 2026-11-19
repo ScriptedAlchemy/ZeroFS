@@ -7,8 +7,8 @@
 use crate::writeback::anchored_dir::AnchoredDir;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)]
 enum SpaceSource {
@@ -28,8 +28,9 @@ pub(crate) struct PhysicalSpaceSample {
 pub(crate) struct PhysicalSpaceSampler {
     writeback_dir: PathBuf,
     source: SpaceSource,
-    next_generation: AtomicU64,
-    latest: Mutex<Option<PhysicalSpaceSample>>,
+    probe_gate: Arc<tokio::sync::Mutex<()>>,
+    next_generation: Arc<AtomicU64>,
+    latest: Arc<Mutex<Option<PhysicalSpaceSample>>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -52,8 +53,9 @@ impl PhysicalSpaceSampler {
         Self {
             source: SpaceSource::Path(writeback_dir.clone()),
             writeback_dir,
-            next_generation: AtomicU64::new(1),
-            latest: Mutex::new(None),
+            probe_gate: Arc::new(tokio::sync::Mutex::new(())),
+            next_generation: Arc::new(AtomicU64::new(1)),
+            latest: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -61,8 +63,9 @@ impl PhysicalSpaceSampler {
         Self {
             writeback_dir: writeback_dir.display().to_path_buf(),
             source: SpaceSource::Anchored(writeback_dir),
-            next_generation: AtomicU64::new(1),
-            latest: Mutex::new(None),
+            probe_gate: Arc::new(tokio::sync::Mutex::new(())),
+            next_generation: Arc::new(AtomicU64::new(1)),
+            latest: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -86,14 +89,41 @@ impl PhysicalSpaceSampler {
 
     /// Probe the canonical writeback directory and publish the next generation.
     ///
-    /// The generation is allocated only after `fs4::available_space` succeeds.
+    /// Probe and publication are serialized on the blocking worker. Allocating
+    /// a generation after awaiting an independent probe can relabel an older
+    /// free-space observation as newer when async continuations resume out of
+    /// order. Allocating it before dispatch has the same problem when workers
+    /// start out of order. Keep the observation and its generation together.
     pub(crate) async fn sample(&self) -> Result<PhysicalSpaceSample, SpaceSampleError> {
         let source = self.source.clone();
-        let available_bytes = tokio::task::spawn_blocking(move || match source {
+        self.sample_with(move || match source {
             SpaceSource::Path(path) => fs4::available_space(path),
             SpaceSource::Anchored(directory) => directory
                 .available_space()
                 .map_err(|error| io::Error::other(error.to_string())),
+        })
+        .await
+    }
+
+    async fn sample_with(
+        &self,
+        probe: impl FnOnce() -> io::Result<u64> + Send + 'static,
+    ) -> Result<PhysicalSpaceSample, SpaceSampleError> {
+        let guard = Arc::clone(&self.probe_gate).lock_owned().await;
+        let next_generation = Arc::clone(&self.next_generation);
+        let latest = Arc::clone(&self.latest);
+        tokio::task::spawn_blocking(move || {
+            // Cancellation must not admit another probe while this native
+            // observation can still publish. Snapshot reads use a separate
+            // lock, so a slow filesystem does not block latest_sample().
+            let _guard = guard;
+            let available_bytes = probe()?;
+            let sample = PhysicalSpaceSample {
+                generation: next_generation.fetch_add(1, Ordering::AcqRel),
+                available_bytes,
+            };
+            Self::publish_sample(&latest, sample);
+            Ok(sample)
         })
         .await
         .map_err(|error| SpaceSampleError::Probe {
@@ -103,23 +133,14 @@ impl PhysicalSpaceSampler {
         .map_err(|source| SpaceSampleError::Probe {
             path: self.writeback_dir.clone(),
             source,
-        })?;
-        let generation = self.next_generation.fetch_add(1, Ordering::AcqRel);
-        let sample = PhysicalSpaceSample {
-            generation,
-            available_bytes,
-        };
-        self.publish_sample(sample);
-        Ok(sample)
+        })
     }
 
-    fn publish_sample(&self, sample: PhysicalSpaceSample) {
-        // Probes may finish publication out of order on different threads.
+    fn publish_sample(latest: &Mutex<Option<PhysicalSpaceSample>>, sample: PhysicalSpaceSample) {
         // Keep the generation and its byte count together: separate atomics
-        // can pair a fresh generation with an older, larger free-space value,
-        // allowing stale-sample retries to over-admit physical reservations.
-        let mut latest = self
-            .latest
+        // could pair a fresh generation with an older, larger free-space value
+        // when latest_sample() reads the published snapshot.
+        let mut latest = latest
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if latest.is_none_or(|current| sample.generation > current.generation) {
@@ -195,14 +216,20 @@ mod tests {
         let sampler = PhysicalSpaceSampler::new(temp.path());
         // The older probe acquired generation 1, then its thread paused before
         // publication while the next caller observed the disk filling up.
-        sampler.publish_sample(PhysicalSpaceSample {
-            generation: 2,
-            available_bytes: 50,
-        });
-        sampler.publish_sample(PhysicalSpaceSample {
-            generation: 1,
-            available_bytes: 1_000,
-        });
+        PhysicalSpaceSampler::publish_sample(
+            &sampler.latest,
+            PhysicalSpaceSample {
+                generation: 2,
+                available_bytes: 50,
+            },
+        );
+        PhysicalSpaceSampler::publish_sample(
+            &sampler.latest,
+            PhysicalSpaceSample {
+                generation: 1,
+                available_bytes: 1_000,
+            },
+        );
         // A stale admission retries with latest_sample(). Returning generation
         // 2 with the older free-byte count would bypass its freshness check and
         // allow a claim that the latest observation cannot accommodate.
@@ -225,6 +252,92 @@ mod tests {
         );
         assert_eq!(latest.generation, 2);
         assert_eq!(latest.available_bytes, 50);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_earlier_probe_cannot_replace_newer_physical_space() {
+        assert_probe_ordering(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_waiter_keeps_its_native_probe_serialized() {
+        assert_probe_ordering(true).await;
+    }
+
+    async fn assert_probe_ordering(cancel_first: bool) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let sampler = Arc::new(PhysicalSpaceSampler::new(temp.path()));
+        let disk_free = Arc::new(AtomicU64::new(1_000));
+        let (observed, first_observation) = tokio::sync::oneshot::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        let first = tokio::spawn({
+            let sampler = Arc::clone(&sampler);
+            let disk_free = Arc::clone(&disk_free);
+            async move {
+                sampler
+                    .sample_with(move || {
+                        let available = disk_free.load(Ordering::SeqCst);
+                        observed.send(()).unwrap();
+                        paused.recv().unwrap();
+                        Ok(available)
+                    })
+                    .await
+                    .unwrap()
+            }
+        });
+        first_observation.await.unwrap();
+        let first = if cancel_first {
+            first.abort();
+            assert!(first.await.unwrap_err().is_cancelled());
+            None
+        } else {
+            Some(first)
+        };
+        disk_free.store(50, Ordering::SeqCst);
+        let mut second = tokio::spawn({
+            let sampler = Arc::clone(&sampler);
+            let disk_free = Arc::clone(&disk_free);
+            async move {
+                sampler
+                    .sample_with(move || Ok(disk_free.load(Ordering::SeqCst)))
+                    .await
+                    .unwrap()
+            }
+        });
+        // Give the second probe an opportunity to finish first. It must wait
+        // for the older observation's publication; with independent probes it
+        // publishes 50 first and the stalled probe then relabels 1,000 as new.
+        let early_second = tokio::time::timeout(Duration::from_millis(100), &mut second)
+            .await
+            .ok();
+        resume.send(()).unwrap();
+        let first = match first {
+            Some(first) => Some(first.await.unwrap()),
+            None => None,
+        };
+        let second = match early_second {
+            Some(result) => result.unwrap(),
+            None => second.await.unwrap(),
+        };
+        if let Some(first) = first {
+            assert!(first.generation < second.generation);
+        }
+        assert_eq!(sampler.latest_sample(), Some(second));
+        assert_eq!(second.available_bytes, 50);
+
+        let admission = SsdAdmission::new(1_000, 8, 90, 70, 0).unwrap();
+        let request = SsdReservationRequest {
+            ssd_reservation_bytes: 200,
+            physical_reservation_bytes: 200,
+            operations: 1,
+        };
+        assert!(matches!(
+            admission.try_reserve(request, sampler.latest_sample().unwrap()),
+            Err(ReservationError::TooLargePhysical { available: 50, .. })
+        ));
     }
 
     #[tokio::test]

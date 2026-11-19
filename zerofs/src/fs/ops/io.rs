@@ -9,7 +9,7 @@ use crate::dedup::DedupResult;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
 use crate::fs::mutation::types::{ConflictKey, ConflictScope};
-use crate::fs::permissions::{AccessMode, Credentials};
+use crate::fs::permissions::{AccessMode, Credentials, mode_after_content_change};
 use crate::fs::quota::QuotaSettlement;
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{AuthContext, FallocateMode, FileAttributes, InodeWithId};
@@ -267,11 +267,7 @@ impl ZeroFS {
             file.ctime = now_sec;
             file.ctime_nsec = now_nsec;
 
-            // Match the write path: a non-owner changing file state must not
-            // leave a privileged executable carrying stale SUID/SGID bits.
-            if creds.uid != file.uid && creds.uid != 0 {
-                file.mode &= !0o6000;
-            }
+            file.mode = mode_after_content_change(file.mode, &creds);
         }
 
         self.inode_store.save(&mut txn, id, &inode)?;

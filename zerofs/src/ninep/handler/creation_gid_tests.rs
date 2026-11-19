@@ -151,11 +151,12 @@ async fn requested_creation_gid_never_changes_parent_authorization() {
     ] {
         let (parent, _) = fs
             .mkdir(
-                &owner,
+                &Credentials { uid: 0, ..owner },
                 0,
                 case.name,
                 &SetAttributes {
                     mode: SetMode::Set(case.mode),
+                    uid: SetUid::Set(owner.uid),
                     gid: SetGid::Set(case.parent_gid),
                     ..Default::default()
                 },
@@ -211,11 +212,12 @@ async fn creation_gid_selection_preserves_inheritance_and_listener_override() {
     ] {
         let (parent, _) = fs
             .mkdir(
-                &owner,
+                &Credentials { uid: 0, ..owner },
                 0,
                 format!("creation-gid-{index}").as_bytes(),
                 &SetAttributes {
                     mode: SetMode::Set(if inherit { 0o2777 } else { 0o777 }),
+                    uid: SetUid::Set(owner.uid),
                     gid: SetGid::Set(4000),
                     ..Default::default()
                 },
@@ -290,11 +292,12 @@ async fn private_create_umask_is_applied_only_without_a_default_acl() {
     for inherit_acl in [false, true] {
         let (parent, _) = fs
             .mkdir(
-                &owner,
+                &Credentials { uid: 0, ..owner },
                 0,
                 if inherit_acl { b"inherited" } else { b"plain" },
                 &SetAttributes {
                     mode: SetMode::Set(0o2770),
+                    uid: SetUid::Set(owner.uid),
                     gid: SetGid::Set(3000),
                     ..Default::default()
                 },

@@ -293,14 +293,16 @@ async fn access_preserves_acknowledged_acl_write_attributes_before_materializati
     .await
     .expect("RAM acknowledgement must not wait for materialization")
     .unwrap();
-    assert_eq!((written.size, written.mode), (8, 0o660));
+    // SUID is discarded by a content change, while non-executable SGID
+    // survives, as on Linux. ACCESS must preserve both resulting decisions.
+    assert_eq!((written.size, written.mode), (8, 0o2660));
     assert_ne!(written.mtime.seconds, before.mtime.seconds);
     let visible = adapter.getattr(&writer, file).await.unwrap();
     assert_eq!(encoded(&visible), encoded(&written));
 
     // The named user takes the ACL snapshot path, while owner/root keep their
     // fast paths. All must return the same acknowledged metadata as GETATTR,
-    // including setid clearing, even though canonical apply is still held.
+    // including SUID clearing, even though canonical apply is still held.
     let writable = ACCESS3_READ | ACCESS3_MODIFY | ACCESS3_EXTEND;
     for (identity, expected_access) in [
         (auth(2000, 2000, &[]), writable),
