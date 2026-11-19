@@ -145,6 +145,8 @@ class PreparedFixture(NamedTuple):
 
 
 class Fixture:
+    profiles = frozenset({"small-nas-journal-v1"})
+
     def __init__(self, args, receipt):
         self.args = args
         self.receipt = receipt
@@ -277,8 +279,8 @@ class Fixture:
             require(str(self.journal) not in source, "verifier refers to the journal")
         else:
             require(
-                runtime.get("profile") == "small-nas-journal-v1",
-                "engine must explicitly select the bounded journal runtime profile",
+                runtime.get("profile") in self.profiles,
+                "engine must explicitly select a bounded journal runtime profile",
             )
             wb = document["writeback"]
             require(
