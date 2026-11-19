@@ -1,6 +1,6 @@
 use crate::writeback::journal::Journal;
 use crate::writeback::journaler::LocalCommitObserver;
-use crate::writeback::model::{LocalEtag, MutationKind, MutationRecord, Sequence};
+use crate::writeback::model::{LocalEtag, MutationKind, MutationMode, MutationRecord, Sequence};
 use crate::writeback::payload::VerifiedPayload;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -46,9 +46,8 @@ struct OverlayEntry {
 }
 
 /// Projection of [`OverlayEntry`] carrying only the fields
-/// [`OverlayIndex::visible_version`] and [`OverlayIndex::has_visible_local_object`]
-/// need, so those lookups don't pay for cloning the full mutation record and
-/// payload location.
+/// [`OverlayIndex::visible_version`] needs, so that lookup doesn't pay for
+/// cloning the full mutation record and payload location.
 struct VisibleSnapshot {
     effect: OverlayEffect,
     local_etag: LocalEtag,
@@ -386,10 +385,42 @@ impl OverlayIndex {
         }
     }
 
-    pub(crate) async fn has_visible_local_object(&self, location: &Path) -> bool {
-        self.visible_snapshot(location)
-            .await
-            .is_some_and(|snapshot| matches!(snapshot.effect, OverlayEffect::Put))
+    /// Reuse an already accepted immutable create only when its verified
+    /// length and digest match. The caller holds the key's mutation lock and
+    /// must still wait for this original sequence's configured durability tier.
+    pub(crate) async fn matching_local_create(
+        &self,
+        location: &Path,
+        payload: &VerifiedPayload,
+    ) -> object_store::Result<Option<(Sequence, LocalEtag)>> {
+        let state = self.state.read().await;
+        let Some(entry) = state
+            .entries
+            .get(location)
+            .and_then(|entries| entries.back())
+        else {
+            return Ok(None);
+        };
+        if entry.effect == OverlayEffect::Delete {
+            return Ok(None);
+        }
+        if matches!(
+            entry.record.kind,
+            MutationKind::Put {
+                mode: MutationMode::Create,
+                ..
+            }
+        ) && payload.matches_record(&entry.record)
+        {
+            return Ok(Some((
+                entry.record.sequence,
+                entry.record.local_etag.clone(),
+            )));
+        }
+        Err(object_store::Error::AlreadyExists {
+            path: location.to_string(),
+            source: "overlay-visible object already exists".into(),
+        })
     }
 
     pub(crate) async fn get(&self, location: &Path) -> object_store::Result<GetResult> {

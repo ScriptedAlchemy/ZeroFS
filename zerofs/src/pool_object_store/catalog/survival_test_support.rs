@@ -68,7 +68,7 @@ pub(crate) async fn create_debts(pool: &PoolObjectStore) -> Result<()> {
         .reserve(&location, 23, Some("disk-b".to_owned()))
         .await?;
     let id = upload.id.clone();
-    pool.catalog(move |catalog| catalog.mark_started_for_migration(&id, false))
+    pool.catalog(move |catalog| catalog.mark_started_for_migration(&id, false, None))
         .await?;
     pool.ensure_member(&upload.member_id, true).await?;
     let mut options = PutOptions::from(PutMode::Create);

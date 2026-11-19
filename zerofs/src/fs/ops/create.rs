@@ -100,9 +100,7 @@ impl ZeroFS {
         let (parent_and_name, cookie) = tokio::join!(parent_and_name, cookie_read);
         let (mut dir_inode, exists) = parent_and_name?;
 
-        self.check_inode_access(dirid, &dir_inode, creds, AccessMode::Write)
-            .await?;
-        self.check_inode_access(dirid, &dir_inode, creds, AccessMode::Execute)
+        self.check_inode_access(dirid, &dir_inode, creds, AccessMode::WriteExecute)
             .await?;
 
         match &mut dir_inode {
@@ -295,9 +293,7 @@ impl ZeroFS {
             self.directory_store.exists(dirid, name)
         )?;
 
-        self.check_inode_access(dirid, &dir_inode, creds, AccessMode::Write)
-            .await?;
-        self.check_inode_access(dirid, &dir_inode, creds, AccessMode::Execute)
+        self.check_inode_access(dirid, &dir_inode, creds, AccessMode::WriteExecute)
             .await?;
 
         match &mut dir_inode {
@@ -314,7 +310,7 @@ impl ZeroFS {
                 let (now_sec, now_nsec) = get_current_time();
 
                 let mut new_mode = match &attr.mode {
-                    SetMode::Set(m) => *m,
+                    SetMode::Set(m) => validate_mode(*m),
                     SetMode::NoChange => 0o777,
                 };
 
@@ -507,9 +503,7 @@ impl ZeroFS {
             self.directory_store.exists(dirid, name)
         )?;
 
-        self.check_inode_access(dirid, &dir_inode, creds, AccessMode::Write)
-            .await?;
-        self.check_inode_access(dirid, &dir_inode, creds, AccessMode::Execute)
+        self.check_inode_access(dirid, &dir_inode, creds, AccessMode::WriteExecute)
             .await?;
 
         match &mut dir_inode {

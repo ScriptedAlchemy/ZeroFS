@@ -654,16 +654,15 @@ impl ZeroFS {
         // hard-link aliases and every actual publication retain the normal
         // write and sticky-directory checks.
         let verify_in_place = verification.is_some() && same_entry && from_name == to_name;
-        if !verify_in_place {
-            self.check_inode_access(from_dirid, &from_dir, &creds, AccessMode::Write)
-                .await?;
-        }
-        self.check_inode_access(from_dirid, &from_dir, &creds, AccessMode::Execute)
+        let required = if verify_in_place {
+            AccessMode::Execute
+        } else {
+            AccessMode::WriteExecute
+        };
+        self.check_inode_access(from_dirid, &from_dir, &creds, required)
             .await?;
         if let Some(ref to_dir) = to_dir {
-            self.check_inode_access(to_dirid, to_dir, &creds, AccessMode::Write)
-                .await?;
-            self.check_inode_access(to_dirid, to_dir, &creds, AccessMode::Execute)
+            self.check_inode_access(to_dirid, to_dir, &creds, AccessMode::WriteExecute)
                 .await?;
         }
         if !verify_in_place {

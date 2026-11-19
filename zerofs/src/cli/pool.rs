@@ -43,7 +43,8 @@ pub async fn run(command: PoolCommands) -> Result<()> {
         PoolCommands::Affected { .. } => unreachable!(),
         PoolCommands::Init { config }
         | PoolCommands::List { config }
-        | PoolCommands::Migrate { config, .. } => config,
+        | PoolCommands::Migrate { config, .. }
+        | PoolCommands::Verify { config, .. } => config,
         PoolCommands::Status { config, .. } => {
             config.as_ref().context("--config required offline")?
         }
@@ -62,6 +63,13 @@ pub async fn run(command: PoolCommands) -> Result<()> {
             }
             PoolCommands::List { .. } => {
                 println!("{}", serde_json::to_string_pretty(&pool.placements().await?)?);
+            }
+            PoolCommands::Verify { member, .. } => {
+                let report = pool.verify_member(&member).await?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if !report.failures.is_empty() {
+                    anyhow::bail!("member {member} failed verification for {} segment(s)", report.failures.len());
+                }
             }
             PoolCommands::Migrate { to, from, segment, limit, .. } => {
                 let locations = if let Some(segment) = segment {

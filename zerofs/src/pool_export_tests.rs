@@ -512,3 +512,181 @@ async fn pool_exports_nfs_and_nbd_survive_locator_evacuation_and_cold_reopen() {
     .await
     .expect("pool-backed NFS/NBD wire regression exceeded its deadline");
 }
+
+async fn write_sealed_file(fs: &ZeroFS, name: &[u8], byte: u8) -> u64 {
+    let credentials = credentials();
+    let (inode, _) = fs
+        .create(&credentials, 0, name, &SetAttributes::default())
+        .await
+        .unwrap();
+    fs.write(
+        &(&credentials).into(),
+        inode,
+        0,
+        &bytes::Bytes::from(vec![byte; PAYLOAD_SIZE]),
+    )
+    .await
+    .unwrap();
+    fs.client_fsync().await.unwrap();
+    inode
+}
+
+async fn affected_paths(fs: &ZeroFS, pool: &PoolObjectStore, member: &str) -> Vec<Vec<u8>> {
+    let segments = pool.affected_segments(member).await.unwrap();
+    let report = crate::fs::affected::scan(&fs.db, "live".into(), &segments)
+        .await
+        .unwrap();
+    let mut paths = report
+        .references
+        .into_iter()
+        .flat_map(|reference| reference.paths)
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn degraded_cold_start_serves_survivor_and_reports_missing_files() {
+    use crate::config::SegmentPlacement;
+    use crate::fs::errors::FsError;
+
+    let root = tempfile::tempdir().unwrap();
+    let mut settings = settings(root.path());
+    settings.storage.pool.as_mut().unwrap().segment_placement = SegmentPlacement::RoundRobinLocal;
+    let (fs, pool) = open(&settings, true).await;
+    let lost = write_sealed_file(&fs, b"lost", 0x31).await;
+    let survivor = write_sealed_file(&fs, b"survivor", 0x32).await;
+    assert_eq!(
+        affected_paths(&fs, &pool, "disk-a").await,
+        [b"/lost".to_vec()]
+    );
+    assert_eq!(
+        affected_paths(&fs, &pool, "disk-b").await,
+        [b"/survivor".to_vec()]
+    );
+    close(fs, pool).await;
+
+    let missing = root.path().join("disk-a");
+    std::fs::remove_dir_all(&missing).unwrap();
+    assert!(open_pool_storage(&settings, false).await.is_err());
+    settings.storage.pool.as_mut().unwrap().allow_degraded_start = true;
+    let (fs, pool) = open(&settings, false).await;
+    close(fs, pool).await;
+
+    // A fallback directory at the unplugged disk's path must not receive writes.
+    std::fs::create_dir(&missing).unwrap();
+    settings.storage.pool.as_mut().unwrap().allow_degraded_start = false;
+    assert!(open_pool_storage(&settings, false).await.is_err());
+    settings.storage.pool.as_mut().unwrap().allow_degraded_start = true;
+    let (fs, pool) = open(&settings, false).await;
+    let auth = (&credentials()).into();
+    let read = fs.read_file(&auth, lost, 0, PAYLOAD_SIZE as u32);
+    let failure = tokio::time::timeout(Duration::from_secs(3), read)
+        .await
+        .expect("missing member must return a bounded error");
+    assert!(matches!(failure, Err(FsError::IoError)));
+    let (body, _) = fs
+        .read_file(&auth, survivor, 0, PAYLOAD_SIZE as u32)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), vec![0x32; PAYLOAD_SIZE].as_slice());
+    assert_eq!(
+        affected_paths(&fs, &pool, "disk-a").await,
+        [b"/lost".to_vec()]
+    );
+    write_sealed_file(&fs, b"new", 0x33).await;
+    assert_eq!(
+        affected_paths(&fs, &pool, "disk-b").await,
+        [b"/new".to_vec(), b"/survivor".to_vec()]
+    );
+    let status = pool.status().await.unwrap();
+    assert!(status.members.iter().any(|member| {
+        member.id == "disk-a" && member.unavailable_at_startup && member.available_bytes == 0
+    }));
+    assert_eq!(std::fs::read_dir(&missing).unwrap().count(), 0);
+    close(fs, pool).await;
+
+    let authority = root.path().join("metadata");
+    let marker = authority.join(".zerofs-pool/identity");
+    std::fs::remove_file(marker).unwrap();
+    assert!(open_pool_storage(&settings, false).await.is_err());
+    let catalog = root
+        .path()
+        .join("catalog")
+        .join(crate::pool_object_store::CATALOG_FILE_NAME);
+    std::fs::remove_file(catalog).unwrap();
+    let failure = open_pool_storage(&settings, false).await.err().unwrap();
+    assert!(
+        failure.to_string().contains("pool catalog is missing"),
+        "{failure:#}"
+    );
+    root.close().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sealed_body_corruption_fails_authentication_and_verification() {
+    use crate::frame_codec::CodecError;
+    use crate::fs::errors::FsError;
+    use crate::segment::{
+        FOOTER_LEN, LEN_PREFIX, SegmentError, parse_footer, read_frames_from_region,
+    };
+    use std::io::{Seek, Write};
+
+    let root = tempfile::tempdir().unwrap();
+    let settings = settings(root.path());
+    let (fs, pool) = open(&settings, true).await;
+    let inode = write_sealed_file(&fs, b"damaged", 0x55).await;
+    let placements = pool.placements().await.unwrap();
+    let [placement] = placements.as_slice() else {
+        panic!("fixture must write exactly one sealed segment: {placements:?}");
+    };
+    let before = pool.verify_member("disk-a").await.unwrap();
+    assert_eq!(before.verified_segments, 1);
+    assert!(before.failures.is_empty());
+    close(fs, pool).await;
+
+    let path = root.path().join("disk-a").join(&placement.physical_key);
+    let mut body = std::fs::read(&path).unwrap();
+    let footer = parse_footer(&body[body.len() - FOOTER_LEN..], body.len() as u64).unwrap();
+    let frame_len = u32::from_le_bytes(body[..LEN_PREFIX].try_into().unwrap()) as usize;
+    let frame_end = LEN_PREFIX + frame_len;
+    assert!(frame_end as u64 <= footer.dir_offset);
+    let codec = FrameCodec::new(
+        &[0x67; 32],
+        crate::segment::SEGMENT_INFO,
+        CompressionConfig::default(),
+    );
+    read_frames_from_region(&codec, &body[..frame_end], footer.segid, 0, &[(inode, 0)]).unwrap();
+    // Flip a ciphertext byte after the nonce, leaving the directory and footer
+    // intact. Keep the original mtime so the conditional GET reaches AEAD.
+    let offset = frame_end - 1;
+    body[offset] ^= 1;
+    let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    let modified = file.metadata().unwrap().modified().unwrap();
+    file.seek(std::io::SeekFrom::Start(offset as u64)).unwrap();
+    file.write_all(&body[offset..offset + 1]).unwrap();
+    file.set_times(std::fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    assert!(matches!(
+        read_frames_from_region(&codec, &body[..frame_end], footer.segid, 0, &[(inode, 0)]),
+        Err(SegmentError::Codec(CodecError::Decrypt))
+    ));
+
+    let (fs, pool) = open(&settings, false).await;
+    let result = fs
+        .read_file(&(&credentials()).into(), inode, 0, PAYLOAD_SIZE as u32)
+        .await;
+    assert!(matches!(result, Err(FsError::IoError)), "{result:?}");
+    assert_eq!(
+        affected_paths(&fs, &pool, "disk-a").await,
+        [b"/damaged".to_vec()]
+    );
+    let after = pool.verify_member("disk-a").await.unwrap();
+    assert_eq!(after.verified_segments, 0);
+    assert!(after.failures[placement.location.as_ref()].contains("checksum"));
+    close(fs, pool).await;
+    root.close().unwrap();
+}

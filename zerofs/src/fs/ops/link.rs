@@ -68,9 +68,7 @@ impl ZeroFS {
             self.directory_store.exists(dirid, linkname)
         )?;
 
-        self.check_inode_access(dirid, &dir_inode, creds, AccessMode::Write)
-            .await?;
-        self.check_inode_access(dirid, &dir_inode, creds, AccessMode::Execute)
+        self.check_inode_access(dirid, &dir_inode, creds, AccessMode::WriteExecute)
             .await?;
 
         let dir = match &mut dir_inode {
@@ -253,9 +251,7 @@ impl ZeroFS {
             self.directory_store.exists(linkdirid, linkname)
         )?;
 
-        self.check_inode_access(linkdirid, &link_dir_inode, &creds, AccessMode::Write)
-            .await?;
-        self.check_inode_access(linkdirid, &link_dir_inode, &creds, AccessMode::Execute)
+        self.check_inode_access(linkdirid, &link_dir_inode, &creds, AccessMode::WriteExecute)
             .await?;
 
         let mut link_dir = match link_dir_inode {

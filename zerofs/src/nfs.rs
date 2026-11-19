@@ -227,16 +227,14 @@ impl NFSFileSystem for NFSAdapter {
     ) -> Result<AccessResult, nfsstat3> {
         let auth = self.auth_context(auth);
         let creds = Credentials::from_auth_context(&auth);
-        let _guard = self.fs.lock_manager.acquire(id).await;
-        let inode = self.fs.visible_inode(id).await?;
-        let acl = if requested & ACCESS3_ALL != 0 {
-            self.fs.access_acl(id, &inode, &creds).await?
+        let (inode, acl) = if requested & ACCESS3_ALL != 0 {
+            self.fs.visible_inode_access_context(id, &creds).await?
         } else {
-            None
+            (self.fs.visible_inode(id).await?, None)
         };
         let allows = |mode| check_access_with_acl(&inode, &creds, mode, acl.as_ref()).is_ok();
-        // NFS ACCESS reports each requested right independently. Directory
-        // mutations require both write and search permission.
+        // NFS ACCESS reports each requested right independently. A directory
+        // mutation still needs one ACL entry granting both write and search.
         let mut access = 0;
         if requested & ACCESS3_READ != 0 && allows(AccessMode::Read) {
             access |= ACCESS3_READ;
@@ -249,16 +247,15 @@ impl NFSFileSystem for NFSAdapter {
         if requested & execute != 0 && allows(AccessMode::Execute) {
             access |= execute;
         }
-        let write = if inode.is_directory() {
-            ACCESS3_MODIFY | ACCESS3_EXTEND | ACCESS3_DELETE
+        let (write, mode) = if inode.is_directory() {
+            (
+                ACCESS3_MODIFY | ACCESS3_EXTEND | ACCESS3_DELETE,
+                AccessMode::WriteExecute,
+            )
         } else {
-            ACCESS3_MODIFY | ACCESS3_EXTEND
+            (ACCESS3_MODIFY | ACCESS3_EXTEND, AccessMode::Write)
         };
-        if !self.fs.db.is_read_only()
-            && requested & write != 0
-            && allows(AccessMode::Write)
-            && (!inode.is_directory() || allows(AccessMode::Execute))
-        {
+        if !self.fs.db.is_read_only() && requested & write != 0 && allows(mode) {
             access |= requested & write;
         }
         Ok(AccessResult {

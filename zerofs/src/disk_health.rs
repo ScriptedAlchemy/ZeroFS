@@ -53,6 +53,9 @@ impl PreparedDiskMonitor {
         let mut devices = std::collections::BTreeSet::new();
         if let Some(config) = &settings.storage.pool {
             for member in &config.members {
+                if pool.unavailable_at_startup(&member.id) {
+                    continue;
+                }
                 let Some(device) = &member.health_device else {
                     continue;
                 };

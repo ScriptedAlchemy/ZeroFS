@@ -24,8 +24,11 @@ use crate::fs::mutation::types::{
     PrepareWriteRequest, PreparedWriteBatch, RequestFingerprint, RequestIdentity, RequestLifetime,
 };
 use crate::fs::ops::write::{apply_prepared_batch, prepare_write, prepare_write_with_append};
+use crate::fs::permissions::Credentials;
+use crate::fs::permissions::acl::PosixAcl;
 use crate::fs::types::{AuthContext, FileAttributes};
 use bytes::Bytes;
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ops::Deref;
 #[cfg(test)]
@@ -1021,6 +1024,48 @@ impl ZeroFS {
         overlay.pause_after_metadata_read_if_requested().await;
         overlay.project_inode(id, &mut inode);
         Ok(inode)
+    }
+
+    /// Load coherent access fields and ACL entries while retaining the same
+    /// pending-write view used by getattr. Reading the ACL after visible_inode
+    /// could replace its acknowledged size and timestamps with committed data.
+    pub(crate) async fn visible_inode_access_context(
+        &self,
+        id: InodeId,
+        creds: &Credentials,
+    ) -> Result<(Inode, Option<PosixAcl>), FsError> {
+        let overlay = self.volatile_overlay.get();
+        let runtime = match overlay {
+            Some(overlay) => overlay.runtime_if_present(id).map_err(overlay_fs_error)?,
+            None => None,
+        };
+        let _read = match &runtime {
+            Some(runtime) => Some(runtime.read_guard().await),
+            None => None,
+        };
+        let inode = self.inode_store.get(id).await?;
+        let (access_inode, acl) = self.inode_access_context(id, &inode, creds).await?;
+        let mut inode = match access_inode {
+            Cow::Borrowed(_) => inode,
+            Cow::Owned(inode) => inode,
+        };
+        if let (Some(overlay), Some(_)) = (overlay, runtime.as_ref()) {
+            // The lease keeps a pending preview from retiring between the
+            // canonical pair read and projection, without draining writes or
+            // acquiring the canonical lock held by their preparation.
+            let canonical_mode = match &inode {
+                Inode::File(file) => file.mode,
+                _ => 0,
+            };
+            overlay.project_inode(id, &mut inode);
+            if let Inode::File(file) = &mut inode {
+                // Writes only clear setid bits. Retain the ACL snapshot's
+                // permission bits even if an idle runtime publishes a new
+                // write after a concurrent chmod changed those permissions.
+                file.mode = canonical_mode & (file.mode | !0o6000);
+            }
+        }
+        Ok((inode, acl))
     }
 
     /// RAM-ack write used by NFS, 9P, NBD, and WebUI. Materialized mode falls

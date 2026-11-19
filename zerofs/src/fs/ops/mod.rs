@@ -6,6 +6,9 @@ use crate::dedup::{DedupResult, OpId};
 use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
 
+#[cfg(test)]
+mod acl_access_tests;
+
 mod create;
 mod io;
 mod link;

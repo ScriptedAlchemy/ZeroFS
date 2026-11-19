@@ -96,6 +96,27 @@ fn access_decisions_follow_posix_acl_permission() {
 }
 
 #[test]
+fn named_users_and_groups_require_defined_ids() {
+    let acl = PosixAcl::from_text("u::rwx,u:2000:r--,g::r--,g:300:r--,m::r--,o::---");
+    for tag in [TAG_USER, TAG_GROUP] {
+        // The reserved sentinel is invalid, not the upper half of the ID space.
+        for id in [UNDEFINED_ID, UNDEFINED_ID - 1] {
+            let mut raw = acl.to_bytes().to_vec();
+            let entry = raw[HEADER_LEN..]
+                .chunks_exact_mut(ENTRY_LEN)
+                .find(|entry| u16::from_le_bytes([entry[0], entry[1]]) == tag)
+                .unwrap();
+            entry[4..8].copy_from_slice(&id.to_le_bytes());
+            if id == UNDEFINED_ID {
+                assert_eq!(PosixAcl::parse(&raw), Err(FsError::InvalidArgument));
+            } else {
+                assert!(PosixAcl::parse(&raw).is_ok());
+            }
+        }
+    }
+}
+
+#[test]
 fn a_matching_group_without_the_right_does_not_fall_through_to_other() {
     let acl = PosixAcl::from_text("u::rwx,g::---,m::rwx,o::r--");
     assert!(!allows(&acl, &creds(3000, &[GROUP]), AccessMode::Read));

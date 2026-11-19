@@ -1,6 +1,6 @@
 use crate::db::{Db, Transaction};
 use crate::fs::errors::FsError;
-use crate::fs::inode::InodeId;
+use crate::fs::inode::{Inode, InodeId};
 use crate::fs::key_codec::KeyCodec;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -25,6 +25,26 @@ impl XattrStore {
             .await
             .map_err(|e| FsError::from_db_error(&e))?
             .ok_or(FsError::NoData)
+    }
+
+    /// Bypass independently refreshed inode caches when mode/ownership and an
+    /// ACL row must describe the same committed permission state.
+    pub(crate) async fn get_with_inode(
+        &self,
+        id: InodeId,
+        name: &[u8],
+    ) -> Result<(Inode, Option<Bytes>), FsError> {
+        let (inode, value) = self
+            .db
+            .get_pair_snapshot(
+                &self.key_codec.inode_key(id),
+                &self.key_codec.xattr_key(id, name),
+            )
+            .await
+            .map_err(|error| FsError::from_db_error(&error))?;
+        let inode = inode.ok_or(FsError::NotFound)?;
+        let inode = bincode::deserialize(&inode).map_err(|_| FsError::InvalidData)?;
+        Ok((inode, value))
     }
 
     pub async fn list(&self, id: InodeId) -> Result<Vec<Bytes>, FsError> {

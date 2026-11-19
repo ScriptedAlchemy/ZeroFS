@@ -52,6 +52,10 @@ fn assess_with(
     let mut destinations = Vec::new();
     for (config, member) in config.iter().zip(members.iter_mut()) {
         member.available_bytes = 0;
+        if member.unavailable_at_startup {
+            unavailable.push(member.id.clone());
+            continue;
+        }
         let observed = config.local_path.is_some().then(|| space(config));
         if let Some(Ok(observed)) = &observed {
             member.space.filesystem_free_bytes = Some(observed.available);
@@ -191,6 +195,7 @@ mod tests {
                 reserved_bytes: reserved,
                 objects: 0,
                 health: MemberHealth::default(),
+                unavailable_at_startup: false,
                 safe_to_remove: false,
                 safe_to_pull_with_known_loss: false,
                 readable_evacuated: false,

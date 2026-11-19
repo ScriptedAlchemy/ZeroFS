@@ -41,8 +41,10 @@ The checks follow Linux `generic_permission`.
   root and not the owner is checked against the ACL: a matching named-user
   entry, else every matching group entry (owning group and named groups), else
   the other entry. Named users and all group-class entries are limited by the
-  mask. A matching group entry that lacks the right denies the request; it
-  does not fall through to other.
+  mask. For a combined request, one matching group entry must grant every
+  requested bit; separate group entries cannot combine read with write or
+  write with directory search. If groups match but none grants the request,
+  access is denied without falling through to other.
 - POSIX default ACLs stored in `system.posix_acl_default` on directories. A new
   file, directory or special file inherits the default as its access ACL,
   limited by the requested mode, as Linux `posix_acl_create` does. A new
@@ -59,8 +61,8 @@ only) is stored as the mode and leaves no ACL row, as on Linux.
 
 Only the owner or root may set or remove an ACL. Any caller may read one, as on
 Linux. A default ACL on a non-directory returns `EACCES`. An invalid ACL
-(unknown tag, entries out of order, duplicate named ids, a named entry without
-a mask, a permission bit above `rwx`) returns `EINVAL` and changes nothing. An
+(unknown tag, entries out of order, duplicate or undefined named ids, a named
+entry without a mask, a permission bit above `rwx`) returns `EINVAL` and changes nothing. An
 ACL value with a version other than 2 returns `EOPNOTSUPP`. An empty value
 removes the ACL. Removing an absent ACL succeeds. ACLs on symlinks return
 `EOPNOTSUPP`.
@@ -77,6 +79,12 @@ list of up to 16 entries. On Linux, the FUSE client reads the requesting thread'
 groups from procfs when its filesystem uid and gid match the request and the
 list fits the protocol. When the list is unavailable, the server uses the
 request's primary gid and the incomplete-group ACL checks.
+
+If ZeroFS itself truncates a supplied group list to its inline credential
+capacity, it preserves that fact across internal credential conversions. The
+lost groups never gain the kernel-authorized fallback: ambiguous mode checks
+require both group and other permissions, ACL checks remain conservative, and
+group changes or setgid retention require known membership.
 
 ### Client-side checks
 
@@ -101,7 +109,11 @@ effective decision is the stricter of the client's and the server's.
   mount. The server still enforces every stored ACL for requests from that
   mount, so restrictions always hold.
 - NFSv3 clients cannot read or set ACLs. The server enforces stored ACLs on
-  every NFS operation that reaches a permission check.
+  data operations and on the ACCESS RPC used by clients to authorize cached
+  opens. ACCESS evaluates each requested NFS right independently, with one
+  combined write/search check for directory mutation rights. Shared-identity
+  mapping applies before the check. Returned attributes retain acknowledged
+  RAM-write size and timestamps without forcing materialization.
 
 ## Translation of NFSv4 ACLs
 
@@ -133,7 +145,7 @@ NFSv4 rights map to POSIX bits as follows.
 | --- | --- |
 | `r` | `READ_DATA` (list directory). Requires `READ_NAMED_ATTRS`, because POSIX read also allows reading `user.*` attributes. |
 | `w` on a file | `WRITE_DATA` and `APPEND_DATA` together. Requires `WRITE_NAMED_ATTRS` and `WRITE_ATTRIBUTES`, because POSIX write also allows writing `user.*` attributes and setting times to now. |
-| `w` on a directory | `ADD_FILE` and `ADD_SUBDIRECTORY` together, with the requirements above, plus `DELETE_CHILD` or an inheritable `DELETE` for the same caller (see narrowings). |
+| `w` on a directory | `ADD_FILE` and `ADD_SUBDIRECTORY` together, with the requirements above, plus `DELETE_CHILD` for the same caller. Inheritable `DELETE` alone cannot authorize deleting every existing or future child. |
 | `x` | `EXECUTE` (traverse directory). |
 
 ### Patterns that translate
@@ -142,8 +154,10 @@ These TrueNAS patterns translate. The tests in
 `zerofs/src/fs/permissions/nfs4/tests.rs` cover each one.
 
 - `owner@`, `group@` and `everyone@` allow entries with the TrueNAS basic sets
-  `FULL_CONTROL`, `MODIFY`, `READ` and `TRAVERSE`, including the
-  `NFS4_RESTRICTED`, `NFS4_OPEN` and `NFS4_HOME` presets.
+  `FULL_CONTROL`, `READ` and `TRAVERSE`. `MODIFY` also translates on files;
+  directory grants need explicit `DELETE_CHILD` in addition to `MODIFY`.
+  `NFS4_RESTRICTED`, `NFS4_OPEN` and `NFS4_HOME` presets containing directory
+  `MODIFY` without that right are refused.
 - Named group entries, such as the SMB `BUILTIN\Users` (gid 545) and
   `BUILTIN\Administrators` (gid 544) groups, and named user entries. A POSIX
   mask is added equal to the union of the named and group-class permissions.
@@ -160,13 +174,13 @@ Each refusal names one rule. The inventory and the server log print the rule.
 
 | Rule | Cause |
 | --- | --- |
-| `decision_mismatch` | Some caller class would get a different `r`, `w` or `x` decision. Typical causes: a deny for one group ahead of an allow for another (POSIX unions group entries), owner rights that depend on the owner's group membership, or a deny for a named user who could own a future child. |
+| `decision_mismatch` | Some caller class would get a different decision for `r`, `w`, `x` or a combined request. Typical causes: a deny for one group ahead of an allow for another, rights split across group entries that no single POSIX group entry can grant together, owner rights that depend on the owner's group membership, or a deny for a named user who could own a future child. |
 | `file_or_directory_only_inheritance` | An entry inherits to files only or to directories only. POSIX defaults apply to both. |
 | `no_propagate_inheritance` | `NO_PROPAGATE_INHERIT`. POSIX defaults always propagate. |
 | `partial_write_rights` | `WRITE_DATA` without `APPEND_DATA`, or the reverse; on a directory, `ADD_FILE` without `ADD_SUBDIRECTORY`. |
 | `data_right_without_named_attribute_right` | Read data without `READ_NAMED_ATTRS`, or write data without `WRITE_NAMED_ATTRS`. |
 | `write_without_write_attributes` | Write data without `WRITE_ATTRIBUTES`. |
-| `directory_write_without_delete_child` | Directory write without `DELETE_CHILD` and without an inheritable `DELETE` for the same caller. |
+| `directory_write_without_delete_child` | Directory write without `DELETE_CHILD`, including inheritable grants. A child's owning group or ACL may differ from the parent's, and an existing/protected child may grant no `DELETE`; the parent ACL alone cannot prove that POSIX deletion would preserve access. |
 | `unsupported_ace_type` | Audit or alarm entries. |
 | `unknown_ace_flags`, `unknown_access_bits`, `malformed_xdr` | Bits or layout outside OpenZFS's NFSv4.1 encoding. |
 | `too_many_entries`, `too_many_named_principals` | More than 128 entries, 8 named users or 6 named groups. These bound the enumeration. |
@@ -183,12 +197,6 @@ and reports each one per file in the `narrowed` list.
   `WRITE_ATTRIBUTES` without data write. POSIX ties both to `w`.
 - `delete_follows_parent_directory_write`: `DELETE` on the object. POSIX
   decides deletion from the parent directory's `w` and `x` and the sticky bit.
-- `child_deletion_relies_on_inherited_delete`: directory write was accepted
-  without `DELETE_CHILD` because the same caller inherits `DELETE` on new
-  children. TrueNAS `MODIFY` produces this. POSIX lets that caller delete every
-  child, including an existing child whose own ACL denied the caller `DELETE`.
-  This is the one case where translation can be looser, and it is reported for
-  every such directory.
 
 ### What translation does not keep
 
@@ -219,7 +227,7 @@ entry's ACL record gains a `posix_translation` object, produced by the same
 code the server runs:
 
 ```json
-{"status": "accepted", "access": "u::rwx,g::rwx,o::---", "default": "u::rwx,g::rwx,o::---", "narrowed": ["child_deletion_relies_on_inherited_delete"]}
+{"status": "accepted", "access": "u::rwx,g::rwx,o::---", "default": "u::rwx,g::rwx,o::---", "narrowed": ["delete_follows_parent_directory_write"]}
 {"status": "refused", "rule": "file_or_directory_only_inheritance"}
 ```
 
@@ -243,6 +251,17 @@ ACL rows use the extended-attribute keys under the inode, so hardlinks share
 them and inode deletion removes them. The first stored ACL also writes a marker
 row under inode id `u64::MAX`, which no file can have. A writer without that
 marker skips ACL lookups; a read-only process always looks them up.
+
+When an ACL can affect a permission check, its entries and the inode's mode and
+ownership are read from one committed database view. A concurrent ACL change,
+`chmod`, or read-only reader refresh cannot combine fields from different
+permission states. Owner, root, symlink and no-ACL fast paths use the original
+inode alone.
+
+The evidence under `docs/evidence/acl-xattr-20261119/` describes its recorded
+source revision. Changes to combined permission checks, coherent ACL reads and
+NFSv4 deletion-policy refusal require fresh mounted qualification; those
+historical receipts do not qualify the updated implementation.
 
 A ZeroFS binary from before this change ignores ACL rows and checks mode bits
 only. Because the mode's group bits hold the mask, such a binary gives a named

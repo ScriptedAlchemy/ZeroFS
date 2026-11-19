@@ -19,6 +19,7 @@ use slatedb::object_store::{
 
 use crate::frame_codec::{Compressed, FrameCodec};
 use crate::fs::inode::InodeId;
+use crate::pool_object_store::SegmentTarget;
 use crate::segment::{
     DirEntry, FOOTER_LEN, FooterMeta, FrameLoc, LEN_PREFIX, Segid, SegmentBuilder, SegmentError,
     SegmentFormatLimits, seal_compressed_batch,
@@ -173,16 +174,21 @@ impl SegmentStore {
     /// PUT pre-built segment bytes (durable on return). Used by the open-segment
     /// buffer's seal, which builds the bytes itself via `seal_directory` +
     /// `assemble_segment`.
-    pub(crate) async fn put_segment(&self, segid: Segid, bytes: Bytes) -> Result<()> {
+    pub(crate) async fn put_segment(
+        &self,
+        segid: Segid,
+        bytes: Bytes,
+        target: Option<&SegmentTarget>,
+    ) -> Result<()> {
         // A small (partial-fsync) seal goes up as a single PUT (which still
         // writes through the parts cache) but a full 256 MiB seal streams as
         // concurrent multipart, so the fsync-path PUT latency stays bounded
         // instead of serializing 256 MiB on one stream.
         let path = Path::from(segid.object_key());
         if bytes.len() < SEAL_PART_SIZE {
-            self.put_segment_create(&path, &bytes).await?;
+            self.put_segment_create(&path, &bytes, target).await?;
         } else if let SegmentPublication::Multipart(result) =
-            self.put_segment_multipart(&path, &bytes).await?
+            self.put_segment_multipart(&path, &bytes, target).await?
         {
             // True multipart bypasses the object-store wrapper's single-PUT
             // write-through, so only this outcome needs the explicit hook.
@@ -193,9 +199,17 @@ impl SegmentStore {
         Ok(())
     }
 
-    async fn put_segment_create(&self, path: &Path, bytes: &Bytes) -> Result<PutResult> {
+    async fn put_segment_create(
+        &self,
+        path: &Path,
+        bytes: &Bytes,
+        target: Option<&SegmentTarget>,
+    ) -> Result<PutResult> {
         let mut options = PutOptions::from(PutMode::Create);
         options.extensions.insert(GeneratedSegmentCreate);
+        if let Some(target) = target {
+            options.extensions.insert(target.clone());
+        }
         match self
             .object_store
             .put_opts(path, bytes.clone().into(), options)
@@ -204,6 +218,13 @@ impl SegmentStore {
             Ok(result) => Ok(result),
             // A no-space answer is definitive: nothing was published.
             Err(error) if crate::retrying_object_store::is_no_space(&error) => {
+                Err(write_failure(&error))
+            }
+            // A refused exact target cannot be reconciled by bytes alone.
+            Err(error)
+                if target.is_some()
+                    && crate::retrying_object_store::has_permanent_source(&error) =>
+            {
                 Err(write_failure(&error))
             }
             // A create whose success response was lost can return either a
@@ -276,11 +297,15 @@ impl SegmentStore {
         &self,
         path: &Path,
         bytes: &Bytes,
+        target: Option<&SegmentTarget>,
     ) -> Result<SegmentPublication> {
         let capability = ConditionalMultipartCreate::for_payload_len(bytes.len() as u64);
         let mut options = PutMultipartOptions::default();
         options.extensions.insert(GeneratedSegmentCreate);
         options.extensions.insert(capability.clone());
+        if let Some(target) = target {
+            options.extensions.insert(target.clone());
+        }
         let upload = match self.object_store.put_multipart_opts(path, options).await {
             Ok(upload) => upload,
             Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
@@ -294,14 +319,14 @@ impl SegmentStore {
                     .map(SegmentPublication::Multipart);
             }
             Err(slatedb::object_store::Error::NotSupported { .. }) => {
-                self.put_segment_create(path, bytes).await?;
+                self.put_segment_create(path, bytes, target).await?;
                 return Ok(SegmentPublication::SingleFallback);
             }
             Err(error) => return Err(write_failure(&error)),
         };
         if capability.is_acknowledged() {
             return self
-                .complete_segment_upload(path, bytes, upload, true)
+                .complete_segment_upload(path, bytes, upload, true, target.is_some())
                 .await
                 .map(SegmentPublication::Multipart);
         }
@@ -311,7 +336,7 @@ impl SegmentStore {
                 "backend ignored conditional multipart create and probe cleanup failed for {path}: {error}"
             ))
         })?;
-        self.put_segment_create(path, bytes).await?;
+        self.put_segment_create(path, bytes, target).await?;
         Ok(SegmentPublication::SingleFallback)
     }
 
@@ -321,6 +346,7 @@ impl SegmentStore {
         bytes: &Bytes,
         mut upload: Box<dyn MultipartUpload>,
         reconcile_completion: bool,
+        exact_target: bool,
     ) -> Result<PutResult> {
         // Parts run as spawned tasks, so upload progress never waits on this
         // future being polled.
@@ -358,7 +384,10 @@ impl SegmentStore {
                 if let Err(abort_err) = abort_segment_upload(upload).await {
                     tracing::warn!("segment seal: aborting failed upload of {path}: {abort_err}");
                 }
-                if reconcile_completion && !crate::retrying_object_store::is_no_space(&e) {
+                if reconcile_completion
+                    && !crate::retrying_object_store::is_no_space(&e)
+                    && !(exact_target && crate::retrying_object_store::has_permanent_source(&e))
+                {
                     match self.verify_existing_segment_bytes(path, bytes).await {
                         Ok(result) => return Ok(result),
                         Err(conflict)
@@ -437,7 +466,7 @@ impl SegmentStore {
             ));
         }
         let bytes = builder.finish(segid.counter)?;
-        self.put_segment(segid, Bytes::from(bytes)).await?;
+        self.put_segment(segid, Bytes::from(bytes), None).await?;
         Ok(locs)
     }
 
@@ -1417,7 +1446,11 @@ mod tests {
         let store = SegmentStore::new(os, codec, 5, Some(warm));
 
         store
-            .put_segment(store.next_segid(), Bytes::from_static(b"small segment"))
+            .put_segment(
+                store.next_segid(),
+                Bytes::from_static(b"small segment"),
+                None,
+            )
             .await
             .unwrap();
 
@@ -1439,7 +1472,11 @@ mod tests {
         let store = SegmentStore::new(os, codec(), 5, Some(warm));
 
         store
-            .put_segment(store.next_segid(), Bytes::from(vec![7u8; SEAL_PART_SIZE]))
+            .put_segment(
+                store.next_segid(),
+                Bytes::from(vec![7u8; SEAL_PART_SIZE]),
+                None,
+            )
             .await
             .unwrap();
 
@@ -1459,11 +1496,11 @@ mod tests {
         let path = Path::from(segid.object_key());
 
         store
-            .put_segment(segid, Bytes::from_static(b"first segment"))
+            .put_segment(segid, Bytes::from_static(b"first segment"), None)
             .await
             .unwrap();
         store
-            .put_segment(segid, Bytes::from_static(b"replacement segment"))
+            .put_segment(segid, Bytes::from_static(b"replacement segment"), None)
             .await
             .expect_err("an immutable segment key must not be overwritten");
 
@@ -1490,7 +1527,7 @@ mod tests {
 
             assert_eq!(
                 store
-                    .put_segment(segid, Bytes::copy_from_slice(wanted))
+                    .put_segment(segid, Bytes::copy_from_slice(wanted), None)
                     .await
                     .is_ok(),
                 succeeds,
@@ -1523,7 +1560,7 @@ mod tests {
 
             assert_eq!(
                 store
-                    .put_segment_multipart(&path, &Bytes::copy_from_slice(wanted))
+                    .put_segment_multipart(&path, &Bytes::copy_from_slice(wanted), None)
                     .await
                     .is_ok(),
                 succeeds,
@@ -1565,7 +1602,7 @@ mod tests {
 
             assert_eq!(
                 store
-                    .put_segment_multipart(&path, &Bytes::copy_from_slice(wanted))
+                    .put_segment_multipart(&path, &Bytes::copy_from_slice(wanted), None)
                     .await
                     .is_ok(),
                 succeeds,
@@ -1598,7 +1635,7 @@ mod tests {
             os.put(&path, existing.clone().into()).await.unwrap();
 
             store
-                .put_segment(segid, Bytes::from(vec![2u8; size]))
+                .put_segment(segid, Bytes::from(vec![2u8; size]), None)
                 .await
                 .expect_err("an existing immutable segment must win at every size boundary");
             assert_eq!(
@@ -1619,7 +1656,7 @@ mod tests {
             let store = store.clone();
             let path = path.clone();
             let wanted = wanted.clone();
-            tokio::spawn(async move { store.put_segment_multipart(&path, &wanted).await })
+            tokio::spawn(async move { store.put_segment_multipart(&path, &wanted, None).await })
         };
 
         backend.entered.notified().await;
@@ -1631,7 +1668,10 @@ mod tests {
             Err(slatedb::object_store::Error::NotFound { .. })
         ));
 
-        store.put_segment_multipart(&path, &wanted).await.unwrap();
+        store
+            .put_segment_multipart(&path, &wanted, None)
+            .await
+            .unwrap();
         assert_eq!(
             object_store
                 .get(&path)
@@ -1662,11 +1702,11 @@ mod tests {
         let wanted = Bytes::from_static(b"multipart publish with a lost response");
 
         store
-            .put_segment_multipart(&path, &wanted)
+            .put_segment_multipart(&path, &wanted, None)
             .await
             .expect("exact readback must reconcile a lost conditional-create response");
         store
-            .put_segment_multipart(&path, &wanted)
+            .put_segment_multipart(&path, &wanted, None)
             .await
             .expect("retry must reconcile the already-published exact bytes");
         assert_eq!(
@@ -1743,7 +1783,7 @@ mod tests {
         let store = SegmentStore::new(os, codec, 5, None);
 
         let error = store
-            .put_segment(store.next_segid(), noise(1, 40 * 1024 * 1024))
+            .put_segment(store.next_segid(), noise(1, 40 * 1024 * 1024), None)
             .await
             .expect_err("a 40 MiB seal must use the injected single-PUT path");
         assert!(error.to_string().contains("injected object-store fault"));
@@ -1757,7 +1797,7 @@ mod tests {
         let path = Path::from(store.next_segid().object_key());
 
         store
-            .put_segment_multipart(&path, &Bytes::from_static(b"multipart segment"))
+            .put_segment_multipart(&path, &Bytes::from_static(b"multipart segment"), None)
             .await
             .unwrap();
 
@@ -1779,7 +1819,7 @@ mod tests {
         let upload = os.put_multipart(&path).await.unwrap();
         let bytes = noise(1, 2 * SEAL_PART_SIZE + 1024);
         let res = store
-            .complete_segment_upload(&path, &bytes, upload, false)
+            .complete_segment_upload(&path, &bytes, upload, false, false)
             .await;
         assert!(res.is_err(), "the seal error must surface");
         assert!(
@@ -1798,7 +1838,7 @@ mod tests {
         let upload = os.put_multipart(&path).await.unwrap();
         let bytes = noise(1, 2 * SEAL_PART_SIZE + 1024);
         let res = store
-            .complete_segment_upload(&path, &bytes, upload, false)
+            .complete_segment_upload(&path, &bytes, upload, false, false)
             .await;
         assert!(res.is_err(), "the seal error must surface");
         assert!(

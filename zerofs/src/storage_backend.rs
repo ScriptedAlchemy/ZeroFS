@@ -143,7 +143,8 @@ pub(crate) async fn open_pool_storage(
         .as_ref()
         .context("[storage.pool] is not configured")?;
     settings.validate()?;
-    crate::storage_readiness::verify(settings)?;
+    let allow_degraded = config.allow_degraded_start && !initialize;
+    let missing = missing_member(settings, config, allow_degraded)?;
     crate::storage_readiness::verify_open_paths(
         settings,
         &[
@@ -157,7 +158,7 @@ pub(crate) async fn open_pool_storage(
             ),
         ],
     )?;
-    validate_directories(settings)?;
+    validate_directories(settings, missing.as_deref())?;
     if !initialize && !config.catalog_dir.join(CATALOG_FILE_NAME).is_file() {
         return Err(operator_required(anyhow::anyhow!(
             "pool catalog is missing: initialize a new pool with `zerofs pool init`, or restore an existing pool's catalog; normal startup never recreates it"
@@ -185,13 +186,26 @@ pub(crate) async fn open_pool_storage(
             let (scheme, member_path) = ObjectStoreScheme::parse(&url)?;
             let mut options = settings.cloud_provider_env_vars();
             options.extend(member.cloud_provider_env_vars());
+            if missing.as_deref() == Some(member.id.as_str()) {
+                members.push(PoolMember {
+                    id: member.id.clone(),
+                    identity: "unavailable".into(),
+                    store: Arc::new(object_store::memory::InMemory::new()),
+                    capacity_bytes: member.capacity_bytes()?,
+                    local_path: None,
+                    min_free_bytes: member.reserve_free_bytes()?,
+                    health_device: None,
+                    free_space: None,
+                });
+                continue;
+            }
             let identity = member_identity(&url, &options)?;
             let parsed = if scheme == ObjectStoreScheme::Sftp {
-                crate::parse_object_store::build_sftp_store_with_warmup(
+                crate::parse_object_store::build_sftp_store(
                     &url,
                     member_path,
                     member.sftp.as_ref(),
-                    false,
+                    crate::parse_object_store::SftpStartup::Deferred,
                 )
                 .await?
             } else {
@@ -233,7 +247,17 @@ pub(crate) async fn open_pool_storage(
             members,
             config.segment_placement,
             initialize,
-            |pool_id| crate::storage_readiness::verify_pool_paths(settings, pool_id),
+            |pool_id| {
+                crate::storage_readiness::verify_pool_paths_except(
+                    settings,
+                    pool_id,
+                    missing.as_deref(),
+                )?;
+                Ok(crate::pool_object_store::MemberPreflight::CheckLocal {
+                    allow_degraded,
+                    missing,
+                })
+            },
         )
         .await?)
     }
@@ -319,7 +343,41 @@ fn resolved_path(path: &FsPath) -> Result<PathBuf> {
     Ok(result)
 }
 
-fn validate_directories(settings: &Settings) -> Result<()> {
+fn missing_member(
+    settings: &Settings,
+    config: &crate::config::StoragePoolConfig,
+    allow_degraded: bool,
+) -> Result<Option<String>> {
+    let verify = |missing: Option<&str>| -> Result<()> {
+        match missing {
+            Some(id) => crate::storage_readiness::verify_without_member(settings, id)?,
+            None => crate::storage_readiness::verify(settings)?,
+        }
+        for member in &config.members {
+            let url: url::Url = member.url.parse()?;
+            if url.scheme() == "file" && missing != Some(member.id.as_str()) {
+                local_directory(&url)?;
+            }
+        }
+        Ok(())
+    };
+    let error = match verify(None) {
+        Ok(()) => return Ok(None),
+        Err(error) => error,
+    };
+    if allow_degraded && config.members.len() > 1 {
+        for member in &config.members {
+            let url: url::Url = member.url.parse()?;
+            if url.scheme() == "file" && verify(Some(&member.id)).is_ok() {
+                tracing::warn!(member = %member.id, %error, "local pool member unavailable at startup");
+                return Ok(Some(member.id.clone()));
+            }
+        }
+    }
+    Err(error)
+}
+
+fn validate_directories(settings: &Settings, missing: Option<&str>) -> Result<()> {
     let config = settings
         .storage
         .pool
@@ -347,7 +405,15 @@ fn validate_directories(settings: &Settings) -> Result<()> {
     for member in &config.members {
         let url: url::Url = member.url.parse()?;
         if url.scheme() == "file" {
-            roots.push((format!("member {}", member.id), local_directory(&url)?));
+            let path = if missing == Some(member.id.as_str()) {
+                resolved_path(
+                    &url.to_file_path()
+                        .map_err(|_| anyhow::anyhow!("invalid local storage URL"))?,
+                )?
+            } else {
+                local_directory(&url)?
+            };
+            roots.push((format!("member {}", member.id), path));
         }
     }
     for (index, (left_name, left)) in roots.iter().enumerate() {

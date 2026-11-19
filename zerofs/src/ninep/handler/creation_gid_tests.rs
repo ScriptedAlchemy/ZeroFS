@@ -1,4 +1,6 @@
 use super::*;
+use crate::fs::permissions::acl::{POSIX_ACL_ACCESS, POSIX_ACL_DEFAULT, PosixAcl};
+use crate::fs::{XattrName, XattrSetMode, XattrValue};
 
 const NAMES: [&[u8]; 4] = [b"file", b"directory", b"symlink", b"fifo"];
 
@@ -93,6 +95,7 @@ async fn requested_creation_gid_never_changes_parent_authorization() {
         parent_gid: u32,
         complete: bool,
         supplementary: &'static [u32],
+        acl: Option<PosixAcl>,
     }
     let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
     let owner = test_creds();
@@ -103,6 +106,23 @@ async fn requested_creation_gid_never_changes_parent_authorization() {
             parent_gid: 300,
             complete: true,
             supplementary: &[],
+            acl: None,
+        },
+        Case {
+            name: b"acl-missing-group",
+            mode: 0o700,
+            parent_gid: 1000,
+            complete: true,
+            supplementary: &[],
+            acl: Some(PosixAcl::from_parts(7, &[], 0, &[(300, 3)], 3, 1)),
+        },
+        Case {
+            name: b"acl-unknown-groups",
+            mode: 0o700,
+            parent_gid: 1000,
+            complete: false,
+            supplementary: &[],
+            acl: Some(PosixAcl::from_parts(7, &[], 0, &[(300, 3)], 3, 1)),
         },
         Case {
             name: b"mode-primary-group",
@@ -110,6 +130,7 @@ async fn requested_creation_gid_never_changes_parent_authorization() {
             parent_gid: 2000,
             complete: true,
             supplementary: &[300],
+            acl: None,
         },
         Case {
             name: b"mode-unknown-primary-group",
@@ -117,6 +138,15 @@ async fn requested_creation_gid_never_changes_parent_authorization() {
             parent_gid: 2000,
             complete: false,
             supplementary: &[],
+            acl: None,
+        },
+        Case {
+            name: b"acl-primary-group",
+            mode: 0o700,
+            parent_gid: 2000,
+            complete: true,
+            supplementary: &[300],
+            acl: Some(PosixAcl::from_parts(7, &[(4000, 3)], 0, &[], 3, 3)),
         },
     ] {
         let (parent, _) = fs
@@ -132,12 +162,22 @@ async fn requested_creation_gid_never_changes_parent_authorization() {
             )
             .await
             .unwrap();
+        if let Some(acl) = case.acl {
+            fs.set_xattr(
+                &owner,
+                parent,
+                &XattrName::new(POSIX_ACL_ACCESS).unwrap(),
+                XattrValue::new(acl.to_bytes()).unwrap(),
+                XattrSetMode::Either,
+            )
+            .await
+            .unwrap();
+        }
         let actor = Credentials::from_auth_context(&AuthContext {
             uid: 2000,
             gid: 2000,
             gids: case.supplementary.to_vec(),
             groups_complete: case.complete,
-            groups_truncated: false,
             ..AuthContext::default()
         });
         let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
@@ -240,4 +280,125 @@ async fn creation_group_hint_is_rejected_by_setattr() {
         Err(FsError::InvalidArgument)
     );
     assert_eq!(fs.inode_store.get(id).await.unwrap().gid(), owner.gid);
+}
+
+#[tokio::test]
+async fn private_create_umask_is_applied_only_without_a_default_acl() {
+    const O_RDWR: u32 = 2;
+    let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+    let owner = test_creds();
+    for inherit_acl in [false, true] {
+        let (parent, _) = fs
+            .mkdir(
+                &owner,
+                0,
+                if inherit_acl { b"inherited" } else { b"plain" },
+                &SetAttributes {
+                    mode: SetMode::Set(0o2770),
+                    gid: SetGid::Set(3000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        if inherit_acl {
+            let acl = PosixAcl::from_parts(7, &[(2000, 7)], 7, &[], 7, 0);
+            fs.set_xattr(
+                &owner,
+                parent,
+                &XattrName::new(POSIX_ACL_DEFAULT).unwrap(),
+                XattrValue::new(acl.to_bytes()).unwrap(),
+                XattrSetMode::Either,
+            )
+            .await
+            .unwrap();
+        }
+        let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+        let version = handler
+            .version(Tversion {
+                msize: P9_MAX_MSIZE,
+                version: P9String::new(VERSION_9P2000L_ZEROFS_UMASK.to_vec()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(version, Message::Rversion(version)
+            if version.version.data == VERSION_9P2000L_ZEROFS_UMASK));
+        bind_parent(&handler, parent, owner).await;
+        for (kind, name) in [b"open".as_slice(), b"directory", b"regular", b"fifo"]
+            .into_iter()
+            .enumerate()
+        {
+            let file_type = match kind {
+                1 => S_IFDIR,
+                3 => S_IFIFO,
+                _ => S_IFREG,
+            };
+            let requested = if kind == 1 { 0o770 } else { 0o666 };
+            let mode = file_type | requested | (0o777 << CREATE_UMASK_SHIFT);
+            match kind {
+                0 => {
+                    handler
+                        .lcreateattr(
+                            Tlcreateattr {
+                                dfid: 1,
+                                newfid: 2,
+                                name: P9String::new(name.to_vec()),
+                                flags: O_RDWR,
+                                mode,
+                                gid: owner.gid,
+                            },
+                            [0; 16],
+                        )
+                        .await
+                        .unwrap();
+                }
+                1 => {
+                    handler
+                        .mkdir_attr(
+                            Tmkdir {
+                                dfid: 1,
+                                name: P9String::new(name.to_vec()),
+                                mode,
+                                gid: owner.gid,
+                            },
+                            [0; 16],
+                        )
+                        .await
+                        .unwrap();
+                }
+                _ => {
+                    handler
+                        .mknod_attr(
+                            Tmknod {
+                                dfid: 1,
+                                name: P9String::new(name.to_vec()),
+                                mode,
+                                major: 0,
+                                minor: 0,
+                                gid: owner.gid,
+                            },
+                            [0; 16],
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            let child = fs.lookup(&owner, parent, name).await.unwrap();
+            let inode = fs.inode_store.get(child).await.unwrap();
+            let expected = match (inherit_acl, kind == 1) {
+                (false, false) => 0,
+                (false, true) => 0o2000,
+                (true, false) => 0o660,
+                (true, true) => 0o2770,
+            };
+            assert_eq!(inode.mode(), expected, "ACL {inherit_acl}, kind {kind}");
+            assert_eq!(inode.gid(), 3000);
+            assert_eq!(inode.is_directory(), kind == 1);
+            assert_eq!(matches!(inode, Inode::Fifo(_)), kind == 3);
+            let access = fs
+                .get_xattr(&owner, child, &XattrName::new(POSIX_ACL_ACCESS).unwrap())
+                .await;
+            assert_eq!(access.is_ok(), inherit_acl);
+        }
+    }
 }

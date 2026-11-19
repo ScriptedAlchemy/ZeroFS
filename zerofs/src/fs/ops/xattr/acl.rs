@@ -11,6 +11,7 @@ use crate::fs::permissions::{AccessMode, Credentials, check_access_with_acl};
 use crate::fs::store::xattr::XATTR_COUNT_MAX;
 use crate::fs::{ZeroFS, get_current_time};
 use bytes::Bytes;
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{error, info, warn};
 
@@ -117,9 +118,9 @@ impl ZeroFS {
         Ok(())
     }
 
-    /// The stored access ACL that governs `creds` on `inode`, when one can
-    /// change the mode-bit decision. Root and the owner never need it: the
-    /// owner entry always equals the owner mode bits.
+    /// The access ACL for a writer holding the inode's canonical lock.
+    /// Unlocked checks and read-only handles must use `inode_access_context`
+    /// so independently loaded inode and ACL versions cannot be combined.
     pub(crate) async fn access_acl(
         &self,
         id: InodeId,
@@ -139,6 +140,35 @@ impl ZeroFS {
         }
     }
 
+    /// Keep permission-bearing inode fields and ACL entries in one committed
+    /// view without acquiring another inode lock or draining volatile writes.
+    pub(crate) async fn inode_access_context<'a>(
+        &self,
+        id: InodeId,
+        inode: &'a Inode,
+        creds: &Credentials,
+    ) -> Result<(Cow<'a, Inode>, Option<PosixAcl>), FsError> {
+        if creds.uid == 0
+            || creds.uid == inode.uid()
+            || matches!(inode, Inode::Symlink(_))
+            || !self.posix_acls_possible().await?
+        {
+            // These decisions use only this inode snapshot, so they can
+            // linearize at that read even if a concurrent ACL change follows.
+            return Ok((Cow::Borrowed(inode), None));
+        }
+        let (inode, value) = self
+            .xattr_store
+            .get_with_inode(id, POSIX_ACL_ACCESS)
+            .await?;
+        let acl = if creds.uid == inode.uid() || matches!(inode, Inode::Symlink(_)) {
+            None
+        } else {
+            value.map(|value| decode_stored(id, &value)).transpose()?
+        };
+        Ok((Cow::Owned(inode), acl))
+    }
+
     /// Mode bits combined with any access ACL on the inode.
     pub(crate) async fn check_inode_access(
         &self,
@@ -147,8 +177,8 @@ impl ZeroFS {
         creds: &Credentials,
         mode: AccessMode,
     ) -> Result<(), FsError> {
-        let acl = self.access_acl(id, inode, creds).await?;
-        check_access_with_acl(inode, creds, mode, acl.as_ref())
+        let (inode, acl) = self.inode_access_context(id, inode, creds).await?;
+        check_access_with_acl(&inode, creds, mode, acl.as_ref())
     }
 
     /// Linux `posix_acl_create`: a parent default ACL restricts the new
@@ -261,12 +291,14 @@ impl ZeroFS {
         let mut txn = self.db.new_transaction()?;
         let mut changed = false;
         let mut new_rows = 0usize;
+        let mut removed_rows = 0usize;
         let mut stored = false;
         if let Some(access) = access {
             let present = self.xattr_exists(id, POSIX_ACL_ACCESS).await?;
             match access {
                 None if present => {
                     self.xattr_store.delete(&mut txn, id, POSIX_ACL_ACCESS);
+                    removed_rows += 1;
                     changed = true;
                 }
                 None => {}
@@ -285,6 +317,7 @@ impl ZeroFS {
                         stored = true;
                     } else if present {
                         self.xattr_store.delete(&mut txn, id, POSIX_ACL_ACCESS);
+                        removed_rows += 1;
                     }
                     changed = true;
                 }
@@ -295,6 +328,7 @@ impl ZeroFS {
             match default {
                 None if present => {
                     self.xattr_store.delete(&mut txn, id, POSIX_ACL_DEFAULT);
+                    removed_rows += 1;
                     changed = true;
                 }
                 None => {}
@@ -311,7 +345,9 @@ impl ZeroFS {
             // Removing an absent ACL succeeds without a change, like tmpfs.
             return Ok(());
         }
-        if new_rows > 0 && self.xattr_store.list(id).await?.len() + new_rows > XATTR_COUNT_MAX {
+        if new_rows > 0
+            && self.xattr_store.list(id).await?.len() - removed_rows + new_rows > XATTR_COUNT_MAX
+        {
             return Err(FsError::NoSpace);
         }
         if stored {

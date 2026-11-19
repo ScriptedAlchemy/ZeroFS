@@ -1252,7 +1252,12 @@ mod nfs4_translation_tests {
     fn entries_report_the_engine_translation_and_summary_counts_formats() {
         let restricted = encode::acl(&[
             (encode::ALLOW, encode::FD, encode::FULL_CONTROL, Who::Owner),
-            (encode::ALLOW, encode::FD, encode::MODIFY, Who::Group),
+            (
+                encode::ALLOW,
+                encode::FD,
+                encode::MODIFY | encode::DELETE_CHILD,
+                Who::Group,
+            ),
         ]);
         let refused = encode::acl(&[(
             encode::ALLOW,
@@ -1273,8 +1278,8 @@ mod nfs4_translation_tests {
         assert_eq!(t["access"], "u::rwx,g::rwx,o::---");
         assert_eq!(t["default"], "u::rwx,g::rwx,o::---");
         assert_eq!(
-            t["narrowed"][0],
-            "child_deletion_relies_on_inherited_delete"
+            t["narrowed"],
+            serde_json::json!(["delete_follows_parent_directory_write"])
         );
         assert!(a["acl"]["value"][0].get("posix_translation").is_none());
         let r = serde_json::to_value(&rejected).unwrap();

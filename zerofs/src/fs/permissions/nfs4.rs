@@ -92,7 +92,8 @@ pub(crate) enum Refusal {
     /// Grants `WRITE_DATA` without `APPEND_DATA` or the reverse, or on a
     /// directory `ADD_FILE` without `ADD_SUBDIRECTORY`.
     PartialWrite,
-    /// Directory write without `DELETE_CHILD` and without inherited `DELETE`.
+    /// Directory write without `DELETE_CHILD`. A default ACL cannot prove
+    /// that every existing or future child grants this caller `DELETE`.
     DirectoryWriteWithoutDelete,
     /// Grants read or write data without the matching named-attribute right.
     DataWithoutNamedAttributes,
@@ -139,14 +140,11 @@ impl fmt::Display for Refusal {
 }
 
 /// Narrowings the translation accepted. Each is a right POSIX ACLs cannot
-/// grant per file; the caller loses it, or for directory deletion gains it
-/// only through the reported inherited `DELETE`.
+/// grant per file; the caller loses it.
 pub(crate) const REPORT_ACL_OR_OWNER_CHANGE: &str = "acl_or_owner_change_limited_to_owner";
 pub(crate) const REPORT_DELETE_FROM_PARENT: &str = "delete_follows_parent_directory_write";
 pub(crate) const REPORT_ATTRIBUTE_WRITE_DROPPED: &str =
     "attribute_write_without_data_write_dropped";
-pub(crate) const REPORT_CHILD_DELETE_VIA_INHERITED: &str =
-    "child_deletion_relies_on_inherited_delete";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Nfs4Mapping {
@@ -209,7 +207,7 @@ fn parse(value: &[u8]) -> Result<Vec<Ace>, Refusal> {
             if mask & !KNOWN_MASK != 0 {
                 return Err(Refusal::UnknownAccessBits(mask & !KNOWN_MASK));
             }
-            let who = if iflag & SPECIAL_WHO != 0 {
+            let who = if iflag == SPECIAL_WHO {
                 match who {
                     WHO_OWNER => Who::Owner,
                     WHO_GROUP => Who::Group,
@@ -218,6 +216,8 @@ fn parse(value: &[u8]) -> Result<Vec<Ace>, Refusal> {
                 }
             } else if iflag != 0 {
                 return Err(Refusal::Malformed("iflag"));
+            } else if who == u32::MAX {
+                return Err(Refusal::Malformed("undefined principal id"));
             } else if flags & IDENTIFIER_GROUP != 0 {
                 Who::GroupId(who)
             } else {
@@ -285,7 +285,6 @@ fn rwx(
     allowed: u32,
     is_directory: bool,
     is_owner: bool,
-    inherited_delete: impl FnOnce() -> bool,
     reports: &mut BTreeSet<&'static str>,
 ) -> Result<u16, Refusal> {
     let read = allowed & READ_DATA != 0;
@@ -302,11 +301,10 @@ fn rwx(
         return Err(Refusal::WriteWithoutWriteAttributes);
     }
     if is_directory && write && allowed & DELETE_CHILD == 0 {
-        if inherited_delete() {
-            reports.insert(REPORT_CHILD_DELETE_VIA_INHERITED);
-        } else {
-            return Err(Refusal::DirectoryWriteWithoutDelete);
-        }
+        // POSIX directory write+search allows deleting any non-sticky child.
+        // An inheritable DELETE grant does not establish that right for an
+        // existing/protected child, or one with a different owner/group.
+        return Err(Refusal::DirectoryWriteWithoutDelete);
     }
     if !is_owner {
         if !write && allowed & (WRITE_NAMED_ATTRS | WRITE_ATTRIBUTES) != 0 {
@@ -371,28 +369,14 @@ struct Scenario {
 /// The POSIX ACL equivalent to `aces` under `scenario`, before verification.
 fn build(
     aces: &[Ace],
-    inherited: &[Ace],
     principals: &Principals,
     scenario: &Scenario,
     stranger: u32,
     reports: &mut BTreeSet<&'static str>,
 ) -> Result<PosixAcl, Refusal> {
     let eval = |caller: &Caller| evaluate(aces, caller, scenario.owner, scenario.group);
-    let inherited_delete = |caller: &Caller| {
-        // A child's owner is whoever creates it, so owner@ cannot be assumed
-        // to match; the child's group is assumed to be this directory's.
-        let child_owner =
-            Principals::fresh(&[&[caller.uid, scenario.owner][..], &principals.users[..]].concat());
-        evaluate(inherited, caller, child_owner, scenario.group) & DELETE != 0
-    };
     let perm = |caller: Caller, is_owner: bool, reports: &mut BTreeSet<&'static str>| {
-        rwx(
-            eval(&caller),
-            scenario.is_directory,
-            is_owner,
-            || inherited_delete(&caller),
-            reports,
-        )
+        rwx(eval(&caller), scenario.is_directory, is_owner, reports)
     };
     let user_obj = perm(
         Caller {
@@ -460,7 +444,6 @@ fn build(
 fn verify(
     acl: &PosixAcl,
     aces: &[Ace],
-    inherited: &[Ace],
     principals: &Principals,
     scenario: &Scenario,
 ) -> Result<(), Refusal> {
@@ -488,12 +471,10 @@ fn verify(
                     .collect(),
             };
             let allowed = evaluate(aces, &caller, scenario.owner, scenario.group);
-            let child_owner = Principals::fresh(&[&uids[..], &[uid][..]].concat());
             let nfs4 = rwx(
                 allowed,
                 scenario.is_directory,
                 uid == scenario.owner,
-                || evaluate(inherited, &caller, child_owner, scenario.group) & DELETE != 0,
                 &mut scratch,
             )?;
             let creds = caller.credentials(unrelated_gid);
@@ -578,15 +559,8 @@ pub(crate) fn map_nfs4_acl(
         group,
         is_directory,
     };
-    let access = build(
-        &effective,
-        &inheritable,
-        &principals,
-        &here,
-        stranger,
-        &mut reports,
-    )?;
-    verify(&access, &effective, &inheritable, &principals, &here)?;
+    let access = build(&effective, &principals, &here, stranger, &mut reports)?;
+    verify(&access, &effective, &principals, &here)?;
 
     let default = if inheritable.is_empty() {
         None
@@ -604,7 +578,6 @@ pub(crate) fn map_nfs4_acl(
         let stranger = Principals::fresh(&[&all_ids[..], &[fresh_owner, fresh_group][..]].concat());
         let acl = build(
             &inheritable,
-            &inheritable,
             &principals,
             &construct,
             stranger,
@@ -620,11 +593,10 @@ pub(crate) fn map_nfs4_acl(
                         group: child_group,
                         is_directory: child_is_directory,
                     };
-                    verify(&acl, &inheritable, &inheritable, &principals, &scenario)?;
+                    verify(&acl, &inheritable, &principals, &scenario)?;
                     // Directory rules may add reports the file build skipped.
                     if child_is_directory {
                         build(
-                            &inheritable,
                             &inheritable,
                             &principals,
                             &scenario,

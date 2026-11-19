@@ -243,9 +243,7 @@ impl ZeroFS {
         }
 
         let mut dir_inode = self.inode_store.get(dirid).await?;
-        self.check_inode_access(dirid, &dir_inode, &creds, AccessMode::Write)
-            .await?;
-        self.check_inode_access(dirid, &dir_inode, &creds, AccessMode::Execute)
+        self.check_inode_access(dirid, &dir_inode, &creds, AccessMode::WriteExecute)
             .await?;
 
         if !matches!(&dir_inode, Inode::Directory(_)) {

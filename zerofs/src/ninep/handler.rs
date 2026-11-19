@@ -406,12 +406,14 @@ fn check_open_access(
     if flags & LINUX_O_PATH != 0 {
         return Ok(());
     }
-    if access_mode != LINUX_O_WRONLY {
-        check_access_with_acl(inode, creds, AccessMode::Read, acl)?;
-    }
-    if access_mode == LINUX_O_WRONLY || access_mode == LINUX_O_RDWR || flags & LINUX_O_TRUNC != 0 {
-        check_access_with_acl(inode, creds, AccessMode::Write, acl)?;
-    }
+    let required = if access_mode == LINUX_O_WRONLY {
+        AccessMode::Write
+    } else if access_mode == LINUX_O_RDWR || flags & LINUX_O_TRUNC != 0 {
+        AccessMode::ReadWrite
+    } else {
+        AccessMode::Read
+    };
+    check_access_with_acl(inode, creds, required, acl)?;
     Ok(())
 }
 
@@ -1875,10 +1877,13 @@ impl NinePHandler {
         let qid = {
             let _guard = self.filesystem.lock_manager.acquire(inode_id).await;
             let inode = self.filesystem.inode_store.get(inode_id).await?;
+            let (inode, acl) = self
+                .filesystem
+                .inode_access_context(inode_id, &inode, &creds)
+                .await?;
             if replay_reopen && inode.nlink() == 0 {
                 return Err(FsError::StaleHandle.into());
             }
-            let acl = self.filesystem.access_acl(inode_id, &inode, &creds).await?;
             check_open_access(&inode, &creds, tl.flags, acl.as_ref())
                 .map_err(|error| Self::map_replay_open_error(replay_reopen, error))?;
             let qid = inode_to_qid(&inode, inode_id);
@@ -1937,13 +1942,13 @@ impl NinePHandler {
         let qid = {
             let _guard = self.filesystem.lock_manager.acquire(src_fid.inode_id).await;
             let inode = self.filesystem.inode_store.get(src_fid.inode_id).await?;
+            let (inode, acl) = self
+                .filesystem
+                .inode_access_context(src_fid.inode_id, &inode, &src_fid.creds)
+                .await?;
             if replay_reopen && inode.nlink() == 0 {
                 return Err(FsError::StaleHandle.into());
             }
-            let acl = self
-                .filesystem
-                .access_acl(src_fid.inode_id, &inode, &src_fid.creds)
-                .await?;
             check_open_access(&inode, &src_fid.creds, tl.flags, acl.as_ref())
                 .map_err(|error| Self::map_replay_open_error(replay_reopen, error))?;
             let qid = inode_to_qid(&inode, src_fid.inode_id);

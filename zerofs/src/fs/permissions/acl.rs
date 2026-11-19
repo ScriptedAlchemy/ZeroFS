@@ -52,14 +52,6 @@ pub(crate) struct PosixAcl {
     entries: Vec<AclEntry>,
 }
 
-fn want_bits(mode: AccessMode) -> u16 {
-    match mode {
-        AccessMode::Read => PERM_READ,
-        AccessMode::Write => PERM_WRITE,
-        AccessMode::Execute => PERM_EXECUTE,
-    }
-}
-
 impl PosixAcl {
     /// Decode an xattr value. `Ok(None)` is the Linux removal encoding: an
     /// empty value or a header with no entries, which `posix_acl_from_xattr`
@@ -128,7 +120,9 @@ impl PosixAcl {
                     previous_id = None;
                 }
                 TAG_USER if state == State::User => {
-                    if previous_id.is_some_and(|previous| entry.id <= previous) {
+                    if entry.id == UNDEFINED_ID
+                        || previous_id.is_some_and(|previous| entry.id <= previous)
+                    {
                         return Err(FsError::InvalidArgument);
                     }
                     previous_id = Some(entry.id);
@@ -139,7 +133,9 @@ impl PosixAcl {
                     previous_id = None;
                 }
                 TAG_GROUP if state == State::Group => {
-                    if previous_id.is_some_and(|previous| entry.id <= previous) {
+                    if entry.id == UNDEFINED_ID
+                        || previous_id.is_some_and(|previous| entry.id <= previous)
+                    {
                         return Err(FsError::InvalidArgument);
                     }
                     previous_id = Some(entry.id);
@@ -269,7 +265,7 @@ impl PosixAcl {
         creds: &Credentials,
         mode: AccessMode,
     ) -> bool {
-        self.permits_bits(owner, owning_group, creds, want_bits(mode))
+        self.permits_bits(owner, owning_group, creds, mode.bits())
     }
 
     /// [`Self::permits`] for a combined request of `r` (4), `w` (2) and `x`
@@ -327,7 +323,7 @@ impl PosixAcl {
         if matched {
             return false;
         }
-        if !creds.groups_complete {
+        if !creds.groups_complete || creds.groups_truncated {
             return grants(other) && group_class().all(|(_, perm)| grants(perm & mask));
         }
         grants(other)

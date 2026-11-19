@@ -307,6 +307,89 @@ async fn default_acls_are_inherited_on_create_and_mkdir() {
 }
 
 #[tokio::test]
+async fn acl_updates_preserve_setgid_only_for_known_group_members() {
+    let fs = ZeroFS::new_in_memory().await.unwrap();
+    let root = Credentials::from_auth_context(&AuthContext::default());
+    let dir = scratch(&fs).await;
+    let file = create(&fs, dir, b"file", 0o600).await;
+    let directory = mkdir(&fs, dir, b"directory", 0o700).await;
+    for id in [file, directory] {
+        for known_member in [false, true] {
+            fs.setattr(
+                &root,
+                id,
+                &SetAttributes {
+                    mode: SetMode::Set(0o2750),
+                    gid: crate::fs::types::SetGid::Set(TEAM),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let creds = Credentials::from_auth_context(&AuthContext {
+                uid: OWNER,
+                gid: OWNER,
+                gids: if known_member { vec![TEAM] } else { vec![] },
+                groups_complete: false,
+                ..AuthContext::default()
+            });
+            fs.set_xattr(
+                &creds,
+                id,
+                &acl_name(POSIX_ACL_ACCESS),
+                acl_value("u::rwx,g::rwx,o::---"),
+                XattrSetMode::Either,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                mode_of(&fs, id).await,
+                if known_member { 0o2770 } else { 0o770 },
+                "incomplete groups do not prove setgid authority"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn inherited_acl_strips_setgid_before_limiting_group_execute() {
+    let fs = ZeroFS::new_in_memory().await.unwrap();
+    let root = Credentials::from_auth_context(&AuthContext::default());
+    let dir = scratch(&fs).await;
+    let parent = mkdir(&fs, dir, b"parent", 0o2770).await;
+    fs.setattr(
+        &root,
+        parent,
+        &SetAttributes {
+            mode: SetMode::Set(0o2770),
+            gid: crate::fs::types::SetGid::Set(TEAM),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    set_text(&fs, parent, POSIX_ACL_DEFAULT, "u::rwx,g::---,o::---")
+        .await
+        .unwrap();
+    let (child, _) = fs
+        .create_with_umask(
+            &who(OWNER, &[OWNER]),
+            parent,
+            b"child",
+            &SetAttributes {
+                mode: SetMode::Set(0o2770),
+                ..Default::default()
+            },
+            [0; 16],
+            0o777,
+        )
+        .await
+        .unwrap();
+    assert_eq!(mode_of(&fs, child).await, 0o700);
+    assert_eq!(fs.inode_store.get(child).await.unwrap().gid(), TEAM);
+}
+
+#[tokio::test]
 async fn directory_acls_govern_lookup_and_listing() {
     let fs = ZeroFS::new_in_memory().await.unwrap();
     let dir = scratch(&fs).await;
@@ -376,11 +459,16 @@ async fn nfs4_acls_are_translated_or_refused() {
     let share = mkdir(&fs, dir, b"share", 0o700).await;
     let restricted = encode::acl(&[
         (encode::ALLOW, encode::FD, encode::FULL_CONTROL, Who::Owner),
-        (encode::ALLOW, encode::FD, encode::MODIFY, Who::Group),
         (
             encode::ALLOW,
             encode::FD,
-            encode::MODIFY,
+            encode::MODIFY | encode::DELETE_CHILD,
+            Who::Group,
+        ),
+        (
+            encode::ALLOW,
+            encode::FD,
+            encode::MODIFY | encode::DELETE_CHILD,
             Who::GroupId(TEAM),
         ),
     ]);
@@ -458,6 +546,141 @@ async fn nfs4_acls_are_translated_or_refused() {
         )
         .await,
         Err(FsError::OperationNotPermitted)
+    );
+}
+
+#[tokio::test]
+async fn access_checks_never_combine_an_old_mode_with_new_acl_entries() {
+    let fs = ZeroFS::new_in_memory().await.unwrap();
+    let dir = scratch(&fs).await;
+    let id = create(&fs, dir, b"coherent", 0o600).await;
+    let named = who(NAMED, &[1000]);
+    for replacement in [
+        "u::rw-,u:2000:r--,g::---,m::---,o::---",
+        "u::rw-,g::---,o::---",
+    ] {
+        set_text(
+            &fs,
+            id,
+            POSIX_ACL_ACCESS,
+            "u::rw-,u:2000:---,g::---,m::r--,o::---",
+        )
+        .await
+        .unwrap();
+        let old_inode = fs.inode_store.get(id).await.unwrap();
+        assert_eq!(
+            fs.check_inode_access(id, &old_inode, &named, AccessMode::Read)
+                .await,
+            Err(FsError::PermissionDenied)
+        );
+        set_text(&fs, id, POSIX_ACL_ACCESS, replacement)
+            .await
+            .unwrap();
+        let current = fs.inode_store.get(id).await.unwrap();
+        assert_eq!(
+            fs.check_inode_access(id, &current, &named, AccessMode::Read)
+                .await,
+            Err(FsError::PermissionDenied)
+        );
+        // Both committed states deny. Combining the old r-- mask with the
+        // new named-user r-- entry (or removed ACL) would incorrectly allow.
+        assert_eq!(
+            fs.check_inode_access(id, &old_inode, &named, AccessMode::Read)
+                .await,
+            Err(FsError::PermissionDenied)
+        );
+    }
+}
+
+#[tokio::test]
+async fn translating_acl_counts_rows_removed_in_the_same_transaction() {
+    use crate::fs::store::xattr::XATTR_COUNT_MAX;
+
+    let fs = ZeroFS::new_in_memory().await.unwrap();
+    let dir = scratch(&fs).await;
+    let share = mkdir(&fs, dir, b"full", 0o700).await;
+    set_text(
+        &fs,
+        share,
+        POSIX_ACL_ACCESS,
+        "u::rwx,u:2000:r--,g::---,m::r--,o::---",
+    )
+    .await
+    .unwrap();
+    let mut txn = fs.db.new_transaction().unwrap();
+    for index in 0..XATTR_COUNT_MAX - 1 {
+        fs.xattr_store.put(
+            &mut txn,
+            share,
+            format!("user.full.{index:04}").as_bytes(),
+            Bytes::from_static(b"retained"),
+        );
+    }
+    fs.write_coordinator.commit(txn).await.unwrap();
+    assert_eq!(
+        fs.xattr_store.list(share).await.unwrap().len(),
+        XATTR_COUNT_MAX
+    );
+    // An actual extra row still fails, without changing the existing ACL.
+    assert_eq!(
+        set_text(&fs, share, POSIX_ACL_DEFAULT, "u::rwx,g::---,o::---").await,
+        Err(FsError::NoSpace)
+    );
+    let translated = encode::acl(&[
+        (encode::ALLOW, 0, encode::FULL_CONTROL, Who::Owner),
+        (
+            encode::ALLOW,
+            encode::FD | encode::INHERIT_ONLY,
+            encode::FULL_CONTROL,
+            Who::Owner,
+        ),
+        (
+            encode::ALLOW,
+            encode::FD | encode::INHERIT_ONLY,
+            encode::READ,
+            Who::User(NAMED),
+        ),
+    ]);
+    fs.set_xattr(
+        &test_creds(),
+        share,
+        &acl_name(NFS4_ACL_XDR),
+        XattrValue::new(Bytes::from(translated)).unwrap(),
+        XattrSetMode::Either,
+    )
+    .await
+    .unwrap();
+    // The access ACL becomes mode-only and frees the default ACL's row.
+    assert_eq!(
+        get_text(&fs, share, POSIX_ACL_ACCESS).await,
+        Err(FsError::NoData)
+    );
+    assert_eq!(mode_of(&fs, share).await, 0o700);
+    assert_eq!(
+        get_text(&fs, share, POSIX_ACL_DEFAULT).await.unwrap(),
+        "u::rwx,u:2000:r-x,g::---,m::r-x,o::---"
+    );
+    assert_eq!(
+        fs.xattr_store.list(share).await.unwrap().len(),
+        XATTR_COUNT_MAX
+    );
+    assert_eq!(
+        fs.xattr_store
+            .get(share, b"user.full.0000")
+            .await
+            .unwrap()
+            .as_ref(),
+        b"retained"
+    );
+    assert_eq!(
+        set_text(
+            &fs,
+            share,
+            POSIX_ACL_ACCESS,
+            "u::rwx,u:2000:r--,g::---,m::r--,o::---",
+        )
+        .await,
+        Err(FsError::NoSpace)
     );
 }
 

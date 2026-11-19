@@ -291,6 +291,9 @@ impl StartupContext {
                     )
                     .await
                     .context("Failed to attach persistent writeback")?;
+                    if let Some(pool) = &pool {
+                        attached.lifecycle.set_pool(pool.clone());
+                    }
                     (attached.store, Some(attached.lifecycle))
                 }
                 None => (retried_remote, None),
@@ -1451,6 +1454,7 @@ mod role_decision_tests {
                 settings.storage.pool = Some(crate::config::StoragePoolConfig {
                     catalog_dir: temp.path().join("catalog"),
                     segment_placement: Default::default(),
+                    allow_degraded_start: false,
                     members: vec![crate::config::StoragePoolMemberConfig {
                         health_device: None,
                         id: "local".to_owned(),

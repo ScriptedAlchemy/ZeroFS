@@ -187,22 +187,25 @@ impl ZeroFS {
     ) -> Result<Bytes, FsError> {
         let _guard = self.lock_manager.acquire(id).await;
         let inode = self.inode_store.get(id).await?;
-        let acl = self.access_acl(id, &inode, creds).await?;
-        name.check_read(&inode, creds, acl.as_ref())?;
-        let value = self.xattr_store.get(id, name.as_bytes()).await?;
         if name.kind()? == XattrKind::PosixAccess {
-            // The owner, mask and other entries follow the current mode.
+            name.check_read(&inode, creds, None)?;
+            // Even an owner must receive ACL entries and mode from the same
+            // view; this process's inode lock does not stop a reader refresh.
+            let (inode, value) = self.xattr_store.get_with_inode(id, name.as_bytes()).await?;
+            let value = value.ok_or(FsError::NoData)?;
             return Ok(acl::decode_stored(id, &value)?
                 .with_mode(inode.mode())
                 .to_bytes());
         }
-        Ok(value)
+        let (inode, acl) = self.inode_access_context(id, &inode, creds).await?;
+        name.check_read(&inode, creds, acl.as_ref())?;
+        self.xattr_store.get(id, name.as_bytes()).await
     }
 
     pub async fn list_xattrs(&self, creds: &Credentials, id: InodeId) -> Result<Bytes, FsError> {
         let _guard = self.lock_manager.acquire(id).await;
         let inode = self.inode_store.get(id).await?;
-        let acl = self.access_acl(id, &inode, creds).await?;
+        let (inode, acl) = self.inode_access_context(id, &inode, creds).await?;
         let mut list = Vec::new();
         for name in self.xattr_store.list(id).await? {
             let Ok(name) = XattrName::new(&name) else {

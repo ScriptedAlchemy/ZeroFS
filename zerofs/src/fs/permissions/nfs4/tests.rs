@@ -3,10 +3,7 @@
 //! groups, inheritance flags, and deny entries.
 
 use super::encode::*;
-use super::{
-    REPORT_ACL_OR_OWNER_CHANGE, REPORT_CHILD_DELETE_VIA_INHERITED, REPORT_DELETE_FROM_PARENT,
-    Refusal, map_nfs4_acl,
-};
+use super::{REPORT_ACL_OR_OWNER_CHANGE, REPORT_DELETE_FROM_PARENT, Refusal, map_nfs4_acl};
 
 const OWNER: u32 = 1000;
 const GROUP: u32 = 100;
@@ -24,11 +21,11 @@ fn texts(m: &super::Nfs4Mapping) -> (String, Option<String>) {
 }
 
 #[test]
-fn restricted_preset_on_a_directory() {
+fn restricted_preset_with_delete_child_on_a_directory() {
     let m = map(
         &[
             (ALLOW, FD, FULL_CONTROL, Who::Owner),
-            (ALLOW, FD, MODIFY, Who::Group),
+            (ALLOW, FD, MODIFY | DELETE_CHILD, Who::Group),
         ],
         true,
     )
@@ -40,18 +37,16 @@ fn restricted_preset_on_a_directory() {
             Some("u::rwx,g::rwx,o::---".into())
         )
     );
-    // MODIFY has no DELETE_CHILD; the group deletes children through the
-    // DELETE every child inherits, which the mapping reports.
-    assert!(m.reports.contains(REPORT_CHILD_DELETE_VIA_INHERITED));
+    assert!(m.reports.contains(REPORT_DELETE_FROM_PARENT));
 }
 
 #[test]
-fn open_preset_on_a_directory() {
+fn open_preset_with_delete_child_on_a_directory() {
     let m = map(
         &[
             (ALLOW, FD, FULL_CONTROL, Who::Owner),
             (ALLOW, FD, FULL_CONTROL, Who::Group),
-            (ALLOW, FD, MODIFY, Who::Everyone),
+            (ALLOW, FD, MODIFY | DELETE_CHILD, Who::Everyone),
         ],
         true,
     )
@@ -61,11 +56,11 @@ fn open_preset_on_a_directory() {
 }
 
 #[test]
-fn home_preset_with_traverse_for_everyone() {
+fn home_preset_with_delete_child_and_traverse_for_everyone() {
     let m = map(
         &[
             (ALLOW, FD, FULL_CONTROL, Who::Owner),
-            (ALLOW, FD, MODIFY, Who::Group),
+            (ALLOW, FD, MODIFY | DELETE_CHILD, Who::Group),
             (ALLOW, FD, TRAVERSE, Who::Everyone),
         ],
         true,
@@ -80,7 +75,12 @@ fn smb_builtin_groups_become_named_group_entries() {
         &[
             (ALLOW, FD, FULL_CONTROL, Who::Owner),
             (ALLOW, FD, FULL_CONTROL, Who::Group),
-            (ALLOW, FD, MODIFY, Who::GroupId(BUILTIN_USERS)),
+            (
+                ALLOW,
+                FD,
+                MODIFY | DELETE_CHILD,
+                Who::GroupId(BUILTIN_USERS),
+            ),
             (
                 ALLOW,
                 FD,
@@ -132,7 +132,7 @@ fn inherit_only_entries_feed_only_the_default_acl() {
             (
                 ALLOW,
                 FD | INHERIT_ONLY,
-                MODIFY,
+                MODIFY | DELETE_CHILD,
                 Who::GroupId(BUILTIN_USERS),
             ),
         ],
@@ -249,7 +249,7 @@ fn partial_rights_are_refused() {
         map(&[(ALLOW, 0, READ_DATA, Who::Owner)], false).unwrap_err(),
         Refusal::DataWithoutNamedAttributes
     );
-    // Directory write without DELETE_CHILD and without inheritable DELETE.
+    // Directory write requires DELETE_CHILD.
     assert_eq!(
         map(
             &[
@@ -300,6 +300,79 @@ fn malformed_and_unsupported_values_are_refused() {
         map_nfs4_acl(&bad_who, false, OWNER, GROUP),
         Err(Refusal::Malformed(_))
     ));
+}
+
+#[test]
+fn inherited_delete_does_not_authorize_deleting_every_child() {
+    let entries = [
+        (ALLOW, FD, FULL_CONTROL, Who::Owner),
+        (ALLOW, FD, MODIFY, Who::Group),
+    ];
+    let source = super::parse(&acl(&entries)).unwrap();
+    let caller = super::Caller {
+        uid: 2000,
+        groups: vec![GROUP],
+    };
+    let parent_rights = super::evaluate(&source, &caller, OWNER, GROUP);
+    assert_ne!(parent_rights & WRITE_DATA, 0);
+    assert_eq!(parent_rights & DELETE_CHILD, 0);
+    // A child of a non-setgid directory may have another owning group.
+    // Its group@ DELETE entry then does not authorize this caller.
+    assert_eq!(
+        super::evaluate(&source, &caller, OWNER, GROUP + 1) & super::DELETE,
+        0
+    );
+    assert_eq!(
+        map(&entries, true).unwrap_err(),
+        Refusal::DirectoryWriteWithoutDelete
+    );
+    // Applying the same unsafe grant only to future directories is refused too.
+    assert_eq!(
+        map(
+            &[
+                (ALLOW, 0, FULL_CONTROL, Who::Owner),
+                (ALLOW, FD | INHERIT_ONLY, FULL_CONTROL, Who::Owner),
+                (ALLOW, FD | INHERIT_ONLY, MODIFY, Who::Group),
+            ],
+            true,
+        )
+        .unwrap_err(),
+        Refusal::DirectoryWriteWithoutDelete
+    );
+    // A file's MODIFY rights remain representable.
+    assert!(map(&entries, false).is_ok());
+}
+
+#[test]
+fn unknown_identity_flags_and_undefined_named_ids_are_refused() {
+    for iflag in [3u32, 0x8000_0000, 0x8000_0001] {
+        let mut value = acl(&[(ALLOW, 0, FULL_CONTROL, Who::Owner)]);
+        value[16..20].copy_from_slice(&iflag.to_be_bytes());
+        assert_eq!(
+            map_nfs4_acl(&value, false, OWNER, GROUP),
+            Err(Refusal::Malformed("iflag"))
+        );
+    }
+    for principal in [Who::User(u32::MAX), Who::GroupId(u32::MAX)] {
+        assert_eq!(
+            map(&[(ALLOW, 0, READ, principal)], false),
+            Err(Refusal::Malformed("undefined principal id"))
+        );
+    }
+    for principal in [Who::User(u32::MAX - 1), Who::GroupId(u32::MAX - 1)] {
+        // Keep the owner's rights independent of named-group membership so
+        // this control tests the high ID, not an unrepresentable ACL policy.
+        assert!(
+            map(
+                &[
+                    (ALLOW, 0, FULL_CONTROL, Who::Owner),
+                    (ALLOW, 0, READ, principal),
+                ],
+                false,
+            )
+            .is_ok()
+        );
+    }
 }
 
 #[test]

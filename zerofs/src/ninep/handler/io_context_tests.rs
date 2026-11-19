@@ -1,5 +1,95 @@
 use super::*;
 
+#[tokio::test]
+async fn opens_require_one_acl_entry_to_grant_the_complete_access_mode() {
+    use crate::fs::permissions::acl::POSIX_ACL_ACCESS;
+    use crate::fs::{XattrName, XattrSetMode, XattrValue};
+
+    let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+    let owner = credentials();
+    let (file, _) = fs
+        .create(&owner, 0, b"acl-open", &SetAttributes::default())
+        .await
+        .unwrap();
+    let acl_name = XattrName::new(POSIX_ACL_ACCESS).unwrap();
+    let actor = Credentials::from_auth_context(&AuthContext {
+        uid: owner.uid + 1,
+        gid: 300,
+        gid_known: true,
+        gids: vec![300, 301],
+        groups_complete: true,
+        groups_truncated: false,
+    });
+    for combined_grant in [false, true] {
+        let entries = if combined_grant {
+            [(300, 6), (301, 0)]
+        } else {
+            [(300, 4), (301, 2)]
+        };
+        let acl = PosixAcl::from_parts(6, &[], 0, &entries, 6, 0);
+        fs.set_xattr(
+            &owner,
+            file,
+            &acl_name,
+            XattrValue::new(acl.to_bytes()).unwrap(),
+            XattrSetMode::Either,
+        )
+        .await
+        .unwrap();
+        let inode = fs.visible_inode(file).await.unwrap();
+        for cloned_open in [false, true] {
+            for (flags, requires_both) in [
+                (0, false),
+                (LINUX_O_WRONLY, false),
+                (LINUX_O_RDWR, true),
+                (LINUX_O_TRUNC, true),
+            ] {
+                let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+                handler.session_state().fids.insert(
+                    2,
+                    FidSlot::unopened(Fid {
+                        path: vec![Bytes::from_static(b"acl-open")],
+                        inode_id: file,
+                        root: 0,
+                        qid: inode_to_qid(&inode, file),
+                        opened: false,
+                        mode: None,
+                        creds: actor,
+                    }),
+                );
+                let result = if cloned_open {
+                    handler
+                        .lopenat(Tlopenat {
+                            fid: 2,
+                            newfid: 3,
+                            flags,
+                        })
+                        .await
+                } else {
+                    handler.lopen(Tlopen { fid: 2, flags }).await
+                };
+                if requires_both && !combined_grant {
+                    assert_eq!(result.unwrap_err().to_errno(), crate::linux_errno::EACCES);
+                    assert!(!handler.get_fid(2).unwrap().opened);
+                    assert!(matches!(handler.get_fid(3), Err(P9Error::BadFid)));
+                    assert_eq!(fs.open_handle_count(file), 0);
+                } else {
+                    result.unwrap();
+                    assert!(
+                        handler
+                            .get_fid(if cloned_open { 3 } else { 2 })
+                            .unwrap()
+                            .opened
+                    );
+                    assert_eq!(fs.open_handle_count(file), 1);
+                }
+                drop(handler);
+                assert_eq!(fs.open_handle_count(file), 0);
+            }
+        }
+    }
+}
+
 fn credentials() -> Credentials {
     Credentials {
         uid: 1000,
