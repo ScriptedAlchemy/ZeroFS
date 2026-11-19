@@ -2255,7 +2255,7 @@ mod tests {
         write_committed(&store, &db, 1, offset, &Bytes::from_static(b"01234567"), 0).await;
         assert_eq!(
             store.read(1, offset - 2, 10).await.unwrap().as_ref(),
-            b"\0\001234567"
+            b"\x00\x0001234567"
         );
         write_committed(
             &store,
