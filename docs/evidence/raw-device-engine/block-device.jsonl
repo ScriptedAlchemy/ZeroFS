@@ -1,0 +1,20 @@
+{"case": "excluded device class, regular file and wrong backing inode refused"}
+{"case": "kernel-exclusive holder blocks competing initialization"}
+{"bytes": 524288, "case": "put-flush and fresh-process get", "payload_sha256": "ca4043b46005d4a1bef7116a39f5bb7b51d082eb5f0f6827682d88672172f93e", "role": "payload", "uuid": "e9a89e1a-75dd-409f-842b-8a385e83d185"}
+{"bytes": 524289, "case": "put-flush and fresh-process get", "payload_sha256": "428cf12b8235f3e75129e3ab69c239a48777b743428d9e7dbe18a131ce3b9e1b", "role": "payload", "uuid": "36466477-8923-44c4-b56f-fcef5f5085f2"}
+{"bytes": 524290, "case": "put-flush and fresh-process get", "payload_sha256": "1d2ec253dbff05879657dfb74b1a4e400d101053b28f18e2909102d00fbb1b58", "role": "authority", "uuid": "b033537a-727a-4a37-ad36-97a4f3adb593"}
+{"ack_to_signal_ns": 42583, "case": "SIGKILL and reopen", "flush_acknowledged": false, "recovered_sha256": "ca4043b46005d4a1bef7116a39f5bb7b51d082eb5f0f6827682d88672172f93e"}
+{"ack_to_signal_ns": 38125, "case": "SIGKILL and reopen", "flush_acknowledged": true, "recovered_sha256": "3dee5a1c852a60d1268125ed6f0be1b513c9ec33ee1dfe2343729327fb2b6079"}
+{"case": "raw extent capacity refusal, previous generation readable"}
+{"case": "missing member, wrong pool/member/role, surviving hashes"}
+{"case": "nonzero last sector refused, bytes preserved"}
+{"case": "foreign ext4 and mounted device refused, whole-device hash preserved"}
+{"case": "owned loop mappings released, private nodes and backing files removed"}
+{"case": "already-open store reports live media loss", "error": "device I/O error: Input/output error (os error 5)", "original_sha256": "3ab526b8b9bce91bd6ae3bde55cb1a42ba0a08eb971394ae9a0ee95bdc6cc65d"}
+{"case": "cold open refuses lost backing geometry"}
+{"case": "all six P3 region bindings checked, wrong geometry refused"}
+{"case": "cold journal replay, missing destination retained, idempotent drain to both members", "sha256": ["bf41060c5babe50a3bdd9dc94641d296c882df1eea061800963c1b7284debe73", "9384e9682b7e9bd7b06b4d6013fc85a424c402a352199deab651db8cbe7d8dd9"]}
+{"case": "full destination refused, pending bytes and destination identity survived reopen", "sha256": "7aa833343d2b8f4dba5b0e5c89fd8b054f0b3b08d4086813a39b37ef007b9150"}
+{"case": "both destination objects independently readable with journal absent"}
+{"case": "raw journal fixture mappings and media removed"}
+{"case": "journal reserves retirement at exact physical boundary, cache isolated; exhausted append log refuses new stage"}
