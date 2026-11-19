@@ -1923,10 +1923,12 @@ pub async fn run_server(
             let webui_lock_manager = Arc::new(crate::ninep::lock_manager::FileLockManager::new());
             crate::webui::start(
                 webui_config,
-                write_ack_router.expect("configured WebUI settings route"),
                 Arc::clone(&fs),
                 webui_lock_manager,
-                webui_rpc_service,
+                crate::webui::AdminServices {
+                    rpc: webui_rpc_service,
+                    settings: write_ack_router.expect("configured WebUI settings route"),
+                },
                 shutdown.clone(),
                 p9_accepted_work.clone(),
                 writeback_for_metrics.clone(),

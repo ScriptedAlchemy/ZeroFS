@@ -1344,12 +1344,17 @@ fn serve_asset(path: &str) -> axum::response::Response {
     }
 }
 
+/// Administration services installed alongside the file transport routes.
+pub struct AdminServices {
+    pub rpc: AdminRpcServer,
+    pub settings: Router,
+}
+
 pub fn start(
     config: &WebUIConfig,
-    settings_router: Router,
     filesystem: Arc<ZeroFS>,
     lock_manager: Arc<FileLockManager>,
-    rpc_service: AdminRpcServer,
+    admin: AdminServices,
     shutdown: CancellationToken,
     accepted_work: P9AcceptedWorkTracker,
     writeback: Option<WritebackObjectStore>,
@@ -1371,7 +1376,7 @@ pub fn start(
     };
 
     // gRPC-web: wrap tonic service with GrpcWebService + CORS
-    let grpc_service = proto::admin_service_server::AdminServiceServer::new(rpc_service);
+    let grpc_service = proto::admin_service_server::AdminServiceServer::new(admin.rpc);
     let grpc_web_service = tower::ServiceBuilder::new()
         .layer(
             CorsLayer::new()
@@ -1393,7 +1398,7 @@ pub fn start(
         .route("/{*path}", get(serve_spa))
         .route("/", get(serve_index))
         .with_state(state)
-        .merge(settings_router);
+        .merge(admin.settings);
 
     let mut handles = Vec::new();
     for &addr in &config.addresses {
