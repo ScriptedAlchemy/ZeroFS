@@ -1469,20 +1469,19 @@ async fn stream_record_to_remote(
 
     let sequence = record.sequence;
     let blob_journal = Arc::clone(&journal);
-    let blob = tokio::task::spawn_blocking(move || blob_journal.open_verified_blob(sequence))
-        .await
-        .map_err(|error| generic_error(format!("journal open task failed: {error}")))?
-        .map_err(|error| generic_error(format!("journal blob open failed: {error:#}")))?;
-    let mut chunks = blob
-        .range_stream(0..blob.len(), REMOTE_STREAM_CHUNK_BYTES)
-        .map_err(|error| generic_error(format!("journal blob stream failed: {error:#}")))?;
-    if blob.len() <= REMOTE_SINGLE_PUT_BYTES {
-        let mut collected = Vec::new();
-        while let Some(chunk) = chunks.next().await {
-            collected.push(chunk.map_err(|error| {
-                generic_error(format!("journal blob stream failed: {error:#}"))
-            })?);
-        }
+    if record
+        .payload()
+        .is_some_and(|(payload_len, _)| payload_len <= REMOTE_SINGLE_PUT_BYTES)
+    {
+        // One pass reads and hashes exactly the bytes that are published. The
+        // streaming path below verifies the whole file before streaming and
+        // hashes the stream again, which doubled journal reads for every
+        // segment the drain moved.
+        let payload =
+            tokio::task::spawn_blocking(move || blob_journal.read_verified_payload(sequence))
+                .await
+                .map_err(|error| generic_error(format!("journal read task failed: {error}")))?
+                .map_err(|error| generic_error(format!("journal blob read failed: {error:#}")))?;
         let mut options = PutOptions::from(mode.clone());
         options
             .extensions
@@ -1491,7 +1490,7 @@ async fn stream_record_to_remote(
             record,
             "bounded atomic put",
             REMOTE_PUBLICATION_TIMEOUT,
-            remote.put_opts(target, PutPayload::from_iter(collected), options),
+            remote.put_opts(target, PutPayload::from(payload), options),
         )
         .await;
         return match result {
@@ -1505,6 +1504,13 @@ async fn stream_record_to_remote(
             Err(error) => Err(error),
         };
     }
+    let blob = tokio::task::spawn_blocking(move || blob_journal.open_verified_blob(sequence))
+        .await
+        .map_err(|error| generic_error(format!("journal open task failed: {error}")))?
+        .map_err(|error| generic_error(format!("journal blob open failed: {error:#}")))?;
+    let mut chunks = blob
+        .range_stream(0..blob.len(), REMOTE_STREAM_CHUNK_BYTES)
+        .map_err(|error| generic_error(format!("journal blob stream failed: {error:#}")))?;
     if matches!(mode, PutMode::Update(_)) {
         return Err(object_store::Error::NotSupported {
             source: Box::new(crate::retrying_object_store::PermanentError::new(

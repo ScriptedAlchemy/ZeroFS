@@ -1728,6 +1728,38 @@ impl Journal {
         Ok(collected)
     }
 
+    /// Read one record's payload in a single pass. The SHA-256 is checked over
+    /// exactly the returned bytes, so the caller can publish them without the
+    /// separate verification read that [`Self::open_verified_blob`] performs.
+    pub(crate) fn read_verified_payload(&self, sequence: Sequence) -> Result<Bytes> {
+        let record = self
+            .mutation(sequence)?
+            .with_context(|| format!("journal mutation {sequence} does not exist"))?;
+        let reference = record
+            .blob_path()
+            .with_context(|| format!("journal mutation {sequence} has no blob"))?;
+        let reference = BlobRef::parse(reference)?;
+        let location = self.blob_location(reference.relative, false)?;
+        let file = location
+            .parent
+            .open_file(&location.name, OFlags::RDONLY, 0)
+            .with_context(|| format!("missing committed blob {}", location.display.display()))?;
+        let (payload_len, payload_sha256) = record
+            .payload()
+            .context("journal record does not reference a payload blob")?;
+        let mut collected =
+            Vec::with_capacity(usize::try_from(payload_len).context("blob is too large to read")?);
+        verify_file_payload_into(
+            file,
+            &location.display,
+            reference.slice,
+            payload_len,
+            payload_sha256,
+            Some(&mut collected),
+        )?;
+        Ok(Bytes::from(collected))
+    }
+
     pub(crate) fn open_verified_blob(&self, sequence: Sequence) -> Result<VerifiedBlob> {
         let record = self
             .mutation(sequence)?
@@ -3170,11 +3202,25 @@ fn verify_record_blob(
 /// it. A whole-file reference still demands an exact file length, while a
 /// container only requires that it be long enough to hold the slice.
 fn verify_file_payload(
+    file: File,
+    path: &Path,
+    slice: Option<BlobSlice>,
+    expected_len: u64,
+    expected_sha256: [u8; 32],
+) -> Result<(File, u64)> {
+    verify_file_payload_into(file, path, slice, expected_len, expected_sha256, None)
+}
+
+/// [`verify_file_payload`], optionally keeping the hashed bytes. A collected
+/// payload is exactly the byte sequence whose digest matched, so a caller that
+/// sends it needs no second read or hash.
+fn verify_file_payload_into(
     mut file: File,
     path: &Path,
     slice: Option<BlobSlice>,
     expected_len: u64,
     expected_sha256: [u8; 32],
+    mut collect: Option<&mut Vec<u8>>,
 ) -> Result<(File, u64)> {
     let offset = slice.map_or(0, |slice| slice.offset);
     if let Some(slice) = slice
@@ -3209,20 +3255,36 @@ fn verify_file_payload(
             .with_context(|| format!("failed to seek blob {}", path.display()))?;
     }
 
+    const WINDOW: u64 = 1024 * 1024;
     let mut hasher = Sha256::new();
     let mut remaining = expected_len;
-    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut buffer = if collect.is_some() {
+        Vec::new()
+    } else {
+        vec![0_u8; WINDOW as usize]
+    };
     while remaining > 0 {
-        let want = usize::try_from(remaining.min(buffer.len() as u64))
-            .context("blob read window overflow")?;
+        let want =
+            usize::try_from(remaining.min(WINDOW)).context("blob read window overflow")?;
+        let window = match collect.as_deref_mut() {
+            Some(collected) => {
+                let start = collected.len();
+                collected.resize(start + want, 0);
+                &mut collected[start..]
+            }
+            None => &mut buffer[..want],
+        };
         let read = file
-            .read(&mut buffer[..want])
+            .read(window)
             .with_context(|| format!("failed to read blob {}", path.display()))?;
         if read == 0 {
             bail!("committed blob length mismatch");
         }
+        hasher.update(&window[..read]);
+        if let Some(collected) = collect.as_deref_mut() {
+            collected.truncate(collected.len() - (want - read));
+        }
         remaining -= read as u64;
-        hasher.update(&buffer[..read]);
     }
     let actual_sha256: [u8; 32] = hasher.finalize().into();
     if actual_sha256 != expected_sha256 {
@@ -5856,6 +5918,55 @@ mod tests {
         }
         assert_eq!(journal.read_blob(2).unwrap(), second);
         assert!(journal.open_verified_blob(1).is_err());
+    }
+
+    #[test]
+    fn single_pass_payload_read_returns_only_verified_slice_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        let committed = journal
+            .publish_batch(prepare_puts(&journal, 1..=3))
+            .unwrap();
+        for sequence in 1..=3_u64 {
+            assert_eq!(
+                journal.read_verified_payload(sequence).unwrap().as_ref(),
+                format!("payload-{sequence}").as_bytes()
+            );
+        }
+        journal
+            .commit_put(put_record(4, "segments/empty", b""), b"")
+            .unwrap();
+        assert!(journal.read_verified_payload(4).unwrap().is_empty());
+
+        // Corrupting one member's slice fails only that member.
+        let middle = super::BlobRef::parse(committed[1].blob_path().unwrap()).unwrap();
+        let slice = middle.slice.unwrap();
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(journal.root().join(middle.relative))
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            file.write_at(b"X", slice.offset + slice.len - 1).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut file = file;
+            file.seek(SeekFrom::Start(slice.offset + slice.len - 1)).unwrap();
+            file.write_all(b"X").unwrap();
+        }
+        let error = journal.read_verified_payload(2).unwrap_err();
+        assert!(format!("{error:#}").contains("hash mismatch"), "{error:#}");
+        assert_eq!(
+            journal.read_verified_payload(1).unwrap().as_ref(),
+            b"payload-1"
+        );
+        assert_eq!(
+            journal.read_verified_payload(3).unwrap().as_ref(),
+            b"payload-3"
+        );
     }
 
     #[tokio::test]
