@@ -383,11 +383,6 @@ impl Catalog {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub fn configure_members(&self, members: &[PoolMember]) -> Result<()> {
-        self.configure_members_except(members, None)
-    }
-
     pub fn configure_members_except(
         &self,
         members: &[PoolMember],
@@ -1521,7 +1516,7 @@ mod catalog_lock_tests {
             health_device: None,
             free_space: None,
         };
-        catalog.configure_members(&[member]).unwrap();
+        catalog.configure_members_except(&[member], None).unwrap();
         catalog.finish_initialization().unwrap();
         catalog
             .kernel_observation("hdd-a", "available".into(), Some(("boot-a".into(), 42)))
@@ -1754,7 +1749,7 @@ mod empty_quarantine_tests {
                 free_space: None,
             })
             .collect::<Vec<_>>();
-        catalog.configure_members(&members).unwrap();
+        catalog.configure_members_except(&members, None).unwrap();
         catalog.finish_initialization().unwrap();
         (root, catalog, members)
     }

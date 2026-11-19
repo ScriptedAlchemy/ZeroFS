@@ -36,7 +36,7 @@ fn storage_readiness_startup_leaves_data_entry_symlinks_for_their_open_checks() 
     for strict in [true, false] {
         fixture.document["storage"]["readiness"]["strict"] = json!(strict);
         fixture.verify().unwrap();
-        verify_pool_paths(&fixture.parse().unwrap(), pool_id).unwrap();
+        verify_pool_paths_except(&fixture.parse().unwrap(), pool_id, None).unwrap();
     }
     verify_bucket_paths(&fixture.parse().unwrap(), "bucket_fixture").unwrap();
 }

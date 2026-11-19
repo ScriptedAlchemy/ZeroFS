@@ -1120,7 +1120,7 @@ impl ExtentStore {
         let mut results: Vec<_> = stream::iter(self.pending_seals())
             .map(|(segid, bytes)| {
                 let segments = Arc::clone(&self.segments);
-                async move { (segid, segments.put_segment(segid, bytes).await) }
+                async move { (segid, segments.put_segment(segid, bytes, None).await) }
             })
             .buffer_unordered(self.max_inflight_seals)
             .collect()
@@ -1282,8 +1282,9 @@ impl ExtentStore {
                 {
                     Ok(Some((segid, bytes))) => {
                         let segments = Arc::clone(&self.segments);
-                        uploads
-                            .push(async move { (segid, segments.put_segment(segid, bytes).await) });
+                        uploads.push(async move {
+                            (segid, segments.put_segment(segid, bytes, None).await)
+                        });
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -1375,7 +1376,7 @@ impl ExtentStore {
             let Some(bytes) = bytes else {
                 return;
             };
-            match segments.put_segment(segid, bytes).await {
+            match segments.put_segment(segid, bytes, None).await {
                 Ok(()) => failures.published(&sealing, segid),
                 Err(e) => {
                     failures.record(seal_failure(None, &e));

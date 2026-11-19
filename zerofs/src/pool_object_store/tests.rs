@@ -3207,7 +3207,7 @@ async fn writeback_replays_segment_to_persisted_member_before_any_pool_put() {
         None,
     );
     segments
-        .put_segment_at_target(segid, body.clone(), Some(&SegmentTarget("hdd-b".into())))
+        .put_segment(segid, body.clone(), Some(&SegmentTarget("hdd-b".into())))
         .await
         .unwrap();
     drop(segments);
@@ -3281,10 +3281,13 @@ async fn targeted_seal_refuses_identical_bytes_already_on_another_member() {
         None,
     );
     let body = Bytes::from_static(b"same bytes");
-    publisher.put_segment(segid, body.clone()).await.unwrap();
+    publisher
+        .put_segment(segid, body.clone(), None)
+        .await
+        .unwrap();
     assert!(
         publisher
-            .put_segment_at_target(segid, body, Some(&SegmentTarget("hdd-b".into())))
+            .put_segment(segid, body, Some(&SegmentTarget("hdd-b".into())))
             .await
             .is_err()
     );

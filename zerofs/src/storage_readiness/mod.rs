@@ -265,11 +265,6 @@ fn verify_open_paths_with(
     Ok(())
 }
 
-#[cfg(test)]
-pub(crate) fn verify_pool_paths(settings: &Settings, pool_id: &str) -> Result<()> {
-    verify_pool_paths_except(settings, pool_id, None)
-}
-
 pub(crate) fn verify_pool_paths_except(
     settings: &Settings,
     pool_id: &str,

@@ -2646,7 +2646,7 @@ mod tests {
         );
 
         segments
-            .put_segment(segid, Bytes::from(vec![2u8; size]))
+            .put_segment(segid, Bytes::from(vec![2u8; size]), None)
             .await
             .expect_err("remote immutable-key collision must remain fatal");
         assert_eq!(
@@ -5178,7 +5178,7 @@ mod tests {
             async move {
                 let segid = segments.next_segid();
                 segments
-                    .put_segment(segid, Bytes::from(vec![index; 1024]))
+                    .put_segment(segid, Bytes::from(vec![index; 1024]), None)
                     .await
                     .unwrap();
             }
@@ -5219,7 +5219,7 @@ mod tests {
 
         let accepted = tokio::time::timeout(
             Duration::from_secs(1),
-            segments.put_segment(segments.next_segid(), Bytes::from_static(b"segment")),
+            segments.put_segment(segments.next_segid(), Bytes::from_static(b"segment"), None),
         )
         .await;
         controls.release_heads();

@@ -174,11 +174,7 @@ impl SegmentStore {
     /// PUT pre-built segment bytes (durable on return). Used by the open-segment
     /// buffer's seal, which builds the bytes itself via `seal_directory` +
     /// `assemble_segment`.
-    pub(crate) async fn put_segment(&self, segid: Segid, bytes: Bytes) -> Result<()> {
-        self.put_segment_at_target(segid, bytes, None).await
-    }
-
-    pub(crate) async fn put_segment_at_target(
+    pub(crate) async fn put_segment(
         &self,
         segid: Segid,
         bytes: Bytes,
@@ -466,7 +462,7 @@ impl SegmentStore {
             ));
         }
         let bytes = builder.finish(segid.counter)?;
-        self.put_segment(segid, Bytes::from(bytes)).await?;
+        self.put_segment(segid, Bytes::from(bytes), None).await?;
         Ok(locs)
     }
 
@@ -1446,7 +1442,11 @@ mod tests {
         let store = SegmentStore::new(os, codec, 5, Some(warm));
 
         store
-            .put_segment(store.next_segid(), Bytes::from_static(b"small segment"))
+            .put_segment(
+                store.next_segid(),
+                Bytes::from_static(b"small segment"),
+                None,
+            )
             .await
             .unwrap();
 
@@ -1468,7 +1468,11 @@ mod tests {
         let store = SegmentStore::new(os, codec(), 5, Some(warm));
 
         store
-            .put_segment(store.next_segid(), Bytes::from(vec![7u8; SEAL_PART_SIZE]))
+            .put_segment(
+                store.next_segid(),
+                Bytes::from(vec![7u8; SEAL_PART_SIZE]),
+                None,
+            )
             .await
             .unwrap();
 
@@ -1488,11 +1492,11 @@ mod tests {
         let path = Path::from(segid.object_key());
 
         store
-            .put_segment(segid, Bytes::from_static(b"first segment"))
+            .put_segment(segid, Bytes::from_static(b"first segment"), None)
             .await
             .unwrap();
         store
-            .put_segment(segid, Bytes::from_static(b"replacement segment"))
+            .put_segment(segid, Bytes::from_static(b"replacement segment"), None)
             .await
             .expect_err("an immutable segment key must not be overwritten");
 
@@ -1519,7 +1523,7 @@ mod tests {
 
             assert_eq!(
                 store
-                    .put_segment(segid, Bytes::copy_from_slice(wanted))
+                    .put_segment(segid, Bytes::copy_from_slice(wanted), None)
                     .await
                     .is_ok(),
                 succeeds,
@@ -1627,7 +1631,7 @@ mod tests {
             os.put(&path, existing.clone().into()).await.unwrap();
 
             store
-                .put_segment(segid, Bytes::from(vec![2u8; size]))
+                .put_segment(segid, Bytes::from(vec![2u8; size]), None)
                 .await
                 .expect_err("an existing immutable segment must win at every size boundary");
             assert_eq!(
@@ -1775,7 +1779,7 @@ mod tests {
         let store = SegmentStore::new(os, codec, 5, None);
 
         let error = store
-            .put_segment(store.next_segid(), noise(1, 40 * 1024 * 1024))
+            .put_segment(store.next_segid(), noise(1, 40 * 1024 * 1024), None)
             .await
             .expect_err("a 40 MiB seal must use the injected single-PUT path");
         assert!(error.to_string().contains("injected object-store fault"));
