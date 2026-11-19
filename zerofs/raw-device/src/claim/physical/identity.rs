@@ -113,7 +113,7 @@ impl Machine {
                 by_dev
                     .components()
                     .any(|part| is_ata_component(part.as_os_str().as_encoded_bytes()))
-                    && udev.wwn.as_deref().is_none_or(|value| value == wwn)
+                    && (udev.wwn.is_none() || udev.hex_wwn() == Some(wwn))
                     && wwid.as_deref().is_none_or(|value| value == wwn)
                     && (wwid.is_some()
                         || udev.wwn.is_some()
@@ -204,7 +204,7 @@ impl Machine {
                 serial.as_deref() != Some(disk.serial)
                     && udev.serial.as_deref() != Some(disk.serial)
                     && disk.wwn.is_none_or(|wwn| {
-                        wwid.as_deref() != Some(wwn) && udev.wwn.as_deref() != Some(wwn)
+                        wwid.as_deref() != Some(wwn) && udev.hex_wwn() != Some(wwn)
                     }),
                 "physical serial or WWN is claimed by multiple whole disks",
             )?;
@@ -345,6 +345,10 @@ impl Udev {
         }
     }
 
+    fn hex_wwn(&self) -> Option<&str> {
+        self.wwn.as_deref()?.strip_prefix("0x")
+    }
+
     fn parse(text: &str) -> io::Result<Self> {
         let mut identity = Self::default();
         for line in text.lines() {
@@ -367,11 +371,9 @@ impl Udev {
                 )?;
             }
             if let Some(wwn) = line.strip_prefix("E:ID_WWN=") {
-                let value = wwn
-                    .strip_prefix("0x")
-                    .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "invalid udev WWN"))?;
+                require(!wwn.is_empty(), "invalid empty udev WWN")?;
                 require(
-                    identity.wwn.replace(value.to_owned()).is_none(),
+                    identity.wwn.replace(wwn.to_owned()).is_none(),
                     "duplicate udev WWN",
                 )?;
             }
@@ -422,6 +424,14 @@ mod tests {
         assert!(alias_node(Path::new("../../../sda")).is_err());
         assert!(alias_node(Path::new("/dev/disk/by-id/link")).is_err());
         assert!(alias_node(Path::new("/proc/self/fd/1")).is_err());
+    }
+
+    #[test]
+    fn accepts_nvme_udev_wwn_without_treating_it_as_an_ata_wwn() {
+        let nvme = Udev::parse("E:ID_WWN=nvme.1b36-323331384536443138434537").unwrap();
+        assert_eq!(nvme.hex_wwn(), None);
+        let ata = Udev::parse("E:ID_WWN=0x5000c500ac8aed0a").unwrap();
+        assert_eq!(ata.hex_wwn(), Some("5000c500ac8aed0a"));
     }
 
     #[test]
