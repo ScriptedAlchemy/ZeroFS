@@ -187,11 +187,11 @@ pub(crate) async fn open_pool_storage(
             options.extend(member.cloud_provider_env_vars());
             let identity = member_identity(&url, &options)?;
             let parsed = if scheme == ObjectStoreScheme::Sftp {
-                crate::parse_object_store::build_sftp_store_with_warmup(
+                crate::parse_object_store::build_sftp_store(
                     &url,
                     member_path,
                     member.sftp.as_ref(),
-                    false,
+                    crate::parse_object_store::SftpStartup::Deferred,
                 )
                 .await?
             } else {
