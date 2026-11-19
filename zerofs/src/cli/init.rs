@@ -177,10 +177,9 @@ impl StartupContext {
         let cleanup_pool = sftp_pool.clone();
         let cleanup_storage_pool = pool.clone();
         let prepared: Result<Self> = async {
-            let writeback_settings = settings.writeback_settings(db_mode.into())?;
             anyhow::ensure!(
-                raw_journal.is_none() || writeback_settings.is_some(),
-                "raw P3 Journal requires active writeback in this database mode"
+                raw_journal.is_none() || !db_mode.is_read_only(),
+                "raw P3 journal requires a read-write server"
             );
             let disk_monitor = match &pool {
                 Some(pool) => Some(
@@ -213,6 +212,7 @@ impl StartupContext {
                 settings,
                 &bucket.cache_directory_name(),
             )?;
+            let writeback_settings = settings.writeback_settings(db_mode.into())?;
             let cache_config = CacheConfig {
                 root_folder: cache_config.root_folder.join(bucket.cache_directory_name()),
                 ..cache_config
