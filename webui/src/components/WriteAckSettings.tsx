@@ -239,7 +239,10 @@ export function WriteAckSettings() {
           credentials: "omit",
           redirect: "error",
         });
-        if (!controller.signal.aborted && response.status === 404) {
+        // Older engines serve the application HTML for an unknown API path.
+        const htmlFallback =
+          response.ok && response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() === "text/html";
+        if (!controller.signal.aborted && (response.status === 404 || htmlFallback)) {
           setLoad({ kind: "unsupported" });
           return;
         }

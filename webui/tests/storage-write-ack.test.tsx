@@ -162,15 +162,32 @@ describe("Storage write acknowledgement settings", () => {
     expect(section().queryByRole("button", { name: "Save for restart" })).toBeNull();
   });
 
-  it("hides the section when running against an older engine", async () => {
-    fetchMock.mockResolvedValueOnce(new Response(null, { status: 404 }));
+  it.each([
+    { name: "missing route", response: () => new Response(null, { status: 404 }) },
+    {
+      name: "HTML application fallback",
+      response: () =>
+        new Response("<!doctype html><html><body><div id=\"root\"></div></body></html>", {
+          headers: { "Content-Type": "text/html; charset=utf-8" },
+        }),
+    },
+  ])("hides the section when running against an older engine ($name)", async ({ response }) => {
+    fetchMock.mockResolvedValueOnce(response());
     render(<StoragePage />);
     expect(screen.getByRole("heading", { name: "Storage" })).toBeTruthy();
     await waitFor(() => expect(screen.queryByRole("region", { name: "Write acknowledgement" })).toBeNull());
   });
 
-  it("reports a load error and allows a retry", async () => {
-    fetchMock.mockResolvedValueOnce(new Response(null, { status: 503 })).mockResolvedValueOnce(Response.json(status));
+  it.each([
+    {
+      name: "server error",
+      load: () =>
+        Promise.resolve(new Response("Service unavailable", { status: 503, headers: { "Content-Type": "text/html" } })),
+    },
+    { name: "invalid JSON status", load: () => Promise.resolve(Response.json({ error: "unavailable" })) },
+    { name: "network failure", load: () => Promise.reject(new TypeError("Network request failed")) },
+  ])("reports a load error and allows a retry ($name)", async ({ load }) => {
+    fetchMock.mockImplementationOnce(load).mockResolvedValueOnce(Response.json(status));
     render(<StoragePage />);
     expect((await section().findByRole("alert")).textContent).toMatch(/Could not load/);
     fireEvent.click(section().getByRole("button", { name: "Retry" }));
