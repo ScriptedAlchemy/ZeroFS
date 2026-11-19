@@ -72,8 +72,11 @@ credential override. ZeroFS then cannot tell which groups the caller is in.
 For such a caller, a named-user entry still applies by uid. Otherwise the
 caller gets a right only if the other entry and every group-class entry, each
 limited by the mask, grant it. This can deny what Linux would allow. It never
-allows what Linux would deny. The ZeroFS FUSE client and `Trebind` carry the
-full group list, so these clients get the exact Linux decision.
+allows what Linux would deny. `Trebind` supports a complete supplementary group
+list of up to 16 entries. On Linux, the FUSE client reads the requesting thread's
+groups from procfs when its filesystem uid and gid match the request and the
+list fits the protocol. When the list is unavailable, the server uses the
+request's primary gid and the incomplete-group ACL checks.
 
 ### Client-side checks
 
@@ -82,8 +85,10 @@ effective decision is the stricter of the client's and the server's.
 
 - The ZeroFS FUSE client negotiates `FUSE_POSIX_ACL`. The kernel then fetches
   ACLs from the server and evaluates them, so named-user and named-group grants
-  work. The kernel still applies the umask when it creates files, so a new file
-  under a default ACL can get a narrower mode than on a local filesystem.
+  work. With a server that negotiates create umask handling and a kernel that
+  supports `FUSE_DONT_MASK`, the server applies the umask only when the parent
+  has no default ACL. An older peer or kernel may supply a mode already
+  narrowed by the umask.
 - The Linux kernel 9P client with the package's `access=user` mount cannot
   read or set ACLs. v9fs marks a superblock as ACL-capable only for
   `access=client,posixacl`, which the app rejected for other reasons, and the
@@ -193,8 +198,9 @@ and reports each one per file in the `narrowed` list.
 - `aclmode=restricted`. On ZFS a `chmod` of a file with a non-trivial ACL fails.
   On ZeroFS the owner may `chmod`, which rewrites the mask and other entry.
 - `aclinherit=passthrough`. ZFS ignores the creating mode for inherited entries.
-  POSIX limits an inherited ACL by the creating mode, and kernel clients apply
-  the umask, so new files can be narrower than on the source.
+  POSIX limits an inherited ACL by the creating mode, so new files can be
+  narrower than on the source. Clients that mask the creating mode also
+  narrow the inherited ACL.
 - `READ_ATTRIBUTES`, `READ_ACL` and `SYNCHRONIZE`. Any caller who can reach an
   inode can `stat` it and read its ACL, as on Linux. Samba enforces these rights
   for SMB clients on the source, so SMB access through ZeroFS is looser here.

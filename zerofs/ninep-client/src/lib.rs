@@ -504,6 +504,7 @@ struct Conn {
     /// Writer epoch returned by `Tgetlineage`; zero for standalone servers.
     writer_epoch: AtomicU64,
     case_insensitive: AtomicBool,
+    create_umask: AtomicBool,
     /// Set by whichever of the reader/writer tasks first sees the socket fail.
     dead: AtomicBool,
     /// Monotonic base for [`Conn::last_alive`].
@@ -998,6 +999,7 @@ impl NinePClient {
             lineage_token: AtomicU64::new(0),
             writer_epoch: AtomicU64::new(0),
             case_insensitive: AtomicBool::new(false),
+            create_umask: AtomicBool::new(false),
             dead: AtomicBool::new(false),
             base: runtime::Clock::now(),
             last_alive: AtomicU64::new(0),
@@ -1844,12 +1846,25 @@ impl NinePClient {
                     // Encoding can copy a full negotiated write payload. Keep
                     // it outside the session registry so independent requests
                     // and fid retirements do not wait on that bulk work.
+                    let mut wire_body = body.clone();
+                    if !conn.create_umask.load(Ordering::Acquire) {
+                        let mode = match &mut wire_body {
+                            Message::Tlcreateattr(request) => Some(&mut request.mode),
+                            Message::Tmkdirattr(request) => Some(&mut request.mode),
+                            Message::Tmknodattr(request) => Some(&mut request.mode),
+                            _ => None,
+                        };
+                        if let Some(mode) = mode {
+                            let umask = (*mode >> CREATE_UMASK_SHIFT) & CREATE_UMASK_MASK;
+                            *mode &= !((CREATE_UMASK_MASK << CREATE_UMASK_SHIFT) | umask);
+                        }
+                    }
                     let bytes = P9Message::new_with_op_id_flags_and_origin(
                         tag,
                         op_id,
                         op_flags,
                         origin_epoch,
-                        body.clone(),
+                        wire_body,
                     )
                     .to_bytes_ctx(true)
                     .map_err(ClientError::Codec)?;
@@ -4086,22 +4101,29 @@ async fn negotiate_on(conn: &Conn, requested: u32) -> ClientResult<u32> {
 
 /// Performs the session-resetting `Tversion` exchange without a lineage query.
 async fn version_on(conn: &Conn, requested: u32) -> ClientResult<u32> {
-    // 9P requires NOTAG for Tversion.
-    match NinePClient::send_raw_at_tag(
-        conn,
-        Some(NOTAG),
-        Message::Tversion(Tversion {
-            msize: requested,
-            version: P9String::new(VERSION_9P2000L_ZEROFS.to_vec()),
-        }),
-    )
-    .await?
-    {
+    // 9P requires NOTAG for Tversion. Older servers explicitly return "unknown".
+    let version = |dialect: &[u8]| {
+        NinePClient::send_raw_at_tag(
+            conn,
+            Some(NOTAG),
+            Message::Tversion(Tversion {
+                msize: requested,
+                version: P9String::new(dialect.to_vec()),
+            }),
+        )
+    };
+    let mut reply = version(VERSION_9P2000L_ZEROFS_UMASK).await?;
+    if matches!(&reply, Message::Rversion(rv) if rv.version.data == b"unknown") {
+        reply = version(VERSION_9P2000L_ZEROFS).await?;
+    }
+    match reply {
         Message::Rlerror(e) => Err(ClientError::Errno(e.ecode)),
         Message::Rversion(rv) => {
-            let case_insensitive = match rv.version.data.as_slice() {
-                VERSION_9P2000L_ZEROFS => false,
-                VERSION_9P2000L_ZEROFS_CI => true,
+            let (case_insensitive, create_umask) = match rv.version.data.as_slice() {
+                VERSION_9P2000L_ZEROFS => (false, false),
+                VERSION_9P2000L_ZEROFS_CI => (true, false),
+                VERSION_9P2000L_ZEROFS_UMASK => (false, true),
+                VERSION_9P2000L_ZEROFS_CI_UMASK => (true, true),
                 _ => {
                     warn!(
                         "server did not accept the required ZeroFS dialect: {:?}",
@@ -4112,6 +4134,7 @@ async fn version_on(conn: &Conn, requested: u32) -> ClientResult<u32> {
             };
             conn.case_insensitive
                 .store(case_insensitive, Ordering::Release);
+            conn.create_umask.store(create_umask, Ordering::Release);
             // Linux v9fs requires msize >= 4096.
             let negotiated = rv.msize.min(requested);
             if negotiated < 4096 {
@@ -4420,6 +4443,7 @@ fn test_conn_with_receiver_at(base: runtime::Clock) -> (Arc<Conn>, mpsc::Receive
         lineage_token: AtomicU64::new(0),
         writer_epoch: AtomicU64::new(0),
         case_insensitive: AtomicBool::new(false),
+        create_umask: AtomicBool::new(false),
         dead: AtomicBool::new(false),
         base,
         last_alive: AtomicU64::new(0),
@@ -4672,6 +4696,69 @@ mod session_transition_tests {
             assert!(candidate.dead.load(Ordering::Acquire));
             assert!(candidate.pending.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_dialect_fallback_masks_private_create_mode_before_sending() {
+        const S_IFDIR: u32 = 0o040000;
+        let (conn, mut requests) = test_conn_with_receiver();
+        let responder_conn = Arc::clone(&conn);
+        let responder = tokio::spawn(async move {
+            for (offered, accepted) in [
+                (VERSION_9P2000L_ZEROFS_UMASK, b"unknown".as_slice()),
+                (VERSION_9P2000L_ZEROFS, VERSION_9P2000L_ZEROFS),
+            ] {
+                let request = recv_request(&mut requests, "version request").await;
+                let Message::Tversion(version) = request.body else {
+                    panic!("expected Tversion");
+                };
+                assert_eq!(version.version.data, offered);
+                reply(
+                    &responder_conn,
+                    request.tag,
+                    Message::Rversion(Rversion {
+                        msize: 8192,
+                        version: P9String::new(accepted.to_vec()),
+                    }),
+                );
+            }
+            let request = recv_op_request(&mut requests, "mkdir request").await;
+            let Message::Tmkdirattr(mkdir) = request.body else {
+                panic!("expected Tmkdirattr");
+            };
+            assert_eq!(mkdir.mode, S_IFDIR | 0o750);
+            reply(
+                &responder_conn,
+                request.tag,
+                Message::Rmkdirattr(Rmkdirattr {
+                    stat: Stat {
+                        qid: qid(42),
+                        ..Default::default()
+                    },
+                }),
+            );
+        });
+
+        assert_eq!(version_on(&conn, 8192).await.unwrap(), 8192);
+        assert!(!conn.create_umask.load(Ordering::Acquire));
+        let client = test_client(conn);
+        client
+            .state
+            .lock()
+            .unwrap()
+            .fids
+            .insert(1, attach_fid(0, 0));
+        let mode = S_IFDIR | 0o777 | (0o027 << CREATE_UMASK_SHIFT);
+        assert_eq!(
+            client
+                .mkdir_attr(1, b"child", mode, 0)
+                .await
+                .unwrap()
+                .qid
+                .path,
+            42
+        );
+        responder.await.unwrap();
     }
 
     #[tokio::test]

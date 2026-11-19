@@ -159,15 +159,24 @@ impl ZeroFS {
         parent_id: InodeId,
         new_is_directory: bool,
         mode: &mut u32,
+        umask: u32,
+        strip_sgid: impl FnOnce(u32) -> u32,
     ) -> Result<InheritedAcls, FsError> {
-        if !self.posix_acls_possible().await? {
-            return Ok(InheritedAcls::default());
-        }
-        let parent_default = match self.xattr_store.get(parent_id, POSIX_ACL_DEFAULT).await {
-            Ok(value) => decode_stored(parent_id, &value)?,
-            Err(FsError::NoData) => return Ok(InheritedAcls::default()),
-            Err(error) => return Err(error),
+        let parent_default = if self.posix_acls_possible().await? {
+            match self.xattr_store.get(parent_id, POSIX_ACL_DEFAULT).await {
+                Ok(value) => Some(decode_stored(parent_id, &value)?),
+                Err(FsError::NoData) => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
         };
+        let Some(parent_default) = parent_default else {
+            *mode = strip_sgid(*mode & !umask);
+            return Ok(InheritedAcls::default());
+        };
+        // SGID stripping uses the requested mode before the ACL limits group execute.
+        *mode = strip_sgid(*mode);
         let mut access = parent_default.clone();
         let store_access = access.create_masq(mode);
         Ok(InheritedAcls {
@@ -265,7 +274,7 @@ impl ZeroFS {
                     // Linux `posix_acl_update_mode`.
                     let (not_equiv, bits) = acl.equiv_mode();
                     let mut mode = (inode.mode() & !0o777) | bits;
-                    if creds.uid != 0 && !creds.is_member_of_group(inode.gid()) {
+                    if creds.uid != 0 && !creds.is_known_member_of_group(inode.gid()) {
                         mode &= !0o2000;
                     }
                     set_permission_mode(&mut inode, mode);

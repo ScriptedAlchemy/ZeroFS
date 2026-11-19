@@ -60,7 +60,7 @@ impl Credentials {
         self.is_known_member_of_group(gid) || (!self.groups_complete && !self.groups_truncated)
     }
 
-    fn is_known_member_of_group(&self, gid: u32) -> bool {
+    pub(crate) fn is_known_member_of_group(&self, gid: u32) -> bool {
         if self.gid_known && self.gid == gid {
             return true;
         }

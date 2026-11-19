@@ -548,7 +548,7 @@ mod tests {
                 t::TVERSION,
                 Message::Rversion(Rversion {
                     msize: P9_MAX_MSIZE,
-                    version: P9String::new(ninep_proto::VERSION_9P2000L_ZEROFS_CI.to_vec()),
+                    version: P9String::new(ninep_proto::VERSION_9P2000L_ZEROFS_CI_UMASK.to_vec()),
                 }),
             ),
             (t::TATTACH, Message::Rattach(Rattach { qid })),

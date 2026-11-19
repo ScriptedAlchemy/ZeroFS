@@ -23,11 +23,12 @@ use fuser::{
 use ninep_client::{
     ClientError, NinePClient, ReaddirState, ReconnectTimeout, SetattrBuilder, SetattrTime, Target,
 };
+use ninep_proto::{
+    CREATE_UMASK_MASK, CREATE_UMASK_SHIFT, GETATTR_ALL, LockStatus, LockType, P9_LOCK_FLAGS_BLOCK,
+    P9_MAX_GROUPS, Stat, classify_fallocate_mode,
+};
 #[cfg(test)]
 use ninep_proto::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE};
-use ninep_proto::{
-    GETATTR_ALL, LockStatus, LockType, P9_LOCK_FLAGS_BLOCK, Stat, classify_fallocate_mode,
-};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -168,15 +169,106 @@ pub enum MountAccess {
 struct UserIdentity {
     uid: u32,
     gid: u32,
+    groups: Option<SupplementaryGroups>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct SupplementaryGroups {
+    ids: [u32; P9_MAX_GROUPS],
+    len: usize,
 }
 
 impl UserIdentity {
     fn from_request(req: &Request) -> Self {
+        let uid = req.uid();
+        let gid = req.gid();
         Self {
-            uid: req.uid(),
-            gid: req.gid(),
+            uid,
+            gid,
+            groups: supplementary_groups(req.pid(), uid, gid),
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn supplementary_groups(tid: u32, uid: u32, gid: u32) -> Option<SupplementaryGroups> {
+    use std::sync::OnceLock;
+    static OVERFLOW_GID: OnceLock<Option<u32>> = OnceLock::new();
+
+    if tid == 0 || uid == 0 {
+        return None;
+    }
+    let overflow_gid = (*OVERFLOW_GID.get_or_init(|| {
+        let status = std::fs::read_to_string("/proc/thread-self/status").ok()?;
+        let ns_pid = status_field(&status, "NSpid:")?
+            .trim()
+            .parse::<u32>()
+            .ok()?;
+        // A single namespace-relative ID confirms that /proc and FUSE use
+        // the mount process's PID namespace. An ancestor procfs can alias TIDs.
+        if ns_pid != unsafe { libc::gettid() } as u32 {
+            return None;
+        }
+        std::fs::read_to_string("/proc/sys/kernel/overflowgid")
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }))?;
+
+    // The kernel keeps a synchronous request's thread waiting once it delivers
+    // the request to userspace. Read its filesystem credentials before replying.
+    // Use the thread ID, since different threads can have different credentials.
+    let status = std::fs::read_to_string(format!("/proc/{tid}/status")).ok()?;
+    parse_supplementary_groups(&status, uid, gid, overflow_gid)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn status_field<'a>(status: &'a str, field: &str) -> Option<&'a str> {
+    status.lines().find_map(|line| line.strip_prefix(field))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_supplementary_groups(
+    status: &str,
+    uid: u32,
+    gid: u32,
+    overflow_gid: u32,
+) -> Option<SupplementaryGroups> {
+    let filesystem_id = |field| {
+        status_field(status, field)?
+            .split_ascii_whitespace()
+            .nth(3)?
+            .parse()
+            .ok()
+    };
+    if filesystem_id("Uid:") != Some(uid) || filesystem_id("Gid:") != Some(gid) {
+        return None;
+    }
+
+    let mut groups = SupplementaryGroups {
+        ids: [0; P9_MAX_GROUPS],
+        len: 0,
+    };
+    for group in status_field(status, "Groups:")?.split_ascii_whitespace() {
+        let group = group.parse::<u32>().ok()?;
+        // procfs substitutes this ID for unmapped groups. The group list is
+        // incomplete if any membership cannot be represented unambiguously.
+        if group == overflow_gid {
+            return None;
+        }
+        if group != gid && !groups.ids[..groups.len].contains(&group) {
+            *groups.ids.get_mut(groups.len)? = group;
+            groups.len += 1;
+        }
+    }
+    groups.ids[..groups.len].sort_unstable();
+    Some(groups)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn supplementary_groups(_tid: u32, _uid: u32, _gid: u32) -> Option<SupplementaryGroups> {
+    None
 }
 
 #[derive(Default)]
@@ -186,8 +278,8 @@ struct InodeEntry {
     /// Open prefetches remain usable only while this value is unchanged.
     content_generation: u64,
     /// One fid per filesystem identity that holds this inode. Every request acts
-    /// as its caller (v9fs `access=user` semantics), so a uid using a different
-    /// primary gid gets a distinct server-side fid.
+    /// as its caller (v9fs `access=user` semantics), so distinct filesystem
+    /// credentials get distinct server-side fids.
     fids: HashMap<UserIdentity, u32>,
     /// Open fids for this inode, mapped to the uid that opened them. Verified
     /// fsync checks every handle because `fsync(fd)` persists writes issued
@@ -268,6 +360,10 @@ fn name_too_long(name: &OsStr) -> bool {
 
 fn clamp_nsec(nsec: u64) -> u32 {
     nsec.min(999_999_999) as u32
+}
+
+fn create_mode(mode: u32, file_type: u32, umask: u32) -> u32 {
+    (mode & 0o7777) | file_type | ((umask & CREATE_UMASK_MASK) << CREATE_UMASK_SHIFT)
 }
 
 fn kind_from_mode(mode: u32) -> FileType {
@@ -396,12 +492,26 @@ async fn user_fid(
         // is stale.
         None => return Err(ClientError::Errno(libc::ESTALE as u32)),
     };
-    // FUSE exposes only the request's primary gid, not supplementary groups.
     let newfid = client.alloc_fid();
-    if let Err(e) = client
-        .rebind_with_primary_group(newfid, server_inode, identity.uid, identity.gid)
-        .await
-    {
+    let rebound = match identity.groups {
+        Some(groups) => {
+            client
+                .rebind_with_credentials(
+                    newfid,
+                    server_inode,
+                    identity.uid,
+                    identity.gid,
+                    &groups.ids[..groups.len],
+                )
+                .await
+        }
+        None => {
+            client
+                .rebind_with_primary_group(newfid, server_inode, identity.uid, identity.gid)
+                .await
+        }
+    };
+    if let Err(e) = rebound {
         client.free_fid(newfid);
         return Err(e);
     }
@@ -564,9 +674,9 @@ impl Filesystem for Fuse9P {
         // Have the kernel evaluate the server's POSIX ACLs in its permission
         // checks. Without this, `default_permissions` checks mode bits only,
         // so a named-user or named-group ACL grant would be denied locally.
-        // The server stores and inherits ACLs and keeps the mode in step; the
-        // kernel still applies the umask, so files created under a default
-        // ACL may get a narrower mode than on a local filesystem.
+        // The server applies either the default ACL or the umask, under the
+        // parent lock. Request the original mode so both inputs reach it.
+        let _ = config.add_capabilities(InitFlags::FUSE_DONT_MASK);
         if let Err(unsupported) = config.add_capabilities(InitFlags::FUSE_POSIX_ACL) {
             debug!("kernel does not support FUSE_POSIX_ACL ({unsupported:?}); mode bits only");
         }
@@ -817,7 +927,7 @@ impl Filesystem for Fuse9P {
         let gid = identity.gid;
         let name = name.as_bytes().to_vec();
         let parent = parent.0;
-        let mode = (mode & 0o7777 & !umask) | libc::S_IFDIR;
+        let mode = create_mode(mode, libc::S_IFDIR, umask);
         self.rt.spawn(async move {
             let parent_fid = match user_fid(&client, &inodes, identity, parent).await {
                 Ok(f) => f,
@@ -858,7 +968,7 @@ impl Filesystem for Fuse9P {
         let gid = identity.gid;
         let name = name.as_bytes().to_vec();
         let parent = parent.0;
-        let mode = (mode & 0o7777 & !umask) | (mode & libc::S_IFMT);
+        let mode = create_mode(mode, mode & libc::S_IFMT, umask);
         // FUSE delivers rdev pre-encoded with the kernel's new_encode_dev(); split
         // it into major/minor with new_decode_dev() (matching what v9fs sends as
         // MAJOR()/MINOR()). The previous (rdev >> 8 / rdev & 0xff) split only
@@ -1353,7 +1463,7 @@ impl Filesystem for Fuse9P {
         let gid = identity.gid;
         let name = name.as_bytes().to_vec();
         let parent = parent.0;
-        let mode = (mode & 0o7777 & !umask) | libc::S_IFREG;
+        let mode = create_mode(mode, libc::S_IFREG, umask);
         // Strip O_APPEND (append is kernel-managed via the write offset; see
         // open_inner) and, as there, upgrade O_WRONLY to O_RDWR under writeback
         // so read-modify-write can read through the backing fid.
@@ -2203,6 +2313,27 @@ mod consistency_tests {
     }
 
     #[test]
+    fn proc_groups_require_matching_filesystem_ids_and_a_complete_list() {
+        let status =
+            "Uid:\t2100 2100 2100 1000\nGid:\t2200 2200 2200 2000\nGroups:\t4000 2000 3000 3000\n";
+        let groups = parse_supplementary_groups(status, 1000, 2000, 65534).unwrap();
+        assert_eq!(&groups.ids[..groups.len], &[3000, 4000]);
+        assert!(parse_supplementary_groups(status, 2100, 2000, 65534).is_none());
+        assert!(parse_supplementary_groups(status, 1000, 2200, 65534).is_none());
+        assert!(parse_supplementary_groups(status, 1000, 2000, 3000).is_none());
+        assert!(parse_supplementary_groups(status, 1000, 2000, 2000).is_none());
+
+        let ids = status.split_once("Groups:").unwrap().0;
+        assert!(parse_supplementary_groups(ids, 1000, 2000, 65534).is_none());
+        let group_list = (3000..=3000 + P9_MAX_GROUPS)
+            .map(|gid| gid.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let too_many = format!("{ids}Groups:\t{group_list}");
+        assert!(parse_supplementary_groups(&too_many, 1000, 2000, 65534).is_none());
+    }
+
+    #[test]
     fn open_flags_precedence() {
         // Default: let the kernel cache normally.
         assert_eq!(handle_open_flags(false, false), FopenFlags::empty());
@@ -2284,6 +2415,7 @@ mod consistency_tests {
         let owner = UserIdentity {
             uid: 1000,
             gid: 2000,
+            groups: None,
         };
         entry.handles.insert(42, owner.uid);
         inodes.insert(7, entry);
@@ -2301,6 +2433,7 @@ mod consistency_tests {
                 UserIdentity {
                     uid: 1000,
                     gid: 2001,
+                    groups: None,
                 },
                 handle
             ),
@@ -2313,6 +2446,7 @@ mod consistency_tests {
                 UserIdentity {
                     uid: 1001,
                     gid: 2000,
+                    groups: None,
                 },
                 handle
             ),
@@ -2357,14 +2491,17 @@ mod consistency_tests {
         let first = UserIdentity {
             uid: 1000,
             gid: 2000,
+            groups: None,
         };
         let other_gid = UserIdentity {
             uid: 1000,
             gid: 2001,
+            groups: None,
         };
         let other_uid = UserIdentity {
             uid: 1001,
             gid: 2000,
+            groups: None,
         };
         assert_eq!(register_entry(&inodes, first, Some(10), &stat).1, None);
         assert_eq!(register_entry(&inodes, first, Some(11), &stat).1, Some(11));

@@ -20,6 +20,7 @@ import json
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -136,6 +137,8 @@ def acl_suite(client, root):
         "named user read": (can(NAMED, [], "read", f), grant),
         "named user write": (can(NAMED, [], "write", f), grant),
         "named group read": (can(STRANGER, [TEAM], "read", f), grant),
+        "supplementary group read": (can(STRANGER, [STRANGER, TEAM], "read", f), grant),
+        "same uid and gid without supplementary group denied": (can(STRANGER, [STRANGER], "read", f), False),
         "named group write": (can(STRANGER, [TEAM], "write", f), False),
         "owning group read": (can(STRANGER, [OWNER], "read", f), False),
         "other read": (can(STRANGER, [], "read", f), False),
@@ -168,26 +171,76 @@ def acl_suite(client, root):
     cacl = getfacl(child)
     emit("inherited_file", client=client, acl=cacl, mode=oct(os.stat(child).st_mode & 0o7777))
     check(f"{client}: file inherits named entry", f"user:{NAMED}:rwx" in cacl, got=cacl)
+    check(f"{client}: inherited file mask keeps write",
+          f"mask::{'rw-' if grant else 'r--'}" in cacl, got=cacl)
     check(f"{client}: named user creates via access ACL",
           can(NAMED, [], "create", os.path.join(d, "by-named")) == grant)
     sub = os.path.join(d, "sub")
     owner("sh", "-c", 'umask 022; mkdir "$1"', "sh", sub)
     check(f"{client}: directory inherits default", getfacl(sub, default=True) == dacl,
           got=getfacl(sub, default=True))
-    # The kernel applied umask 022 before the server saw the mode, so the
-    # inherited mask is r-x; a local Linux filesystem would ignore the umask
-    # here. Documented narrowing: the named user cannot create in `sub`.
     sacl = getfacl(sub)
+    mask = "rwx" if grant else "r-x"
     emit("inherited_directory", client=client, acl=sacl, mode=oct(os.stat(sub).st_mode & 0o7777))
-    check(f"{client}: inherited directory mask narrowed by umask",
-          sacl == f"user::rwx,user:{NAMED}:rwx,group::r-x,mask::r-x,other::---", got=sacl)
-    check(f"{client}: named user write narrowed by umask", not can(NAMED, [], "create", os.path.join(sub, "n")))
-    owner("setfacl", "-m", "m::rwx", sub)
-    check(f"{client}: named user creates after mask widened",
+    check(f"{client}: inherited directory mask",
+          sacl == f"user::rwx,user:{NAMED}:rwx,group::r-x,mask::{mask},other::---", got=sacl)
+    check(f"{client}: named user creates through inherited ACL",
           can(NAMED, [], "create", os.path.join(sub, "n")) == grant)
     check(f"{client}: stranger cannot create", not can(STRANGER, [], "create", os.path.join(sub, "x")))
     check(f"{client}: stranger cannot list", not can(STRANGER, [], "list", sub))
     return f, d
+
+
+def fuse_create_and_sgid(root):
+    base = os.path.join(root, "creation-modes")
+    os.mkdir(base, 0o755)
+    plain, inherited = [os.path.join(base, name) for name in ("plain", "inherited")]
+    for parent in (plain, inherited):
+        os.mkdir(parent, 0o755)
+        os.chown(parent, OWNER, TEAM)
+        os.chmod(parent, 0o2755)
+    subprocess.run(["setfacl", "-d", "-m", "u::rwx,g::rwx,o::---", inherited], check=True)
+
+    # Use raw syscall modes so the test only measures kernel and filesystem masking.
+    create = """
+import os, stat, sys
+os.chdir(sys.argv[1])
+os.umask(0o777)
+open('open', 'xb').close()
+os.mkdir('mkdir', 0o770)
+os.mknod('regular', stat.S_IFREG | 0o660)
+os.mkfifo('fifo', 0o660)
+"""
+    for parent, expected in ((plain, [0o000, 0o2000, 0o000, 0o000]),
+                             (inherited, [0o660, 0o2770, 0o660, 0o660])):
+        result = as_user(OWNER, [OWNER], ["python3", "-c", create, parent])
+        check(f"fuse: create and mknod under {os.path.basename(parent)}",
+              result.returncode == 0, stderr=result.stderr.strip())
+        if result.returncode:
+            continue
+        for name, kind, mode in zip(("open", "mkdir", "regular", "fifo"),
+                                    (stat.S_IFREG, stat.S_IFDIR, stat.S_IFREG, stat.S_IFIFO),
+                                    expected):
+            attrs = os.stat(os.path.join(parent, name))
+            check(f"fuse: {os.path.basename(parent)}/{name} type, mode and inherited gid",
+                  (stat.S_IFMT(attrs.st_mode), stat.S_IMODE(attrs.st_mode), attrs.st_gid)
+                  == (kind, mode, TEAM), mode=oct(attrs.st_mode), gid=attrs.st_gid)
+
+    for directory in (False, True):
+        path = os.path.join(base, "sgid-dir" if directory else "sgid-file")
+        if directory:
+            os.mkdir(path)
+        else:
+            open(path, "wb").close()
+        os.chown(path, OWNER, TEAM)
+        # The same uid and primary gid must not reuse a fid bound with another
+        # request's supplementary groups.
+        for groups, want in (([OWNER, TEAM], 0o2770), ([OWNER], 0o770)):
+            os.chmod(path, 0o2750)
+            result = as_user(OWNER, groups, ["setfacl", "-m", "u::rwx,g::rwx,o::---", path])
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+            check(f"fuse: {os.path.basename(path)} ACL update with groups {groups}",
+                  result.returncode == 0 and mode == want, mode=oct(mode), stderr=result.stderr.strip())
 
 
 def kernel_9p_acl_support():
@@ -391,6 +444,7 @@ def main():
             # VFS refuses ACL calls without it. Assert that refusal instead.
             kernel_9p_acl_refusal(fixture.kmnt, support)
         saved = {client: acl_suite(client, mnt) for client, mnt in acl_clients}
+        fuse_create_and_sgid(fixture.fmnt)
         nfs4_write("fuse", fixture.fmnt, expect_ok=True)
         nfs4_write("kernel-9p", fixture.kmnt, expect_ok=False)
         cross_client(fixture.kmnt, fixture.fmnt, os.path.relpath(saved["fuse"][0], fixture.fmnt))

@@ -35,7 +35,7 @@ async fn create_kind(
     match kind {
         0 => {
             handler
-                .create_child(&handler.get_fid(1)?, &name.data, 0o600, gid, [0; 16])
+                .create_child(&handler.get_fid(1)?, &name.data, 0o600, gid, [0; 16], 0)
                 .await
         }
         1 => {
@@ -48,6 +48,7 @@ async fn create_kind(
                         gid,
                     },
                     [0; 16],
+                    false,
                 )
                 .await
         }
@@ -76,6 +77,7 @@ async fn create_kind(
                         gid,
                     },
                     [0; 16],
+                    false,
                 )
                 .await
         }

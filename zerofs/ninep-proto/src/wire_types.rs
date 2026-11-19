@@ -10,6 +10,11 @@ pub const VERSION_9P2000L: &[u8] = b"9P2000.L";
 pub const VERSION_9P2000L_ZEROFS: &[u8] = b"9P2000.L.Z";
 /// Insensitive exports use a distinct dialect so byte-exact clients refuse them.
 pub const VERSION_9P2000L_ZEROFS_CI: &[u8] = b"9P2000.L.Z.CI";
+/// These dialects carry the client's umask in bits 16–24 of private create modes.
+pub const VERSION_9P2000L_ZEROFS_UMASK: &[u8] = b"9P2000.L.Z.UMASK";
+pub const VERSION_9P2000L_ZEROFS_CI_UMASK: &[u8] = b"9P2000.L.Z.CI.UMASK";
+pub const CREATE_UMASK_SHIFT: u32 = 16;
+pub const CREATE_UMASK_MASK: u32 = 0o777;
 
 /// The native kernel client supports only byte-exact directory names.
 pub fn kernel_dialect_supported(version: &[u8]) -> bool {
