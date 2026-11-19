@@ -180,7 +180,8 @@ impl ZeroFS {
             store_profile
                 .decoded_extent_cache_bytes
                 .unwrap_or(crate::fs::store::extent::DEFAULT_DECODED_EXTENT_CACHE_BYTES),
-        );
+        )
+        .with_max_segment_append_bytes(store_profile.max_segment_append_bytes);
         // Seed the monitor's segment footprint gauges from the existing on-store
         // segments before any write; from here they are maintained incrementally
         // off the commit path, so the panel never scans to stay current.

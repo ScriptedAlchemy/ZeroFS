@@ -182,20 +182,11 @@ impl RawStore {
         })
     }
 
-    /// Reopen a provisioned device and replay its durable log.
-    ///
-    /// The label must record exactly `expected` and `device_size`. Anything
-    /// appended after the last durable checkpoint is ignored and will be
-    /// overwritten by later appends. Open never writes to the device.
-    pub fn open(file: File, device_size: u64, expected: Identity) -> Result<Self> {
-        Self::open_region(Region::whole(file, device_size)?, expected)
-    }
-
-    pub(crate) fn open_region(file: Region, expected: Identity) -> Result<Self> {
+    pub(crate) fn binding(file: &Region, expected: Identity) -> Result<(Label, Option<u64>)> {
         let device_size = file.len;
         expected.validate()?;
         check_device_size(device_size).map_err(Error::InvalidGeometry)?;
-        let (label, stale_slot) = select_label(read_slots(&file)?)?;
+        let (label, stale_slot) = select_label(read_slots(file)?)?;
         if label.identity != expected {
             return Err(Error::IdentityMismatch {
                 expected,
@@ -208,6 +199,21 @@ impl RawStore {
                 supplied: device_size,
             });
         }
+
+        Ok((label, stale_slot))
+    }
+
+    /// Reopen a provisioned device and replay its durable log.
+    ///
+    /// The label must record exactly `expected` and `device_size`. Anything
+    /// appended after the last durable checkpoint is ignored and will be
+    /// overwritten by later appends. Open never writes to the device.
+    pub fn open(file: File, device_size: u64, expected: Identity) -> Result<Self> {
+        Self::open_region(Region::whole(file, device_size)?, expected)
+    }
+
+    pub(crate) fn open_region(file: Region, expected: Identity) -> Result<Self> {
+        let (label, stale_slot) = Self::binding(&file, expected)?;
 
         let mut index = HashMap::new();
         let mut offset = LOG_START;

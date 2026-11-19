@@ -8,7 +8,37 @@ The engine selects `raw-device-p3-nas-fit-v1` through `[runtime].profile`. Its p
 | `hdd6` | 6,001,175,126,016 | WF203KQ8 | ATA by-id and WWN 5000c500ac8aed0a |
 | `hdd18` | 18,000,207,937,536 | 3WH7H3BJ | ATA by-id and WWN 5000cca284d17ed1 |
 
-The engine requires host PID namespace visibility, readable original host sysfs, mount and swap information, trusted udev records, by-id links, libblkid and write access for its exclusive block open. It rejects a partition, a device with partitions, holders, slaves, active mounts or swap, conflicting identities, a protected alias, or a recognized foreign signature. It checks device number, node identity, disk sequence, sector size and capacity across lookup and exclusive open. An uncooperative privileged process with ordinary raw write access can still damage the media. The legacy Storage disk ZL213G03 and the boot device are protected. App commissioning requires its own authorization and a compatible host-claim arrangement. The parent's 19 November preflight reported three unused whole devices and an SSH account without block read permission.
+The trusted local claim process requires initial host PID namespace visibility, readable original host sysfs, mount and swap information, trusted udev records, by-id links, libblkid and write access for its exclusive block open. It rejects a partition, a device with partitions, holders, slaves, active mounts or swap, conflicting identities, a protected alias, or a recognized foreign signature. It checks device number, node identity, disk sequence, sector size and capacity across lookup and exclusive open. An uncooperative privileged process with ordinary raw write access can still damage the media. The legacy Storage disk ZL213G03 and the boot device are protected. Physical commissioning belongs to the app owner. The parent's 19 November preflight reported three unused whole devices and an SSH account without block read permission.
+
+## Isolated engine and claim service
+
+The package interface takes one absolute pathname. The trusted local process runs
+`zerofs-raw-device physical serve-claims SOCKET 20001 20001`. Supply a canonical,
+dedicated root-owned directory whose ancestors exclude group and other writes.
+The broker owns its socket as root:20001 with mode 0660. Bind the directory
+read-only into the isolated engine so restarting the broker makes its replacement
+listener visible there. The broker uses only a local Unix seqpacket listener. Its
+trusted namespace must support the host inventory checks above, reading the peer's
+namespace metadata in procfs, and Linux `SO_PEERPIDFD`.
+
+Run the engine as 20001:20001 with no supplementary groups, its own PID and mount
+namespaces, the host user namespace, and private procfs. Give it its finite cgroup,
+group-readable config, and its own writable runtime and socket directories. Set
+`ZEROFS_RAW_CLAIM_SOCKET` to the socket path **inside that namespace** for
+`pool init`, stopped `pool verify-raw`, and `run`. The engine needs no host-root
+bind mount, host PID access, device node, udev database, or host sysfs inventory.
+`memory-status` reads the configuration and cgroup without opening a device.
+
+Each request names one of the three fixed designations and the configured pool and
+member UUIDs. The broker authenticates the connecting process and checks its namespaces
+and the original labels on the exclusively held whole disk. It transfers that open
+file description with `SCM_RIGHTS`. The engine authenticates the broker and checks
+the received descriptor's block type, access, device number, disk sequence and exact
+geometry before opening its role. Missing transport, a partial grant or a failed
+binding check aborts open. Once a grant completes, the engine owns its duplicate
+until the last reference closes. A broker outage prevents new claims and preserves
+existing exclusive opens. Device provisioning is available only as a separate trusted
+local command. Logical initialization still requires the explicit `pool init` command.
 
 ## Provisioning and reopen interfaces
 

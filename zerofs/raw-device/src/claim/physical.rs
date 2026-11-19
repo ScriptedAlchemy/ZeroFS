@@ -40,6 +40,10 @@ impl FromStr for PhysicalRole {
 }
 
 impl Claim {
+    pub(super) fn verify_host_inventory_access() -> io::Result<()> {
+        Machine::host().map(drop)
+    }
+
     pub fn physical(role: PhysicalRole) -> io::Result<Self> {
         let host = Machine::host()?;
         let disk = TrialDisk::for_role(role);
@@ -74,24 +78,41 @@ impl Claim {
 
 impl Snapshot {
     fn verify_fd(&self, device: &File, disk: &TrialDisk) -> io::Result<()> {
-        // Linux BLKGETDISKSEQ, BLKGETSIZE64, BLKSSZGET and BLKROGET.
-        let mut diskseq = 0u64;
-        let mut bytes = 0u64;
-        let mut logical_block_size = 0i32;
-        let mut read_only = -1i32;
-        checked(unsafe { libc::ioctl(device.as_raw_fd(), 0x8008_1280u32 as _, &mut diskseq) })?;
-        #[cfg(target_pointer_width = "64")]
-        checked(unsafe { libc::ioctl(device.as_raw_fd(), 0x8008_1272u32 as _, &mut bytes) })?;
-        #[cfg(target_pointer_width = "32")]
-        checked(unsafe { libc::ioctl(device.as_raw_fd(), 0x8004_1272u32 as _, &mut bytes) })?;
-        checked(unsafe { libc::ioctl(device.as_raw_fd(), 0x1268, &mut logical_block_size) })?;
-        checked(unsafe { libc::ioctl(device.as_raw_fd(), 0x125e, &mut read_only) })?;
+        let [rdev, sequence, _] = held_geometry(device, disk.bytes)?;
         require(
-            diskseq == self.diskseq
-                && bytes == disk.bytes
-                && logical_block_size == 512
-                && read_only == 0,
-            "held physical device has unexpected disk sequence, geometry, or write access",
+            rdev == self.node_identity.2 && sequence == self.diskseq,
+            "held physical device sequence or identity changed",
         )
     }
+}
+
+pub(super) fn held_geometry(device: &File, expected_bytes: u64) -> io::Result<[u64; 3]> {
+    let meta = device.metadata()?;
+    require(
+        meta.file_type().is_block_device(),
+        "claim descriptor must be a block device",
+    )?;
+    // Linux BLKGETDISKSEQ, BLKGETSIZE64, BLKSSZGET and BLKROGET.
+    let mut diskseq = 0u64;
+    let mut bytes = 0u64;
+    let mut logical_block_size = 0i32;
+    let mut read_only = -1i32;
+    checked(unsafe { libc::ioctl(device.as_raw_fd(), 0x8008_1280u32 as _, &mut diskseq) })?;
+    #[cfg(target_pointer_width = "64")]
+    checked(unsafe { libc::ioctl(device.as_raw_fd(), 0x8008_1272u32 as _, &mut bytes) })?;
+    #[cfg(target_pointer_width = "32")]
+    checked(unsafe { libc::ioctl(device.as_raw_fd(), 0x8004_1272u32 as _, &mut bytes) })?;
+    checked(unsafe { libc::ioctl(device.as_raw_fd(), 0x1268, &mut logical_block_size) })?;
+    checked(unsafe { libc::ioctl(device.as_raw_fd(), 0x125e, &mut read_only) })?;
+    let flags = unsafe { libc::fcntl(device.as_raw_fd(), libc::F_GETFL) };
+    checked(flags)?;
+    require(
+        diskseq > 0
+            && bytes == expected_bytes
+            && logical_block_size == 512
+            && read_only == 0
+            && flags & libc::O_ACCMODE == libc::O_RDWR,
+        "held physical device has unexpected geometry or write access",
+    )?;
+    Ok([meta.rdev(), diskseq, bytes])
 }

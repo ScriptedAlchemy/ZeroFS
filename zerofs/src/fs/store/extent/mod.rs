@@ -224,6 +224,7 @@ pub struct ExtentStore {
     /// Tests and the DST harness lower it at construction time so seal paths do
     /// not allocate 256 MiB.
     seal_threshold: usize,
+    max_append_extents: usize,
     /// Maximum segment objects publishing concurrently. SFTP uses its bounded
     /// write concurrency so each seal can own an independent remote file.
     max_inflight_seals: usize,
@@ -358,6 +359,7 @@ impl ExtentStore {
             read_ahead,
             prefetch_sem: Arc::new(Semaphore::new(READ_AHEAD_MAX_CONCURRENT)),
             seal_threshold,
+            max_append_extents: usize::MAX,
             max_inflight_seals,
             coordinator: Arc::new(std::sync::OnceLock::new()),
             segment_gc_stats: Arc::new(SegmentGcStats::default()),
@@ -417,6 +419,11 @@ impl ExtentStore {
         if !txn.has_extent_ref_guard() {
             txn.hold_extent_ref_guard(self.new_extent_ref_guard().await);
         }
+    }
+
+    pub(crate) fn with_max_segment_append_bytes(mut self, bytes: Option<usize>) -> Self {
+        self.max_append_extents = bytes.map_or(usize::MAX, |n| (n / EXTENT_SIZE).max(1));
+        self
     }
 
     /// One-time footprint scan: sums the segcount rows into the aggregate the
