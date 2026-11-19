@@ -439,7 +439,7 @@ def verify_missing_journal(configuration, binding, empty_headers):
         for mode in (("pool", "verify-raw"), ("run",)):
             result = subprocess.run([ZEROFS, *mode, "-c", configuration], capture_output=True, timeout=30)
             output = (result.stdout + result.stderr).decode(errors="replace")
-            assert result.returncode and "original raw journal is missing" in output, (mode, output)
+            assert result.returncode and "original raw P3 journal is missing" in output, (mode, output)
             assert not (configuration.parent / "ninep.sock").exists()
             assert not (configuration.parent / "rpc.sock").exists()
             record("missing_original_journal_refused", command=mode, metrics_endpoint=address, output=output)
