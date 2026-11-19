@@ -2406,8 +2406,7 @@ impl Settings {
             == Some(RuntimeProfile::RawDeviceP3NasFit)
     }
 
-    /// Data-plane tuning for the configured backend. SFTP publishes its own
-    /// profile; every other backend runs on the defaults.
+    /// Resolve segment tuning from the runtime profile and storage backends.
     pub(crate) fn store_profile(&self) -> Result<StoreProfile> {
         if self.raw_device_p3_candidate() || self.raw_device_p3_nas_fit() {
             return Ok(StoreProfile {

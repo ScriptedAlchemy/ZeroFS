@@ -124,11 +124,10 @@ impl ZeroFS {
                 let (now_sec, now_nsec) = get_current_time();
 
                 let new_gid = new_entry_gid(dir, &attr.gid, creds);
-                let mode = match attr.mode {
+                let mut final_mode = match attr.mode {
                     SetMode::Set(mode) => validate_mode(mode),
                     SetMode::NoChange => 0o666,
                 };
-                let mut final_mode = mode;
                 let inherited_acls = self
                     .inherited_acls(dirid, false, &mut final_mode, umask, |mode| {
                         strip_sgid_unless_member(dir, mode, new_gid, creds)
@@ -363,7 +362,7 @@ impl ZeroFS {
                     .allocate_cookie(dirid, &mut txn)
                     .await?;
 
-                let new_dir_inode_enum = Inode::Directory(new_dir_inode.clone());
+                let new_dir_inode_enum = Inode::Directory(new_dir_inode);
                 let attrs: FileAttributes = InodeWithId {
                     inode: &new_dir_inode_enum,
                     id: new_dir_id,
@@ -434,9 +433,7 @@ impl ZeroFS {
                 self.tracer.emit(
                     &self.inode_store,
                     new_dir_id,
-                    FileOperation::Mkdir {
-                        mode: new_dir_inode.mode,
-                    },
+                    FileOperation::Mkdir { mode: new_mode },
                 );
 
                 Ok((new_dir_id, attrs))
@@ -524,18 +521,18 @@ impl ZeroFS {
                 let (now_sec, now_nsec) = get_current_time();
 
                 let base_mode = match ftype {
-                    FileType::Fifo => 0o666,
-                    FileType::CharDevice | FileType::BlockDevice => 0o666,
-                    FileType::Socket => 0o666,
+                    FileType::Fifo
+                    | FileType::CharDevice
+                    | FileType::BlockDevice
+                    | FileType::Socket => 0o666,
                     _ => return Err(FsError::InvalidArgument),
                 };
 
                 let new_gid = new_entry_gid(dir, &attr.gid, creds);
-                let mode = match attr.mode {
+                let mut final_mode = match attr.mode {
                     SetMode::Set(mode) => validate_mode(mode),
                     SetMode::NoChange => base_mode,
                 };
-                let mut final_mode = mode;
                 let inherited_acls = self
                     .inherited_acls(dirid, false, &mut final_mode, umask, |mode| {
                         strip_sgid_unless_member(dir, mode, new_gid, creds)

@@ -630,7 +630,8 @@ impl NinePHandler {
         }
     }
 
-    /// Publish an opened compound-operation fid under the session lock.
+    /// Publish the exact fid snapshot that passed authorization, even if an
+    /// in-place walk replaced the slot while authorization awaited the inode lock.
     fn install_open_fid(
         &self,
         state: &mut SessionState,
@@ -642,6 +643,7 @@ impl NinePHandler {
         let slot = match state.fids.entry(newfid) {
             Entry::Vacant(entry) => entry.insert(FidSlot::unopened(fid)),
             Entry::Occupied(_) if newfid != replace_fid => return Err(P9Error::FidInUse),
+            // A concurrent xattrcreate owns this slot's staged value and inode pin.
             Entry::Occupied(entry) if entry.get().xattr.is_some() => return Err(P9Error::BadFid),
             Entry::Occupied(entry) if entry.get().fid.opened => {
                 return Err(P9Error::FidAlreadyOpen);
@@ -1888,32 +1890,14 @@ impl NinePHandler {
                 .map_err(|error| Self::map_replay_open_error(replay_reopen, error))?;
             let qid = inode_to_qid(&inode, inode_id);
             let mut state = self.session_for_update()?;
-            match state.fids.get_mut(&tl.fid) {
-                Some(slot) => {
-                    // A concurrent walk and xattrcreate may have converted
-                    // this number while the inode lock was awaited. Never
-                    // attach an ordinary inode to that staged attribute.
-                    if slot.xattr.is_some() {
-                        return Err(P9Error::BadFid);
-                    }
-                    // Publish the exact fid snapshot whose inode and
-                    // credentials were authorized. A racing in-place walk may
-                    // have replaced the table entry while the inode lock was
-                    // awaited; mutating that replacement would attach A's
-                    // authorization and handle to B's identity.
-                    if slot.fid.opened {
-                        return Err(P9Error::FidAlreadyOpen);
-                    }
-                    fid_entry.qid = qid;
-                    fid_entry.opened = true;
-                    fid_entry.mode = Some(tl.flags);
-                    slot.fid = fid_entry;
-                    slot.replay_reopen = false;
-                    slot.handle = Some(self.filesystem.new_open_handle(inode_id));
-                    slot.directory_pin = None;
-                }
-                None => return Err(P9Error::BadFid),
+            // Unlike a compound open, Tlopen may not recreate a clunked fid.
+            if !state.fids.contains_key(&tl.fid) {
+                return Err(P9Error::BadFid);
             }
+            fid_entry.qid = qid;
+            fid_entry.opened = true;
+            fid_entry.mode = Some(tl.flags);
+            self.install_open_fid(&mut state, tl.fid, tl.fid, fid_entry)?;
             qid
         };
 

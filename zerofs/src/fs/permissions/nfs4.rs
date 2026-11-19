@@ -478,17 +478,17 @@ fn verify(
                 &mut scratch,
             )?;
             let creds = caller.credentials(unrelated_gid);
-            let mut posix = 0;
-            for bit in [4u16, 2, 1] {
-                if acl.permits_bits(scenario.owner, scenario.group, &creds, bit) {
-                    posix |= bit;
-                }
-            }
             // Combined requests must agree too: POSIX needs one entry to
             // grant all requested bits.
             for want in 1u16..=7 {
                 let nfs4_grants = nfs4 & want == want;
                 if acl.permits_bits(scenario.owner, scenario.group, &creds, want) != nfs4_grants {
+                    let mut posix = 0;
+                    for bit in [4u16, 2, 1] {
+                        if acl.permits_bits(scenario.owner, scenario.group, &creds, bit) {
+                            posix |= bit;
+                        }
+                    }
                     return Err(Refusal::DecisionMismatch {
                         caller: format!("uid {uid} groups {:?}", caller.groups),
                         nfs4,
@@ -514,13 +514,14 @@ pub(crate) fn map_nfs4_acl(
     let named = Principals::of(&aces)?;
     let mut reports = BTreeSet::new();
 
-    let (effective, inheritable): (Vec<Ace>, Vec<Ace>) = if is_directory {
-        let effective = aces
-            .iter()
-            .filter(|a| a.flags & INHERIT_ONLY == 0)
-            .copied()
-            .collect();
-        let mut inheritable = Vec::new();
+    let effective: Vec<Ace> = aces
+        .iter()
+        .filter(|a| a.flags & INHERIT_ONLY == 0)
+        .copied()
+        .collect();
+    let mut inheritable = Vec::new();
+    // Inheritance flags have no effect on a file.
+    if is_directory {
         for ace in &aces {
             let inherit = ace.flags & (FILE_INHERIT | DIRECTORY_INHERIT);
             if inherit == 0 {
@@ -537,18 +538,7 @@ pub(crate) fn map_nfs4_acl(
                 ..*ace
             });
         }
-        (effective, inheritable)
-    } else {
-        // Inheritance flags have no effect on a file; inherit-only entries
-        // never apply to it.
-        (
-            aces.iter()
-                .filter(|a| a.flags & INHERIT_ONLY == 0)
-                .copied()
-                .collect(),
-            Vec::new(),
-        )
-    };
+    }
 
     let all_ids: Vec<u32> = [&named.users[..], &named.groups[..], &[owner, group][..]].concat();
     // Each ACL names only the principals its own entries mention.

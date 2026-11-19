@@ -50,14 +50,8 @@ impl P3Layout {
         pool: [u8; 16],
         member: [u8; 16],
     ) -> Result<()> {
-        let mut offset = 0;
-        for (len, role) in self.lengths.into_iter().zip(ROLES) {
-            let identity = Identity {
-                pool_uuid: pool,
-                member_uuid: member,
-                role,
-            };
-            if matches!(role, Role::Journal | Role::Catalog) {
+        for (offset, len, identity) in self.bindings(pool, member) {
+            if matches!(identity.role, Role::Journal | Role::Catalog) {
                 crate::journal_region::TransactionRegion::open(
                     file.try_clone()?,
                     self.device_len,
@@ -71,7 +65,6 @@ impl P3Layout {
                     identity,
                 )?;
             }
-            offset += len;
         }
         Ok(())
     }
@@ -121,14 +114,8 @@ impl P3Layout {
     pub fn provision_v2(&self, file: File, pool: [u8; 16], device: [u8; 16]) -> Result<()> {
         let whole = Region::whole(file.try_clone()?, self.device_len)?;
         crate::store::require_blank(&whole)?;
-        let mut offset = 0;
-        for (len, role) in self.lengths.into_iter().zip(ROLES) {
-            let id = Identity {
-                pool_uuid: pool,
-                member_uuid: device,
-                role,
-            };
-            if matches!(role, Role::Journal | Role::Catalog) {
+        for (offset, len, id) in self.bindings(pool, device) {
+            if matches!(id.role, Role::Journal | Role::Catalog) {
                 crate::journal_region::TransactionRegion::provision(
                     file.try_clone()?,
                     self.device_len,
@@ -142,23 +129,16 @@ impl P3Layout {
                     id,
                 )?;
             }
-            offset += len;
         }
         Ok(())
     }
 
     pub fn open_v2(&self, file: File, pool: [u8; 16], device: [u8; 16]) -> Result<P3v2> {
         Region::whole(file.try_clone()?, self.device_len)?;
-        let mut offset = 0;
         let mut transactional = Vec::with_capacity(2);
         let mut objects = Vec::with_capacity(4);
-        for (len, role) in self.lengths.into_iter().zip(ROLES) {
-            let id = Identity {
-                pool_uuid: pool,
-                member_uuid: device,
-                role,
-            };
-            if matches!(role, Role::Journal | Role::Catalog) {
+        for (offset, len, id) in self.bindings(pool, device) {
+            if matches!(id.role, Role::Journal | Role::Catalog) {
                 transactional.push(crate::journal_region::TransactionRegion::open(
                     file.try_clone()?,
                     self.device_len,
@@ -172,7 +152,6 @@ impl P3Layout {
                     id,
                 )?);
             }
-            offset += len;
         }
         let [journal, catalog] = transactional
             .try_into()
@@ -196,21 +175,33 @@ impl P3Layout {
         pool_uuid: [u8; 16],
         member_uuid: [u8; 16],
     ) -> Result<Vec<(Region, Identity)>> {
+        self.bindings(pool_uuid, member_uuid)
+            .map(|(offset, len, identity)| {
+                let region = Region::new(file.try_clone()?, self.device_len, offset, len)?;
+                Ok((region, identity))
+            })
+            .collect()
+    }
+
+    fn bindings(
+        &self,
+        pool_uuid: [u8; 16],
+        member_uuid: [u8; 16],
+    ) -> impl Iterator<Item = (u64, u64, Identity)> {
         let mut offset = 0;
-        let mut result = Vec::with_capacity(ROLES.len());
-        for (n, role) in self.lengths.into_iter().zip(ROLES) {
-            let region = Region::new(file.try_clone()?, self.device_len, offset, n)?;
-            result.push((
-                region,
+        self.lengths.into_iter().zip(ROLES).map(move |(len, role)| {
+            let start = offset;
+            offset += len;
+            (
+                start,
+                len,
                 Identity {
                     pool_uuid,
                     member_uuid,
                     role,
                 },
-            ));
-            offset += n;
-        }
-        Ok(result)
+            )
+        })
     }
 }
 

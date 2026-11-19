@@ -12,6 +12,18 @@ struct XattrFid<'a> {
     admission: AdmissionPermit,
 }
 
+impl XattrFid<'_> {
+    async fn clunk(&mut self) -> ClientResult<()> {
+        let result = NinePClient::xattr_rpc(self, Message::Tclunk(Tclunk { fid: self.fid })).await;
+        self.settled = matches!(&result, Ok(Message::Rclunk(_)) | Err(ClientError::Errno(_)));
+        match result {
+            Ok(Message::Rclunk(_)) => Ok(()),
+            Err(error) => Err(error),
+            _ => Err(ClientError::Unexpected("xattr clunk")),
+        }
+    }
+}
+
 impl Drop for XattrFid<'_> {
     fn drop(&mut self) {
         if !self.settled {
@@ -131,16 +143,11 @@ impl NinePClient {
         if matches!(result, Err(ClientError::Disconnected)) {
             return result;
         }
-        let clunk = Self::xattr_rpc(&attr, Message::Tclunk(Tclunk { fid: attr.fid })).await;
-        attr.settled = matches!(&clunk, Ok(Message::Rclunk(_)) | Err(ClientError::Errno(_)));
-        match result {
-            Err(error) => Err(error),
-            Ok(value) => match clunk {
-                Ok(Message::Rclunk(_)) => Ok(value),
-                Err(error) => Err(error),
-                _ => Err(ClientError::Unexpected("xattr clunk")),
-            },
-        }
+        // Cleanup must run before propagating the read's error.
+        let clunk = attr.clunk().await;
+        let value = result?;
+        clunk?;
+        Ok(value)
     }
 
     /// Set an attribute with Linux XATTR_CREATE or XATTR_REPLACE flags, or zero.
@@ -224,10 +231,7 @@ impl NinePClient {
             Err(error @ ClientError::Errno(_)) => {
                 // An errno is a completed request. Clunk the temporary fid;
                 // an incomplete write may itself return EINVAL at cleanup.
-                let cleanup =
-                    Self::xattr_rpc(&attr, Message::Tclunk(Tclunk { fid: attr.fid })).await;
-                attr.settled =
-                    matches!(cleanup, Ok(Message::Rclunk(_)) | Err(ClientError::Errno(_)));
+                let _ = attr.clunk().await;
                 return Err(error);
             }
             // A lost response may hide a completed final write. Disconnect
@@ -235,22 +239,12 @@ impl NinePClient {
             Err(error) => return Err(error),
             Ok(()) => {}
         }
-        let result = Self::xattr_rpc(&attr, Message::Tclunk(Tclunk { fid: attr.fid })).await;
-        attr.settled = matches!(&result, Ok(Message::Rclunk(_)) | Err(ClientError::Errno(_)));
-        match result {
-            Ok(Message::Rclunk(_)) => {
-                let registry = self.stateful_requests.lock().unwrap();
-                self.validate_admission_generation(
-                    &attr.admission,
-                    registry.retirement_generation,
-                )?;
-                let token = attr.conn.lineage_token.load(Ordering::Relaxed);
-                self.note_unsynced(fid, token);
-                Ok(())
-            }
-            Err(error) => Err(error),
-            _ => Err(ClientError::Unexpected("xattr clunk")),
-        }
+        attr.clunk().await?;
+        let registry = self.stateful_requests.lock().unwrap();
+        self.validate_admission_generation(&attr.admission, registry.retirement_generation)?;
+        let token = attr.conn.lineage_token.load(Ordering::Relaxed);
+        self.note_unsynced(fid, token);
+        Ok(())
     }
 
     pub async fn remove_xattr(&self, fid: u32, name: &[u8]) -> ClientResult<()> {

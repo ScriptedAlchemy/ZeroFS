@@ -1,6 +1,5 @@
-use crate::config::{
-    CompressionConfig, GcConfig, LsmConfig, SegmentPlacement, Settings, WarmMetadata,
-};
+use super::package_policy::{gc_matches_defaults, lsm_matches_defaults};
+use crate::config::{CompressionConfig, SegmentPlacement, Settings, WarmMetadata};
 use crate::fs::mutation::config::{
     ClientDurabilityTarget, FilesystemWriteAckMode, FilesystemWriteAckSettings,
 };
@@ -140,9 +139,6 @@ pub(super) fn validate(
             "16 MiB disk and up to 8 MiB free reserve",
         )
     };
-    // Sealing rotates after one whole write batch. A maximum 10 MiB 9P
-    // request can join almost 4 MiB already buffered, plus frame metadata.
-    // The RAM tier must admit that complete object before it can reach P3.
     ensure!(
         wb.ack_mode == AckMode::Memory
             && wb.shutdown_flush == ShutdownFlush::Local
@@ -205,23 +201,8 @@ pub(super) fn validate(
                 .is_some_and(|s| !s.ignore_fsync),
         "requires package filesystem and diagnostic settings with replication and telemetry disabled"
     );
-    let gc = settings.gc.unwrap_or_default();
-    let defaults = GcConfig::default();
     ensure!(
-        settings
-            .lsm
-            .is_none_or(|s| s.l0_max_ssts() == LsmConfig::DEFAULT_L0_MAX_SSTS
-                && s.max_concurrent_compactions() == LsmConfig::DEFAULT_MAX_CONCURRENT_COMPACTIONS
-                && s.flush_interval_secs() == LsmConfig::DEFAULT_FLUSH_INTERVAL_SECS
-                && !s.sync_writes())
-            && gc.interval_secs() == defaults.interval_secs()
-            && gc.idle_interval_secs() == defaults.idle_interval_secs()
-            && gc.read_directed() == defaults.read_directed()
-            && gc.tail_scrub_min_dead_percent() == defaults.tail_scrub_min_dead_percent()
-            && gc.min_batches_per_pass() == defaults.min_batches_per_pass()
-            && gc.busy_backlog_interval_secs() == defaults.busy_backlog_interval_secs()
-            && gc.busy_backlog_dead_percent() == defaults.busy_backlog_dead_percent()
-            && gc.compact_round_bytes() == defaults.compact_round_bytes(),
+        lsm_matches_defaults(settings.lsm) && gc_matches_defaults(settings.gc),
         "requires default LSM and GC geometry and sync_writes off"
     );
     Ok(())

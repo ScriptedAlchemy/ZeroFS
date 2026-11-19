@@ -600,9 +600,8 @@ pub(crate) enum StagedBatch {
         records: Vec<MutationRecord>,
         container: Option<AnchoredFileLocation>,
     },
-    /// A sink that does not separate the two halves (the journaler's test
-    /// doubles) carries its prepared mutations through to the commit half
-    /// instead, so the pipeline drives them unchanged.
+    /// Raw journals commit payloads and records together. Test sinks may also
+    /// carry prepared mutations directly to the commit half.
     Unstaged(Vec<PreparedMutation>),
 }
 
@@ -1538,9 +1537,11 @@ impl Journal {
         expected_first: Sequence,
         filesystem: &dyn PublicationFilesystem,
     ) -> Result<StagedBatch> {
+        // Preparation writes nothing, so rejected batches have no disk state
+        // to unwind. Both storage backends require the same sequence and IDs.
+        self.require_contiguous_local_batch(&prepared, expected_first)?;
+        self.require_unique_local_batch_identities(&prepared)?;
         if self.is_raw() {
-            self.require_contiguous_local_batch(&prepared, expected_first)?;
-            self.require_unique_local_batch_identities(&prepared)?;
             return Ok(StagedBatch::Unstaged(prepared));
         }
         if prepared.is_empty() {
@@ -1549,11 +1550,6 @@ impl Journal {
                 container: None,
             });
         }
-        // Rejecting here only drops `prepared`: preparation writes nothing, so
-        // an unpublished batch owns no disk state to unwind.
-        self.require_contiguous_local_batch(&prepared, expected_first)?;
-        self.require_unique_local_batch_identities(&prepared)?;
-
         let mut records = Vec::with_capacity(prepared.len());
         let mut payloads = Vec::with_capacity(prepared.len());
         for prepared in prepared {
@@ -1623,23 +1619,18 @@ impl Journal {
         };
         record_local_publish_phase("container_write", write_started.elapsed());
 
-        let directories = written
-            .iter()
-            .map(|container| container.parent.clone())
-            .collect::<Vec<_>>();
-
         let fsync_started = Instant::now();
-        for directory in &directories {
-            if let Err(error) = filesystem.sync_directory(directory) {
-                let publication = error.context(format!(
-                    "failed to fsync published blob directory {}",
-                    directory.display().display()
-                ));
-                return Err(with_container_cleanup(
-                    publication,
-                    self.rollback_uncommitted_batch(written.as_ref(), &directories, filesystem),
-                ));
-            }
+        if let Some(container) = &written
+            && let Err(error) = filesystem.sync_directory(&container.parent)
+        {
+            let publication = error.context(format!(
+                "failed to fsync published blob directory {}",
+                container.parent.display().display()
+            ));
+            return Err(with_container_cleanup(
+                publication,
+                Self::rollback_uncommitted_batch(container, filesystem),
+            ));
         }
         record_local_publish_phase("directory_fsync", fsync_started.elapsed());
 
@@ -1709,18 +1700,14 @@ impl Journal {
     /// from sitting on bytes nothing references.
     pub(crate) fn discard_staged(&self, staged: StagedBatch) -> Result<()> {
         match staged {
-            StagedBatch::Durable { container, .. } => self.discard_container_at(container.as_ref()),
-            StagedBatch::Unstaged(prepared) => {
-                drop(prepared);
-                Ok(())
+            StagedBatch::Durable {
+                container: Some(container),
+                ..
+            } => self.discard_container(&container),
+            StagedBatch::Durable {
+                container: None, ..
             }
-        }
-    }
-
-    fn discard_container_at(&self, container: Option<&AnchoredFileLocation>) -> Result<()> {
-        match container {
-            Some(path) => self.discard_container(path),
-            None => Ok(()),
+            | StagedBatch::Unstaged(_) => Ok(()),
         }
     }
 
@@ -1780,35 +1767,23 @@ impl Journal {
     }
 
     fn rollback_uncommitted_batch(
-        &self,
-        written: Option<&AnchoredFileLocation>,
-        directories: &[AnchoredDir],
+        container: &AnchoredFileLocation,
         filesystem: &dyn PublicationFilesystem,
     ) -> Result<()> {
-        let mut first_error = None;
-        if let Some(location) = written {
-            match location.parent.remove_file(&location.name) {
-                Ok(()) => {}
-                Err(error) => {
-                    first_error =
-                        Some(error.context("failed to remove uncommitted publication container"));
-                }
-            }
-        }
-        for directory in directories {
-            if let Err(error) = filesystem.sync_directory(directory)
-                && first_error.is_none()
-            {
-                first_error = Some(error.context(format!(
+        let removed = container
+            .parent
+            .remove_file(&container.name)
+            .context("failed to remove uncommitted publication container");
+        // Attempt the sync even if removal failed, preserving the first error.
+        let synced = filesystem
+            .sync_directory(&container.parent)
+            .with_context(|| {
+                format!(
                     "failed to fsync uncommitted blob cleanup directory {}",
-                    directory.display().display()
-                )));
-            }
-        }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+                    container.parent.display().display()
+                )
+            });
+        removed.and(synced)
     }
 
     fn require_contiguous_local_batch(

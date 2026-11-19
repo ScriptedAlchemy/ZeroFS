@@ -38,22 +38,6 @@ pub(super) fn exclusion(
                     && member.health_device.is_none()
             })
     });
-    let lsm = settings.lsm.is_none_or(|config| {
-        config.l0_max_ssts() == LsmConfig::DEFAULT_L0_MAX_SSTS
-            && config.max_concurrent_compactions() == LsmConfig::DEFAULT_MAX_CONCURRENT_COMPACTIONS
-            && config.flush_interval_secs() == LsmConfig::DEFAULT_FLUSH_INTERVAL_SECS
-            && !config.sync_writes()
-    });
-    let gc = settings.gc.unwrap_or_default();
-    let defaults = GcConfig::default();
-    let package_gc = gc.interval_secs() == defaults.interval_secs()
-        && gc.idle_interval_secs() == defaults.idle_interval_secs()
-        && gc.read_directed() == defaults.read_directed()
-        && gc.tail_scrub_min_dead_percent() == defaults.tail_scrub_min_dead_percent()
-        && gc.min_batches_per_pass() == defaults.min_batches_per_pass()
-        && gc.busy_backlog_interval_secs() == defaults.busy_backlog_interval_secs()
-        && gc.busy_backlog_dead_percent() == defaults.busy_backlog_dead_percent()
-        && gc.compact_round_bytes() == defaults.compact_round_bytes();
     let bounded_ram_ack = settings.bounded_journal_ram();
     [
         (clean_cache_bytes <= 96 * 1024 * 1024, "clean_cache_bytes exceeds 100663296"),
@@ -72,11 +56,33 @@ pub(super) fn exclusion(
         (settings.name_mode() == NameMode::Insensitive, "filesystem.name_mode must be insensitive"),
         (settings.compression() == CompressionConfig::Lz4, "filesystem.compression must be lz4"),
         (settings.filesystem.as_ref().is_none_or(|config| !config.ignore_fsync), "filesystem.ignore_fsync must be false"),
-        (lsm, "lsm must use package flush and compaction defaults with sync_writes off"),
-        (package_gc, "gc must use package defaults"),
+        (lsm_matches_defaults(settings.lsm), "lsm must use package flush and compaction defaults with sync_writes off"),
+        (gc_matches_defaults(settings.gc), "gc must use package defaults"),
         (settings.telemetry.as_ref().is_none_or(|config| !config.enabled), "telemetry must be disabled"),
         (settings.prometheus.as_ref().is_none_or(|config| config.addresses.len() <= 1), "prometheus permits at most one diagnostic listener"),
     ].into_iter().find_map(|(within, reason)| (!within).then_some(reason))
+}
+
+pub(super) fn lsm_matches_defaults(config: Option<LsmConfig>) -> bool {
+    config.is_none_or(|config| {
+        config.l0_max_ssts() == LsmConfig::DEFAULT_L0_MAX_SSTS
+            && config.max_concurrent_compactions() == LsmConfig::DEFAULT_MAX_CONCURRENT_COMPACTIONS
+            && config.flush_interval_secs() == LsmConfig::DEFAULT_FLUSH_INTERVAL_SECS
+            && !config.sync_writes()
+    })
+}
+
+pub(super) fn gc_matches_defaults(config: Option<GcConfig>) -> bool {
+    let config = config.unwrap_or_default();
+    let defaults = GcConfig::default();
+    config.interval_secs() == defaults.interval_secs()
+        && config.idle_interval_secs() == defaults.idle_interval_secs()
+        && config.read_directed() == defaults.read_directed()
+        && config.tail_scrub_min_dead_percent() == defaults.tail_scrub_min_dead_percent()
+        && config.min_batches_per_pass() == defaults.min_batches_per_pass()
+        && config.busy_backlog_interval_secs() == defaults.busy_backlog_interval_secs()
+        && config.busy_backlog_dead_percent() == defaults.busy_backlog_dead_percent()
+        && config.compact_round_bytes() == defaults.compact_round_bytes()
 }
 
 pub(super) const ENGINE_PEAK_BYTES: u64 = 3_241_541_632;

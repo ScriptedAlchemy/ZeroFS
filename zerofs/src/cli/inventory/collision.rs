@@ -47,27 +47,11 @@ pub(super) fn emit<W: Write>(rows: &Rows, path: &[u8], output: &mut Manifest<W>)
         let key = &first[..=separator];
         let mut names = vec![RawBytes::new(&first[separator + 1..])];
         let mut chunk = 0;
-        loop {
-            let same = match rows.peek() {
-                Some(Ok(row)) => row.starts_with(key),
-                Some(Err(_)) => {
-                    rows.next().unwrap()?;
-                    unreachable!()
-                }
-                None => false,
-            };
-            if !same {
-                if names.len() > 1 || chunk > 0 {
-                    output.emit(&Record::NameCollision(NameCollision {
-                        dir: RawBytes::new(path),
-                        rule,
-                        names,
-                        chunk,
-                        last_chunk: true,
-                    }))?;
-                }
-                break;
-            }
+        while let Some(row) = rows.next_if(|row| match row {
+            Ok(row) => row.starts_with(key),
+            Err(_) => true,
+        }) {
+            let row = row?;
             if names.len() == GROUP_ROWS {
                 output.emit(&Record::NameCollision(NameCollision {
                     dir: RawBytes::new(path),
@@ -79,8 +63,16 @@ pub(super) fn emit<W: Write>(rows: &Rows, path: &[u8], output: &mut Manifest<W>)
                 names = Vec::new();
                 chunk += 1;
             }
-            let row = rows.next().unwrap()?;
             names.push(RawBytes::new(&row[separator + 1..]));
+        }
+        if names.len() > 1 || chunk > 0 {
+            output.emit(&Record::NameCollision(NameCollision {
+                dir: RawBytes::new(path),
+                rule,
+                names,
+                chunk,
+                last_chunk: true,
+            }))?;
         }
     }
     Ok(())

@@ -568,19 +568,11 @@ impl<W: Write> Walker<'_, W> {
             let (nlink, stable) = link_metadata(&first);
             let mut consistent = stable;
             let mut count = 1_u64;
-            loop {
-                let same = match metadata.peek() {
-                    Some(Ok(row)) => row[..16] == first[..16],
-                    Some(Err(_)) => {
-                        metadata.next().unwrap()?;
-                        unreachable!()
-                    }
-                    None => false,
-                };
-                if !same {
-                    break;
-                }
-                let row = metadata.next().unwrap()?;
+            while let Some(row) = metadata.next_if(|row| match row {
+                Ok(row) => row[..16] == first[..16],
+                Err(_) => true,
+            }) {
+                let row = row?;
                 let (other_nlink, stable) = link_metadata(&row);
                 consistent &= stable && other_nlink == nlink;
                 count += 1;

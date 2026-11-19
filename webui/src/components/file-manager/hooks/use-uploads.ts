@@ -81,12 +81,10 @@ export function useUploads(path: string) {
     async (filePath: string, isDir = false) => {
       const name = filePath.split("/").pop() ?? "download";
       const retry = () => { void startDownload(filePath, isDir); };
-
-      if (isDir) {
-        const handle = transfers.startDownload(`${name}.zip`, retry);
-        try {
+      const handle = transfers.startDownload(isDir ? `${name}.zip` : name, retry);
+      try {
+        if (isDir) {
           let collected = 0;
-          let totalBytes = 0;
           const files = await p9client.collectFiles(
             filePath,
             "",
@@ -97,7 +95,7 @@ export function useUploads(path: string) {
             handle.signal,
           );
           if (handle.signal.aborted) return;
-          totalBytes = files.reduce((sum, f) => sum + f.data.length, 0);
+          const totalBytes = files.reduce((sum, f) => sum + f.data.length, 0);
           handle.update(0, 0, `Zipping ${collected} files (${formatSize(totalBytes)})...`);
           const { Zip, ZipDeflate } = await import("fflate");
           if (handle.signal.aborted) return;
@@ -122,26 +120,17 @@ export function useUploads(path: string) {
           a.click();
           URL.revokeObjectURL(url);
           handle.update(blob.size, blob.size);
-          handle.finish();
-        } catch (err) {
-          if (err instanceof DOMException && err.name === "AbortError") return;
-          handle.fail(formatError(err));
-        }
-      } else {
-        const handle = transfers.startDownload(name, retry);
-        try {
+        } else {
           await p9client.download(
             filePath,
-            (received, total) => {
-              handle.update(received, total);
-            },
+            (received, total) => handle.update(received, total),
             handle.signal,
           );
-          handle.finish();
-        } catch (err) {
-          if (err instanceof DOMException && err.name === "AbortError") return;
-          handle.fail(formatError(err));
         }
+        handle.finish();
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        handle.fail(formatError(err));
       }
     },
     [transfers],
