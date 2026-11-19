@@ -102,8 +102,10 @@ fn named_users_and_groups_require_defined_ids() {
         // The reserved sentinel is invalid, not the upper half of the ID space.
         for id in [UNDEFINED_ID, UNDEFINED_ID - 1] {
             let mut raw = acl.to_bytes().to_vec();
-            let entry = raw[HEADER_LEN..]
-                .chunks_exact_mut(ENTRY_LEN)
+            let (entries, remainder) = raw[HEADER_LEN..].as_chunks_mut::<ENTRY_LEN>();
+            assert!(remainder.is_empty());
+            let entry = entries
+                .iter_mut()
                 .find(|entry| u16::from_le_bytes([entry[0], entry[1]]) == tag)
                 .unwrap();
             entry[4..8].copy_from_slice(&id.to_le_bytes());
