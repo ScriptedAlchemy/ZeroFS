@@ -686,7 +686,7 @@ impl Catalog {
             // paths. In particular, two directories on the same filesystem
             // must not both promise the same currently-free physical bytes.
             let mut local_reserved = 0_u64;
-            for member in members.iter().filter(|member| member.local_path.is_some()) {
+            for member in members.iter().filter(|member| member.is_local()) {
                 let record: MemberRecord = bincode::deserialize(
                     table
                         .get(member.id.as_str())?
@@ -712,10 +712,9 @@ impl Catalog {
             let candidates = locals[start..]
                 .iter()
                 .chain(&locals[..start])
-                .filter(|member| member.local_path.is_some())
+                .filter(|member| member.is_local())
                 .chain(members.iter().filter(|member| {
-                    target.is_none_or(|id| id == member.id)
-                        && (!rotate || member.local_path.is_none())
+                    target.is_none_or(|id| id == member.id) && (!rotate || !member.is_local())
                 }));
             let mut chosen = None;
             let mut unavailable = None;
@@ -761,7 +760,10 @@ impl Catalog {
                     }
                 };
                 let declared = record.capacity.saturating_sub(occupied);
-                if super::space::room(declared, physical).is_none_or(|room| room < size) {
+                if declared < size
+                    || physical
+                        .is_some_and(|room| room.is_none_or(|bytes| bytes < member.put_cost(size)))
+                {
                     capacity_limited = true;
                     continue;
                 }
@@ -770,7 +772,7 @@ impl Catalog {
                     .checked_add(size)
                     .context("pool reservation overflow")?;
                 table.insert(member.id.as_str(), bincode::serialize(&record)?.as_slice())?;
-                if rotate && member.local_path.is_some() {
+                if rotate && member.is_local() {
                     // Advance only for a local reservation, in the same transaction
                     // as the capacity charge and upload record.
                     tx.open_table(META)?

@@ -13,7 +13,6 @@ mod recovery;
 mod space;
 pub use health::{MemberHealth, SegmentFault, SmartSample};
 pub(crate) use recovery::PoolRecovery;
-#[cfg(test)]
 pub use space::{FilesystemSpace, FreeSpace};
 #[cfg(test)]
 mod tests;
@@ -118,6 +117,8 @@ pub struct MemberSpace {
     /// Free bytes the filesystem reports (`statvfs` `f_bavail`), before the
     /// member's free-space reserve.
     pub filesystem_free_bytes: Option<u64>,
+    /// Future tombstone appends on a raw member. Already excluded from available_bytes.
+    pub retirement_reserved_bytes: u64,
     /// Size of the filesystem (`statvfs` `f_blocks`).
     pub filesystem_total_bytes: Option<u64>,
     /// The declared capacity is larger than the filesystem. Thin provisioning
@@ -665,12 +666,7 @@ impl PoolObjectStore {
                 "pool authority identity does not match its catalog",
             ));
         }
-        for member in pool
-            .inner
-            .members
-            .iter()
-            .filter(|member| member.local_path.is_some())
-        {
+        for member in pool.inner.members.iter().filter(|member| member.is_local()) {
             let id = member.id.clone();
             let record = pool.catalog(move |catalog| catalog.member(&id)).await?;
             if initialize || !record.initialized {
@@ -1047,7 +1043,7 @@ impl PoolObjectStore {
             options.mode = PutMode::Create;
             let member = self.member(&upload.member_id)?;
             let logical_attributes = store_attributes(&options.attributes)?;
-            if member.local_path.is_some() {
+            if member.is_local() {
                 // The local object store rejects attributes. Preserve them in
                 // the authoritative catalog and expose the same logical view
                 // before and after moving this object to another member.
@@ -1542,10 +1538,7 @@ impl PoolObjectStore {
         // member has thousands of interrupted operations. Started native uploads
         // keep an owned task through deletion and catalog settlement: a slow
         // directory scan must not lose its result when the bounded wait expires.
-        let is_local = |id: &str| {
-            self.member(id)
-                .is_ok_and(|member| member.local_path.is_some())
-        };
+        let is_local = |id: &str| self.member(id).is_ok_and(|member| member.is_local());
         uploads.sort_by_key(|upload| !is_local(&upload.member_id));
         garbage.sort_by_key(|garbage| {
             garbage

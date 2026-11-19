@@ -1,13 +1,11 @@
 //! Synthetic Linux loop-device qualification client for the raw store.
-#[cfg(target_os = "linux")]
-mod claim;
 
 #[cfg(target_os = "linux")]
 mod probe {
-    use super::claim::Claim;
     use std::error::Error;
     use std::io::{self, BufRead, Read, Write};
     use std::path::Path;
+    use zerofs_raw_device::claim::Claim;
     use zerofs_raw_device::{Identity, RawStore, Role, landing::LandingJournal, p3::P3Layout};
 
     const LIMIT: usize = 16 << 20;

@@ -15,6 +15,7 @@ struct Budget {
 struct Destination {
     available: u64,
     filesystem: Option<u64>,
+    cost: Option<std::sync::Arc<dyn super::FreeSpace>>,
 }
 
 /// `full` holds members whose last write returned no space, with the time it
@@ -44,7 +45,7 @@ fn assess_with(
     let local_reserved = config
         .iter()
         .zip(members.iter())
-        .filter(|(config, _)| config.local_path.is_some())
+        .filter(|(config, _)| config.is_local())
         .fold(0_u64, |sum, (_, m)| sum.saturating_add(m.reserved_bytes));
     let mut filesystems = BTreeMap::<u64, Budget>::new();
     let mut available = 0_u64;
@@ -52,9 +53,10 @@ fn assess_with(
     let mut destinations = Vec::new();
     for (config, member) in config.iter().zip(members.iter_mut()) {
         member.available_bytes = 0;
-        let observed = config.local_path.is_some().then(|| space(config));
+        let observed = config.is_local().then(|| space(config));
         if let Some(Ok(observed)) = &observed {
             member.space.filesystem_free_bytes = Some(observed.available);
+            member.space.retirement_reserved_bytes = observed.committed;
             member.space.filesystem_total_bytes = Some(observed.total);
             member.space.declared_exceeds_filesystem = member.capacity_bytes > observed.total;
         }
@@ -91,6 +93,7 @@ fn assess_with(
                 destinations.push(Destination {
                     available: quota,
                     filesystem: None,
+                    cost: None,
                 });
                 continue;
             }
@@ -105,16 +108,19 @@ fn assess_with(
             destinations.push(Destination {
                 available: room,
                 filesystem: Some(observed.filesystem),
+                cost: config.free_space.clone(),
             });
         }
         let budget = filesystems.entry(observed.filesystem).or_insert(Budget {
             available: observed.available,
-            reserve: config.min_free_bytes,
+            reserve: config.min_free_bytes.saturating_add(observed.committed),
             quota: 0,
         });
         // Several roots may share one filesystem: add quotas, never free bytes.
         budget.available = budget.available.min(observed.available);
-        budget.reserve = budget.reserve.max(config.min_free_bytes);
+        budget.reserve = budget
+            .reserve
+            .max(config.min_free_bytes.saturating_add(observed.committed));
         budget.quota = budget.quota.saturating_add(quota);
     }
     let filesystems: BTreeMap<_, _> = filesystems
@@ -153,10 +159,14 @@ fn fits(
             }
             if let Some(filesystem) = destination.filesystem {
                 let remaining = filesystems.get_mut(&filesystem).unwrap();
-                if *remaining < size {
+                let cost = destination
+                    .cost
+                    .as_ref()
+                    .map_or(size, |store| store.put_cost(size));
+                if *remaining < cost {
                     continue;
                 }
-                *remaining -= size;
+                *remaining -= cost;
             }
             destination.available -= size;
             return true;
@@ -221,6 +231,7 @@ mod tests {
             |_| {
                 Ok(FilesystemSpace {
                     filesystem: 1,
+                    committed: 0,
                     available: 150,
                     total: 1000,
                 })
@@ -246,6 +257,7 @@ mod tests {
             |_| {
                 Ok(FilesystemSpace {
                     filesystem: 1,
+                    committed: 0,
                     available: 1000,
                     total: 1000,
                 })
@@ -285,6 +297,7 @@ mod tests {
             |member| {
                 Ok(FilesystemSpace {
                     filesystem: if member.id == "a" { 1 } else { 2 },
+                    committed: 0,
                     available: 60,
                     total: 1000,
                 })
@@ -313,6 +326,7 @@ mod tests {
                 |member| {
                     Ok(FilesystemSpace {
                         filesystem: if member.id == "c" { 2 } else { 1 },
+                        committed: 0,
                         available: if member.id == "c" { 14 } else { shared_free },
                         total: 1000,
                     })
@@ -340,6 +354,7 @@ mod tests {
                 |_| {
                     Ok(FilesystemSpace {
                         filesystem: 1,
+                        committed: 0,
                         available,
                         total: 1000,
                     })

@@ -847,6 +847,7 @@ impl StoragePoolConfig {
         }
         let mut ids = HashSet::new();
         let mut urls = HashSet::new();
+        let mut raw_pool = None;
         let mut account_connections =
             std::collections::HashMap::<(String, u16, String), usize>::new();
         for member in &self.members {
@@ -867,6 +868,27 @@ impl StoragePoolConfig {
             member.reserve_free_bytes()?;
             let url = url::Url::parse(&member.url)
                 .with_context(|| format!("invalid URL for pool member {}", member.id))?;
+            if url.scheme() == "raw+loop" {
+                let binding = crate::storage_backend::raw::RawBinding::parse(&url)?;
+                if raw_pool
+                    .replace(binding.pool)
+                    .is_some_and(|old| old != binding.pool)
+                    || !urls.insert(binding.locator())
+                {
+                    anyhow::bail!("raw members must have unique UUIDs in the same raw pool");
+                }
+                if member.health_device.is_some()
+                    || member.storage_class.is_some()
+                    || member.sftp.is_some()
+                    || !member.cloud_provider_env_vars().is_empty()
+                    || settings.storage.readiness.is_some()
+                {
+                    anyhow::bail!(
+                        "raw members require device claims and cannot use directory readiness or provider options"
+                    );
+                }
+                continue;
+            }
             if url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
                 anyhow::bail!(
                     "pool member URLs must not contain passwords, queries, or fragments; configure credentials in provider sections"

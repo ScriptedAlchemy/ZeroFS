@@ -1,5 +1,7 @@
 //! Build the configured storage graph and retain every transport's lifecycle.
 
+pub(crate) mod raw;
+
 use crate::config::Settings;
 use crate::metadata_fault::{LocalMetadataStore, MetadataFault};
 use crate::operator_required::operator_required;
@@ -69,6 +71,7 @@ impl BackendSessions {
 pub(crate) struct OpenedStorage {
     pub(crate) store: Box<dyn ObjectStore>,
     pub(crate) path: Path,
+    pub(crate) raw_journal: Option<zerofs_raw_device::RawStore>,
     pub(crate) sftp_pool: Option<BackendSessions>,
     pub(crate) pool: Option<PoolObjectStore>,
     /// Trips on the first non-transient local I/O error of the metadata
@@ -127,6 +130,7 @@ pub(crate) async fn open_storage(settings: &Settings) -> Result<OpenedStorage> {
         path,
         sftp_pool: sftp_pool.map(BackendSessions::single),
         pool: None,
+        raw_journal: None,
         metadata_fault,
     })
 }
@@ -182,6 +186,11 @@ pub(crate) async fn open_pool_storage(
         let mut members = Vec::with_capacity(config.members.len());
         for member in &config.members {
             let url: url::Url = member.url.parse()?;
+            if url.scheme() == "raw+loop" {
+                let binding = raw::RawBinding::parse(&url)?;
+                members.push(raw::open_member(member, binding).await?);
+                continue;
+            }
             let (scheme, member_path) = ObjectStoreScheme::parse(&url)?;
             let mut options = settings.cloud_provider_env_vars();
             options.extend(member.cloud_provider_env_vars());
@@ -242,6 +251,7 @@ pub(crate) async fn open_pool_storage(
         Ok(pool) => Ok((
             OpenedStorage {
                 pool: Some(pool.clone()),
+                raw_journal: None,
                 store: Box::new(pool.clone()),
                 path,
                 sftp_pool: (!sessions.pools.is_empty()).then_some(sessions),

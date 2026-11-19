@@ -117,6 +117,7 @@ async fn resolve_checkpoint_name(settings: &Settings, name: &str) -> Result<uuid
         path: path_from_url,
         sftp_pool,
         pool: _,
+        raw_journal: _,
         metadata_fault,
     } = open_storage(settings).await?;
     let object_store = with_storage_class(

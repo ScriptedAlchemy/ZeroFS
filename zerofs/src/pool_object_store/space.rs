@@ -26,6 +26,8 @@ use std::time::{Duration, Instant};
 pub struct FilesystemSpace {
     /// Device id, so roots that share one filesystem share its free bytes.
     pub filesystem: u64,
+    /// Space promised for retiring objects that still occupy this device.
+    pub committed: u64,
     /// Bytes an unprivileged writer may still use (`f_bavail * f_frsize`).
     pub available: u64,
     /// Size of the filesystem (`f_blocks * f_frsize`).
@@ -36,6 +38,9 @@ pub struct FilesystemSpace {
 /// [`Statvfs`]; tests inject exact numbers.
 pub trait FreeSpace: Send + Sync + fmt::Debug {
     fn observe(&self) -> std::io::Result<FilesystemSpace>;
+    fn put_cost(&self, payload: u64) -> u64 {
+        payload
+    }
 }
 
 #[derive(Debug)]
@@ -45,6 +50,7 @@ impl FreeSpace for Statvfs {
     fn observe(&self) -> std::io::Result<FilesystemSpace> {
         Ok(FilesystemSpace {
             filesystem: std::fs::metadata(&self.0)?.dev(),
+            committed: 0,
             available: fs4::available_space(&self.0)?,
             total: fs4::total_space(&self.0)?,
         })
@@ -52,15 +58,26 @@ impl FreeSpace for Statvfs {
 }
 
 impl PoolMember {
+    pub(super) fn is_local(&self) -> bool {
+        self.free_space.is_some() || self.local_path.is_some()
+    }
+
+    pub(super) fn put_cost(&self, payload: u64) -> u64 {
+        self.free_space
+            .as_ref()
+            .map_or(payload, |source| source.put_cost(payload))
+    }
+
     /// A local member's real free space; `None` for a remote member, which has
     /// no filesystem to ask and is bounded only by its declared capacity and
     /// by its real write errors.
     pub(super) fn filesystem_space(&self) -> Option<std::io::Result<FilesystemSpace>> {
-        let path = self.local_path.as_ref()?;
-        Some(match &self.free_space {
-            Some(source) => source.observe(),
-            None => Statvfs(path.clone()).observe(),
-        })
+        if let Some(source) = &self.free_space {
+            return Some(source.observe());
+        }
+        self.local_path
+            .as_ref()
+            .map(|path| Statvfs(path.clone()).observe())
     }
 
     /// Replaces the member's `statvfs` reading with an injected source.
@@ -82,6 +99,7 @@ pub(super) fn physical_room(
 ) -> Option<u64> {
     space
         .available
+        .checked_sub(space.committed)?
         .checked_sub(reserve)?
         .checked_sub(local_reserved)
 }
@@ -253,6 +271,7 @@ mod tests {
     fn space(available: u64) -> FilesystemSpace {
         FilesystemSpace {
             filesystem: 1,
+            committed: 0,
             available,
             total: 1000,
         }

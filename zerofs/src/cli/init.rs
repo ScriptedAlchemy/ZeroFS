@@ -168,6 +168,7 @@ impl StartupContext {
             sftp_pool,
             pool,
             metadata_fault,
+            raw_journal,
         } = open_storage(settings)
             .await
             .context("Failed to connect to storage backend")?;
@@ -175,6 +176,10 @@ impl StartupContext {
         let cleanup_pool = sftp_pool.clone();
         let cleanup_storage_pool = pool.clone();
         let prepared: Result<Self> = async {
+            anyhow::ensure!(
+                raw_journal.is_none(),
+                "raw P3 writeback requires raw mutation metadata, remote progress, and crash-safe space reclamation; directory writeback cannot open this binding"
+            );
             let disk_monitor = match &pool {
                 Some(pool) => Some(
                     crate::disk_health::PreparedDiskMonitor::prepare(pool.clone(), settings)
