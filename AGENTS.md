@@ -2,8 +2,8 @@
 
 ## Active runner
 
-Use Zack's Mac Studio and its local Docker Desktop context for all Linux
-builds, Rust builds and tests, runtime tests, and benchmarks. Before starting
+Use Zack's Mac Studio and its local Docker Desktop context by default for
+Linux builds and software tests, including Rust. Before starting
 a container, check `docker context show`, its endpoint, and `docker info`.
 Use native `linux/arm64` on the arm64 Studio when the image supports it. Record
 the image platform and whether any emulation was used with each result.
@@ -15,10 +15,16 @@ to task-owned scratch. Limit Cargo
 parallelism to four jobs. Publish no ports beyond loopback. Remove only objects
 created for the task. The production NAS trial is owned by the app owner.
 
-The former remote runner `ubuntu-main` is permanently forbidden, including
-connections for inspection, waiting, synchronization, and cleanup. The Spark
-and other remote build hosts are also out of scope. Historical receipts identify
-their original environments.
+When needed, `ubuntu-main` may run software tests and build native x86-64
+artifacts or Docker images. Use a new task-owned directory under `/var/tmp`
+without sudo. Record the host, architecture, and shared-host caveat with each
+result, and remove only what the task creates. Deployment, persistent services,
+and inspection or cleanup of scratch from before the earlier ban are outside
+this authorization. The Spark is the alternate Linux test host.
+
+Physical-disk testing belongs to the app owner on the N5 NAS, on designated
+trial drives under separate commissioning authorization. This runner note
+authorizes no worker NAS action. See `truenas-storage-union` commit `10a3729`.
 
 ## Performance and benchmark map
 
