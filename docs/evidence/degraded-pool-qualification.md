@@ -44,6 +44,51 @@ source, build outputs, fixture directory and logs. The fixture directory was
 empty before removal and there were no mounts under the root. No NAS access,
 deployment, installed binary, persistent service, or container was involved.
 
+## Mac Studio container qualification
+
+The Mac Studio reports `arm64`. Docker context `desktop-linux` uses a local
+Unix socket and reports `linux/aarch64`. The pre-existing
+`rust:1.100.0-bookworm` image was run as native `linux/arm64` without emulation.
+The Rust source matches `ff25c08e`, with subsequent documentation changes.
+
+```sh
+docker --context desktop-linux run --rm --pull=never --platform linux/arm64 \
+  --name zerofs-degraded-033fd9ba-qualification --cpus 4 --memory 8g \
+  --mount "type=bind,source=$PWD,target=/checkout,readonly" \
+  --env CARGO_TARGET_DIR=/scratch/target --env TMPDIR=/scratch/tmp \
+  --env CARGO_PROFILE_TEST_DEBUG=0 --env CARGO_PROFILE_DEV_DEBUG=0 \
+  rust:1.100.0-bookworm bash -euc '
+    mkdir -p /scratch/tmp
+    apt-get update -qq
+    apt-get install -y -qq protobuf-compiler
+    cd /checkout/zerofs
+    uname -m
+    rustc --version
+    protoc --version
+    cargo test --locked --no-default-features -j4 -p zerofs --lib -- \
+      --test-threads=4 pool_export_tests storage_backend::tests \
+      storage_readiness:: pool_object_store::
+  '
+```
+
+This invocation uses system Protobuf 3.21.12 and disables the default vendored
+Protobuf build. All generated files and fixtures live in the disposable
+container filesystem.
+
+```text
+aarch64
+rustc 1.100.0 (0ef1bc386 2026-11-09)
+libprotoc 3.21.12
+test pool_export_tests::sealed_body_corruption_fails_authentication_and_verification ... ok
+test pool_export_tests::degraded_cold_start_serves_survivor_and_reports_missing_files ... ok
+test storage_readiness::tests::degraded_readiness_keeps_authority_and_catalog_identity_checks ... ok
+test result: ok. 167 passed; 0 failed; 2 ignored; 0 measured; 2582 filtered out; finished in 8.32s
+```
+
+Docker removed the named container on exit. The run created no named volume,
+network, or image. No connection to the former remote runner was made after
+the cutoff, and this lane had no known outstanding artifacts there at cutoff.
+
 ## Whole-file placement still open
 
 1. Persist a versioned inode-to-member binding and define how an incoming
