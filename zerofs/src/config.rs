@@ -179,6 +179,8 @@ pub struct Settings {
 enum RuntimeProfile {
     #[serde(rename = "small-nas-journal-v1")]
     SmallNasJournal,
+    #[serde(rename = "raw-device-p3-candidate-v1")]
+    RawDeviceP3Candidate,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -329,6 +331,8 @@ pub struct StoreProfile {
 impl StoreProfile {
     pub(crate) const NAS_JOURNAL_SEAL_BYTES: usize = 32 * 1024 * 1024;
     pub(crate) const NAS_JOURNAL_INFLIGHT: usize = 2;
+    pub(crate) const RAW_CANDIDATE_SEAL_BYTES: usize = 4 * 1024 * 1024;
+    pub(crate) const RAW_CANDIDATE_INFLIGHT: usize = 1;
 }
 
 impl From<SftpDataProfile> for StoreProfile {
@@ -2319,9 +2323,21 @@ impl Settings {
             == Some(RuntimeProfile::SmallNasJournal)
     }
 
+    pub(crate) fn raw_device_p3_candidate(&self) -> bool {
+        self.runtime.as_ref().and_then(|runtime| runtime.profile)
+            == Some(RuntimeProfile::RawDeviceP3Candidate)
+    }
+
     /// Data-plane tuning for the configured backend. SFTP publishes its own
     /// profile; every other backend runs on the defaults.
     pub(crate) fn store_profile(&self) -> Result<StoreProfile> {
+        if self.raw_device_p3_candidate() {
+            return Ok(StoreProfile {
+                seal_threshold: Some(StoreProfile::RAW_CANDIDATE_SEAL_BYTES),
+                max_inflight_seals: Some(StoreProfile::RAW_CANDIDATE_INFLIGHT),
+                ..StoreProfile::default()
+            });
+        }
         if self.small_nas_journal() {
             return Ok(StoreProfile {
                 seal_threshold: Some(StoreProfile::NAS_JOURNAL_SEAL_BYTES),
