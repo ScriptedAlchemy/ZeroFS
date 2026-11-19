@@ -17,6 +17,8 @@ const COMPANION_PROCESS_RESERVE_BYTES: u64 = 8 * GIB;
 mod admission_tests;
 #[path = "memory_package_policy.rs"]
 mod package_policy;
+#[path = "memory_raw_policy.rs"]
+mod raw_policy;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct StartupMemoryTiers {
@@ -56,6 +58,7 @@ enum MemoryPolicyProfile {
     Legacy { reason: &'static str },
     SmallNasPackage,
     SmallNasJournal,
+    RawDeviceP3Candidate,
 }
 
 struct MemoryPolicy {
@@ -83,31 +86,49 @@ impl MemoryPolicy {
         tiers: StartupMemoryTiers,
         write_ack: crate::fs::mutation::config::FilesystemWriteAckSettings,
     ) -> Result<Self> {
-        let exclusion = package_policy::exclusion(settings, tiers.clean_cache_bytes, write_ack);
-        let mut policy = match exclusion {
-            Some(reason) if settings.small_nas_journal() => {
-                bail!("small-nas-journal-v1 configuration rejected: {reason}")
-            }
-            Some(reason) => Self::legacy(reason),
-            None if settings.small_nas_journal() => Self {
-                profile: MemoryPolicyProfile::SmallNasJournal,
-                // Charge an extra two full journal budgets for metadata, redb and worker
-                // buffers, in addition to the accepted RAM tier and segment geometry.
-                residency_bytes: package_policy::RESIDENCY_BYTES + GIB,
-                headroom_bytes: package_policy::HEADROOM_BYTES,
+        let mut policy = if settings.raw_device_p3_candidate() {
+            raw_policy::validate(settings, tiers.clean_cache_bytes, write_ack)
+                .with_context(|| format!("{} configuration rejected", raw_policy::NAME))?;
+            Self {
+                profile: MemoryPolicyProfile::RawDeviceP3Candidate,
+                residency_bytes: package_policy::RESIDENCY_BYTES + raw_policy::RAW_RESIDENCY_BYTES,
+                headroom_bytes: package_policy::HEADROOM_BYTES + raw_policy::COMPANION_BYTES,
                 residency_source: format!(
-                    "baseline plus 1 GiB journal workers/replay allowance; {}",
+                    "directory package baseline input plus 2 GiB provisional raw recovery/index allowance; {}",
                     package_policy::EVIDENCE
                 ),
-                headroom_source: package_policy::EVIDENCE.into(),
-            },
-            None => Self {
-                profile: MemoryPolicyProfile::SmallNasPackage,
-                residency_bytes: package_policy::RESIDENCY_BYTES,
-                headroom_bytes: package_policy::HEADROOM_BYTES,
-                residency_source: package_policy::EVIDENCE.into(),
-                headroom_source: package_policy::EVIDENCE.into(),
-            },
+                headroom_source: format!(
+                    "baseline kernel/allocator input plus 1 GiB provisional companion and loop-backing allowance; {}",
+                    package_policy::EVIDENCE
+                ),
+            }
+        } else {
+            let exclusion = package_policy::exclusion(settings, tiers.clean_cache_bytes, write_ack);
+            match exclusion {
+                Some(reason) if settings.small_nas_journal() => {
+                    bail!("small-nas-journal-v1 configuration rejected: {reason}")
+                }
+                Some(reason) => Self::legacy(reason),
+                None if settings.small_nas_journal() => Self {
+                    profile: MemoryPolicyProfile::SmallNasJournal,
+                    // Charge an extra two full journal budgets for metadata, redb and worker
+                    // buffers, in addition to the accepted RAM tier and segment geometry.
+                    residency_bytes: package_policy::RESIDENCY_BYTES + GIB,
+                    headroom_bytes: package_policy::HEADROOM_BYTES,
+                    residency_source: format!(
+                        "baseline plus 1 GiB journal workers/replay allowance; {}",
+                        package_policy::EVIDENCE
+                    ),
+                    headroom_source: package_policy::EVIDENCE.into(),
+                },
+                None => Self {
+                    profile: MemoryPolicyProfile::SmallNasPackage,
+                    residency_bytes: package_policy::RESIDENCY_BYTES,
+                    headroom_bytes: package_policy::HEADROOM_BYTES,
+                    residency_source: package_policy::EVIDENCE.into(),
+                    headroom_source: package_policy::EVIDENCE.into(),
+                },
+            }
         };
         let (residency, headroom) = settings.runtime_memory_reserve_bytes()?;
         for (configured, computed, source, field) in [
@@ -146,11 +167,15 @@ impl MemoryPolicy {
             MemoryPolicyProfile::Legacy { .. } => "legacy",
             MemoryPolicyProfile::SmallNasPackage => "small-nas-package-v1",
             MemoryPolicyProfile::SmallNasJournal => "small-nas-journal-v1",
+            MemoryPolicyProfile::RawDeviceP3Candidate => raw_policy::NAME,
         }
     }
 
     fn reason(&self) -> &'static str {
         match self.profile {
+            MemoryPolicyProfile::RawDeviceP3Candidate => {
+                "synthetic raw geometry candidate; end-to-end peak and event qualification pending"
+            }
             MemoryPolicyProfile::Legacy { reason } => reason,
             MemoryPolicyProfile::SmallNasJournal => {
                 "explicit bounded journal fixture geometry; application-wide qualification required"
@@ -163,6 +188,16 @@ impl MemoryPolicy {
 
     fn direct_segment_bytes(&self) -> u64 {
         match self.profile {
+            MemoryPolicyProfile::RawDeviceP3Candidate => {
+                use crate::config::StoreProfile;
+                // A claim can carry the open lane past the threshold.
+                // Charge two allocation stages and the full volatile write
+                // budget as an overrun allowance for each open/retained lane.
+                let lanes = crate::fs::store::extent::OPEN_SEGMENT_LANES
+                    + StoreProfile::RAW_CANDIDATE_INFLIGHT;
+                2 * lanes as u64
+                    * (StoreProfile::RAW_CANDIDATE_SEAL_BYTES as u64 + 16 * 1024 * 1024)
+            }
             MemoryPolicyProfile::Legacy { .. } => 0,
             MemoryPolicyProfile::SmallNasJournal => {
                 use crate::config::StoreProfile;
@@ -179,6 +214,7 @@ impl MemoryPolicy {
     fn headroom_label(&self) -> &'static str {
         match self.profile {
             MemoryPolicyProfile::Legacy { .. } => "companion/process reserve",
+            MemoryPolicyProfile::RawDeviceP3Candidate => "engine/companion headroom",
             MemoryPolicyProfile::SmallNasPackage | MemoryPolicyProfile::SmallNasJournal => {
                 "engine kernel/allocator headroom"
             }
@@ -191,15 +227,17 @@ impl MemoryPolicy {
                 .residency_bytes
                 .checked_add(self.headroom_bytes)
                 .context("startup memory policy reserves overflowed"),
-            MemoryPolicyProfile::SmallNasPackage | MemoryPolicyProfile::SmallNasJournal => {
-                Ok(self.headroom_bytes)
-            }
+            MemoryPolicyProfile::SmallNasPackage
+            | MemoryPolicyProfile::SmallNasJournal
+            | MemoryPolicyProfile::RawDeviceP3Candidate => Ok(self.headroom_bytes),
         }
     }
 
     fn qualification(&self) -> Option<StoredStateQualification> {
         match self.profile {
-            MemoryPolicyProfile::Legacy { .. } | MemoryPolicyProfile::SmallNasJournal => None,
+            MemoryPolicyProfile::Legacy { .. }
+            | MemoryPolicyProfile::SmallNasJournal
+            | MemoryPolicyProfile::RawDeviceP3Candidate => None,
             MemoryPolicyProfile::SmallNasPackage => Some(StoredStateQualification {
                 logical_bytes: package_policy::QUALIFIED_LOGICAL_BYTES,
                 regular_files: package_policy::QUALIFIED_REGULAR_FILES,
@@ -216,13 +254,20 @@ impl MemoryPolicy {
             ),
             None => "stored_state_qualification=unavailable for selected policy".into(),
         };
+        let companions = match self.profile {
+            MemoryPolicyProfile::RawDeviceP3Candidate => format!(
+                "companion_allowance_bytes={} included in headroom; clean_cache_disk_bytes=0",
+                raw_policy::COMPANION_BYTES,
+            ),
+            _ => "external_companions=excluded from measured engine reserves, subtract FUSE/smbd and file cache from container limit before runtime.memory_limit_gb".into(),
+        };
         format!(
             "memory_policy={} reason={}; clean_cache_bytes={} source=resolved cache split with three 32 MiB floors; \
              object_writeback_bytes={} source=resolved writeback RAM or disabled; \
              volatile_write_bytes={} source=resolved shared write-ack setting times two ownership stages; \
              direct_segment_bytes={} source=selected store geometry (open plus retained segments); \
              unmodeled_residency_reserve_bytes={} source={}; engine_headroom_bytes={} source={}; \
-             hard_limit_source={source}; external_companions=excluded from measured engine reserves, subtract FUSE/smbd and file cache from container limit before runtime.memory_limit_gb; {qualification}",
+             hard_limit_source={source}; {companions}; {qualification}",
             self.name(),
             self.reason(),
             tiers.clean_cache_bytes,
@@ -281,6 +326,30 @@ fn validate_server_startup_with_limits(
     let tiers = StartupMemoryTiers::from_settings(settings, write_ack.volatile_memory_bytes)?;
     let policy = MemoryPolicy::from_settings(settings, tiers, write_ack)?;
     let configured = settings.runtime_memory_limit_bytes()?;
+    if settings.raw_device_p3_candidate() {
+        let dedicated = detected
+            .dedicated
+            .as_ref()
+            .context("raw-device-p3-candidate-v1 requires a dedicated cgroup-v2 memory.max")?;
+        if !(raw_policy::MIN_CGROUP_BYTES..=raw_policy::MAX_CGROUP_BYTES)
+            .contains(&dedicated.hard_limit_bytes)
+        {
+            bail!("raw-device-p3-candidate-v1 requires cgroup memory.max from 8 through 16 GiB");
+        }
+        if configured.is_some_and(|value| value < dedicated.hard_limit_bytes) {
+            bail!("raw-device-p3-candidate-v1 uses the dedicated cgroup limit as its envelope");
+        }
+        let swap_path = dedicated.source.with_file_name("memory.swap.max");
+        let swap = std::fs::read_to_string(&swap_path).with_context(|| {
+            format!(
+                "reading raw candidate swap limit at {}",
+                swap_path.display()
+            )
+        })?;
+        if swap.trim() != "0" {
+            bail!("raw-device-p3-candidate-v1 requires memory.swap.max = 0");
+        }
+    }
     let Some(envelope) = select_memory_limit(detected, configured)? else {
         if settings.small_nas_journal() {
             bail!("small-nas-journal-v1 requires a finite dedicated memory envelope");
@@ -337,9 +406,13 @@ fn validate_resolved_memory_budget(
         .context("startup memory budget overflowed")?;
     let accounting = policy.accounting(tiers, source);
     if required_bytes > hard_limit_bytes {
+        let residency_label = match policy.profile {
+            MemoryPolicyProfile::RawDeviceP3Candidate => "provisional residency reserve",
+            _ => "observed-unmodeled reserve",
+        };
         bail!(
             "startup memory admission rejected: {:.2} GB clean cache + {:.2} GB object writeback + \
-             {:.2} GB volatile writes + {:.2} GiB observed-unmodeled reserve + {:.2} GiB \
+             {:.2} GB volatile writes + {:.2} GiB {residency_label} + {:.2} GiB \
              {headroom_label} + {:.2} GiB direct segments require {:.2} GiB, above the {:.2} GiB hard limit \
              from {source}; required_bytes={required_bytes}; hard_limit_bytes={hard_limit_bytes}; {accounting}",
             decimal_gb(tiers.clean_cache_bytes),

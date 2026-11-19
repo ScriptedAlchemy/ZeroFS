@@ -1,0 +1,85 @@
+Build v3 from working snapshot as implementation finalized. Integration reference 056d4158.
+Command: scripts/test-raw-device-mounted.sh /var/tmp/zerofs-run-raw.cJVsClYD
+{"case": "binaries", "sha256": ["b08591babfd4f723c4d5cae545645607851fc0fde9490d82e1ff5e94f105233e  /input/zerofs", "18ba094a1d6446f722b31c87e5b40a5105c5c9017e2374ee3096f5f3e6023a7c  /input/zerofs-raw-device"]}
+{"backing": "/dev/shm/zerofs-raw-28vudrlp/media-0", "backing_device": 95, "backing_inode": 4, "case": "initialized_loop", "member": "small", "member_uuid": "5fd38ec3-1ad7-4e64-8968-112c7cf50307", "node": "/dev/zerofs-raw-i3m9vlhp/loop0", "pool_uuid": "b620ebaa-4967-4646-b218-a6e73584170f", "size_bytes": 33554432}
+{"backing": "/dev/shm/zerofs-raw-28vudrlp/media-1", "backing_device": 95, "backing_inode": 5, "case": "initialized_loop", "member": "large", "member_uuid": "31e7ac2c-6ce3-4173-9c70-daeb1a999b41", "node": "/dev/zerofs-raw-i3m9vlhp/loop1", "pool_uuid": "b620ebaa-4967-4646-b218-a6e73584170f", "size_bytes": 100663296}
+
+⠀⠀⠀⠀⠀⣠⣴⣶⣿⣿⣿⣿⣿⣷⣶⣤⣄
+⠀⠀⢀⣴⣿⣿⣿⠿⠛⠛⠋⠉⠙⠻⠿⣿⣿⣿⣦⡀
+⠀⣠⣿⣿⡿⠋⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠙⢿⣿⣿⡄
+⢰⣿⣿⡟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⢿⣿⣿⡄⠀⠀⠀⢸⣿⣿⣿⣿⣿⣿⣿⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿⠀⠀⢠⣶⣿⣿⣿⣿⣶⡆
+⣾⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠸⣿⣿⣷⠀⠀⠀⠀⠀⠀⠀⣠⣾⣿⠟⠁⠀⠀⣠⣴⣶⣶⣶⣤⡀⠀⠀⣶⣶⣆⣤⣶⣶⠀⢀⣤⣶⣶⣶⣦⣄⠀⠀⠀⣿⣿⡇⠀⠀⠀⠀⠀⠀⣿⣿⣏⠀⠀⠈⠉⠃
+⣿⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿⠀⠀⠀⠀⠀⢀⣼⣿⡟⠁⠀⠀⠀⣼⣿⣟⣁⣀⣙⣿⣿⡀⠀⣿⣿⣿⠋⠉⠙⢠⣿⣿⠏⠀⠈⢻⣿⣧⠀⠀⣿⣿⣿⣿⣿⣿⡇⠀⠀⠘⠻⠿⣿⣿⣶⣦⣄
+⢿⢿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣿⣿⡿⠀⠀⠀⢀⣴⣿⡿⠋⠀⠀⠀⠀⠀⢿⣿⣟⠛⠛⠛⠛⠛⠃⠀⣿⣿⡇⠀⠀⠀⠸⣿⣿⡄⠀⠀⣸⣿⡿⠀⠀⣿⣿⡇⠀⠀⠀⠀⠀⠀⣄⣀⠀⠀⠀⣹⣿⣿
+⠈⠈⢿⣇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣾⣿⣿⠃⠀⠀⠀⣾⣿⣿⣿⣿⣿⣿⣿⣿⠀⠈⠻⢿⣷⣶⣶⣶⠿⠀⠀⣿⣿⡇⠀⠀⠀⠀⠙⠿⣿⣶⣾⡿⠟⠁⠀⠀⣿⣿⡇⠀⠀⠀⠀⠀⠀⠻⠿⣿⣿⣿⣿⠿⠋
+⠀⠀⠀⠻⣷⣦⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢐⣽⣿⣿⠋
+⠀⠀⠀⠀⠙⢿⣿⣶⣤⣀⣀⣀⣀⣤⣤⣶⣿⣿⠟⠁
+⠀⠀⠀⠀⠀⠀⠉⠛⠿⢿⣿⣿⣿⣿⠿⠟⠋
+
+2026-11-19T08:04:41.529346Z  INFO zerofs::cli::server: ZeroFS v2.2.2
+2026-11-19T08:04:41.547322Z  WARN zerofs::cli::memory_budget: no cgroup-v2 memory ceiling or [runtime] memory_limit_gb; startup memory defense-in-depth admission is unavailable accounting="memory_policy=legacy reason=servers.webui requires the webui build and one listener with the measured 120s session timeout; clean_cache_bytes=100663296 source=resolved cache split with three 32 MiB floors; object_writeback_bytes=0 source=resolved writeback RAM or disabled; volatile_write_bytes=0 source=resolved shared write-ack setting times two ownership stages; direct_segment_bytes=0 source=selected store geometry (open plus retained segments); unmodeled_residency_reserve_bytes=34359738368 source=computed legacy 32 GiB from fork ad6835d5/4b2b645d; engine_headroom_bytes=8589934592 source=computed legacy mixed process/companion 8 GiB from fork ad6835d5/4b2b645d; hard_limit_source=unavailable; external_companions=excluded from measured engine reserves, subtract FUSE/smbd and file cache from container limit before runtime.memory_limit_gb; stored_state_qualification=unavailable for selected policy"
+2026-11-19T08:04:41.583658Z  INFO zerofs::cli::init: Starting ZeroFS server with PoolObjectStore(10e48d53-061a-4efc-854e-f4fcdac55846) backend
+2026-11-19T08:04:41.583688Z  INFO zerofs::cli::init: DB Path: dev/shm/zerofs-mounted-yo0iqbeo/authority
+2026-11-19T08:04:41.583879Z  INFO zerofs::cli::init: Base Cache Directory: /dev/shm/zerofs-mounted-yo0iqbeo/initial/cache
+2026-11-19T08:04:41.583927Z  INFO zerofs::cli::init: Cache Size: 0.064 GB
+2026-11-19T08:04:41.583934Z  INFO zerofs::cli::init: Checking bucket identity...
+2026-11-19T08:04:41.589327Z  INFO zerofs::bucket_identity: Creating new bucket ID: 73df64fd-ffce-476a-ac75-0055bdfc4bf6
+2026-11-19T08:04:41.589692Z  INFO zerofs::cli::init: Bucket ID: 73df64fd-ffce-476a-ac75-0055bdfc4bf6, Cache directory: /dev/shm/zerofs-mounted-yo0iqbeo/initial/cache/bucket_73df64fd
+2026-11-19T08:04:41.591081Z  INFO zerofs::storage_compatibility: Checking storage provider compatibility...
+2026-11-19T08:04:41.595235Z  INFO zerofs::storage_compatibility: Storage provider compatibility check passed
+2026-11-19T08:04:41.595263Z  INFO zerofs::cli::init: Loading or initializing encryption key from object store
+2026-11-19T08:04:43.049294Z  INFO zerofs::cli::server: Cache allocation - Disk: 0.06GB total (1073 MB decoded-blocks + 1073 MB raw-parts), Memory: 0.06GB total (33 MB extent-reads + 33 MB decoded-blocks + 33 MB raw-parts)
+2026-11-19T08:04:43.057063Z  INFO foyer_storage::engine::block::recover: Recovers 0 blocks with data, 16 clean blocks, 0 total entries with max sequence as 0..
+2026-11-19T08:04:43.058892Z  INFO foyer_storage::engine::block::recover: [recover] finish in 5.01025ms
+2026-11-19T08:04:43.060301Z  INFO foyer_storage::engine::block::recover: Recovers 0 blocks with data, 16 clean blocks, 0 total entries with max sequence as 0..
+2026-11-19T08:04:43.061948Z  INFO foyer_storage::engine::block::recover: [recover] finish in 2.020709ms
+2026-11-19T08:04:43.062254Z  INFO zerofs::cli::server: Resident-memory pressure cap: 64 MB (configured clean cache: 64 MB)
+2026-11-19T08:04:43.062542Z  INFO zerofs::cli::server: Opening database in read-write mode
+2026-11-19T08:04:43.106814Z  INFO zerofs::cli::server: Starting 9P server on Unix socket: /dev/shm/zerofs-mounted-yo0iqbeo/initial/ninep.sock
+2026-11-19T08:04:43.107065Z  INFO zerofs::cli::server: Starting RPC server on Unix socket: /dev/shm/zerofs-mounted-yo0iqbeo/initial/rpc.sock
+2026-11-19T08:04:43.107549Z  INFO zerofs::rpc::server: RPC server listening on Unix socket: "/dev/shm/zerofs-mounted-yo0iqbeo/initial/rpc.sock"
+2026-11-19T08:04:43.107585Z  INFO zerofs::ninep::server: 9P server listening on Unix socket "/dev/shm/zerofs-mounted-yo0iqbeo/initial/ninep.sock"
+2026-11-19T08:04:43.107647Z  INFO zerofs::fs::gc: Starting segment reclamation task (round budget 256 MiB, floor 4 batch(es); cadence base 60s / drain 15s (>= 20% dead) / idle 5s)
+2026-11-19T08:04:43.107658Z  INFO zerofs::fs::gc: Starting garbage collection task (runs continuously)
+2026-11-19T08:04:43.107888Z  INFO zerofs::cli::server: Starting periodic flush task (flushes every 30 seconds)
+2026-11-19T08:04:43.109766Z  INFO zerofs::cli::server: Starting stats reporting task (reports to debug every 5 seconds)
+2026-11-19T08:04:43.112198Z  INFO zerofs::fs::store::extent::reclaim: segment GC: 0 segments, 0 B appended (0 B live, ~0 B reclaimable, 0% dead); idle
+2026-11-19T08:04:43.139423Z  INFO zerofs::fs::store::extent::reclaim: orphan sweep: scanned 0 segment objects, reclaimed 0 orphan(s)
+2026-11-19T08:04:43.139884Z  INFO zerofs::fs::gc: slow orphan sweep reclaimed 0 orphan(s)
+2026-11-19T08:04:43.139905Z  INFO zerofs::fs::gc: segment GC plan: next 60s, 4 batches: backlog drained tier="base"
+2026-11-19T08:04:43.277510Z  INFO zerofs::ninep::server: 9P client connected via Unix socket
+2026-11-19T08:04:43.315600Z  INFO fuser::session: Mounting /dev/shm/zerofs-mounted-yo0iqbeo/initial/mount
+ZeroFS mounted at /dev/shm/zerofs-mounted-yo0iqbeo/initial/mount (9P: unix:/dev/shm/zerofs-mounted-yo0iqbeo/initial/ninep.sock, msize: 10240 KiB, cache: writethrough)
+Press Ctrl-C to unmount.
+Unmounting /dev/shm/zerofs-mounted-yo0iqbeo/initial/mount...
+2026-11-19T08:04:43.332908Z  INFO fuser::mnt: Unmounting /dev/shm/zerofs-mounted-yo0iqbeo/initial/mount
+2026-11-19T08:04:43.339212Z  INFO zerofs::cli::server: Received SIGTERM, initiating graceful shutdown...
+2026-11-19T08:04:43.339236Z  INFO zerofs::cli::server: Cancelling all servers and background tasks...
+2026-11-19T08:04:43.339377Z  INFO zerofs::cli::server: Waiting for servers to exit...
+2026-11-19T08:04:43.339667Z  INFO zerofs::cli::server: Periodic flush task shutting down
+2026-11-19T08:04:43.340070Z  INFO zerofs::cli::server: Stats reporting task shutting down
+2026-11-19T08:04:43.340097Z  INFO zerofs::ninep::server: 9P Unix socket server shutting down at "/dev/shm/zerofs-mounted-yo0iqbeo/initial/ninep.sock"
+2026-11-19T08:04:43.340424Z  INFO zerofs::fs::gc: GC task shutting down
+2026-11-19T08:04:43.341533Z  INFO zerofs::rpc::server: RPC Unix socket server shutting down at "/dev/shm/zerofs-mounted-yo0iqbeo/initial/rpc.sock"
+2026-11-19T08:04:43.341659Z  INFO zerofs::cli::server: Waiting for accepted 9P work to settle...
+2026-11-19T08:04:43.341830Z  INFO zerofs::cli::server: Waiting for background tasks to exit...
+2026-11-19T08:04:43.341967Z  INFO zerofs::cli::server: Waiting for deferred orphan reclaims to finish...
+2026-11-19T08:04:43.343591Z  INFO zerofs::cli::server: Performing final flush and closing database...
+2026-11-19T08:04:43.371698Z  INFO zerofs::cli::server: Shutdown complete
+2026-11-19T08:04:43.374752Z  INFO foyer::hybrid::cache: [hybrid]: flush all in-memory cached entries to disk on close bytes=274
+2026-11-19T08:04:43.374752Z  INFO foyer::hybrid::cache: [hybrid]: flush all in-memory cached entries to disk on close bytes=0
+
+Traceback (most recent call last):
+  File "/h/mounted.py", line 328, in <module>
+    main()
+  File "/h/mounted.py", line 320, in main
+    qualify(root, members)
+  File "/h/mounted.py", line 218, in qualify
+    with mounted(configs[0]) as path:
+  File "/usr/lib/python3.11/contextlib.py", line 137, in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+  File "/h/mounted.py", line 98, in mounted
+    assert types == ["fuse.zerofs"], types
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: ['fuse']

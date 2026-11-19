@@ -1,0 +1,55 @@
+Build v3 from working snapshot as implementation finalized. Integration reference 056d4158.
+Command: scripts/test-raw-device-mounted.sh /var/tmp/zerofs-run-raw.cJVsClYD
+{"case": "binaries", "sha256": ["b08591babfd4f723c4d5cae545645607851fc0fde9490d82e1ff5e94f105233e  /input/zerofs", "18ba094a1d6446f722b31c87e5b40a5105c5c9017e2374ee3096f5f3e6023a7c  /input/zerofs-raw-device"]}
+{"backing": "/dev/shm/zerofs-raw-yz4h6t0e/media-0", "backing_device": 95, "backing_inode": 4, "case": "initialized_loop", "member": "small", "member_uuid": "b3ff6921-4630-4d58-9ec0-f94f0f948455", "node": "/dev/zerofs-raw-jntexlgx/loop0", "pool_uuid": "46fc9033-7724-40f8-bc2f-aea127f0802f", "size_bytes": 33554432}
+{"backing": "/dev/shm/zerofs-raw-yz4h6t0e/media-1", "backing_device": 95, "backing_inode": 5, "case": "initialized_loop", "member": "large", "member_uuid": "c4bd220c-ec12-4ffc-8e97-598e50070a17", "node": "/dev/zerofs-raw-jntexlgx/loop1", "pool_uuid": "46fc9033-7724-40f8-bc2f-aea127f0802f", "size_bytes": 100663296}
+
+⠀⠀⠀⠀⠀⣠⣴⣶⣿⣿⣿⣿⣿⣷⣶⣤⣄
+⠀⠀⢀⣴⣿⣿⣿⠿⠛⠛⠋⠉⠙⠻⠿⣿⣿⣿⣦⡀
+⠀⣠⣿⣿⡿⠋⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠙⢿⣿⣿⡄
+⢰⣿⣿⡟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⢿⣿⣿⡄⠀⠀⠀⢸⣿⣿⣿⣿⣿⣿⣿⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿⠀⠀⢠⣶⣿⣿⣿⣿⣶⡆
+⣾⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠸⣿⣿⣷⠀⠀⠀⠀⠀⠀⠀⣠⣾⣿⠟⠁⠀⠀⣠⣴⣶⣶⣶⣤⡀⠀⠀⣶⣶⣆⣤⣶⣶⠀⢀⣤⣶⣶⣶⣦⣄⠀⠀⠀⣿⣿⡇⠀⠀⠀⠀⠀⠀⣿⣿⣏⠀⠀⠈⠉⠃
+⣿⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿⠀⠀⠀⠀⠀⢀⣼⣿⡟⠁⠀⠀⠀⣼⣿⣟⣁⣀⣙⣿⣿⡀⠀⣿⣿⣿⠋⠉⠙⢠⣿⣿⠏⠀⠈⢻⣿⣧⠀⠀⣿⣿⣿⣿⣿⣿⡇⠀⠀⠘⠻⠿⣿⣿⣶⣦⣄
+⢿⢿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣿⣿⡿⠀⠀⠀⢀⣴⣿⡿⠋⠀⠀⠀⠀⠀⢿⣿⣟⠛⠛⠛⠛⠛⠃⠀⣿⣿⡇⠀⠀⠀⠸⣿⣿⡄⠀⠀⣸⣿⡿⠀⠀⣿⣿⡇⠀⠀⠀⠀⠀⠀⣄⣀⠀⠀⠀⣹⣿⣿
+⠈⠈⢿⣇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣾⣿⣿⠃⠀⠀⠀⣾⣿⣿⣿⣿⣿⣿⣿⣿⠀⠈⠻⢿⣷⣶⣶⣶⠿⠀⠀⣿⣿⡇⠀⠀⠀⠀⠙⠿⣿⣶⣾⡿⠟⠁⠀⠀⣿⣿⡇⠀⠀⠀⠀⠀⠀⠻⠿⣿⣿⣿⣿⠿⠋
+⠀⠀⠀⠻⣷⣦⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢐⣽⣿⣿⠋
+⠀⠀⠀⠀⠙⢿⣿⣶⣤⣀⣀⣀⣀⣤⣤⣶⣿⣿⠟⠁
+⠀⠀⠀⠀⠀⠀⠉⠛⠿⢿⣿⣿⣿⣿⠿⠟⠋
+
+2026-11-19T08:04:01.499520Z  INFO zerofs::cli::server: ZeroFS v2.2.2
+Error: Invalid startup memory budget
+
+Caused by:
+    startup memory admission rejected: 0.10 GB clean cache + 0.00 GB object writeback + 0.00 GB volatile writes + 32.00 GiB observed-unmodeled reserve + 8.00 GiB companion/process reserve + 0.00 GiB direct segments require 40.09 GiB, above the 2.00 GiB hard limit from /sys/fs/cgroup/memory.max; required_bytes=43050336256; hard_limit_bytes=2147483648; memory_policy=legacy reason=servers.webui requires the webui build and one listener with the measured 120s session timeout; clean_cache_bytes=100663296 source=resolved cache split with three 32 MiB floors; object_writeback_bytes=0 source=resolved writeback RAM or disabled; volatile_write_bytes=0 source=resolved shared write-ack setting times two ownership stages; direct_segment_bytes=0 source=selected store geometry (open plus retained segments); unmodeled_residency_reserve_bytes=34359738368 source=computed legacy 32 GiB from fork ad6835d5/4b2b645d; engine_headroom_bytes=8589934592 source=computed legacy mixed process/companion 8 GiB from fork ad6835d5/4b2b645d; hard_limit_source=/sys/fs/cgroup/memory.max; external_companions=excluded from measured engine reserves, subtract FUSE/smbd and file cache from container limit before runtime.memory_limit_gb; stored_state_qualification=unavailable for selected policy
+
+Traceback (most recent call last):
+  File "/h/mounted.py", line 87, in mounted
+    wait_for(endpoint.exists, server)
+  File "/h/mounted.py", line 58, in wait_for
+    raise RuntimeError(f"{process.args[:2]} exited with {process.returncode}")
+RuntimeError: ['/input/zerofs', 'run'] exited with 1
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/h/mounted.py", line 328, in <module>
+    main()
+  File "/h/mounted.py", line 320, in main
+    qualify(root, members)
+  File "/h/mounted.py", line 218, in qualify
+    with mounted(configs[0]) as path:
+  File "/usr/lib/python3.11/contextlib.py", line 137, in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+  File "/h/mounted.py", line 84, in mounted
+    with ExitStack() as cleanup:
+  File "/usr/lib/python3.11/contextlib.py", line 589, in __exit__
+    raise exc_details[1]
+  File "/usr/lib/python3.11/contextlib.py", line 574, in __exit__
+    if cb(*exc_details):
+       ^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/contextlib.py", line 457, in _exit_wrapper
+    callback(*args, **kwds)
+  File "/h/mounted.py", line 74, in stop
+    raise RuntimeError(f"{process.args[:2]} exited with {code}")
+RuntimeError: ['/input/zerofs', 'run'] exited with 1

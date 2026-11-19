@@ -53,6 +53,7 @@ impl FreeSpace for InjectedSpace {
     fn observe(&self) -> std::io::Result<FilesystemSpace> {
         Ok(FilesystemSpace {
             filesystem: self.filesystem,
+            committed: 0,
             available: self.available.load(Ordering::SeqCst),
             total: self.total,
         })

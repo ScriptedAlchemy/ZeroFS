@@ -204,6 +204,7 @@ impl ZeroFS {
 
 #[derive(Clone)]
 pub struct CacheConfig {
+    pub(crate) memory_only: bool,
     pub(crate) root_folder: PathBuf,
     pub(crate) max_cache_size_gb: f64,
     pub(crate) memory_cache_size_gb: Option<f64>,

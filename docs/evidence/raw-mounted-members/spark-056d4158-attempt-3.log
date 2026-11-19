@@ -1,0 +1,113 @@
+Engine and probe provenance: exact Git archive 056d41586ee925479e21d169294123a2acb8f565
+Spark command: scripts/test-raw-device-mounted.sh --spark OWNED_TRANSFER_DIRECTORY/bin
+/var/tmp/zerofs-raw-fixture.KhIcLKC9/bin/zerofs: OK
+/var/tmp/zerofs-raw-fixture.KhIcLKC9/bin/zerofs-raw-device: OK
+Docker host: gx10-6a8d aarch64 130594021376 (unix:///var/run/docker.sock)
+Docker image: linux/arm64 sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea rust@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
+{"case": "container_limits", "memory.max": 47244640256, "memory.swap.max": 0}
+{"case": "binaries", "sha256": ["4bd465b489c167a55a04fbac16b5cc1ae98d1e5980dfd35e23eb5fc87d042d4c  /input/zerofs", "18ba094a1d6446f722b31c87e5b40a5105c5c9017e2374ee3096f5f3e6023a7c  /input/zerofs-raw-device"]}
+{"backing": "/dev/shm/zerofs-raw-ngkwxjk2/media-0", "backing_device": 120, "backing_inode": 4, "case": "initialized_loop", "loop_major": 7, "loop_minor": 11, "member": "small", "member_uuid": "07c67c27-c65b-4a78-bdf3-5642a0ca35b6", "node": "/dev/zerofs-raw-w1_f8b6r/loop11", "pool_uuid": "c916acb2-cd6d-49d5-9935-180b5fbabb87", "size_bytes": 33554432}
+{"backing": "/dev/shm/zerofs-raw-ngkwxjk2/media-1", "backing_device": 120, "backing_inode": 5, "case": "initialized_loop", "loop_major": 7, "loop_minor": 12, "member": "large", "member_uuid": "cb5a37f6-9260-463f-95dd-7a113d2c13da", "node": "/dev/zerofs-raw-w1_f8b6r/loop12", "pool_uuid": "c916acb2-cd6d-49d5-9935-180b5fbabb87", "size_bytes": 100663296}
+{"case": "rejected_loop_binding", "error": "loop backing identity mismatch", "member": "small", "substituted": "backing inode"}
+{"case": "rejected_loop_binding", "error": "device label binding mismatch (member): expected pool c916acb2-cd6d-49d5-9935-180b5fbabb87 member cb5a37f6-9260-463f-95dd-7a113d2c13da role data, label has pool c916acb2-cd6d-49d5-9935-180b5fbabb87 member 07c67c27-c65b-4a78-bdf3-5642a0ca35b6 role data", "member": "small", "substituted": "member UUID"}
+{"accounting": "memory_policy=legacy reason=servers.webui requires the webui build and one listener with the measured 120s session timeout; clean_cache_bytes=100663296 source=resolved cache split with three 32 MiB floors; object_writeback_bytes=0 source=resolved writeback RAM or disabled; volatile_write_bytes=0 source=resolved shared write-ack setting times two ownership stages; direct_segment_bytes=0 source=selected store geometry (open plus retained segments); unmodeled_residency_reserve_bytes=34359738368 source=computed legacy 32 GiB from fork ad6835d5/4b2b645d; engine_headroom_bytes=8589934592 source=computed legacy mixed process/companion 8 GiB from fork ad6835d5/4b2b645d; hard_limit_source=/sys/fs/cgroup/memory.max; external_companions=excluded from measured engine reserves, subtract FUSE/smbd and file cache from container limit before runtime.memory_limit_gb; stored_state_qualification=unavailable for selected policy", "case": "memory_admission", "hard_limit_bytes": 47244640256, "remaining_bytes": 4194304000, "required_bytes": 43050336256, "rss_pressure_cap_bytes": 4294967296, "stored_state_qualification": null}
+
+⠀⠀⠀⠀⠀⣠⣴⣶⣿⣿⣿⣿⣿⣷⣶⣤⣄
+⠀⠀⢀⣴⣿⣿⣿⠿⠛⠛⠋⠉⠙⠻⠿⣿⣿⣿⣦⡀
+⠀⣠⣿⣿⡿⠋⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠙⢿⣿⣿⡄
+⢰⣿⣿⡟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⢿⣿⣿⡄⠀⠀⠀⢸⣿⣿⣿⣿⣿⣿⣿⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿⠀⠀⢠⣶⣿⣿⣿⣿⣶⡆
+⣾⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠸⣿⣿⣷⠀⠀⠀⠀⠀⠀⠀⣠⣾⣿⠟⠁⠀⠀⣠⣴⣶⣶⣶⣤⡀⠀⠀⣶⣶⣆⣤⣶⣶⠀⢀⣤⣶⣶⣶⣦⣄⠀⠀⠀⣿⣿⡇⠀⠀⠀⠀⠀⠀⣿⣿⣏⠀⠀⠈⠉⠃
+⣿⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿⠀⠀⠀⠀⠀⢀⣼⣿⡟⠁⠀⠀⠀⣼⣿⣟⣁⣀⣙⣿⣿⡀⠀⣿⣿⣿⠋⠉⠙⢠⣿⣿⠏⠀⠈⢻⣿⣧⠀⠀⣿⣿⣿⣿⣿⣿⡇⠀⠀⠘⠻⠿⣿⣿⣶⣦⣄
+⢿⢿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣿⣿⡿⠀⠀⠀⢀⣴⣿⡿⠋⠀⠀⠀⠀⠀⢿⣿⣟⠛⠛⠛⠛⠛⠃⠀⣿⣿⡇⠀⠀⠀⠸⣿⣿⡄⠀⠀⣸⣿⡿⠀⠀⣿⣿⡇⠀⠀⠀⠀⠀⠀⣄⣀⠀⠀⠀⣹⣿⣿
+⠈⠈⢿⣇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣾⣿⣿⠃⠀⠀⠀⣾⣿⣿⣿⣿⣿⣿⣿⣿⠀⠈⠻⢿⣷⣶⣶⣶⠿⠀⠀⣿⣿⡇⠀⠀⠀⠀⠙⠿⣿⣶⣾⡿⠟⠁⠀⠀⣿⣿⡇⠀⠀⠀⠀⠀⠀⠻⠿⣿⣿⣿⣿⠿⠋
+⠀⠀⠀⠻⣷⣦⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢐⣽⣿⣿⠋
+⠀⠀⠀⠀⠙⢿⣿⣶⣤⣀⣀⣀⣀⣤⣤⣶⣿⣿⠟⠁
+⠀⠀⠀⠀⠀⠀⠉⠛⠿⢿⣿⣿⣿⣿⠿⠟⠋
+
+2026-11-19T08:13:07.273041Z  INFO zerofs::cli::server: ZeroFS v2.2.2
+2026-11-19T08:13:07.274045Z  INFO zerofs::cli::memory_budget: startup memory defense-in-depth admission passed hard_limit_bytes=47244640256 required_bytes=43050336256 remaining_bytes=4194304000 rss_pressure_cap_bytes=4294967296 accounting="memory_policy=legacy reason=servers.webui requires the webui build and one listener with the measured 120s session timeout; clean_cache_bytes=100663296 source=resolved cache split with three 32 MiB floors; object_writeback_bytes=0 source=resolved writeback RAM or disabled; volatile_write_bytes=0 source=resolved shared write-ack setting times two ownership stages; direct_segment_bytes=0 source=selected store geometry (open plus retained segments); unmodeled_residency_reserve_bytes=34359738368 source=computed legacy 32 GiB from fork ad6835d5/4b2b645d; engine_headroom_bytes=8589934592 source=computed legacy mixed process/companion 8 GiB from fork ad6835d5/4b2b645d; hard_limit_source=/sys/fs/cgroup/memory.max; external_companions=excluded from measured engine reserves, subtract FUSE/smbd and file cache from container limit before runtime.memory_limit_gb; stored_state_qualification=unavailable for selected policy" source="/sys/fs/cgroup/memory.max"
+2026-11-19T08:13:07.279224Z  INFO zerofs::cli::init: Starting ZeroFS server with PoolObjectStore(00be4d85-3fc4-4921-a556-d437df60cc7b) backend
+2026-11-19T08:13:07.279238Z  INFO zerofs::cli::init: DB Path: dev/shm/zerofs-mounted-20n2nhle/authority
+2026-11-19T08:13:07.279293Z  INFO zerofs::cli::init: Base Cache Directory: /dev/shm/zerofs-mounted-20n2nhle/initial/cache
+2026-11-19T08:13:07.279298Z  INFO zerofs::cli::init: Cache Size: 0.064 GB
+2026-11-19T08:13:07.279303Z  INFO zerofs::cli::init: Checking bucket identity...
+2026-11-19T08:13:07.280985Z  INFO zerofs::bucket_identity: Creating new bucket ID: ab9524ca-6bb1-4d25-b89f-65aca2f246d7
+2026-11-19T08:13:07.281064Z  INFO zerofs::cli::init: Bucket ID: ab9524ca-6bb1-4d25-b89f-65aca2f246d7, Cache directory: /dev/shm/zerofs-mounted-20n2nhle/initial/cache/bucket_ab9524ca
+2026-11-19T08:13:07.281568Z  INFO zerofs::storage_compatibility: Checking storage provider compatibility...
+2026-11-19T08:13:07.282660Z  INFO zerofs::storage_compatibility: Storage provider compatibility check passed
+2026-11-19T08:13:07.282721Z  INFO zerofs::cli::init: Loading or initializing encryption key from object store
+2026-11-19T08:13:08.482033Z  INFO zerofs::cli::server: Cache allocation - Disk: 0.06GB total (1073 MB decoded-blocks + 1073 MB raw-parts), Memory: 0.06GB total (33 MB extent-reads + 33 MB decoded-blocks + 33 MB raw-parts)
+2026-11-19T08:13:08.485538Z  INFO foyer_storage::engine::block::recover: Recovers 0 blocks with data, 16 clean blocks, 0 total entries with max sequence as 0..
+2026-11-19T08:13:08.488444Z  INFO foyer_storage::engine::block::recover: [recover] finish in 4.692427ms
+2026-11-19T08:13:08.489088Z  INFO foyer_storage::engine::block::recover: Recovers 0 blocks with data, 16 clean blocks, 0 total entries with max sequence as 0..
+2026-11-19T08:13:08.490191Z  INFO foyer_storage::engine::block::recover: [recover] finish in 1.195311ms
+2026-11-19T08:13:08.490288Z  INFO zerofs::cli::server: Resident-memory pressure cap: 4294 MB (configured clean cache: 64 MB)
+2026-11-19T08:13:08.490347Z  INFO zerofs::cli::server: Opening database in read-write mode
+2026-11-19T08:13:08.511103Z  INFO zerofs::cli::server: Starting 9P server on Unix socket: /dev/shm/zerofs-mounted-20n2nhle/initial/ninep.sock
+2026-11-19T08:13:08.511167Z  INFO zerofs::cli::server: Starting RPC server on Unix socket: /dev/shm/zerofs-mounted-20n2nhle/initial/rpc.sock
+2026-11-19T08:13:08.511312Z  INFO zerofs::ninep::server: 9P server listening on Unix socket "/dev/shm/zerofs-mounted-20n2nhle/initial/ninep.sock"
+2026-11-19T08:13:08.511337Z  INFO zerofs::fs::gc: Starting segment reclamation task (round budget 256 MiB, floor 4 batch(es); cadence base 60s / drain 15s (>= 20% dead) / idle 5s)
+2026-11-19T08:13:08.511369Z  INFO zerofs::fs::gc: Starting garbage collection task (runs continuously)
+2026-11-19T08:13:08.511603Z  INFO zerofs::cli::server: Starting periodic flush task (flushes every 30 seconds)
+2026-11-19T08:13:08.511857Z  INFO zerofs::rpc::server: RPC server listening on Unix socket: "/dev/shm/zerofs-mounted-20n2nhle/initial/rpc.sock"
+2026-11-19T08:13:08.512172Z  INFO zerofs::cli::server: Starting stats reporting task (reports to debug every 5 seconds)
+2026-11-19T08:13:08.514088Z  INFO zerofs::fs::store::extent::reclaim: segment GC: 0 segments, 0 B appended (0 B live, ~0 B reclaimable, 0% dead); idle
+2026-11-19T08:13:08.522185Z  INFO zerofs::fs::store::extent::reclaim: orphan sweep: scanned 0 segment objects, reclaimed 0 orphan(s)
+2026-11-19T08:13:08.522525Z  INFO zerofs::fs::gc: slow orphan sweep reclaimed 0 orphan(s)
+2026-11-19T08:13:08.522556Z  INFO zerofs::fs::gc: segment GC plan: next 60s, 4 batches: backlog drained tier="base"
+2026-11-19T08:13:08.579649Z  INFO zerofs::ninep::server: 9P client connected via Unix socket
+2026-11-19T08:13:08.582888Z  INFO fuser::session: Mounting /dev/shm/zerofs-mounted-20n2nhle/initial/mount
+✗ Error: failed to mount filesystem at /dev/shm/zerofs-mounted-20n2nhle/initial/mount: Error calling mount() at "/dev/shm/zerofs-mounted-20n2nhle/initial/mount" with "fd=10,rootmode=40700,user_id=0,group_id=0,default_permissions" and flags=MsFlags(MS_NOSUID | MS_NODEV): EACCES: Permission denied
+2026-11-19T08:13:08.674316Z  INFO zerofs::cli::server: Received SIGTERM, initiating graceful shutdown...
+2026-11-19T08:13:08.674343Z  INFO zerofs::cli::server: Cancelling all servers and background tasks...
+2026-11-19T08:13:08.674374Z  INFO zerofs::cli::server: Waiting for servers to exit...
+2026-11-19T08:13:08.674553Z  INFO zerofs::fs::gc: GC task shutting down
+2026-11-19T08:13:08.674555Z  INFO zerofs::cli::server: Stats reporting task shutting down
+2026-11-19T08:13:08.674608Z  INFO zerofs::ninep::server: 9P Unix socket server shutting down at "/dev/shm/zerofs-mounted-20n2nhle/initial/ninep.sock"
+2026-11-19T08:13:08.674676Z  INFO zerofs::cli::server: Periodic flush task shutting down
+2026-11-19T08:13:08.674743Z  INFO zerofs::rpc::server: RPC Unix socket server shutting down at "/dev/shm/zerofs-mounted-20n2nhle/initial/rpc.sock"
+2026-11-19T08:13:08.674850Z  INFO zerofs::cli::server: Waiting for accepted 9P work to settle...
+2026-11-19T08:13:08.674873Z  INFO zerofs::cli::server: Waiting for background tasks to exit...
+2026-11-19T08:13:08.674925Z  INFO zerofs::cli::server: Waiting for deferred orphan reclaims to finish...
+2026-11-19T08:13:08.675303Z  INFO zerofs::cli::server: Performing final flush and closing database...
+2026-11-19T08:13:08.683224Z  INFO zerofs::cli::server: Shutdown complete
+2026-11-19T08:13:08.684605Z  INFO foyer::hybrid::cache: [hybrid]: flush all in-memory cached entries to disk on close bytes=3518
+2026-11-19T08:13:08.684651Z  INFO foyer::hybrid::cache: [hybrid]: flush all in-memory cached entries to disk on close bytes=274
+
+Traceback (most recent call last):
+  File "/h/mounted.py", line 98, in mounted
+    wait_for(lambda: os.path.ismount(mount), client)
+  File "/h/mounted.py", line 62, in wait_for
+    raise RuntimeError(f"{process.args[:2]} exited with {process.returncode}")
+RuntimeError: ['/input/zerofs', 'mount'] exited with 1
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/h/mounted.py", line 360, in <module>
+    main()
+  File "/h/mounted.py", line 352, in main
+    qualify(root, members, expected_memory)
+  File "/h/mounted.py", line 242, in qualify
+    with mounted(configs[0]) as path:
+  File "/usr/lib/python3.11/contextlib.py", line 137, in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+  File "/h/mounted.py", line 88, in mounted
+    with ExitStack() as cleanup:
+  File "/usr/lib/python3.11/contextlib.py", line 589, in __exit__
+    raise exc_details[1]
+  File "/usr/lib/python3.11/contextlib.py", line 574, in __exit__
+    if cb(*exc_details):
+       ^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/contextlib.py", line 457, in _exit_wrapper
+    callback(*args, **kwds)
+  File "/h/mounted.py", line 78, in stop
+    raise RuntimeError(f"{process.args[:2]} exited with {code}")
+RuntimeError: ['/input/zerofs', 'mount'] exited with 1
+Removed the owned Docker fixture and its CID directory.
+rm: cannot remove '/var/tmp/zerofs-raw-fixture.KhIcLKC9/bin/zerofs': Permission denied
+rm: cannot remove '/var/tmp/zerofs-raw-fixture.KhIcLKC9/bin/zerofs-raw-device': Permission denied
+rm: cannot remove '/var/tmp/zerofs-raw-fixture.KhIcLKC9/scripts/raw-device/fixture.py': Permission denied
+rm: cannot remove '/var/tmp/zerofs-raw-fixture.KhIcLKC9/scripts/raw-device/mounted.py': Permission denied
+Removed exact owned Spark transfer directory /var/tmp/zerofs-raw-fixture.KhIcLKC9

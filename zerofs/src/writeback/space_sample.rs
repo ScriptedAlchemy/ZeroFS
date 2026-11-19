@@ -4,7 +4,7 @@
 //! [`PhysicalSpaceSample`] values from [`PhysicalSpaceSampler::sample`]. They
 //! do not allocate or construct generations themselves.
 
-use crate::writeback::anchored_dir::AnchoredDir;
+use crate::writeback::{anchored_dir::AnchoredDir, journal::Journal};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 enum SpaceSource {
     Path(PathBuf),
     Anchored(AnchoredDir),
+    Raw(Arc<Journal>),
 }
 
 /// One successful probe of the writeback filesystem.
@@ -50,19 +51,24 @@ pub(crate) enum SpaceSampleError {
 impl PhysicalSpaceSampler {
     pub(crate) fn new(writeback_dir: impl Into<PathBuf>) -> Self {
         let writeback_dir = writeback_dir.into();
-        Self {
-            source: SpaceSource::Path(writeback_dir.clone()),
-            writeback_dir,
-            probe_gate: Arc::new(tokio::sync::Mutex::new(())),
-            next_generation: Arc::new(AtomicU64::new(1)),
-            latest: Arc::new(Mutex::new(None)),
-        }
+        Self::from_source(writeback_dir.clone(), SpaceSource::Path(writeback_dir))
     }
 
     pub(crate) fn new_anchored(writeback_dir: AnchoredDir) -> Self {
+        Self::from_source(
+            writeback_dir.display().to_path_buf(),
+            SpaceSource::Anchored(writeback_dir),
+        )
+    }
+
+    pub(crate) fn new_raw(journal: Arc<Journal>) -> Self {
+        Self::from_source(journal.root().to_path_buf(), SpaceSource::Raw(journal))
+    }
+
+    fn from_source(writeback_dir: PathBuf, source: SpaceSource) -> Self {
         Self {
-            writeback_dir: writeback_dir.display().to_path_buf(),
-            source: SpaceSource::Anchored(writeback_dir),
+            writeback_dir,
+            source,
             probe_gate: Arc::new(tokio::sync::Mutex::new(())),
             next_generation: Arc::new(AtomicU64::new(1)),
             latest: Arc::new(Mutex::new(None)),
@@ -98,6 +104,9 @@ impl PhysicalSpaceSampler {
         let source = self.source.clone();
         self.sample_with(move || match source {
             SpaceSource::Path(path) => fs4::available_space(path),
+            SpaceSource::Raw(journal) => journal
+                .raw_available_space()
+                .map_err(|error| io::Error::other(error.to_string())),
             SpaceSource::Anchored(directory) => directory
                 .available_space()
                 .map_err(|error| io::Error::other(error.to_string())),

@@ -13,12 +13,12 @@ mod recovery;
 mod space;
 pub use health::{MemberHealth, SegmentFault, SmartSample};
 pub(crate) use recovery::PoolRecovery;
-#[cfg(test)]
 pub use space::{FilesystemSpace, FreeSpace};
 #[cfg(test)]
 mod tests;
 
 pub use catalog::CATALOG_FILE_NAME;
+pub(crate) use catalog::CatalogSource;
 #[cfg(test)]
 pub(crate) use catalog::survival_test_support;
 use catalog::{Catalog, Entry, Garbage, Physical, StoredAttribute, Upload};
@@ -119,6 +119,8 @@ pub struct MemberSpace {
     /// Free bytes the filesystem reports (`statvfs` `f_bavail`), before the
     /// member's free-space reserve.
     pub filesystem_free_bytes: Option<u64>,
+    /// Future tombstone appends on a raw member. Already excluded from available_bytes.
+    pub retirement_reserved_bytes: u64,
     /// Size of the filesystem (`statvfs` `f_blocks`).
     pub filesystem_total_bytes: Option<u64>,
     /// The declared capacity is larger than the filesystem. Thin provisioning
@@ -584,7 +586,7 @@ impl PoolObjectStore {
     pub(crate) async fn open_with_preflight(
         authority: Arc<dyn ObjectStore>,
         authority_prefix: Path,
-        catalog_dir: PathBuf,
+        catalog_source: impl Into<CatalogSource>,
         members: Vec<PoolMember>,
         segment_placement: SegmentPlacement,
         initialize: bool,
@@ -597,13 +599,9 @@ impl PoolObjectStore {
         let marker = read_marker(authority.as_ref(), &marker_path).await?;
         let prefix = authority_prefix.to_string();
         let marker_for_open = marker.clone();
+        let source = catalog_source.into();
         let catalog = tokio::task::spawn_blocking(move || {
-            Catalog::open(
-                &catalog_dir,
-                &prefix,
-                initialize,
-                marker_for_open.as_deref(),
-            )
+            source.open(&prefix, initialize, marker_for_open.as_deref())
         })
         .await
         .map_err(|e| error(format!("pool catalog open task failed: {e}")))?
@@ -699,12 +697,7 @@ impl PoolObjectStore {
             ));
         }
         let mut unavailable = pool.inner.unavailable.clone();
-        for member in pool
-            .inner
-            .members
-            .iter()
-            .filter(|member| member.local_path.is_some())
-        {
+        for member in pool.inner.members.iter().filter(|member| member.is_local()) {
             let id = member.id.clone();
             let record = pool.catalog(move |catalog| catalog.member(&id)).await?;
             if initialize || !record.initialized {
@@ -1121,7 +1114,7 @@ impl PoolObjectStore {
             options.mode = PutMode::Create;
             let member = self.member(&upload.member_id)?;
             let logical_attributes = store_attributes(&options.attributes)?;
-            if member.local_path.is_some() {
+            if member.is_local() {
                 // The local object store rejects attributes. Preserve them in
                 // the authoritative catalog and expose the same logical view
                 // before and after moving this object to another member.
@@ -1674,10 +1667,7 @@ impl PoolObjectStore {
         // Recover local debts first, and bound startup work even when a remote
         // member has thousands of interrupted operations. Native deletions
         // keep an owned task through catalog settlement when the bounded wait expires.
-        let is_local = |id: &str| {
-            self.member(id)
-                .is_ok_and(|member| member.local_path.is_some())
-        };
+        let is_local = |id: &str| self.member(id).is_ok_and(|member| member.is_local());
         uploads.sort_by_key(|upload| !is_local(&upload.member_id));
         garbage.sort_by_key(|garbage| {
             garbage

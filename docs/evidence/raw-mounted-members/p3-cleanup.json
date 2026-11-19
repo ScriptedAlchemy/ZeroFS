@@ -1,0 +1,45 @@
+{
+  "removed_containers": {
+    "zerofs-run-raw.cJVsClYD-build": "94e863ee7e6db351d0d49175b8817ca5b27908c35f91032e36cdd255be106fb5",
+    "zerofs-run-raw.cJVsClYD-finalunits": "d8051fab67265bfdcb47b23436f224b57f9647939ebbd89f6d72a42a68b7e6fe",
+    "zerofs-run-raw.cJVsClYD-first": "2c355b0559605c90962bcd51c3b3310d9e797f5ebc2e09feea7fbf8b2db14cf3",
+    "zerofs-run-raw.cJVsClYD-p3first": "1b9c5a84cf267a530db76166a89d045118136ea6a56da8a594990b21ccea27cb",
+    "zerofs-run-raw.cJVsClYD-p3second": "885b290cd0f5ee43c2df6e1068a71e79ac50b56a01c78c4efef76b9171b6c66d",
+    "zerofs-run-raw.cJVsClYD-p3tests": "655cb74919a2c146aa43fff8c4efc2a0a4302967b8152d0da468856dc60c1ca1",
+    "zerofs-run-raw.cJVsClYD-p3units": "138c09b1ec243eeed37e76089357114a061b8c948b1caa9718dc542d0c62ad41",
+    "zerofs-run-raw.cJVsClYD-p3web": "9bbf1394dffa993efd6da800bd7a408797176b75c5507b1d393caca9b7bbfd75",
+    "zerofs-run-raw.cJVsClYD-pin2": "1e072a842680b3a6c7d250a2dd517866ece17732d74f867e6bd6776dcc95b0c3",
+    "zerofs-run-raw.cJVsClYD-pin5f": "e1e2640ab084eb966672c2619f86a4d05258b9ebec355714387580f6f2be4b46",
+    "zerofs-run-raw.cJVsClYD-pinned": "16c5342bfb02e7658af3303377e34b3367da161d93855969348c0e2108cb0f8c",
+    "zerofs-run-raw.cJVsClYD-second": "a3094361956eae088449bd1d79853ba06d96578484f3bfbc97cad49422c00eac",
+    "zerofs-run-raw.cJVsClYD-tests": "050977ec43742a29033f674e954523ef4fc78441576c58b559adc1a2681858fc",
+    "zerofs-run-raw.cJVsClYD-v3": "0fa35c3b8e3a9095ae74ef1f8f0325dd07ac2a1431201f922ef876ca4b4fc3a4",
+    "zerofs-run-raw.cJVsClYD-warm": "7acda4903af4a48cfe22e43eb70d1e4d013dba18666b3097a4b2233143ac37f0",
+    "zerofs-run-raw.cJVsClYD-wasm": "befcd595ec1155d3c317133b932836aec1f46e6ef708e38a9f2a770aa12db546",
+    "zerofs-run-raw.cJVsClYD-wasm2": "087108f4a3798338208b0e2e4dedca9265e0fb5fb6c7386b4b63bdccbab58fe7",
+    "zerofs-run-raw.cJVsClYD-webdeps": "a3e0e7e748f713b01b05d24c43e58f9b4577026d4e65ce15eb4844754cd6bb7c"
+  },
+  "verified_containers_absent": true,
+  "removed_and_verified_absent_volumes": [
+    "zerofs-run-raw.cJVsClYD-cargo",
+    "zerofs-run-raw.cJVsClYD-target"
+  ],
+  "preexisting_volumes_preserved": 33,
+  "shared_seed_volume_present": true,
+  "shared_builder_image_retained": "sha256:0728ce88add0b9419181905121ad1169a947493e73a0a72c61a54661bad8009c",
+  "studio_scratch_removed": "/var/tmp/zerofs-run-raw.cJVsClYD",
+  "checkout_empty_asset_mountpoint_removed": "webui/dist",
+  "local_transfer_helpers_removed": [
+    "/var/tmp/zerofs-spark-nasfit-transfer.PnHmL5u7",
+    "/var/tmp/zerofs-spark-transfer.ydzenEEN"
+  ],
+  "spark_transfer_directories_verified_absent_in_exit_traps": [
+    "/var/tmp/zerofs-raw-fixture.6BaRoP2a",
+    "/var/tmp/zerofs-raw-fixture.BQtGmhr1",
+    "/var/tmp/zerofs-raw-fixture.QnAg6d8z",
+    "/var/tmp/zerofs-raw-fixture.YShg8Tnk",
+    "/var/tmp/zerofs-raw-fixture.m9gFZ0Ls",
+    "/var/tmp/zerofs-raw-fixture.tD3cThAe"
+  ],
+  "later_ssh_recheck": "Redundant post-run check stalled. Each runner had already tested absence in its exit trap."
+}

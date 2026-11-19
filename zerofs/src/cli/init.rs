@@ -153,6 +153,7 @@ enum ReconcileOutcome {
 impl StartupContext {
     async fn prepare(settings: &Settings, db_mode: DatabaseMode) -> Result<Self> {
         let cache_config = CacheConfig {
+            memory_only: settings.raw_p3_authority(),
             root_folder: settings.cache.dir.clone(),
             max_cache_size_gb: settings.cache.disk_size_gb,
             memory_cache_size_gb: settings.cache.memory_size_gb,
@@ -168,6 +169,7 @@ impl StartupContext {
             sftp_pool,
             pool,
             metadata_fault,
+            raw_journal,
         } = open_storage(settings)
             .await
             .context("Failed to connect to storage backend")?;
@@ -175,6 +177,11 @@ impl StartupContext {
         let cleanup_pool = sftp_pool.clone();
         let cleanup_storage_pool = pool.clone();
         let prepared: Result<Self> = async {
+            let writeback_settings = settings.writeback_settings(db_mode.into())?;
+            anyhow::ensure!(
+                raw_journal.is_none() || writeback_settings.is_some(),
+                "raw P3 Journal requires active writeback in this database mode"
+            );
             let disk_monitor = match &pool {
                 Some(pool) => Some(
                     crate::disk_health::PreparedDiskMonitor::prepare(pool.clone(), settings)
@@ -275,7 +282,7 @@ impl StartupContext {
             let retried_remote = Arc::new(crate::retrying_object_store::RetryingObjectStore::new(
                 traced_remote,
             )) as Arc<dyn object_store::ObjectStore>;
-            let (object_store, writeback) = match settings.writeback_settings(db_mode.into())? {
+            let (object_store, writeback) = match writeback_settings {
                 Some(writeback_settings) => {
                     let identity = writeback_journal_identity(
                         settings,
@@ -283,13 +290,28 @@ impl StartupContext {
                         &actual_db_path,
                         &encryption_key,
                     )?;
-                    let attached = crate::writeback::bootstrap::attach(
-                        retried_remote,
-                        writeback_settings,
-                        identity,
-                        &bucket.cache_directory_name(),
-                    )
-                    .await
+                    let namespace = bucket.cache_directory_name();
+                    let attached = match raw_journal {
+                        Some(region) => {
+                            crate::writeback::bootstrap::attach_raw(
+                                retried_remote,
+                                writeback_settings,
+                                identity,
+                                &namespace,
+                                region,
+                            )
+                            .await
+                        }
+                        None => {
+                            crate::writeback::bootstrap::attach(
+                                retried_remote,
+                                writeback_settings,
+                                identity,
+                                &namespace,
+                            )
+                            .await
+                        }
+                    }
                     .context("Failed to attach persistent writeback")?;
                     if let Some(pool) = &pool {
                         attached.lifecycle.set_pool(pool.clone());
@@ -1655,6 +1677,7 @@ mod role_decision_tests {
                 CompressionConfig::default(),
             ),
             cache_config: crate::fs::CacheConfig {
+                memory_only: false,
                 root_folder: std::env::temp_dir(),
                 max_cache_size_gb: 0.0,
                 memory_cache_size_gb: None,

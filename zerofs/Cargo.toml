@@ -25,7 +25,7 @@ members = [
     "zerofs-ffi",
 ]
 # A patched dependency, not a member: its tests and lints stay upstream's.
-exclude = ["vendor/foyer-storage"]
+exclude = ["vendor/foyer-storage", "raw-device"]
 
 # Single source of truth for the release version. The zerofs-csi image is
 # tagged with the repo release tag and layers on the zerofs image of that
@@ -70,6 +70,7 @@ hotpath-profile = ["dep:hotpath"]
 
 
 [dependencies]
+zerofs-raw-device = { path = "raw-device" }
 ninep-proto = { path = "ninep-proto" }
 nbd-proto = { path = "nbd-proto" }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }

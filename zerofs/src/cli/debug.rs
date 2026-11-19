@@ -102,6 +102,7 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
 
     let cache_config = CacheConfig {
+        memory_only: settings.raw_p3_authority(),
         root_folder: settings.cache.dir.clone(),
         max_cache_size_gb: settings.cache.disk_size_gb,
         memory_cache_size_gb: settings.cache.memory_size_gb,
@@ -112,6 +113,7 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
         path: path_from_url,
         sftp_pool,
         pool: _,
+        raw_journal: _,
         metadata_fault,
     } = open_storage(&settings).await?;
     let command = async move {
@@ -279,6 +281,7 @@ pub async fn reseed_writeback_predecessor(
         sftp_pool,
         path: database_path,
         pool: _,
+        raw_journal: _,
         metadata_fault: _,
     } = open_storage(&settings).await?;
     let remote = with_storage_class(Arc::from(remote), settings.storage.storage_class.as_deref());
@@ -351,6 +354,7 @@ pub async fn accept_remote_writeback_branch(
         sftp_pool,
         path: database_path,
         pool: _,
+        raw_journal: _,
         metadata_fault: _,
     } = open_storage(&settings).await?;
     let remote = with_storage_class(Arc::from(remote), settings.storage.storage_class.as_deref());

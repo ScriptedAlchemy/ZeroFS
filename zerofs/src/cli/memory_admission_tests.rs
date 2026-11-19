@@ -548,3 +548,192 @@ fn bounded_journal_keeps_an_independent_budget_and_rejects_shape_changes() {
     }
     assert!(admission(temp.path(), &base).is_err());
 }
+
+#[cfg(all(target_os = "linux", feature = "webui"))]
+mod raw_candidate {
+    use super::*;
+    use crate::config::StoreProfile;
+    use std::fs::{self, File};
+
+    const MIB: u64 = 1 << 20;
+
+    fn fixture(root: &Path) -> String {
+        for (name, size) in [("p3", 256), ("small", 32), ("large", 96)] {
+            File::create(root.join(name))
+                .unwrap()
+                .set_len(size * MIB)
+                .unwrap();
+        }
+        include_str!("memory_raw_fixture.toml")
+            .replace("/fixture/", &format!("{}/", root.display()))
+    }
+
+    fn validate(
+        root: &Path,
+        config: &str,
+        limit: Option<u64>,
+        swap: &str,
+    ) -> Result<MemoryBudgetReceipt> {
+        let config_path = root.join("raw.toml");
+        fs::write(&config_path, config)?;
+        fs::write(root.join("memory.swap.max"), swap)?;
+        let settings = Settings::from_file(config_path)?;
+        validate_server_startup_with_limits(
+            &settings,
+            CgroupMemoryLimits {
+                dedicated: limit.map(|hard_limit_bytes| super::super::MemoryEnvelope {
+                    hard_limit_bytes,
+                    source: root.join("memory.max"),
+                }),
+                shared_ceiling: None,
+            },
+        )?
+        .context("raw candidate requires a startup receipt")
+    }
+
+    #[test]
+    fn raw_candidate_fits_eight_gib_with_raised_destage_reserves() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let config = fixture(root);
+        let raised = config
+            .replace(
+                "reserve_free_gb = 0.016777216",
+                "reserve_free_gb = 0.033554432",
+            )
+            .replace(
+                "reserve_free_gb = 0.008388608",
+                "reserve_free_gb = 0.100663296",
+            );
+        let baseline = validate(root, &config, Some(8 * GIB), "0\n").unwrap();
+        let receipt = validate(root, &raised, Some(8 * GIB), "0\n").unwrap();
+        assert_eq!(receipt, baseline);
+        assert_eq!(receipt.required_bytes, 7_504 * MIB);
+        assert!(receipt.required_bytes < 8 * GIB);
+        assert_eq!(receipt.hard_limit_bytes, 8 * GIB);
+        assert!(receipt.stored_state_qualification.is_none());
+        for field in [
+            "memory_policy=raw-device-p3-candidate-v1",
+            "companion_allowance_bytes=1073741824",
+            "clean_cache_disk_bytes=0",
+            "clean_cache_bytes=100663296",
+            "object_writeback_bytes=8388608",
+            "volatile_write_bytes=33554432",
+        ] {
+            assert!(receipt.accounting.contains(field), "{}", receipt.accounting);
+        }
+        let settings = Settings::from_file(root.join("raw.toml")).unwrap();
+        let store = settings.store_profile().unwrap();
+        assert_eq!(
+            store.seal_threshold,
+            Some(StoreProfile::RAW_CANDIDATE_SEAL_BYTES)
+        );
+        assert_eq!(store.max_inflight_seals, Some(1));
+        for unused in ["unused-clean-cache", "unused-directory-journal"] {
+            assert!(!root.join(unused).exists());
+        }
+    }
+
+    #[test]
+    fn raw_candidate_rejects_unbounded_or_incompatible_geometry() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let config = fixture(root);
+        for (before, after, reason) in [
+            ("96,32,88,8,16,16", "96,32,80,16,16,16", "P3 layout"),
+            (
+                "round_robin_local",
+                "first_fit",
+                "round_robin_local placement",
+            ),
+            (
+                "reserve_free_gb = 0.016777216",
+                "reserve_free_gb = 0.008388608",
+                "reserves in",
+            ),
+            (
+                "reserve_free_gb = 0.008388608",
+                "reserve_free_gb = 0.101711872",
+                "reserves in",
+            ),
+            (
+                "disk_size_gb = 0.0\n",
+                "disk_size_gb = 0.064\n",
+                "cache.disk_size_gb",
+            ),
+            (
+                "memory_size_gb = 0.064",
+                "memory_size_gb = 1.0",
+                "96 MiB resolved clean cache",
+            ),
+            (
+                "volatile_max_operations = 128",
+                "volatile_max_operations = 129",
+                "128-operation",
+            ),
+            (
+                "disk_size_gb = 0.016777216",
+                "disk_size_gb = 0.032",
+                "16 MiB disk",
+            ),
+            (
+                "memory_size_gb = 0.008388608",
+                "memory_size_gb = 0.009",
+                "8 MiB journal RAM",
+            ),
+            (
+                "local_concurrency = 1",
+                "local_concurrency = 2",
+                "one local",
+            ),
+            (
+                "upload_concurrency = 2",
+                "upload_concurrency = 3",
+                "two upload workers",
+            ),
+        ] {
+            let bad = config.replace(before, after);
+            assert_ne!(bad, config);
+            let error = validate(root, &bad, Some(8 * GIB), "0").unwrap_err();
+            assert!(format!("{error:#}").contains(reason), "{error:#}");
+        }
+        File::options()
+            .write(true)
+            .open(root.join("small"))
+            .unwrap()
+            .set_len(96 * MIB)
+            .unwrap();
+        let error = validate(root, &config, Some(8 * GIB), "0").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("exactly 33554432 bytes"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn raw_candidate_requires_a_dedicated_swap_free_cgroup_and_explicit_opt_in() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let config = fixture(root);
+        for (limit, swap, reason) in [
+            (None, "0", "dedicated cgroup-v2"),
+            (Some(8 * GIB - 1), "0", "8 through 16 GiB"),
+            (Some(16 * GIB + 1), "0", "8 through 16 GiB"),
+            (Some(8 * GIB), "max", "memory.swap.max = 0"),
+        ] {
+            let error = validate(root, &config, limit, swap).unwrap_err();
+            assert!(format!("{error:#}").contains(reason), "{error:#}");
+        }
+        let error = validate(
+            root,
+            &config.replace("profile = \"raw-device-p3-candidate-v1\"\n", ""),
+            Some(8 * GIB),
+            "0",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("memory_policy=legacy"),
+            "{error:#}"
+        );
+    }
+}

@@ -1,0 +1,607 @@
+//! Bounded, resizable file semantics on a dedicated raw Journal or Catalog region.
+//!
+//! The first two blocks hold checksummed length checkpoints. The rest of the
+//! region is a direct byte mapping for a transactional database such as redb.
+//! The database owns transaction ordering and page reclamation. In particular
+//! its durable metadata must stop referencing truncated bytes before it calls
+//! `set_len`. Ordinary writes are durable only once `sync_data` succeeds.
+
+use crate::{BLOCK_SIZE, Error, Identity, MIN_DEVICE_SIZE, Result, Role, region::Region};
+use sha2::{Digest, Sha256};
+use std::{
+    any::Any,
+    fmt,
+    fs::File,
+    io,
+    sync::{Arc, Mutex},
+};
+
+const DATA_START: u64 = 2 * BLOCK_SIZE;
+const JOURNAL_MAGIC: [u8; 8] = *b"ZWBREG02";
+const CATALOG_MAGIC: [u8; 8] = *b"ZCTREG02";
+const DIGEST_START: usize = BLOCK_SIZE as usize - 32;
+type Block = [u8; BLOCK_SIZE as usize];
+
+pub struct TransactionRegion {
+    region: Region,
+    binding: Binding,
+    resize_ceiling: u64,
+    state: Mutex<State>,
+    // Drop the region descriptor before releasing exclusive device ownership.
+    _claim: Option<Arc<dyn Any + Send + Sync>>,
+}
+
+impl fmt::Debug for TransactionRegion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TransactionRegion")
+            .field("binding", &self.binding)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Binding {
+    identity: Identity,
+    device_len: u64,
+    start: u64,
+    region_len: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Length {
+    generation: u64,
+    len: u64,
+}
+
+#[derive(Debug)]
+struct State {
+    length: Length,
+    stale_slot: Option<u64>,
+    poisoned: bool,
+}
+
+impl TransactionRegion {
+    /// Initialize a blank subregion on an exclusively claimed descriptor.
+    /// Existing RawStore regions require an explicit migration.
+    pub fn provision(
+        file: File,
+        device_len: u64,
+        start: u64,
+        region_len: u64,
+        identity: Identity,
+    ) -> Result<Self> {
+        let (region, binding) = Self::bind(file, device_len, start, region_len, identity)?;
+        crate::store::require_blank(&region)?;
+        let length = Length {
+            generation: 1,
+            len: 0,
+        };
+        checkpoint(&region, binding, length)?;
+        Ok(Self::new(region, binding, length, None))
+    }
+
+    /// Open the labeled subregion. This performs no writes.
+    pub fn open(
+        file: File,
+        device_len: u64,
+        start: u64,
+        region_len: u64,
+        identity: Identity,
+    ) -> Result<Self> {
+        let (region, binding) = Self::bind(file, device_len, start, region_len, identity)?;
+        let mut block = [0; BLOCK_SIZE as usize];
+        let mut slots = [None; 2];
+        for (slot, length) in slots.iter_mut().enumerate() {
+            region.read_exact_at(&mut block, slot as u64 * BLOCK_SIZE)?;
+            *length = decode(&block, binding)?;
+        }
+        let (length, stale_slot) = match slots {
+            [Some(first), Some(second)] if first == second => (first, None),
+            [Some(first), Some(second)]
+                if first.generation.checked_sub(1) == Some(second.generation) =>
+            {
+                (first, Some(BLOCK_SIZE))
+            }
+            [Some(first), None] => (first, Some(BLOCK_SIZE)),
+            [None, Some(second)] => (second, Some(0)),
+            _ => {
+                return Err(corrupt(
+                    "no consistent raw transactional region length checkpoint",
+                ));
+            }
+        };
+        Ok(Self::new(region, binding, length, stale_slot))
+    }
+
+    fn bind(
+        file: File,
+        device_len: u64,
+        start: u64,
+        region_len: u64,
+        identity: Identity,
+    ) -> Result<(Region, Binding)> {
+        identity.validate()?;
+        if !matches!(identity.role, Role::Journal | Role::Catalog) {
+            return Err(Error::InvalidArgument(
+                "expected a Journal or Catalog region identity",
+            ));
+        }
+        if region_len < MIN_DEVICE_SIZE {
+            return Err(Error::InvalidGeometry(
+                "transactional region is too small".into(),
+            ));
+        }
+        // Validate the claimed descriptor's reported boundary before trusting
+        // the caller's subregion geometry.
+        Region::whole(file.try_clone()?, device_len)?;
+        let region = Region::new(file, device_len, start, region_len)?;
+        Ok((
+            region,
+            Binding {
+                identity,
+                device_len,
+                start,
+                region_len,
+            },
+        ))
+    }
+
+    fn new(region: Region, binding: Binding, length: Length, stale_slot: Option<u64>) -> Self {
+        Self {
+            region,
+            binding,
+            resize_ceiling: binding.region_len - DATA_START,
+            state: Mutex::new(State {
+                length,
+                stale_slot,
+                poisoned: false,
+            }),
+            _claim: None,
+        }
+    }
+
+    /// Keep the exclusive claim alive until after this region's descriptor closes.
+    pub fn retain_claim<C: Any + Send + Sync>(mut self, claim: Arc<C>) -> Self {
+        self._claim = Some(claim);
+        self
+    }
+
+    pub fn identity(&self) -> Identity {
+        self.binding.identity
+    }
+
+    pub fn capacity(&self) -> u64 {
+        self.binding.region_len - DATA_START
+    }
+
+    /// Restrict future growth before handing the file to the database.
+    /// Refuse to start if the current file already occupies the reserve.
+    pub fn with_resize_ceiling(mut self, ceiling: u64) -> io::Result<Self> {
+        if ceiling > self.resize_ceiling {
+            return Err(io::Error::other(
+                "raw transactional resize ceiling exceeds the region",
+            ));
+        }
+        if self.len()? > ceiling {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "existing raw transactional file exceeds the requested resize ceiling",
+            ));
+        }
+        self.resize_ceiling = ceiling;
+        Ok(self)
+    }
+
+    pub fn resize_ceiling(&self) -> u64 {
+        self.resize_ceiling
+    }
+
+    pub fn len(&self) -> io::Result<u64> {
+        Ok(self.state()?.length.len)
+    }
+
+    pub fn is_empty(&self) -> io::Result<bool> {
+        Ok(self.len()? == 0)
+    }
+
+    pub fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        let state = self.state()?;
+        let start = data_offset(offset, out.len(), state.length.len)?;
+        self.region.read_exact_at(out, start)
+    }
+
+    pub fn write(&self, offset: u64, bytes: &[u8]) -> io::Result<()> {
+        let mut state = self.state()?;
+        let start = data_offset(offset, bytes.len(), state.length.len)?;
+        self.repair(&mut state)?;
+        let result = self.region.write_all_at(bytes, start);
+        poison_on_error(&mut state, result)
+    }
+
+    /// Restore file-style zero-on-growth even after previously used physical
+    /// blocks are exposed again. Persist zeros before publishing the length.
+    /// Shrink keeps the truncated bytes intact and fences prior database writes
+    /// before publishing the shorter length.
+    pub fn set_len(&self, len: u64) -> io::Result<()> {
+        if len > self.resize_ceiling {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "raw transactional region region is full",
+            ));
+        }
+        let mut state = self.state()?;
+        self.repair(&mut state)?;
+        if len == state.length.len {
+            return Ok(());
+        }
+        let next =
+            Length {
+                generation: state.length.generation.checked_add(1).ok_or_else(|| {
+                    io::Error::other("raw transactional region generation exhausted")
+                })?,
+                len,
+            };
+        let result = (|| {
+            if len > state.length.len {
+                let zeros = [0; 64 * 1024];
+                let mut offset = state.length.len;
+                while offset < len {
+                    let count = (len - offset).min(zeros.len() as u64) as usize;
+                    self.region
+                        .write_all_at(&zeros[..count], DATA_START + offset)?;
+                    offset += count as u64;
+                }
+            }
+            self.region.sync_data()?;
+            checkpoint(&self.region, self.binding, next)
+        })();
+        poison_on_error(&mut state, result)?;
+        state.length = next;
+        Ok(())
+    }
+
+    pub fn sync_data(&self) -> io::Result<()> {
+        let mut state = self.state()?;
+        self.repair(&mut state)?;
+        let result = self.region.sync_data();
+        poison_on_error(&mut state, result)
+    }
+
+    fn state(&self) -> io::Result<std::sync::MutexGuard<'_, State>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("raw transactional region lock poisoned"))?;
+        if state.poisoned {
+            return Err(Error::Poisoned.into());
+        }
+        Ok(state)
+    }
+
+    fn repair(&self, state: &mut State) -> io::Result<()> {
+        if let Some(offset) = state.stale_slot {
+            let bytes = encode(self.binding, state.length);
+            let result = self
+                .region
+                .write_all_at(&bytes, offset)
+                .and_then(|()| self.region.sync_data());
+            poison_on_error(state, result)?;
+            state.stale_slot = None;
+        }
+        Ok(())
+    }
+}
+
+fn poison_on_error(state: &mut State, result: io::Result<()>) -> io::Result<()> {
+    state.poisoned |= result.is_err();
+    result
+}
+
+fn data_offset(offset: u64, count: usize, len: u64) -> io::Result<u64> {
+    if offset.checked_add(count as u64).is_none_or(|end| end > len) {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "I/O outside raw transactional region file",
+        ));
+    }
+    Ok(DATA_START + offset)
+}
+
+fn checkpoint(region: &Region, binding: Binding, length: Length) -> io::Result<()> {
+    let bytes = encode(binding, length);
+    for offset in [0, BLOCK_SIZE] {
+        region.write_all_at(&bytes, offset)?;
+        region.sync_data()?;
+    }
+    Ok(())
+}
+
+fn encode(binding: Binding, length: Length) -> Block {
+    let mut block = [0; BLOCK_SIZE as usize];
+    let magic = match binding.identity.role {
+        Role::Journal => JOURNAL_MAGIC,
+        Role::Catalog => CATALOG_MAGIC,
+        _ => unreachable!("validated transactional role"),
+    };
+    block[..8].copy_from_slice(&magic);
+    block[8..24].copy_from_slice(&binding.identity.pool_uuid);
+    block[24..40].copy_from_slice(&binding.identity.member_uuid);
+    for (index, value) in [
+        binding.device_len,
+        binding.start,
+        binding.region_len,
+        length.generation,
+        length.len,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let offset = 40 + index * 8;
+        block[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    let digest = Sha256::digest(&block[..DIGEST_START]);
+    block[DIGEST_START..].copy_from_slice(&digest);
+    block
+}
+
+fn decode(block: &Block, binding: Binding) -> Result<Option<Length>> {
+    let role = match block[..8].try_into().unwrap() {
+        JOURNAL_MAGIC => Role::Journal,
+        CATALOG_MAGIC => Role::Catalog,
+        _ => return Ok(None),
+    };
+    if block[DIGEST_START..] != Sha256::digest(&block[..DIGEST_START])[..] {
+        return Ok(None);
+    }
+    let word = |offset| u64::from_le_bytes(block[offset..offset + 8].try_into().unwrap());
+    let identity = Identity {
+        pool_uuid: block[8..24].try_into().unwrap(),
+        member_uuid: block[24..40].try_into().unwrap(),
+        role,
+    };
+    if identity != binding.identity {
+        return Err(Error::IdentityMismatch {
+            expected: binding.identity,
+            found: identity,
+        });
+    }
+    if word(40) != binding.device_len || word(48) != binding.start || word(56) != binding.region_len
+    {
+        return Err(corrupt(
+            "raw transactional region checkpoint geometry mismatch",
+        ));
+    }
+    let length = Length {
+        generation: word(64),
+        len: word(72),
+    };
+    if length.generation == 0 || length.len > binding.region_len - DATA_START {
+        return Err(corrupt(
+            "invalid raw transactional region checkpoint length",
+        ));
+    }
+    Ok(Some(length))
+}
+
+fn corrupt(reason: &str) -> Error {
+    Error::Corrupt {
+        offset: 0,
+        reason: reason.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::FileExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const START: u64 = MIN_DEVICE_SIZE;
+    const DEVICE_LEN: u64 = 3 * MIN_DEVICE_SIZE;
+    const ID: Identity = Identity {
+        pool_uuid: [1; 16],
+        member_uuid: [2; 16],
+        role: Role::Journal,
+    };
+
+    struct Media {
+        path: std::path::PathBuf,
+        file: File,
+    }
+
+    impl Media {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "zerofs-journal-region-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed),
+            ));
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            file.set_len(DEVICE_LEN).unwrap();
+            Self { path, file }
+        }
+
+        fn reopen(&self) -> TransactionRegion {
+            TransactionRegion::open(
+                self.file.try_clone().unwrap(),
+                DEVICE_LEN,
+                START,
+                MIN_DEVICE_SIZE,
+                ID,
+            )
+            .unwrap()
+        }
+
+        fn provision(&self) -> TransactionRegion {
+            TransactionRegion::provision(
+                self.file.try_clone().unwrap(),
+                DEVICE_LEN,
+                START,
+                MIN_DEVICE_SIZE,
+                ID,
+            )
+            .unwrap()
+        }
+    }
+
+    impl Drop for Media {
+        fn drop(&mut self) {
+            std::fs::remove_file(&self.path).unwrap();
+        }
+    }
+
+    #[test]
+    fn journal_and_catalog_hold_the_claim_independently() {
+        let media = Media::new();
+        let claim = Arc::new(());
+        let weak = Arc::downgrade(&claim);
+        let journal = media.provision().retain_claim(Arc::clone(&claim));
+        let catalog_id = Identity {
+            role: Role::Catalog,
+            ..ID
+        };
+        let catalog = TransactionRegion::provision(
+            media.file.try_clone().unwrap(),
+            DEVICE_LEN,
+            2 * MIN_DEVICE_SIZE,
+            MIN_DEVICE_SIZE,
+            catalog_id,
+        )
+        .unwrap()
+        .retain_claim(claim);
+        assert!(matches!(
+            TransactionRegion::open(
+                media.file.try_clone().unwrap(),
+                DEVICE_LEN,
+                START,
+                MIN_DEVICE_SIZE,
+                catalog_id,
+            ),
+            Err(Error::IdentityMismatch { .. })
+        ));
+        drop(journal);
+        assert!(weak.upgrade().is_some());
+        drop(catalog);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn reuses_retired_physical_bytes_and_preserves_adjacent_regions() {
+        let media = Media::new();
+        media.file.write_all_at(&[0xba], START - 1).unwrap();
+        media
+            .file
+            .write_all_at(&[0xbe], START + MIN_DEVICE_SIZE)
+            .unwrap();
+
+        let journal = media.provision();
+        let len = journal.capacity() - BLOCK_SIZE;
+        let journal = journal.with_resize_ceiling(len).unwrap();
+        journal.set_len(len).unwrap();
+        assert_eq!(
+            journal.set_len(len + 1).unwrap_err().kind(),
+            io::ErrorKind::StorageFull
+        );
+        journal.write(len - 2, &[0xa1, 0xa2]).unwrap();
+        journal.sync_data().unwrap();
+        drop(journal);
+
+        let error = media.reopen().with_resize_ceiling(len - 1).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+        let reopen_with_reserve = || media.reopen().with_resize_ceiling(len).unwrap();
+        let journal = reopen_with_reserve();
+        let mut data = [0; 2];
+        journal.read(len - 2, &mut data).unwrap();
+        assert_eq!(data, [0xa1, 0xa2]);
+
+        // The caller's durable retirement allows it to truncate this tail.
+        journal.set_len(len - 2).unwrap();
+        drop(journal);
+        let journal = reopen_with_reserve();
+        assert!(journal.read(len - 2, &mut data).is_err());
+        journal.set_len(len).unwrap();
+        drop(journal);
+
+        let journal = reopen_with_reserve();
+        journal.read(len - 2, &mut data).unwrap();
+        assert_eq!(data, [0, 0]);
+        journal.write(len - 2, &[0xf1, 0xf2]).unwrap();
+        journal.sync_data().unwrap();
+        drop(journal);
+        let journal = reopen_with_reserve();
+        journal.read(len - 2, &mut data).unwrap();
+        assert_eq!(data, [0xf1, 0xf2]);
+        assert_eq!(
+            journal.set_len(len + 1).unwrap_err().kind(),
+            io::ErrorKind::StorageFull
+        );
+        let mut reserve = [0; BLOCK_SIZE as usize];
+        media
+            .file
+            .read_exact_at(&mut reserve, START + DATA_START + len)
+            .unwrap();
+        assert_eq!(reserve, [0; BLOCK_SIZE as usize]);
+        media.file.read_exact_at(&mut data[..1], START - 1).unwrap();
+        media
+            .file
+            .read_exact_at(&mut data[1..], START + MIN_DEVICE_SIZE)
+            .unwrap();
+        assert_eq!(data, [0xba, 0xbe]);
+    }
+
+    #[test]
+    fn recovers_torn_and_interrupted_length_updates_without_destroying_the_good_slot() {
+        let media = Media::new();
+        let journal = media.provision();
+        journal.set_len(2 * BLOCK_SIZE).unwrap();
+        journal.write(BLOCK_SIZE, &[0x42]).unwrap();
+        journal.sync_data().unwrap();
+
+        let binding = journal.binding;
+        let length = journal.state().unwrap().length;
+        // A torn first slot represents a cut before the new shrink checkpoint.
+        media.file.write_all_at(&[0; 4], START).unwrap();
+        media.file.sync_data().unwrap();
+        drop(journal);
+
+        let journal = media.reopen();
+        assert_eq!(journal.len().unwrap(), 2 * BLOCK_SIZE);
+        let mut data = [0];
+        journal.read(BLOCK_SIZE, &mut data).unwrap();
+        assert_eq!(data, [0x42]);
+        journal.sync_data().unwrap();
+        drop(journal);
+
+        // A cut after the first shorter label is durable must expose that
+        // shorter length. Even interrupted repair leaves the first slot valid.
+        let shorter = Length {
+            generation: length.generation + 1,
+            len: BLOCK_SIZE,
+        };
+        media
+            .file
+            .write_all_at(&encode(binding, shorter), START)
+            .unwrap();
+        media.file.sync_data().unwrap();
+        let journal = media.reopen();
+        assert_eq!(journal.state().unwrap().stale_slot, Some(BLOCK_SIZE));
+        drop(journal);
+        media
+            .file
+            .write_all_at(&[0; 4], START + BLOCK_SIZE)
+            .unwrap();
+        media.file.sync_data().unwrap();
+        let journal = media.reopen();
+        assert_eq!(journal.len().unwrap(), BLOCK_SIZE);
+        journal.set_len(2 * BLOCK_SIZE).unwrap();
+        journal.read(BLOCK_SIZE, &mut data).unwrap();
+        assert_eq!(data, [0]);
+    }
+}

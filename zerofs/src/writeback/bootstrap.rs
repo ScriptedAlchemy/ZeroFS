@@ -5,6 +5,7 @@ use crate::writeback::model::JournalIdentity;
 use crate::writeback::reservation::SsdAdmission;
 use crate::writeback::space_sample::PhysicalSpaceSampler;
 use crate::writeback::store::WritebackObjectStore;
+use anyhow::Context;
 use object_store::ObjectStore;
 use std::sync::Arc;
 
@@ -35,8 +36,56 @@ pub(crate) async fn attach(
     let journal_dir = base.open_or_create_child(namespace.as_ref(), 0o700)?;
     settings.dir = journal_dir.display().to_path_buf();
     let journal = Arc::new(Journal::open_anchored(journal_dir.clone(), identity)?);
-    let recovery = journal.progress()?;
     let space = Arc::new(PhysicalSpaceSampler::new_anchored(journal_dir));
+    attach_journal(remote, settings, journal, space).await
+}
+
+pub(crate) async fn attach_raw(
+    remote: Arc<dyn ObjectStore>,
+    settings: WritebackSettings,
+    identity: JournalIdentity,
+    namespace: &str,
+    region: zerofs_raw_device::journal_region::TransactionRegion,
+) -> anyhow::Result<AttachedWriteback> {
+    validate_namespace(namespace)?;
+    let previous = settings.dir.join(namespace);
+    match std::fs::symlink_metadata(&previous) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+        Ok(_) => anyhow::bail!(
+            "raw P3 writeback refuses an existing directory journal at {}; drain and migrate it first",
+            previous.display()
+        ),
+    }
+
+    let capacity = region.capacity();
+    let ceiling = capacity
+        .checked_sub(settings.min_free_bytes)
+        .context("raw writeback free-space reserve exceeds P3 Journal capacity")?;
+    // Leave room below the hard ceiling for geometric allocator growth,
+    // copy-on-write metadata, and pages pinned by older replay readers.
+    anyhow::ensure!(
+        settings.disk_bytes <= ceiling / 4,
+        "raw writeback disk budget exceeds one quarter of the usable P3 Journal bytes ({ceiling})"
+    );
+    let region = region.with_resize_ceiling(ceiling)?;
+    let journal = Arc::new(Journal::open_raw(region, identity)?);
+    let space = Arc::new(PhysicalSpaceSampler::new_raw(Arc::clone(&journal)));
+    tracing::info!(
+        capacity,
+        ceiling,
+        "using raw P3 Journal for writeback metadata and payloads"
+    );
+    attach_journal(remote, settings, journal, space).await
+}
+
+async fn attach_journal(
+    remote: Arc<dyn ObjectStore>,
+    settings: WritebackSettings,
+    journal: Arc<Journal>,
+    space: Arc<PhysicalSpaceSampler>,
+) -> anyhow::Result<AttachedWriteback> {
+    let recovery = journal.progress()?;
     let sample = space.sample().await?;
     let pending = journal.pending_ssd_reservations()?;
     let ssd = Arc::new(SsdAdmission::recover(
@@ -98,6 +147,122 @@ mod tests {
 
     fn physical_child(temp: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
         temp.path().canonicalize().unwrap().join(name)
+    }
+
+    #[tokio::test]
+    async fn raw_attachment_fences_replays_and_retires_without_a_directory() {
+        use zerofs_raw_device::{Identity, Role, journal_region::TransactionRegion};
+
+        const CAPACITY: u64 = 64 << 20;
+        const ID: Identity = Identity {
+            pool_uuid: [1; 16],
+            member_uuid: [2; 16],
+            role: Role::Journal,
+        };
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(CAPACITY).unwrap();
+        let region =
+            TransactionRegion::provision(file.try_clone().unwrap(), CAPACITY, 0, CAPACITY, ID)
+                .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let settings = WritebackSettings {
+            dir: physical_child(&temp, "unused-directory"),
+            ack_mode: AckMode::Memory,
+            memory_bytes: 4 << 20,
+            disk_bytes: 8 << 20,
+            min_free_bytes: 1,
+            high_watermark_percent: 95,
+            resume_percent: 85,
+            upload_concurrency: 2,
+            local_concurrency: 2,
+            shutdown_flush: ShutdownFlush::Local,
+        };
+        let identity = JournalIdentity {
+            format_version: 1,
+            bucket_id: "raw-bucket".to_owned(),
+            backend_endpoint: "raw-pool".to_owned(),
+            database_prefix: "db".to_owned(),
+            backend_kind: "raw".to_owned(),
+            encryption_key_identity_sha256: [7; 32],
+        };
+        let remote = Arc::new(InMemory::new());
+        let (partitioned, controls) = FaultStore::new(remote.clone());
+        controls.partition_writes(true);
+        let attached = super::attach_raw(
+            partitioned.clone(),
+            settings.clone(),
+            identity.clone(),
+            "bucket_fixture",
+            region,
+        )
+        .await
+        .unwrap();
+        let sample = attached.space.sample().await.unwrap();
+        assert!(sample.available_bytes < CAPACITY - 2 * zerofs_raw_device::BLOCK_SIZE);
+        let path = Path::from("db/segments/1");
+        let payload = Bytes::from(vec![0x58; 132 << 10]);
+        attached
+            .store
+            .put(&path, payload.clone().into())
+            .await
+            .unwrap();
+        attached
+            .lifecycle
+            .wait_local_through_accepted()
+            .await
+            .unwrap();
+        assert_eq!(attached.lifecycle.status().unwrap().local_seq, 1);
+        assert!(remote.head(&path).await.is_err());
+        attached.lifecycle.shutdown().await.unwrap();
+        drop(attached);
+
+        let region =
+            TransactionRegion::open(file.try_clone().unwrap(), CAPACITY, 0, CAPACITY, ID).unwrap();
+        let attached = super::attach_raw(
+            partitioned,
+            settings.clone(),
+            identity.clone(),
+            "bucket_fixture",
+            region,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            attached
+                .store
+                .get(&path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            payload
+        );
+        assert!(remote.head(&path).await.is_err());
+        controls.partition_writes(false);
+        attached.lifecycle.activate_remote().unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            attached.lifecycle.wait_remote(1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        attached.lifecycle.shutdown().await.unwrap();
+        drop(attached);
+        assert_eq!(
+            remote.get(&path).await.unwrap().bytes().await.unwrap(),
+            payload
+        );
+
+        let region = TransactionRegion::open(file, CAPACITY, 0, CAPACITY, ID).unwrap();
+        let ceiling = region.capacity() - settings.min_free_bytes;
+        assert!(region.len().unwrap() <= ceiling);
+        let region = region.with_resize_ceiling(ceiling).unwrap();
+        let journal = super::Journal::open_raw(region, identity).unwrap();
+        assert_eq!(journal.progress().unwrap().remote_seq, 1);
+        assert!(journal.mutation(1).unwrap().is_none());
+        assert!(!settings.dir.exists());
     }
 
     #[tokio::test]

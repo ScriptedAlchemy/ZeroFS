@@ -117,6 +117,7 @@ async fn resolve_checkpoint_name(settings: &Settings, name: &str) -> Result<uuid
         path: path_from_url,
         sftp_pool,
         pool: _,
+        raw_journal: _,
         metadata_fault,
     } = open_storage(settings).await?;
     let object_store = with_storage_class(
@@ -755,7 +756,7 @@ pub(crate) const CLEAN_CACHE_LOCK_FILE: &str = ".zerofs-clean-cache.lock";
 
 #[derive(Debug)]
 pub(super) struct CleanCacheOwner {
-    _lock: File,
+    _lock: Option<File>,
 }
 
 impl Drop for CleanCacheOwner {
@@ -763,7 +764,9 @@ impl Drop for CleanCacheOwner {
         // A child's inherited descriptor can outlive this owner until exec.
         // Release the shared open file description when the last cache
         // ownership guard is dropped, rather than waiting for that descriptor.
-        if let Err(error) = FileExt::unlock(&self._lock) {
+        if let Some(lock) = &self._lock
+            && let Err(error) = FileExt::unlock(lock)
+        {
             tracing::warn!(%error, "failed to release clean cache ownership lock");
         }
     }
@@ -800,7 +803,7 @@ fn acquire_clean_cache_owner(root: &StdPath) -> Result<CleanCacheOwner> {
             root.display()
         );
     }
-    Ok(CleanCacheOwner { _lock: lock })
+    Ok(CleanCacheOwner { _lock: Some(lock) })
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -884,33 +887,39 @@ async fn build_block_hybrid(
     Arc<FoyerHybridCache>,
     foyer::HybridCache<slatedb::db_cache::CachedKey, slatedb::db_cache::CachedEntry>,
 )> {
-    tokio::fs::create_dir_all(hybrid_cache_root)
-        .await
-        .with_context(|| {
-            format!(
-                "creating foyer hybrid cache dir at {}",
-                hybrid_cache_root.display()
-            )
-        })?;
-
-    let hybrid = HybridCacheBuilder::new()
+    let builder = HybridCacheBuilder::new()
         .with_name("zerofs-slatedb-hybrid")
         .with_metrics_registry(Box::new(metrics))
         .memory(memory_bytes)
         .with_eviction_config(S3FifoConfig::default())
         .with_weighter(|_, v: &slatedb::db_cache::CachedEntry| v.size())
         .storage()
-        .with_spawner(Spawner::from(foyer_handle.clone()))
-        .with_io_engine_config(PsyncIoEngineConfig::new())
-        .with_engine_config(
-            BlockEngineConfig::new(
-                FsDeviceBuilder::new(hybrid_cache_root)
-                    .with_capacity(disk_bytes)
-                    .build()
-                    .map_err(|e| foyer_build_error("foyer device build failed", e))?,
+        .with_spawner(Spawner::from(foyer_handle.clone()));
+    let builder = if disk_bytes == 0 {
+        builder
+    } else {
+        tokio::fs::create_dir_all(hybrid_cache_root)
+            .await
+            .with_context(|| {
+                format!(
+                    "creating foyer hybrid cache dir at {}",
+                    hybrid_cache_root.display()
+                )
+            })?;
+
+        builder
+            .with_io_engine_config(PsyncIoEngineConfig::new())
+            .with_engine_config(
+                BlockEngineConfig::new(
+                    FsDeviceBuilder::new(hybrid_cache_root)
+                        .with_capacity(disk_bytes)
+                        .build()
+                        .map_err(|e| foyer_build_error("foyer device build failed", e))?,
+                )
+                .with_block_size(BLOCK_CACHE_BLOCK_SIZE),
             )
-            .with_block_size(BLOCK_CACHE_BLOCK_SIZE),
-        )
+    };
+    let hybrid = builder
         .build()
         .await
         .map_err(|e| foyer_build_error("foyer hybrid build failed", e))?;
@@ -1073,43 +1082,49 @@ pub(crate) async fn build_parts_hybrid(
     use crate::object_store_prefetch::PartKey;
     use bytes::Bytes;
 
-    // Legacy binaries ignore our layout marker. Keep their files in a distinct
-    // namespace so a rollback cannot overwrite files belonging to this policy.
-    // Reclaim only their owned disposable files, under the caller's cache lock.
-    prune_foyer_partitions(&cache_root.join(LEGACY_PARTS_CACHE_DIR), 0)?;
-    let parts_root = cache_root.join(PARTS_CACHE_DIR);
-    prepare_parts_cache_layout(&parts_root, disk_bytes)?;
-
-    let knobs = parts_engine_knobs(disk_bytes);
-
-    HybridCacheBuilder::new()
+    let builder = HybridCacheBuilder::new()
         .with_name("zerofs-object-prefetch-parts")
         .with_metrics_registry(Box::new(metrics))
         .memory(memory_bytes)
         .with_eviction_config(S3FifoConfig::default())
         .with_weighter(|_: &PartKey, v: &Bytes| v.len())
         .storage()
-        .with_spawner(Spawner::from(foyer_handle.clone()))
-        .with_io_engine_config(PsyncIoEngineConfig::new())
-        // Pinned Foyer 0.22.3 can lose tombstones on reopen or log wraparound.
-        // Start this disposable cache cold so invalidated parts cannot return.
-        .with_recover_mode(foyer::RecoverMode::None)
-        .with_engine_config(
-            BlockEngineConfig::new(
-                FsDeviceBuilder::new(&parts_root)
-                    .with_capacity(disk_bytes)
-                    .build()
-                    .map_err(|e| foyer_build_error("parts foyer device build failed", e))?,
+        .with_spawner(Spawner::from(foyer_handle.clone()));
+    let builder = if disk_bytes == 0 {
+        builder
+    } else {
+        // Legacy binaries ignore our layout marker. Keep their files in a distinct
+        // namespace so a rollback cannot overwrite files belonging to this policy.
+        // Reclaim only their owned disposable files, under the caller's cache lock.
+        prune_foyer_partitions(&cache_root.join(LEGACY_PARTS_CACHE_DIR), 0)?;
+        let parts_root = cache_root.join(PARTS_CACHE_DIR);
+        prepare_parts_cache_layout(&parts_root, disk_bytes)?;
+
+        let knobs = parts_engine_knobs(disk_bytes);
+
+        builder
+            .with_io_engine_config(PsyncIoEngineConfig::new())
+            // Pinned Foyer 0.22.3 can lose tombstones on reopen or log wraparound.
+            // Start this disposable cache cold so invalidated parts cannot return.
+            .with_recover_mode(foyer::RecoverMode::None)
+            .with_engine_config(
+                BlockEngineConfig::new(
+                    FsDeviceBuilder::new(&parts_root)
+                        .with_capacity(disk_bytes)
+                        .build()
+                        .map_err(|e| foyer_build_error("parts foyer device build failed", e))?,
+                )
+                .with_block_size(PARTS_BLOCK_SIZE)
+                // Recovery is disabled, so no persistent deletion log is needed.
+                .with_tombstone_log(false)
+                .with_submit_queue_size_threshold(knobs.submit_queue_bytes)
+                .with_flushers(knobs.flushers)
+                .with_reclaimers(knobs.flushers)
+                .with_clean_block_threshold(knobs.clean_block_threshold)
+                .with_buffer_pool_size(knobs.buffer_pool_bytes),
             )
-            .with_block_size(PARTS_BLOCK_SIZE)
-            // Recovery is disabled, so no persistent deletion log is needed.
-            .with_tombstone_log(false)
-            .with_submit_queue_size_threshold(knobs.submit_queue_bytes)
-            .with_flushers(knobs.flushers)
-            .with_reclaimers(knobs.flushers)
-            .with_clean_block_threshold(knobs.clean_block_threshold)
-            .with_buffer_pool_size(knobs.buffer_pool_bytes),
-        )
+    };
+    builder
         .build()
         .await
         .map_err(|e| foyer_build_error("parts foyer hybrid build failed", e))
@@ -1248,40 +1263,50 @@ pub async fn build_slatedb(
     let total_memory_cache_gb = cache_config.memory_cache_size_gb.unwrap_or(0.25);
 
     let total_disk_bytes = (total_disk_cache_gb * 1_000_000_000.0) as usize;
-    let (parts_disk_bytes, hybrid_disk_bytes) = split_disk_budget(total_disk_bytes);
-    let cache_owner = Arc::new(acquire_clean_cache_owner(&cache_config.root_folder)?);
-    for (name, root, capacity) in [
-        (
-            "legacy-decoded-blocks",
-            cache_config.root_folder.join(LEGACY_BLOCK_CACHE_DIR),
-            0,
-        ),
-        (
-            "decoded-blocks",
-            cache_config.root_folder.join(BLOCK_CACHE_DIR),
-            hybrid_disk_bytes,
-        ),
-        (
-            "legacy-raw-parts",
-            cache_config.root_folder.join(LEGACY_PARTS_CACHE_DIR),
-            0,
-        ),
-        (
-            "raw-parts",
-            cache_config.root_folder.join(PARTS_CACHE_DIR),
-            parts_disk_bytes,
-        ),
-    ] {
-        let pruned = prune_foyer_partitions(&root, capacity)?;
-        if pruned.removed_files > 0 {
-            info!(
-                cache = name,
-                removed_files = pruned.removed_files,
-                allocated_bytes_reclaimed = pruned.allocated_bytes_reclaimed,
-                "Pruned surplus clean-cache partitions before opening Foyer"
-            );
+    let (parts_disk_bytes, hybrid_disk_bytes, cache_owner) = if cache_config.memory_only {
+        anyhow::ensure!(
+            total_disk_cache_gb == 0.0,
+            "raw P3 currently requires zero persistent clean cache"
+        );
+        (0, 0, CleanCacheOwner { _lock: None })
+    } else {
+        let (parts_disk_bytes, hybrid_disk_bytes) = split_disk_budget(total_disk_bytes);
+        let cache_owner = acquire_clean_cache_owner(&cache_config.root_folder)?;
+        for (name, root, capacity) in [
+            (
+                "legacy-decoded-blocks",
+                cache_config.root_folder.join(LEGACY_BLOCK_CACHE_DIR),
+                0,
+            ),
+            (
+                "decoded-blocks",
+                cache_config.root_folder.join(BLOCK_CACHE_DIR),
+                hybrid_disk_bytes,
+            ),
+            (
+                "legacy-raw-parts",
+                cache_config.root_folder.join(LEGACY_PARTS_CACHE_DIR),
+                0,
+            ),
+            (
+                "raw-parts",
+                cache_config.root_folder.join(PARTS_CACHE_DIR),
+                parts_disk_bytes,
+            ),
+        ] {
+            let pruned = prune_foyer_partitions(&root, capacity)?;
+            if pruned.removed_files > 0 {
+                info!(
+                    cache = name,
+                    removed_files = pruned.removed_files,
+                    allocated_bytes_reclaimed = pruned.allocated_bytes_reclaimed,
+                    "Pruned surplus clean-cache partitions before opening Foyer"
+                );
+            }
         }
-    }
+        (parts_disk_bytes, hybrid_disk_bytes, cache_owner)
+    };
+    let cache_owner = Arc::new(cache_owner);
     let total_memory_bytes = (total_memory_cache_gb * 1_000_000_000.0) as usize;
     let (parts_memory_bytes, hybrid_memory_bytes, decoded_extent_memory_bytes) =
         split_memory_budget(total_memory_bytes);
@@ -2311,6 +2336,7 @@ mod tests {
         let opened = build_slatedb(
             store,
             &crate::fs::CacheConfig {
+                memory_only: false,
                 root_folder: cache_root.path().to_owned(),
                 max_cache_size_gb: 0.0,
                 memory_cache_size_gb: Some(0.064),
@@ -2354,6 +2380,7 @@ mod tests {
         let opened = build_slatedb(
             store,
             &crate::fs::CacheConfig {
+                memory_only: false,
                 root_folder: cache_root.path().to_owned(),
                 max_cache_size_gb: 0.0,
                 memory_cache_size_gb: Some(0.064),
@@ -3483,7 +3510,7 @@ min_free_gb = 256.0
         let live_owner = Arc::clone(&first);
         // A duplicate models the shared open file description inherited
         // between fork and exec without starting a child or relying on timing.
-        let inherited_lock = first._lock.try_clone().unwrap();
+        let inherited_lock = first._lock.as_ref().unwrap().try_clone().unwrap();
         let assert_locked = || {
             let error = acquire_clean_cache_owner(root.path()).unwrap_err();
             assert!(error.to_string().contains("already in use"), "{error:#}");

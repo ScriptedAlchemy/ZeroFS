@@ -1,5 +1,9 @@
 //! Build the configured storage graph and retain every transport's lifecycle.
 
+pub(crate) mod raw;
+#[cfg(target_os = "linux")]
+mod raw_authority;
+
 use crate::config::Settings;
 use crate::metadata_fault::{LocalMetadataStore, MetadataFault};
 use crate::operator_required::operator_required;
@@ -69,6 +73,7 @@ impl BackendSessions {
 pub(crate) struct OpenedStorage {
     pub(crate) store: Box<dyn ObjectStore>,
     pub(crate) path: Path,
+    pub(crate) raw_journal: Option<zerofs_raw_device::journal_region::TransactionRegion>,
     pub(crate) sftp_pool: Option<BackendSessions>,
     pub(crate) pool: Option<PoolObjectStore>,
     /// Trips on the first non-transient local I/O error of the metadata
@@ -83,7 +88,7 @@ fn guard_local_metadata(
     store: Box<dyn ObjectStore>,
     fault: &MetadataFault,
 ) -> Box<dyn ObjectStore> {
-    if url.scheme() != "file" {
+    if !matches!(url.scheme(), "file" | "raw+p3-v2") {
         return store;
     }
     #[cfg(test)]
@@ -127,6 +132,7 @@ pub(crate) async fn open_storage(settings: &Settings) -> Result<OpenedStorage> {
         path,
         sftp_pool: sftp_pool.map(BackendSessions::single),
         pool: None,
+        raw_journal: None,
         metadata_fault,
     })
 }
@@ -145,33 +151,56 @@ pub(crate) async fn open_pool_storage(
     settings.validate()?;
     let allow_degraded = config.allow_degraded_start && !initialize;
     let missing = missing_member(settings, config, allow_degraded)?;
-    crate::storage_readiness::verify_open_paths(
-        settings,
-        &[
-            (
-                crate::storage_readiness::RoleName::Catalog,
-                config.catalog_dir.join(CATALOG_FILE_NAME),
-            ),
-            (
-                crate::storage_readiness::RoleName::Catalog,
-                config.catalog_dir.join("pool.lock"),
-            ),
-        ],
-    )?;
     validate_directories(settings, missing.as_deref())?;
-    if !initialize && !config.catalog_dir.join(CATALOG_FILE_NAME).is_file() {
-        return Err(operator_required(anyhow::anyhow!(
-            "pool catalog is missing: initialize a new pool with `zerofs pool init`, or restore an existing pool's catalog; normal startup never recreates it"
-        )));
-    }
-    let authority_url = settings.storage.url.parse()?;
-    let authority =
-        parse_url_opts(&authority_url, settings.cloud_provider_env_vars(), None).await?;
+    let authority_url: url::Url = settings.storage.url.parse()?;
+    let (authority, catalog_source, raw_journal) = if authority_url.scheme() == "raw+p3-v2" {
+        let opened = raw::open_p3(raw::RawBinding::parse(&authority_url)?).await?;
+        let journal = if settings
+            .writeback
+            .as_ref()
+            .is_some_and(|config| config.enabled)
+        {
+            Some(opened.journal)
+        } else {
+            anyhow::ensure!(
+                opened.journal.is_empty()?,
+                "raw P3 already contains a writeback database; reopen with the original writeback configuration"
+            );
+            None
+        };
+        (opened.authority, opened.catalog, journal)
+    } else {
+        crate::storage_readiness::verify_open_paths(
+            settings,
+            &[
+                (
+                    crate::storage_readiness::RoleName::Catalog,
+                    config.catalog_dir.join(CATALOG_FILE_NAME),
+                ),
+                (
+                    crate::storage_readiness::RoleName::Catalog,
+                    config.catalog_dir.join("pool.lock"),
+                ),
+            ],
+        )?;
+        if !initialize && !config.catalog_dir.join(CATALOG_FILE_NAME).is_file() {
+            return Err(operator_required(anyhow::anyhow!(
+                "pool catalog is missing: initialize a new pool with `zerofs pool init`, or restore an existing pool's catalog; normal startup never recreates it"
+            )));
+        }
+        let parsed =
+            parse_url_opts(&authority_url, settings.cloud_provider_env_vars(), None).await?;
+        (
+            bind_readiness_root(settings, &authority_url, parsed)?,
+            config.catalog_dir.clone().into(),
+            None,
+        )
+    };
     let ParsedStore {
         store: authority,
         path,
         sftp_pool: authority_sessions,
-    } = bind_readiness_root(settings, &authority_url, authority)?;
+    } = authority;
     let metadata_fault = MetadataFault::default();
     let authority = guard_local_metadata(&authority_url, authority, &metadata_fault);
     debug_assert!(authority_sessions.is_none(), "pool metadata must be local");
@@ -183,6 +212,13 @@ pub(crate) async fn open_pool_storage(
         let mut members = Vec::with_capacity(config.members.len());
         for member in &config.members {
             let url: url::Url = member.url.parse()?;
+            if url.scheme() == "raw+loop" {
+                let binding = raw::RawBinding::parse(&url)?;
+                members.push(
+                    raw::open_member(member, binding, settings.raw_device_p3_candidate()).await?,
+                );
+                continue;
+            }
             let (scheme, member_path) = ObjectStoreScheme::parse(&url)?;
             let mut options = settings.cloud_provider_env_vars();
             options.extend(member.cloud_provider_env_vars());
@@ -243,7 +279,7 @@ pub(crate) async fn open_pool_storage(
         Ok(PoolObjectStore::open_with_preflight(
             Arc::from(authority),
             path.clone(),
-            config.catalog_dir.clone(),
+            catalog_source,
             members,
             config.segment_placement,
             initialize,
@@ -266,6 +302,7 @@ pub(crate) async fn open_pool_storage(
         Ok(pool) => Ok((
             OpenedStorage {
                 pool: Some(pool.clone()),
+                raw_journal,
                 store: Box::new(pool.clone()),
                 path,
                 sftp_pool: (!sessions.pools.is_empty()).then_some(sessions),
@@ -383,17 +420,15 @@ fn validate_directories(settings: &Settings, missing: Option<&str>) -> Result<()
         .pool
         .as_ref()
         .context("pool is not configured")?;
-    let mut roots = vec![
-        (
-            "metadata".to_owned(),
-            local_directory(&settings.storage.url.parse()?)?,
-        ),
-        ("catalog".to_owned(), resolved_path(&config.catalog_dir)?),
-        (
-            "clean cache".to_owned(),
-            resolved_path(&settings.cache.dir)?,
-        ),
-    ];
+    let mut roots = vec![(
+        "clean cache".to_owned(),
+        resolved_path(&settings.cache.dir)?,
+    )];
+    let authority_url: url::Url = settings.storage.url.parse()?;
+    if authority_url.scheme() == "file" {
+        roots.push(("metadata".to_owned(), local_directory(&authority_url)?));
+        roots.push(("catalog".to_owned(), resolved_path(&config.catalog_dir)?));
+    }
     if let Some(writeback) = &settings.writeback
         && writeback.enabled
     {
