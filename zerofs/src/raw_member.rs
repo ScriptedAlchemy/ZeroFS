@@ -195,6 +195,7 @@ impl RawCapacity {
     /// an empty object fits.
     /// A new key also funds its own delete; an overwrite of an existing key
     /// can be one tombstone larger.
+    #[cfg(test)]
     pub fn max_put_payload(&self) -> Option<u64> {
         let room = self
             .admissible_bytes

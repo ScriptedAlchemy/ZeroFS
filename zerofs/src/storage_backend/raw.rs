@@ -11,6 +11,7 @@ pub(crate) struct RawBinding {
     pub backing: PathBuf,
     pub pool: Uuid,
     pub member: Uuid,
+    pub layout: Option<[u64; 6]>,
 }
 
 fn path(value: &str) -> Result<PathBuf> {
@@ -29,7 +30,7 @@ impl RawBinding {
     pub(crate) fn parse(url: &Url) -> Result<Self> {
         ensure!(
             cfg!(target_os = "linux")
-                && url.scheme() == "raw+loop"
+                && matches!(url.scheme(), "raw+loop" | "raw+p3-v2")
                 && url.host().is_none()
                 && url.fragment().is_none()
                 && !url.path().contains('%'),
@@ -37,6 +38,7 @@ impl RawBinding {
         );
         let node = path(url.path())?;
         let mut backing = None;
+        let mut layout = None;
         let mut pool = None;
         let mut member = None;
         for (key, value) in url.query_pairs() {
@@ -44,6 +46,22 @@ impl RawBinding {
                 "backing" if backing.is_none() => backing = Some(path(&value)?),
                 "pool" if pool.is_none() => pool = Some(Uuid::parse_str(&value)?),
                 "member" if member.is_none() => member = Some(Uuid::parse_str(&value)?),
+                "layout_mib" if url.scheme() == "raw+p3-v2" && layout.is_none() => {
+                    let lengths = value
+                        .split(',')
+                        .map(|n| -> Result<_> {
+                            n.parse::<u64>()?
+                                .checked_mul(1 << 20)
+                                .filter(|len| *len > 0)
+                                .context("invalid P3 role length")
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    layout = Some(
+                        lengths
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("P3 layout requires six lengths"))?,
+                    );
+                }
                 _ => bail!("duplicate or unrecognized raw device binding field"),
             }
         }
@@ -53,7 +71,12 @@ impl RawBinding {
             !pool.is_nil() && !member.is_nil(),
             "nil raw device binding UUID"
         );
+        ensure!(
+            url.scheme() != "raw+p3-v2" || layout.is_some(),
+            "missing explicit P3 layout_mib"
+        );
         Ok(Self {
+            layout,
             node,
             backing: backing.context("missing raw backing path")?,
             pool,
@@ -70,6 +93,7 @@ impl RawBinding {
 pub(super) async fn open_member(
     config: &crate::config::StoragePoolMemberConfig,
     binding: RawBinding,
+    exact_size: bool,
 ) -> Result<crate::pool_object_store::PoolMember> {
     use crate::pool_object_store::{FilesystemSpace, FreeSpace, PoolMember};
     use crate::raw_member::RawMemberStore;
@@ -95,8 +119,8 @@ pub(super) async fn open_member(
         }
 
         fn put_cost(&self, bytes: u64) -> u64 {
-            RawStore::put_cost(bytes)
-                .and_then(|cost| cost.checked_add(RawStore::delete_cost()))
+            RawMemberStore::put_cost(bytes)
+                .and_then(|cost| cost.checked_add(RawMemberStore::delete_cost()))
                 .unwrap_or(u64::MAX)
         }
     }
@@ -107,6 +131,10 @@ pub(super) async fn open_member(
     tokio::task::spawn_blocking(move || {
         let claim = Claim::synthetic(&binding.node, &binding.backing)
             .with_context(|| format!("claim raw member {id}"))?;
+        ensure!(
+            !exact_size || claim.size == capacity,
+            "held raw device for {id} does not match admitted capacity"
+        );
         let device = claim.device.metadata()?.rdev();
         let store = RawStore::open(
             claim.device.try_clone()?,
@@ -141,6 +169,7 @@ pub(super) async fn open_member(
 pub(super) async fn open_member(
     _: &crate::config::StoragePoolMemberConfig,
     _: RawBinding,
+    _: bool,
 ) -> Result<crate::pool_object_store::PoolMember> {
     bail!("raw+loop requires Linux")
 }
@@ -170,4 +199,58 @@ mod tests {
             assert!(parse(invalid).is_err());
         }
     }
+}
+
+pub(super) struct OpenP3 {
+    pub authority: crate::parse_object_store::ParsedStore,
+    pub catalog: crate::pool_object_store::CatalogSource,
+    pub journal: zerofs_raw_device::journal_region::TransactionRegion,
+}
+
+#[cfg(target_os = "linux")]
+pub(super) async fn open_p3(binding: RawBinding) -> Result<OpenP3> {
+    use crate::parse_object_store::ParsedStore;
+    use crate::pool_object_store::CatalogSource;
+    use crate::raw_member::RawMemberStore;
+    use object_store::path::Path;
+    use std::sync::Arc;
+    use zerofs_raw_device::{claim::Claim, p3::P3Layout};
+    tokio::task::spawn_blocking(move || {
+        let claim = Arc::new(Claim::synthetic(&binding.node, &binding.backing)?);
+        let layout = P3Layout::new(claim.size, binding.layout.context("missing raw P3 layout")?)?;
+        let roles = layout.open_v2(
+            claim.device.try_clone()?,
+            *binding.pool.as_bytes(),
+            *binding.member.as_bytes(),
+        )?;
+        let path = Path::from("db");
+        let envelope = path
+            .clone()
+            .join(crate::key_management::WRAPPED_KEY_FILENAME);
+        let key = envelope.as_ref().as_bytes();
+        ensure!(
+            !roles.metadata.contains_key(key) && roles.keys.keys().all(|stored| stored == key),
+            "raw authority and key-envelope regions contain misplaced objects"
+        );
+        let store = super::raw_authority::RawAuthority {
+            envelope,
+            metadata: RawMemberStore::new(roles.metadata, claim.clone(), 0)?,
+            keys: RawMemberStore::new(roles.keys, claim.clone(), 0)?,
+        };
+        Ok(OpenP3 {
+            authority: ParsedStore {
+                store: Box::new(store),
+                path,
+                sftp_pool: None,
+            },
+            catalog: CatalogSource::Raw(roles.catalog.retain_claim(claim.clone())),
+            journal: roles.journal.retain_claim(claim),
+        })
+    })
+    .await?
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) async fn open_p3(_: RawBinding) -> Result<OpenP3> {
+    bail!("raw+p3-v2 requires Linux")
 }

@@ -93,6 +93,37 @@ mod probe {
         } else {
             (op.as_str(), None, tail)
         };
+        if op == "v2-inspect" && role == "p3" && tail.is_empty() {
+            let roles = layout
+                .ok_or("P3 inspection needs explicit geometry")?
+                .open_v2(claim.device, pool_uuid, member_uuid)?;
+            println!("journal_bytes={}", roles.journal.len()?);
+            println!("catalog_bytes={}", roles.catalog.len()?);
+            for (name, store) in [
+                ("authority", &roles.metadata),
+                ("keys", &roles.keys),
+                ("scratch", &roles.scratch),
+                ("cache", &roles.cache),
+            ] {
+                println!("{name}_objects={}", store.len());
+                println!("{name}_tail={}", store.geometry().durable_tail);
+            }
+            println!(
+                "envelope_in_keys={}",
+                roles.keys.contains_key(b"db/zerofs.key")
+            );
+            println!(
+                "envelope_in_authority={}",
+                roles.metadata.contains_key(b"db/zerofs.key")
+            );
+            return Ok(());
+        }
+        if op == "v2-init-blank" && role == "p3" && tail.is_empty() {
+            layout
+                .ok_or("P3 initialization needs explicit geometry")?
+                .provision_v2(claim.device, pool_uuid, member_uuid)?;
+            return Ok(());
+        }
         if op == "init-blank" && role == "p3" && tail.is_empty() {
             layout
                 .ok_or("P3 initialization needs explicit geometry")?

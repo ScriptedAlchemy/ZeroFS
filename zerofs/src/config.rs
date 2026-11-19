@@ -711,7 +711,11 @@ pub struct StorageConfig {
 #[serde(deny_unknown_fields)]
 pub struct StoragePoolConfig {
     /// Authoritative placement database; this is data, never an evictable cache.
-    #[serde(deserialize_with = "deserialize_expandable_path")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_expandable_path",
+        skip_serializing_if = "path_is_empty"
+    )]
     pub(crate) catalog_dir: PathBuf,
     /// Placement policy for newly created immutable segments.
     #[serde(default, skip_serializing_if = "SegmentPlacement::is_first_fit")]
@@ -818,10 +822,29 @@ fn pool_gb_to_bytes(value: f64, name: &str, allow_zero: bool) -> Result<u64> {
     Ok(bytes.floor() as u64)
 }
 
+fn path_is_empty(path: &std::path::Path) -> bool {
+    path.as_os_str().is_empty()
+}
+
 impl StoragePoolConfig {
     fn validate(&self, settings: &Settings) -> Result<()> {
         let authority = url::Url::parse(&settings.storage.url)?;
-        if authority.scheme() != "file" || authority.to_file_path().is_err() {
+        let p3 = if authority.scheme() == "raw+p3-v2" {
+            anyhow::ensure!(
+                settings.cache.disk_size_gb == 0.0,
+                "raw P3 requires cache.disk_size_gb=0 until persistent raw clean caching is supported"
+            );
+            let binding = crate::storage_backend::raw::RawBinding::parse(&authority)?;
+            if !path_is_empty(&self.catalog_dir) || settings.storage.readiness.is_some() {
+                anyhow::bail!(
+                    "a raw P3 authority owns its placement catalog and cannot use catalog_dir or directory readiness"
+                );
+            }
+            Some(binding)
+        } else {
+            None
+        };
+        if p3.is_none() && (authority.scheme() != "file" || authority.to_file_path().is_err()) {
             anyhow::bail!(
                 "[storage.pool] requires a local file:// [storage].url for authoritative metadata"
             );
@@ -836,11 +859,12 @@ impl StoragePoolConfig {
                 "set storage_class on individual pool members, not the local metadata store"
             );
         }
-        if !self.catalog_dir.is_absolute()
-            || self
-                .catalog_dir
-                .components()
-                .any(|part| matches!(part, std::path::Component::ParentDir))
+        if p3.is_none()
+            && (!self.catalog_dir.is_absolute()
+                || self
+                    .catalog_dir
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir)))
         {
             anyhow::bail!(
                 "[storage.pool] catalog_dir must be an absolute path without parent components"
@@ -851,7 +875,7 @@ impl StoragePoolConfig {
         }
         let mut ids = HashSet::new();
         let mut urls = HashSet::new();
-        let mut raw_pool = None;
+        let mut raw_pool = p3.as_ref().map(|binding| binding.pool);
         let mut account_connections =
             std::collections::HashMap::<(String, u16, String), usize>::new();
         for member in &self.members {
@@ -874,6 +898,9 @@ impl StoragePoolConfig {
                 .with_context(|| format!("invalid URL for pool member {}", member.id))?;
             if url.scheme() == "raw+loop" {
                 let binding = crate::storage_backend::raw::RawBinding::parse(&url)?;
+                if p3.as_ref().is_some_and(|p3| p3.member == binding.member) {
+                    anyhow::bail!("raw P3 and payload devices require different member UUIDs");
+                }
                 if raw_pool
                     .replace(binding.pool)
                     .is_some_and(|old| old != binding.pool)
@@ -892,6 +919,9 @@ impl StoragePoolConfig {
                     );
                 }
                 continue;
+            }
+            if p3.is_some() {
+                anyhow::bail!("raw P3 authority requires raw payload members");
             }
             if url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
                 anyhow::bail!(
@@ -2321,6 +2351,10 @@ impl Settings {
     pub(crate) fn small_nas_journal(&self) -> bool {
         self.runtime.as_ref().and_then(|runtime| runtime.profile)
             == Some(RuntimeProfile::SmallNasJournal)
+    }
+
+    pub(crate) fn raw_p3_authority(&self) -> bool {
+        url_scheme(&self.storage.url).is_some_and(|scheme| scheme.eq_ignore_ascii_case("raw+p3-v2"))
     }
 
     pub(crate) fn raw_device_p3_candidate(&self) -> bool {

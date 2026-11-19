@@ -58,6 +58,81 @@ impl P3Layout {
         Ok(P3 { stores })
     }
 
+    /// Explicit v2 layout for a reusable transactional journal and catalog.
+    /// A v1 device, including an interrupted v1 initialization, fails the
+    /// whole-device blank check before the first label write.
+    pub fn provision_v2(&self, file: File, pool: [u8; 16], device: [u8; 16]) -> Result<()> {
+        let whole = Region::whole(file.try_clone()?, self.device_len)?;
+        crate::store::require_blank(&whole)?;
+        let mut offset = 0;
+        for (len, role) in self.lengths.into_iter().zip(ROLES) {
+            let id = Identity {
+                pool_uuid: pool,
+                member_uuid: device,
+                role,
+            };
+            if matches!(role, Role::Journal | Role::Catalog) {
+                crate::journal_region::TransactionRegion::provision(
+                    file.try_clone()?,
+                    self.device_len,
+                    offset,
+                    len,
+                    id,
+                )?;
+            } else {
+                RawStore::provision_region(
+                    Region::new(file.try_clone()?, self.device_len, offset, len)?,
+                    id,
+                )?;
+            }
+            offset += len;
+        }
+        Ok(())
+    }
+
+    pub fn open_v2(&self, file: File, pool: [u8; 16], device: [u8; 16]) -> Result<P3v2> {
+        Region::whole(file.try_clone()?, self.device_len)?;
+        let mut offset = 0;
+        let mut transactional = Vec::with_capacity(2);
+        let mut objects = Vec::with_capacity(4);
+        for (len, role) in self.lengths.into_iter().zip(ROLES) {
+            let id = Identity {
+                pool_uuid: pool,
+                member_uuid: device,
+                role,
+            };
+            if matches!(role, Role::Journal | Role::Catalog) {
+                transactional.push(crate::journal_region::TransactionRegion::open(
+                    file.try_clone()?,
+                    self.device_len,
+                    offset,
+                    len,
+                    id,
+                )?);
+            } else {
+                objects.push(RawStore::open_region(
+                    Region::new(file.try_clone()?, self.device_len, offset, len)?,
+                    id,
+                )?);
+            }
+            offset += len;
+        }
+        let [journal, catalog] = transactional
+            .try_into()
+            .map_err(|_| Error::InvalidArgument("incomplete transactional layout"))?;
+        let [metadata, keys, scratch, cache] = objects
+            .try_into()
+            .map_err(|_| Error::InvalidArgument("incomplete object layout"))?;
+        Ok(P3v2 {
+            journal,
+            catalog,
+            metadata,
+            keys,
+            scratch,
+            cache,
+        })
+    }
+
     fn regions(
         &self,
         file: &File,
@@ -94,4 +169,13 @@ impl P3 {
             .find(|s| s.identity().role == role)
             .ok_or(Error::InvalidArgument("role is not on the P3"))
     }
+}
+
+pub struct P3v2 {
+    pub journal: crate::journal_region::TransactionRegion,
+    pub catalog: crate::journal_region::TransactionRegion,
+    pub metadata: RawStore,
+    pub keys: RawStore,
+    pub scratch: RawStore,
+    pub cache: RawStore,
 }

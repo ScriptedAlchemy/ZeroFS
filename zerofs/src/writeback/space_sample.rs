@@ -4,16 +4,17 @@
 //! [`PhysicalSpaceSample`] values from [`PhysicalSpaceSampler::sample`]. They
 //! do not allocate or construct generations themselves.
 
-use crate::writeback::anchored_dir::AnchoredDir;
+use crate::writeback::{anchored_dir::AnchoredDir, journal::Journal};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)]
 enum SpaceSource {
     Path(PathBuf),
     Anchored(AnchoredDir),
+    Raw(Arc<Journal>),
 }
 
 /// One successful probe of the writeback filesystem.
@@ -66,6 +67,15 @@ impl PhysicalSpaceSampler {
         }
     }
 
+    pub(crate) fn new_raw(journal: Arc<Journal>) -> Self {
+        Self {
+            writeback_dir: journal.root().to_path_buf(),
+            source: SpaceSource::Raw(journal),
+            next_generation: AtomicU64::new(1),
+            latest: Mutex::new(None),
+        }
+    }
+
     // Landed-but-not-wired accessor.
     #[allow(dead_code)]
     pub(crate) fn writeback_dir(&self) -> &Path {
@@ -91,6 +101,9 @@ impl PhysicalSpaceSampler {
         let source = self.source.clone();
         let available_bytes = tokio::task::spawn_blocking(move || match source {
             SpaceSource::Path(path) => fs4::available_space(path),
+            SpaceSource::Raw(journal) => journal
+                .raw_available_space()
+                .map_err(|error| io::Error::other(error.to_string())),
             SpaceSource::Anchored(directory) => directory
                 .available_space()
                 .map_err(|error| io::Error::other(error.to_string())),

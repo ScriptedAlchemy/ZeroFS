@@ -998,14 +998,19 @@ impl ObjectStore for WritebackObjectStore {
                 ));
             }
         }
-        let memory_parts = self.inner.settings.ack_mode == AckMode::Memory;
+        let memory_parts =
+            self.inner.settings.ack_mode == AckMode::Memory || self.inner.journal.is_raw();
         let staging = if memory_parts {
             None
         } else {
             Some(
-                allocate_multipart_staging(&self.inner.journal.anchored_root()).map_err(
-                    |error| generic_error(format!("failed to allocate multipart staging: {error}")),
-                )?,
+                self.inner
+                    .journal
+                    .anchored_root()
+                    .and_then(allocate_multipart_staging)
+                    .map_err(|error| {
+                        generic_error(format!("failed to allocate multipart staging: {error}"))
+                    })?,
             )
         };
         let declared_payload_len =

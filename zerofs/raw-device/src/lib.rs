@@ -47,6 +47,7 @@
 #[cfg(target_os = "linux")]
 pub mod claim;
 mod format;
+pub mod journal_region;
 pub mod landing;
 pub mod p3;
 mod region;

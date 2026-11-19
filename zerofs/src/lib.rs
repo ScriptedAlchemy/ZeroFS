@@ -41,6 +41,7 @@ mod pool_export_tests;
 mod pool_full_tests;
 mod pool_object_store;
 mod prometheus;
+mod raw_database;
 #[cfg(target_os = "linux")]
 mod raw_member;
 mod redis_conditional_store;

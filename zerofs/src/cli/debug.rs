@@ -104,6 +104,7 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
 
     let cache_config = CacheConfig {
+        memory_only: settings.raw_p3_authority(),
         root_folder: settings.cache.dir.clone(),
         max_cache_size_gb: settings.cache.disk_size_gb,
         memory_cache_size_gb: settings.cache.memory_size_gb,

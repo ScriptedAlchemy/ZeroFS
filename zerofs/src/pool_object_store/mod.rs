@@ -18,6 +18,7 @@ pub use space::{FilesystemSpace, FreeSpace};
 mod tests;
 
 pub use catalog::CATALOG_FILE_NAME;
+pub(crate) use catalog::CatalogSource;
 #[cfg(test)]
 pub(crate) use catalog::survival_test_support;
 use catalog::{Catalog, Entry, Garbage, Physical, StoredAttribute, Upload};
@@ -563,7 +564,7 @@ impl PoolObjectStore {
     pub(crate) async fn open_with_preflight(
         authority: Arc<dyn ObjectStore>,
         authority_prefix: Path,
-        catalog_dir: PathBuf,
+        catalog_source: impl Into<CatalogSource>,
         members: Vec<PoolMember>,
         segment_placement: SegmentPlacement,
         initialize: bool,
@@ -576,13 +577,9 @@ impl PoolObjectStore {
         let marker = read_marker(authority.as_ref(), &marker_path).await?;
         let prefix = authority_prefix.to_string();
         let marker_for_open = marker.clone();
+        let source = catalog_source.into();
         let catalog = tokio::task::spawn_blocking(move || {
-            Catalog::open(
-                &catalog_dir,
-                &prefix,
-                initialize,
-                marker_for_open.as_deref(),
-            )
+            source.open(&prefix, initialize, marker_for_open.as_deref())
         })
         .await
         .map_err(|e| error(format!("pool catalog open task failed: {e}")))?

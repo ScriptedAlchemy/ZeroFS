@@ -194,6 +194,61 @@ pub(super) struct Snapshot {
     pub hidden: BTreeSet<String>,
 }
 
+pub(crate) enum CatalogSource {
+    Directory(std::path::PathBuf),
+    Raw(zerofs_raw_device::journal_region::TransactionRegion),
+}
+
+impl From<std::path::PathBuf> for CatalogSource {
+    fn from(path: std::path::PathBuf) -> Self {
+        Self::Directory(path)
+    }
+}
+
+impl CatalogSource {
+    pub(super) fn open(
+        self,
+        prefix: &str,
+        initialize: bool,
+        marker: Option<&[u8]>,
+    ) -> Result<Catalog> {
+        match self {
+            Self::Directory(root) => Catalog::open(&root, prefix, initialize, marker),
+            Self::Raw(region) => {
+                let binding = region.identity();
+                anyhow::ensure!(
+                    binding.role == zerofs_raw_device::Role::Catalog,
+                    "expected raw catalog role"
+                );
+                let empty = region.is_empty()?;
+                if empty && (!initialize || marker.is_some()) {
+                    return Err(operator_required(anyhow!(
+                        "raw placement catalog is empty; explicit initialization requires a new authority"
+                    )));
+                }
+                let pool = Uuid::from_bytes(binding.pool_uuid);
+                let locator = format!(
+                    "raw:v2:{pool}:{}:catalog",
+                    Uuid::from_bytes(binding.member_uuid)
+                );
+                let cache_bytes = region.capacity().min(32 << 20) as usize;
+                let database = Builder::new()
+                    .set_cache_size(cache_bytes)
+                    .create_with_backend(crate::raw_database::RawDatabase(region))?;
+                Catalog::open_database(
+                    database,
+                    locator,
+                    None,
+                    prefix,
+                    initialize,
+                    marker,
+                    Some((pool, empty)),
+                )
+            }
+        }
+    }
+}
+
 pub(super) struct Catalog {
     // Fields drop in declaration order: finish database shutdown before
     // releasing the catalog's exclusive ownership below.
@@ -205,8 +260,7 @@ pub(super) struct Catalog {
     verified_empty_quarantined: Mutex<BTreeSet<String>>,
     #[cfg(test)]
     empty_ownership_scans: std::sync::atomic::AtomicUsize,
-    _root: AnchoredDir,
-    _lock: CatalogLock,
+    _directory: Option<(AnchoredDir, CatalogLock)>,
 }
 
 struct CatalogLock(File);
@@ -283,6 +337,26 @@ impl Catalog {
         if !database_existed {
             anchored.sync()?;
         }
+        Self::open_database(
+            database,
+            catalog_directory,
+            Some((anchored, lock)),
+            prefix,
+            initialize,
+            marker,
+            None,
+        )
+    }
+
+    fn open_database(
+        database: Database,
+        catalog_directory: String,
+        directory: Option<(AnchoredDir, CatalogLock)>,
+        prefix: &str,
+        initialize: bool,
+        marker: Option<&[u8]>,
+        raw: Option<(Uuid, bool)>,
+    ) -> Result<Self> {
         let mut tx = database.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
         let identity = {
@@ -293,20 +367,28 @@ impl Catalog {
                 .transpose()?;
             let identity = match existing {
                 Some(identity) => identity,
-                None if initialize && marker.is_none() => Identity {
-                    format: 1,
-                    pool_id: Uuid::new_v4().to_string(),
-                    authority_prefix: prefix.to_owned(),
-                    catalog_directory: catalog_directory.clone(),
-                    initialized: false,
-                },
+                None if initialize && marker.is_none() && raw.is_none_or(|(_, empty)| empty) => {
+                    Identity {
+                        format: 1,
+                        pool_id: raw
+                            .map(|(id, _)| id)
+                            .unwrap_or_else(Uuid::new_v4)
+                            .to_string(),
+                        authority_prefix: prefix.to_owned(),
+                        catalog_directory: catalog_directory.clone(),
+                        initialized: false,
+                    }
+                }
                 None => {
                     return Err(operator_required(anyhow!(
                         "pool catalog has no identity; explicit initialization or recovery is required"
                     )));
                 }
             };
-            if identity.format != 1 || identity.authority_prefix != prefix {
+            if identity.format != 1
+                || identity.authority_prefix != prefix
+                || raw.is_some_and(|(id, _)| identity.pool_id != id.to_string())
+            {
                 return Err(operator_required(anyhow!(
                     "pool catalog format or authority prefix does not match this configuration"
                 )));
@@ -364,8 +446,7 @@ impl Catalog {
             verified_empty_quarantined: Mutex::new(BTreeSet::new()),
             #[cfg(test)]
             empty_ownership_scans: std::sync::atomic::AtomicUsize::new(0),
-            _root: anchored,
-            _lock: lock,
+            _directory: directory,
         })
     }
 
@@ -1468,7 +1549,14 @@ mod catalog_lock_tests {
         // fork() duplicates the open file description before CLOEXEC can close
         // it. A duplicated descriptor models that interval without forking a
         // multithreaded test process or relying on scheduler timing.
-        let inherited_lock = catalog._lock.0.try_clone().unwrap();
+        let inherited_lock = catalog
+            ._directory
+            .as_ref()
+            .unwrap()
+            .1
+            .0
+            .try_clone()
+            .unwrap();
         let assert_locked = || {
             assert!(
                 Catalog::open(&root, "db", false, Some(&marker))

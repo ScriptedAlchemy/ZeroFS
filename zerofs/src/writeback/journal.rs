@@ -122,6 +122,10 @@
 //! it runs ahead of it; it takes the expected first sequence from its caller
 //! as an early check and leaves the authoritative one to the commit.
 
+#[cfg(test)]
+mod raw_backend;
+mod raw_payload;
+
 use crate::operator_required::operator_required;
 use crate::writeback::anchored_dir::AnchoredDir;
 use crate::writeback::model::{
@@ -134,7 +138,8 @@ use bytes::Bytes;
 use fs4::fs_std::FileExt;
 use futures::{StreamExt, stream, stream::BoxStream};
 use redb::{
-    Builder, Database, Durability, ReadableDatabase, ReadableTable, StorageBackend, TableDefinition,
+    Builder, Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata,
+    StorageBackend, TableDefinition,
 };
 use rustix::fs::OFlags;
 use sha2::{Digest, Sha256};
@@ -168,12 +173,13 @@ const FENCE_CLASSIFICATION_VERSION: u32 = 2;
 
 pub struct Journal {
     root: PathBuf,
-    root_dir: AnchoredDir,
+    root_dir: Option<AnchoredDir>,
+    raw_region: Option<Arc<zerofs_raw_device::journal_region::TransactionRegion>>,
     // Fields drop in declaration order: close the database before releasing
     // the journal's exclusive ownership below.
     database: Database,
     write_gate: JournalWriteGate,
-    _lock: JournalLock,
+    _lock: Option<JournalLock>,
     format_version: u32,
     #[cfg(test)]
     snapshot_calls: AtomicU64,
@@ -195,6 +201,7 @@ struct RedbHeader {
     page_size: u64,
     /// Bytes the layout of the header's durable commit covers.
     layout_len: u64,
+    usable_pages: u64,
     /// Set while a writer has the file open and cleared when it closes.
     recovery_required: bool,
 }
@@ -232,6 +239,9 @@ impl RedbHeader {
             layout_len: page_size
                 .saturating_add(full_regions.saturating_mul(full_region))
                 .saturating_add(trailing_region),
+            usable_pages: full_regions
+                .saturating_mul(region_data_pages)
+                .saturating_add(trailing_data_pages),
             recovery_required: header[Self::MAGIC.len()] & 2 != 0,
         })
     }
@@ -963,7 +973,7 @@ impl Journal {
             root_dir.sync()?;
         }
 
-        initialize_or_validate_identity(&database, &expected_identity, !database_existed)
+        initialize_or_validate_identity(&database, &expected_identity, !database_existed, false)
             .with_context(|| {
                 format!(
                     "failed to validate journal database {}",
@@ -975,10 +985,11 @@ impl Journal {
         backfill_remote_object_versions(&database)?;
         let journal = Self {
             root,
-            root_dir,
+            root_dir: Some(root_dir),
+            raw_region: None,
             database,
             write_gate: JournalWriteGate::default(),
-            _lock: lock,
+            _lock: Some(lock),
             format_version: expected_identity.format_version,
             #[cfg(test)]
             snapshot_calls: AtomicU64::new(0),
@@ -999,19 +1010,109 @@ impl Journal {
         Ok(journal)
     }
 
+    pub(crate) fn open_raw(
+        region: zerofs_raw_device::journal_region::TransactionRegion,
+        expected_identity: JournalIdentity,
+    ) -> Result<Self> {
+        use zerofs_raw_device::Role;
+        anyhow::ensure!(
+            region.identity().role == Role::Journal,
+            "expected a P3 Journal region"
+        );
+        let root = PathBuf::from("<P3 Journal>");
+        let len = region.len()?;
+        let initialize = len == 0;
+        if !initialize {
+            let mut bytes = [0; RedbHeader::LEN];
+            region.read(0, &mut bytes)?;
+            let header = RedbHeader::parse(&bytes)
+                .ok_or_else(|| operator_required(anyhow!("invalid raw writeback redb header")))?;
+            header.ensure_openable(len, &root)?;
+        }
+        let cache_bytes = region.resize_ceiling().min(64 << 20) as usize;
+        let region = Arc::new(region);
+        let database = open_journal_database(&root, || {
+            Builder::new()
+                .set_cache_size(cache_bytes)
+                .create_with_backend(crate::raw_database::RawDatabase(Arc::clone(&region)))
+        })?;
+        initialize_or_validate_identity(&database, &expected_identity, initialize, true)?;
+        normalize_mutation_fences(&database, &expected_identity)?;
+        let journal = Self {
+            root,
+            root_dir: None,
+            raw_region: Some(region),
+            database,
+            write_gate: JournalWriteGate::default(),
+            _lock: None,
+            format_version: expected_identity.format_version,
+            #[cfg(test)]
+            snapshot_calls: AtomicU64::new(0),
+            #[cfg(test)]
+            remote_watermark_commits: AtomicU64::new(0),
+            #[cfg(test)]
+            local_commit_error_after_durable: AtomicBool::new(false),
+            #[cfg(test)]
+            remote_mark_pause: Mutex::new(None),
+        };
+        let remote_seq = journal.progress()?.remote_seq;
+        if remote_seq > 0 {
+            journal.remove_remote_prefix(remote_seq)?;
+        }
+        journal.validate_recovery_state()?;
+        Ok(journal)
+    }
+
+    pub(crate) fn is_raw(&self) -> bool {
+        self.raw_region.is_some()
+    }
+
+    pub(crate) fn raw_available_space(&self) -> Result<u64> {
+        let region = self.raw_region.as_ref().context("expected raw writeback")?;
+        // Match the allocator counts to one on-disk layout. A write
+        // transaction excludes writers while we inspect these read-only stats.
+        let transaction = self.database.begin_write()?;
+        let stats = transaction.stats()?;
+        let len = region.len()?;
+        let mut bytes = [0; RedbHeader::LEN];
+        region.read(0, &mut bytes)?;
+        let header = RedbHeader::parse(&bytes).context("invalid raw writeback redb header")?;
+        header.ensure_openable(len, self.root())?;
+        anyhow::ensure!(
+            header.page_size == stats.page_size() as u64,
+            "raw allocator page size mismatch"
+        );
+
+        let unallocated = region.resize_ceiling().saturating_sub(len);
+        let reserve = region.capacity() - region.resize_ceiling();
+        // Free allocator pages exclude live and snapshot-pinned pages. Use
+        // half of the free arena as an estimate to allow for buddy fragmentation
+        // and copy-on-write work. The resize ceiling is the physical limit.
+        let reusable = header
+            .usable_pages
+            .saturating_sub(stats.allocated_pages())
+            .saturating_mul(header.page_size)
+            / 2;
+        // SSD admission subtracts its configured min_free_bytes from the
+        // sample. Add the fenced reserve so that it is deducted exactly once.
+        Ok(unallocated + reusable + reserve)
+    }
+
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }
 
-    pub(crate) fn anchored_root(&self) -> AnchoredDir {
-        self.root_dir.clone()
+    pub(crate) fn anchored_root(&self) -> std::io::Result<&AnchoredDir> {
+        self.root_dir
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("raw writeback has no journal directory"))
     }
 
     fn blob_location(&self, relative: &str, create_parent: bool) -> Result<AnchoredFileLocation> {
         let relative = checked_blob_relative(relative)?;
-        let (parent, name) = self
-            .root_dir
-            .resolve_parent(&relative, create_parent, 0o700)?;
+        let (parent, name) =
+            self.anchored_root()?
+                .resolve_parent(&relative, create_parent, 0o700)?;
         Ok(AnchoredFileLocation {
             parent,
             name,
@@ -1022,7 +1123,8 @@ impl Journal {
 
     fn existing_blob_location(&self, relative: &str) -> Result<Option<AnchoredFileLocation>> {
         let relative = checked_blob_relative(relative)?;
-        let Some((parent, name)) = self.root_dir.try_resolve_parent(&relative, 0o700)? else {
+        let Some((parent, name)) = self.anchored_root()?.try_resolve_parent(&relative, 0o700)?
+        else {
             return Ok(None);
         };
         Ok(Some(AnchoredFileLocation {
@@ -1357,6 +1459,11 @@ impl Journal {
         expected_first: Sequence,
         filesystem: &dyn PublicationFilesystem,
     ) -> Result<StagedBatch> {
+        if self.is_raw() {
+            self.require_contiguous_local_batch(&prepared, expected_first)?;
+            self.require_unique_local_batch_identities(&prepared)?;
+            return Ok(StagedBatch::Unstaged(prepared));
+        }
         if prepared.is_empty() {
             return Ok(StagedBatch::Durable {
                 records: Vec::new(),
@@ -1472,18 +1579,42 @@ impl Journal {
     /// watermark. This is the point at which the batch's records become
     /// ACKable.
     pub(crate) fn commit_staged(&self, staged: StagedBatch) -> Result<Vec<MutationRecord>> {
-        let StagedBatch::Durable { records, .. } = staged else {
-            bail!("commit_staged requires a staged batch");
+        let commit_started = Instant::now();
+        let records = match staged {
+            StagedBatch::Durable { records, .. } if !self.is_raw() => {
+                // Keep the container if the durable header swap may have succeeded.
+                self.commit_record_batch(&records, &[])?;
+                records
+            }
+            StagedBatch::Unstaged(prepared) if self.is_raw() => {
+                let mut records = Vec::with_capacity(prepared.len());
+                let mut payloads = Vec::with_capacity(prepared.len());
+                for PreparedMutation {
+                    mut record,
+                    payload,
+                } in prepared
+                {
+                    anyhow::ensure!(
+                        record.payload() == payload.as_ref().map(|p| (p.byte_len(), p.sha256())),
+                        "prepared raw payload and mutation record disagree"
+                    );
+                    if let Some(payload) = payload {
+                        *record
+                            .blob_path_mut()
+                            .context("missing raw blob reference")? =
+                            raw_payload::RAW_REFERENCE.to_owned();
+                        payloads.push((record.sequence, payload));
+                    }
+                    records.push(record);
+                }
+                self.commit_record_batch(&records, &payloads)?;
+                records
+            }
+            _ => bail!("staged batch does not match journal storage"),
         };
         if records.is_empty() {
-            return Ok(Vec::new());
+            return Ok(records);
         }
-        let commit_started = Instant::now();
-        // A commit error does not prove the transaction failed: the database
-        // may report an I/O error after its durable header swap. Keep the
-        // container so recovery can use LOCAL_SEQ to distinguish a committed
-        // batch (payload required) from an uncommitted one (payload reclaimed).
-        self.commit_record_batch(&records)?;
         record_local_publish_phase("record_commit", commit_started.elapsed());
         metrics::counter!("zerofs_writeback_local_publish_batches_total").increment(1);
         metrics::counter!("zerofs_writeback_local_publish_records_total")
@@ -1639,7 +1770,11 @@ impl Journal {
     /// advancing `LOCAL_SEQ_KEY` in one immediate transaction is what makes a
     /// batch atomic, and what makes `last <= LOCAL_SEQ` a sound test for
     /// "this container committed".
-    fn commit_record_batch(&self, records: &[MutationRecord]) -> Result<()> {
+    fn commit_record_batch(
+        &self,
+        records: &[MutationRecord],
+        payloads: &[(Sequence, VerifiedPayload)],
+    ) -> Result<()> {
         let Some(last) = records.last() else {
             return Ok(());
         };
@@ -1681,6 +1816,12 @@ impl Journal {
                     expected = expected.checked_add(1).context("local sequence overflow")?;
                 }
             }
+            if !payloads.is_empty() {
+                let mut chunks = transaction.open_table(raw_payload::PAYLOADS)?;
+                for (sequence, payload) in payloads {
+                    raw_payload::insert(&mut chunks, *sequence, payload)?;
+                }
+            }
             drop(table);
             write_value(&mut meta, LOCAL_SEQ_KEY, &last.sequence)?;
             write_value(&mut meta, LOCAL_BYTES_COMPLETED_KEY, &total_completed)?;
@@ -1719,15 +1860,17 @@ impl Journal {
         self.read_blob_bounded(sequence, u64::MAX)
     }
 
-    /// Read and verify the exact bytes returned to the caller in one pass.
-    /// The caller's bound is checked against the durable record before any
-    /// payload allocation. This lets bounded atomic uploads avoid verifying a
-    /// file, then reading and hashing the same file again through a stream.
+    /// Check the caller's bound against the durable record before allocating
+    /// the payload. Directory reads verify the exact bytes in one pass. Raw
+    /// reads verify a pinned redb snapshot and collect from that same snapshot.
     pub(crate) fn read_blob_bounded(
         &self,
         sequence: Sequence,
         maximum_bytes: u64,
     ) -> Result<Vec<u8>> {
+        if self.is_raw() {
+            return self.open_raw_payload(sequence, maximum_bytes)?.collect();
+        }
         let record = self.blob_record(sequence)?;
         let (payload_len, payload_sha256) = record
             .payload()
@@ -1741,9 +1884,33 @@ impl Journal {
     }
 
     pub(crate) fn open_verified_blob(&self, sequence: Sequence) -> Result<VerifiedBlob> {
+        if self.is_raw() {
+            let payload = self.open_raw_payload(sequence, u64::MAX)?;
+            return Ok(VerifiedBlob {
+                len: payload.len(),
+                sha256: payload.sha256(),
+                source: VerifiedBlobSource::Raw(Arc::new(payload)),
+                offset: 0,
+            });
+        }
         let record = self.blob_record(sequence)?;
         let (file, path, slice) = self.open_blob_file(&record)?;
         open_verified_blob(file, &path, slice, &record)
+    }
+
+    fn open_raw_payload(
+        &self,
+        sequence: Sequence,
+        maximum_bytes: u64,
+    ) -> Result<raw_payload::RawPayload> {
+        let read = self.database.begin_read()?;
+        let mutations = read.open_table(MUTATIONS)?;
+        let encoded = mutations
+            .get(sequence)?
+            .with_context(|| format!("journal mutation {sequence} does not exist"))?;
+        let record: MutationRecord = bincode::deserialize(encoded.value())?;
+        let table = read.open_table(raw_payload::PAYLOADS)?;
+        raw_payload::RawPayload::open(table, &record, maximum_bytes)
     }
 
     fn blob_record(&self, sequence: Sequence) -> Result<MutationRecord> {
@@ -2139,6 +2306,20 @@ impl Journal {
                 progress.remote_seq
             );
         }
+        if self.is_raw() {
+            let _write = self.write_gate.lock();
+            let mut transaction = self.database.begin_write()?;
+            transaction.set_durability(Durability::Immediate)?;
+            transaction
+                .open_table(MUTATIONS)?
+                .retain_in(..=through, |_, _| false)?;
+            transaction
+                .open_table(raw_payload::PAYLOADS)?
+                .retain_in(..=(through, u64::MAX), |_, _| false)?;
+            return transaction
+                .commit()
+                .context("failed to retire raw journal prefix");
+        }
         let read = self
             .database
             .begin_read()
@@ -2191,7 +2372,10 @@ impl Journal {
         }
         let mut swept = BTreeMap::new();
         for shard_path in &shards {
-            let Some(shard) = self.root_dir.try_open_relative_dir(shard_path, 0o700)? else {
+            let Some(shard) = self
+                .anchored_root()?
+                .try_open_relative_dir(shard_path, 0o700)?
+            else {
                 continue;
             };
             shard.for_each_entry(|name| {
@@ -2258,7 +2442,7 @@ impl Journal {
     /// a stray one costs disk until the next restart instead of failing
     /// `reject_unreferenced_blobs` and refusing to open the journal at all.
     fn reclaim_drained_containers(&self, through: Sequence) -> Result<()> {
-        let blobs = self.root_dir.open_child("blobs".as_ref(), 0o700)?;
+        let blobs = self.anchored_root()?.open_child("blobs".as_ref(), 0o700)?;
         blobs.for_each_entry(|shard_name| {
             let shard = blobs.open_child(shard_name, 0o700)?;
             let mut removed = false;
@@ -2308,7 +2492,7 @@ impl Journal {
     }
 
     fn recover_local_artifacts(&self) -> Result<()> {
-        let tmp = self.root_dir.open_child("tmp".as_ref(), 0o700)?;
+        let tmp = self.anchored_root()?.open_child("tmp".as_ref(), 0o700)?;
         tmp.for_each_entry(|name| tmp.remove_tree(name))?;
         tmp.sync()?;
 
@@ -2362,7 +2546,7 @@ impl Journal {
     /// reject it as unreferenced.
     fn remove_uncommitted_containers(&self) -> Result<()> {
         let local_seq = self.progress()?.local_seq;
-        let blobs = self.root_dir.open_child("blobs".as_ref(), 0o700)?;
+        let blobs = self.anchored_root()?.open_child("blobs".as_ref(), 0o700)?;
         blobs.for_each_entry(|shard_name| {
             let shard = blobs.open_child(shard_name, 0o700)?;
             let mut removed = false;
@@ -2423,6 +2607,7 @@ impl Journal {
             bail!("remote journal watermark exceeds local watermark");
         }
         let mut expected = snapshot.remote_seq.saturating_add(1);
+        let mut referenced_chunks = 0u64;
         let mut referenced_blobs = BTreeSet::new();
         for record in &snapshot.records {
             self.validate_record_format(record)?;
@@ -2439,6 +2624,13 @@ impl Journal {
                 .checked_add(1)
                 .context("journal sequence overflow")?;
             if let Some(relative) = record.blob_path() {
+                if self.is_raw() {
+                    let payload = self.open_raw_payload(record.sequence, u64::MAX)?;
+                    referenced_chunks = referenced_chunks
+                        .checked_add(payload.chunk_count())
+                        .context("raw payload chunk count overflow")?;
+                    continue;
+                }
                 let reference = BlobRef::parse(relative)?;
                 let location = self.blob_location(reference.relative, false)?;
                 let file = location
@@ -2466,11 +2658,21 @@ impl Journal {
                 snapshot.local_seq
             );
         }
-        self.reject_unreferenced_blobs(&referenced_blobs)
+        if self.is_raw() {
+            let read = self.database.begin_read()?;
+            let payloads = read.open_table(raw_payload::PAYLOADS)?;
+            anyhow::ensure!(
+                payloads.len()? == referenced_chunks,
+                "orphaned raw payload chunks"
+            );
+            Ok(())
+        } else {
+            self.reject_unreferenced_blobs(&referenced_blobs)
+        }
     }
 
     fn reject_unreferenced_blobs(&self, referenced: &BTreeSet<PathBuf>) -> Result<()> {
-        let blobs = self.root_dir.open_child("blobs".as_ref(), 0o700)?;
+        let blobs = self.anchored_root()?.open_child("blobs".as_ref(), 0o700)?;
         blobs.for_each_entry(|shard_name| {
             let shard = blobs.open_child(shard_name, 0o700)?;
             shard.for_each_entry(|blob_name| {
@@ -2512,6 +2714,7 @@ fn initialize_or_validate_identity(
     database: &Database,
     expected: &JournalIdentity,
     initialize: bool,
+    raw: bool,
 ) -> Result<()> {
     if !initialize {
         // Existing journals must pass read-only validation before even an
@@ -2521,6 +2724,10 @@ fn initialize_or_validate_identity(
             let read = database
                 .begin_read()
                 .context("failed to read existing journal identity")?;
+            if raw {
+                read.open_table(raw_payload::PAYLOADS)
+                    .map_err(operator_required)?;
+            }
             let meta = read
                 .open_table(META)
                 .context("failed to open existing journal metadata")
@@ -2565,6 +2772,9 @@ fn initialize_or_validate_identity(
         write_value(&mut meta, REMOTE_SEQ_KEY, &0_u64)?;
         write_value(&mut meta, REMOTE_BYTES_COMPLETED_KEY, &0_u64)?;
         write_value(&mut meta, REMOTE_RETRIES_KEY, &0_u64)?;
+    }
+    if initialize && raw {
+        transaction.open_table(raw_payload::PAYLOADS)?;
     }
     transaction
         .open_table(MUTATIONS)
@@ -2976,10 +3186,16 @@ pub(crate) enum JournalBlobIntegrityError {
 
 #[derive(Clone)]
 pub(crate) struct VerifiedBlob {
-    file: Arc<Mutex<File>>,
+    source: VerifiedBlobSource,
     offset: u64,
     len: u64,
     sha256: [u8; 32],
+}
+
+#[derive(Clone)]
+enum VerifiedBlobSource {
+    File(Arc<Mutex<File>>),
+    Raw(Arc<raw_payload::RawPayload>),
 }
 
 impl VerifiedBlob {
@@ -2999,7 +3215,7 @@ impl VerifiedBlob {
             bail!("verified blob stream chunk size must be nonzero");
         }
         let state = VerifiedBlobCursor {
-            file: Arc::clone(&self.file),
+            source: self.source.clone(),
             absolute: self
                 .offset
                 .checked_add(range.start)
@@ -3020,9 +3236,15 @@ impl VerifiedBlob {
                 return Ok(None);
             }
             let wanted = state.remaining.min(state.chunk_bytes as u64) as usize;
-            let file = Arc::clone(&state.file);
+            let source = state.source.clone();
             let absolute = state.absolute;
             let bytes = tokio::task::spawn_blocking(move || {
+                let file = match source {
+                    VerifiedBlobSource::Raw(payload) => {
+                        return payload.read_chunk(absolute, wanted);
+                    }
+                    VerifiedBlobSource::File(file) => file,
+                };
                 let mut file = file
                     .lock()
                     .map_err(|_| anyhow::anyhow!("verified blob file lock poisoned"))?;
@@ -3066,7 +3288,7 @@ impl VerifiedBlob {
 }
 
 struct VerifiedBlobCursor {
-    file: Arc<Mutex<File>>,
+    source: VerifiedBlobSource,
     absolute: u64,
     remaining: u64,
     chunk_bytes: usize,
@@ -3181,7 +3403,7 @@ fn open_verified_blob(
         .context("journal record does not reference a payload blob")?;
     let (file, offset) = verify_file_payload(file, path, slice, payload_len, payload_sha256)?;
     Ok(VerifiedBlob {
-        file: Arc::new(Mutex::new(file)),
+        source: VerifiedBlobSource::File(Arc::new(Mutex::new(file))),
         offset,
         len: payload_len,
         sha256: payload_sha256,
@@ -4489,7 +4711,7 @@ mod tests {
 
         // A duplicate shares the same open file description as a descriptor
         // inherited between fork and exec, without timing or child processes.
-        let inherited_lock = journal._lock.0.try_clone().unwrap();
+        let inherited_lock = journal._lock.as_ref().unwrap().0.try_clone().unwrap();
         let assert_locked = || {
             let error = Journal::open(&root, identity("bucket-a")).unwrap_err();
             assert!(format!("{error:#}").contains("already locked"));
@@ -5050,26 +5272,18 @@ mod tests {
         }
         drop(journal);
         let closed = fs::read(&database).unwrap();
-        assert_eq!(
-            super::RedbHeader::parse(&closed),
-            Some(super::RedbHeader {
-                page_size: 4096,
-                layout_len: closed.len() as u64,
-                recovery_required: false,
-            })
-        );
+        let header = super::RedbHeader::parse(&closed).unwrap();
+        assert_eq!(header.page_size, 4096);
+        assert_eq!(header.layout_len, closed.len() as u64);
+        assert!(!header.recovery_required);
 
         let raw = temp.path().join("raw.redb");
         drop(redb::Database::create(&raw).unwrap());
         let raw = fs::read(&raw).unwrap();
-        assert_eq!(
-            super::RedbHeader::parse(&raw),
-            Some(super::RedbHeader {
-                page_size: 4096,
-                layout_len: raw.len() as u64,
-                recovery_required: false,
-            })
-        );
+        let header = super::RedbHeader::parse(&raw).unwrap();
+        assert_eq!(header.page_size, 4096);
+        assert_eq!(header.layout_len, raw.len() as u64);
+        assert!(!header.recovery_required);
         assert_eq!(
             super::RedbHeader::parse(b"not a redb database file at all."),
             None
