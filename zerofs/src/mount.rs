@@ -3726,6 +3726,7 @@ mod client_tests {
             gid_known: true,
             gids: Vec::new(),
             groups_complete: true,
+            groups_truncated: false,
         };
         let root_creds = Credentials::from_auth_context(&root_auth);
 

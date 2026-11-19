@@ -81,6 +81,7 @@ fn root_auth() -> AuthContext {
         gid_known: true,
         gids: Vec::new(),
         groups_complete: true,
+        groups_truncated: false,
     }
 }
 

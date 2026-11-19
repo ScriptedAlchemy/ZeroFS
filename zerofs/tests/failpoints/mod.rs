@@ -29,6 +29,7 @@ fn test_creds() -> Credentials {
         groups: [1000; 16],
         groups_count: 1,
         groups_complete: true,
+        groups_truncated: false,
     }
 }
 

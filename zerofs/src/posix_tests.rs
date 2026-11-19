@@ -21,6 +21,7 @@ mod tests {
             groups: [1000; 16],
             groups_count: 1,
             groups_complete: true,
+            groups_truncated: false,
         }
     }
 
@@ -118,6 +119,7 @@ mod tests {
             gid_known: true,
             gids: vec![1000],
             groups_complete: true,
+            groups_truncated: false,
         };
 
         let (a_id, _) = fs
@@ -153,6 +155,7 @@ mod tests {
             gid_known: true,
             gids: vec![1000],
             groups_complete: true,
+            groups_truncated: false,
         };
 
         let (file1_id, _) = fs
@@ -206,6 +209,7 @@ mod tests {
             gid_known: true,
             gids: vec![1000],
             groups_complete: true,
+            groups_truncated: false,
         };
 
         let (parent_id, _) = fs
@@ -240,6 +244,7 @@ mod tests {
             gid_known: true,
             gids: vec![1000],
             groups_complete: true,
+            groups_truncated: false,
         };
 
         let (dir_id, _) = fs
@@ -291,6 +296,7 @@ mod tests {
             gid_known: true,
             gids: vec![1000],
             groups_complete: true,
+            groups_truncated: false,
         };
 
         let (file_id, _) = fs
@@ -348,6 +354,7 @@ mod tests {
             gid_known: true,
             gids: vec![1000],
             groups_complete: true,
+            groups_truncated: false,
         };
 
         let (tmp_id, _) = fs
@@ -424,6 +431,7 @@ mod tests {
             gid_known: true,
             gids: vec![1000],
             groups_complete: true,
+            groups_truncated: false,
         };
 
         let file_id = fs
@@ -447,6 +455,7 @@ mod tests {
             gid_known: true,
             gids: vec![1000],
             groups_complete: true,
+            groups_truncated: false,
         };
 
         let (dir_id, _) = fs
@@ -497,6 +506,7 @@ mod tests {
             gid_known: true,
             gids: vec![1000],
             groups_complete: true,
+            groups_truncated: false,
         };
 
         let (dir1_id, _) = fs
@@ -549,6 +559,7 @@ mod tests {
             gid_known: true,
             gids: vec![1000],
             groups_complete: true,
+            groups_truncated: false,
         };
 
         let (file_id, _) = fs
@@ -614,6 +625,7 @@ mod tests {
             gid_known: true,
             gids: vec![1000],
             groups_complete: true,
+            groups_truncated: false,
         };
 
         let (file_id, _) = fs
@@ -702,6 +714,7 @@ mod tests {
             gid_known: true,
             gids: vec![1000],
             groups_complete: true,
+            groups_truncated: false,
         };
 
         let (file_id, _) = fs
@@ -735,6 +748,7 @@ mod tests {
             gid_known: true,
             gids: vec![1000],
             groups_complete: true,
+            groups_truncated: false,
         };
 
         let (file_id, _) = fs
@@ -772,6 +786,7 @@ mod tests {
             gid_known: true,
             gids: vec![1000],
             groups_complete: true,
+            groups_truncated: false,
         };
 
         let (src_id, _) = fs
@@ -849,6 +864,7 @@ mod tests {
             gid_known: true,
             gids: vec![1000],
             groups_complete: true,
+            groups_truncated: false,
         };
 
         let (file_id, _) = fs
@@ -894,6 +910,7 @@ mod tests {
             gid_known: true,
             gids: vec![1000],
             groups_complete: true,
+            groups_truncated: false,
         };
 
         let (a_id, _) = fs
@@ -990,6 +1007,7 @@ mod tests {
             gid_known: true,
             gids: vec![1000],
             groups_complete: true,
+            groups_truncated: false,
         };
 
         // Create file 'a'
@@ -1096,6 +1114,7 @@ mod tests {
             gid_known: true,
             gids: vec![1000],
             groups_complete: true,
+            groups_truncated: false,
         };
         fs.rename(&auth, dir2_id, b"dir3", 0, b"moved_dir3")
             .await
@@ -1135,6 +1154,7 @@ mod tests {
                 gid_known: true,
                 gids: vec![1000],
                 groups_complete: true,
+                groups_truncated: false,
             },
             file_id,
             0,
@@ -1172,6 +1192,7 @@ mod tests {
                 gid_known: true,
                 gids: vec![1000],
                 groups_complete: true,
+                groups_truncated: false,
             },
             file_id,
             0,
@@ -1187,6 +1208,7 @@ mod tests {
                 gid_known: true,
                 gids: vec![1000],
                 groups_complete: true,
+                groups_truncated: false,
             },
             0,
             b"hardlink.txt",
@@ -1223,6 +1245,7 @@ mod tests {
                 gid_known: true,
                 gids: vec![1000],
                 groups_complete: true,
+                groups_truncated: false,
             },
             file_id,
             0,
@@ -1238,6 +1261,7 @@ mod tests {
                 gid_known: true,
                 gids: vec![1000],
                 groups_complete: true,
+                groups_truncated: false,
             },
             0,
             b"hardlink.txt",
@@ -1257,6 +1281,7 @@ mod tests {
                 gid_known: true,
                 gids: vec![1000],
                 groups_complete: true,
+                groups_truncated: false,
             },
             0,
             b"original.txt",
@@ -1295,6 +1320,7 @@ mod tests {
                 gid_known: true,
                 gids: vec![1000],
                 groups_complete: true,
+                groups_truncated: false,
             },
             file_id,
             0,
@@ -1315,6 +1341,7 @@ mod tests {
                 gid_known: true,
                 gids: vec![1000],
                 groups_complete: true,
+                groups_truncated: false,
             },
             0,
             b"original.txt",
@@ -1346,6 +1373,7 @@ mod tests {
             groups: [1000; 16],
             groups_count: 1,
             groups_complete: true,
+            groups_truncated: false,
         };
 
         let (dir_id, _) = fs
@@ -1373,6 +1401,7 @@ mod tests {
                 gid_known: true,
                 gids: vec![1000],
                 groups_complete: true,
+                groups_truncated: false,
             },
             file_id,
             0,
@@ -1399,6 +1428,7 @@ mod tests {
                     gid_known: true,
                     gids: vec![2000],
                     groups_complete: true,
+                    groups_truncated: false,
                 },
                 file_id,
                 0,
@@ -1454,6 +1484,7 @@ mod tests {
             gid_known: true,
             gids: vec![],
             groups_complete: true,
+            groups_truncated: false,
         };
 
         let (file_id, _) = fs
@@ -1593,6 +1624,7 @@ mod tests {
             gid_known: true,
             gids: vec![],
             groups_complete: true,
+            groups_truncated: false,
         };
 
         let (file_id, _) = fs
@@ -1630,6 +1662,7 @@ mod tests {
             gid_known: true,
             gids: vec![],
             groups_complete: true,
+            groups_truncated: false,
         };
 
         let (file_id, _) = fs
