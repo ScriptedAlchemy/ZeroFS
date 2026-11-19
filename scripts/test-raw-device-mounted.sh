@@ -42,8 +42,8 @@ if [[ $suite == spark ]]; then
     memory=44g
     memory_bytes=$((44 * 1024 ** 3))
     if [[ $mode == nas-fit ]]; then
-        memory=7504m
-        memory_bytes=$((7504 * 1024 ** 2))
+        memory=8g
+        memory_bytes=$((8 * 1024 ** 3))
     fi
     platform=linux/arm64
     # Spark's docker-default AppArmor profile denies the FUSE mount syscall.
