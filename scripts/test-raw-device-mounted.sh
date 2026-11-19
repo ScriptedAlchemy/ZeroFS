@@ -6,9 +6,14 @@ if [[ ${1:-} == --spark ]]; then
     suite=spark
     shift
 fi
+p3=0
+if [[ ${1:-} == --p3 ]]; then
+    p3=1
+    shift
+fi
 if [[ $# != 1 || ! -f $1/zerofs || ! -x $1/zerofs ||
       ! -f $1/zerofs-raw-device || ! -x $1/zerofs-raw-device ]]; then
-    echo "Usage: $0 [--spark] LINUX_EXECUTABLE_DIRECTORY" >&2
+    echo "Usage: $0 [--spark] [--p3] LINUX_EXECUTABLE_DIRECTORY" >&2
     exit 2
 fi
 engine_root=$(cd "$(dirname "$0")/.." && pwd)
@@ -96,5 +101,5 @@ trap 'exit 143' TERM
     --mount "type=bind,src=$binaries,dst=/input,readonly" \
     --mount "type=bind,src=$engine_root/scripts/raw-device,dst=/h,readonly" \
     -e PYTHONDONTWRITEBYTECODE=1 -e TMPDIR=/dev/shm \
-    -e "RAW_MOUNTED_MEMORY_BYTES=$memory_bytes" "$image_id" \
+    -e "RAW_MOUNTED_MEMORY_BYTES=$memory_bytes" -e "RAW_MOUNTED_P3=$p3" "$image_id" \
     timeout --kill-after=15s 12m python3 -u /h/mounted.py

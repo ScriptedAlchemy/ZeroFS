@@ -23,6 +23,8 @@ CHUNK = 4 * MIB
 RAW_BLOCK = 4096  # Raw v1 record header and payload alignment.
 SIZES = {"small": 32 * MIB, "large": 96 * MIB}
 RESERVES = {"small": 16 * MIB, "large": 8 * MIB}
+P3_LAYOUT = "96,32,88,8,16,16"
+P3_SIZE = 256 * MIB
 
 
 def record(case, **fields):
@@ -112,10 +114,17 @@ def mounted(config):
             raise
 
 
-def write_config(root, authority, catalog, members):
+def raw_url(scheme, binding, **extra):
+    node, backing, pool_id, member_id = binding
+    query = urlencode({"backing": str(backing), "pool": pool_id, "member": member_id, **extra})
+    return f"{scheme}://{node}?{query}"
+
+
+def write_config(root, authority_url, catalog, members):
     root.mkdir()
     (root / "mount").mkdir()
     config = root / "zerofs.toml"
+    catalog_setting = f'catalog_dir = "{catalog}"\n' if catalog is not None else ""
     content = f"""[cache]
 dir = "{root / 'cache'}"
 disk_size_gb = 0.064
@@ -123,12 +132,11 @@ memory_size_gb = 0.064
 warm_metadata = "off"
 
 [storage]
-url = "file://{authority}"
+url = "{authority_url}"
 encryption_password = "disposable-raw-mounted-fixture"
 
 [storage.pool]
-catalog_dir = "{catalog}"
-segment_placement = "round_robin_local"
+{catalog_setting}segment_placement = "round_robin_local"
 
 [servers.ninep]
 unix_socket = "{root / 'ninep.sock'}"
@@ -139,12 +147,11 @@ unix_socket = "{root / 'rpc.sock'}"
 [telemetry]
 enabled = false
 """
-    for member, (node, backing, pool_id, member_id) in members.items():
-        query = urlencode({"backing": str(backing), "pool": pool_id, "member": member_id})
+    for member, binding in members.items():
         content += f"""
 [[storage.pool.members]]
 id = "{member}"
-url = "raw+loop://{node}?{query}"
+url = "{raw_url('raw+loop', binding)}"
 capacity_gb = {SIZES[member] / 1e9:.9f}
 reserve_free_gb = {RESERVES[member] / 1e9:.9f}
 """
@@ -225,11 +232,26 @@ def check_member_bindings(members):
     record("rejected_loop_binding", member="small", substituted="member UUID", error=error)
 
 
-def qualify(root, members, memory_limit):
+def inspect_p3(binding, phase):
+    lines = run(PROBE, "p3-v2-inspect", *binding, "p3", P3_LAYOUT).decode().splitlines()
+    stats = {key: json.loads(value) for key, value in (line.split("=", 1) for line in lines)}
+    record("p3_regions", phase=phase, **stats)
+    return stats
+
+
+def qualify(root, members, memory_limit, p3):
     authority = root / "authority"
-    authority.mkdir()
-    catalog = root / "catalog"
-    configs = [write_config(root / phase, authority, catalog, members)
+    catalog = None
+    if p3 is None:
+        authority.mkdir()
+        authority_url = f"file://{authority}"
+        catalog = root / "catalog"
+    else:
+        authority_url = raw_url("raw+p3-v2", p3, layout_mib=P3_LAYOUT)
+        blank = inspect_p3(p3, "blank")
+        assert blank["catalog_bytes"] == blank["journal_bytes"] == 0, blank
+        assert blank["keys_objects"] == blank["authority_objects"] == 0, blank
+    configs = [write_config(root / phase, authority_url, catalog, members)
                for phase in ("initial", "fill", "overflow", "cold_restart")]
     admission = json.loads(run(ZEROFS, "memory-status", "-c", configs[0]))
     assert admission["hard_limit_bytes"] == memory_limit, admission
@@ -237,6 +259,10 @@ def qualify(root, members, memory_limit):
     record("memory_admission", **admission)
     initialized = json.loads(run(ZEROFS, "pool", "init", "-c", configs[0]))
     assert initialized["mapped_objects"] == 0, initialized
+    if p3 is not None:
+        assert initialized["pool_id"] == p3[2], initialized
+        initialized_roles = inspect_p3(p3, "pool_initialized")
+        assert initialized_roles["catalog_bytes"] > 0, initialized_roles
     digest = hashlib.sha256()
     chunks = 0
     with mounted(configs[0]) as path:
@@ -313,6 +339,15 @@ def qualify(root, members, memory_limit):
     assert restarted == final, restarted
     for member in SIZES:
         assert restarted_status[member]["space"] == after[member]["space"], restarted_status
+    if p3 is not None:
+        roles = inspect_p3(p3, "cold_restart")
+        assert roles["catalog_bytes"] > 0 and roles["authority_objects"] > 0, roles
+        assert roles["keys_objects"] == 1 and roles["envelope_in_keys"], roles
+        assert not roles["envelope_in_authority"] and roles["journal_bytes"] == 0, roles
+        shadows = sorted(str(path.relative_to(root)) for path in root.rglob("*")
+                         if path.name in {"pool.redb", "pool.lock", "zerofs.key"})
+        assert not shadows and not authority.exists(), shadows
+        record("p3_no_directory_shadows", catalog=True, authority=True, key_envelope=True)
 
 
 def main():
@@ -331,25 +366,35 @@ def main():
         if not os.access(executable, os.X_OK):
             raise RuntimeError(f"missing parent-built Linux executable at {executable}")
     record("binaries", sha256=run("sha256sum", ZEROFS, PROBE).decode().splitlines())
+    p3_enabled = os.environ["RAW_MOUNTED_P3"] == "1"
     with tempfile.TemporaryDirectory(dir="/dev/shm", prefix="zerofs-mounted-") as scratch:
         root = Path(scratch)
+        temp = root / "tmp"
+        temp.mkdir()
+        os.environ["TMPDIR"] = str(temp)
         pool_id = str(uuid4())
-        with pool(count=2) as (disks, nodes), ExitStack() as opened:
+        sizes = SIZES | ({"p3": P3_SIZE} if p3_enabled else {})
+        with pool(count=len(sizes)) as (disks, nodes), ExitStack() as opened:
             members = {}
-            for (member, size), disk in zip(SIZES.items(), disks, strict=True):
+            for (member, size), disk in zip(sizes.items(), disks, strict=True):
                 os.truncate(disk, size)
                 node = opened.enter_context(device(disk, nodes))
                 member_id = str(uuid4())
-                run(PROBE, "init-blank", node, disk, pool_id, member_id, "payload")
-                members[member] = (node, disk, pool_id, member_id)
+                binding = (node, disk, pool_id, member_id)
+                if member == "p3":
+                    run(PROBE, "p3-v2-init-blank", *binding, "p3", P3_LAYOUT)
+                else:
+                    run(PROBE, "init-blank", *binding, "payload")
+                members[member] = binding
                 backing = disk.stat()
                 block_id = node.stat().st_rdev
                 record("initialized_loop", member=member, member_uuid=member_id,
                        pool_uuid=pool_id, size_bytes=size, node=str(node), backing=str(disk),
                        backing_device=backing.st_dev, backing_inode=backing.st_ino,
                        loop_major=os.major(block_id), loop_minor=os.minor(block_id))
+            p3 = members.pop("p3", None)
             check_member_bindings(members)
-            qualify(root, members, expected_memory)
+            qualify(root, members, expected_memory, p3)
         assert all(not disk.exists() for disk in disks) and not nodes.exists()
         record("fixture_cleanup", autocleared_loops=len(disks), backing_files_removed=True)
     assert not root.exists()
