@@ -51,6 +51,33 @@ stored bytes. A larger journal needs a configuration with the corresponding
 memory admission and capacity validation; the bounded profile does not silently
 use all free space on the P3.
 
+### The v2 journal profile
+
+`[runtime] profile = "small-nas-journal-v2"` keeps v1's dirty RAM (128 MiB),
+95/85 watermarks, one local journal worker and local shutdown. The operator sets
+the dirty journal (`disk_size_gb`, 512 MiB to 16 GiB in 256 MiB steps) with a free
+floor of at least max(64 MiB, journal/8), and two to eight `upload_concurrency`
+destage workers. Startup refuses a journal filesystem too small for the budget
+plus its floor, and memory admission charges 64 MiB for each worker beyond two.
+v2 also stops copying freshly written segments into the clean disk cache, which
+on v1 cost about one extra SSD byte per payload byte.
+
+Settings for the app owner to trial on the directory-backed package:
+
+- `disk_size_gb` no larger than the journal device can absorb at the rate you
+  want. A larger window only defers work to FLUSH when the device's sustained
+  synchronous rate is below the copy rate.
+- `upload_concurrency = 4` (two per HDD member), then compare 2 and 8 with HDD
+  device counters. Upload count was not measured in isolation here, because the
+  fixture's members share one device.
+- Keep the volatile write budget at 256 MiB / 2,048 operations, and keep a FUSE
+  mount whose `max_write` is a multiple of 32 KiB. Writes that end mid-extent
+  force read-back of sealed data.
+
+Measurements, the sizing arithmetic and the raw-device contract are in
+[the sustained-drain evidence](evidence/sustained-journal-drain/README.md).
+These settings are untested on the NAS and on raw devices.
+
 ### Packaged NVMe/TCP target
 
 The target is maintained in the separate TrueNAS app repository. The fixture's

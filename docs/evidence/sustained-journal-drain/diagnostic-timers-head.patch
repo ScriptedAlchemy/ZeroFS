@@ -1,0 +1,404 @@
+diff --git a/zerofs/Cargo.toml b/zerofs/Cargo.toml
+index 2829b265..caf7fe7e 100644
+--- a/zerofs/Cargo.toml
++++ b/zerofs/Cargo.toml
+@@ -82,6 +82,7 @@ slatedb = { git = "https://github.com/Barre/slatedb.git", rev = "230ade681f1fdf0
+ slatedb-common = { git = "https://github.com/Barre/slatedb.git", rev = "230ade681f1fdf0f85fc1c2cb6c118575a83ceb1" }
+ zerofs_nfsserve = { git = "https://github.com/ScriptedAlchemy/nfsserve.git", branch = "main" }
+ tikv-jemallocator = "0.7"
++pprof = { version = "0.15", default-features = false }
+ tikv-jemalloc-ctl = { version = "0.7", features = [
+     "stats",
+ ] }
+diff --git a/zerofs/src/diag.rs b/zerofs/src/diag.rs
+new file mode 100644
+index 00000000..bbeb7e4e
+--- /dev/null
++++ b/zerofs/src/diag.rs
+@@ -0,0 +1,138 @@
++//! Diagnostic-only stage timers and CPU sampler for the sustained-drain study.
++//! Enabled by ZEROFS_DIAG_DIR. Not part of the product build.
++use std::future::Future;
++use std::io::Write;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::time::{Duration, Instant};
++
++pub const WB_RAM_ADMISSION: usize = 0;
++pub const WB_SSD_ADMISSION: usize = 1;
++pub const WB_MULTIPART_RAM: usize = 2;
++pub const REMOTE_VERIFY_OPEN: usize = 3;
++pub const REMOTE_READ_COLLECT: usize = 4;
++pub const REMOTE_POOL_PUT: usize = 5;
++pub const REMOTE_COMMIT_RUN: usize = 6;
++pub const POOL_HASH: usize = 7;
++pub const POOL_CATALOG: usize = 8;
++pub const POOL_MEMBER_PUT: usize = 9;
++pub const POOL_ENSURE_MEMBER: usize = 10;
++pub const LOCAL_LOCK_PARENTS: usize = 11;
++pub const LOCAL_INNER_PUT: usize = 12;
++pub const JOURNAL_STAGE: usize = 13;
++pub const JOURNAL_COMMIT: usize = 14;
++pub const EXTENT_SEAL_OPEN: usize = 15;
++pub const REMOTE_APPLY: usize = 16;
++pub const POOL_HEAD: usize = 17;
++const NAMES: [&str; 18] = [
++    "wb.ram_admission",
++    "wb.ssd_admission",
++    "wb.multipart_ram_admission",
++    "remote.verify_open",
++    "remote.read_collect",
++    "remote.pool_put",
++    "remote.commit_run",
++    "pool.hash",
++    "pool.catalog",
++    "pool.member_put",
++    "pool.ensure_member",
++    "local.lock_parents",
++    "local.inner_put",
++    "journal.stage_batch",
++    "journal.commit_staged",
++    "extent.seal_open",
++    "remote.apply_record",
++    "pool.head",
++];
++static NS: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
++static COUNT: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
++
++pub fn record(stage: usize, started: Instant) {
++    NS[stage].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
++    COUNT[stage].fetch_add(1, Ordering::Relaxed);
++}
++
++pub async fn time<F: Future>(stage: usize, future: F) -> F::Output {
++    let started = Instant::now();
++    let output = future.await;
++    record(stage, started);
++    output
++}
++
++pub fn time_sync<T>(stage: usize, operation: impl FnOnce() -> T) -> T {
++    let started = Instant::now();
++    let output = operation();
++    record(stage, started);
++    output
++}
++
++fn snapshot(origin: Instant) -> String {
++    let mut line = format!("{{\"t\":{:.3}", origin.elapsed().as_secs_f64());
++    for (index, name) in NAMES.iter().enumerate() {
++        line.push_str(&format!(
++            ",\"{name}\":[{},{}]",
++            COUNT[index].load(Ordering::Relaxed),
++            NS[index].load(Ordering::Relaxed)
++        ));
++    }
++    line.push('}');
++    line
++}
++
++pub fn start() {
++    let Some(dir) = std::env::var_os("ZEROFS_DIAG_DIR") else {
++        return;
++    };
++    let dir = std::path::PathBuf::from(dir);
++    let origin = Instant::now();
++    let stages = dir.clone();
++    std::thread::spawn(move || {
++        let path = stages.join(format!("stages-{}.jsonl", std::process::id()));
++        let Ok(mut file) = std::fs::File::create(path) else {
++            return;
++        };
++        loop {
++            std::thread::sleep(Duration::from_millis(500));
++            let _ = writeln!(file, "{}", snapshot(origin));
++        }
++    });
++    let start_after = env_secs("ZEROFS_DIAG_PPROF_START");
++    let seconds = env_secs("ZEROFS_DIAG_PPROF_SECS");
++    if seconds == 0 {
++        return;
++    }
++    std::thread::spawn(move || {
++        std::thread::sleep(Duration::from_secs(start_after));
++        let Ok(guard) = pprof::ProfilerGuardBuilder::default()
++            .frequency(499)
++            .blocklist(&["libc", "libgcc", "pthread", "vdso"])
++            .build()
++        else {
++            return;
++        };
++        std::thread::sleep(Duration::from_secs(seconds));
++        let Ok(report) = guard.report().build() else {
++            return;
++        };
++        let path = dir.join(format!("pprof-{}.folded", std::process::id()));
++        let Ok(mut file) = std::fs::File::create(path) else {
++            return;
++        };
++        for (frames, count) in &report.data {
++            let mut stack: Vec<String> = Vec::new();
++            for frame in frames.frames.iter().rev() {
++                for symbol in frame.iter().rev() {
++                    stack.push(symbol.name().replace(';', ":"));
++                }
++            }
++            let thread = frames.thread_name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '-').to_owned();
++            let _ = writeln!(file, "{thread};{} {count}", stack.join(";"));
++        }
++    });
++}
++
++fn env_secs(name: &str) -> u64 {
++    std::env::var(name)
++        .ok()
++        .and_then(|value| value.parse().ok())
++        .unwrap_or(0)
++}
+diff --git a/zerofs/src/fs/store/extent/write.rs b/zerofs/src/fs/store/extent/write.rs
+index ec488046..40f23bc2 100644
+--- a/zerofs/src/fs/store/extent/write.rs
++++ b/zerofs/src/fs/store/extent/write.rs
+@@ -1216,6 +1216,10 @@ impl ExtentStore {
+     /// then synchronously seal the current open buffer. After this returns, every
+     /// segment referenced by a committed extent is durable on the object store.
+     pub async fn seal_open(&self) -> Result<(), FsError> {
++        crate::diag::time(crate::diag::EXTENT_SEAL_OPEN, self.seal_open_inner()).await
++    }
++
++    async fn seal_open_inner(&self) -> Result<(), FsError> {
+         // Active-upload capacity is independent from resident-buffer capacity.
+         // Drain uploads first so a failed resident generation cannot deadlock a
+         // writer holding an append gate while it waits for memory budget.
+diff --git a/zerofs/src/lib.rs b/zerofs/src/lib.rs
+index d0681ba9..fbad37e9 100644
+--- a/zerofs/src/lib.rs
++++ b/zerofs/src/lib.rs
+@@ -3,6 +3,7 @@ use std::io::BufRead;
+ 
+ pub(crate) mod abandonment;
+ pub mod alloc_rss;
++pub mod diag;
+ pub mod block_transformer;
+ mod bucket_identity;
+ mod cache_metrics;
+diff --git a/zerofs/src/local_object_store.rs b/zerofs/src/local_object_store.rs
+index 7f614ebd..40738d6d 100644
+--- a/zerofs/src/local_object_store.rs
++++ b/zerofs/src/local_object_store.rs
+@@ -262,7 +262,7 @@ impl ObjectStore for LocalConditionalStore {
+         let root = self.readiness_root.clone();
+         run_local(move || {
+             check_readiness_path(root.as_deref(), &path)?;
+-            let _locks = lock_parents(std::slice::from_ref(&path))?;
++            let _locks = crate::diag::time_sync(crate::diag::LOCAL_LOCK_PARENTS, || lock_parents(std::slice::from_ref(&path)))?;
+             if opts.extensions.get::<pool::PoolObjectCreate>().is_some() {
+                 if !matches!(opts.mode, PutMode::Create) {
+                     return Err(generic("pool native writes must be create-only"));
+@@ -295,7 +295,7 @@ impl ObjectStore for LocalConditionalStore {
+                 }
+                 opts.mode = PutMode::Overwrite;
+             }
+-            futures::executor::block_on(inner.put_opts(&location, payload, opts))
++            crate::diag::time_sync(crate::diag::LOCAL_INNER_PUT, || futures::executor::block_on(inner.put_opts(&location, payload, opts)))
+         })
+         .await
+     }
+diff --git a/zerofs/src/main.rs b/zerofs/src/main.rs
+index a642aa8a..502207d9 100644
+--- a/zerofs/src/main.rs
++++ b/zerofs/src/main.rs
+@@ -14,6 +14,7 @@ static GLOBAL: Jemalloc = Jemalloc;
+ /// needing an operator; every other failure exits with 1, as a `Result` from
+ /// `main` did.
+ fn main() -> ExitCode {
++    zerofs::diag::start();
+     let runtime = match tokio::runtime::Builder::new_multi_thread()
+         .enable_all()
+         .enable_eager_driver_handoff()
+diff --git a/zerofs/src/pool_object_store/mod.rs b/zerofs/src/pool_object_store/mod.rs
+index c953abee..eceea454 100644
+--- a/zerofs/src/pool_object_store/mod.rs
++++ b/zerofs/src/pool_object_store/mod.rs
+@@ -721,10 +721,10 @@ impl PoolObjectStore {
+         operation: impl FnOnce(&Catalog) -> anyhow::Result<T> + Send + 'static,
+     ) -> object_store::Result<T> {
+         let catalog = Arc::clone(&self.inner.catalog);
+-        match self
++        match crate::diag::time(crate::diag::POOL_CATALOG, self
+             .inner
+             .tasks
+-            .spawn_blocking(move || operation(&catalog))
++            .spawn_blocking(move || operation(&catalog)))
+             .await
+         {
+             Ok(Ok(value)) => Ok(value),
+@@ -1024,7 +1024,7 @@ impl PoolObjectStore {
+             }
+             let member_id = upload.member_id.clone();
+             self.catalog(move |c| c.require_eligible(&member_id)).await?;
+-            self.ensure_member(&upload.member_id, true).await?;
++            crate::diag::time(crate::diag::POOL_ENSURE_MEMBER, self.ensure_member(&upload.member_id, true)).await?;
+             if cancelled.load(Ordering::Acquire) {
+                 return Err(error("pool publication was cancelled before upload"));
+             }
+@@ -1032,11 +1032,11 @@ impl PoolObjectStore {
+                 Some(known) => known.0,
+                 None => {
+                     let digest_payload = payload.clone();
+-                    tokio::task::spawn_blocking(move || {
++                    crate::diag::time(crate::diag::POOL_HASH, tokio::task::spawn_blocking(move || {
+                         let mut hash = Sha256::new();
+                         for bytes in digest_payload { hash.update(&bytes); }
+                         hash.finalize().into()
+-                    }).await.map_err(|e| error(format!("pool checksum task failed: {e}")))?
++                    })).await.map_err(|e| error(format!("pool checksum task failed: {e}")))?
+                 }
+             };
+             if let Some(expected) = preserve.as_ref().and_then(|entry| entry.sha256)
+@@ -1060,13 +1060,13 @@ impl PoolObjectStore {
+                 options.extensions.insert(PoolObjectCreate);
+             }
+             let path = Path::from(upload.physical_key.clone());
+-            let written = member.store.put_opts(&path, payload, options).await?;
++            let written = crate::diag::time(crate::diag::POOL_MEMBER_PUT, member.store.put_opts(&path, payload, options)).await?;
+             #[cfg(test)] crash_cutpoint("after_target_write");
+             let physical = Physical::Member {
+                 member_id: upload.member_id.clone(), key: upload.physical_key.clone(),
+                 e_tag: written.e_tag, version: written.version,
+             };
+-            let meta = member.store.head(&path).await?;
++            let meta = crate::diag::time(crate::diag::POOL_HEAD, member.store.head(&path)).await?;
+             if meta.size != upload.size {
+                 return Err(error("pool member stored a different object length"));
+             }
+@@ -1097,7 +1097,7 @@ impl PoolObjectStore {
+             let id = upload.id.clone();
+             let member_id = upload.member_id.clone();
+             self.catalog(move |c| c.require_eligible(&member_id)).await?;
+-            self.ensure_member(&upload.member_id, true).await?;
++            crate::diag::time(crate::diag::POOL_ENSURE_MEMBER, self.ensure_member(&upload.member_id, true)).await?;
+             let garbage = self.catalog(move |catalog| catalog.publish_for_migration(&id, &entry, previous.as_ref(), automatic)).await?;
+             #[cfg(test)] crash_cutpoint("after_remap");
+             #[cfg(test)] if garbage.is_some() { crash_cutpoint("before_source_delete"); }
+diff --git a/zerofs/src/writeback/journaler.rs b/zerofs/src/writeback/journaler.rs
+index 398cd5d5..e9474747 100644
+--- a/zerofs/src/writeback/journaler.rs
++++ b/zerofs/src/writeback/journaler.rs
+@@ -1050,7 +1050,7 @@ async fn run_journaler(
+                 .expect("a staged batch owns its permits");
+             let commit_sink = sink.clone();
+             committing = Some(tokio::task::spawn_blocking(move || {
+-                commit_sink.commit_staged(staged)
++                crate::diag::time_sync(crate::diag::JOURNAL_COMMIT, || commit_sink.commit_staged(staged))
+             }));
+             committing_ownership = ownership;
+         }
+@@ -1101,7 +1101,7 @@ async fn run_journaler(
+                     staging.push(tokio::task::spawn_blocking(move || {
+                         (
+                             expected_first,
+-                            stage_sink.stage_batch(mutations, expected_first),
++                            crate::diag::time_sync(crate::diag::JOURNAL_STAGE, || stage_sink.stage_batch(mutations, expected_first)),
+                         )
+                     }));
+                     staged_ownership.insert(expected_first, ownership);
+diff --git a/zerofs/src/writeback/remote.rs b/zerofs/src/writeback/remote.rs
+index fc9f80df..f8890814 100644
+--- a/zerofs/src/writeback/remote.rs
++++ b/zerofs/src/writeback/remote.rs
+@@ -598,13 +598,13 @@ async fn run_remote_scheduler(worker: RemoteWorker) {
+                         let applying = warn_while_flush_is_slow(
+                             record.sequence,
+                             record.path.clone(),
+-                            apply_record(
++                            crate::diag::time(crate::diag::REMOTE_APPLY, apply_record(
+                                 remote,
+                                 journal,
+                                 record.clone(),
+                                 cleanup_sender,
+                                 cleanup_state,
+-                            ),
++                            )),
+                         );
+                         let result = if matches!(record.kind, MutationKind::Delete) {
+                             bounded_remote_operation(&record, REMOTE_OPERATION_TIMEOUT, applying)
+@@ -1310,7 +1310,7 @@ fn start_ready_commit(
+                 .expect("ready commit run contains the frontier")
+                 .0
+                 .sequence;
+-            let result = commit_remote_run(&journal, &overlay, &ssd, &space, &run).await;
++            let result = crate::diag::time(crate::diag::REMOTE_COMMIT_RUN, commit_remote_run(&journal, &overlay, &ssd, &space, &run)).await;
+             (last, result)
+         }
+         .boxed(),
+@@ -1479,7 +1479,7 @@ async fn stream_record_to_remote(
+         // segment the drain moved.
+         let digest = record.payload().map(|(_, sha256)| sha256);
+         let payload =
+-            tokio::task::spawn_blocking(move || blob_journal.read_verified_payload(sequence))
++            crate::diag::time(crate::diag::REMOTE_VERIFY_OPEN, tokio::task::spawn_blocking(move || blob_journal.read_verified_payload(sequence)))
+                 .await
+                 .map_err(|error| generic_error(format!("journal read task failed: {error}")))?
+                 .map_err(|error| generic_error(format!("journal blob read failed: {error:#}")))?;
+@@ -1497,7 +1497,7 @@ async fn stream_record_to_remote(
+             record,
+             "bounded atomic put",
+             REMOTE_PUBLICATION_TIMEOUT,
+-            remote.put_opts(target, PutPayload::from(payload), options),
++            crate::diag::time(crate::diag::REMOTE_POOL_PUT, remote.put_opts(target, PutPayload::from(payload), options)),
+         )
+         .await;
+         return match result {
+@@ -1511,7 +1511,7 @@ async fn stream_record_to_remote(
+             Err(error) => Err(error),
+         };
+     }
+-    let blob = tokio::task::spawn_blocking(move || blob_journal.open_verified_blob(sequence))
++    let blob = crate::diag::time(crate::diag::REMOTE_VERIFY_OPEN, tokio::task::spawn_blocking(move || blob_journal.open_verified_blob(sequence)))
+         .await
+         .map_err(|error| generic_error(format!("journal open task failed: {error}")))?
+         .map_err(|error| generic_error(format!("journal blob open failed: {error:#}")))?;
+@@ -1784,7 +1784,7 @@ async fn verify_existing(
+     let meta = bounded_remote_step(record, "reconciliation head", remote.head(target)).await?;
+     let sequence = record.sequence;
+     let blob_journal = Arc::clone(journal);
+-    let blob = tokio::task::spawn_blocking(move || blob_journal.open_verified_blob(sequence))
++    let blob = crate::diag::time(crate::diag::REMOTE_VERIFY_OPEN, tokio::task::spawn_blocking(move || blob_journal.open_verified_blob(sequence)))
+         .await
+         .map_err(|error| generic_error(format!("journal open task failed: {error}")))?
+         .map_err(|error| generic_error(format!("journal blob open failed: {error:#}")))?;
+diff --git a/zerofs/src/writeback/store.rs b/zerofs/src/writeback/store.rs
+index e3778df7..a4147289 100644
+--- a/zerofs/src/writeback/store.rs
++++ b/zerofs/src/writeback/store.rs
+@@ -412,7 +412,7 @@ impl WritebackObjectStore {
+     }
+ 
+     async fn reserve_ssd(&self, bytes: u64) -> object_store::Result<SsdReservationToken> {
+-        reserve_ssd_token(&self.inner.ssd, &self.inner.space, bytes).await
++        crate::diag::time(crate::diag::WB_SSD_ADMISSION, reserve_ssd_token(&self.inner.ssd, &self.inner.space, bytes)).await
+     }
+ 
+     #[cfg(test)]
+@@ -955,10 +955,10 @@ impl ObjectStore for WritebackObjectStore {
+     ) -> object_store::Result<PutResult> {
+         let bytes_len = u64::try_from(payload.content_length())
+             .map_err(|_| generic_error("put payload length exceeds u64"))?;
+-        let ram = self
++        let ram = crate::diag::time(crate::diag::WB_RAM_ADMISSION, self
+             .inner
+             .admission
+-            .reserve(bytes_len)
++            .reserve(bytes_len))
+             .await
+             .map_err(|error| generic_error(format!("dirty RAM admission failed: {error}")))?
+             .accept();
+@@ -1020,7 +1020,7 @@ impl ObjectStore for WritebackObjectStore {
+                 });
+         let preowned_reservation = match declared_payload_len {
+             Some(payload_len) if memory_parts => Some(MultipartPartReservation::Ram(
+-                RamMultipartPartReservation::reserve(&self.inner.admission, payload_len)
++                crate::diag::time(crate::diag::WB_MULTIPART_RAM, RamMultipartPartReservation::reserve(&self.inner.admission, payload_len))
+                     .await
+                     .map_err(|error| {
+                         generic_error(format!("declared multipart RAM admission failed: {error}"))

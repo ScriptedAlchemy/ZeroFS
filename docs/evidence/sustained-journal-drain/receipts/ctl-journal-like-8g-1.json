@@ -1,0 +1,16 @@
+{
+  "status": "passed",
+  "mode": "journal-like",
+  "depth": 8,
+  "write_kib": 1024,
+  "file_mib": 8192,
+  "kernel": "6.12.76-linuxkit",
+  "sha256": "87956f8badfeca62f08fd383a940e995bda1488ef3e708f8521615932a37354e",
+  "bytes": 8589934592,
+  "write_seconds": 43.76611960299988,
+  "through_fsync_seconds": 43.76611960299988,
+  "write_mb_per_second": 196.26904715151434,
+  "through_fsync_mb_per_second": 196.26904715151434,
+  "client_cpu_seconds": 7.8453430939999995,
+  "cleanup_verified": true
+}

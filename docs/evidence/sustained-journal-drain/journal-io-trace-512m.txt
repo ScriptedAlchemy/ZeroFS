@@ -1,0 +1,16 @@
+cache              sync  n=     4 time=   0.13s mean=  32.79ms
+cache              write n=     1 time=   0.00s mean=   0.09ms bytes=106 per_payload=0.000
+catalog            sync  n=    52 time=   5.52s mean= 106.20ms
+catalog            write n=   325 time=   0.33s mean=   1.03ms bytes=1,134,848 per_payload=0.002
+destination        sync  n=    62 time=  10.12s mean= 163.17ms
+destination        write n=    16 time=   0.51s mean=  32.12ms bytes=539,946,797 per_payload=1.006
+journal            sync  n=   126 time=  10.60s mean=  84.13ms
+journal            write n=   408 time=   0.72s mean=   1.76ms bytes=541,634,555 per_payload=1.009
+metadata           sync  n=    67 time=   3.30s mean=  49.19ms
+metadata           write n=    16 time=   0.00s mean=   0.23ms bytes=387,911 per_payload=0.001
+other              sync  n=     9 time=   0.05s mean=   5.42ms
+  catalog write sizes (<=pow2: count): [(4096, 273), (512, 52)]
+  metadata write sizes (<=pow2: count): [(64, 3), (256, 3), (8, 2), (16, 1)]
+  journal write sizes (<=pow2: count): [(4096, 312), (512, 70), (67108864, 16), (256, 3)]
+  cache write sizes (<=pow2: count): [(128, 1)]
+  destination write sizes (<=pow2: count): [(67108864, 16)]

@@ -1,0 +1,37 @@
+# prof-v2-8g-ext4 (software SHA, ext4 volume, v2 16 GiB journal, 8 GiB, unaligned 1 MiB-24 writes, depth 8), engine seconds 25-85
+window 25.1-85.2 s (60.1 s)
+stage                          count    sum_s   mean_ms   busy%
+wb.ram_admission                 172    96.65    561.92   160.8
+wb.ssd_admission                 172     0.04      0.26     0.1
+remote.verify_open               160   144.27    901.69   240.0
+remote.pool_put                  159   336.08   2113.69   559.0
+remote.commit_run                 77    34.29    445.35    57.0
+pool.catalog                    1309   125.38     95.78   208.6
+pool.member_put                  145   207.30   1429.67   344.8
+pool.ensure_member               290     0.54      1.86     0.9
+local.lock_parents               159    98.57    619.93   164.0
+local.inner_put                  160   115.39    721.20   191.9
+journal.stage_batch              158   111.96    708.62   186.2
+journal.commit_staged            157    11.85     75.48    19.7
+extent.seal_open                   3     3.46   1154.75     5.8
+remote.apply_record              159   481.56   3028.70   801.0
+pool.head                        145     0.07      0.49     0.1
+
+# prof-hwsha-2g-tmpfs (hardware SHA, tmpfs, v2 4 GiB journal, 2 GiB), engine seconds 4-12
+window 4.0-11.5 s (7.5 s)
+stage                          count    sum_s   mean_ms   busy%
+wb.ram_admission                  62     0.00      0.01     0.0
+wb.ssd_admission                  62     0.01      0.19     0.2
+remote.verify_open                65     2.69     41.40    35.7
+remote.pool_put                   65     5.40     83.05    71.7
+remote.commit_run                 28     0.15      5.23     1.9
+pool.catalog                     585     0.19      0.32     2.5
+pool.member_put                   65     4.85     74.54    64.4
+pool.ensure_member               130     0.11      0.87     1.5
+local.lock_parents                65     2.45     37.70    32.6
+local.inner_put                   65     2.34     36.06    31.1
+journal.stage_batch               63     2.15     34.11    28.5
+journal.commit_staged             63     0.01      0.16     0.1
+extent.seal_open                   1     0.02     15.13     0.2
+remote.apply_record               65     8.11    124.79   107.7
+pool.head                         65     0.03      0.39     0.3
