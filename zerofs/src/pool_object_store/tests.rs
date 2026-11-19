@@ -3141,3 +3141,79 @@ async fn segment_target_cannot_override_an_inflight_multipart_reservation() {
         .unwrap();
     assert_eq!(placement(&pool, &location).await, "hdd-b");
 }
+
+#[tokio::test]
+async fn writeback_replays_segment_to_persisted_member_before_any_pool_put() {
+    use crate::writeback::config::{AckMode, ShutdownFlush, WritebackSettings};
+    use crate::writeback::model::JournalIdentity;
+
+    let fixture = Fixture::new(1024);
+    let pool = fixture.initialize().await;
+    let settings = WritebackSettings {
+        dir: fixture.catalog.path().canonicalize().unwrap().join("dirty"),
+        ack_mode: AckMode::Memory,
+        memory_bytes: 1_000_000,
+        disk_bytes: 10_000_000,
+        min_free_bytes: 1,
+        high_watermark_percent: 95,
+        resume_percent: 85,
+        upload_concurrency: 1,
+        local_concurrency: 1,
+        shutdown_flush: ShutdownFlush::Local,
+    };
+    let identity = JournalIdentity {
+        format_version: 1,
+        bucket_id: "pool-target-fixture".into(),
+        backend_endpoint: "memory://pool-target-fixture".into(),
+        database_prefix: "db".into(),
+        backend_kind: "pool".into(),
+        encryption_key_identity_sha256: [0x86; 32],
+    };
+    let attached = crate::writeback::bootstrap::attach(
+        Arc::new(pool.clone()),
+        settings.clone(),
+        identity.clone(),
+        "target-fixture",
+    )
+    .await
+    .unwrap();
+    attached.lifecycle.set_pool(pool.clone());
+    let key = segment(706);
+    let body = Bytes::from_static(b"durable before the first pool put");
+    let mut options = create_options();
+    options.extensions.insert(SegmentTarget("hdd-b".into()));
+    attached
+        .store
+        .put_opts(&key, body.clone().into(), options)
+        .await
+        .unwrap();
+    attached
+        .lifecycle
+        .wait_local_through_accepted()
+        .await
+        .unwrap();
+    assert!(pool.placements().await.unwrap().is_empty());
+    attached.lifecycle.shutdown().await.unwrap();
+    drop(attached);
+    pool.settle().await;
+    drop(pool);
+
+    let pool = fixture.reopen().await.unwrap();
+    let replay = crate::writeback::bootstrap::attach(
+        Arc::new(pool.clone()),
+        settings,
+        identity,
+        "target-fixture",
+    )
+    .await
+    .unwrap();
+    assert!(pool.placements().await.unwrap().is_empty());
+    replay.lifecycle.activate_remote().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), replay.lifecycle.wait_remote(1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(placement(&pool, &key).await, "hdd-b");
+    assert_eq!(read(&pool, &key).await, body);
+    replay.lifecycle.shutdown().await.unwrap();
+}

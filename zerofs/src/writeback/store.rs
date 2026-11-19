@@ -441,7 +441,10 @@ impl WritebackObjectStore {
     }
 
     pub(crate) fn set_pool(&self, pool: PoolObjectStore) {
-        self.inner.pool.set(pool).expect("writeback pool already configured");
+        self.inner
+            .pool
+            .set(pool)
+            .expect("writeback pool already configured");
     }
 
     /// Start remote writeback after callers have finished opening over the
@@ -710,7 +713,9 @@ impl WritebackObjectStore {
         })?;
         if let Some(target) = options.extensions.get::<SegmentTarget>() {
             if mode != MutationMode::Create || !trusted_segment_create {
-                return Err(generic_error("writeback segment targets require generated conditional create"));
+                return Err(generic_error(
+                    "writeback segment targets require generated conditional create",
+                ));
             }
             let pool = self.inner.pool.get().ok_or_else(|| {
                 generic_error("writeback cannot persist a segment target without its pool catalog")

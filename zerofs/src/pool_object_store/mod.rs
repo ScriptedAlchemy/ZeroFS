@@ -1192,7 +1192,9 @@ impl PoolObjectStore {
         target: &SegmentTarget,
     ) -> object_store::Result<()> {
         if !self.segment(location) {
-            return Err(unsupported("segment targets require a canonical segment key"));
+            return Err(unsupported(
+                "segment targets require a canonical segment key",
+            ));
         }
         let _guard = self.key_lock(location).write_owned().await;
         let previous = self.visible(location).await?;
