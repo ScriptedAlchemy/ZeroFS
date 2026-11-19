@@ -3054,13 +3054,12 @@ async fn quarantined_segment_target_refuses_creation_without_spilling() {
     let pool = fixture.initialize().await;
     let location = segment(703);
     pool.quarantine("hdd-b", "synthetic offline member").await.unwrap();
-    let mut options = create_options();
+    let mut options = PutMultipartOptions::default();
+    let capability = ConditionalMultipartCreate::for_payload_len(4);
+    options.extensions.insert(capability.clone());
     options.extensions.insert(SegmentTarget("hdd-b".into()));
-    assert!(
-        pool.put_opts(&location, Bytes::from_static(b"data").into(), options)
-            .await
-            .is_err()
-    );
+    assert!(pool.put_multipart_opts(&location, options).await.is_err());
+    assert!(!capability.is_acknowledged());
     assert!(
         pool.put_opts(&location, Bytes::from_static(b"data").into(), create_options())
             .await
