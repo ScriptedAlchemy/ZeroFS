@@ -1,0 +1,112 @@
+{
+  "platform": "aarch64 Linux, Studio Docker Desktop",
+  "rustc": "1.100.0 (0ef1bc386 2026-11-09)",
+  "cargo": "1.100.0 (3acc79c0c 2026-11-05)",
+  "image_id": "sha256:0728ce88add0b9419181905121ad1169a947493e73a0a72c61a54661bad8009c",
+  "build": "cargo build --locked --offline --profile ci -j5 --no-default-features --features webui --bin zerofs",
+  "tests": "same profile and features; six library test filters, two threads; actual built WebUI assets",
+  "mounted_sources": {
+    "initial": {
+      "source": "6a1855b8a77cb5f7ba4f6c4acc36864a503419fb",
+      "engine_sha256": "81b14192e72684c75f013dd85c5172dcfae5edc91a095f88023249c9f6959701",
+      "probe_sha256": "768349f4db099c0904b4c126677ebf911279868c6b44613872715c08b038ab66",
+      "probe_profile": "dev",
+      "raw_device_suite": {
+        "passed": 59,
+        "failed": 0,
+        "ignored": 1
+      },
+      "explicit_ignored_held_fd_libblkid_control": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0
+      },
+      "engine_filters": {
+        "cli::memory_budget::": {
+          "passed": 43,
+          "failed": 0,
+          "ignored": 0
+        },
+        "storage_backend::": {
+          "passed": 12,
+          "failed": 0,
+          "ignored": 0
+        },
+        "raw_member::": {
+          "passed": 18,
+          "failed": 0,
+          "ignored": 0
+        },
+        "writeback::bootstrap::": {
+          "passed": 8,
+          "failed": 0,
+          "ignored": 0
+        },
+        "writeback::journal::": {
+          "passed": 101,
+          "failed": 0,
+          "ignored": 2
+        },
+        "pool_object_store::": {
+          "passed": 96,
+          "failed": 0,
+          "ignored": 1
+        }
+      }
+    },
+    "final": {
+      "source": "143fb0c8f8a2863d4e4b02cb965c451f09ce9fab",
+      "engine_sha256": "b3d996156be4b6c04617334837f1171a6698be1b123c0bfbc8a4676e6e783e5e",
+      "probe_sha256": "d94fee2d44520ed7d2878bcd3d8423fedd9631dca56731e89848f2170e41c731",
+      "probe_profile": "release",
+      "raw_device_suite": {
+        "passed": 64,
+        "failed": 0,
+        "ignored": 1
+      },
+      "explicit_ignored_held_fd_libblkid_control": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0
+      },
+      "engine_filters": {
+        "cli::memory_budget::": {
+          "passed": 44,
+          "failed": 0,
+          "ignored": 0
+        },
+        "storage_backend::": {
+          "passed": 12,
+          "failed": 0,
+          "ignored": 0
+        },
+        "raw_member::": {
+          "passed": 18,
+          "failed": 0,
+          "ignored": 0
+        },
+        "writeback::bootstrap::": {
+          "passed": 8,
+          "failed": 0,
+          "ignored": 0
+        },
+        "writeback::journal::": {
+          "passed": 101,
+          "failed": 0,
+          "ignored": 2
+        },
+        "pool_object_store::": {
+          "passed": 96,
+          "failed": 0,
+          "ignored": 1
+        }
+      }
+    }
+  },
+  "disclosures": [
+    "Initial offline build lacked cfg-if 1.0.5. Fetched the locked dependency. An intermediate compile used libc::RAMFS_MAGIC, unavailable in the pinned libc, and was corrected before the first mounted build.",
+    "The check-claim invalid-role witness initially grepped for the wrong error string. The role was refused, and the corrected assertion and manifest tests passed.",
+    "Concurrent source archives reused the same target directory. Detected an old test binary via its missing physical-manifest test. Rebuilt the final source alone, confirmed the physical test by name, ran every filter again, and reproduced the exact mounted engine binary byte for byte. Only the audited test count is included for the final source."
+  ],
+  "final_engine_test_binary_sha256": "de0b31fc423c9c4f8d3229d1b57cb7b56d60bf0aafcbdde13af0822be3b6759a"
+}

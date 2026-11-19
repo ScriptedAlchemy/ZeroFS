@@ -76,14 +76,16 @@ pub async fn run(command: PoolCommands) -> Result<()> {
         } else { None };
         match command {
             PoolCommands::VerifyRaw { .. } => {
-                let progress = journal.context("raw journal was not verified")?.progress()?;
+                let journal = journal.context("raw journal was not verified")?;
+                let progress = journal.progress()?;
+                let allocation = tokio::task::spawn_blocking(move || journal.raw_allocation()).await??;
                 let status = pool.status().await?;
                 println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                     "schema_version": 1, "profile": "raw-device-p3-nas-fit-v1",
                     "pool_id": status.pool_id, "members": status.members,
                     "authority_verified": true, "catalog_verified": true, "key_envelope_verified": true,
                     "journal_verified": true, "local_seq": progress.local_seq, "remote_seq": progress.remote_seq,
-                    "memory": admission
+                    "journal_allocation": allocation, "memory": admission
                 }))?);
             }
             PoolCommands::Affected { .. } => unreachable!(),

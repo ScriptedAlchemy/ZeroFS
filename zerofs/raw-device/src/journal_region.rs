@@ -2,6 +2,9 @@
 //!
 //! The first two blocks hold checksummed length checkpoints. The rest of the
 //! region is a direct byte mapping for a transactional database such as redb.
+//! The v2 checkpoints may carry a checksummed high-water offset for backing
+//! verified blank at provisioning. Beyond it the initial zero bytes remain
+//! untouched. Older v2 writers discard the optional field when checkpointing.
 //! The database owns transaction ordering and page reclamation. In particular
 //! its durable metadata must stop referencing truncated bytes before it calls
 //! `set_len`. Ordinary writes are durable only once `sync_data` succeeds.
@@ -19,6 +22,7 @@ use std::{
 const DATA_START: u64 = 2 * BLOCK_SIZE;
 const JOURNAL_MAGIC: [u8; 8] = *b"ZWBREG02";
 const CATALOG_MAGIC: [u8; 8] = *b"ZCTREG02";
+const ZERO_FRONTIER_MAGIC: [u8; 8] = *b"ZTRZERO1";
 const DIGEST_START: usize = BLOCK_SIZE as usize - 32;
 type Block = [u8; BLOCK_SIZE as usize];
 
@@ -51,6 +55,9 @@ struct Binding {
 struct Length {
     generation: u64,
     len: u64,
+    // A provision-time blank scan proves the suffix at and beyond this
+    // block-aligned high-water offset has never been exposed to a caller.
+    zero_from: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -75,6 +82,7 @@ impl TransactionRegion {
         let length = Length {
             generation: 1,
             len: 0,
+            zero_from: Some(0),
         };
         checkpoint(&region, binding, length)?;
         Ok(Self::new(region, binding, length, None))
@@ -95,8 +103,13 @@ impl TransactionRegion {
             region.read_exact_at(&mut block, slot as u64 * BLOCK_SIZE)?;
             *length = decode(&block, binding)?;
         }
-        let (length, stale_slot) = match slots {
-            [Some(first), Some(second)] if first == second => (first, None),
+        let (mut length, stale_slot) = match slots {
+            [Some(first), Some(second)]
+                if first.generation == second.generation && first.len == second.len =>
+            {
+                let stale = (first.zero_from != second.zero_from).then_some(BLOCK_SIZE);
+                (first, stale)
+            }
             [Some(first), Some(second)]
                 if first.generation.checked_sub(1) == Some(second.generation) =>
             {
@@ -109,6 +122,20 @@ impl TransactionRegion {
                     "no consistent raw transactional region length checkpoint",
                 ));
             }
+        };
+        // V2 writers that predate the extension discard it on resize and
+        // repair. Only use the proof when both slots carry it and agree on
+        // the exact high-water transition. Keep unknown history unknown.
+        length.zero_from = match slots {
+            [Some(first), Some(second)] => match (first.zero_from, second.zero_from) {
+                (Some(new), Some(old))
+                    if new == old.max(first.len.next_multiple_of(BLOCK_SIZE)) =>
+                {
+                    Some(new)
+                }
+                _ => None,
+            },
+            _ => None,
         };
         Ok(Self::new(region, binding, length, stale_slot))
     }
@@ -218,15 +245,16 @@ impl TransactionRegion {
         poison_on_error(&mut state, result)
     }
 
-    /// Restore file-style zero-on-growth even after previously used physical
-    /// blocks are exposed again. Persist zeros before publishing the length.
+    /// Restore file-style zero-on-growth after previously exposed physical
+    /// bytes are used again. Persist any required zeros before publishing the
+    /// length. A checkpointed, verified blank suffix needs no writes.
     /// Shrink keeps the truncated bytes intact and fences prior database writes
     /// before publishing the shorter length.
     pub fn set_len(&self, len: u64) -> io::Result<()> {
         if len > self.resize_ceiling {
             return Err(io::Error::new(
                 io::ErrorKind::StorageFull,
-                "raw transactional region region is full",
+                "raw transactional region is full",
             ));
         }
         let mut state = self.state()?;
@@ -240,13 +268,18 @@ impl TransactionRegion {
                     io::Error::other("raw transactional region generation exhausted")
                 })?,
                 len,
+                zero_from: state
+                    .length
+                    .zero_from
+                    .map(|offset| offset.max(len.next_multiple_of(BLOCK_SIZE))),
             };
         let result = (|| {
-            if len > state.length.len {
+            let zero_until = len.min(state.length.zero_from.unwrap_or(len));
+            if zero_until > state.length.len {
                 let zeros = [0; 64 * 1024];
                 let mut offset = state.length.len;
-                while offset < len {
-                    let count = (len - offset).min(zeros.len() as u64) as usize;
+                while offset < zero_until {
+                    let count = (zero_until - offset).min(zeros.len() as u64) as usize;
                     self.region
                         .write_all_at(&zeros[..count], DATA_START + offset)?;
                     offset += count as u64;
@@ -339,6 +372,10 @@ fn encode(binding: Binding, length: Length) -> Block {
         let offset = 40 + index * 8;
         block[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
     }
+    if let Some(offset) = length.zero_from {
+        block[80..88].copy_from_slice(&ZERO_FRONTIER_MAGIC);
+        block[88..96].copy_from_slice(&offset.to_le_bytes());
+    }
     let digest = Sha256::digest(&block[..DIGEST_START]);
     block[DIGEST_START..].copy_from_slice(&digest);
     block
@@ -374,8 +411,15 @@ fn decode(block: &Block, binding: Binding) -> Result<Option<Length>> {
     let length = Length {
         generation: word(64),
         len: word(72),
+        zero_from: (block[80..88] == ZERO_FRONTIER_MAGIC).then(|| word(88)),
     };
-    if length.generation == 0 || length.len > binding.region_len - DATA_START {
+    let capacity = binding.region_len - DATA_START;
+    if length.generation == 0
+        || length.len > capacity
+        || length.zero_from.is_some_and(|offset| {
+            !offset.is_multiple_of(BLOCK_SIZE) || offset < length.len || offset > capacity
+        })
+    {
         return Err(corrupt(
             "invalid raw transactional region checkpoint length",
         ));
@@ -584,6 +628,7 @@ mod tests {
         let shorter = Length {
             generation: length.generation + 1,
             len: BLOCK_SIZE,
+            zero_from: length.zero_from,
         };
         media
             .file
@@ -603,5 +648,157 @@ mod tests {
         journal.set_len(2 * BLOCK_SIZE).unwrap();
         journal.read(BLOCK_SIZE, &mut data).unwrap();
         assert_eq!(data, [0]);
+    }
+    #[test]
+    fn first_growth_keeps_blank_suffix_sparse_and_advances_the_frontier() {
+        use std::os::unix::fs::MetadataExt;
+
+        let media = Media::new();
+        let journal = media.provision();
+        let blocks = media.file.metadata().unwrap().blocks();
+        let first_len = MIN_DEVICE_SIZE / 2;
+        journal.set_len(first_len).unwrap();
+        assert_eq!(media.file.metadata().unwrap().blocks(), blocks);
+        let mut byte = [1];
+        journal.read(first_len - 1, &mut byte).unwrap();
+        assert_eq!(byte, [0]);
+        journal.write(first_len - 1, &[0xa5]).unwrap();
+        journal.set_len(0).unwrap();
+        drop(journal);
+
+        let journal = media.reopen();
+        let blocks = media.file.metadata().unwrap().blocks();
+        assert_eq!(journal.state().unwrap().length.zero_from, Some(first_len));
+        journal.set_len(2 * first_len - DATA_START).unwrap();
+        assert!(media.file.metadata().unwrap().blocks() < blocks + first_len / 512);
+        journal.read(first_len - 1, &mut byte).unwrap();
+        assert_eq!(byte, [0]);
+    }
+
+    #[test]
+    fn partial_block_exposure_advances_the_frontier_to_a_whole_block() {
+        let media = Media::new();
+        let journal = media.provision();
+        journal.set_len(1).unwrap();
+        assert_eq!(journal.state().unwrap().length.zero_from, Some(BLOCK_SIZE));
+        journal.write(0, &[0xa5]).unwrap();
+        journal.sync_data().unwrap();
+        drop(journal);
+
+        let journal = media.reopen();
+        assert_eq!(journal.state().unwrap().length.zero_from, Some(BLOCK_SIZE));
+        journal.set_len(BLOCK_SIZE + 1).unwrap();
+        let mut bytes = [1; 2];
+        journal.read(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [0xa5, 0]);
+        assert_eq!(
+            journal.state().unwrap().length.zero_from,
+            Some(2 * BLOCK_SIZE)
+        );
+    }
+
+    #[test]
+    fn interrupted_growth_exposes_only_the_durable_checkpoint_and_remembers_the_frontier() {
+        let media = Media::new();
+        let journal = media.provision();
+        let binding = journal.binding;
+        let next = Length {
+            generation: 2,
+            len: 2 * BLOCK_SIZE,
+            zero_from: Some(2 * BLOCK_SIZE),
+        };
+        let mut checkpoint = encode(binding, next);
+        checkpoint[DIGEST_START] ^= 1;
+        drop(journal);
+        media.file.write_all_at(&checkpoint, START).unwrap();
+        media.file.sync_data().unwrap();
+        let journal = media.reopen();
+        assert_eq!(journal.len().unwrap(), 0);
+        assert_eq!(journal.state().unwrap().length.zero_from, None);
+        drop(journal);
+
+        media
+            .file
+            .write_all_at(&encode(binding, next), START)
+            .unwrap();
+        media.file.sync_data().unwrap();
+        let journal = media.reopen();
+        assert_eq!(journal.state().unwrap().length, next);
+        assert_eq!(journal.state().unwrap().stale_slot, Some(BLOCK_SIZE));
+        let mut byte = [1];
+        journal.read(2 * BLOCK_SIZE - 1, &mut byte).unwrap();
+        assert_eq!(byte, [0]);
+
+        journal.write(2 * BLOCK_SIZE - 1, &[0xa5]).unwrap();
+        journal.sync_data().unwrap();
+        drop(journal);
+        let journal = media.reopen();
+        assert_eq!(journal.state().unwrap().length, next);
+        journal.set_len(BLOCK_SIZE).unwrap();
+        journal.set_len(2 * BLOCK_SIZE).unwrap();
+        journal.read(2 * BLOCK_SIZE - 1, &mut byte).unwrap();
+        assert_eq!(byte, [0]);
+    }
+
+    #[test]
+    fn legacy_or_downgraded_checkpoints_never_infer_blank_history() {
+        let media = Media::new();
+        let journal = media.provision();
+        let binding = journal.binding;
+        journal.set_len(BLOCK_SIZE).unwrap();
+        journal.write(0, &[0xa5]).unwrap();
+        journal.sync_data().unwrap();
+
+        // The legacy encoder used the same sealed v2 block and wrote zeros
+        // in the extension bytes. Its reader used only the fields up to 80.
+        let current = journal.state().unwrap().length;
+        let legacy_current = Length {
+            zero_from: None,
+            ..current
+        };
+        assert_eq!(
+            encode(binding, current)[..80],
+            encode(binding, legacy_current)[..80]
+        );
+        drop(journal);
+
+        // A downgrade repairing only one copy produces a mixed same-length
+        // pair. Both old and new readers must retain the acknowledged data.
+        media
+            .file
+            .write_all_at(&encode(binding, legacy_current), START)
+            .unwrap();
+        let journal = media.reopen();
+        let mut byte = [0];
+        journal.read(0, &mut byte).unwrap();
+        assert_eq!(byte, [0xa5]);
+        assert_eq!(journal.state().unwrap().length.zero_from, None);
+        drop(journal);
+
+        // An old writer has grown, written past the tracked frontier, then
+        // shrunk to zero. The old encoder does not preserve the extension.
+        media
+            .file
+            .write_all_at(&[0xab], START + DATA_START + BLOCK_SIZE)
+            .unwrap();
+        let legacy_empty = Length {
+            generation: current.generation + 2,
+            len: 0,
+            zero_from: None,
+        };
+        for offset in [START, START + BLOCK_SIZE] {
+            media
+                .file
+                .write_all_at(&encode(binding, legacy_empty), offset)
+                .unwrap();
+        }
+        media.file.sync_data().unwrap();
+        let journal = media.reopen();
+        journal.set_len(2 * BLOCK_SIZE).unwrap();
+        journal.read(BLOCK_SIZE, &mut byte).unwrap();
+        assert_eq!(byte, [0]);
+        assert_eq!(journal.state().unwrap().length.zero_from, None);
+        drop(journal);
+        assert_eq!(media.reopen().state().unwrap().length.zero_from, None);
     }
 }

@@ -726,6 +726,22 @@ impl JournalSnapshot {
     }
 }
 
+/// Allocator and dirty-record accounting for stopped raw-pool inspection.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct RawJournalAllocation {
+    region_data_capacity_bytes: u64,
+    resize_ceiling_bytes: u64,
+    physical_reserve_bytes: u64,
+    database_length_bytes: u64,
+    page_size_bytes: usize,
+    allocated_pages: u64,
+    stored_key_value_bytes: u64,
+    metadata_bytes: u64,
+    fragmented_bytes: u64,
+    dirty_blob_bytes: u64,
+    dirty_metadata_reserved_bytes: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JournalProgress {
     pub(crate) local_seq: Sequence,
@@ -1091,6 +1107,28 @@ impl Journal {
 
     pub(crate) fn is_raw(&self) -> bool {
         self.raw_region.is_some()
+    }
+
+    /// Called offline while the pool holds every device claim. redb's statistics
+    /// traverse the trees and belong outside the write admission path.
+    pub(crate) fn raw_allocation(&self) -> Result<RawJournalAllocation> {
+        let region = self.raw_region.as_ref().context("expected raw writeback")?;
+        let pending = self.snapshot()?;
+        let transaction = self.database.begin_write()?;
+        let stats = transaction.stats()?;
+        Ok(RawJournalAllocation {
+            region_data_capacity_bytes: region.capacity(),
+            resize_ceiling_bytes: region.resize_ceiling(),
+            physical_reserve_bytes: region.capacity() - region.resize_ceiling(),
+            database_length_bytes: region.len()?,
+            page_size_bytes: stats.page_size(),
+            allocated_pages: stats.allocated_pages(),
+            stored_key_value_bytes: stats.stored_bytes(),
+            metadata_bytes: stats.metadata_bytes(),
+            fragmented_bytes: stats.fragmented_bytes(),
+            dirty_blob_bytes: pending.dirty_blob_bytes,
+            dirty_metadata_reserved_bytes: pending.dirty_metadata_reserved_bytes,
+        })
     }
 
     pub(crate) fn raw_available_space(&self) -> Result<u64> {
