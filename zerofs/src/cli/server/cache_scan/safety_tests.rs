@@ -370,3 +370,54 @@ fn a_non_directory_cache_cannot_hide_beside_a_clean_cache() {
         File::create(path).unwrap();
     });
 }
+
+fn write_decoded_namespace(namespace: &Path, dirty: bool) {
+    let cache = namespace.join(super::super::BLOCK_CACHE_DIR);
+    std::fs::create_dir_all(&cache).unwrap();
+    File::create(namespace.join(super::super::CLEAN_CACHE_LOCK_FILE)).unwrap();
+    let mut bytes = vec![0; 2 * PAGE];
+    blob(&mut bytes, 0);
+    if dirty {
+        bytes[PAGE + ENTRY_HEADER + 3] = 0x5a;
+    }
+    let mut file = File::create(cache.join("foyer-storage-direct-fs-00000000")).unwrap();
+    file.write_all(&bytes).unwrap();
+    file.set_len(super::super::BLOCK_CACHE_BLOCK_SIZE as u64)
+        .unwrap();
+}
+
+#[test]
+fn a_symlinked_namespace_cannot_hide_beside_a_clean_namespace() {
+    let root = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    write_decoded_namespace(&root.path().join("bucket_good"), false);
+    write_decoded_namespace(elsewhere.path(), true);
+    assert_eq!(
+        scan_cache_files(elsewhere.path(), ScanOptions::default())
+            .unwrap()
+            .status,
+        ScanStatus::UndefinedBytes
+    );
+    std::os::unix::fs::symlink(elsewhere.path(), root.path().join("bucket_link")).unwrap();
+
+    let error = scan_cache_files(root.path(), ScanOptions::default())
+        .expect_err("a namespace symlink must not disappear from scan coverage");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("namespace") && message.contains("symlink"),
+        "{message}"
+    );
+}
+
+#[test]
+fn unrelated_symlinks_inside_a_namespace_are_not_cache_directories() {
+    let root = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let namespace = root.path().join("bucket_good");
+    write_decoded_namespace(&namespace, false);
+    std::os::unix::fs::symlink(elsewhere.path(), namespace.join("unrelated-link")).unwrap();
+
+    let report = scan_cache_files(root.path(), ScanOptions::default()).unwrap();
+    assert_eq!(report.status, ScanStatus::Clean, "{report:#?}");
+    assert_eq!(report.caches.len(), 1);
+}

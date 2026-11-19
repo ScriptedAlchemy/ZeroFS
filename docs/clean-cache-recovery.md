@@ -99,7 +99,10 @@ pass `--live` to explicitly scan them without that exclusion. An offline scan
 refuses a missing ownership lock and never creates one.
 
 A recognized cache path that is a symlink or is not a directory stops the scan.
-It is never silently omitted from a clean result.
+Discovery also refuses symlinks where a child could be a cache namespace;
+scan that target directory explicitly instead. Neither a cache nor a possible
+namespace is silently omitted from a clean result. Unrelated symlinks inside
+an already discovered namespace are ignored, and no directory symlink is followed.
 
 For each cache the report gives partitions, blobs, entries, and the index-tail,
 padding and past-the-last-blob bytes scanned and found non-zero. A clean

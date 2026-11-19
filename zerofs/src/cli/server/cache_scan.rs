@@ -345,7 +345,7 @@ fn find_cache_dirs(path: &Path) -> Result<Vec<(CacheKind, std::path::PathBuf)>> 
     if let Some(kind) = named(path) {
         return Ok(vec![(kind, path.to_path_buf())]);
     }
-    let children = |dir: &Path| -> Result<Vec<std::path::PathBuf>> {
+    let children = |dir: &Path, discover_namespaces: bool| -> Result<Vec<std::path::PathBuf>> {
         let mut found = Vec::new();
         for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
             let entry = entry?;
@@ -360,19 +360,27 @@ fn find_cache_dirs(path: &Path) -> Result<Vec<(CacheKind, std::path::PathBuf)>> 
                 // because it is a symlink or has an unexpected type. A clean
                 // sibling would otherwise make the partial scan report clean.
                 anyhow::bail!("cache path {} is not a directory", path.display());
+            } else if discover_namespaces && kind.is_symlink() {
+                // At this depth an arbitrary name may identify a namespace.
+                // Skipping its link would let clean siblings certify a root
+                // whose other cache contents were never inspected.
+                anyhow::bail!(
+                    "cache namespace path {} is a symlink; scan its target explicitly",
+                    path.display()
+                );
             }
         }
         found.sort();
         Ok(found)
     };
     let caches_in = |dir: &Path| -> Result<Vec<(CacheKind, std::path::PathBuf)>> {
-        Ok(children(dir)?
+        Ok(children(dir, false)?
             .into_iter()
             .filter_map(|child| named(&child).map(|kind| (kind, child)))
             .collect())
     };
     let mut found = Vec::new();
-    for namespace in children(path)? {
+    for namespace in children(path, true)? {
         if let Some(kind) = named(&namespace) {
             found.push((kind, namespace));
         } else {
