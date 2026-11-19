@@ -55,7 +55,7 @@ impl StartupMemoryTiers {
 enum MemoryPolicyProfile {
     Legacy { reason: &'static str },
     SmallNasPackage,
-    SmallNasJournal,
+    SmallNasJournal { name: &'static str },
 }
 
 struct MemoryPolicy {
@@ -84,24 +84,48 @@ impl MemoryPolicy {
         write_ack: crate::fs::mutation::config::FilesystemWriteAckSettings,
     ) -> Result<Self> {
         let exclusion = package_policy::exclusion(settings, tiers.clean_cache_bytes, write_ack);
-        let mut policy = match exclusion {
-            Some(reason) if settings.small_nas_journal() => {
-                bail!("small-nas-journal-v1 configuration rejected: {reason}")
+        let journal_profile = settings.nas_journal_profile();
+        let mut policy = match (exclusion, journal_profile) {
+            (Some(reason), Some(profile)) => {
+                bail!("{} configuration rejected: {reason}", profile.name())
             }
-            Some(reason) => Self::legacy(reason),
-            None if settings.small_nas_journal() => Self {
-                profile: MemoryPolicyProfile::SmallNasJournal,
-                // Charge an extra two full journal budgets for metadata, redb and worker
-                // buffers, in addition to the accepted RAM tier and segment geometry.
-                residency_bytes: package_policy::RESIDENCY_BYTES + GIB,
-                headroom_bytes: package_policy::HEADROOM_BYTES,
-                residency_source: format!(
-                    "baseline plus 1 GiB journal workers/replay allowance; {}",
-                    package_policy::EVIDENCE
-                ),
-                headroom_source: package_policy::EVIDENCE.into(),
-            },
-            None => Self {
+            (Some(reason), None) => Self::legacy(reason),
+            (None, Some(profile)) => {
+                // Charge an extra two full v1 journal budgets for metadata, redb and worker
+                // buffers, in addition to the accepted RAM tier and segment geometry. The
+                // journal's redb cache is fixed, so a larger v2 journal adds no resident
+                // payload; each destage worker beyond v1's two can hold one collected
+                // segment while the pool writes it.
+                let extra_uploads = settings
+                    .writeback_settings(WritebackAccessMode::ReadWrite)?
+                    .map_or(0, |writeback| {
+                        writeback
+                            .upload_concurrency
+                            .saturating_sub(crate::config::NasJournalV2Limits::MIN_UPLOADS)
+                    }) as u64;
+                let upload_bytes =
+                    extra_uploads * crate::config::NasJournalV2Limits::EXTRA_UPLOAD_BYTES;
+                Self {
+                    profile: MemoryPolicyProfile::SmallNasJournal {
+                        name: profile.name(),
+                    },
+                    residency_bytes: package_policy::RESIDENCY_BYTES + GIB + upload_bytes,
+                    headroom_bytes: package_policy::HEADROOM_BYTES,
+                    residency_source: if extra_uploads == 0 {
+                        format!(
+                            "baseline plus 1 GiB journal workers/replay allowance; {}",
+                            package_policy::EVIDENCE
+                        )
+                    } else {
+                        format!(
+                            "baseline plus 1 GiB journal workers/replay allowance plus {upload_bytes} bytes for {extra_uploads} destage workers beyond two; {}",
+                            package_policy::EVIDENCE
+                        )
+                    },
+                    headroom_source: package_policy::EVIDENCE.into(),
+                }
+            }
+            (None, None) => Self {
                 profile: MemoryPolicyProfile::SmallNasPackage,
                 residency_bytes: package_policy::RESIDENCY_BYTES,
                 headroom_bytes: package_policy::HEADROOM_BYTES,
@@ -145,14 +169,14 @@ impl MemoryPolicy {
         match self.profile {
             MemoryPolicyProfile::Legacy { .. } => "legacy",
             MemoryPolicyProfile::SmallNasPackage => "small-nas-package-v1",
-            MemoryPolicyProfile::SmallNasJournal => "small-nas-journal-v1",
+            MemoryPolicyProfile::SmallNasJournal { name } => name,
         }
     }
 
     fn reason(&self) -> &'static str {
         match self.profile {
             MemoryPolicyProfile::Legacy { reason } => reason,
-            MemoryPolicyProfile::SmallNasJournal => {
+            MemoryPolicyProfile::SmallNasJournal { .. } => {
                 "explicit bounded journal fixture geometry; application-wide qualification required"
             }
             MemoryPolicyProfile::SmallNasPackage => {
@@ -164,7 +188,7 @@ impl MemoryPolicy {
     fn direct_segment_bytes(&self) -> u64 {
         match self.profile {
             MemoryPolicyProfile::Legacy { .. } => 0,
-            MemoryPolicyProfile::SmallNasJournal => {
+            MemoryPolicyProfile::SmallNasJournal { .. } => {
                 use crate::config::StoreProfile;
                 ((crate::fs::store::extent::OPEN_SEGMENT_LANES
                     + StoreProfile::NAS_JOURNAL_INFLIGHT)
@@ -179,7 +203,7 @@ impl MemoryPolicy {
     fn headroom_label(&self) -> &'static str {
         match self.profile {
             MemoryPolicyProfile::Legacy { .. } => "companion/process reserve",
-            MemoryPolicyProfile::SmallNasPackage | MemoryPolicyProfile::SmallNasJournal => {
+            MemoryPolicyProfile::SmallNasPackage | MemoryPolicyProfile::SmallNasJournal { .. } => {
                 "engine kernel/allocator headroom"
             }
         }
@@ -191,7 +215,7 @@ impl MemoryPolicy {
                 .residency_bytes
                 .checked_add(self.headroom_bytes)
                 .context("startup memory policy reserves overflowed"),
-            MemoryPolicyProfile::SmallNasPackage | MemoryPolicyProfile::SmallNasJournal => {
+            MemoryPolicyProfile::SmallNasPackage | MemoryPolicyProfile::SmallNasJournal { .. } => {
                 Ok(self.headroom_bytes)
             }
         }
@@ -199,7 +223,7 @@ impl MemoryPolicy {
 
     fn qualification(&self) -> Option<StoredStateQualification> {
         match self.profile {
-            MemoryPolicyProfile::Legacy { .. } | MemoryPolicyProfile::SmallNasJournal => None,
+            MemoryPolicyProfile::Legacy { .. } | MemoryPolicyProfile::SmallNasJournal { .. } => None,
             MemoryPolicyProfile::SmallNasPackage => Some(StoredStateQualification {
                 logical_bytes: package_policy::QUALIFIED_LOGICAL_BYTES,
                 regular_files: package_policy::QUALIFIED_REGULAR_FILES,
@@ -282,8 +306,8 @@ fn validate_server_startup_with_limits(
     let policy = MemoryPolicy::from_settings(settings, tiers, write_ack)?;
     let configured = settings.runtime_memory_limit_bytes()?;
     let Some(envelope) = select_memory_limit(detected, configured)? else {
-        if settings.small_nas_journal() {
-            bail!("small-nas-journal-v1 requires a finite dedicated memory envelope");
+        if let Some(profile) = settings.nas_journal_profile() {
+            bail!("{} requires a finite dedicated memory envelope", profile.name());
         }
         tracing::warn!(
             accounting = policy.accounting(tiers, "unavailable"),

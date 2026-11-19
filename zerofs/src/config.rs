@@ -176,9 +176,68 @@ pub struct Settings {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
-enum RuntimeProfile {
+pub(crate) enum RuntimeProfile {
     #[serde(rename = "small-nas-journal-v1")]
     SmallNasJournal,
+    /// The v1 package policy with a parameterised SSD journal and destage
+    /// fan-out. See [`NasJournalV2Limits`].
+    #[serde(rename = "small-nas-journal-v2")]
+    SmallNasJournalV2,
+}
+
+impl RuntimeProfile {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::SmallNasJournal => "small-nas-journal-v1",
+            Self::SmallNasJournalV2 => "small-nas-journal-v2",
+        }
+    }
+}
+
+/// The deepest existing directory at or above `path`. The journal directory
+/// may not exist before first start, but its filesystem already does.
+fn nearest_existing_ancestor(path: &std::path::Path) -> Result<PathBuf> {
+    path.ancestors()
+        .find(|candidate| candidate.is_dir())
+        .map(std::path::Path::to_path_buf)
+        .with_context(|| format!("no existing ancestor for {}", path.display()))
+}
+
+/// Bounds of the `small-nas-journal-v2` profile. Dirty RAM, watermarks, the
+/// local journal worker and the shutdown contract match v1. The journal budget
+/// and the number of concurrent destage uploads are operator inputs.
+pub(crate) struct NasJournalV2Limits;
+
+impl NasJournalV2Limits {
+    pub(crate) const MIN_DISK_BYTES: u64 = 512 << 20;
+    pub(crate) const MAX_DISK_BYTES: u64 = 16 << 30;
+    pub(crate) const DISK_GRANULE_BYTES: u64 = 256 << 20;
+    pub(crate) const MIN_UPLOADS: usize = 2;
+    pub(crate) const MAX_UPLOADS: usize = 8;
+    /// Admission charge for each upload worker beyond v1's two. A destage
+    /// worker holds at most one collected single-put payload (36 MiB) while the
+    /// pool writes it; the rest covers its read buffer and allocator slack.
+    pub(crate) const EXTRA_UPLOAD_BYTES: u64 = 64 << 20;
+
+    /// The free-space floor grows with the journal so a full budget still leaves
+    /// the device an eighth of that budget for redb growth and allocation.
+    pub(crate) fn min_free_bytes(disk_bytes: u64) -> u64 {
+        (64 << 20).max(disk_bytes / 8)
+    }
+
+    /// A journal device whose whole filesystem cannot hold the dirty budget
+    /// plus its free floor can never reach the configured watermark.
+    pub(crate) fn check_capacity(disk_bytes: u64, min_free_bytes: u64, filesystem_bytes: u64) -> Result<()> {
+        let required = disk_bytes
+            .checked_add(min_free_bytes)
+            .context("journal capacity overflow")?;
+        if filesystem_bytes < required {
+            anyhow::bail!(
+                "small-nas-journal-v2 journal filesystem holds {filesystem_bytes} bytes; the {disk_bytes}-byte dirty budget plus {min_free_bytes}-byte free floor needs {required}"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -2174,8 +2233,8 @@ impl Settings {
         access_mode: crate::writeback::config::WritebackAccessMode,
     ) -> Result<Option<crate::writeback::config::WritebackSettings>> {
         let Some(writeback) = &self.writeback else {
-            if self.small_nas_journal() {
-                anyhow::bail!("small-nas-journal-v1 requires enabled [writeback]");
+            if let Some(profile) = self.nas_journal_profile() {
+                anyhow::bail!("{} requires enabled [writeback]", profile.name());
             }
             return Ok(None);
         };
@@ -2196,7 +2255,38 @@ impl Settings {
             access_mode,
             self.replication.is_some(),
         )?;
-        if self.small_nas_journal() {
+        if self.nas_journal_profile() == Some(RuntimeProfile::SmallNasJournalV2) {
+            use crate::writeback::config::{AckMode, ShutdownFlush};
+            let wb = settings
+                .as_ref()
+                .context("small-nas-journal-v2 requires enabled [writeback]")?;
+            let limits = NasJournalV2Limits::MIN_DISK_BYTES..=NasJournalV2Limits::MAX_DISK_BYTES;
+            if wb.ack_mode != AckMode::Memory
+                || wb.shutdown_flush != ShutdownFlush::Local
+                || wb.memory_bytes != 128 << 20
+                || !limits.contains(&wb.disk_bytes)
+                || wb.disk_bytes % NasJournalV2Limits::DISK_GRANULE_BYTES != 0
+                || wb.min_free_bytes < NasJournalV2Limits::min_free_bytes(wb.disk_bytes)
+                || wb.local_concurrency != 1
+                || !(NasJournalV2Limits::MIN_UPLOADS..=NasJournalV2Limits::MAX_UPLOADS)
+                    .contains(&wb.upload_concurrency)
+                || wb.high_watermark_percent != 95
+                || wb.resume_percent != 85
+            {
+                anyhow::bail!(
+                    "small-nas-journal-v2 requires memory acknowledgement, local shutdown, 128 MiB dirty RAM, a 512 MiB to 16 GiB dirty journal in whole 256 MiB steps, a free floor of at least max(64 MiB, journal/8), one local and two to eight upload workers, and 95/85 watermarks"
+                );
+            }
+            let journal_filesystem = nearest_existing_ancestor(&wb.dir)?;
+            let stats = rustix::fs::statvfs(&journal_filesystem).with_context(|| {
+                format!("failed to inspect journal filesystem at {}", journal_filesystem.display())
+            })?;
+            NasJournalV2Limits::check_capacity(
+                wb.disk_bytes,
+                wb.min_free_bytes,
+                stats.f_blocks.saturating_mul(stats.f_frsize),
+            )?;
+        } else if self.small_nas_journal() {
             use crate::writeback::config::{AckMode, ShutdownFlush};
             let wb = settings
                 .as_ref()
@@ -2215,15 +2305,21 @@ impl Settings {
                     "small-nas-journal-v1 requires memory acknowledgement, local shutdown, 128 MiB dirty RAM, 512 MiB dirty journal, at least 64 MiB free, one local and two upload workers, and 95/85 watermarks"
                 );
             }
+        }
+        if let Some(profile) = self.nas_journal_profile() {
+            let name = profile.name();
+            let wb = settings
+                .as_ref()
+                .with_context(|| format!("{name} requires enabled [writeback]"))?;
             let pool = self
                 .storage
                 .pool
                 .as_ref()
-                .context("small-nas-journal-v1 requires a local pool")?;
+                .with_context(|| format!("{name} requires a local pool"))?;
             let local_path = |value: &str| -> Result<PathBuf> {
                 url::Url::parse(value)?
                     .to_file_path()
-                    .map_err(|_| anyhow::anyhow!("small-nas-journal-v1 requires local directories"))
+                    .map_err(|_| anyhow::anyhow!("{name} requires local directories"))
             };
             let mut directories = vec![
                 self.cache.dir.clone(),
@@ -2238,7 +2334,7 @@ impl Settings {
                     crate::writeback::config::normalize_absolute_path(&path, "storage directory")?;
                 if path.starts_with(&wb.dir) || wb.dir.starts_with(&path) {
                     anyhow::bail!(
-                        "small-nas-journal-v1 requires a journal directory disjoint from cache, catalog, authority and member roots"
+                        "{name} requires a journal directory disjoint from cache, catalog, authority and member roots"
                     );
                 }
             }
@@ -2292,9 +2388,14 @@ impl Settings {
         .max_by_key(|(_, bytes)| *bytes)
     }
 
+    /// True for every bounded NAS journal profile. Each shares the package
+    /// policy, local pool, journal isolation and finite memory envelope.
     pub(crate) fn small_nas_journal(&self) -> bool {
+        self.nas_journal_profile().is_some()
+    }
+
+    pub(crate) fn nas_journal_profile(&self) -> Option<RuntimeProfile> {
         self.runtime.as_ref().and_then(|runtime| runtime.profile)
-            == Some(RuntimeProfile::SmallNasJournal)
     }
 
     /// Data-plane tuning for the configured backend. SFTP publishes its own

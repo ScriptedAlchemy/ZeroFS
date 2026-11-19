@@ -55,7 +55,7 @@ impl Document {
         ensure!(self.version == 1, "unknown write-ack document version");
         ensure!(
             settings.small_nas_journal(),
-            "write-ack override requires small-nas-journal-v1"
+            "write-ack override requires small-nas-journal-v1 or small-nas-journal-v2"
         );
         let fs = settings
             .filesystem
@@ -88,7 +88,7 @@ impl Document {
 pub(crate) fn check_path(settings: &Settings, path: &Path, toml: &Path) -> Result<()> {
     ensure!(
         settings.small_nas_journal(),
-        "write-ack settings require small-nas-journal-v1"
+        "write-ack settings require small-nas-journal-v1 or small-nas-journal-v2"
     );
     ensure!(
         path.is_absolute() && path.file_name().is_some(),

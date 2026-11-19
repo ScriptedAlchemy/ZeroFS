@@ -548,3 +548,74 @@ fn bounded_journal_keeps_an_independent_budget_and_rejects_shape_changes() {
     }
     assert!(admission(temp.path(), &base).is_err());
 }
+
+#[test]
+#[cfg(feature = "webui")]
+fn bounded_journal_v2_parameterises_journal_and_destage_with_matching_admission() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().display();
+    let base = package_config(temp.path(), 6 * GIB + GIB / 2)
+        .replace("[runtime]", "[runtime]\nprofile = \"small-nas-journal-v2\"");
+    let config = format!(
+        "{base}\n[writeback]\nenabled = true\ndir = \"{root}/journal\"\nack_mode = \"memory\"\nmemory_size_gb = 0.134217728\ndisk_size_gb = 4.294967296\nmin_free_gb = 0.536870912\nlocal_concurrency = 1\nupload_concurrency = 6\n"
+    );
+    let receipt = admission(temp.path(), &config).unwrap();
+    assert!(
+        receipt
+            .accounting
+            .contains("memory_policy=small-nas-journal-v2")
+    );
+    // The v1 requirement plus 64 MiB for each of four uploads beyond two. The
+    // journal's on-disk budget adds no resident memory.
+    assert_eq!(receipt.required_bytes, 5_804_916_736 + 4 * (64 << 20));
+    let two_uploads = config.replace("upload_concurrency = 6", "upload_concurrency = 2");
+    assert_eq!(
+        admission(temp.path(), &two_uploads).unwrap().required_bytes,
+        5_804_916_736
+    );
+    let settings = Settings::from_file(temp.path().join("config.toml")).unwrap();
+    let geometry = settings.store_profile().unwrap();
+    assert_eq!(geometry.seal_threshold, Some(32 * 1024 * 1024));
+    assert_eq!(geometry.max_inflight_seals, Some(2));
+    for accepted in [
+        config.replace("4.294967296", "0.536870912").replace("0.536870912\nlocal", "0.067108864\nlocal"),
+        config.replace("upload_concurrency = 6", "upload_concurrency = 8"),
+        config.replace("0.536870912\nlocal", "1.0\nlocal"),
+    ] {
+        assert!(admission(temp.path(), &accepted).is_ok(), "{accepted}");
+    }
+    for (before, after) in [
+        ("4.294967296", "4.3"),
+        ("4.294967296", "0.268435456"),
+        ("4.294967296", "17.448304640"),
+        ("0.536870912\nlocal", "0.268435456\nlocal"),
+        ("upload_concurrency = 6", "upload_concurrency = 9"),
+        ("upload_concurrency = 6", "upload_concurrency = 1"),
+        ("local_concurrency = 1", "local_concurrency = 2"),
+        ("0.134217728", "0.268435456"),
+        ("ack_mode = \"memory\"", "ack_mode = \"ssd\""),
+        ("/journal\"", "/cache/journal\""),
+        ("6.979321856", "5.5"),
+    ] {
+        assert_ne!(config.replace(before, after), config);
+        assert!(
+            admission(temp.path(), &config.replace(before, after)).is_err(),
+            "{after}"
+        );
+    }
+    // v1 keeps its fixed geometry; the v2 shape does not validate under v1.
+    let as_v1 = config.replace("small-nas-journal-v2", "small-nas-journal-v1");
+    assert!(admission(temp.path(), &as_v1).is_err());
+}
+
+#[test]
+fn bounded_journal_v2_requires_a_journal_filesystem_that_can_hold_its_budget() {
+    use crate::config::NasJournalV2Limits;
+    let budget = 4 * GIB;
+    let floor = NasJournalV2Limits::min_free_bytes(budget);
+    assert_eq!(floor, 512 << 20);
+    assert_eq!(NasJournalV2Limits::min_free_bytes(512 << 20), 64 << 20);
+    assert!(NasJournalV2Limits::check_capacity(budget, floor, budget + floor).is_ok());
+    let error = NasJournalV2Limits::check_capacity(budget, floor, budget + floor - 1).unwrap_err();
+    assert!(error.to_string().contains("small-nas-journal-v2"), "{error}");
+}
