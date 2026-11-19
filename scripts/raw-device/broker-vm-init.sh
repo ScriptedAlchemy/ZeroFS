@@ -11,7 +11,8 @@ trap failed EXIT
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
-mount -t tmpfs tmpfs /run
+mount -t tmpfs -o mode=0755 tmpfs /run
+chmod 0755 /
 while IFS= read -r filename; do insmod "/modules/$filename"; done </modules/load-order
 /usr/lib/systemd/systemd-udevd --daemon
 udevadm trigger --action=add --subsystem-match=block
