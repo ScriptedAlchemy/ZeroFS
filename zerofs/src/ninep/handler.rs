@@ -1631,9 +1631,18 @@ impl NinePHandler {
 
         // Complete fallible reads before publishing `newfid`.
         let stat_inode = match last_inode {
+            Some(Inode::File(_)) if self.filesystem.volatile_overlay.get().is_some() => {
+                self.filesystem.visible_inode(current_id).await?
+            }
             Some(inode) => inode,
-            None => self.filesystem.inode_store.get(current_id).await?,
+            None => self.filesystem.visible_inode(current_id).await?,
         };
+        // The visible write preview can advance mtime, which is the Qid
+        // version. The final walk entry, installed fid and stat share one view.
+        let final_qid = inode_to_qid(&stat_inode, current_id);
+        if let Some(qid) = wqids.last_mut() {
+            *qid = final_qid;
+        }
         #[cfg(test)]
         self.pause_before_exact_walk_pin(rule).await;
         let directory_pin = self
@@ -1650,7 +1659,7 @@ impl NinePHandler {
                 path: current_path,
                 inode_id: current_id,
                 root: src_fid.root,
-                qid: wqids.last().copied().unwrap_or(src_fid.qid),
+                qid: final_qid,
                 opened: false,
                 mode: None,
                 creds: src_fid.creds,
@@ -4306,6 +4315,110 @@ mod tests {
             response.body,
             Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::EOVERFLOW
         ));
+    }
+
+    #[tokio::test]
+    async fn walk_getattr_projects_pending_write_metadata_and_matching_qids() {
+        use crate::fs::mutation::config::{
+            ClientDurabilityTarget, FilesystemWriteAckMode, FilesystemWriteAckSettings,
+            FilesystemWriteAckSource,
+        };
+
+        let mut fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.write_ack = FilesystemWriteAckSettings {
+            mode: FilesystemWriteAckMode::VolatileMemory,
+            volatile_memory_bytes: 8 * 1024 * 1024,
+            volatile_max_operations: 1024,
+            source: FilesystemWriteAckSource::Filesystem,
+            client_durability_target: ClientDurabilityTarget::LocalSsd,
+        };
+        let fs = Arc::new(fs);
+        let handler = NinePHandler::new(fs.clone(), Arc::new(FileLockManager::new()));
+        let auth = AuthContext::from(&test_creds());
+        let (file, _) = fs
+            .create(&test_creds(), 0, b"pending-stat", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.write(&auth, file, 0, &Bytes::from_static(b"abcd"))
+            .await
+            .unwrap();
+        fs.setattr(
+            &test_creds(),
+            file,
+            &SetAttributes {
+                mode: SetMode::Set(0o6777),
+                mtime: SetTime::SetToClientTime(Timestamp {
+                    seconds: 1,
+                    nanoseconds: 0,
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+
+        let release_apply = fs
+            .materializer
+            .get()
+            .unwrap()
+            .hold_inode_lane_for_test(file)
+            .await;
+        let writer = AuthContext {
+            uid: 1001,
+            gid: 1001,
+            ..auth.clone()
+        };
+        let acknowledged = fs
+            .write_ack(&writer, file, 0, &Bytes::from_static(b"wxyz"))
+            .await
+            .unwrap();
+        assert_eq!(acknowledged.mode & 0o6000, 0);
+
+        for (fid, newfid, names) in [
+            (1, 2, vec![P9String::new(b"pending-stat".to_vec())]),
+            (2, 3, Vec::new()),
+        ] {
+            let count = names.len() as u16;
+            let response = request(
+                &handler,
+                2,
+                Message::Twalkgetattr(Twalkgetattr {
+                    fid,
+                    newfid,
+                    nwname: count,
+                    wnames: names,
+                }),
+            )
+            .await;
+            let Message::Rwalkgetattr(reply) = response.body else {
+                panic!("expected walk attributes, got {:?}", response.body);
+            };
+            assert_eq!(reply.nwqid, count);
+            assert_eq!(reply.stat.mode & 0o7777, acknowledged.mode);
+            assert_eq!(reply.stat.size, acknowledged.size);
+            assert_eq!(reply.stat.mtime_sec, acknowledged.mtime.seconds);
+            assert_eq!(
+                reply.stat.mtime_nsec,
+                u64::from(acknowledged.mtime.nanoseconds)
+            );
+            assert_eq!(reply.stat.ctime_sec, acknowledged.ctime.seconds);
+            assert_eq!(
+                reply.stat.ctime_nsec,
+                u64::from(acknowledged.ctime.nanoseconds)
+            );
+            assert_eq!(reply.stat.qid.version, acknowledged.mtime.seconds as u32);
+            if let Some(final_qid) = reply.wqids.last() {
+                assert_eq!(*final_qid, reply.stat.qid);
+            }
+            assert_eq!(handler.get_fid(newfid).unwrap().qid, reply.stat.qid);
+        }
+
+        release_apply.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), fs.quiesce_overlay_inode(file))
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

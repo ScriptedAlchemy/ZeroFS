@@ -46,6 +46,8 @@ pub(crate) struct FilesystemVolatileOverlay {
     fail_publish: AtomicBool,
     #[cfg(test)]
     publish_pause: Mutex<Option<PublicationPause>>,
+    #[cfg(test)]
+    metadata_read_pause: Mutex<Option<PublicationPause>>,
     fs: Weak<ZeroFS>,
 }
 
@@ -212,6 +214,8 @@ impl FilesystemVolatileOverlay {
             fail_publish: AtomicBool::new(false),
             #[cfg(test)]
             publish_pause: Mutex::new(None),
+            #[cfg(test)]
+            metadata_read_pause: Mutex::new(None),
             fs,
         })
     }
@@ -355,6 +359,35 @@ impl FilesystemVolatileOverlay {
         attrs
     }
 
+    /// The caller pins this inode's runtime retirement before loading the
+    /// canonical inode. A preview can then disappear only after this read, or
+    /// before its canonical snapshot, never between the two metadata layers.
+    fn project_inode(&self, id: InodeId, inode: &mut Inode) {
+        let Inode::File(file) = inode else {
+            return;
+        };
+        let latest = self
+            .latest_attrs
+            .lock()
+            .expect("filesystem overlay poisoned");
+        let Some(attrs) = latest.get(&id).and_then(|attrs| {
+            attrs
+                .iter()
+                .rev()
+                .find(|entry| entry.visibility.is_published())
+        }) else {
+            return;
+        };
+        // Only writes' own metadata is projected. In particular, an automatic
+        // atime update may have committed after the prepared write's snapshot.
+        file.size = attrs.attrs.size;
+        file.mode = attrs.attrs.mode;
+        file.mtime = attrs.attrs.mtime.seconds;
+        file.mtime_nsec = attrs.attrs.mtime.nanoseconds;
+        file.ctime = attrs.attrs.ctime.seconds;
+        file.ctime_nsec = attrs.attrs.ctime.nanoseconds;
+    }
+
     async fn reserve(
         self: &Arc<Self>,
         inode: u64,
@@ -407,7 +440,22 @@ impl FilesystemVolatileOverlay {
             });
     }
 
-    pub(crate) fn retire_inode(&self, inode: u64) {
+    pub(crate) async fn retire_inode(&self, inode: u64) {
+        let runtime = self
+            .runtimes
+            .lock()
+            .expect("filesystem overlay poisoned")
+            .entries
+            .get(&inode)
+            .map(|entry| Arc::clone(&entry.runtime));
+        if let Some(runtime) = runtime {
+            runtime.retire_metadata(|| self.retire_attrs(inode)).await;
+        } else {
+            self.retire_attrs(inode);
+        }
+    }
+
+    fn retire_attrs(&self, inode: u64) {
         // Pending batches are owned by the apply worker that popped them.
         // Only drop the preview attributes once canonical apply owns the bytes.
         let mut latest = self
@@ -727,10 +775,36 @@ impl FilesystemVolatileOverlay {
         }
     }
 
-    #[cfg_attr(
-        feature = "hotpath-profile",
-        hotpath::measure(future = true, label = "zerofs.overlay.read")
-    )]
+    #[cfg(test)]
+    pub(crate) fn pause_metadata_read_for_test(
+        &self,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = oneshot::channel();
+        *self
+            .metadata_read_pause
+            .lock()
+            .expect("filesystem overlay poisoned") = Some(PublicationPause {
+            reached: reached_tx,
+            resume: resume_rx,
+        });
+        (reached_rx, resume_tx)
+    }
+
+    #[cfg(test)]
+    async fn pause_after_metadata_read_if_requested(&self) {
+        let pause = self
+            .metadata_read_pause
+            .lock()
+            .expect("filesystem overlay poisoned")
+            .take();
+        if let Some(pause) = pause {
+            let _ = pause.reached.send(());
+            let _ = pause.resume.await;
+        }
+    }
+
+    #[cfg(test)]
     async fn read(
         self: &Arc<Self>,
         inode: u64,
@@ -935,10 +1009,17 @@ impl ZeroFS {
     }
 
     pub(crate) async fn visible_inode(&self, id: InodeId) -> Result<Inode, FsError> {
+        let Some(overlay) = self.volatile_overlay.get() else {
+            return self.inode_store.get(id).await;
+        };
+        let Some(runtime) = overlay.runtime_if_present(id).map_err(overlay_fs_error)? else {
+            return self.inode_store.get(id).await;
+        };
+        let _read = runtime.read_guard().await;
         let mut inode = self.inode_store.get(id).await?;
-        if let Inode::File(file) = &mut inode {
-            file.size = self.overlay_visible_size(id, file.size);
-        }
+        #[cfg(test)]
+        overlay.pause_after_metadata_read_if_requested().await;
+        overlay.project_inode(id, &mut inode);
         Ok(inode)
     }
 
@@ -1401,7 +1482,22 @@ impl ZeroFS {
                 .await;
         };
 
-        let inode = self.inode_store.get(id).await?;
+        let Some(runtime) = overlay.runtime_if_present(id).map_err(overlay_fs_error)? else {
+            return self
+                .read_file_inner_canonical(auth, id, offset, count)
+                .await;
+        };
+        // Keep the registry handle as well as the read lease: a replacement
+        // runtime must not take over between metadata and payload snapshots.
+        let read = runtime.read_guard().await;
+        let mut inode = self.inode_store.get(id).await?;
+        #[cfg(test)]
+        overlay.pause_after_metadata_read_if_requested().await;
+        let canonical_size = match &inode {
+            Inode::File(file) => file.size,
+            _ => 0,
+        };
+        overlay.project_inode(id, &mut inode);
         if let Some(auth) = auth {
             let creds = crate::fs::permissions::Credentials::from_auth_context(auth);
             crate::fs::permissions::check_access(
@@ -1413,15 +1509,14 @@ impl ZeroFS {
         let Inode::File(file) = &inode else {
             return Err(FsError::IsDirectory);
         };
-        let visible_size = overlay.visible_size(id, file.size);
+        let visible_size = file.size;
         if offset >= visible_size {
             return Ok((Bytes::new(), true));
         }
         let read_len = std::cmp::min(count as u64, visible_size - offset) as usize;
-        let canonical_size = file.size;
         let filesystem = self.extent_store.clone();
-        let data = overlay
-            .read(id, offset, read_len, move || {
+        let data = read
+            .read(offset, read_len, move || {
                 Box::pin(async move {
                     canonical_read_base(&filesystem, id, offset, read_len, canonical_size).await
                 })
@@ -1487,6 +1582,54 @@ mod tests {
             source: FilesystemWriteAckSource::Filesystem,
             client_durability_target: ClientDurabilityTarget::LocalSsd,
         }
+    }
+
+    #[tokio::test]
+    async fn write_metadata_projection_preserves_newer_canonical_atime() {
+        use crate::fs::types::{InodeWithId, Timestamp};
+
+        let mut fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.write_ack = volatile_settings();
+        let fs = Arc::new(fs);
+        fs.install_volatile_overlay();
+        let auth = crate::fs::types::AuthContext::from(&test_creds());
+        let file = fs
+            .create_exclusive(&auth, 0, b"projection-atime")
+            .await
+            .unwrap();
+        let acknowledged = fs
+            .write_ack(&auth, file, 0, &Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+        fs.quiesce_overlay_inode(file).await.unwrap();
+
+        // Model a committed write whose preview is still pinned by a reader.
+        // Automatic atime commits intentionally do not fence those previews.
+        let overlay = fs.volatile_overlay.get().unwrap();
+        let runtime = overlay.runtime(file).unwrap();
+        overlay.preview_attrs(file, acknowledged.clone());
+        let atime = Timestamp {
+            seconds: acknowledged.atime.seconds + 10,
+            nanoseconds: 123,
+        };
+        fs.record_access_time_idempotent(file, atime, [0x42; 16])
+            .await
+            .unwrap();
+        let inode = fs.visible_inode(file).await.unwrap();
+        let visible: FileAttributes = InodeWithId {
+            inode: &inode,
+            id: file,
+        }
+        .into();
+        assert_eq!(visible.atime, atime);
+        assert_eq!(visible.size, acknowledged.size);
+        assert_eq!(visible.mode, acknowledged.mode);
+        assert_eq!(visible.mtime, acknowledged.mtime);
+        assert_eq!(visible.ctime, acknowledged.ctime);
+        overlay.retire_inode(file).await;
+        drop(runtime);
+        assert_eq!(overlay.lifecycle_census_for_test().runtimes, 0);
+        assert_eq!(overlay.lifecycle_census_for_test().visible_attrs, 0);
     }
 
     #[tokio::test]

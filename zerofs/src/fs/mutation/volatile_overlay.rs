@@ -37,7 +37,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 #[cfg(test)]
 use tokio::sync::oneshot;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{Notify, RwLock, RwLockReadGuard};
 use tokio_util::sync::CancellationToken;
 #[cfg(test)]
 use tokio_util::task::TaskTracker;
@@ -336,6 +336,47 @@ pub(crate) struct VolatileWriteRuntime {
     worker_stopped: Notify,
     #[cfg(test)]
     idle_retirement_pause: Mutex<Option<IdleRetirementPause>>,
+}
+
+/// Pins acknowledged bytes and their prepared metadata while a reader obtains
+/// the canonical inode and combines it with the volatile view.
+pub(crate) struct VolatileReadGuard<'a> {
+    runtime: &'a VolatileWriteRuntime,
+    _retirement: RwLockReadGuard<'a, ()>,
+}
+
+impl VolatileReadGuard<'_> {
+    #[cfg_attr(
+        feature = "hotpath-profile",
+        hotpath::measure(future = true, label = "zerofs.overlay.read")
+    )]
+    pub(crate) async fn read<F>(self, offset: u64, length: usize, base: F) -> OverlayResult<Bytes>
+    where
+        F: FnOnce() -> BoxFuture<'static, OverlayResult<Bytes>>,
+    {
+        let first = self.runtime.snapshot();
+        if let Some(data) = fully_covered(offset, length, &first) {
+            return Ok(data);
+        }
+
+        let base = base().await?;
+        if base.len() != length {
+            return Err(OverlayError::IoError);
+        }
+        // Terminal state stops admission and durability progress, but accepted
+        // entries stay pinned. Snapshot after the canonical read so any write
+        // that could have partially changed the base is still present in full.
+        let overlay = self.runtime.snapshot();
+        if overlay.is_empty() {
+            return Ok(base);
+        }
+
+        let mut output = BytesMut::from(base.as_ref());
+        for entry in overlay {
+            apply_entry(&mut output, offset, &entry);
+        }
+        Ok(output.freeze())
+    }
 }
 
 impl VolatileWriteRuntime {
@@ -669,39 +710,24 @@ impl VolatileWriteRuntime {
         }
     }
 
+    pub(crate) async fn read_guard(&self) -> VolatileReadGuard<'_> {
+        VolatileReadGuard {
+            runtime: self,
+            _retirement: self.retirement.read().await,
+        }
+    }
+
+    pub(super) async fn retire_metadata(&self, retire: impl FnOnce()) {
+        let _retirement = self.retirement.write().await;
+        retire();
+    }
+
+    #[cfg(test)]
     pub(crate) async fn read<F>(&self, offset: u64, length: usize, base: F) -> OverlayResult<Bytes>
     where
         F: FnOnce() -> BoxFuture<'static, OverlayResult<Bytes>>,
     {
-        let _retirement = self.retirement.read().await;
-        let first = self.snapshot();
-        if let Some(data) = fully_covered(offset, length, &first) {
-            return Ok(data);
-        }
-
-        let base = base().await?;
-        if base.len() != length {
-            return Err(OverlayError::IoError);
-        }
-        // Terminal state stops admission and durability progress, but accepted
-        // entries stay pinned. Overlaying that frozen logical view over the
-        // canonical read preserves the last coherent bytes after a partial or
-        // failed materialization instead of turning every read into EIO.
-        // Snapshot after the canonical read while retirement remains pinned.
-        // Any write that could have partially changed the base is therefore
-        // still present here in its complete logical form.
-        let overlay = self.snapshot();
-        if overlay.is_empty() {
-            // Nothing to apply: the canonical bytes are already the answer, so
-            // skip copying them into a mutable buffer.
-            return Ok(base);
-        }
-
-        let mut output = BytesMut::from(base.as_ref());
-        for entry in overlay {
-            apply_entry(&mut output, offset, &entry);
-        }
-        Ok(output.freeze())
+        self.read_guard().await.read(offset, length, base).await
     }
 
     pub(crate) fn stop_admission(&self) -> u64 {
