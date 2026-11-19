@@ -1629,9 +1629,8 @@ impl PoolObjectStore {
     async fn recover_pending(&self) -> object_store::Result<()> {
         let (mut uploads, mut garbage) = self.catalog(Catalog::recovery).await?;
         // Recover local debts first, and bound startup work even when a remote
-        // member has thousands of interrupted operations. Started native uploads
-        // keep an owned task through deletion and catalog settlement: a slow
-        // directory scan must not lose its result when the bounded wait expires.
+        // member has thousands of interrupted operations. Native deletions
+        // keep an owned task through catalog settlement when the bounded wait expires.
         let is_local = |id: &str| {
             self.member(id)
                 .is_ok_and(|member| member.local_path.is_some())
@@ -1764,15 +1763,37 @@ impl PoolObjectStore {
             };
             let attempt_deadline =
                 deadline.min(tokio::time::Instant::now() + std::time::Duration::from_secs(1));
-            match tokio::time::timeout_at(attempt_deadline, self.cleanup_garbage(&garbage)).await {
+            let garbage_id = garbage.id.clone();
+            let result = if is_local(&member_id) {
+                let pool = self.clone();
+                let cleaning = self.inner.tasks.spawn(async move {
+                    let _guard = _guard;
+                    let interrupted = pool.inner.safety_failure.clone().drop_guard();
+                    let result = pool.cleanup_garbage(&garbage).await;
+                    interrupted.disarm();
+                    if result.is_ok() {
+                        pool.inner.health_changed.notify_one();
+                    }
+                    result
+                });
+                tokio::time::timeout_at(attempt_deadline, async {
+                    cleaning.await.map_err(|issue| {
+                        error(format!("native garbage recovery task failed: {issue}"))
+                    })?
+                })
+                .await
+            } else {
+                tokio::time::timeout_at(attempt_deadline, self.cleanup_garbage(&garbage)).await
+            };
+            match result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     unavailable.insert(member_id);
-                    tracing::warn!(%error, object = %garbage.id, "pool recovery retains superseded object cleanup debt");
+                    tracing::warn!(%error, object = %garbage_id, "pool recovery retains superseded object cleanup debt");
                 }
                 Err(_) => {
                     unavailable.insert(member_id);
-                    tracing::warn!(object = %garbage.id, "pool recovery timed out; superseded object cleanup remains recorded");
+                    tracing::warn!(object = %garbage_id, "pool recovery timed out; superseded object cleanup remains recorded");
                 }
             }
         }

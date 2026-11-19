@@ -2318,6 +2318,40 @@ async fn pull_ready_cancelled_stale_native_cleanup_keeps_worker_and_shutdown_own
 }
 
 #[tokio::test]
+async fn native_garbage_reconciles_after_startup_wait_times_out() {
+    let temp = tempfile::tempdir().unwrap();
+    for directory in ["authority", "hdd-a", "hdd-b"] {
+        std::fs::create_dir(temp.path().join(directory)).unwrap();
+    }
+    let pool = persistent_pool(temp.path(), true).await;
+    let path = segment(2408);
+    create(&pool, &path, b"original").await;
+    let previous = pool.visible(&path).await.unwrap().unwrap();
+    let body = temp.path().join("hdd-a").join(previous.physical.key());
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(body.parent().unwrap().join(".zerofs-local-mutations#0"))
+        .unwrap();
+    fs4::fs_std::FileExt::lock_exclusive(&lock).unwrap();
+
+    let key = path.to_string();
+    pool.catalog(move |catalog| catalog.retire(&key, &previous))
+        .await
+        .unwrap();
+    pool.recover_pending().await.unwrap();
+    assert!(body.exists());
+    assert!(pool.key_lock(&path).try_write_owned().is_err());
+    assert_eq!(pool.status().await.unwrap().pending_operations, 1);
+
+    drop(lock);
+    pool.settle().await;
+    assert!(!body.exists());
+    assert_eq!(pool.status().await.unwrap().pending_operations, 0);
+    assert!(!pool.inner.safety_failure.is_cancelled());
+}
+
+#[tokio::test]
 #[ignore = "child of disk_health_crash_reopen_preserves_one_verified_placement"]
 async fn disk_health_crash_child() {
     let Some(root) = std::env::var_os("ZEROFS_POOL_CRASH_ROOT") else {
