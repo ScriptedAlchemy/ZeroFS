@@ -1,0 +1,798 @@
+{
+  "recorded_at_utc": "2026-11-19T11:12:51.601614+00:00",
+  "identifier_scope": "The local snapshot and remote source commit have exactly the same Git tree; an evidence-only publication may have a later commit SHA.",
+  "remote_source_commit": "5eb785217012678e67738475952490c95d1c2fb3",
+  "remote_source_tree_matches_tested_local_tree": true,
+  "final_tested_local_source_snapshot": "6c6846baa2929ba6372f23a1a468a226f6cfa43c",
+  "final_tested_local_source_tree": "5fed08ddaf7f9ed2562918309a50d34d598d6908",
+  "upstream_pr87_head": "75036e9de5a4ae114fd85decfa9383e041163782",
+  "integrated_base": "ca34705e22dd9095d15a3975a48dd310286ea177",
+  "host": {
+    "system": "Linux",
+    "architecture": "x86_64",
+    "emulation_requested": false
+  },
+  "focused_build": {
+    "stage": "build",
+    "exit_code": 0,
+    "seconds": 209.66962158100068
+  },
+  "focused_runtime": {
+    "passed": 131,
+    "failed": 0,
+    "seconds_sum": 116.81788507006422,
+    "results": [
+      {
+        "selector": "acl_xattr_bytes_round_trip_and_match_libacl_layout",
+        "exit_code": 0,
+        "seconds": 0.11587971700646449
+      },
+      {
+        "selector": "acl_removal_encodings_and_invalid_values",
+        "exit_code": 0,
+        "seconds": 0.06677659999695607
+      },
+      {
+        "selector": "acl_access_decisions_follow_posix_acl_permission",
+        "exit_code": 0,
+        "seconds": 0.11503236700082198
+      },
+      {
+        "selector": "acl_named_users_and_groups_require_defined_ids",
+        "exit_code": 0,
+        "seconds": 0.06504032600059872
+      },
+      {
+        "selector": "acl_a_matching_group_without_the_right_does_not_fall_through_to_other",
+        "exit_code": 0,
+        "seconds": 0.06530804200156126
+      },
+      {
+        "selector": "acl_incomplete_group_lists_never_widen_access",
+        "exit_code": 0,
+        "seconds": 0.11499512499722186
+      },
+      {
+        "selector": "acl_combined_requests_need_one_entry_granting_every_bit",
+        "exit_code": 0,
+        "seconds": 0.08435718499822542
+      },
+      {
+        "selector": "acl_mode_is_the_source_of_owner_mask_and_other",
+        "exit_code": 0,
+        "seconds": 0.14148662399384193
+      },
+      {
+        "selector": "acl_create_masq_follows_linux",
+        "exit_code": 0,
+        "seconds": 0.1738450799966813
+      },
+      {
+        "selector": "nfs4_restricted_preset_with_delete_child_on_a_directory",
+        "exit_code": 0,
+        "seconds": 0.06566655600181548
+      },
+      {
+        "selector": "nfs4_open_preset_with_delete_child_on_a_directory",
+        "exit_code": 0,
+        "seconds": 0.06584930599638028
+      },
+      {
+        "selector": "nfs4_home_preset_with_delete_child_and_traverse_for_everyone",
+        "exit_code": 0,
+        "seconds": 0.06614453099609818
+      },
+      {
+        "selector": "nfs4_smb_builtin_groups_become_named_group_entries",
+        "exit_code": 0,
+        "seconds": 0.104813183999795
+      },
+      {
+        "selector": "nfs4_inherited_entries_on_files_map_to_an_access_acl",
+        "exit_code": 0,
+        "seconds": 0.0701786310019088
+      },
+      {
+        "selector": "nfs4_inherit_only_entries_feed_only_the_default_acl",
+        "exit_code": 0,
+        "seconds": 0.03458294399752049
+      },
+      {
+        "selector": "nfs4_a_directory_without_inheritable_entries_has_no_default",
+        "exit_code": 0,
+        "seconds": 0.12532845799432835
+      },
+      {
+        "selector": "nfs4_expressible_deny_entries",
+        "exit_code": 0,
+        "seconds": 0.06899012000212679
+      },
+      {
+        "selector": "nfs4_group_deny_that_posix_cannot_express_is_refused",
+        "exit_code": 0,
+        "seconds": 0.0678108220017748
+      },
+      {
+        "selector": "nfs4_owner_rights_that_depend_on_group_membership_are_refused",
+        "exit_code": 0,
+        "seconds": 0.06702641399897402
+      },
+      {
+        "selector": "nfs4_inheritance_patterns_posix_defaults_cannot_carry_are_refused",
+        "exit_code": 0,
+        "seconds": 0.06614255900058197
+      },
+      {
+        "selector": "nfs4_partial_rights_are_refused",
+        "exit_code": 0,
+        "seconds": 0.06725226099661086
+      },
+      {
+        "selector": "nfs4_malformed_and_unsupported_values_are_refused",
+        "exit_code": 0,
+        "seconds": 0.06843153400404844
+      },
+      {
+        "selector": "nfs4_inherited_delete_does_not_authorize_deleting_every_child",
+        "exit_code": 0,
+        "seconds": 0.06790127100248355
+      },
+      {
+        "selector": "nfs4_unknown_identity_flags_and_undefined_named_ids_are_refused",
+        "exit_code": 0,
+        "seconds": 0.06641908700112253
+      },
+      {
+        "selector": "nfs4_named_users_who_may_own_future_children_are_checked",
+        "exit_code": 0,
+        "seconds": 0.03777496600378072
+      },
+      {
+        "selector": "nfs4_too_many_principals_are_refused",
+        "exit_code": 0,
+        "seconds": 0.07038766199548263
+      },
+      {
+        "selector": "nfs4_read_data_and_execute_only_entries",
+        "exit_code": 0,
+        "seconds": 0.06639619400084484
+      },
+      {
+        "selector": "permissions_root_can_search_directories_without_execute_bits",
+        "exit_code": 0,
+        "seconds": 0.06751316900044912
+      },
+      {
+        "selector": "permissions_root_still_needs_an_execute_bit_for_regular_files",
+        "exit_code": 0,
+        "seconds": 0.06745216000126675
+      },
+      {
+        "selector": "permissions_combined_requests_require_every_bit_from_one_permission_class",
+        "exit_code": 0,
+        "seconds": 0.06840609899518313
+      },
+      {
+        "selector": "permissions_combined_acl_requests_do_not_union_matching_group_entries",
+        "exit_code": 0,
+        "seconds": 0.06573492600000463
+      },
+      {
+        "selector": "permissions_combined_acl_requests_preserve_named_user_precedence_and_mask",
+        "exit_code": 0,
+        "seconds": 0.0676178380017518
+      },
+      {
+        "selector": "permissions_truncated_groups_do_not_bypass_restrictive_acl_entries",
+        "exit_code": 0,
+        "seconds": 0.06493829200189793
+      },
+      {
+        "selector": "permissions_locally_truncated_groups_do_not_gain_mode_or_group_authority",
+        "exit_code": 0,
+        "seconds": 0.06547258199861972
+      },
+      {
+        "selector": "permissions_truncated_group_provenance_survives_roundtrip_and_changes_replay_identity",
+        "exit_code": 0,
+        "seconds": 0.06616562000272097
+      },
+      {
+        "selector": "permissions_upstream_kernel_authorized_unknown_groups_keep_the_existing_fallback",
+        "exit_code": 0,
+        "seconds": 0.06517335199896479
+      },
+      {
+        "selector": "permissions_truncated_groups_cannot_change_ownership_to_an_unproven_group",
+        "exit_code": 0,
+        "seconds": 0.11454370700084837
+      },
+      {
+        "selector": "engine_access_acl_round_trip_updates_mode_and_enforces_each_class",
+        "exit_code": 0,
+        "seconds": 0.11539665199961746
+      },
+      {
+        "selector": "engine_chmod_rewrites_the_mask_and_the_acl_follows",
+        "exit_code": 0,
+        "seconds": 0.11481882500083884
+      },
+      {
+        "selector": "engine_an_acl_equivalent_to_the_mode_is_stored_as_the_mode",
+        "exit_code": 0,
+        "seconds": 0.06611633300053654
+      },
+      {
+        "selector": "engine_default_acls_are_inherited_on_create_and_mkdir",
+        "exit_code": 0,
+        "seconds": 0.11802067099779379
+      },
+      {
+        "selector": "engine_acl_updates_preserve_setgid_only_for_known_group_members",
+        "exit_code": 0,
+        "seconds": 0.1222863619987038
+      },
+      {
+        "selector": "engine_inherited_acl_strips_setgid_before_limiting_group_execute",
+        "exit_code": 0,
+        "seconds": 0.1704173640027875
+      },
+      {
+        "selector": "engine_directory_acls_govern_lookup_and_listing",
+        "exit_code": 0,
+        "seconds": 0.06674674300302286
+      },
+      {
+        "selector": "engine_a_default_acl_is_refused_on_a_file",
+        "exit_code": 0,
+        "seconds": 0.16716812900267541
+      },
+      {
+        "selector": "engine_invalid_acl_values_are_rejected_without_change",
+        "exit_code": 0,
+        "seconds": 0.06554662200505845
+      },
+      {
+        "selector": "engine_nfs4_acls_are_translated_or_refused",
+        "exit_code": 0,
+        "seconds": 0.11712567500217119
+      },
+      {
+        "selector": "engine_access_checks_never_combine_an_old_mode_with_new_acl_entries",
+        "exit_code": 0,
+        "seconds": 0.11495481999736512
+      },
+      {
+        "selector": "engine_translating_acl_counts_rows_removed_in_the_same_transaction",
+        "exit_code": 0,
+        "seconds": 0.3182108610053547
+      },
+      {
+        "selector": "engine_user_xattr_access_follows_the_acl",
+        "exit_code": 0,
+        "seconds": 0.06589143600285752
+      },
+      {
+        "selector": "engine_volumes_without_acls_skip_lookups_until_the_first_acl",
+        "exit_code": 0,
+        "seconds": 0.16643547599960584
+      },
+      {
+        "selector": "engine_acls_persist_and_are_enforced_after_reopening",
+        "exit_code": 0,
+        "seconds": 0.2173457180033438
+      },
+      {
+        "selector": "namespace_namespace_mutations_require_a_combined_acl_group_grant",
+        "exit_code": 0,
+        "seconds": 0.17013330299960217
+      },
+      {
+        "selector": "db_pair_snapshot_keeps_one_writer_version",
+        "exit_code": 0,
+        "seconds": 0.16753043600328965
+      },
+      {
+        "selector": "db_pair_snapshot_keeps_one_reader_version_across_refresh",
+        "exit_code": 0,
+        "seconds": 0.23097078800492454
+      },
+      {
+        "selector": "db_pair_snapshot_handles_missing_keys_and_requires_order",
+        "exit_code": 0,
+        "seconds": 0.24013180600013584
+      },
+      {
+        "selector": "db_pair_snapshot_rechecks_serving_authority_after_both_reads",
+        "exit_code": 0,
+        "seconds": 0.12173824600176886
+      },
+      {
+        "selector": "ninep_opens_require_one_acl_entry_to_grant_the_complete_access_mode",
+        "exit_code": 0,
+        "seconds": 0.11929029999737395
+      },
+      {
+        "selector": "ninep_dot_walk_steps_do_not_grow_paths_or_displace_parent_components",
+        "exit_code": 0,
+        "seconds": 0.06560477700259071
+      },
+      {
+        "selector": "ninep_dot_then_parent_walk_keeps_rename_source_consistent",
+        "exit_code": 0,
+        "seconds": 0.2670247149944771
+      },
+      {
+        "selector": "ninep_detached_parent_walk_restores_root_path_before_rename",
+        "exit_code": 0,
+        "seconds": 0.3352558170008706
+      },
+      {
+        "selector": "ninep_io_snapshot_preserves_open_modes_credentials_and_pin_ownership",
+        "exit_code": 0,
+        "seconds": 0.06460929400054738
+      },
+      {
+        "selector": "ninep_io_uses_the_pinned_open_inode_after_name_and_permission_changes",
+        "exit_code": 0,
+        "seconds": 0.06478491700545419
+      },
+      {
+        "selector": "ninep_requested_creation_gid_never_changes_parent_authorization",
+        "exit_code": 0,
+        "seconds": 0.11526135299936868
+      },
+      {
+        "selector": "ninep_creation_gid_selection_preserves_inheritance_and_listener_override",
+        "exit_code": 0,
+        "seconds": 0.11552016399946297
+      },
+      {
+        "selector": "ninep_creation_group_hint_is_rejected_by_setattr",
+        "exit_code": 0,
+        "seconds": 0.06502991700108396
+      },
+      {
+        "selector": "ninep_private_create_umask_is_applied_only_without_a_default_acl",
+        "exit_code": 0,
+        "seconds": 0.11820390899811173
+      },
+      {
+        "selector": "ninep_trename_updates_the_fid_for_repeated_file_and_directory_moves",
+        "exit_code": 0,
+        "seconds": 0.16507559700403363
+      },
+      {
+        "selector": "ninep_trename_hardlink_noop_keeps_the_original_entry_bound",
+        "exit_code": 0,
+        "seconds": 0.11523346800095169
+      },
+      {
+        "selector": "ninep_trename_reconstructs_a_renamed_destination_directory_path",
+        "exit_code": 0,
+        "seconds": 0.06445039000391262
+      },
+      {
+        "selector": "ninep_failed_trename_keeps_the_fid_path_and_both_entries",
+        "exit_code": 0,
+        "seconds": 0.16952869200031273
+      },
+      {
+        "selector": "ninep_trename_replay_does_not_rewind_a_later_fid_path",
+        "exit_code": 0,
+        "seconds": 0.11807331599993631
+      },
+      {
+        "selector": "ninep_case_only_trename_updates_the_fid_before_the_next_rename",
+        "exit_code": 0,
+        "seconds": 0.11917907300085062
+      },
+      {
+        "selector": "inventory_entries_report_the_engine_translation_and_summary_counts_formats",
+        "exit_code": 0,
+        "seconds": 0.06786258100328268
+      },
+      {
+        "selector": "nfs_access_access_honors_modes_shared_identity_and_requested_rights",
+        "exit_code": 0,
+        "seconds": 0.06474366399925202
+      },
+      {
+        "selector": "nfs_access_access_honors_named_user_acl_and_owning_group_entry",
+        "exit_code": 0,
+        "seconds": 0.16473136200511362
+      },
+      {
+        "selector": "nfs_access_access_honors_acl_named_users_groups_and_directory_combined_rights",
+        "exit_code": 0,
+        "seconds": 0.06464277600025525
+      },
+      {
+        "selector": "nfs_access_access_preserves_acknowledged_acl_write_attributes_before_materialization",
+        "exit_code": 0,
+        "seconds": 0.06463747800444253
+      },
+      {
+        "selector": "nfs_access_access_without_supported_rights_does_not_read_a_corrupt_acl",
+        "exit_code": 0,
+        "seconds": 0.06485588399664266
+      },
+      {
+        "selector": "mount_proc_groups_require_matching_filesystem_ids_and_a_complete_list",
+        "exit_code": 0,
+        "seconds": 0.06523517000459833
+      },
+      {
+        "selector": "pool_member_verification_rejects_replaced_empty_and_nonempty_generations",
+        "exit_code": 0,
+        "seconds": 0.1698717420003959
+      },
+      {
+        "selector": "pool_legacy_native_garbage_reconciles_after_startup_wait_times_out",
+        "exit_code": 0,
+        "seconds": 1.1238406080010463
+      },
+      {
+        "selector": "pool_native_garbage_reconciles_after_startup_wait_times_out",
+        "exit_code": 0,
+        "seconds": 1.1183344689998194
+      },
+      {
+        "selector": "pool_native_recovery_timeout_keeps_cleanup_owned_until_catalog_settlement",
+        "exit_code": 0,
+        "seconds": 1.118842907002545
+      },
+      {
+        "selector": "pool_native_staging_recovery_reclaims_owned_files_before_releasing_reservation",
+        "exit_code": 0,
+        "seconds": 0.16484004400263075
+      },
+      {
+        "selector": "pool_disk_health_verified_same_generation_retry_clears_source_fault",
+        "exit_code": 0,
+        "seconds": 0.11475839599734172
+      },
+      {
+        "selector": "pool_legacy_authority_segments_can_be_read_and_migrated_without_changing_identity",
+        "exit_code": 0,
+        "seconds": 0.115030826003931
+      },
+      {
+        "selector": "pool_segment_target_survives_capacity_refusal_reopen_and_replay",
+        "exit_code": 0,
+        "seconds": 0.1161450790023082
+      },
+      {
+        "selector": "pool_quarantined_segment_target_refuses_creation_without_spilling",
+        "exit_code": 0,
+        "seconds": 0.06522029799816664
+      },
+      {
+        "selector": "pool_segment_target_cannot_override_an_inflight_multipart_reservation",
+        "exit_code": 0,
+        "seconds": 0.06425201599631691
+      },
+      {
+        "selector": "pool_writeback_replays_segment_to_persisted_member_before_any_pool_put",
+        "exit_code": 0,
+        "seconds": 0.36619412599975476
+      },
+      {
+        "selector": "pool_targeted_seal_refuses_identical_bytes_already_on_another_member",
+        "exit_code": 0,
+        "seconds": 0.06497686200600583
+      },
+      {
+        "selector": "pool_writeback_target_retry_does_not_reconcile_pending_bytes_on_another_member",
+        "exit_code": 0,
+        "seconds": 0.11506907100556418
+      },
+      {
+        "selector": "pool_writeback_multipart_target_retry_does_not_reconcile_pending_bytes_on_another_member",
+        "exit_code": 0,
+        "seconds": 9.876366780998069
+      },
+      {
+        "selector": "pool_writeback_multipart_target_refusal_does_not_reconcile_remote_bytes",
+        "exit_code": 0,
+        "seconds": 3.1008974189971923
+      },
+      {
+        "selector": "pool_writeback_segment_retry_waits_for_original_remote_ack",
+        "exit_code": 0,
+        "seconds": 0.11632265300431754
+      },
+      {
+        "selector": "pool_writeback_segment_retry_needs_no_second_ssd_reservation",
+        "exit_code": 0,
+        "seconds": 0.1975621159945149
+      },
+      {
+        "selector": "pool_writeback_segment_retry_bypasses_a_ram_owner_waiting_for_full_ssd",
+        "exit_code": 0,
+        "seconds": 0.2811698020013864
+      },
+      {
+        "selector": "pool_degraded_member_counts_once_in_automatic_evacuation_fences",
+        "exit_code": 0,
+        "seconds": 0.3168268950030324
+      },
+      {
+        "selector": "pool_bound_segment_refusal_does_not_stop_other_automatic_evacuation",
+        "exit_code": 0,
+        "seconds": 0.11573367500386667
+      },
+      {
+        "selector": "pool_recovery_two_sick_members_stop_new_copies_and_report_failure_across_restart",
+        "exit_code": 0,
+        "seconds": 0.11554100600187667
+      },
+      {
+        "selector": "pool_recovery_emptied_historical_quarantine_does_not_block_later_single_failure",
+        "exit_code": 0,
+        "seconds": 0.11761778599611716
+      },
+      {
+        "selector": "pool_recovery_zero_byte_pending_upload_counts_as_an_active_failed_member",
+        "exit_code": 0,
+        "seconds": 0.11812355399888474
+      },
+      {
+        "selector": "pool_recovery_second_failure_during_reserved_copy_fences_remap_and_keeps_committed_copy",
+        "exit_code": 0,
+        "seconds": 0.11888928600092186
+      },
+      {
+        "selector": "pool_recovery_running_copy_rechecks_two_disk_policy_at_publication",
+        "exit_code": 0,
+        "seconds": 0.11968155799695523
+      },
+      {
+        "selector": "pool_export_degraded_cold_start_serves_survivor_and_reports_missing_files",
+        "exit_code": 0,
+        "seconds": 0.4245705069988617
+      },
+      {
+        "selector": "pool_export_sealed_body_corruption_fails_authentication_and_verification",
+        "exit_code": 0,
+        "seconds": 0.31001442299748305
+      },
+      {
+        "selector": "writeback_matching_segment_retry_preserves_terminal_admission_failures",
+        "exit_code": 0,
+        "seconds": 0.11970707699947525
+      },
+      {
+        "selector": "storage_native_file_backend_passes_the_real_startup_compatibility_probe",
+        "exit_code": 0,
+        "seconds": 0.06644890700408723
+      },
+      {
+        "selector": "storage_initialized_local_pool_needs_no_cloud_credentials_or_remote_sessions",
+        "exit_code": 0,
+        "seconds": 0.1150555339991115
+      },
+      {
+        "selector": "storage_configured_local_disks_spill_at_capacity_and_reopen_with_the_same_placements",
+        "exit_code": 0,
+        "seconds": 0.2157810420030728
+      },
+      {
+        "selector": "storage_degraded_local_pool_keeps_an_unused_sftp_member_deferred",
+        "exit_code": 0,
+        "seconds": 0.16479034600342857
+      },
+      {
+        "selector": "storage_ordinary_open_requires_initialization_and_never_recreates_a_lost_catalog",
+        "exit_code": 0,
+        "seconds": 0.11557648400048492
+      },
+      {
+        "selector": "storage_adding_a_configured_disk_preserves_existing_data_and_uses_new_capacity",
+        "exit_code": 0,
+        "seconds": 0.1152559710026253
+      },
+      {
+        "selector": "storage_metadata_catalog_members_and_clean_cache_cannot_share_a_directory_tree",
+        "exit_code": 0,
+        "seconds": 0.11471492599957855
+      },
+      {
+        "selector": "storage_symlink_aliases_cannot_bypass_member_or_cache_overlap_checks",
+        "exit_code": 0,
+        "seconds": 0.06436009599565296
+      },
+      {
+        "selector": "storage_invalid_member_ids_and_capacity_budgets_are_rejected_during_settings_validation",
+        "exit_code": 0,
+        "seconds": 0.06453238899848657
+      },
+      {
+        "selector": "storage_unsupported_member_schemes_and_remote_metadata_are_rejected_before_opening_storage",
+        "exit_code": 0,
+        "seconds": 0.06538766300218413
+      },
+      {
+        "selector": "storage_only_a_local_metadata_store_stops_retrying_an_eio",
+        "exit_code": 0,
+        "seconds": 0.8705160140016233
+      },
+      {
+        "selector": "builder_parse_storage_box_sftp_url_keeps_remote_prefix",
+        "exit_code": 0,
+        "seconds": 0.11739621000015177
+      },
+      {
+        "selector": "builder_sftp_parser_requires_host",
+        "exit_code": 0,
+        "seconds": 0.06450099100038642
+      },
+      {
+        "selector": "builder_sftp_parser_requires_username",
+        "exit_code": 0,
+        "seconds": 0.0653358829949866
+      },
+      {
+        "selector": "builder_sftp_parser_rejects_password_without_leaking_it",
+        "exit_code": 0,
+        "seconds": 0.06467563100159168
+      },
+      {
+        "selector": "sftp_deferred_writable_pool_dials_only_when_a_member_operation_is_requested",
+        "exit_code": 0,
+        "seconds": 0.06759185199916828
+      },
+      {
+        "selector": "sftp_an_unreachable_deferred_member_does_not_prevent_construction_or_unused_shutdown",
+        "exit_code": 0,
+        "seconds": 0.06513395399815636
+      },
+      {
+        "selector": "sftp_writable_config_warms_the_full_connection_budget_before_returning",
+        "exit_code": 0,
+        "seconds": 0.06460873600008199
+      },
+      {
+        "selector": "sftp_partial_writable_warmup_failure_reaps_opened_sessions_and_lifetime_capacity",
+        "exit_code": 0,
+        "seconds": 0.06445812200399814
+      },
+      {
+        "selector": "recovery_command_reseed_rejects_missing_remote_evidence_without_recovering_the_journal",
+        "exit_code": 0,
+        "seconds": 9.38532262499939
+      },
+      {
+        "selector": "recovery_command_accept_rejects_wrong_remote_hash_without_recovering_the_journal",
+        "exit_code": 0,
+        "seconds": 11.76097707900044
+      },
+      {
+        "selector": "recovery_command_recovery_commands_reject_config_b_before_mutating_journal_a",
+        "exit_code": 0,
+        "seconds": 28.33261415600282
+      },
+      {
+        "selector": "recovery_command_readiness_refuses_relocated_recovery_journals_before_mutation",
+        "exit_code": 0,
+        "seconds": 36.147793285999796
+      }
+    ]
+  },
+  "native_client_tests": [
+    {
+      "selector": "session_transition_tests::legacy_dialect_fallback_masks_private_create_mode_before_sending",
+      "exit_code": 0,
+      "seconds": 0.01638787300180411
+    },
+    {
+      "selector": "session_transition_tests::negotiated_umask_dialect_preserves_all_private_create_requests",
+      "exit_code": 0,
+      "seconds": 0.007922557000711095
+    }
+  ],
+  "isolated_dependency_builds": [
+    {
+      "kind": "proto",
+      "exit_code": 0,
+      "seconds": 3.4234975740037044,
+      "compiler": "/workspace/scratch/cea7f05042a1/rust/rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc"
+    },
+    {
+      "kind": "client",
+      "exit_code": 0,
+      "seconds": 3.1062122940056724,
+      "compiler": "/workspace/scratch/cea7f05042a1/rust/rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc"
+    },
+    {
+      "kind": "zerofs-client",
+      "exit_code": 0,
+      "seconds": 3.7580589240023983,
+      "compiler": "/workspace/scratch/cea7f05042a1/rust/rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc"
+    },
+    {
+      "kind": "client-tests",
+      "exit_code": 0,
+      "seconds": 16.510622563000652,
+      "compiler": "/workspace/scratch/cea7f05042a1/rust/rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc"
+    }
+  ],
+  "ordinary_production_typecheck": {
+    "local_source_snapshot": "faaced5c3fb10ada906ac6618232097319e5448a",
+    "exit_code": 0,
+    "seconds": 132.33625140699587,
+    "kind": "direct rustc production type-check; real crate root and full CLI; no whole-crate cfg(test), no default features; not Cargo build or Clippy",
+    "subsequent_changes": [
+      "src/fs/ops/create.rs",
+      "src/fs/ops/xattr/acl_tests.rs",
+      "src/ninep/handler/creation_gid_tests.rs"
+    ],
+    "scope_note": "Two later changes corrected cfg(test)-only modules; the subsequent one-line mkdir normalization is compiled and executed by the final normal-module focused harness. The full real-CLI typecheck was not rerun at the final snapshot and is not claimed at that SHA."
+  },
+  "directory_mode_regression": {
+    "before_local_snapshot": "fea4f4d6253867ccd1900be534ccc35c94275f38",
+    "before_passed": 130,
+    "before_failed": 1,
+    "selector": "ninep_private_create_umask_is_applied_only_without_a_default_acl",
+    "actual_before_octal": "0o42000",
+    "expected_octal": "0o2000",
+    "correction": "mkdir applies validate_mode to the requested mode, consistently with regular and special creates.",
+    "compiled_test_file_identical_before_and_after": true,
+    "test_file_sha256": "4926e951c182803dbba9f9bf68f2a34ab454093461dbd7b8909cf4499a69d6f0"
+  },
+  "selected_test_sources_sha256": {
+    "fs/permissions/acl/tests.rs": "dfd925f5f6b15f7fa7e212ba9b1a82637d882f45ebfe134448cefeecc12e1db5",
+    "fs/permissions/nfs4/tests.rs": "46d7c5b47bd3114d1f49e9975e92d55f95e98143b47fcf75a190334abb262326",
+    "fs/permissions.rs": "8ea61869a5e9f88544b15784f126beca83c4a78e0aa763f2f008377fd1f92773",
+    "fs/ops/xattr/acl_tests.rs": "b3b77af6d06d032a6a533422d5f69a27a8bb16b914fb007c48cd882174d089a6",
+    "fs/ops/acl_access_tests.rs": "d75d309865ff2b944719614adfcffdf9d61e7dd93b4383be6518386ae5936411",
+    "db/permission_snapshot_tests.rs": "99e51f4d623023da5ea6117112c17e4d44c79853be9e91c2022a990e20ea002a",
+    "ninep/handler/io_context_tests.rs": "0af78506a2a75b2deb6637dadcbe14be0dfcc973bad4db07d6e01a8eedfaade9",
+    "ninep/handler/creation_gid_tests.rs": "9d79ab397d27d19fe450bda5d228e282af424bad2f037c8055d7df6568819fda",
+    "ninep/handler/rename_fid_tests.rs": "7b7e41a7a7638a59803b482a3d3dad5cd60dde0a8af9860ce35b0d8d93680be2",
+    "cli/inventory/walk.rs": "af4e05fe3cb0564b3413732a9dcee46228fb7a0c75031a68f06055c7aff4a726",
+    "nfs/access_tests.rs": "4eb151d5ee3309bb982a20b4eb01a34b6aca9a85d603c93ca9249a5f4042411b",
+    "mount.rs": "84c64ef081fbe83d25e41ba0f277e9a1c210f5bc5cc68e6586d3d7e11fcb85c7",
+    "pool_object_store/tests.rs": "cd440584783724739316137ec9d62d890594be8399defc02154e441c963fd8d7",
+    "pool_object_store/recovery/tests.rs": "bf2c80a1a34507741f36730e32a672c59f5206ad8e993dc84ba300730bc3e66b",
+    "pool_export_tests.rs": "86631477e21f37d87e5b1cc830e90154d0d89c6b7360fe62a91085f729e7cf62",
+    "writeback/store.rs": "42a76c5f59ba3d5dd09fa96ecf9ff9819229b6b1464ecea6bef00fc36d6c0c5a",
+    "storage_backend/tests.rs": "2d2018c3f9e0497b8b4a395ae6f7e621da7009dc6e0c2b27f192bc1f20601f2a",
+    "parse_object_store.rs": "ded9d2e0ab2dce9266b4bbe6c78cc14a55c86e37680ed271760068f81e298447",
+    "sftp_transport.rs": "bcc038b74f23c482440d1780b52466ee698c7ee82622cefbf950318add8debb3",
+    "cli/debug.rs": "19d16eba539c5ff34003e1733b92594b7a13ead9c6fd27853bb02b585d45b0bd"
+  },
+  "harness_transformations": [
+    "Copy exact production sources without whole-server cfg(test); omit CLI command entrypoint while retaining exact CLI cleanup helpers/constants and real inventory modules.",
+    "Expose existing in-memory constructors, inode fixture, filesystem credential fixture and Lease::renew helper; no fixture implementation changes.",
+    "Expose selected test modules and replace test attributes with callable pub(crate) entrypoints; preserve all original bodies/assertions.",
+    "Expose existing materializer hold-lane fixture (oneshot, Hold variant/arm and method); worker algorithm unchanged.",
+    "Expose parser from_text and NFSv4 fixture encoder, preserving their original implementations.",
+    "Expose internal module paths needed by the standalone driver; no production algorithm changes.",
+    "Copy the existing FUSE group-parser test unchanged into a callable child module.",
+    "Extract exact selected pool/recovery/export tests and fixtures into callable child modules; expose existing Lazy initialization, reserve pause, write coordinator worker and flush close hooks.",
+    "Include all storage_backend tests with the existing native errno injection wrapper exposed for its local-versus-remote metadata error test.",
+    "Extract four exact SFTP transport tests with original RecordingFactory/RecordingSession fixtures; preserve start_paused semantics in dedicated current-thread runtimes.",
+    "Preserve exact production CLI writeback recovery functions, identity loader and cleanup helper; extract four exact recovery tests and their real open_storage fixtures.",
+    "Include full-SSD, queued-RAM-owner, terminal-admission and degraded-local-plus-deferred-SFTP integration regressions from the frozen repository source."
+  ],
+  "dependency_note": "Uses the pinned zerofs_nfsserve0f7d4f6 ACCESS implementation rebuilt against the cached graph; ninep-proto and ninep-client are rebuilt directly from the combined current checkout into isolated scratch outputs. Shared Cargo target unchanged.",
+  "receipt_sha256": {
+    "original-source-manifest.json": "94cb67d4ec10e0d2b8399d7eaf58d7e1d5663ed323aeb7feeb15910facb19c37",
+    "compiled-source-manifest.json": "f0ee9931c49ecbbdcb2a5a402b8ed5559160262f6843661ce23aa3d781b36557",
+    "test-provenance.json": "0d9e0fffa392f3a28c5431f793f5042aebaeab2fb877f5f5bb0acbac3cf93bb7",
+    "command.json": "8172cb5b425628e481d1cb0f180323f0066bc221d201f75436009d0953fbba84",
+    "build-result.json": "583975057504ac7265f4dc6d8e72da1e68a791364038b6aa4db70f0ba2a8d446",
+    "test-results.json": "4291525fd55ab96a8fc66235acfbd265035f6d344c15bcb5278b02b31f13c615",
+    "production-check-result.json": "6439dac8343b25b31f8201254f558787b0d27e2fe247469294c00f9798faaafd"
+  },
+  "historical_stage": "validation.json and initial-stage-README.md retain the original76/41 pass and NFSv4 negative-control evidence.",
+  "limitations": [
+    "Focused standalone source harness, not a complete Cargo test invocation or Clippy run.",
+    "Ordinary direct production typecheck is an earlier-stage result on faaced5, not the final snapshot.",
+    "No new mounted FUSE or kernel 9P qualification, NAS deployment, physical disk qualification, or throughput measurement.",
+    "No additional SSD-budget mutation harness was executed."
+  ],
+  "checked_in_source_tree_file_count": 287,
+  "source_tree_hashes_match_final_checkout": true
+}

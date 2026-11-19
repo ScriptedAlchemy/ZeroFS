@@ -1,37 +1,60 @@
-# PR87 current-source audit
+# PR87 and combined integration audit
 
-This review starts at remote PR87 commit `948aa2563e60d99caa20ad48804225dcfe00a755`. It restores and rechecks the unpublished ACL audit corrections, reconciles them with the current integration code, and validates source commit `3f9706629f849aa71839af01fd29892d1f07728a`. The earlier [pass8 receipt](../deep-audit-pass8-acl/README.md) remains historical evidence.
+## Final source snapshot
 
-## Corrections and reconciliation
+The final runtime validation uses local source snapshot `6c6846baa2929ba6372f23a1a468a226f6cfa43c`, tree `5fed08ddaf7f9ed2562918309a50d34d598d6908`. It combines the latest PR87 contributor commit `75036e9de5a4ae114fd85decfa9383e041163782`, the reviewed PR86/PR89 integration base `ca34705e22dd9095d15a3975a48dd310286ea177`, and the additional audit corrections.
 
-- Namespace mutations and 9P read/write opens submit their complete permission request. Matching POSIX group entries cannot each contribute a different permission bit to one operation. The regression exercises create, mkdir, mknod, symlink, hardlink, remove, and same-directory and cross-directory rename, as well as 9P opens.
-- An inode's mode and ownership are paired with its ACL from one committed database view. The writer and read-only reader tests exercise a commit or refresh between the two reads. NFS ACCESS retains acknowledged, pending-write attributes while using coherent permission fields.
-- NFSv4 directory write without explicit DELETE_CHILD is refused. An inherited child DELETE grant cannot safely authorize deleting every child, because a child's group or ACL may differ from its parent's. Unknown identity flags and undefined named IDs are also refused.
-- ACL row-limit admission deducts rows removed by the same transaction before charging new rows.
-- The merge preserves the current integration's creation-GID validation, truncated-group provenance, removal of the old mode-only authorization API, and NFS ACCESS fast path for zero or unsupported-only rights.
-- Additional tests check combined named-user precedence, owner precedence, ACL mask restrictions, and NFS ACCESS with a corrupt ACL when no supported right was requested. Documentation attributes umask narrowing to the client correctly.
+The matching GitHub source commit is `5eb785217012678e67738475952490c95d1c2fb3`, with exactly the same tree. Its parents preserve the latest PR87 and integration heads. A later evidence-only commit can have a different SHA; the integration audit receipt records the final publication and branch references.
 
-## Fresh validation
+## Corrections and preserved contributor changes
 
-All **76 focused regression entrypoints passed**. These cover the complete POSIX ACL parser and NFSv4 translator test modules, permissions, ACL storage and inheritance, chmod, row limits, writer/reader snapshot consistency, namespace mutations, 9P opens and creation identity, rename integration regressions, inventory reporting, and NFS ACCESS including pending-write attributes. The current-source executable compiled successfully without warnings or errors.
+- Namespace mutations and 9P read/write opens request every required permission bit together. Separate matching POSIX group entries cannot each contribute a different bit to one operation.
+- An inode's permission mode and ownership stay paired with its ACL in one committed database view. Writer and read-only refresh tests cover the mixed-version failure. NFS ACCESS retains acknowledged pending-write attributes while checking coherent permissions.
+- NFSv4 directory write requires explicit DELETE_CHILD; inherited child DELETE alone is refused. Unknown identity flags and undefined named IDs are also refused. ACL transactions account for removed rows before charging new rows.
+- The latest contributor's FUSE request credentials and negotiated create-umask handling are preserved. Tests cover both new dialects and the legacy fallback, all three private create request forms, file/directory/regular-node/FIFO creation with and without default ACLs, and setgid handling with incomplete versus known group membership.
+- Directory creation now normalizes the stored permission mode, matching regular and special-node creation. The new FUSE path supplies file-type bits separately from permission bits; those type bits must not persist in the inode's permission field.
+- The combined storage tests cover degraded startup, exact member placement, journal recovery, deferred SFTP construction, and accepted generated-create retries under full RAM/SSD budgets. Identical retries retain the original acknowledgement target and terminal admission checks without waiting for a second reservation.
 
-The harness copied all 287 current production source files and verified their hashes before compilation. It exposed existing fixtures and selected tests, removed test attributes to call those tests from a standalone driver, and omitted the CLI command entrypoint. Production algorithm bodies and selected test assertions were unchanged. This is a focused developer-profile correctness check, rather than a complete Cargo test invocation.
+## Final validation
 
-A separate small source harness also passed **41 unit tests**. These overlap with the focused set and are not 41 additional unique regressions. Its two runtime-dependent permission tests were included in, and passed, the 76-case run.
+| Check | Result and scope |
+| --- | --- |
+| Combined native regression executable | 131 passed, 0 failed on the final local source snapshot |
+| Native client protocol regressions | 2 passed: legacy fallback and both negotiated-UMASK dialects across all private create forms |
+| Direct ordinary production typecheck | Passed on earlier local snapshot `faaced5c3fb10ada906ac6618232097319e5448a`; real crate root and full CLI, no whole-crate cfg(test), no default features |
+| Formatting and whitespace | Passed |
+| Changed mounted-test script | Python syntax checked |
 
-For a fresh negative control, a separate source copy restored the exact original NFSv4 translator function bodies from remote commit `948aa256`. The unchanged `inherited_delete_does_not_authorize_deleting_every_child` test then failed at the expected assertion: the old implementation accepted the unsafe mapping. The fixed test passed in both current-source runs. A larger five-selector negative-control harness was prepared but was not compiled or executed; no result is claimed for it.
+The 131 entrypoints comprise 80 ACL/FUSE/9P/NFS cases and 51 pool, writeback, storage constructor, deferred/warm transport, and recovery cases. Their test bodies and assertions come from the checked-in source. The harness copies all 287 files in the checked-in `zerofs/src` tree, exposes existing fixtures and selected tests, and calls them from a standalone driver. It compiles the actual production `mount.rs` request-credential and umask paths without whole-crate cfg(test). Its CLI subset contains the exact recovery and cleanup functions required by the selected tests.
 
-The existing shared dependency cache initially contained a SlateDB artifact incompatible with its overwritten Foyer dependency. After the dependency cache was repaired, the fresh source build and all 76 tests passed. The earlier cache failure was not treated as a source failure or as test evidence.
+The real, unmodified crate root and full CLI were separately type-checked with direct rustc. The initial attempt needed an isolated rebuild of the path-based `zerofs-client` wrapper to match the updated 9P dependencies. The successful check passed without warning or error output. The later changes were two test-module typing fixes and one production line normalizing directory modes. The final focused executable compiles and executes that production line; the earlier full-CLI typecheck is not claimed at the final SHA.
 
-`validation.json` identifies the tested commit and tree, selectors, source hashes, harness transformations, build result, and negative-control result. Formatting, diff whitespace checks, and Python syntax checking of the changed mount script also passed. No new mounted FUSE/kernel 9P run, NAS deployment, or throughput measurement was performed.
+The 9P protocol/client and path-based client wrapper were compiled into isolated scratch outputs against the coherent cached dependency graph. These isolated client builds left the shared Cargo target unchanged. The native client test binary executes the original client code and tests, including serialization and operation-envelope assertions.
 
-The normal Rust suite retains the regressions. Representative commands are:
+### Failure found by the combined run
+
+The first executed combined run passed 130 of 131 cases. The new private-create umask regression found a directory mode of `0o42000` where the permission field should have contained `0o2000`: the extra bits were S_IFDIR. Directory creation had accepted the raw mode while its sibling constructors called `validate_mode`. The fix adds the same normalization to mkdir.
+
+The regression's assertions and compiled test file are byte-identical before and after this fix. The strict raw-mode assertion remains, alongside the separate inode-type assertion. The final rerun passes all 131 cases. The previous executable, logs, and receipts were retained as direct failure evidence; no separate synthetic mutation was needed for this defect.
+
+The first expanded harness compilation also exposed missing test-only fixture imports and typing/setup mistakes in the new tests. These were corrected before runtime validation. They did not require changes to production behavior.
+
+## Historical stage and evidence
+
+[The initial audit stage](initial-stage-README.md) and its [validation record](validation.json) retain the earlier 76-case run, overlapping 41-test unit run, and unchanged-test NFSv4 original-defect proof. Those counts are historical stages, not additional unique final tests.
+
+[integration-validation.json](integration-validation.json) records the final 131 results, native client results, local source identifiers, selected source hashes, harness transformations, earlier production-check scope, and unchanged directory-mode regression proof.
+
+Representative normal-suite commands remain:
 
 ```sh
 cargo test --locked --no-default-features -p zerofs --lib fs::permissions
 cargo test --locked --no-default-features -p zerofs --lib fs::ops::xattr
-cargo test --locked --no-default-features -p zerofs --lib namespace_mutations_require_a_combined_acl_group_grant
-cargo test --locked --no-default-features -p zerofs --lib db::permission_snapshot_tests
-cargo test --locked --no-default-features -p zerofs --lib opens_require_one_acl_entry_to_grant_the_complete_access_mode
-cargo test --locked --no-default-features -p zerofs --lib nfs::access_tests
+cargo test --locked --no-default-features -p zerofs --lib private_create_umask_is_applied_only_without_a_default_acl
+cargo test --locked --no-default-features -p zerofs --lib writeback_segment_retry
+cargo test --locked --no-default-features -p zerofs --lib degraded_local_pool_keeps_an_unused_sftp_member_deferred
+cargo test --locked -p ninep-client legacy_dialect_fallback_masks_private_create_mode_before_sending
+cargo test --locked -p ninep-client negotiated_umask_dialect_preserves_all_private_create_requests
 ```
+
+This is developer-profile correctness evidence, not a full Cargo test or Clippy run. No new mounted FUSE/kernel 9P qualification, NAS deployment, physical-disk qualification, or throughput measurement was performed. The larger SSD-budget mutation harness was not executed. The integration audit receipt records the separate WebUI/WASM production build and hosted checks.

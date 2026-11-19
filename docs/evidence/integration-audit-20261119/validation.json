@@ -1,0 +1,277 @@
+{
+  "repository": "ScriptedAlchemy/ZeroFS",
+  "integration_pr": 84,
+  "integration_branch": "integration/all-open-prs",
+  "source_prs": [
+    86,
+    87,
+    89
+  ],
+  "local_source_commit": "6c6846baa2929ba6372f23a1a468a226f6cfa43c",
+  "local_source_tree": "5fed08ddaf7f9ed2562918309a50d34d598d6908",
+  "ordinary_production_type_check": {
+    "exit_code": 0,
+    "seconds": 132.33625140699587,
+    "kind": "direct rustc production type-check; real crate root and full CLI; no whole-crate cfg(test), no default features; not Cargo build or Clippy",
+    "source_commit": "faaced5c3fb10ada906ac6618232097319e5448a",
+    "subsequent_changes": "Two cfg(test)-only files corrected in fea4f4d and one mkdir mode-normalization line in create.rs corrected in 6c6846b. Earlier ordinary CLI type-check is not claimed at final source; final combined native harness compiles and exercises the production correction."
+  },
+  "root_suites": {
+    "python_scripts": {
+      "log": "integration-python-tests-retry.log",
+      "log_sha256": "dae15b15960e5988d292b33318c5594dbfda2f05663fc37bf7c029375c6f53a8",
+      "passed": 406,
+      "environment_blocked": 0
+    },
+    "webui_unit": {
+      "log": "integration-webui-tests.log",
+      "log_sha256": "fc613f92c928be7324ffb752394f76e5633b70a34013e2f91370dceba0d9aa47",
+      "passed": 122,
+      "environment_blocked": 0
+    },
+    "kernel_permission": {
+      "log": "integration-kernel-permission-tests.log",
+      "log_sha256": "25d427bbee134a5df1a9fcc6c5e9b08f42d1ad808bb8d2b068b8b817236cb4ee",
+      "passed": 7,
+      "environment_blocked": 0
+    },
+    "proxmox": {
+      "log": "integration-proxmox-tests.log",
+      "log_sha256": "189674a25da5af9a17c7a296a60e32ae0e58c59bb9c78199024b96626d955c8f",
+      "passed": 180,
+      "environment_blocked": 1
+    },
+    "scope_comparison": {
+      "from": "ca34705e22dd9095d15a3975a48dd310286ea177",
+      "to_local_source": "6c6846baa2929ba6372f23a1a468a226f6cfa43c",
+      "changed_files_in_root_suite_directories": [
+        "scripts/acl_xattr_mount_e2e.py"
+      ],
+      "note": "Only the manually mounted ACL integration script changed; no Python unit suite imports it. That changed script received syntax validation and was not run on a mounted filesystem."
+    }
+  },
+  "webui_and_proxmox": {
+    "repository": "ScriptedAlchemy/ZeroFS",
+    "result": "passed",
+    "runner": {
+      "kind": "local Linux sandbox on shared host",
+      "architecture": "x86_64",
+      "native_compiler_emulation": false,
+      "build_target": "wasm32-unknown-unknown"
+    },
+    "tools": {
+      "rustc": "1.100.0 (0ef1bc386 2026-11-09)",
+      "wasm_bindgen": "0.2.126",
+      "node": "v24.22.3",
+      "npm": "11.9.0",
+      "vite": "8.0.3"
+    },
+    "source_manifest": "/workspace/scratch/6a20c267dc4e/final-webui-source-manifest.json",
+    "tracked_inputs_verified": 142,
+    "source_sha256": "3e241d0acfca50f694040430c88b5f3a740fc5914698ffc5a3162cb2f32ec839",
+    "dependencies": {
+      "node_modules": "/workspace/scratch/91322066c5c6/zerofs-pr84/webui/node_modules",
+      "package_lock_matches_worktree": true,
+      "package_lock_sha256": "c6dc84d5f6f1e2f722fd16bc4ca7c8b6d50f91b3ba5a052c97827e77f26e6582"
+    },
+    "stages": [
+      {
+        "name": "generate_grpc_typescript",
+        "cwd": "/workspace/scratch/6a20c267dc4e/pr87/webui",
+        "argv": [
+          "npm",
+          "run",
+          "generate"
+        ],
+        "exit_code": 0
+      },
+      {
+        "name": "compile_release_wasm",
+        "cwd": "/workspace/scratch/6a20c267dc4e/pr87/zerofs",
+        "environment": {
+          "CARGO_HOME": "/workspace/scratch/cea7f05042a1/rust/cargo",
+          "RUSTUP_HOME": "/workspace/scratch/cea7f05042a1/rust/rustup",
+          "CARGO_TARGET_DIR": "/workspace/scratch/91322066c5c6/wasm-target",
+          "CARGO_BUILD_JOBS": "1",
+          "CARGO_INCREMENTAL": "0",
+          "CARGO_PROFILE_RELEASE_DEBUG": "0",
+          "RUSTC": "/workspace/scratch/cea7f05042a1/rust/rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc"
+        },
+        "argv": [
+          "timeout",
+          "600s",
+          "/workspace/scratch/cea7f05042a1/rust/rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+          "build",
+          "--locked",
+          "--offline",
+          "--release",
+          "--target",
+          "wasm32-unknown-unknown",
+          "-p",
+          "zerofs-client-web"
+        ],
+        "exit_code": 0,
+        "cargo_duration_seconds": 127,
+        "profile": {
+          "optimized": true,
+          "lto": true,
+          "opt_level": 3,
+          "codegen_units": 1,
+          "strip": true
+        },
+        "log": "/workspace/scratch/6a20c267dc4e/final-webui-wasm-release.log"
+      },
+      {
+        "name": "generate_browser_bindings",
+        "cwd": "/workspace/scratch/6a20c267dc4e/pr87/webui",
+        "argv": [
+          "/workspace/scratch/91322066c5c6/wasm-tools/wasm-bindgen-0.2.126-x86_64-unknown-linux-musl/wasm-bindgen",
+          "/workspace/scratch/91322066c5c6/wasm-target/wasm32-unknown-unknown/release/zerofs_client_web.wasm",
+          "--target",
+          "web",
+          "--out-dir",
+          "/workspace/scratch/6a20c267dc4e/pr87/webui/src/generated/zerofs-client",
+          "--out-name",
+          "zerofs_client"
+        ],
+        "exit_code": 0,
+        "wasm_pack_equivalent_note": "wasm-pack binary unavailable; ran its release Cargo and wasm-bindgen stages directly. Package metadata explicitly sets wasm-opt=false."
+      },
+      {
+        "name": "instantiate_generated_wasm",
+        "cwd": "/workspace/scratch/6a20c267dc4e/pr87/webui",
+        "argv": [
+          "node",
+          "--input-type=module",
+          "-"
+        ],
+        "checks": [
+          "await init({module_or_path: fs.readFileSync(generated_wasm)}) succeeds",
+          "exports.memory instanceof WebAssembly.Memory",
+          "typeof Client.connect === function"
+        ],
+        "exit_code": 0,
+        "wasm_bytes": 606727,
+        "network_connections": 0,
+        "stdin_script": "import assert from 'node:assert/strict';\nimport fs from 'node:fs';\nimport init, { Client } from './src/generated/zerofs-client/zerofs_client.js';\nconst bytes = fs.readFileSync('./src/generated/zerofs-client/zerofs_client_bg.wasm');\nconst exports = await init({ module_or_path: bytes });\nassert.ok(exports.memory instanceof WebAssembly.Memory);\nassert.equal(typeof Client.connect, 'function');\nconsole.log(JSON.stringify({ wasm_module_initialized: true, client_connect_export: typeof Client.connect, wasm_bytes: bytes.length }));\n"
+      },
+      {
+        "name": "production_ui_build",
+        "cwd": "/workspace/scratch/6a20c267dc4e/pr87/webui",
+        "argv": [
+          "npm",
+          "run",
+          "build"
+        ],
+        "expanded_script": "tsc -b && vite build",
+        "exit_code": 0,
+        "vite_duration_seconds": 8.24,
+        "modules_transformed": 3865,
+        "log": "/workspace/scratch/6a20c267dc4e/final-webui-production-build.log"
+      }
+    ],
+    "artifact": {
+      "path": "/workspace/scratch/6a20c267dc4e/pr87/webui/dist/assets/zerofs_client_bg-CbUyRH5N.wasm",
+      "bytes": 606727,
+      "sha256": "f0e0029ef947415e1d4b1f5de9208cfc15ea6a3bfebf3f5707f33b52d6d7097d",
+      "identical_to_generated_wasm": true
+    },
+    "cleanup": {
+      "untracked_generated_binding_sources_removed": true,
+      "tracked_source_changes": false,
+      "source_worktree_clean": true,
+      "production_dist_retained_ignored": true,
+      "isolated_wasm_cache_retained": true,
+      "shared_server_cargo_target_used": false
+    },
+    "proxmox_validation": {
+      "suite_log": "/workspace/scratch/6a20c267dc4e/integration-proxmox-tests.log",
+      "tests_run": 181,
+      "passed": 180,
+      "environment_blocked": 1,
+      "blocked_test": "test_deploy.DeploymentLockTests.test_holder_death_before_start_ack_never_executes_payload",
+      "failure": "AssertionError: unexpectedly None : holder did not create a child",
+      "source_revision_checked": "ca34705e22dd9095d15a3975a48dd310286ea177",
+      "deploy_and_test_files_unchanged_from_main": true,
+      "minimal_environment_reproduction": {
+        "live_child_verified_using_proc_status_ppid": true,
+        "parent_task_children_path_exists": false,
+        "children_read_error": "FileNotFoundError (ENOENT)",
+        "children_entry_absent_from_task_directory": true
+      },
+      "production_holder_reproduction": {
+        "locked_handshake_received": true,
+        "started_handshake_received_with_child_pid": true,
+        "child_stat_state": "T",
+        "child_stat_ppid_matches_holder": true,
+        "owner_json_pgid_matches_child": true,
+        "payload_executed_before_ack": false,
+        "child_proc_exists_after_holder_kill": false,
+        "payload_executed_after_holder_death": false,
+        "production_cleanup_exit_code": 0,
+        "owned_runtime_removed": true
+      },
+      "scope": "Local temporary fixtures only; no deployment or network access; source and original test unchanged.",
+      "limitation": "Production probe waited for STARTED and validated pre-ACK guard; it is separate evidence, not a passing execution of the original proc-children-dependent test."
+    },
+    "local_source_commit": "faaced5c3fb10ada906ac6618232097319e5448a",
+    "local_source_tree": "08a58492a808978c57719b2c0732fe91773b747b",
+    "integration_source_inputs_reverified": true
+  },
+  "limitations": [
+    "No complete final-source Cargo test or Clippy pass is claimed by this local receipt.",
+    "No mounted FUSE/kernel 9P, physical-disk, production NAS, or throughput qualification was run.",
+    "Final-head hosted CI is separate.",
+    "The full-budget retry pre-fix executable was not run; no executed-before result is claimed."
+  ],
+  "ordinary_production_scope_followup": {
+    "typechecked_local_snapshot": "faaced5c3fb10ada906ac6618232097319e5448a",
+    "current_test_local_snapshot": "fea4f4d6253867ccd1900be534ccc35c94275f38",
+    "changed_source_files": [
+      "src/fs/ops/xattr/acl_tests.rs",
+      "src/ninep/handler/creation_gid_tests.rs"
+    ],
+    "all_changed_files_excluded_without_cfg_test": true,
+    "all_other_source_hashes_match": true,
+    "typecheck_rerun_needed": false,
+    "reason": "Only standalone modules gated by cfg(test) were corrected after the ordinary no-cfg(test) production check.",
+    "scope": "Historical followup through fea4f4d only; superseded for final-source equivalence by the one-line production correction in 6c6846b."
+  },
+  "published_source_commit": "5eb785217012678e67738475952490c95d1c2fb3",
+  "published_source_tree": "5fed08ddaf7f9ed2562918309a50d34d598d6908",
+  "published_source_tree_verified_identical_to_local": true,
+  "combined_native": {
+    "published_source_commit": "5eb785217012678e67738475952490c95d1c2fb3",
+    "local_source_commit": "6c6846baa2929ba6372f23a1a468a226f6cfa43c",
+    "source_tree": "5fed08ddaf7f9ed2562918309a50d34d598d6908",
+    "build": {
+      "stage": "build",
+      "exit_code": 0,
+      "seconds": 209.66962158100068
+    },
+    "tests_run": 131,
+    "passed": 131,
+    "failed": 0,
+    "runtime_seconds": 116.81788507006422,
+    "test_results_sha256": "4291525fd55ab96a8fc66235acfbd265035f6d344c15bcb5278b02b31f13c615",
+    "details": "../pr87-audit-current/integration-validation.json",
+    "scope": "Focused exact-source harness; selected checked-in test bodies and actual production algorithms, with documented test-fixture exposure. Not a full Cargo test or Clippy run."
+  },
+  "directory_mode_red_green": {
+    "before_local_source": "fea4f4d6253867ccd1900be534ccc35c94275f38",
+    "before_passed": 130,
+    "before_failed": 1,
+    "failed_selector": {
+      "selector": "ninep_private_create_umask_is_applied_only_without_a_default_acl",
+      "exit_code": 101,
+      "seconds": 0.06509402600204339
+    },
+    "after_result": {
+      "selector": "ninep_private_create_umask_is_applied_only_without_a_default_acl",
+      "exit_code": 0,
+      "seconds": 0.11820390899811173
+    },
+    "only_source_change": "zerofs/src/fs/ops/create.rs: SetMode::Set(m) => validate_mode(*m)",
+    "test_assertions_unchanged": true
+  }
+}
