@@ -56,6 +56,7 @@
 //! | 40     | 8       | value length (0 for delete)          |
 //! | 48     | 32      | SHA-256 of the value                 |
 //! | 80     | key len | key                                  |
+//! | 1104   | 8       | modification time, Unix nanoseconds  |
 //! | 4064   | 32      | SHA-256 of bytes 0..4064             |
 //!
 //! The nonce ties records to one provisioning, and the contiguous sequence
@@ -75,8 +76,9 @@ const LABEL_MAGIC: [u8; 8] = *b"ZFSRAWL1";
 const RECORD_MAGIC: [u8; 8] = *b"ZFSRAWR1";
 const CHECKSUM_AT: usize = BLOCK - 32;
 const KEY_AT: usize = 80;
+const MODIFIED_AT: usize = KEY_AT + MAX_KEY_LEN;
 
-const _: () = assert!(KEY_AT + MAX_KEY_LEN <= CHECKSUM_AT);
+const _: () = assert!(MODIFIED_AT + 8 <= CHECKSUM_AT);
 
 pub(crate) type Block = Box<[u8; BLOCK]>;
 
@@ -259,6 +261,9 @@ pub(crate) struct RecordHeader {
     pub key: Vec<u8>,
     pub value_len: u64,
     pub value_sha256: [u8; 32],
+    /// Wall-clock time of the append. Recorded, never validated: clocks may
+    /// step backwards between records.
+    pub modified_unix_nanos: u64,
 }
 
 impl RecordHeader {
@@ -278,6 +283,8 @@ impl RecordHeader {
         block[40..48].copy_from_slice(&self.value_len.to_le_bytes());
         block[48..80].copy_from_slice(&self.value_sha256);
         block[KEY_AT..KEY_AT + self.key.len()].copy_from_slice(&self.key);
+        block[MODIFIED_AT..MODIFIED_AT + 8]
+            .copy_from_slice(&self.modified_unix_nanos.to_le_bytes());
         seal(&mut block);
         block
     }
@@ -321,6 +328,7 @@ impl RecordHeader {
             key: block[KEY_AT..KEY_AT + key_len].to_vec(),
             value_len,
             value_sha256: array_at(block, 48),
+            modified_unix_nanos: u64_at(block, MODIFIED_AT),
         })
     }
 }
@@ -426,6 +434,7 @@ mod tests {
             key: b"objects/a".to_vec(),
             value_len: 5000,
             value_sha256: sha256(b"x"),
+            modified_unix_nanos: 1_700_000_000_123_456_789,
         };
         let nonce = [3; 16];
         let encoded = header.encode(&nonce);

@@ -1,3 +1,6 @@
+// Single-range slices and a deliberately reversed range exercise the API.
+#![allow(clippy::single_range_in_vec_init, clippy::reversed_empty_ranges)]
+
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
@@ -739,6 +742,7 @@ fn records_from_another_provisioning_are_rejected() {
         key: b"k".to_vec(),
         value_len: 0,
         value_sha256: sha256(&[]),
+        modified_unix_nanos: 0,
     };
     scratch.write_at(LOG_START, &foreign.encode(&[0x42; 16])[..]);
     let forged = Label {
@@ -830,6 +834,7 @@ fn oversized_record_length_in_a_header_is_corrupt() {
         key: b"old".to_vec(),
         value_len: u64::MAX,
         value_sha256: sha256(&[]),
+        modified_unix_nanos: 0,
     };
     scratch.write_at(LOG_START, &huge.encode(&label.nonce)[..]);
     assert!(matches!(
@@ -922,4 +927,119 @@ fn arguments_are_bounded() {
 fn store_is_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<RawStore>();
+}
+
+#[test]
+fn stat_and_handles_track_overwrites_and_survive_reopen() {
+    let scratch = Scratch::new(SIZE);
+    let mut store = provision(&scratch);
+    assert_eq!(store.stat(b"k"), None);
+    let first = value(1, 9000);
+    store.put(b"k", &first).unwrap();
+    let a = store.stat(b"k").unwrap();
+    assert_eq!((a.len, a.sha256, a.seq), (9000, sha256(&first), 1));
+    assert!(a.modified_unix_nanos > 1_600_000_000_000_000_000);
+    let old = store.handle(b"k").unwrap().unwrap();
+    let second = value(2, 10);
+    store.put(b"k", &second).unwrap();
+    let b = store.stat(b"k").unwrap();
+    assert_eq!((b.len, b.seq), (10, 2));
+    assert!(b.modified_unix_nanos >= a.modified_unix_nanos);
+    // The old handle still reads the old, immutable record.
+    let reader = store.reader();
+    assert_eq!(reader.read_ranges(&old, &[0..9000]).unwrap()[0], first);
+    store.flush().unwrap();
+    drop(store);
+    let store = reopen(&scratch);
+    assert_eq!(store.stat(b"k"), Some(b));
+    let listed: Vec<_> = store.objects().map(|(k, i)| (k.to_vec(), i)).collect();
+    assert_eq!(listed, vec![(b"k".to_vec(), b)]);
+}
+
+#[test]
+fn verified_range_reads_return_only_the_requested_bytes() {
+    let scratch = Scratch::new(SIZE);
+    let mut store = provision(&scratch);
+    // Spans more than one verify chunk.
+    let payload = value(7, (VERIFY_CHUNK as usize) + 5000);
+    store.put(b"big", &payload).unwrap();
+    store.put(b"empty", &[]).unwrap();
+    let handle = store.handle(b"big").unwrap().unwrap();
+    let len = payload.len() as u64;
+    let ranges = [
+        0..0,
+        0..10,
+        VERIFY_CHUNK - 3..VERIFY_CHUNK + 3,
+        len - 1..len,
+        5..len,
+    ];
+    let got = store.reader().read_ranges(&handle, &ranges).unwrap();
+    for (range, bytes) in ranges.iter().zip(&got) {
+        assert_eq!(bytes[..], payload[range.start as usize..range.end as usize]);
+    }
+    let empty = store.handle(b"empty").unwrap().unwrap();
+    assert_eq!(
+        store.reader().read_ranges(&empty, &[0..0]).unwrap(),
+        vec![Vec::<u8>::new()]
+    );
+    for bad in [len..len + 1, 4..3] {
+        assert!(matches!(
+            store.reader().read_ranges(&handle, &[bad]),
+            Err(Error::InvalidArgument(_))
+        ));
+    }
+    assert!(store.handle(b"missing").unwrap().is_none());
+}
+
+#[test]
+fn range_reads_verify_the_whole_payload_even_outside_the_range() {
+    let scratch = Scratch::new(SIZE);
+    let mut store = provision(&scratch);
+    let payload = value(3, 3 * 4096);
+    store.put(b"k", &payload).unwrap();
+    store.flush().unwrap();
+    let handle = store.handle(b"k").unwrap().unwrap();
+    // Damage the last payload block; ask only for the first bytes.
+    scratch.write_at(LOG_START + BLOCK_SIZE + 2 * 4096 + 7, &[0xFF]);
+    assert!(matches!(
+        store.reader().read_ranges(&handle, &[0..16]),
+        Err(Error::Corrupt { .. })
+    ));
+}
+
+#[test]
+fn costs_match_the_tail_advance_exactly() {
+    let scratch = Scratch::new(SIZE);
+    let mut store = provision(&scratch);
+    for len in [0usize, 1, 4095, 4096, 4097, 300_000] {
+        let before = store.geometry().tail;
+        store.put(b"k", &value(len as u64, len)).unwrap();
+        assert_eq!(
+            Some(store.geometry().tail - before),
+            RawStore::put_cost(len as u64),
+            "len {len}"
+        );
+    }
+    assert_eq!(RawStore::put_cost(u64::MAX), None);
+    assert_eq!(RawStore::put_cost(u64::MAX - BLOCK_SIZE), None);
+    assert_eq!(
+        RawStore::put_cost(u64::MAX - 2 * BLOCK_SIZE + 1),
+        Some(u64::MAX - BLOCK_SIZE + 1)
+    );
+    let before = store.geometry().tail;
+    assert!(store.delete(b"k").unwrap());
+    assert_eq!(store.geometry().tail - before, RawStore::delete_cost());
+}
+
+#[test]
+fn handles_are_refused_once_poisoned() {
+    let scratch = Scratch::new(SIZE);
+    let mut store = provision(&scratch);
+    store.put(b"k", b"v").unwrap();
+    store.flush().unwrap();
+    drop(store);
+    let mut store = RawStore::open(scratch.read_only(), SIZE, id()).unwrap();
+    assert!(store.handle(b"k").unwrap().is_some());
+    assert!(store.put(b"x", b"v").is_err());
+    assert!(matches!(store.handle(b"k"), Err(Error::Poisoned)));
 }

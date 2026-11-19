@@ -44,6 +44,8 @@
 
 #![cfg_attr(not(unix), allow(unused))]
 
+#[cfg(target_os = "linux")]
+pub mod claim;
 mod format;
 pub mod landing;
 pub mod p3;
@@ -53,7 +55,7 @@ mod store;
 use std::fmt;
 use std::io;
 
-pub use store::RawStore;
+pub use store::{ObjectHandle, ObjectInfo, RawReader, RawStore};
 
 /// Unit of every on-disk structure and of payload alignment. The device size
 /// must be an exact multiple of it.

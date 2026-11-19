@@ -5,6 +5,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
+use std::ops::Range;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::format::{
     BLOCK, Block, Kind, LABEL_SLOTS, LOG_START, Label, RecordHeader, SlotState, blocks_for,
@@ -16,12 +19,89 @@ use crate::{BLOCK_SIZE, Error, Geometry, Identity, MAX_KEY_LEN, MAX_OBJECT_LEN, 
 const SCAN_CHUNK: usize = 1 << 20;
 /// Appends up to this size go to the device as one write.
 const COALESCE_LIMIT: u64 = 256 << 10;
+/// Read size for verified range reads, which hash the whole payload.
+const VERIFY_CHUNK: u64 = 1 << 20;
 
 #[derive(Debug, Clone, Copy)]
 struct Entry {
     value_offset: u64,
-    value_len: u64,
-    value_sha256: [u8; 32],
+    info: ObjectInfo,
+}
+
+/// What the log records about one live object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectInfo {
+    /// Payload length in bytes.
+    pub len: u64,
+    /// SHA-256 of the whole payload.
+    pub sha256: [u8; 32],
+    /// Log sequence number of the put record. Unique within one provisioning
+    /// and strictly larger for every later append.
+    pub seq: u64,
+    /// Wall-clock time of the put, in Unix nanoseconds.
+    pub modified_unix_nanos: u64,
+}
+
+/// A live object located by [`RawStore::handle`], readable through a
+/// [`RawReader`] without holding the store. Log records are never rewritten
+/// while the store is open, so the handle stays valid after later overwrites
+/// or deletes of its key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectHandle {
+    value_offset: u64,
+    pub info: ObjectInfo,
+}
+
+/// Shares the store's device for checksum-verified reads that do not borrow
+/// the store. Only hand it handles from the store that created it.
+#[derive(Debug, Clone)]
+pub struct RawReader {
+    file: Arc<Region>,
+}
+
+impl RawReader {
+    /// Read `ranges` of the object, verifying the whole payload's SHA-256.
+    ///
+    /// The full payload is read in bounded chunks to check the digest, but
+    /// only the requested bytes are retained, so memory stays near the sum of
+    /// the ranges. Each range must lie within the object. Nothing is returned
+    /// unless the digest matches.
+    pub fn read_ranges(
+        &self,
+        handle: &ObjectHandle,
+        ranges: &[Range<u64>],
+    ) -> Result<Vec<Vec<u8>>> {
+        let len = handle.info.len;
+        if ranges.iter().any(|r| r.start > r.end || r.end > len) {
+            return Err(Error::InvalidArgument("range outside the object"));
+        }
+        let mut out: Vec<Vec<u8>> = ranges
+            .iter()
+            .map(|r| Vec::with_capacity((r.end - r.start) as usize))
+            .collect();
+        let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+        let mut buf = vec![0u8; VERIFY_CHUNK.min(len) as usize];
+        let mut at = 0u64;
+        while at < len {
+            let n = VERIFY_CHUNK.min(len - at);
+            let chunk = &mut buf[..n as usize];
+            self.file.read_exact_at(chunk, handle.value_offset + at)?;
+            sha2::Digest::update(&mut hasher, &*chunk);
+            for (range, dest) in ranges.iter().zip(out.iter_mut()) {
+                let start = range.start.max(at);
+                let end = range.end.min(at + n);
+                if start < end {
+                    dest.extend_from_slice(&chunk[(start - at) as usize..(end - at) as usize]);
+                }
+            }
+            at += n;
+        }
+        let digest: [u8; 32] = sha2::Digest::finalize(hasher).into();
+        if digest != handle.info.sha256 {
+            return Err(corrupt(handle.value_offset, "payload checksum mismatch"));
+        }
+        Ok(out)
+    }
 }
 
 /// A durable key/value object store over one claimed device.
@@ -29,7 +109,7 @@ struct Entry {
 /// `get` takes `&self` and may run concurrently from several threads. Appends
 /// and `flush` take `&mut self`. Dropping the store does not flush.
 pub struct RawStore {
-    file: Region,
+    file: Arc<Region>,
     /// The last durable checkpoint.
     label: Label,
     /// One label slot is damaged, blank, or behind; the next flush rewrites
@@ -90,7 +170,7 @@ impl RawStore {
         write_checkpoint(&file, &label)?;
 
         Ok(Self {
-            file,
+            file: Arc::new(file),
             label,
             label_degraded: false,
             tail: LOG_START,
@@ -158,7 +238,7 @@ impl RawStore {
         }
 
         Ok(Self {
-            file,
+            file: Arc::new(file),
             tail: label.durable_tail,
             label,
             label_degraded,
@@ -182,6 +262,7 @@ impl RawStore {
             key: key.to_vec(),
             value_len: value.len() as u64,
             value_sha256: sha256(value),
+            modified_unix_nanos: now_unix_nanos(),
         };
         let span = self.reserve(&header)?;
         let at = self.tail;
@@ -209,6 +290,7 @@ impl RawStore {
             key: key.to_vec(),
             value_len: 0,
             value_sha256: sha256(&[]),
+            modified_unix_nanos: now_unix_nanos(),
         };
         let span = self.reserve(&header)?;
         let at = self.tail;
@@ -255,6 +337,52 @@ impl RawStore {
             return Ok(None);
         };
         self.read_verified(entry).map(Some)
+    }
+
+    /// Metadata of the live object under `key`, without reading its payload.
+    pub fn stat(&self, key: &[u8]) -> Option<ObjectInfo> {
+        self.index.get(key).map(|entry| entry.info)
+    }
+
+    /// Every live object and its metadata, in no particular order.
+    pub fn objects(&self) -> impl Iterator<Item = (&[u8], ObjectInfo)> {
+        self.index
+            .iter()
+            .map(|(key, entry)| (key.as_slice(), entry.info))
+    }
+
+    /// Locate the live object under `key` for reading through a [`RawReader`].
+    pub fn handle(&self, key: &[u8]) -> Result<Option<ObjectHandle>> {
+        if self.poisoned {
+            return Err(Error::Poisoned);
+        }
+        Ok(self.index.get(key).map(|entry| ObjectHandle {
+            value_offset: entry.value_offset,
+            info: entry.info,
+        }))
+    }
+
+    /// A reader sharing this store's device. See [`RawReader`].
+    pub fn reader(&self) -> RawReader {
+        RawReader {
+            file: Arc::clone(&self.file),
+        }
+    }
+
+    /// Exact log bytes a put of a `value_len`-byte value appends: one header
+    /// block plus the value rounded up to whole blocks. `None` when that does
+    /// not fit in a `u64`; such a value is refused long before by
+    /// [`crate::MAX_OBJECT_LEN`], but the arithmetic never wraps.
+    pub const fn put_cost(value_len: u64) -> Option<u64> {
+        match value_len.div_ceil(BLOCK_SIZE).checked_mul(BLOCK_SIZE) {
+            Some(payload) => payload.checked_add(BLOCK_SIZE),
+            None => None,
+        }
+    }
+
+    /// Exact log bytes a delete appends. Deletes never reclaim space.
+    pub const fn delete_cost() -> u64 {
+        BLOCK_SIZE
     }
 
     /// Read and verify every live object. Returns how many were checked.
@@ -365,9 +493,9 @@ impl RawStore {
     }
 
     fn read_verified(&self, entry: &Entry) -> Result<Vec<u8>> {
-        let mut value = vec![0u8; entry.value_len as usize];
+        let mut value = vec![0u8; entry.info.len as usize];
         self.file.read_exact_at(&mut value, entry.value_offset)?;
-        if sha256(&value) != entry.value_sha256 {
+        if sha256(&value) != entry.info.sha256 {
             return Err(corrupt(entry.value_offset, "payload checksum mismatch"));
         }
         Ok(value)
@@ -398,8 +526,12 @@ fn apply(index: &mut HashMap<Vec<u8>, Entry>, at: u64, header: RecordHeader) {
                 header.key,
                 Entry {
                     value_offset: at + BLOCK_SIZE,
-                    value_len: header.value_len,
-                    value_sha256: header.value_sha256,
+                    info: ObjectInfo {
+                        len: header.value_len,
+                        sha256: header.value_sha256,
+                        seq: header.seq,
+                        modified_unix_nanos: header.modified_unix_nanos,
+                    },
                 },
             );
         }
@@ -507,6 +639,14 @@ fn first_nonzero(file: &Region, device_size: u64) -> Result<Option<u64>> {
         offset += len as u64;
     }
     Ok(None)
+}
+
+fn now_unix_nanos() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+        })
 }
 
 fn random_nonce() -> Result<[u8; 16]> {
