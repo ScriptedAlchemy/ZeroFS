@@ -594,6 +594,7 @@ impl NinePHandler {
         let slot = match state.fids.entry(newfid) {
             Entry::Vacant(entry) => entry.insert(FidSlot::unopened(fid)),
             Entry::Occupied(_) if newfid != replace_fid => return Err(P9Error::FidInUse),
+            Entry::Occupied(entry) if entry.get().xattr.is_some() => return Err(P9Error::BadFid),
             Entry::Occupied(entry) if entry.get().fid.opened => {
                 return Err(P9Error::FidAlreadyOpen);
             }
@@ -1696,6 +1697,12 @@ impl NinePHandler {
             let mut state = self.session_for_update()?;
             match state.fids.get_mut(&tl.fid) {
                 Some(slot) => {
+                    // A concurrent walk and xattrcreate may have converted
+                    // this number while the inode lock was awaited. Never
+                    // attach an ordinary inode to that staged attribute.
+                    if slot.xattr.is_some() {
+                        return Err(P9Error::BadFid);
+                    }
                     // Publish the exact fid snapshot whose inode and
                     // credentials were authorized. A racing in-place walk may
                     // have replaced the table entry while the inode lock was
@@ -2036,6 +2043,9 @@ impl NinePHandler {
             }
             let mut state = self.session_for_update()?;
             let slot = state.fids.get_mut(&tc.fid).ok_or(P9Error::BadFid)?;
+            if slot.xattr.is_some() {
+                return Err(P9Error::BadFid);
+            }
             // Serialize racing creates under the session lock.
             if slot.fid.opened {
                 return Err(P9Error::FidAlreadyOpen);
@@ -3509,6 +3519,126 @@ mod tests {
         assert_eq!(final_fid.qid.path, 0);
         assert_eq!(fs.open_handle_count(0), 1);
         assert_eq!(fs.open_handle_count(replacement_id), 0);
+    }
+
+    #[tokio::test]
+    async fn ordinary_open_publication_cannot_retarget_a_staged_xattr() {
+        for opening in [
+            Message::Tlopen(Tlopen {
+                fid: 1,
+                flags: O_RDONLY as u32,
+            }),
+            Message::Tlopenat(Tlopenat {
+                fid: 1,
+                newfid: 1,
+                flags: O_RDONLY as u32,
+            }),
+            Message::Tlopenatread(Tlopenatread {
+                fid: 1,
+                newfid: 1,
+                flags: O_RDONLY as u32,
+                count: 1,
+            }),
+            Message::Tlcreate(Tlcreate {
+                fid: 1,
+                name: P9String::new(b"created".to_vec()),
+                flags: O_RDWR as u32,
+                mode: 0o600,
+                gid: 0,
+            }),
+            Message::Tlcreateattr(Tlcreateattr {
+                dfid: 1,
+                newfid: 1,
+                name: P9String::new(b"created".to_vec()),
+                flags: O_RDWR as u32,
+                mode: 0o600,
+                gid: 0,
+            }),
+        ] {
+            let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+            let root_creds = Credentials {
+                uid: 0,
+                ..test_creds()
+            };
+            let (target, _) = fs
+                .create(&test_creds(), 0, b"target", &SetAttributes::default())
+                .await
+                .unwrap();
+            let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()))
+                .with_credential_override(0, 0);
+            start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+
+            // Suspend publication after the operation snapshots the root fid.
+            // The same numeric fid becomes an xattr on a different inode
+            // before that old ordinary open/create resumes.
+            let root_guard = fs.lock_manager.acquire(0).await;
+            let mut opening = Box::pin(request(&handler, 2, opening));
+            assert!(futures::poll!(opening.as_mut()).is_pending());
+            expect_walk(&handler, 3, 1, 1, &[b"target"]).await;
+            assert!(matches!(
+                request(
+                    &handler,
+                    4,
+                    Message::Txattrcreate(Txattrcreate {
+                        fid: 1,
+                        name: P9String::new(b"user.race".to_vec()),
+                        size: 1,
+                        flags: 0,
+                    })
+                )
+                .await
+                .body,
+                Message::Rxattrcreate(_)
+            ));
+            assert!(matches!(
+                request(
+                    &handler,
+                    5,
+                    Message::Twrite(Twrite {
+                        fid: 1,
+                        offset: 0,
+                        count: 1,
+                        data: Bytes::from_static(b"x").into(),
+                    })
+                )
+                .await
+                .body,
+                Message::Rwrite(_)
+            ));
+            drop(root_guard);
+            assert_eq!(errno(&opening.await), Some(P9Error::BadFid.to_errno()));
+            {
+                let state = handler.session_state();
+                let slot = state.fids.get(&1).unwrap();
+                assert_eq!(slot.fid.inode_id, target);
+                assert!(!slot.fid.opened);
+                assert!(matches!(&slot.xattr, Some(XattrFid::Write { .. })));
+            }
+            assert!(matches!(
+                request(&handler, 6, Message::Tclunk(Tclunk { fid: 1 }))
+                    .await
+                    .body,
+                Message::Rclunk(_)
+            ));
+            let name = crate::fs::XattrName::new(b"user.race").unwrap();
+            assert_eq!(
+                fs.get_xattr(&root_creds, target, &name).await.unwrap(),
+                b"x"[..]
+            );
+            assert_eq!(
+                fs.get_xattr(&root_creds, 0, &name).await,
+                Err(FsError::NoData)
+            );
+            if let Ok(created) = fs.lookup(&test_creds(), 0, b"created").await {
+                assert_eq!(
+                    fs.get_xattr(&root_creds, created, &name).await,
+                    Err(FsError::NoData)
+                );
+                assert_eq!(fs.open_handle_count(created), 0);
+            }
+            assert_eq!(fs.open_handle_count(target), 0);
+            assert_eq!(fs.open_handle_count(0), 0);
+        }
     }
 
     #[tokio::test]
