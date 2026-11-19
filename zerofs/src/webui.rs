@@ -637,7 +637,16 @@ async fn upload_resolve_existing_entry(
     for component in dirs {
         dir = fs.lookup(creds, dir, component).await?;
     }
+    // The cookie lookup itself is internal and does not authorize pathname
+    // traversal. Hold the parent lock while checking its search permission
+    // and reading the final entry identity so chmod or replacement cannot
+    // separate that authorization from the identity retained by the caller.
+    let _parent_guard = fs.lock_manager.acquire(dir).await;
+    let expected = fs.lookup(creds, dir, &name[0]).await?;
     let (file, cookie) = fs.entry_identity(dir, &name[0]).await?;
+    if file != expected {
+        return Err(FsError::StaleHandle);
+    }
     Ok((dir, file, cookie))
 }
 
@@ -1850,6 +1859,203 @@ mod tests {
             write!(hex, "{byte:02x}").unwrap();
         }
         hex
+    }
+
+    async fn upload_private_source_fixture() -> (Arc<ZeroFS>, Router, InodeId, InodeId) {
+        use crate::fs::types::SetMode;
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let auth = AuthContext::default();
+        let creds = Credentials::from_auth_context(&auth);
+        let private = filesystem
+            .mkdir(
+                &creds,
+                0,
+                b"private",
+                &SetAttributes {
+                    mode: SetMode::Set(0o700),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .0;
+        let secret = filesystem
+            .create(
+                &creds,
+                private,
+                b"secret",
+                &SetAttributes {
+                    mode: SetMode::Set(0o644),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .0;
+        filesystem
+            .write(
+                &auth,
+                secret,
+                0,
+                &bytes::Bytes::from_static(b"private payload"),
+            )
+            .await
+            .unwrap();
+        let app = Router::new().merge(upload_router()).with_state(AppState {
+            filesystem: Arc::clone(&filesystem),
+            lock_manager: Arc::new(FileLockManager::new()),
+            uid: 1000,
+            gid: 1000,
+            shutdown: CancellationToken::new(),
+            ws_drain: TaskTracker::new(),
+            accepted_work: P9AcceptedWorkTracker::new(),
+            p9_idle_timeout: None,
+            upload_write_permits: upload_write_permits(),
+            upload_ingress: upload_ingress(),
+            writeback: None,
+        });
+        (filesystem, app, private, secret)
+    }
+
+    #[tokio::test]
+    async fn upload_status_requires_parent_search_but_not_file_read_access() {
+        use crate::fs::types::SetMode;
+        let (filesystem, app, private, secret) = upload_private_source_fixture().await;
+        let (status, body) = upload_request(
+            &app,
+            "GET",
+            "/api/v1/upload/private/secret/status",
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+        // Status exposes ordinary path metadata: parent search is required,
+        // while reading the file's contents is a separate permission.
+        let creds = Credentials::from_auth_context(&AuthContext::default());
+        for (inode, mode) in [(private, 0o711), (secret, 0)] {
+            filesystem
+                .setattr(
+                    &creds,
+                    inode,
+                    &SetAttributes {
+                        mode: SetMode::Set(mode),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let (status, body) = upload_request(
+            &app,
+            "GET",
+            "/api/v1/upload/private/secret/status",
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["size"], b"private payload".len() as u64);
+    }
+
+    #[tokio::test]
+    async fn upload_assembly_rejects_sources_inside_unsearchable_directories() {
+        use crate::fs::types::{SetGid, SetMode, SetUid};
+        let (filesystem, app, private, secret) = upload_private_source_fixture().await;
+        let auth = AuthContext::default();
+        let creds = Credentials::from_auth_context(&auth);
+        let public = filesystem
+            .mkdir(
+                &creds,
+                0,
+                b"public",
+                &SetAttributes {
+                    mode: SetMode::Set(0o777),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .0;
+        let target = filesystem
+            .create(
+                &creds,
+                public,
+                b"target",
+                &SetAttributes {
+                    mode: SetMode::Set(0o600),
+                    uid: SetUid::Set(1000),
+                    gid: SetGid::Set(1000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .0;
+        filesystem
+            .write(
+                &auth,
+                target,
+                0,
+                &bytes::Bytes::from_static(b"keep this staging file"),
+            )
+            .await
+            .unwrap();
+        let commit = serde_json::json!({
+            "size": b"private payload".len(),
+            "sha256": sha256_hex(b"private payload"),
+            "assemble_from": ["/private/secret"],
+        });
+        let (status, body) = upload_request(
+            &app,
+            "POST",
+            "/api/v1/upload/public/target/commit",
+            serde_json::to_vec(&commit).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(
+            filesystem
+                .read_file(&auth, target, 0, 1024)
+                .await
+                .unwrap()
+                .0
+                .as_ref(),
+            b"keep this staging file"
+        );
+        assert_eq!(
+            filesystem.lookup(&creds, private, b"secret").await,
+            Ok(secret)
+        );
+
+        filesystem
+            .setattr(
+                &creds,
+                private,
+                &SetAttributes {
+                    mode: SetMode::Set(0o711),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let (status, body) = upload_request(
+            &app,
+            "POST",
+            "/api/v1/upload/public/target/commit",
+            serde_json::to_vec(&commit).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["verified"], true);
+        assert_eq!(
+            filesystem
+                .read_file(&auth, target, 0, 1024)
+                .await
+                .unwrap()
+                .0
+                .as_ref(),
+            b"private payload"
+        );
     }
 
     #[tokio::test]
