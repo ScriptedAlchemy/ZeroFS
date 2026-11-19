@@ -3149,6 +3149,18 @@ async fn writeback_replays_segment_to_persisted_member_before_any_pool_put() {
 
     let fixture = Fixture::new(1024);
     let pool = fixture.initialize().await;
+    let occupying_key = segment(708);
+    let mut occupying_options = create_options();
+    occupying_options
+        .extensions
+        .insert(SegmentTarget("hdd-b".into()));
+    pool.put_opts(
+        &occupying_key,
+        Bytes::from(vec![0; 1024]).into(),
+        occupying_options,
+    )
+    .await
+    .unwrap();
     let settings = WritebackSettings {
         dir: fixture.catalog.path().canonicalize().unwrap().join("dirty"),
         ack_mode: AckMode::Memory,
@@ -3204,7 +3216,7 @@ async fn writeback_replays_segment_to_persisted_member_before_any_pool_put() {
         .wait_local_through_accepted()
         .await
         .unwrap();
-    assert!(pool.placements().await.unwrap().is_empty());
+    assert_eq!(pool.placements().await.unwrap().len(), 1);
     attached.lifecycle.shutdown().await.unwrap();
     drop(attached);
     pool.settle().await;
@@ -3219,8 +3231,27 @@ async fn writeback_replays_segment_to_persisted_member_before_any_pool_put() {
     )
     .await
     .unwrap();
-    assert!(pool.placements().await.unwrap().is_empty());
+    assert_eq!(pool.placements().await.unwrap().len(), 1);
     replay.lifecycle.activate_remote().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = replay.lifecycle.status().unwrap();
+            assert_eq!(status.local_seq, 1);
+            assert_eq!(status.remote_seq, 0);
+            if status.retries > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("full target must retain journal debt instead of spilling");
+    assert_eq!(pool.placements().await.unwrap().len(), 1);
+    assert_eq!(
+        replay.store.get(&key).await.unwrap().bytes().await.unwrap(),
+        body
+    );
+    pool.delete(&occupying_key).await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), replay.lifecycle.wait_remote(1))
         .await
         .unwrap()
