@@ -1585,6 +1585,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_volatile_write_preserves_metadata_and_replay() {
+        use crate::fs::types::{InodeWithId, SetAttributes, SetMode, SetTime, Timestamp};
+
+        let mut fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.write_ack = volatile_settings();
+        let fs = Arc::new(fs);
+        fs.install_volatile_overlay();
+        let owner = crate::fs::types::AuthContext::from(&test_creds());
+        let file = fs
+            .create_exclusive(&owner, 0, b"empty-write")
+            .await
+            .unwrap();
+        fs.write(&owner, file, 0, &Bytes::from_static(b"seed"))
+            .await
+            .unwrap();
+        let before = fs
+            .setattr(
+                &test_creds(),
+                file,
+                &SetAttributes {
+                    mode: SetMode::Set(0o6777),
+                    atime: SetTime::SetToClientTime(Timestamp {
+                        seconds: 1,
+                        nanoseconds: 2,
+                    }),
+                    mtime: SetTime::SetToClientTime(Timestamp {
+                        seconds: 3,
+                        nanoseconds: 4,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let writer = AuthContext {
+            uid: owner.uid + 1,
+            ..owner.clone()
+        };
+        let before_attrs = bincode::serialize(&before).unwrap();
+        let quota = (fs.quota.committed_bytes(), fs.quota.pending_bytes());
+        let writes = fs.stats.write_operations.load(Ordering::Relaxed);
+        let cutoff = fs.capture_mutation_cutoff();
+        let release = fs
+            .materializer
+            .get()
+            .unwrap()
+            .hold_inode_lane_for_test(file)
+            .await;
+        let empty = Bytes::new();
+        let request = || IdentifiedWrite {
+            auth: &writer,
+            id: file,
+            offset: u64::MAX,
+            data: &empty,
+            op_id: [0x34; 16],
+            check_permissions: true,
+            identity: RequestIdentity::NineP {
+                origin_epoch: 1,
+                operation_id: [0x34; 16],
+            },
+            request_lifetime: RequestLifetime::CanonicalDedup,
+            fingerprint_context: &[],
+        };
+        let receipt = fs.write_ack_identified(request()).await.unwrap();
+        assert_eq!(bincode::serialize(&receipt.attrs).unwrap(), before_attrs);
+        assert_eq!(receipt.cutoff.sequence, cutoff.sequence + 1);
+        assert_eq!(fs.overlay_visible_size(file, before.size), before.size);
+        let inode = fs.visible_inode(file).await.unwrap();
+        let visible: FileAttributes = InodeWithId {
+            inode: &inode,
+            id: file,
+        }
+        .into();
+        assert_eq!(bincode::serialize(&visible).unwrap(), before_attrs);
+        assert_eq!(
+            fs.read_file(&owner, file, 0, 16).await.unwrap().0.as_ref(),
+            b"seed"
+        );
+        assert_eq!(
+            (fs.quota.committed_bytes(), fs.quota.pending_bytes()),
+            quota
+        );
+        assert_eq!(fs.volatile_budget().unwrap().status().dirty_bytes, 0);
+        assert_eq!(fs.volatile_budget().unwrap().status().dirty_operations, 1);
+        let replay = fs.write_ack_identified(request()).await.unwrap();
+        assert_eq!(bincode::serialize(&replay.attrs).unwrap(), before_attrs);
+        assert_eq!(replay.cutoff, receipt.cutoff);
+        let mut materialized = Box::pin(fs.materialize_through_cutoff(receipt.cutoff));
+        assert!(futures::poll!(materialized.as_mut()).is_pending());
+
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), materialized)
+            .await
+            .unwrap()
+            .unwrap();
+        fs.quiesce_overlay_inode(file).await.unwrap();
+        assert_eq!(fs.stats.write_operations.load(Ordering::Relaxed), writes);
+        assert_eq!(
+            (fs.quota.committed_bytes(), fs.quota.pending_bytes()),
+            quota
+        );
+        assert_eq!(fs.volatile_budget().unwrap().status().dirty_operations, 0);
+        let after = fs.inode_store.get(file).await.unwrap();
+        let after: FileAttributes = InodeWithId {
+            inode: &after,
+            id: file,
+        }
+        .into();
+        assert_eq!(bincode::serialize(&after).unwrap(), before_attrs);
+
+        // Replaying the zero-byte operation after an append must preserve its
+        // original reply without shrinking or touching the newer contents.
+        fs.write_ack(&owner, file, before.size, &Bytes::from_static(b"+tail"))
+            .await
+            .unwrap();
+        fs.quiesce_overlay_inode(file).await.unwrap();
+        let replay = fs.write_ack_identified(request()).await.unwrap();
+        assert_eq!(bincode::serialize(&replay.attrs).unwrap(), before_attrs);
+        assert_eq!(
+            fs.read_file(&owner, file, 0, 16).await.unwrap().0.as_ref(),
+            b"seed+tail",
+        );
+        assert_eq!(fs.quota.committed_bytes(), 9);
+        assert_eq!(fs.quota.pending_bytes(), 0);
+    }
+
+    #[tokio::test]
     async fn write_metadata_projection_preserves_newer_canonical_atime() {
         use crate::fs::types::{InodeWithId, Timestamp};
 

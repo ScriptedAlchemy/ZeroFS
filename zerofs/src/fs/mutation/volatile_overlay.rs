@@ -568,7 +568,7 @@ impl VolatileWriteRuntime {
         if admission.permit.bytes != data.len() as u64 {
             return Err(OverlayError::InvalidArgument);
         }
-        if data.is_empty() || offset.checked_add(data.len() as u64).is_none() {
+        if offset.checked_add(data.len() as u64).is_none() {
             return Err(OverlayError::InvalidArgument);
         }
         if self.budget.is_terminal() {
@@ -653,6 +653,8 @@ impl VolatileWriteRuntime {
     pub(crate) fn dirty_end(&self) -> u64 {
         self.snapshot()
             .iter()
+            // Empty writes keep their ordering without extending the file.
+            .filter(|entry| !entry.data.is_empty())
             .map(|entry| entry.offset.saturating_add(entry.data.len() as u64))
             .max()
             .unwrap_or(0)
@@ -1116,12 +1118,6 @@ mod tests {
         let budget = VolatileBudget::new(4096, 16);
         let runtime = VolatileWriteRuntime::new(Arc::clone(&budget), 7, materialize);
 
-        let empty = runtime.reserve(0).await.unwrap();
-        let result = runtime.accept_write(empty, 0, Bytes::new()).await;
-        assert!(matches!(result, Err(super::OverlayError::InvalidArgument)));
-        assert_eq!(runtime.accepted_cutoff(), 0);
-        assert_eq!(budget.used_bytes(), 0);
-
         let overflowing = runtime.reserve(4).await.unwrap();
         let result = runtime
             .accept_write(overflowing, u64::MAX - 1, Bytes::from_static(b"tiny"))
@@ -1137,6 +1133,44 @@ mod tests {
         assert!(matches!(result, Err(super::OverlayError::InvalidArgument)));
         assert_eq!(runtime.accepted_cutoff(), 0);
         assert_eq!(budget.used_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_write_keeps_cutoff_without_dirty_data() {
+        let budget = VolatileBudget::new(0, 1);
+        let runtime = VolatileWriteRuntime::new_state_only(Arc::clone(&budget), 7, 0, None);
+        let admission = runtime.reserve(0).await.unwrap();
+        let sequence = runtime
+            .accept_staged_write_enqueued(
+                admission,
+                u64::MAX,
+                Bytes::new(),
+                super::WriteVisibility::published(),
+                |_| Ok(()),
+            )
+            .expect("a zero-length write is a valid ordered no-op");
+        assert_eq!(sequence, 1);
+        assert_eq!(runtime.accepted_cutoff(), sequence);
+        assert_eq!(runtime.dirty_end(), 0, "an empty range never extends EOF");
+        assert_eq!(budget.status().dirty_bytes, 0);
+        assert_eq!(budget.status().dirty_operations, 1);
+        let mut next_admission = Box::pin(runtime.reserve(0));
+        assert!(futures::poll!(next_admission.as_mut()).is_pending());
+        assert_eq!(
+            runtime
+                .read(0, 4, || async { Ok(Bytes::from_static(b"base")) }.boxed())
+                .await
+                .unwrap(),
+            Bytes::from_static(b"base"),
+        );
+
+        runtime.complete(sequence).await;
+        runtime.wait_materialized(sequence).await.unwrap();
+        assert_eq!(budget.status().dirty_bytes, 0);
+        assert_eq!(budget.status().dirty_operations, 0);
+        drop(next_admission.await.unwrap());
+        assert_eq!(budget.status().dirty_operations, 0);
+        assert!(runtime.is_reapable());
     }
 
     #[tokio::test]

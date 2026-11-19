@@ -426,6 +426,63 @@ async fn assert_stable_write_waits(requested_stability: stable_how, xid: u32) {
 }
 
 #[tokio::test]
+async fn volatile_empty_writes_preserve_attributes_and_stability() {
+    let (fs, adapter, file) = volatile_adapter(b"empty-write").await;
+    let auth = nfs_auth(1000);
+    let before = adapter.write(&auth, file, 0, b"payload").await.unwrap();
+    fs.quiesce_overlay_inode(file).await.unwrap();
+
+    let assert_unchanged = |attributes: fattr3| {
+        assert_eq!(attributes.size, before.size);
+        assert_eq!(attributes.used, before.used);
+        assert_eq!(attributes.mode, before.mode);
+        assert_eq!(attributes.mtime.seconds, before.mtime.seconds);
+        assert_eq!(attributes.mtime.nseconds, before.mtime.nseconds);
+        assert_eq!(attributes.ctime.seconds, before.ctime.seconds);
+        assert_eq!(attributes.ctime.nseconds, before.ctime.nseconds);
+    };
+    assert_unchanged(
+        adapter
+            .write(&auth, file, u64::MAX, b"")
+            .await
+            .expect("a zero-byte NFS write is a successful no-op"),
+    );
+    for (xid, requested) in [
+        (900, stable_how::UNSTABLE),
+        (901, stable_how::DATA_SYNC),
+        (902, stable_how::FILE_SYNC),
+    ] {
+        let context = write_context(xid, 99, requested);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            adapter.write_with_context(&context, &auth, file, u64::MAX, b""),
+        )
+        .await
+        .expect("zero-byte NFS write did not settle")
+        .expect("zero-byte contextual NFS write failed");
+        assert_unchanged(result.attributes);
+        assert_eq!(
+            result.committed,
+            if requested == stable_how::UNSTABLE {
+                stable_how::UNSTABLE
+            } else {
+                stable_how::FILE_SYNC
+            }
+        );
+        assert_eq!(result.verifier, adapter.get_write_verf());
+        let replay = adapter
+            .write_with_context(&context, &auth, file, u64::MAX, b"")
+            .await
+            .expect("zero-byte NFS retry failed");
+        assert_unchanged(replay.attributes);
+        assert_eq!(replay.committed, result.committed);
+        assert_eq!(replay.verifier, result.verifier);
+    }
+    fs.quiesce_overlay_inode(file).await.unwrap();
+    assert_eq!(adapter.read(&auth, file, 0, 7).await.unwrap().0, b"payload");
+}
+
+#[tokio::test]
 async fn unstable_write_returns_without_explicit_barrier() {
     let (fs, adapter, file) = volatile_adapter(b"unstable-write").await;
     let (entered, _release) = blocking_local_barrier(&fs);
