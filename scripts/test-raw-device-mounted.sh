@@ -39,16 +39,12 @@ if [[ $suite == spark ]]; then
         echo 'Spark gx10-6a8d arm64 with its default local Docker socket and at least 48 GiB required' >&2
         exit 1
     fi
-    gib=44
+    memory=44g
+    memory_bytes=$((44 * 1024 ** 3))
     if [[ $mode == nas-fit ]]; then
-        gib=${RAW_MOUNTED_NAS_GIB:-10}
-        if [[ $gib != 10 && $gib != 12 ]]; then
-            echo 'The Spark NAS-fit cgroup must be 10 or 12 GiB' >&2
-            exit 2
-        fi
+        memory=7504m
+        memory_bytes=$((7504 * 1024 ** 2))
     fi
-    memory="${gib}g"
-    memory_bytes=$((gib * 1024 ** 3))
     platform=linux/arm64
     # Spark's docker-default AppArmor profile denies the FUSE mount syscall.
     security=(--security-opt apparmor=unconfined)
