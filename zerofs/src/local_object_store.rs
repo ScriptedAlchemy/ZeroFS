@@ -132,9 +132,7 @@ fn lock_parents(paths: &[PathBuf]) -> Result<Vec<File>> {
         let parent = std::fs::canonicalize(parent).map_err(generic)?;
         // Sync the ancestry too. Another process can have created a directory
         // without yet syncing its parent; existence alone is not durability.
-        for directory in parent.ancestors() {
-            sync_directory(directory)?;
-        }
+        sync_ancestry(&parent)?;
         parents.push(parent);
     }
     parents.sort();
@@ -150,11 +148,92 @@ fn lock_parents(paths: &[PathBuf]) -> Result<Vec<File>> {
             .open(parent.join(LOCK_FILE))
             .map_err(generic)?;
         FileExt::lock_exclusive(&lock).map_err(generic)?;
-        lock.sync_all().map_err(generic)?;
-        sync_directory(&parent)?;
+        // The lock file never changes after creation. Once this process has
+        // synced it and its directory entry, repeating both only issues device
+        // cache flushes for every object written.
+        let key = inode_key(&lock.metadata().map_err(generic)?);
+        let known = key.is_some_and(|key| {
+            durable_entries()
+                .lock()
+                .expect("durable entry set")
+                .contains(&key)
+        });
+        if !known {
+            lock.sync_all().map_err(generic)?;
+            sync_directory(&parent)?;
+            if let Some(key) = key {
+                durable_entries().lock().expect("durable entry set").insert(key);
+            }
+        }
         locks.push(lock);
     }
     Ok(locks)
+}
+
+type EntryKey = (u64, u64, std::time::SystemTime);
+
+/// Inodes whose directory entry this process has made durable. Keys are device,
+/// inode number and birth time, so a removed and recreated directory or lock
+/// file is synced again even when the filesystem reuses its inode number.
+fn durable_entries() -> &'static std::sync::Mutex<std::collections::HashSet<EntryKey>> {
+    static ENTRIES: OnceLock<std::sync::Mutex<std::collections::HashSet<EntryKey>>> =
+        OnceLock::new();
+    ENTRIES.get_or_init(Default::default)
+}
+
+/// `None` when the filesystem reports no birth time; such entries are never
+/// cached and keep the sync-every-time behaviour.
+#[cfg(unix)]
+fn inode_key(metadata: &std::fs::Metadata) -> Option<EntryKey> {
+    use std::os::unix::fs::MetadataExt;
+    let born = metadata.created().ok()?;
+    Some((metadata.dev(), metadata.ino(), born))
+}
+
+#[cfg(not(unix))]
+fn inode_key(_metadata: &std::fs::Metadata) -> Option<EntryKey> {
+    None
+}
+
+/// Make every directory entry from `directory` up to the root durable. A
+/// directory is recorded only after its parent was synced while the parent's
+/// own entry was already durable, so a recorded directory implies a durable
+/// chain above it and the walk can stop there.
+fn sync_ancestry(directory: &FsPath) -> Result<()> {
+    if cfg!(not(unix)) {
+        for directory in directory.ancestors() {
+            sync_directory(directory)?;
+        }
+        return Ok(());
+    }
+    let chain: Vec<&FsPath> = directory.ancestors().collect();
+    let mut keys = Vec::with_capacity(chain.len());
+    let mut known = chain.len().saturating_sub(1);
+    {
+        let entries = durable_entries().lock().expect("durable entry set");
+        for (index, path) in chain.iter().enumerate() {
+            let key = inode_key(&std::fs::metadata(path).map_err(generic)?);
+            keys.push(key);
+            if key.is_some_and(|key| entries.contains(&key)) {
+                known = index;
+                break;
+            }
+        }
+    }
+    // The leaf directory's own contents are always synced, as before.
+    sync_directory(directory)?;
+    // Walk down from the deepest known-durable ancestor (or the root, whose
+    // entry needs no parent) so each recorded entry has a durable parent.
+    for index in (0..known).rev() {
+        sync_directory(chain[index + 1])?;
+        if let Some(key) = keys[index] {
+            durable_entries()
+                .lock()
+                .expect("durable entry set")
+                .insert(key);
+        }
+    }
+    Ok(())
 }
 
 /// The detached worker owns the admission permit, operation, and any lock guards
@@ -474,6 +553,34 @@ mod tests {
     use object_store::{CopyMode, RenameTargetMode, UpdateVersion};
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn ancestry_sync_records_entries_and_resyncs_a_recreated_directory() {
+        let temp = TempDir::new().unwrap();
+        let leaf = temp.path().join("a").join("b");
+        std::fs::create_dir_all(&leaf).unwrap();
+        let leaf = std::fs::canonicalize(&leaf).unwrap();
+        let key = |path: &FsPath| inode_key(&std::fs::metadata(path).unwrap());
+        let Some(first) = key(&leaf) else {
+            // Without birth times nothing is cached and every write syncs.
+            sync_ancestry(&leaf).unwrap();
+            return;
+        };
+        sync_ancestry(&leaf).unwrap();
+        let recorded = |key| durable_entries().lock().unwrap().contains(&key);
+        assert!(recorded(first));
+        assert!(recorded(key(leaf.parent().unwrap()).unwrap()));
+
+        std::fs::remove_dir(&leaf).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        std::fs::create_dir(&leaf).unwrap();
+        let second = key(&leaf).unwrap();
+        assert_ne!(first, second, "a recreated directory must not reuse its key");
+        assert!(!recorded(second));
+        sync_ancestry(&leaf).unwrap();
+        assert!(recorded(second));
+    }
 
     fn fixture() -> (TempDir, LocalConditionalStore, Path) {
         let directory = TempDir::new().unwrap();
