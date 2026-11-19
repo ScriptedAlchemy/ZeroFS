@@ -34,7 +34,7 @@ PAYLOAD = 8 * GIB
 IO = MIB
 MEMORY_LIMIT = 8 * GIB
 COMPANION = 3 * GIB // 2
-PUT_DELAY_MS = 500
+PUT_DELAY_MS = 200
 P3_LAYOUT = "61440,128,3072,16,32,848"
 JOURNAL_BUDGET = 10 * GIB
 JOURNAL_HEADERS = 2 * RAW_BLOCK
@@ -176,7 +176,8 @@ def copy_file(source, destination, *, crash=None):
             drop_clean_cache(src.fileno(), position, IO)
             written = position + IO
             if written % GIB == 0:
-                record("copy_progress", bytes=written, elapsed_ns=time.monotonic_ns() - started)
+                record("copy_progress", file=destination.name, bytes=written,
+                       elapsed_ns=time.monotonic_ns() - started)
         assert os.fstat(dst.fileno()).st_size == PAYLOAD
         write_done = time.monotonic_ns()
         os.fsync(dst.fileno())
@@ -185,7 +186,7 @@ def copy_file(source, destination, *, crash=None):
             crash.send_signal(signal.SIGKILL)
             killed_at = time.monotonic_ns()
             assert crash.wait(timeout=10) == -signal.SIGKILL
-    record("copy_fsync", bytes=PAYLOAD, write_ns=write_done - started,
+    record("copy_fsync", file=destination.name, bytes=PAYLOAD, write_ns=write_done - started,
            fsync_ns=fsync_done - write_done, max_write_ns=longest,
            fsync_to_sigkill_ns=None if crash is None else killed_at - fsync_done)
     return slow_writes
