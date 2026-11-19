@@ -820,6 +820,8 @@ pub struct NinePClient {
     session_transition: tokio::sync::Mutex<()>,
     /// Admission bounds this registry; independent fid transitions run in parallel.
     stateful_requests: Arc<Mutex<StatefulRequests>>,
+    #[cfg(test)]
+    frame_encoded_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Dispatch window for filesystem RPCs. Session-maintenance exchanges use
     /// the raw request path and take no permit.
     request_admission: Arc<Semaphore>,
@@ -968,6 +970,8 @@ impl NinePClient {
             stale_fids: DashSet::new(),
             session_transition: tokio::sync::Mutex::new(()),
             stateful_requests: Arc::new(Mutex::new(StatefulRequests::default())),
+            #[cfg(test)]
+            frame_encoded_hook: Mutex::new(None),
             request_admission: Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS)),
             unsynced: DashMap::new(),
             counters,
@@ -1835,16 +1839,11 @@ impl NinePClient {
             }
             let has_op_id = op_id != [0u8; 16];
             let connection_epoch = conn.writer_epoch.load(Ordering::Relaxed);
-            let (op_flags, mut send) = {
-                // Keep the final check and enqueue atomic with failed/stale
-                // fid retirement. This section has no cancellation point.
-                let registry = self.stateful_requests.lock().unwrap();
-                if let Some((_, request)) = stateful {
-                    self.check_stateful_request(request)?;
-                } else {
-                    self.validate_admission_generation(admission, registry.retirement_generation)?;
-                }
+            let (op_flags, mut send) =
                 attempt.dispatch_frame(has_op_id, connection_epoch, |op_flags, origin_epoch| {
+                    // Encoding can copy a full negotiated write payload. Keep
+                    // it outside the session registry so independent requests
+                    // and fid retirements do not wait on that bulk work.
                     let bytes = P9Message::new_with_op_id_flags_and_origin(
                         tag,
                         op_id,
@@ -1855,7 +1854,26 @@ impl NinePClient {
                     .to_bytes_ctx(true)
                     .map_err(ClientError::Codec)?;
 
-                    // Registration-to-enqueue has no cancellation point.
+                    #[cfg(test)]
+                    {
+                        let hook = self.frame_encoded_hook.lock().unwrap().take();
+                        if let Some(hook) = hook {
+                            hook();
+                        }
+                    }
+
+                    // A fid may retire while the frame is being encoded. Keep
+                    // the final validation and enqueue atomic with retirement;
+                    // failed validation leaves this tag undispatched.
+                    let registry = self.stateful_requests.lock().unwrap();
+                    if let Some((_, request)) = stateful {
+                        self.check_stateful_request(request)?;
+                    } else {
+                        self.validate_admission_generation(
+                            admission,
+                            registry.retirement_generation,
+                        )?;
+                    }
                     let (frame, send) = OutboundFrame::new(bytes, &conn.send_progress);
                     pending.mark_dispatched();
                     if let Some((dispatched_conn, _)) = stateful {
@@ -1863,8 +1881,7 @@ impl NinePClient {
                     }
                     permit.send(frame);
                     Ok(send)
-                })?
-            };
+                })?;
             let early_response = match Self::wait_for_send_or_response(&mut send, &mut orx).await {
                 Ok(response) => response,
                 Err(SendWaitError::Stalled) => {
@@ -4456,6 +4473,7 @@ mod session_transition_tests {
             stale_fids: DashSet::new(),
             session_transition: tokio::sync::Mutex::new(()),
             stateful_requests: Arc::new(Mutex::new(StatefulRequests::default())),
+            frame_encoded_hook: Mutex::new(None),
             request_admission: Arc::new(Semaphore::new(max_inflight_requests)),
             unsynced: DashMap::new(),
             counters: Arc::new(TrafficCounters::default()),
@@ -6054,6 +6072,94 @@ mod session_transition_tests {
     #[tokio::test]
     async fn generic_notleader_after_first_preserves_ha_retry_fencing() {
         assert_notleader_reroute(P9_ENOTLEADER, P9_OP_FLAG_RETRY, 7).await;
+    }
+
+    async fn assert_frame_encoding_allows_fid_retirement(stateful: bool) {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let mut client = test_client_with_limit(Arc::clone(&conn), 1);
+        Arc::get_mut(&mut client).unwrap().msize = 2 * 1024 * 1024;
+        client
+            .state
+            .lock()
+            .unwrap()
+            .fids
+            .insert(7, inode_fid(70, 0, 0, None));
+        let registry_available = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&registry_available);
+        let retiring_client = Arc::downgrade(&client);
+        *client.frame_encoded_hook.lock().unwrap() = Some(Box::new(move || {
+            let client = retiring_client.upgrade().unwrap();
+            // Run exactly between bulk encoding and dispatch. This also makes
+            // the old lock scope fail without blocking or poisoning a mutex.
+            if client.stateful_requests.try_lock().is_err() {
+                return;
+            }
+            observed.store(true, Ordering::SeqCst);
+            let _transition = client.session_transition.try_lock().unwrap();
+            client.invalidate_fid_requests(7, None);
+            client
+                .state
+                .lock()
+                .unwrap()
+                .fids
+                .insert(7, inode_fid(99, 0, 0, None));
+        }));
+
+        let exchange = async {
+            if stateful {
+                client.lopen(7, 0).await.map(|_| ())
+            } else {
+                client
+                    .write_bytes(7, 0, Bytes::from(vec![b'x'; 1024 * 1024]))
+                    .await
+                    .map(|_| ())
+            }
+        };
+        tokio::pin!(exchange);
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                result = &mut exchange => result,
+                frame = requests.recv() => {
+                    // Settle the old lock scope's dispatched request so this
+                    // regression fails without leaving work outstanding.
+                    let frame = frame.unwrap().acknowledge();
+                    let request = P9Message::from_bytes_ctx(&frame, true).unwrap();
+                    let response = match request.body {
+                        Message::Tlopen(_) => Message::Rlopen(Rlopen { qid: qid(70), iounit: 0 }),
+                        Message::Twrite(write) => Message::Rwrite(Rwrite { count: write.count }),
+                        other => panic!("unexpected request {other:?}"),
+                    };
+                    reply(&conn, request.tag, response);
+                    exchange.await
+                }
+            }
+        })
+        .await
+        .expect("request did not settle after the encoding/retirement interleave");
+        assert!(
+            registry_available.load(Ordering::SeqCst),
+            "frame encoding held the fid registry lock"
+        );
+        assert!(matches!(result, Err(ClientError::Disconnected)));
+        assert!(requests.try_recv().is_err(), "retired request was enqueued");
+        assert!(conn.pending.is_empty());
+        assert_eq!(client.request_admission.available_permits(), 1);
+        assert!(client.stateful_requests.lock().unwrap().pending.is_empty());
+        let state = client.state.lock().unwrap();
+        let replacement = state.fids.get(&7).unwrap();
+        assert_eq!(replacement.inode_id, 99);
+        assert_eq!(replacement.opened, None);
+        assert!(client.unsynced.get(&7).is_none());
+    }
+
+    #[tokio::test]
+    async fn bulk_write_encoding_allows_fid_retirement_before_dispatch() {
+        assert_frame_encoding_allows_fid_retirement(false).await;
+    }
+
+    #[tokio::test]
+    async fn stateful_encoding_allows_fid_retirement_before_dispatch() {
+        assert_frame_encoding_allows_fid_retirement(true).await;
     }
 
     #[tokio::test]
