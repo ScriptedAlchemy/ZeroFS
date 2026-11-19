@@ -3178,15 +3178,27 @@ async fn writeback_replays_segment_to_persisted_member_before_any_pool_put() {
     .await
     .unwrap();
     attached.lifecycle.set_pool(pool.clone());
-    let key = segment(706);
+    let segid = Segid::new(41, 706);
+    let key = segment(segid.counter);
     let body = Bytes::from_static(b"durable before the first pool put");
-    let mut options = create_options();
-    options.extensions.insert(SegmentTarget("hdd-b".into()));
-    attached
-        .store
-        .put_opts(&key, body.clone().into(), options)
+    let segments = crate::segment_store::SegmentStore::new(
+        Arc::new(object_store::prefix::PrefixStore::new(
+            Arc::clone(&attached.store),
+            Path::from("db"),
+        )),
+        crate::frame_codec::FrameCodec::new(
+            &[0x86; 32],
+            crate::segment::SEGMENT_INFO,
+            crate::config::CompressionConfig::default(),
+        ),
+        segid.epoch,
+        None,
+    );
+    segments
+        .put_segment_at_target(segid, body.clone(), Some(&SegmentTarget("hdd-b".into())))
         .await
         .unwrap();
+    drop(segments);
     attached
         .lifecycle
         .wait_local_through_accepted()
