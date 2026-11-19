@@ -419,7 +419,7 @@ def verify_members(devices, baseline, final, entries):
                non_catalog_key=outside_catalog[0])
 
 
-def check_readiness(configuration, pool, phase, *, drained=False, held=False):
+def check_readiness(configuration, pool, phase, *, minimum_remote_sequence=0, held=False):
     result = json.loads(command(ZEROFS, "pool", "verify-raw", "-c", configuration, timeout=300))
     assert result["pool_id"] == pool and result["profile"] == "raw-device-p3-nas-fit-v1", result
     assert all(result[f"{key}_verified"] for key in ("authority", "catalog", "key_envelope", "journal")), result
@@ -435,9 +435,7 @@ def check_readiness(configuration, pool, phase, *, drained=False, held=False):
         assert 0 < result["remote_seq"] < result["local_seq"], result
         assert PAYLOAD <= allocation["dirty_blob_bytes"] <= allocation["stored_key_value_bytes"]
         assert allocation["dirty_blob_bytes"] + allocation["dirty_metadata_reserved_bytes"] <= JOURNAL_BUDGET
-    if drained:
-        assert 0 < result["local_seq"] == result["remote_seq"], result
-        assert allocation["dirty_blob_bytes"] == allocation["dirty_metadata_reserved_bytes"] == 0
+    assert minimum_remote_sequence <= result["remote_seq"] <= result["local_seq"], result
     record("offline_readiness", phase=phase, allocated_pages_bytes=allocated_pages_bytes, **result)
 
 
@@ -461,7 +459,7 @@ def exclusive_fixture_loop(binding):
         os.close(fd)
 
 
-def verify_missing_journal(configuration, binding, empty_headers):
+def verify_missing_journal(configuration, binding, empty_headers, *, minimum_remote_sequence=0):
     metadata_before = inspect_p3(binding, "before_journal_loss")
     with exclusive_fixture_loop(binding) as fd:
         original = os.pread(fd, JOURNAL_HEADERS, 0)
@@ -492,7 +490,23 @@ def verify_missing_journal(configuration, binding, empty_headers):
         with exclusive_fixture_loop(binding) as fd:
             assert os.pwrite(fd, original, 0) == JOURNAL_HEADERS
             os.fsync(fd)
-    check_readiness(configuration, binding[2], "after_restoring_journal_headers", drained=True)
+    check_readiness(configuration, binding[2], "after_restoring_journal_headers",
+                    minimum_remote_sequence=minimum_remote_sequence)
+
+
+def initialize_pool(configuration, devices):
+    initialized = json.loads(command(ZEROFS, "pool", "init", "-c", configuration))
+    assert initialized["pool_id"] == devices["p3"][2] and initialized["mapped_objects"] == 0
+    check_readiness(configuration, devices["p3"][2], "explicit_pool_init")
+
+
+def qualify_journal_refusal(root, devices, empty_headers):
+    template = TEMPLATE.read_text()
+    initial = config(root / "initial", template, devices)
+    fault = config(root / "missing_journal", template, devices)
+    initialize_pool(initial, devices)
+    verify_missing_journal(fault, devices["p3"], empty_headers)
+    check_p3_shadows(root, [initial, fault])
 
 
 def qualify(root, devices, source, empty_headers):
@@ -503,9 +517,7 @@ def qualify(root, devices, source, empty_headers):
     for phase in ("held_copy", "destage"):
         admission = check_admission(configs[phase], MEMORY_LIMIT)
         assert "memory_policy=raw-device-p3-nas-fit-v1" in admission["accounting"], admission
-    initialized = json.loads(command(ZEROFS, "pool", "init", "-c", configs["destage"]))
-    assert initialized["pool_id"] == devices["p3"][2] and initialized["mapped_objects"] == 0
-    check_readiness(configs["destage"], devices["p3"][2], "explicit_pool_init")
+    initialize_pool(configs["destage"], devices)
     baseline, entries = snapshot(configs["held_copy"], "empty_catalog")
     assert not entries and all(m["available_bytes"] == 0 for m in baseline.values())
 
@@ -538,6 +550,7 @@ def qualify(root, devices, source, empty_headers):
             slow_writes = copy_file(source, path.with_name("payload-second"))
             drained = remote_barrier(configs["destage"], address, 2 * PAYLOAD)
             assert drained["dirty_ssd_capacity_bytes"] == JOURNAL_BUDGET
+            sample_cgroup("both_payloads_remotely_durable")
     finally:
         del os.environ[delay_var]
     paced = [sample for sample in samples if sample[1]["ssd_admission_paced"] == 1]
@@ -563,8 +576,13 @@ def qualify(root, devices, source, empty_headers):
     with mount_large(configs["cold"]) as (path, server), monitor(configs["cold"], server):
         verify_mounted(path, first_hash, "destaged_restart_first")
         verify_mounted(path.with_name("payload-second"), second_hash, "destaged_restart_second")
-    check_readiness(configs["cold"], devices["p3"][2], "after_destage_and_cold_restart", drained=True)
-    verify_missing_journal(configs["missing_journal"], devices["p3"], empty_headers)
+        sample_cgroup("both_destaged_cold_hashes")
+    # A new server may journal its own metadata past the proven payload barrier.
+    minimum = drained["remote_sequence"]
+    check_readiness(configs["cold"], devices["p3"][2], "after_destage_and_cold_restart",
+                    minimum_remote_sequence=minimum)
+    verify_missing_journal(configs["missing_journal"], devices["p3"], empty_headers,
+                           minimum_remote_sequence=minimum)
     check_p3_shadows(root, list(configs.values()))
 
 
@@ -575,12 +593,14 @@ def main():
     assert int((CGROUP / "memory.max").read_text()) == MEMORY_LIMIT
     assert int((CGROUP / "memory.swap.max").read_text()) == 0
     assert os.path.ismount(VOLUME) and not any(VOLUME.iterdir())
-    required = PAYLOAD + sum(SIZES.values())
+    mode = os.environ["RAW_LARGE_MODE"]
+    assert mode in {"all", "journal-refusal"}
+    required = (PAYLOAD if mode == "all" else 0) + sum(SIZES.values())
     free = free_bytes(VOLUME)
     assert free >= required + 4 * GIB, (free, required)
     os.umask(0o077)
     require_fuse()
-    record("fixture_limits", cgroup_bytes=MEMORY_LIMIT, app_companion_allowance_bytes=COMPANION,
+    record("fixture_limits", mode=mode, cgroup_bytes=MEMORY_LIMIT, app_companion_allowance_bytes=COMPANION,
            swap_bytes=0, media_and_source_preallocation_bytes=required, host_free_bytes=free,
            binaries=command("sha256sum", ZEROFS, PROBE).decode().splitlines())
     start_events = keyed_lines(CGROUP / "memory.events")
@@ -591,10 +611,10 @@ def main():
             companion[offset:offset + MIB] = ones
         assert keyed_lines(CGROUP / "memory.stat")["anon"] >= COMPANION
         sample_cgroup("companion_resident")
-        run_fixture(start_events)
+        run_fixture(mode, start_events)
 
 
-def run_fixture(start_events):
+def run_fixture(mode, start_events):
     with tempfile.TemporaryDirectory(dir=VOLUME, prefix="fixture-") as scratch, \
          tempfile.TemporaryDirectory(dir="/dev", prefix="zerofs-large-") as node_dir:
         root, nodes = Path(scratch), Path(node_dir)
@@ -620,7 +640,10 @@ def run_fixture(start_events):
                 evict_media(bindings, "after_provisioning")
                 with exclusive_fixture_loop(bindings["p3"]) as fd:
                     empty_headers = os.pread(fd, JOURNAL_HEADERS, 0)
-                qualify(run_root, bindings, source, empty_headers)
+                if mode == "all":
+                    qualify(run_root, bindings, source, empty_headers)
+                else:
+                    qualify_journal_refusal(run_root, bindings, empty_headers)
                 for name, (_, backing, *_) in bindings.items():
                     assert allocated_bytes(backing) >= SIZES[name]
             assert not any(nodes.iterdir()), nodes
@@ -633,7 +656,8 @@ def run_fixture(start_events):
     assert peak > 0, peak
     sample_cgroup("cleaned")
     end_events = keyed_lines(CGROUP / "memory.events")
-    record("large_raw_pass", scratch=str(root), nodes=str(nodes), runtime=str(run_root),
+    case = "large_raw_pass" if mode == "all" else "raw_journal_refusal_pass"
+    record(case, scratch=str(root), nodes=str(nodes), runtime=str(run_root),
            exact_paths_removed=True, owned_loop_mappings_autocleared=len(SIZES),
            cgroup_peak_bytes=peak, cgroup_max_bytes=MEMORY_LIMIT,
            cgroup_headroom_at_peak_bytes=max(0, MEMORY_LIMIT - peak),

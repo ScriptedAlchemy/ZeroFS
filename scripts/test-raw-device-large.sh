@@ -2,9 +2,14 @@
 # Run the 8 GiB mounted raw-device qualification on Spark.
 set -euo pipefail
 
+mode=all
+if [[ ${1:-} == --journal-refusal ]]; then
+    mode=journal-refusal
+    shift
+fi
 if [[ $# != 1 || ! -x $1/zerofs || ! -x $1/zerofs-raw-device ||
       ! -r $1/memory_raw_nas_fit_fixture.toml ]]; then
-    echo "Usage: $0 LINUX_EXECUTABLE_AND_MANIFEST_DIRECTORY" >&2
+    echo "Usage: $0 [--journal-refusal] LINUX_EXECUTABLE_AND_MANIFEST_DIRECTORY" >&2
     exit 2
 fi
 
@@ -88,5 +93,5 @@ printf 'Docker host %s (%s)\nDocker image %s\n' "$identity" "$endpoint" "$image_
     --mount "type=volume,src=$name,dst=/fixture-volume,volume-nocopy" \
     --mount "type=bind,src=$binaries,dst=/input,readonly" \
     --mount "type=bind,src=$harness,dst=/h,readonly" \
-    -e PYTHONDONTWRITEBYTECODE=1 -e TMPDIR=/dev/shm "$image_id" \
+    -e PYTHONDONTWRITEBYTECODE=1 -e TMPDIR=/dev/shm -e "RAW_LARGE_MODE=$mode" "$image_id" \
     timeout --kill-after=30s 75m python3 -u /h/large_mounted.py
