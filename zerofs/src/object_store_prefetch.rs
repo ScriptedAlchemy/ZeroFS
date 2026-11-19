@@ -711,6 +711,8 @@ pub struct PrefetchingObjectStore {
     /// Highest part_id+1 seen per object, so evict can form PartKeys
     /// after a seal warm that never saved a head.
     part_counts: Cache<Path, usize>,
+    /// Copy each single-PUT payload into the parts cache after it commits.
+    write_through: bool,
 }
 
 /// Clonable handles for window fetches, which outlive `&self` (demand fetch
@@ -1101,6 +1103,7 @@ impl PrefetchingObjectStore {
                 .with_name("zerofs-object-prefetch-part-counts")
                 .with_eviction_config(foyer::S3FifoConfig::default())
                 .build(),
+            write_through: true,
         }
     }
 
@@ -1108,6 +1111,14 @@ impl PrefetchingObjectStore {
     /// inserts ungated (tests).
     pub(crate) fn with_admission_cap(mut self, cap_bytes: u64) -> Self {
         self.admission_cap_bytes = cap_bytes;
+        self
+    }
+
+    /// Disable copying committed single-PUT payloads into the parts cache.
+    /// Reads still populate it. A store behind a durable local journal can
+    /// already serve freshly written objects from that journal.
+    pub(crate) fn with_write_through(mut self, enabled: bool) -> Self {
+        self.write_through = enabled;
         self
     }
 
@@ -2330,7 +2341,9 @@ impl ObjectStore for PrefetchingObjectStore {
         })
         .await?;
         drop(invalidate);
-        self.write_through(location, cached, &result);
+        if self.write_through {
+            self.write_through(location, cached, &result);
+        }
         Ok(result)
     }
 
@@ -5231,6 +5244,29 @@ mod tests {
             1,
             "unaligned contiguous read should be a single GET"
         );
+    }
+
+    #[tokio::test]
+    async fn disabled_write_through_leaves_parts_cache_to_reads() {
+        let (store, _inner, _dir) = make_store(1024, MEM, DISK).await;
+        let store = store.with_write_through(false);
+        let path = Path::from("segments/3b/no-warm");
+        let body: Vec<u8> = (0..2560u32).map(|i| i as u8).collect();
+        let result = store.put(&path, body.clone().into()).await.unwrap();
+        let generation = CacheGeneration::from_put_result(&result).unwrap();
+        for part_id in 0..3 {
+            assert!(
+                store
+                    .parts
+                    .get(&PartKey::new(&path, 1024, &generation, part_id))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "part {part_id} must not be written through"
+            );
+        }
+        let read = store.get(&path).await.unwrap().bytes().await.unwrap();
+        assert_eq!(&read[..], &body[..]);
     }
 
     #[tokio::test]

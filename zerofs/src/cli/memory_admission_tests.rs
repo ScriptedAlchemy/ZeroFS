@@ -493,6 +493,7 @@ fn bounded_journal_keeps_an_independent_budget_and_rejects_shape_changes() {
     let geometry = settings.store_profile().unwrap();
     assert_eq!(geometry.seal_threshold, Some(32 * 1024 * 1024));
     assert_eq!(geometry.max_inflight_seals, Some(2));
+    assert!(!geometry.skip_write_warm, "v1 keeps its write-time cache warm");
     let ram_ack = config.replace(
         "write_ack_mode = \"materialized\"",
         "write_ack_mode = \"volatile_memory\"\nvolatile_memory_gb = 0.268435456\nvolatile_max_operations = 2048",
@@ -577,6 +578,7 @@ fn bounded_journal_v2_parameterises_journal_and_destage_with_matching_admission(
     let geometry = settings.store_profile().unwrap();
     assert_eq!(geometry.seal_threshold, Some(32 * 1024 * 1024));
     assert_eq!(geometry.max_inflight_seals, Some(2));
+    assert!(geometry.skip_write_warm, "v2 leaves fresh segments to the journal");
     for accepted in [
         config.replace("4.294967296", "0.536870912").replace("0.536870912\nlocal", "0.067108864\nlocal"),
         config.replace("upload_concurrency = 6", "upload_concurrency = 8"),

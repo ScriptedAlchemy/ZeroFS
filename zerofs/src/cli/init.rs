@@ -823,7 +823,8 @@ impl StartupContext {
                 parts_cache,
                 self.store_profile.prefetch,
             )
-            .with_admission_cap(crate::alloc_rss::rss_cap_bytes()),
+            .with_admission_cap(crate::alloc_rss::rss_cap_bytes())
+            .with_write_through(!self.store_profile.skip_write_warm),
         );
         let db_prefix = Path::from(self.actual_db_path.clone());
         let segment_object_store: Arc<dyn object_store::ObjectStore> =
@@ -835,10 +836,12 @@ impl StartupContext {
         // object path, so prepend the db prefix exactly as PrefixStore would, giving
         // the same cache key the read path derives.
         let segment_warm: Option<crate::segment_store::SegmentWarmHook> =
-            Some(Arc::new(move |loc: &Path, bytes: bytes::Bytes, result| {
-                let full: Path = db_prefix.parts().chain(loc.parts()).collect();
-                prefetch.warm_object(&full, bytes, result);
-            }));
+            (!self.store_profile.skip_write_warm).then(|| {
+                Arc::new(move |loc: &Path, bytes: bytes::Bytes, result: &slatedb::object_store::PutResult| {
+                    let full: Path = db_prefix.parts().chain(loc.parts()).collect();
+                    prefetch.warm_object(&full, bytes, result);
+                }) as crate::segment_store::SegmentWarmHook
+            });
 
         Ok(OpenOutcome::Opened(DbOpen {
             promotion,

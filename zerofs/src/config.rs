@@ -383,6 +383,10 @@ pub struct StoreProfile {
     pub decoded_extent_cache_bytes: Option<usize>,
     /// Cold segment-read prefetch geometry.
     pub prefetch: crate::object_store_prefetch::PrefetchProfile,
+    /// Do not copy freshly written segments into the clean disk cache. The
+    /// bounded journal serves them until they drain, so on a NAS the copy only
+    /// spends SSD write bandwidth and endurance; reads still populate the cache.
+    pub skip_write_warm: bool,
 }
 
 impl StoreProfile {
@@ -401,6 +405,7 @@ impl From<SftpDataProfile> for StoreProfile {
                 profile.read_fetch_window_min_bytes,
                 profile.read_fetch_window_max_bytes,
             ),
+            skip_write_warm: false,
         }
     }
 }
@@ -2405,6 +2410,9 @@ impl Settings {
             return Ok(StoreProfile {
                 seal_threshold: Some(StoreProfile::NAS_JOURNAL_SEAL_BYTES),
                 max_inflight_seals: Some(StoreProfile::NAS_JOURNAL_INFLIGHT),
+                // v1 keeps its qualified write-time cache warm.
+                skip_write_warm: self.nas_journal_profile()
+                    == Some(RuntimeProfile::SmallNasJournalV2),
                 ..StoreProfile::default()
             });
         }
