@@ -1788,6 +1788,13 @@ async fn verify_existing(
             source: Box::new(RemoteContentDivergence),
         });
     }
+    // Keep one cursor over the entire committed payload. Independent partial
+    // range streams do not rehash their bytes, so a journal changed after the
+    // initial verification could otherwise reconcile against the same wrong
+    // remote contents and then be retired as durable.
+    let mut local_stream = blob
+        .range_stream(0..blob.len(), REMOTE_STREAM_CHUNK_BYTES)
+        .map_err(|error| journal_blob_error("journal range failed", error))?;
     let mut offset = 0u64;
     while offset < blob.len() {
         let end = offset
@@ -1803,22 +1810,33 @@ async fn verify_existing(
             remote.get_opts(target, options).await?.bytes().await
         })
         .await?;
-        let mut local_stream = blob
-            .range_stream(offset..end, REMOTE_STREAM_CHUNK_BYTES)
-            .map_err(|error| journal_blob_error("journal range failed", error))?;
         let local_range = local_stream
             .next()
             .await
             .transpose()
             .map_err(|error| journal_blob_error("journal range read failed", error))?
             .unwrap_or_default();
-        if local_stream.next().await.is_some() || remote_range != local_range {
+        if local_range.len() as u64 != end - offset || remote_range != local_range {
             return Err(object_store::Error::AlreadyExists {
                 path: target.to_string(),
                 source: Box::new(RemoteContentDivergence),
             });
         }
         offset = end;
+    }
+    // Exhaust the verifier even for an empty payload, and propagate a final
+    // integrity error rather than treating any extra item as mere divergence.
+    if local_stream
+        .next()
+        .await
+        .transpose()
+        .map_err(|error| journal_blob_error("journal range read failed", error))?
+        .is_some()
+    {
+        return Err(object_store::Error::AlreadyExists {
+            path: target.to_string(),
+            source: Box::new(RemoteContentDivergence),
+        });
     }
     Ok(PutResult {
         e_tag: meta.e_tag,
