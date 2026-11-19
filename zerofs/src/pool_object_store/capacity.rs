@@ -191,6 +191,7 @@ mod tests {
                 reserved_bytes: reserved,
                 objects: 0,
                 health: MemberHealth::default(),
+                unavailable_at_startup: false,
                 safe_to_remove: false,
                 safe_to_pull_with_known_loss: false,
                 readable_evacuated: false,

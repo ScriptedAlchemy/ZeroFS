@@ -1451,6 +1451,7 @@ mod role_decision_tests {
                 settings.storage.pool = Some(crate::config::StoragePoolConfig {
                     catalog_dir: temp.path().join("catalog"),
                     segment_placement: Default::default(),
+                    allow_degraded_start: false,
                     members: vec![crate::config::StoragePoolMemberConfig {
                         health_device: None,
                         id: "local".to_owned(),

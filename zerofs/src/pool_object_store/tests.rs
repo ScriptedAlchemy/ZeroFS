@@ -132,7 +132,7 @@ impl Fixture {
             members,
             SegmentPlacement::RoundRobinLocal,
             initialize,
-            |_| Ok(()),
+            |_| Ok(MemberPreflight::Lazy),
         )
         .await
         .unwrap()

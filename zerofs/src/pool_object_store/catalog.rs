@@ -380,7 +380,12 @@ impl Catalog {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn configure_members(&self, members: &[PoolMember]) -> Result<()> {
+        self.configure_members_except(members, None)
+    }
+
+    pub fn configure_members_except(&self, members: &[PoolMember], unavailable: Option<&str>) -> Result<()> {
         let mut ids = BTreeSet::new();
         let mut identities = BTreeSet::new();
         for member in members {
@@ -427,6 +432,12 @@ impl Catalog {
                     .get(member.id.as_str())?
                     .map(|value| bincode::deserialize(value.value()))
                     .transpose()?;
+                if unavailable == Some(member.id.as_str()) {
+                    if !existing.is_some_and(|record| record.initialized) {
+                        bail!("unavailable pool member {} was never initialized", member.id);
+                    }
+                    continue;
+                }
                 let record = match existing {
                     Some(mut record) => {
                         if record.identity != member.identity {
@@ -1282,6 +1293,7 @@ impl Catalog {
                 },
                 available_bytes: 0,
                 space: Default::default(),
+                unavailable_at_startup: false,
                 health,
                 safe_to_remove,
                 safe_to_pull_with_known_loss,

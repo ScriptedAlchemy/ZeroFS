@@ -75,10 +75,24 @@ pub(crate) fn verify(settings: &Settings) -> Result<()> {
 }
 
 pub(super) fn verify_with(settings: &Settings, provider: &dyn IdentityProvider) -> Result<()> {
+    verify_except(settings, provider, None)
+}
+
+pub(crate) fn verify_without_member(settings: &Settings, member: &str) -> Result<()> {
+    verify_except(settings, &HostIdentityProvider, Some(member))
+}
+
+fn verify_except(
+    settings: &Settings,
+    provider: &dyn IdentityProvider,
+    missing: Option<&str>,
+) -> Result<()> {
+    let excluded = missing.map(|id| RoleName::Member(id.to_owned()));
     let Some(config) = &settings.storage.readiness else {
         return Ok(());
     };
-    let roots = config.validated_roots(settings)?;
+    let mut roots = config.validated_roots(settings)?;
+    roots.retain(|root| Some(&root.role) != excluded.as_ref());
     if !config.strict {
         for root in &roots {
             paths::verify_role(root)
@@ -87,6 +101,11 @@ pub(super) fn verify_with(settings: &Settings, provider: &dyn IdentityProvider) 
         return Ok(());
     }
     for device in &config.devices {
+        if excluded.as_ref().is_some_and(|role| device.roles.as_slice() == [role.clone()])
+            && !device.boot
+        {
+            continue;
+        }
         let serial = provider.observe_device(&device.by_id).with_context(|| {
             format!(
                 "storage readiness device evidence unavailable at {}",
@@ -244,7 +263,14 @@ fn verify_open_paths_with(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn verify_pool_paths(settings: &Settings, pool_id: &str) -> Result<()> {
+    verify_pool_paths_except(settings, pool_id, None)
+}
+
+pub(crate) fn verify_pool_paths_except(
+    settings: &Settings, pool_id: &str, missing: Option<&str>,
+) -> Result<()> {
     let Some(config) = &settings.storage.readiness else {
         return Ok(());
     };
@@ -253,6 +279,9 @@ pub(crate) fn verify_pool_paths(settings: &Settings, pool_id: &str) -> Result<()
         let RoleName::Member(id) = &root.role else {
             continue;
         };
+        if missing == Some(id.as_str()) {
+            continue;
+        }
         let pool = root.path.join(".zerofs-pool").join(pool_id);
         let lock = crate::local_object_store::LOCK_FILE;
         for path in [

@@ -561,7 +561,7 @@ pub struct ReplicationConfig {
     pub(crate) replication_listen: Option<String>,
     /// One-startup authorization to replace durable HA ownership.
     /// All former participants must be stopped before this is enabled.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) force_recovery: bool,
 }
 
@@ -703,6 +703,10 @@ pub struct StorageConfig {
     pub(crate) readiness: Option<crate::storage_readiness::ReadinessConfig>,
 }
 
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct StoragePoolConfig {
@@ -712,6 +716,9 @@ pub struct StoragePoolConfig {
     /// Placement policy for newly created immutable segments.
     #[serde(default, skip_serializing_if = "SegmentPlacement::is_first_fit")]
     pub(crate) segment_placement: SegmentPlacement,
+    /// Allow one initialized local data member to be unavailable at open.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) allow_degraded_start: bool,
     pub(crate) members: Vec<StoragePoolMemberConfig>,
 }
 

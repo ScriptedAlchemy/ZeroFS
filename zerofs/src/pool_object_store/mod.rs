@@ -98,6 +98,7 @@ pub struct PoolMemberStatus {
     pub reserved_bytes: u64,
     pub objects: u64,
     pub health: MemberHealth,
+    pub unavailable_at_startup: bool,
     pub safe_to_remove: bool,
     pub safe_to_pull_with_known_loss: bool,
     pub readable_evacuated: bool,
@@ -179,6 +180,7 @@ struct PoolInner {
     catalog: Arc<Catalog>,
     members: Vec<PoolMember>,
     segment_placement: SegmentPlacement,
+    unavailable: Option<String>,
     member_indices: HashMap<String, usize>,
     member_checks: Vec<Mutex<bool>>,
     // Physical read/copy/cleanup dependencies for each member's pull status.
@@ -520,6 +522,12 @@ impl Drop for CancelOnDrop {
     }
 }
 
+pub(crate) enum MemberPreflight {
+    #[cfg(test)]
+    Lazy,
+    CheckLocal { allow_degraded: bool, missing: Option<String> },
+}
+
 impl PoolObjectStore {
     #[cfg(test)]
     pub async fn initialize(
@@ -535,7 +543,7 @@ impl PoolObjectStore {
             members,
             SegmentPlacement::FirstFit,
             true,
-            |_| Ok(()),
+            |_| Ok(MemberPreflight::Lazy),
         )
         .await
     }
@@ -554,7 +562,7 @@ impl PoolObjectStore {
             members,
             SegmentPlacement::FirstFit,
             false,
-            |_| Ok(()),
+            |_| Ok(MemberPreflight::Lazy),
         )
         .await
     }
@@ -566,7 +574,7 @@ impl PoolObjectStore {
         members: Vec<PoolMember>,
         segment_placement: SegmentPlacement,
         initialize: bool,
-        preflight: impl FnOnce(&str) -> anyhow::Result<()> + Send,
+        preflight: impl FnOnce(&str) -> anyhow::Result<MemberPreflight> + Send,
     ) -> object_store::Result<Self> {
         let marker_path = authority_prefix
             .clone()
@@ -588,15 +596,20 @@ impl PoolObjectStore {
         .map_err(|e| flattened(format!("pool catalog open failed: {e:#}"), &e))?;
         // The catalog supplies the active pool UUID. Check its fixed member
         // paths before marker creation or recovery can write member objects.
-        preflight(&catalog.identity.pool_id).map_err(|issue| {
+        let preflight = preflight(&catalog.identity.pool_id).map_err(|issue| {
             flattened(format!("pool storage preflight failed: {issue:#}"), &issue)
         })?;
+        let (check_local, allow_degraded, unavailable) = match preflight {
+            #[cfg(test)]
+            MemberPreflight::Lazy => (false, false, None),
+            MemberPreflight::CheckLocal { allow_degraded, missing } => (true, allow_degraded, missing),
+        };
         let member_indices = members
             .iter()
             .enumerate()
             .map(|(i, member)| (member.id.clone(), i))
             .collect();
-        let pool = Self {
+        let mut pool = Self {
             inner: Arc::new(PoolInner {
                 authority,
                 authority_prefix,
@@ -610,6 +623,7 @@ impl PoolObjectStore {
                     .collect(),
                 members,
                 segment_placement,
+                unavailable: unavailable.clone(),
                 member_indices,
                 migration: Mutex::new(()),
                 evacuating: Arc::new(StdMutex::new(None)),
@@ -630,7 +644,7 @@ impl PoolObjectStore {
             }),
         };
         let configured = pool.inner.members.clone();
-        pool.catalog(move |catalog| catalog.configure_members(&configured))
+        pool.catalog(move |catalog| catalog.configure_members_except(&configured, unavailable.as_deref()))
             .await?;
         let expected = pool
             .inner
@@ -665,6 +679,7 @@ impl PoolObjectStore {
                 "pool authority identity does not match its catalog",
             ));
         }
+        let mut unavailable = pool.inner.unavailable.clone();
         for member in pool
             .inner
             .members
@@ -674,13 +689,19 @@ impl PoolObjectStore {
             let id = member.id.clone();
             let record = pool.catalog(move |catalog| catalog.member(&id)).await?;
             if initialize || !record.initialized {
-                // Bind a newly registered HDD while it is explicitly being
-                // added, even before it receives its first segment. Existing
-                // members remain lazy on ordinary reopen so an unavailable
-                // disk does not prevent unrelated local reads.
+                // Bind a newly registered HDD before it receives its first segment.
                 pool.ensure_member(&member.id, true).await?;
+            } else if check_local && let Err(issue) = pool.probe_local_member(member, &record).await {
+                if !allow_degraded || unavailable.is_some() || pool.inner.members.len() < 2
+                    || pool.inner.safety_failure.is_cancelled()
+                {
+                    return Err(issue);
+                }
+                tracing::warn!(member = %member.id, %issue, "local pool member unavailable at startup");
+                unavailable = Some(member.id.clone());
             }
         }
+        Arc::get_mut(&mut pool.inner).expect("pool has not been shared").unavailable = unavailable;
         pool.catalog(Catalog::finish_initialization).await?;
         // Idle remote members are deliberately not opened or probed here.
         pool.warn_declared_beyond_filesystem();
@@ -802,7 +823,28 @@ impl PoolObjectStore {
             })
     }
 
+    async fn probe_local_member(
+        &self,
+        member: &PoolMember,
+        record: &catalog::MemberRecord,
+    ) -> object_store::Result<()> {
+        member.validate_binding().map_err(permanent)?;
+        let pool_id = &self.inner.catalog.identity.pool_id;
+        let path = Path::from(format!(".zerofs-pool/{pool_id}/members/{}", member.id));
+        let expected = record.marker(pool_id).map_err(|issue| error(issue.to_string()))?;
+        if read_marker(member.store.as_ref(), &path).await?.as_deref() != Some(expected.as_slice()) {
+            return Err(refusal(format!(
+                "pool member {} identity marker is missing or does not match",
+                member.id
+            )));
+        }
+        Ok(())
+    }
+
     async fn ensure_member(&self, id: &str, writing: bool) -> object_store::Result<()> {
+        if self.inner.unavailable.as_deref() == Some(id) {
+            return Err(refusal(format!("pool member {id} is unavailable until restart")));
+        }
         let member = self.member(id)?;
         if writing && let Err(issue) = member.validate_binding() {
             self.quarantine(id, &format!("device binding lost: {issue}"))
@@ -967,7 +1009,7 @@ impl PoolObjectStore {
         }
         let blocked = self.catalog(Catalog::blocked_members).await?;
         for member in &self.inner.members {
-            if blocked.contains(&member.id) {
+            if blocked.contains(&member.id) || self.inner.unavailable.as_ref() == Some(&member.id) {
                 continue;
             }
             if let Err(issue) = member.validate_binding() {
@@ -979,6 +1021,7 @@ impl PoolObjectStore {
         let mut skip: BTreeSet<String> =
             self.inner.no_space.current(&members).into_keys().collect();
         skip.extend(refused.iter().cloned());
+        skip.extend(self.inner.unavailable.iter().cloned());
         let key = location.to_string();
         let upload = self
             .catalog(move |catalog| {
@@ -1717,6 +1760,13 @@ impl PoolObjectStore {
             }
         }
         for member in &mut status.members {
+            if self.inner.unavailable.as_ref() == Some(&member.id) {
+                member.unavailable_at_startup = true;
+                member.available_bytes = 0;
+                member.safe_to_remove = false;
+                member.safe_to_pull_with_known_loss = false;
+                continue;
+            }
             if evacuating
                 .as_ref()
                 .is_some_and(|active| active.member_id == member.id)
