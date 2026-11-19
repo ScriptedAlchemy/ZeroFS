@@ -87,23 +87,21 @@ impl RawPayload {
             sha256: expected,
         };
         let mut hasher = Sha256::new();
-        let mut count = 0;
         let mut bytes = 0;
-        for entry in payload
+        let chunks = payload
             .table
-            .range((payload.sequence, 0)..=(payload.sequence, u64::MAX))?
-        {
+            .range((payload.sequence, 0)..=(payload.sequence, u64::MAX))?;
+        for (index, entry) in (0_u64..).zip(chunks) {
             let (key, chunk) = entry?;
             let expected_len = (len - bytes).min(CHUNK_BYTES as u64);
             ensure!(
                 expected_len != 0
-                    && key.value().1 == count
+                    && key.value().1 == index
                     && chunk.value().len() as u64 == expected_len,
                 JournalBlobIntegrityError::LengthMismatch
             );
             hasher.update(chunk.value());
             bytes += expected_len;
-            count += 1;
         }
         ensure!(bytes == len, JournalBlobIntegrityError::LengthMismatch);
         let actual: [u8; 32] = hasher.finalize().into();
