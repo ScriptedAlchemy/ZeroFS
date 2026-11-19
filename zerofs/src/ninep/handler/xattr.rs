@@ -75,7 +75,11 @@ impl NinePHandler {
         }
         let _guard = self.filesystem.lock_manager.acquire(fid.inode_id).await;
         let inode = self.filesystem.inode_store.get(fid.inode_id).await?;
-        name.check_mutation(&inode, &fid.creds, remove)?;
+        let (inode, acl) = self
+            .filesystem
+            .inode_access_context(fid.inode_id, &inode, &fid.creds)
+            .await?;
+        name.check_mutation(&inode, &fid.creds, remove, acl.as_ref())?;
         let mut state = self.session_for_update()?;
         let slot = state.fids.get_mut(&tx.fid).ok_or(P9Error::BadFid)?;
         if slot.xattr.is_some() || slot.fid.opened {

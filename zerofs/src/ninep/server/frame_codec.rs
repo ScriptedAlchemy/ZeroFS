@@ -5,7 +5,7 @@ use ninep_proto::{
     DekuBytes, DirEntry, DirEntryPlus, Message, P9_COUNT_FIELD_LEN, P9_HEADER_SIZE, P9_IOHDRSZ,
     P9_MAX_MSIZE, P9_MIN_MESSAGE_SIZE, P9_OP_ENVELOPE_LEN, P9_OP_FLAG_RETRY, P9_OP_ID_LEN,
     P9_READDIR_BATCH_SIZE, P9_RLOPENATREAD_HDR, P9_SIZE_FIELD_LEN, P9Message, P9String, Qid, Stat,
-    T_WRITE, Twrite, VERSION_9P2000L_ZEROFS_CI, message_type,
+    T_WRITE, Twrite, VERSION_9P2000L_ZEROFS_CI_UMASK, message_type,
 };
 use std::mem::size_of;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -307,8 +307,8 @@ pub(super) fn possible_frame_response_bytes(frame: &[u8]) -> usize {
     let type_byte = frame.get(4).copied().unwrap_or_default();
     let reply = match type_byte {
         // Rversion: msize[4] version[s]. The server answers with one of its
-        // own dialect names or "unknown", 13 bytes at most.
-        t::TVERSION => H + 4 + 2 + VERSION_9P2000L_ZEROFS_CI.len(),
+        // own dialect names or "unknown".
+        t::TVERSION => H + 4 + 2 + VERSION_9P2000L_ZEROFS_CI_UMASK.len(),
         // Rattach and Rrebind: qid[13].
         t::TATTACH | t::TREBIND => H + QID,
         // Rwalk: nwqid[2] qid[13] per name walked. The handler also keeps a

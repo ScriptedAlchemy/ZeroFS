@@ -17,7 +17,8 @@ use crate::fs::inode::{Inode, InodeAttrs, InodeId, MAX_DEVICE_MAJOR, MAX_DEVICE_
 use crate::fs::mutation::overlay::IdentifiedWrite;
 use crate::fs::mutation::types::{RequestIdentity, RequestLifetime};
 use crate::fs::name_mode::NameMatch;
-use crate::fs::permissions::{AccessMode, Credentials, check_access};
+use crate::fs::permissions::acl::PosixAcl;
+use crate::fs::permissions::{AccessMode, Credentials, check_access_with_acl};
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{
     AuthContext, FallocateMode, FileAttributes, FileType, InodeWithId, SetAttributes, SetGid,
@@ -238,6 +239,7 @@ impl FidSlot {
 struct SessionState {
     msize: u32,
     zerofs_protocol: bool,
+    create_umask: bool,
     fids: HashMap<u32, FidSlot>,
     /// Blocks installation of new resource-bearing fid slots.
     disconnected: bool,
@@ -388,7 +390,12 @@ fn parse_rebind_credentials(n_uname: u32, payload: &[u8]) -> P9Result<Option<Cre
 /// client can satisfy a read from its inode-wide page cache without sending a
 /// subsequent `Tread`, so deferring permission enforcement until I/O would let
 /// one user's cached pages bypass another user's access check.
-fn check_open_access(inode: &Inode, creds: &Credentials, flags: u32) -> P9Result<()> {
+fn check_open_access(
+    inode: &Inode,
+    creds: &Credentials,
+    flags: u32,
+    acl: Option<&PosixAcl>,
+) -> P9Result<()> {
     let access_mode = flags & LINUX_O_ACCMODE;
     if access_mode == LINUX_O_ACCMODE {
         return Err(P9Error::InvalidArgument);
@@ -399,12 +406,14 @@ fn check_open_access(inode: &Inode, creds: &Credentials, flags: u32) -> P9Result
     if flags & LINUX_O_PATH != 0 {
         return Ok(());
     }
-    if access_mode != LINUX_O_WRONLY {
-        check_access(inode, creds, AccessMode::Read)?;
-    }
-    if access_mode == LINUX_O_WRONLY || access_mode == LINUX_O_RDWR || flags & LINUX_O_TRUNC != 0 {
-        check_access(inode, creds, AccessMode::Write)?;
-    }
+    let required = if access_mode == LINUX_O_WRONLY {
+        AccessMode::Write
+    } else if access_mode == LINUX_O_RDWR || flags & LINUX_O_TRUNC != 0 {
+        AccessMode::ReadWrite
+    } else {
+        AccessMode::Read
+    };
+    check_access_with_acl(inode, creds, required, acl)?;
     Ok(())
 }
 
@@ -1144,15 +1153,21 @@ impl NinePHandler {
         let fids = {
             let mut state = self.session_state();
             state.zerofs_protocol = false;
+            state.create_umask = false;
             std::mem::take(&mut state.fids)
         };
         drop(fids);
         self.lock_manager.release_session_locks(self.handler_id);
 
         let requested = version_str.as_bytes();
+        let create_umask = matches!(
+            requested,
+            VERSION_9P2000L_ZEROFS_UMASK | VERSION_9P2000L_ZEROFS_CI_UMASK
+        );
         if requested != VERSION_9P2000L
             && requested != VERSION_9P2000L_ZEROFS
             && requested != VERSION_9P2000L_ZEROFS_CI
+            && !create_umask
         {
             debug!("Client requested an unsupported 9P dialect, returning unknown");
             return Ok(Message::Rversion(Rversion {
@@ -1166,11 +1181,16 @@ impl NinePHandler {
         let mut state = self.session_state();
         state.msize = msize;
         state.zerofs_protocol = zerofs_protocol;
+        state.create_umask = create_umask;
 
         let advertised = if zerofs_protocol {
-            match self.filesystem.name_mode() {
-                crate::fs::name_mode::NameMode::Sensitive => VERSION_9P2000L_ZEROFS,
-                crate::fs::name_mode::NameMode::Insensitive => VERSION_9P2000L_ZEROFS_CI,
+            match (self.filesystem.name_mode(), create_umask) {
+                (crate::fs::name_mode::NameMode::Sensitive, false) => VERSION_9P2000L_ZEROFS,
+                (crate::fs::name_mode::NameMode::Insensitive, false) => VERSION_9P2000L_ZEROFS_CI,
+                (crate::fs::name_mode::NameMode::Sensitive, true) => VERSION_9P2000L_ZEROFS_UMASK,
+                (crate::fs::name_mode::NameMode::Insensitive, true) => {
+                    VERSION_9P2000L_ZEROFS_CI_UMASK
+                }
             }
         } else {
             VERSION_9P2000L
@@ -1341,7 +1361,9 @@ impl NinePHandler {
             if !parent.is_directory() {
                 return Err(Self::rebind_authorization_error(replay));
             }
-            check_access(&parent, creds, AccessMode::Execute)
+            self.filesystem
+                .check_inode_access(parent_id, &parent, creds, AccessMode::Execute)
+                .await
                 .map_err(|_| Self::rebind_authorization_error(replay))?;
             current_id = parent_id;
             current = parent;
@@ -1399,7 +1421,9 @@ impl NinePHandler {
             // Keep hardlink rebinding O(1). Resolving an arbitrary alias would
             // require a namespace-wide reverse search because hardlinked
             // inodes intentionally retain no parent pointer.
-            check_access(&root, &creds, AccessMode::Execute)
+            self.filesystem
+                .check_inode_access(tr.root_inode, &root, &creds, AccessMode::Execute)
+                .await
                 .map_err(|_| Self::rebind_authorization_error(replay))?;
         } else if tr.inode_id != tr.root_inode {
             self.authorize_rebind_ancestry(&creds, tr.inode_id, tr.root_inode, &inode, replay)
@@ -1474,7 +1498,9 @@ impl NinePHandler {
         let Inode::Directory(dir) = &inode else {
             return Err(P9Error::NotADirectory);
         };
-        check_access(&inode, creds, AccessMode::Execute)?;
+        self.filesystem
+            .check_inode_access(current_id, &inode, creds, AccessMode::Execute)
+            .await?;
         if name == b"." {
             return Ok(WalkTarget::relative(current_id));
         }
@@ -1851,10 +1877,14 @@ impl NinePHandler {
         let qid = {
             let _guard = self.filesystem.lock_manager.acquire(inode_id).await;
             let inode = self.filesystem.inode_store.get(inode_id).await?;
+            let (inode, acl) = self
+                .filesystem
+                .inode_access_context(inode_id, &inode, &creds)
+                .await?;
             if replay_reopen && inode.nlink() == 0 {
                 return Err(FsError::StaleHandle.into());
             }
-            check_open_access(&inode, &creds, tl.flags)
+            check_open_access(&inode, &creds, tl.flags, acl.as_ref())
                 .map_err(|error| Self::map_replay_open_error(replay_reopen, error))?;
             let qid = inode_to_qid(&inode, inode_id);
             let mut state = self.session_for_update()?;
@@ -1912,10 +1942,14 @@ impl NinePHandler {
         let qid = {
             let _guard = self.filesystem.lock_manager.acquire(src_fid.inode_id).await;
             let inode = self.filesystem.inode_store.get(src_fid.inode_id).await?;
+            let (inode, acl) = self
+                .filesystem
+                .inode_access_context(src_fid.inode_id, &inode, &src_fid.creds)
+                .await?;
             if replay_reopen && inode.nlink() == 0 {
                 return Err(FsError::StaleHandle.into());
             }
-            check_open_access(&inode, &src_fid.creds, tl.flags)
+            check_open_access(&inode, &src_fid.creds, tl.flags, acl.as_ref())
                 .map_err(|error| Self::map_replay_open_error(replay_reopen, error))?;
             let qid = inode_to_qid(&inode, src_fid.inode_id);
             let mut state = self.session_for_update()?;
@@ -2155,6 +2189,15 @@ impl NinePHandler {
         ))
     }
 
+    fn decode_create_mode(&self, mode: u32) -> (u32, u32) {
+        if self.session_state().create_umask {
+            let umask = (mode >> CREATE_UMASK_SHIFT) & CREATE_UMASK_MASK;
+            (mode & 0o177777, umask)
+        } else {
+            (mode, 0)
+        }
+    }
+
     /// Create a regular file under `parent_fid`, returning the new inode's id
     /// and post-op attributes. Shared by Tlcreate and Tlcreateattr.
     async fn create_child(
@@ -2164,11 +2207,12 @@ impl NinePHandler {
         mode: u32,
         client_gid: u32,
         op_id: crate::dedup::OpId,
+        umask: u32,
     ) -> P9Result<(InodeId, FileAttributes)> {
         let gid = self.effective_gid(client_gid, &parent_fid.creds);
         Ok(self
             .filesystem
-            .create_idempotent(
+            .create_with_umask(
                 &parent_fid.creds,
                 parent_fid.inode_id,
                 name,
@@ -2179,6 +2223,7 @@ impl NinePHandler {
                     ..Default::default()
                 },
                 op_id,
+                umask,
             )
             .await?)
     }
@@ -2191,7 +2236,7 @@ impl NinePHandler {
         }
 
         let (child_id, post_attr) = self
-            .create_child(&parent_fid, &tc.name.data, tc.mode, tc.gid, op_id)
+            .create_child(&parent_fid, &tc.name.data, tc.mode, tc.gid, op_id, 0)
             .await?;
 
         let qid = attrs_to_qid(&post_attr, child_id);
@@ -2242,8 +2287,9 @@ impl NinePHandler {
             return Err(P9Error::FidInUse);
         }
 
+        let (mode, umask) = self.decode_create_mode(tc.mode);
         let (child_id, post_attr) = self
-            .create_child(&parent_fid, &tc.name.data, tc.mode, tc.gid, op_id)
+            .create_child(&parent_fid, &tc.name.data, mode, tc.gid, op_id, umask)
             .await?;
 
         let mut path = parent_fid.path;
@@ -2487,6 +2533,7 @@ impl NinePHandler {
         &self,
         tm: &Tmkdir,
         op_id: crate::dedup::OpId,
+        with_attr: bool,
     ) -> P9Result<(InodeId, FileAttributes)> {
         let parent_fid = self.get_fid(tm.dfid)?;
 
@@ -2502,6 +2549,11 @@ impl NinePHandler {
         );
 
         let gid = self.effective_gid(tm.gid, &parent_fid.creds);
+        let (mode, umask) = if with_attr {
+            self.decode_create_mode(tm.mode)
+        } else {
+            (tm.mode, 0)
+        };
         Ok(self
             .filesystem
             .mkdir_idempotent(
@@ -2509,25 +2561,26 @@ impl NinePHandler {
                 parent_fid.inode_id,
                 &tm.name.data,
                 &SetAttributes {
-                    mode: SetMode::Set(tm.mode),
+                    mode: SetMode::Set(mode),
                     uid: SetUid::Set(parent_fid.creds.uid),
                     gid: SetGid::InheritOr(gid),
                     ..Default::default()
                 },
                 op_id,
+                umask,
             )
             .await?)
     }
 
     async fn mkdir(&self, tm: Tmkdir, op_id: crate::dedup::OpId) -> P9Result<Message> {
-        let (new_id, post_attr) = self.make_dir(&tm, op_id).await?;
+        let (new_id, post_attr) = self.make_dir(&tm, op_id, false).await?;
         Ok(Message::Rmkdir(Rmkdir {
             qid: attrs_to_qid(&post_attr, new_id),
         }))
     }
 
     async fn mkdir_attr(&self, tm: Tmkdir, op_id: crate::dedup::OpId) -> P9Result<Message> {
-        let (new_id, post_attr) = self.make_dir(&tm, op_id).await?;
+        let (new_id, post_attr) = self.make_dir(&tm, op_id, true).await?;
         Ok(Message::Rmkdirattr(Rmkdirattr {
             stat: attrs_to_stat(&post_attr, new_id)?,
         }))
@@ -2581,10 +2634,21 @@ impl NinePHandler {
         &self,
         tm: &Tmknod,
         op_id: crate::dedup::OpId,
+        with_attr: bool,
     ) -> P9Result<(InodeId, FileAttributes)> {
         let parent_fid = self.get_fid(tm.dfid)?;
 
         let file_type = tm.mode & 0o170000; // S_IFMT
+        let (mode, umask) = if with_attr {
+            self.decode_create_mode(tm.mode)
+        } else {
+            (tm.mode, 0)
+        };
+        if with_attr && file_type == S_IFREG {
+            return self
+                .create_child(&parent_fid, &tm.name.data, mode, tm.gid, op_id, umask)
+                .await;
+        }
         let device_type = match file_type {
             S_IFCHR => FileType::CharDevice,
             S_IFBLK => FileType::BlockDevice,
@@ -2606,26 +2670,27 @@ impl NinePHandler {
                 &tm.name.data,
                 device_type,
                 &SetAttributes {
-                    mode: SetMode::Set(tm.mode & 0o7777),
+                    mode: SetMode::Set(mode & 0o7777),
                     uid: SetUid::Set(parent_fid.creds.uid),
                     gid: SetGid::InheritOr(gid),
                     ..Default::default()
                 },
                 rdev,
                 op_id,
+                umask,
             )
             .await?)
     }
 
     async fn mknod(&self, tm: Tmknod, op_id: crate::dedup::OpId) -> P9Result<Message> {
-        let (child_id, post_attr) = self.make_node(&tm, op_id).await?;
+        let (child_id, post_attr) = self.make_node(&tm, op_id, false).await?;
         Ok(Message::Rmknod(Rmknod {
             qid: attrs_to_qid(&post_attr, child_id),
         }))
     }
 
     async fn mknod_attr(&self, tm: Tmknod, op_id: crate::dedup::OpId) -> P9Result<Message> {
-        let (child_id, post_attr) = self.make_node(&tm, op_id).await?;
+        let (child_id, post_attr) = self.make_node(&tm, op_id, true).await?;
         Ok(Message::Rmknodattr(Rmknodattr {
             stat: attrs_to_stat(&post_attr, child_id)?,
         }))

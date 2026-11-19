@@ -6,6 +6,9 @@ use crate::dedup::{DedupResult, OpId};
 use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
 
+#[cfg(test)]
+mod acl_access_tests;
+
 mod create;
 mod io;
 mod link;
@@ -16,6 +19,7 @@ mod remove;
 mod rename;
 mod setattr;
 mod xattr;
+pub(crate) use xattr::AclState;
 pub use xattr::{XATTR_VALUE_MAX, XattrName, XattrSetMode, XattrValue};
 pub(crate) mod write;
 

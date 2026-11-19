@@ -3728,6 +3728,136 @@ async fn writeback_segment_retry_waits_for_original_remote_ack() {
     attached.lifecycle.shutdown().await.unwrap();
 }
 
+async fn check_writeback_retry_with_full_ssd(queue_ram_owner: bool) {
+    use crate::segment_store::GeneratedSegmentCreate;
+    use crate::writeback::config::{AckMode, ShutdownFlush, WritebackSettings};
+    use crate::writeback::model::{JournalIdentity, MutationRecord};
+
+    let fixture = Fixture::new(1024);
+    let pool = fixture.initialize().await;
+    let key = segment(713);
+    let body = Bytes::from_static(b"one accepted segment");
+    let disk_bytes =
+        MutationRecord::ssd_reservation_estimate(key.as_ref(), None, body.len() as u64).unwrap();
+    let attached = crate::writeback::bootstrap::attach(
+        Arc::new(pool.clone()),
+        WritebackSettings {
+            dir: fixture.catalog.path().canonicalize().unwrap().join("dirty"),
+            ack_mode: AckMode::Ssd,
+            memory_bytes: body.len() as u64,
+            disk_bytes,
+            min_free_bytes: 1,
+            high_watermark_percent: 100,
+            resume_percent: 50,
+            upload_concurrency: 1,
+            local_concurrency: 1,
+            shutdown_flush: ShutdownFlush::Local,
+        },
+        JournalIdentity {
+            format_version: 1,
+            bucket_id: "target-retry-full-ssd".into(),
+            backend_endpoint: "memory://target-retry-full-ssd".into(),
+            database_prefix: "db".into(),
+            backend_kind: "pool".into(),
+            encryption_key_identity_sha256: [0x73; 32],
+        },
+        "target-retry-full-ssd",
+    )
+    .await
+    .unwrap();
+    attached.lifecycle.set_pool(pool.clone());
+    let mut options = create_options();
+    options.extensions.insert(GeneratedSegmentCreate);
+    options.extensions.insert(SegmentTarget("hdd-a".into()));
+    let first = attached
+        .store
+        .put_opts(&key, body.clone().into(), options.clone())
+        .await
+        .unwrap();
+    let status = attached.lifecycle.status().unwrap();
+    assert_eq!(status.local_seq, 1);
+    assert_eq!(status.remote_seq, 0);
+    assert_eq!(status.dirty_ssd_reserved_bytes, disk_bytes);
+    assert_eq!(status.dirty_ram_bytes, 0);
+
+    // A different writer may own the entire RAM budget while waiting for the
+    // full SSD journal to drain. An idempotent retry needs neither budget.
+    let queued = if queue_ram_owner {
+        let store = Arc::clone(&attached.store);
+        let queued_body = body.clone();
+        let options = options.clone();
+        let queued = tokio::spawn(async move {
+            store
+                .put_opts(&segment(714), queued_body.into(), options)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while attached.lifecycle.status().unwrap().dirty_ram_bytes != body.len() as u64 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(attached.lifecycle.status().unwrap().accepted_seq, 1);
+        Some(queued)
+    } else {
+        None
+    };
+    let retry_store = Arc::clone(&attached.store);
+    let retry_key = key.clone();
+    let retry_body = body.clone();
+    let mut retry = tokio::spawn(async move {
+        retry_store
+            .put_opts(&retry_key, retry_body.into(), options)
+            .await
+    });
+    let before_drain = tokio::time::timeout(Duration::from_secs(1), &mut retry).await;
+    let completed_before_drain = before_drain.is_ok();
+    let paused_status = attached.lifecycle.status().unwrap();
+
+    // Drain and join even when the regression is present, so a failing test
+    // does not leave an owned put waiting for admission in the background.
+    attached.lifecycle.activate_remote().unwrap();
+    if let Some(queued) = queued {
+        tokio::time::timeout(Duration::from_secs(10), queued)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+    if !completed_before_drain {
+        let _ = tokio::time::timeout(Duration::from_secs(10), retry)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let accepted = attached.lifecycle.status().unwrap().accepted_seq;
+    attached.lifecycle.wait_remote(accepted).await.unwrap();
+    attached.lifecycle.shutdown().await.unwrap();
+
+    let retried = before_drain
+        .expect("an identical accepted create must complete while remote replay is paused and the SSD budget is full")
+        .unwrap()
+        .unwrap();
+    assert_eq!(retried.e_tag, first.e_tag);
+    assert_eq!(retried.version, first.version);
+    assert_eq!(paused_status.accepted_seq, 1);
+    assert_eq!(paused_status.remote_seq, 0);
+    assert_eq!(paused_status.dirty_ssd_reserved_bytes, disk_bytes);
+    assert_eq!(read(&pool, &key).await, body);
+    assert_eq!(placement(&pool, &key).await, "hdd-a");
+}
+
+#[tokio::test]
+async fn writeback_segment_retry_needs_no_second_ssd_reservation() {
+    check_writeback_retry_with_full_ssd(false).await;
+}
+
+#[tokio::test]
+async fn writeback_segment_retry_bypasses_a_ram_owner_waiting_for_full_ssd() {
+    check_writeback_retry_with_full_ssd(true).await;
+}
+
 #[tokio::test]
 async fn bound_segment_refusal_does_not_stop_other_automatic_evacuation() {
     let fixture = Fixture::new(1024);

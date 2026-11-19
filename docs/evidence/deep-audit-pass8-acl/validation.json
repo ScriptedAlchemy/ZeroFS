@@ -1,0 +1,568 @@
+{
+  "original_pr_head": "84b5dc515185ae918caf7292f7c48144ff3853b0",
+  "integration_base": "8509886dfd61e077c186afec767eaa3f2d643a4f",
+  "nfs_dependency": "0f7d4f6666979d9ba683ae3288b2c8ee19cc3634",
+  "environment": "unprivileged Linux x86_64; rustc1.100.0; developer profile",
+  "scope": "65 selected checked-in tests executed against actual production source; fixture gates exposed and CLI command entrypoint omitted; no whole-server cfg(test)",
+  "build": {
+    "stage": "build",
+    "exit_code": 0,
+    "seconds": 148.5837500849957
+  },
+  "tests": [
+    {
+      "selector": "acl_xattr_bytes_round_trip_and_match_libacl_layout",
+      "exit_code": 0,
+      "seconds": 0.032761406000645366
+    },
+    {
+      "selector": "acl_removal_encodings_and_invalid_values",
+      "exit_code": 0,
+      "seconds": 0.06464468200283591
+    },
+    {
+      "selector": "acl_access_decisions_follow_posix_acl_permission",
+      "exit_code": 0,
+      "seconds": 0.06758959700528067
+    },
+    {
+      "selector": "acl_named_users_and_groups_require_defined_ids",
+      "exit_code": 0,
+      "seconds": 0.036648508001235314
+    },
+    {
+      "selector": "acl_a_matching_group_without_the_right_does_not_fall_through_to_other",
+      "exit_code": 0,
+      "seconds": 0.032673027002601884
+    },
+    {
+      "selector": "acl_incomplete_group_lists_never_widen_access",
+      "exit_code": 0,
+      "seconds": 0.06562229799601482
+    },
+    {
+      "selector": "acl_combined_requests_need_one_entry_granting_every_bit",
+      "exit_code": 0,
+      "seconds": 0.036669641005573794
+    },
+    {
+      "selector": "acl_mode_is_the_source_of_owner_mask_and_other",
+      "exit_code": 0,
+      "seconds": 0.07990404200245393
+    },
+    {
+      "selector": "acl_create_masq_follows_linux",
+      "exit_code": 0,
+      "seconds": 0.08923386599781225
+    },
+    {
+      "selector": "nfs4_restricted_preset_with_delete_child_on_a_directory",
+      "exit_code": 0,
+      "seconds": 0.157621731996187
+    },
+    {
+      "selector": "nfs4_open_preset_with_delete_child_on_a_directory",
+      "exit_code": 0,
+      "seconds": 0.08331030299450504
+    },
+    {
+      "selector": "nfs4_home_preset_with_delete_child_and_traverse_for_everyone",
+      "exit_code": 0,
+      "seconds": 0.11954790799791226
+    },
+    {
+      "selector": "nfs4_smb_builtin_groups_become_named_group_entries",
+      "exit_code": 0,
+      "seconds": 0.06479784700059099
+    },
+    {
+      "selector": "nfs4_inherited_entries_on_files_map_to_an_access_acl",
+      "exit_code": 0,
+      "seconds": 0.06693658699805383
+    },
+    {
+      "selector": "nfs4_inherit_only_entries_feed_only_the_default_acl",
+      "exit_code": 0,
+      "seconds": 0.034342756000114605
+    },
+    {
+      "selector": "nfs4_a_directory_without_inheritable_entries_has_no_default",
+      "exit_code": 0,
+      "seconds": 0.1173366779985372
+    },
+    {
+      "selector": "nfs4_expressible_deny_entries",
+      "exit_code": 0,
+      "seconds": 0.03306752399657853
+    },
+    {
+      "selector": "nfs4_group_deny_that_posix_cannot_express_is_refused",
+      "exit_code": 0,
+      "seconds": 0.0672255470053642
+    },
+    {
+      "selector": "nfs4_owner_rights_that_depend_on_group_membership_are_refused",
+      "exit_code": 0,
+      "seconds": 0.03276514499884797
+    },
+    {
+      "selector": "nfs4_inheritance_patterns_posix_defaults_cannot_carry_are_refused",
+      "exit_code": 0,
+      "seconds": 0.06872758999816142
+    },
+    {
+      "selector": "nfs4_partial_rights_are_refused",
+      "exit_code": 0,
+      "seconds": 0.03260017299908213
+    },
+    {
+      "selector": "nfs4_malformed_and_unsupported_values_are_refused",
+      "exit_code": 0,
+      "seconds": 0.03497111899923766
+    },
+    {
+      "selector": "nfs4_inherited_delete_does_not_authorize_deleting_every_child",
+      "exit_code": 0,
+      "seconds": 0.03432094699383015
+    },
+    {
+      "selector": "nfs4_unknown_identity_flags_and_undefined_named_ids_are_refused",
+      "exit_code": 0,
+      "seconds": 0.06921837199479342
+    },
+    {
+      "selector": "nfs4_named_users_who_may_own_future_children_are_checked",
+      "exit_code": 0,
+      "seconds": 0.06937694900261704
+    },
+    {
+      "selector": "nfs4_too_many_principals_are_refused",
+      "exit_code": 0,
+      "seconds": 0.03733168500184547
+    },
+    {
+      "selector": "nfs4_read_data_and_execute_only_entries",
+      "exit_code": 0,
+      "seconds": 0.035335442997165956
+    },
+    {
+      "selector": "permissions_root_can_search_directories_without_execute_bits",
+      "exit_code": 0,
+      "seconds": 0.0325631509986124
+    },
+    {
+      "selector": "permissions_root_still_needs_an_execute_bit_for_regular_files",
+      "exit_code": 0,
+      "seconds": 0.034989916006452404
+    },
+    {
+      "selector": "permissions_combined_requests_require_every_bit_from_one_permission_class",
+      "exit_code": 0,
+      "seconds": 0.03261029200075427
+    },
+    {
+      "selector": "permissions_combined_acl_requests_do_not_union_matching_group_entries",
+      "exit_code": 0,
+      "seconds": 0.03687284899933729
+    },
+    {
+      "selector": "permissions_truncated_groups_do_not_bypass_restrictive_acl_entries",
+      "exit_code": 0,
+      "seconds": 0.03323511499911547
+    },
+    {
+      "selector": "permissions_locally_truncated_groups_do_not_gain_mode_or_group_authority",
+      "exit_code": 0,
+      "seconds": 0.03497685899492353
+    },
+    {
+      "selector": "permissions_truncated_group_provenance_survives_roundtrip_and_changes_replay_identity",
+      "exit_code": 0,
+      "seconds": 0.03251684000133537
+    },
+    {
+      "selector": "permissions_upstream_kernel_authorized_unknown_groups_keep_the_existing_fallback",
+      "exit_code": 0,
+      "seconds": 0.03396640800201567
+    },
+    {
+      "selector": "permissions_truncated_groups_cannot_change_ownership_to_an_unproven_group",
+      "exit_code": 0,
+      "seconds": 0.06850994800333865
+    },
+    {
+      "selector": "engine_access_acl_round_trip_updates_mode_and_enforces_each_class",
+      "exit_code": 0,
+      "seconds": 0.11735714999667834
+    },
+    {
+      "selector": "engine_chmod_rewrites_the_mask_and_the_acl_follows",
+      "exit_code": 0,
+      "seconds": 0.07204490599542623
+    },
+    {
+      "selector": "engine_an_acl_equivalent_to_the_mode_is_stored_as_the_mode",
+      "exit_code": 0,
+      "seconds": 0.06971389099635417
+    },
+    {
+      "selector": "engine_default_acls_are_inherited_on_create_and_mkdir",
+      "exit_code": 0,
+      "seconds": 0.0653381320007611
+    },
+    {
+      "selector": "engine_directory_acls_govern_lookup_and_listing",
+      "exit_code": 0,
+      "seconds": 0.06653019999794196
+    },
+    {
+      "selector": "engine_a_default_acl_is_refused_on_a_file",
+      "exit_code": 0,
+      "seconds": 0.06724671499978285
+    },
+    {
+      "selector": "engine_invalid_acl_values_are_rejected_without_change",
+      "exit_code": 0,
+      "seconds": 0.07182679200195707
+    },
+    {
+      "selector": "engine_nfs4_acls_are_translated_or_refused",
+      "exit_code": 0,
+      "seconds": 0.06741865500225686
+    },
+    {
+      "selector": "engine_access_checks_never_combine_an_old_mode_with_new_acl_entries",
+      "exit_code": 0,
+      "seconds": 0.07105274600326084
+    },
+    {
+      "selector": "engine_translating_acl_counts_rows_removed_in_the_same_transaction",
+      "exit_code": 0,
+      "seconds": 0.699352452000312
+    },
+    {
+      "selector": "engine_user_xattr_access_follows_the_acl",
+      "exit_code": 0,
+      "seconds": 0.06708032899769023
+    },
+    {
+      "selector": "engine_volumes_without_acls_skip_lookups_until_the_first_acl",
+      "exit_code": 0,
+      "seconds": 0.06461301499803085
+    },
+    {
+      "selector": "engine_acls_persist_and_are_enforced_after_reopening",
+      "exit_code": 0,
+      "seconds": 0.11481178699614247
+    },
+    {
+      "selector": "namespace_namespace_mutations_require_a_combined_acl_group_grant",
+      "exit_code": 0,
+      "seconds": 0.06447206300072139
+    },
+    {
+      "selector": "db_pair_snapshot_keeps_one_writer_version",
+      "exit_code": 0,
+      "seconds": 0.26513980199524667
+    },
+    {
+      "selector": "db_pair_snapshot_keeps_one_reader_version_across_refresh",
+      "exit_code": 0,
+      "seconds": 0.1649795500052278
+    },
+    {
+      "selector": "db_pair_snapshot_handles_missing_keys_and_requires_order",
+      "exit_code": 0,
+      "seconds": 0.16489781699783634
+    },
+    {
+      "selector": "db_pair_snapshot_rechecks_serving_authority_after_both_reads",
+      "exit_code": 0,
+      "seconds": 0.06501686499541393
+    },
+    {
+      "selector": "ninep_opens_require_one_acl_entry_to_grant_the_complete_access_mode",
+      "exit_code": 0,
+      "seconds": 0.06457260900060646
+    },
+    {
+      "selector": "ninep_dot_walk_steps_do_not_grow_paths_or_displace_parent_components",
+      "exit_code": 0,
+      "seconds": 0.11527351599943358
+    },
+    {
+      "selector": "ninep_dot_then_parent_walk_keeps_rename_source_consistent",
+      "exit_code": 0,
+      "seconds": 0.06460886899731122
+    },
+    {
+      "selector": "ninep_io_snapshot_preserves_open_modes_credentials_and_pin_ownership",
+      "exit_code": 0,
+      "seconds": 0.1146877270002733
+    },
+    {
+      "selector": "ninep_io_uses_the_pinned_open_inode_after_name_and_permission_changes",
+      "exit_code": 0,
+      "seconds": 0.06483314800425433
+    },
+    {
+      "selector": "ninep_requested_creation_gid_never_changes_parent_authorization",
+      "exit_code": 0,
+      "seconds": 0.06493695399694843
+    },
+    {
+      "selector": "ninep_creation_gid_selection_preserves_inheritance_and_listener_override",
+      "exit_code": 0,
+      "seconds": 0.11492491600074572
+    },
+    {
+      "selector": "inventory_entries_report_the_engine_translation_and_summary_counts_formats",
+      "exit_code": 0,
+      "seconds": 0.06496118199720513
+    },
+    {
+      "selector": "nfs_access_access_honors_modes_shared_identity_and_requested_rights",
+      "exit_code": 0,
+      "seconds": 0.12327604500023881
+    },
+    {
+      "selector": "nfs_access_access_honors_acl_named_users_groups_and_directory_combined_rights",
+      "exit_code": 0,
+      "seconds": 0.2826344909990439
+    },
+    {
+      "selector": "nfs_access_access_preserves_acknowledged_acl_write_attributes_before_materialization",
+      "exit_code": 0,
+      "seconds": 0.11693586299952585
+    }
+  ],
+  "formatting": {
+    "command": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--",
+      "--check"
+    ],
+    "exit_code": 0,
+    "seconds": 7.454879056000209,
+    "repository": "/workspace/scratch/91322066c5c6/zerofs-check-pr87"
+  },
+  "source_sha256": {
+    "zerofs/src/db.rs": "26c7f87166f57ed6f0ef789bbc1dfe270b36f4c9965f4c5f19868822dbd4394a",
+    "zerofs/src/fs/permissions.rs": "f168b3174d398dd96102457a606fde0a67c8b8740c69844775d02b7cf6530aba",
+    "zerofs/src/fs/permissions/acl.rs": "5814a85c5d0fb7beb508c07c41edfbb01a93f9bda2635247b6ca57dd98cc566f",
+    "zerofs/src/fs/permissions/nfs4.rs": "131bc495ec063fee491cac06d83e3bbea1b128da3c7dd1207b7e7fcbb49e337e",
+    "zerofs/src/fs/ops/xattr/acl.rs": "431bdd44c737217a9f462b6606f2200944064535568587798d81567bbb83db0e",
+    "zerofs/src/fs/store/xattr.rs": "d1ef78ffe5819fcefcda38f75168d9174d48e4bc72e6131aafa5a199c78c0016",
+    "zerofs/src/fs/mutation/overlay.rs": "ff1512329de7ca38eff2fef5a3b4ec84519f3f397528eac885bb8c00a3e9f385",
+    "zerofs/src/nfs.rs": "f7cd089796b105897e8e76112976c326b3e11548bec1ae68c75af7b994b130d3",
+    "zerofs/src/ninep/handler.rs": "35b36caa3bf697f017cfe8dbff3524e53d83bb881f8db1cbe3a785c611e192b0"
+  },
+  "old_code_mutation_checks": {
+    "baseline_revision": "2ef04b30ddc2c75d9c1a587fbff266c63182ed43",
+    "build": {
+      "stage": "build",
+      "exit_code": 0,
+      "seconds": 142.44147588399937
+    },
+    "expected_exit_code": 101,
+    "tests": [
+      {
+        "selector": "ninep_opens_require_one_acl_entry_to_grant_the_complete_access_mode",
+        "exit_code": 101,
+        "seconds": 0.11477776800165884,
+        "failure_reason": "Original split checks incorrectly accepted Rlopen instead of denying the combined request.",
+        "log_sha256": "da3c68282034b1a648ce467dd4355cd93c5e2c6f1845d7611b8921c10eae7405",
+        "failure_output": "thread 'main' (58) panicked at /workspace/scratch/91322066c5c6/pass8-pr87-red-harness/src/ninep/handler/io_context_tests.rs:71:39:\ncalled `Result::unwrap_err()` on an `Ok` value: Rlopen(Rlopen { qid: Qid { type_: 0, version: 1795071507, path: 1 }, iounit: 0 })\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace"
+      },
+      {
+        "selector": "namespace_namespace_mutations_require_a_combined_acl_group_grant",
+        "exit_code": 101,
+        "seconds": 0.06465880100586219,
+        "failure_reason": "Original separate write/search checks incorrectly returned Ok instead of PermissionDenied.",
+        "log_sha256": "e61f817d84eefff166a02c31306b79b93e6b4ca88c35fd35c06679fcc7b692c8",
+        "failure_output": "thread 'main' (69) panicked at /workspace/scratch/91322066c5c6/pass8-pr87-red-harness/src/fs/ops/acl_access_tests.rs:58:5:\nassertion `left == right` failed\n  left: Ok(())\n right: Err(PermissionDenied)\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace"
+      },
+      {
+        "selector": "engine_access_checks_never_combine_an_old_mode_with_new_acl_entries",
+        "exit_code": 101,
+        "seconds": 0.11507301699748496,
+        "failure_reason": "Original mixed-generation permission check returned Ok instead of PermissionDenied.",
+        "log_sha256": "2517c236575a4342adf4c3786c592dfe554916e40befd652692d3fa9a4578ad3",
+        "failure_output": "thread 'main' (80) panicked at /workspace/scratch/91322066c5c6/pass8-pr87-red-harness/src/fs/ops/xattr/acl_tests.rs:495:9:\nassertion `left == right` failed\n  left: Ok(())\n right: Err(PermissionDenied)\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace"
+      },
+      {
+        "selector": "nfs4_inherited_delete_does_not_authorize_deleting_every_child",
+        "exit_code": 101,
+        "seconds": 0.06485230600083014,
+        "failure_reason": "Original inherited-DELETE exception accepted the unrepresentable directory mapping.",
+        "log_sha256": "42fef12f7fa8d737a664b3d8977063ba9debf0151701b3a99f5819efe4adf065",
+        "failure_output": "thread 'main' (91) panicked at /workspace/scratch/91322066c5c6/pass8-pr87-red-harness/src/fs/permissions/nfs4/tests.rs:312:29:\ncalled `Result::unwrap_err()` on an `Ok` value: Nfs4Mapping { access: PosixAcl { entries: [AclEntry { tag: 1, perm: 7, id: 4294967295 }, AclEntry { tag: 4, perm: 7, id: 4294967295 }, AclEntry { tag: 32, perm: 0, id: 4294967295 }] }, default: Some(PosixAcl { entries: [AclEntry { tag: 1, perm: 7, id: 4294967295 }, AclEntry { tag: 4, perm: 7, id: 4294967295 }, AclEntry { tag: 32, perm: 0, id: 4294967295 }] }), reports: {\"child_deletion_relies_on_inherited_delete\", \"delete_follows_parent_directory_write\"} }\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace"
+      },
+      {
+        "selector": "engine_translating_acl_counts_rows_removed_in_the_same_transaction",
+        "exit_code": 101,
+        "seconds": 0.2654450409972924,
+        "failure_reason": "Original row-limit accounting returned NoSpace for a transaction whose final row count fits.",
+        "log_sha256": "4d28e7119f009290eb7e28f264299685618f70ddcaaf04f98e8cff9a1f3572a2",
+        "failure_output": "thread 'main' (102) panicked at /workspace/scratch/91322066c5c6/pass8-pr87-red-harness/src/fs/ops/xattr/acl_tests.rs:559:6:\ncalled `Result::unwrap()` on an `Err` value: NoSpace\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace"
+      },
+      {
+        "selector": "permissions_locally_truncated_groups_do_not_gain_mode_or_group_authority",
+        "exit_code": 101,
+        "seconds": 0.0325273870039382,
+        "failure_reason": "Original truncated-group constructor caused an omitted restrictive owning group to fall through to OTHER and grant access.",
+        "log_sha256": "f1dca0ad633865525ec16e9389e0c6cc939a7d718d4605a44791886b68bdae0b",
+        "failure_output": "thread 'main' (113) panicked at /workspace/scratch/91322066c5c6/pass8-pr87-red-harness/src/fs/permissions.rs:424:9:\nassertion `left == right` failed\n  left: Ok(())\n right: Err(PermissionDenied)\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace"
+      },
+      {
+        "selector": "ninep_requested_creation_gid_never_changes_parent_authorization",
+        "exit_code": 101,
+        "seconds": 0.06488656299916329,
+        "failure_reason": "Original request-GID substitution allowed creation in a directory the caller could not modify.",
+        "log_sha256": "ff660cd8430ed62dbea8b9f2f9cf89e3c7a90df12addbe415611254149b481ed",
+        "failure_output": "thread 'main' (124) panicked at /workspace/scratch/91322066c5c6/pass8-pr87-red-harness/src/ninep/handler/creation_gid_tests.rs:185:24:\ncalled `Result::unwrap_err()` on an `Ok` value: (2, FileAttributes { file_type: Regular, mode: 384, nlink: 1, uid: 2000, gid: 300, size: 0, used: 0, rdev: None, fsid: 0, fileid: 2, atime: Timestamp { seconds: 1795071507, nanoseconds: 958396713 }, mtime: Timestamp { seconds: 1795071507, nanoseconds: 958396713 }, ctime: Timestamp { seconds: 1795071507, nanoseconds: 958396713 } })\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace"
+      }
+    ],
+    "all_test_bodies_identical": true,
+    "type_adaptation": "The original Credentials constructor gains groups_truncated:false solely to fit the added field; no authorization algorithm is added.",
+    "restored_functions": [
+      {
+        "path": "ninep/handler.rs",
+        "function": "check_open_access",
+        "original_function_sha256": "76bf56fca2aa4c4a1dda0ed4464505c616605364fb134ecb19ae3514e1b921de",
+        "restored_function_sha256": "76bf56fca2aa4c4a1dda0ed4464505c616605364fb134ecb19ae3514e1b921de",
+        "adapted_for_current_type_shape": false
+      },
+      {
+        "path": "fs/ops/create.rs",
+        "function": "create_idempotent",
+        "original_function_sha256": "751fdc388f005b77565495e6c0b8478032a7adc816b452c8f273789760296e71",
+        "restored_function_sha256": "751fdc388f005b77565495e6c0b8478032a7adc816b452c8f273789760296e71",
+        "adapted_for_current_type_shape": false
+      },
+      {
+        "path": "fs/ops/create.rs",
+        "function": "mkdir_idempotent",
+        "original_function_sha256": "ba2012d0d8e8995f2f8c840128d399e937858a99bc12728921fc698cbc8c6a97",
+        "restored_function_sha256": "ba2012d0d8e8995f2f8c840128d399e937858a99bc12728921fc698cbc8c6a97",
+        "adapted_for_current_type_shape": false
+      },
+      {
+        "path": "fs/ops/create.rs",
+        "function": "mknod_idempotent",
+        "original_function_sha256": "b985f5f08943fd5c454df3346d5c2bf02a98e0b67621f08b25a8edd7eef58f75",
+        "restored_function_sha256": "b985f5f08943fd5c454df3346d5c2bf02a98e0b67621f08b25a8edd7eef58f75",
+        "adapted_for_current_type_shape": false
+      },
+      {
+        "path": "fs/ops/link.rs",
+        "function": "symlink_idempotent",
+        "original_function_sha256": "f2991a70166b3ee6314761ab71ff4afc98b56d2f59d82232fd979a36727fc4a0",
+        "restored_function_sha256": "f2991a70166b3ee6314761ab71ff4afc98b56d2f59d82232fd979a36727fc4a0",
+        "adapted_for_current_type_shape": false
+      },
+      {
+        "path": "fs/ops/link.rs",
+        "function": "link_idempotent",
+        "original_function_sha256": "9ed2838c06689fde124ffb15162a05a1ad7c2ef0a6a1fc5eaf8ac684ea2a4bb0",
+        "restored_function_sha256": "9ed2838c06689fde124ffb15162a05a1ad7c2ef0a6a1fc5eaf8ac684ea2a4bb0",
+        "adapted_for_current_type_shape": false
+      },
+      {
+        "path": "fs/ops/remove.rs",
+        "function": "remove_idempotent_inner",
+        "original_function_sha256": "1203afd2c2a1c171f0b207da2aec72ac5df371e45a6fbfb8081b8956c3c1f1cf",
+        "restored_function_sha256": "1203afd2c2a1c171f0b207da2aec72ac5df371e45a6fbfb8081b8956c3c1f1cf",
+        "adapted_for_current_type_shape": false
+      },
+      {
+        "path": "fs/ops/rename.rs",
+        "function": "rename_with_options",
+        "original_function_sha256": "ff467cd74967d66359198ab991f974c83e6d69ac4ff71a0090f551cad00eeded",
+        "restored_function_sha256": "ff467cd74967d66359198ab991f974c83e6d69ac4ff71a0090f551cad00eeded",
+        "adapted_for_current_type_shape": false
+      },
+      {
+        "path": "fs/ops/xattr/acl.rs",
+        "function": "check_inode_access",
+        "original_function_sha256": "997fdb87753e49713082187477657b93fb34507e0f02983fac03c88ab9b585b0",
+        "restored_function_sha256": "997fdb87753e49713082187477657b93fb34507e0f02983fac03c88ab9b585b0",
+        "adapted_for_current_type_shape": false
+      },
+      {
+        "path": "fs/ops/xattr/acl.rs",
+        "function": "mutate_acl",
+        "original_function_sha256": "77866772c1f693bcbfb52a65a3bea4c02a14f6dabdc894f6714307ae438ef480",
+        "restored_function_sha256": "77866772c1f693bcbfb52a65a3bea4c02a14f6dabdc894f6714307ae438ef480",
+        "adapted_for_current_type_shape": false
+      },
+      {
+        "path": "fs/permissions/nfs4.rs",
+        "function": "rwx",
+        "original_function_sha256": "65f3a143ed51828803604f2b87905cff86ce7775deeaaf8fb6f33ecd4d0156e4",
+        "restored_function_sha256": "65f3a143ed51828803604f2b87905cff86ce7775deeaaf8fb6f33ecd4d0156e4",
+        "adapted_for_current_type_shape": false
+      },
+      {
+        "path": "fs/permissions/nfs4.rs",
+        "function": "build",
+        "original_function_sha256": "3fdb7f052def8c5b221172f4f233ef7425dfa30dc6d94ee043f13e7038ab89f9",
+        "restored_function_sha256": "3fdb7f052def8c5b221172f4f233ef7425dfa30dc6d94ee043f13e7038ab89f9",
+        "adapted_for_current_type_shape": false
+      },
+      {
+        "path": "fs/permissions/nfs4.rs",
+        "function": "verify",
+        "original_function_sha256": "12607d864b00c0ec0da89ac3e7eabbd758a5735caaee799e3fcbc0fb1f252ddb",
+        "restored_function_sha256": "12607d864b00c0ec0da89ac3e7eabbd758a5735caaee799e3fcbc0fb1f252ddb",
+        "adapted_for_current_type_shape": false
+      },
+      {
+        "path": "fs/permissions/nfs4.rs",
+        "function": "map_nfs4_acl",
+        "original_function_sha256": "ed272b09e02ba7bd576e249fc767a23c834b1de0755b3dcb2527075f3b79cab0",
+        "restored_function_sha256": "ed272b09e02ba7bd576e249fc767a23c834b1de0755b3dcb2527075f3b79cab0",
+        "adapted_for_current_type_shape": false
+      },
+      {
+        "path": "fs/permissions.rs",
+        "function": "from_auth_context",
+        "original_function_sha256": "f3b436deb7ca0c4cac822e66eb081e41d61b657f204f13214bbe6c9dbca58b9d",
+        "restored_function_sha256": "cff658023a3d1be3f624053d7bf4c1a280d3ca984e58cb926155c4b6a7ad5977",
+        "adapted_for_current_type_shape": true
+      },
+      {
+        "path": "ninep/handler.rs",
+        "function": "create_child",
+        "original_function_sha256": "e8652471df25fdc4a9062d3e53f8aab85418b90d23b874f78fb30df9bc18a61d",
+        "restored_function_sha256": "e8652471df25fdc4a9062d3e53f8aab85418b90d23b874f78fb30df9bc18a61d",
+        "adapted_for_current_type_shape": false
+      },
+      {
+        "path": "ninep/handler.rs",
+        "function": "make_dir",
+        "original_function_sha256": "29096140ebaaa3d88e3c96edca7c023ff3e7562d23c6b34750ca2ce686d9b4db",
+        "restored_function_sha256": "29096140ebaaa3d88e3c96edca7c023ff3e7562d23c6b34750ca2ce686d9b4db",
+        "adapted_for_current_type_shape": false
+      },
+      {
+        "path": "ninep/handler.rs",
+        "function": "make_symlink",
+        "original_function_sha256": "3b9d07053cc0e52bdf0a9d08af2f7a59a98b4291d693aee1e2d2d0119d5e43e4",
+        "restored_function_sha256": "3b9d07053cc0e52bdf0a9d08af2f7a59a98b4291d693aee1e2d2d0119d5e43e4",
+        "adapted_for_current_type_shape": false
+      },
+      {
+        "path": "ninep/handler.rs",
+        "function": "make_node",
+        "original_function_sha256": "40fcb4619827af92563217c9a43617fca37451d143eab0fb27633c8c62106b7f",
+        "restored_function_sha256": "40fcb4619827af92563217c9a43617fca37451d143eab0fb27633c8c62106b7f",
+        "adapted_for_current_type_shape": false
+      }
+    ],
+    "scope": "Original production function bodies restored only in a separate harness copy. Fixed production and green harness sources were not changed.",
+    "provenance_sha256": "53975950f4536ddf8e43a440b0d207c0b2347acb526f6e961e4103a4cdae0c23"
+  }
+}

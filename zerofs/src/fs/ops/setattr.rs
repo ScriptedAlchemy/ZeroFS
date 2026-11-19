@@ -10,7 +10,7 @@ use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId};
 use crate::fs::mutation::types::{ConflictKey, ConflictScope};
 use crate::fs::permissions::{
-    AccessMode, Credentials, can_set_times, check_access, check_ownership, validate_mode,
+    AccessMode, Credentials, can_set_times, check_access_with_acl, check_ownership, validate_mode,
 };
 use crate::fs::quota::QuotaSettlement;
 use crate::fs::tracing::FileOperation;
@@ -157,6 +157,7 @@ impl ZeroFS {
             return Ok(result);
         }
         let mut inode = self.inode_store.get(id).await?;
+        let acl = self.access_acl(id, &inode, creds).await?;
 
         // For chmod (mode change), must be owner
         if matches!(setattr.mode, SetMode::Set(_)) {
@@ -205,19 +206,19 @@ impl ZeroFS {
 
         match setattr.atime {
             SetTime::SetToClientTime(_) => {
-                can_set_times(&inode, creds, false)?;
+                can_set_times(&inode, creds, false, acl.as_ref())?;
             }
             SetTime::SetToServerTime => {
-                can_set_times(&inode, creds, true)?;
+                can_set_times(&inode, creds, true, acl.as_ref())?;
             }
             SetTime::NoChange => {}
         }
         match setattr.mtime {
             SetTime::SetToClientTime(_) => {
-                can_set_times(&inode, creds, false)?;
+                can_set_times(&inode, creds, false, acl.as_ref())?;
             }
             SetTime::SetToServerTime => {
-                can_set_times(&inode, creds, true)?;
+                can_set_times(&inode, creds, true, acl.as_ref())?;
             }
             SetTime::NoChange => {}
         }
@@ -225,7 +226,7 @@ impl ZeroFS {
         if matches!(size_authorization, SizeAuthorization::CurrentMode)
             && matches!(setattr.size, SetSize::Set(_))
         {
-            check_access(&inode, creds, AccessMode::Write)?;
+            check_access_with_acl(&inode, creds, AccessMode::Write, acl.as_ref())?;
         }
 
         match &mut inode {

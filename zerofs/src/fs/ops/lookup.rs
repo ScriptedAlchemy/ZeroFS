@@ -3,7 +3,7 @@
 use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
-use crate::fs::permissions::{AccessMode, Credentials, check_access};
+use crate::fs::permissions::{AccessMode, Credentials};
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{AuthContext, DirEntry, InodeWithId, ReadDirResult};
 use ::tracing::{debug, error};
@@ -40,7 +40,8 @@ impl ZeroFS {
 
         match dir_inode {
             Inode::Directory(_) => {
-                check_access(&dir_inode, creds, AccessMode::Execute)?;
+                self.check_inode_access(dirid, &dir_inode, creds, AccessMode::Execute)
+                    .await?;
 
                 match entry_result {
                     Ok(inode_id) => {
@@ -119,7 +120,8 @@ impl ZeroFS {
 
         if let Some(auth) = auth {
             let creds = Credentials::from_auth_context(auth);
-            check_access(&dir_inode, &creds, AccessMode::Read)?;
+            self.check_inode_access(dirid, &dir_inode, &creds, AccessMode::Read)
+                .await?;
         }
 
         use crate::fs::store::directory::{COOKIE_DOT, COOKIE_DOTDOT};

@@ -9,7 +9,7 @@ use crate::dedup::DedupResult;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
 use crate::fs::mutation::types::{ConflictKey, ConflictScope};
-use crate::fs::permissions::{AccessMode, Credentials, check_access};
+use crate::fs::permissions::{AccessMode, Credentials};
 use crate::fs::quota::QuotaSettlement;
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{AuthContext, FallocateMode, FileAttributes, InodeWithId};
@@ -55,7 +55,8 @@ impl ZeroFS {
 
         if let Some(auth) = auth {
             let creds = Credentials::from_auth_context(auth);
-            check_access(&inode, &creds, AccessMode::Read)?;
+            self.check_inode_access(id, &inode, &creds, AccessMode::Read)
+                .await?;
         }
 
         match &inode {
@@ -121,7 +122,8 @@ impl ZeroFS {
 
         match &inode {
             Inode::File(file) if creds.uid != file.uid => {
-                check_access(&inode, &creds, AccessMode::Write)?;
+                self.check_inode_access(id, &inode, &creds, AccessMode::Write)
+                    .await?;
             }
             Inode::File(_) => {}
             _ => return Err(FsError::IsDirectory),

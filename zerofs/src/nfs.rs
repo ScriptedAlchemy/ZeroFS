@@ -5,7 +5,7 @@ use crate::fs::inode::Inode;
 use crate::fs::mutation::durability::DurabilityTarget;
 use crate::fs::mutation::overlay::IdentifiedWrite;
 use crate::fs::mutation::types::{RequestIdentity, RequestLifetime};
-use crate::fs::permissions::{AccessMode, Credentials, check_access};
+use crate::fs::permissions::{AccessMode, Credentials, check_access_with_acl};
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{AuthContext, FileType, InodeWithId, SetAttributes, SetGid, SetUid};
 use async_trait::async_trait;
@@ -15,10 +15,10 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 use zerofs_nfsserve::nfs::{
-    ACCESS3_DELETE, ACCESS3_EXECUTE, ACCESS3_EXTEND, ACCESS3_LOOKUP, ACCESS3_MODIFY, ACCESS3_READ,
-    FSF_CANSETTIME, FSF_HOMOGENEOUS, FSF_LINK, FSF_SYMLINK, fattr3, fileid3, filename3, fsinfo3,
-    fsstat3, ftype3, nfspath3, nfsstat3, nfstime3, post_op_attr, sattr3, specdata3, stable_how,
-    writeverf3,
+    ACCESS3_ALL, ACCESS3_DELETE, ACCESS3_EXECUTE, ACCESS3_EXTEND, ACCESS3_LOOKUP, ACCESS3_MODIFY,
+    ACCESS3_READ, FSF_CANSETTIME, FSF_HOMOGENEOUS, FSF_LINK, FSF_SYMLINK, fattr3, fileid3,
+    filename3, fsinfo3, fsstat3, ftype3, nfspath3, nfsstat3, nfstime3, post_op_attr, sattr3,
+    specdata3, stable_how, writeverf3,
 };
 use zerofs_nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use zerofs_nfsserve::vfs::{
@@ -227,10 +227,14 @@ impl NFSFileSystem for NFSAdapter {
     ) -> Result<AccessResult, nfsstat3> {
         let auth = self.auth_context(auth);
         let creds = Credentials::from_auth_context(&auth);
-        let inode = self.fs.visible_inode(id).await?;
-        let allows = |mode| check_access(&inode, &creds, mode).is_ok();
-        // NFS ACCESS reports each requested right independently. Directory
-        // mutations require both write and search permission.
+        let (inode, acl) = if requested & ACCESS3_ALL != 0 {
+            self.fs.visible_inode_access_context(id, &creds).await?
+        } else {
+            (self.fs.visible_inode(id).await?, None)
+        };
+        let allows = |mode| check_access_with_acl(&inode, &creds, mode, acl.as_ref()).is_ok();
+        // NFS ACCESS reports each requested right independently. A directory
+        // mutation still needs one ACL entry granting both write and search.
         let mut access = 0;
         if requested & ACCESS3_READ != 0 && allows(AccessMode::Read) {
             access |= ACCESS3_READ;
@@ -243,16 +247,15 @@ impl NFSFileSystem for NFSAdapter {
         if requested & execute != 0 && allows(AccessMode::Execute) {
             access |= execute;
         }
-        let write = if inode.is_directory() {
-            ACCESS3_MODIFY | ACCESS3_EXTEND | ACCESS3_DELETE
+        let (write, mode) = if inode.is_directory() {
+            (
+                ACCESS3_MODIFY | ACCESS3_EXTEND | ACCESS3_DELETE,
+                AccessMode::WriteExecute,
+            )
         } else {
-            ACCESS3_MODIFY | ACCESS3_EXTEND
+            (ACCESS3_MODIFY | ACCESS3_EXTEND, AccessMode::Write)
         };
-        if !self.fs.db.is_read_only()
-            && requested & write != 0
-            && allows(AccessMode::Write)
-            && (!inode.is_directory() || allows(AccessMode::Execute))
-        {
+        if !self.fs.db.is_read_only() && requested & write != 0 && allows(mode) {
             access |= requested & write;
         }
         Ok(AccessResult {

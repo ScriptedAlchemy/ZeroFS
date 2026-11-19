@@ -384,6 +384,14 @@ impl Admission {
         lock(&self.inner.state).extra.used_operations
     }
 
+    /// Check terminal state without allocating bytes or joining the FIFO queue.
+    pub(crate) fn check_available(&self) -> Result<(), AdmissionError> {
+        match &lock(&self.inner.state).terminal {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+
     pub(crate) fn poison(&self, message: impl Into<String>) {
         terminate(&self.inner, AdmissionError::Poisoned(message.into()));
     }

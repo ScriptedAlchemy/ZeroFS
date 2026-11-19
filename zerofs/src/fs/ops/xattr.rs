@@ -1,7 +1,9 @@
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId};
 use crate::fs::mutation::types::{ConflictKey, ConflictScope};
-use crate::fs::permissions::{AccessMode, Credentials, check_access};
+use crate::fs::permissions::acl::PosixAcl;
+use crate::fs::permissions::acl::{NFS4_ACL_XDR, POSIX_ACL_ACCESS, POSIX_ACL_DEFAULT};
+use crate::fs::permissions::{AccessMode, Credentials, check_access_with_acl, check_ownership};
 use crate::fs::{ZeroFS, get_current_time};
 use bytes::Bytes;
 
@@ -9,6 +11,21 @@ pub const XATTR_VALUE_MAX: usize = 2_097_152;
 
 #[derive(Debug, Clone)]
 pub struct XattrName(Bytes);
+
+/// How ZeroFS treats an attribute name. See `docs/extended-attributes.md` and
+/// `docs/permissions-and-acl-contract.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum XattrKind {
+    User,
+    Trusted,
+    Security,
+    /// `system.posix_acl_access`: stored, served and enforced.
+    PosixAccess,
+    /// `system.posix_acl_default`: stored, served and inherited on create.
+    PosixDefault,
+    /// `system.nfs4_acl_xdr`: translated to POSIX ACLs on write, or refused.
+    Nfs4Xdr,
+}
 
 impl XattrName {
     pub fn new(name: &[u8]) -> Result<Self, FsError> {
@@ -19,7 +36,7 @@ impl XattrName {
             return Err(FsError::NameTooLong);
         }
         let name = Self(Bytes::copy_from_slice(name));
-        name.namespace()?;
+        name.kind()?;
         Ok(name)
     }
 
@@ -27,7 +44,7 @@ impl XattrName {
         &self.0
     }
 
-    fn namespace(&self) -> Result<&[u8], FsError> {
+    pub(crate) fn kind(&self) -> Result<XattrKind, FsError> {
         let Some(dot) = self.0.iter().position(|&b| b == b'.') else {
             return Err(FsError::NotSupported);
         };
@@ -35,16 +52,38 @@ impl XattrName {
             return Err(FsError::InvalidArgument);
         }
         match &self.0[..dot] {
-            ns @ (b"user" | b"trusted" | b"security") => Ok(ns),
+            b"user" => Ok(XattrKind::User),
+            b"trusted" => Ok(XattrKind::Trusted),
+            b"security" => Ok(XattrKind::Security),
+            b"system" => match self.as_bytes() {
+                POSIX_ACL_ACCESS => Ok(XattrKind::PosixAccess),
+                POSIX_ACL_DEFAULT => Ok(XattrKind::PosixDefault),
+                NFS4_ACL_XDR => Ok(XattrKind::Nfs4Xdr),
+                _ => Err(FsError::NotSupported),
+            },
             _ => Err(FsError::NotSupported),
         }
     }
 
-    fn check_read(&self, inode: &Inode, creds: &Credentials) -> Result<(), FsError> {
+    /// Whether the name is one of the ACL attributes ZeroFS interprets.
+    pub(crate) fn is_acl(&self) -> bool {
+        matches!(
+            self.kind(),
+            Ok(XattrKind::PosixAccess | XattrKind::PosixDefault | XattrKind::Nfs4Xdr)
+        )
+    }
+
+    /// `acl` is the inode's access ACL, from `ZeroFS::access_acl`.
+    fn check_read(
+        &self,
+        inode: &Inode,
+        creds: &Credentials,
+        acl: Option<&PosixAcl>,
+    ) -> Result<(), FsError> {
         if self.as_bytes() == b"security.capability" {
             return Err(FsError::NoData);
         }
-        self.check_access(inode, creds, false)
+        self.check_access(inode, creds, false, acl)
     }
 
     pub(crate) fn check_mutation(
@@ -52,16 +91,23 @@ impl XattrName {
         inode: &Inode,
         creds: &Credentials,
         remove: bool,
+        acl: Option<&PosixAcl>,
     ) -> Result<(), FsError> {
         if !remove && self.as_bytes() == b"security.capability" {
             return Err(FsError::NotSupported);
         }
-        self.check_access(inode, creds, true)
+        self.check_access(inode, creds, true, acl)
     }
 
-    fn check_access(&self, inode: &Inode, creds: &Credentials, write: bool) -> Result<(), FsError> {
-        match self.namespace()? {
-            b"user" => {
+    fn check_access(
+        &self,
+        inode: &Inode,
+        creds: &Credentials,
+        write: bool,
+        acl: Option<&PosixAcl>,
+    ) -> Result<(), FsError> {
+        match self.kind()? {
+            XattrKind::User => {
                 if !matches!(inode, Inode::File(_) | Inode::Directory(_)) {
                     return Err(FsError::OperationNotPermitted);
                 }
@@ -73,7 +119,7 @@ impl XattrName {
                 {
                     return Err(FsError::OperationNotPermitted);
                 }
-                check_access(
+                check_access_with_acl(
                     inode,
                     creds,
                     if write {
@@ -81,10 +127,22 @@ impl XattrName {
                     } else {
                         AccessMode::Read
                     },
+                    acl,
                 )
             }
-            b"trusted" if creds.uid != 0 => Err(FsError::OperationNotPermitted),
-            b"security" if write && creds.uid != 0 => Err(FsError::OperationNotPermitted),
+            XattrKind::Trusted if creds.uid != 0 => Err(FsError::OperationNotPermitted),
+            XattrKind::Security if write && creds.uid != 0 => Err(FsError::OperationNotPermitted),
+            // Linux has no ACL operations on symlinks.
+            XattrKind::PosixAccess | XattrKind::PosixDefault | XattrKind::Nfs4Xdr
+                if matches!(inode, Inode::Symlink(_)) =>
+            {
+                Err(FsError::NotSupported)
+            }
+            // Any caller may read an ACL; only the owner or root may change it
+            // (Linux `inode_owner_or_capable`).
+            XattrKind::PosixAccess | XattrKind::PosixDefault | XattrKind::Nfs4Xdr if write => {
+                check_ownership(inode, creds)
+            }
             _ => Ok(()),
         }
     }
@@ -129,17 +187,33 @@ impl ZeroFS {
     ) -> Result<Bytes, FsError> {
         let _guard = self.lock_manager.acquire(id).await;
         let inode = self.inode_store.get(id).await?;
-        name.check_read(&inode, creds)?;
+        if name.kind()? == XattrKind::PosixAccess {
+            name.check_read(&inode, creds, None)?;
+            // Even an owner must receive ACL entries and mode from the same
+            // view; this process's inode lock does not stop a reader refresh.
+            let (inode, value) = self.xattr_store.get_with_inode(id, name.as_bytes()).await?;
+            let value = value.ok_or(FsError::NoData)?;
+            return Ok(acl::decode_stored(id, &value)?
+                .with_mode(inode.mode())
+                .to_bytes());
+        }
+        let (inode, acl) = self.inode_access_context(id, &inode, creds).await?;
+        name.check_read(&inode, creds, acl.as_ref())?;
         self.xattr_store.get(id, name.as_bytes()).await
     }
 
     pub async fn list_xattrs(&self, creds: &Credentials, id: InodeId) -> Result<Bytes, FsError> {
         let _guard = self.lock_manager.acquire(id).await;
         let inode = self.inode_store.get(id).await?;
+        let (inode, acl) = self.inode_access_context(id, &inode, creds).await?;
         let mut list = Vec::new();
         for name in self.xattr_store.list(id).await? {
-            let name = XattrName::new(&name)?;
-            if name.check_read(&inode, creds).is_ok() {
+            let Ok(name) = XattrName::new(&name) else {
+                // Internal rows, such as the volume ACL marker, are not
+                // attributes of any file.
+                continue;
+            };
+            if name.check_read(&inode, creds, acl.as_ref()).is_ok() {
                 list.extend_from_slice(name.as_bytes());
                 list.push(0);
             }
@@ -155,6 +229,10 @@ impl ZeroFS {
         value: XattrValue,
         mode: XattrSetMode,
     ) -> Result<(), FsError> {
+        if name.is_acl() {
+            // Linux ignores XATTR_CREATE and XATTR_REPLACE for ACLs.
+            return self.mutate_acl(creds, id, name, Some(value.0)).await;
+        }
         self.mutate_xattr(creds, id, name, Some((value, mode)))
             .await
     }
@@ -165,6 +243,9 @@ impl ZeroFS {
         id: InodeId,
         name: &XattrName,
     ) -> Result<(), FsError> {
+        if name.is_acl() {
+            return self.mutate_acl(creds, id, name, None).await;
+        }
         self.mutate_xattr(creds, id, name, None).await
     }
 
@@ -180,12 +261,9 @@ impl ZeroFS {
             .await?;
         let guard = self.lock_manager.acquire(id).await;
         let mut inode = self.inode_store.get(id).await?;
-        name.check_mutation(&inode, creds, value.is_none())?;
-        let exists = match self.xattr_store.get(id, name.as_bytes()).await {
-            Ok(_) => true,
-            Err(FsError::NoData) => false,
-            Err(error) => return Err(error),
-        };
+        let acl = self.access_acl(id, &inode, creds).await?;
+        name.check_mutation(&inode, creds, value.is_none(), acl.as_ref())?;
+        let exists = self.xattr_exists(id, name.as_bytes()).await?;
         match &value {
             Some((_, XattrSetMode::Create)) if exists => return Err(FsError::Exists),
             Some((_, XattrSetMode::Replace)) | None if !exists => return Err(FsError::NoData),
@@ -219,5 +297,10 @@ impl ZeroFS {
     }
 }
 
+mod acl;
+pub(crate) use acl::AclState;
+
+#[cfg(test)]
+mod acl_tests;
 #[cfg(test)]
 mod tests;

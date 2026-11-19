@@ -12,7 +12,7 @@ use crate::fs::inode::{
 };
 use crate::fs::mutation::types::{ConflictKey, ConflictScope};
 use crate::fs::permissions::{
-    AccessMode, Credentials, check_access, new_entry_gid, strip_sgid_unless_member, validate_mode,
+    AccessMode, Credentials, new_entry_gid, strip_sgid_unless_member, validate_mode,
 };
 #[cfg(test)]
 use crate::fs::store::directory::COOKIE_FIRST_ENTRY;
@@ -53,6 +53,19 @@ impl ZeroFS {
         attr: &SetAttributes,
         op_id: crate::dedup::OpId,
     ) -> Result<(InodeId, FileAttributes), FsError> {
+        self.create_with_umask(creds, dirid, name, attr, op_id, 0)
+            .await
+    }
+
+    pub(crate) async fn create_with_umask(
+        &self,
+        creds: &Credentials,
+        dirid: InodeId,
+        name: &[u8],
+        attr: &SetAttributes,
+        op_id: crate::dedup::OpId,
+        umask: u32,
+    ) -> Result<(InodeId, FileAttributes), FsError> {
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_create)? {
             return Ok(result);
         }
@@ -87,8 +100,8 @@ impl ZeroFS {
         let (parent_and_name, cookie) = tokio::join!(parent_and_name, cookie_read);
         let (mut dir_inode, exists) = parent_and_name?;
 
-        check_access(&dir_inode, creds, AccessMode::Write)?;
-        check_access(&dir_inode, creds, AccessMode::Execute)?;
+        self.check_inode_access(dirid, &dir_inode, creds, AccessMode::WriteExecute)
+            .await?;
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
@@ -109,15 +122,16 @@ impl ZeroFS {
                 let (now_sec, now_nsec) = get_current_time();
 
                 let new_gid = new_entry_gid(dir, &attr.gid, creds);
-                let final_mode = strip_sgid_unless_member(
-                    dir,
-                    match &attr.mode {
-                        SetMode::Set(m) => validate_mode(*m),
-                        SetMode::NoChange => 0o666,
-                    },
-                    new_gid,
-                    creds,
-                );
+                let mode = match attr.mode {
+                    SetMode::Set(mode) => validate_mode(mode),
+                    SetMode::NoChange => 0o666,
+                };
+                let mut final_mode = mode;
+                let inherited_acls = self
+                    .inherited_acls(dirid, false, &mut final_mode, umask, |mode| {
+                        strip_sgid_unless_member(dir, mode, new_gid, creds)
+                    })
+                    .await?;
 
                 let file_inode = Inode::File(FileInode {
                     size: 0,
@@ -156,6 +170,7 @@ impl ZeroFS {
                     },
                 );
                 self.inode_store.save(&mut txn, file_id, &file_inode)?;
+                inherited_acls.stage(self, &mut txn, file_id);
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::CREATE_AFTER_INODE);
@@ -239,7 +254,7 @@ impl ZeroFS {
         name: &[u8],
         attr: &SetAttributes,
     ) -> Result<(InodeId, FileAttributes), FsError> {
-        self.mkdir_idempotent(creds, dirid, name, attr, [0u8; 16])
+        self.mkdir_idempotent(creds, dirid, name, attr, [0u8; 16], 0)
             .await
     }
 
@@ -252,6 +267,7 @@ impl ZeroFS {
         name: &[u8],
         attr: &SetAttributes,
         op_id: crate::dedup::OpId,
+        umask: u32,
     ) -> Result<(InodeId, FileAttributes), FsError> {
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_mkdir)? {
             return Ok(result);
@@ -277,8 +293,8 @@ impl ZeroFS {
             self.directory_store.exists(dirid, name)
         )?;
 
-        check_access(&dir_inode, creds, AccessMode::Write)?;
-        check_access(&dir_inode, creds, AccessMode::Execute)?;
+        self.check_inode_access(dirid, &dir_inode, creds, AccessMode::WriteExecute)
+            .await?;
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
@@ -294,13 +310,16 @@ impl ZeroFS {
                 let (now_sec, now_nsec) = get_current_time();
 
                 let mut new_mode = match &attr.mode {
-                    SetMode::Set(m) => *m,
+                    SetMode::Set(m) => validate_mode(*m),
                     SetMode::NoChange => 0o777,
                 };
 
                 if dir.mode & 0o2000 != 0 {
                     new_mode |= 0o2000;
                 }
+                let inherited_acls = self
+                    .inherited_acls(dirid, true, &mut new_mode, umask, |mode| mode)
+                    .await?;
 
                 let new_uid = match &attr.uid {
                     SetUid::Set(u) => *u,
@@ -356,6 +375,7 @@ impl ZeroFS {
                 );
                 self.inode_store
                     .save(&mut txn, new_dir_id, &new_dir_inode_enum)?;
+                inherited_acls.stage(self, &mut txn, new_dir_id);
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::MKDIR_AFTER_INODE);
@@ -433,7 +453,7 @@ impl ZeroFS {
         attr: &SetAttributes,
         rdev: Option<(u32, u32)>,
     ) -> Result<(InodeId, FileAttributes), FsError> {
-        self.mknod_idempotent(creds, dirid, name, ftype, attr, rdev, [0u8; 16])
+        self.mknod_idempotent(creds, dirid, name, ftype, attr, rdev, [0u8; 16], 0)
             .await
     }
 
@@ -449,6 +469,7 @@ impl ZeroFS {
         attr: &SetAttributes,
         rdev: Option<(u32, u32)>,
         op_id: crate::dedup::OpId,
+        umask: u32,
     ) -> Result<(InodeId, FileAttributes), FsError> {
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_mknod)? {
             return Ok(result);
@@ -482,8 +503,8 @@ impl ZeroFS {
             self.directory_store.exists(dirid, name)
         )?;
 
-        check_access(&dir_inode, creds, AccessMode::Write)?;
-        check_access(&dir_inode, creds, AccessMode::Execute)?;
+        self.check_inode_access(dirid, &dir_inode, creds, AccessMode::WriteExecute)
+            .await?;
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
@@ -506,16 +527,16 @@ impl ZeroFS {
                 };
 
                 let new_gid = new_entry_gid(dir, &attr.gid, creds);
-                let final_mode = strip_sgid_unless_member(
-                    dir,
-                    if let SetMode::Set(m) = attr.mode {
-                        validate_mode(m)
-                    } else {
-                        base_mode
-                    },
-                    new_gid,
-                    creds,
-                );
+                let mode = match attr.mode {
+                    SetMode::Set(mode) => validate_mode(mode),
+                    SetMode::NoChange => base_mode,
+                };
+                let mut final_mode = mode;
+                let inherited_acls = self
+                    .inherited_acls(dirid, false, &mut final_mode, umask, |mode| {
+                        strip_sgid_unless_member(dir, mode, new_gid, creds)
+                    })
+                    .await?;
 
                 let special_inode = SpecialInode {
                     mtime: now_sec,
@@ -564,6 +585,7 @@ impl ZeroFS {
                 );
 
                 self.inode_store.save(&mut txn, special_id, &inode)?;
+                inherited_acls.stage(self, &mut txn, special_id);
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::MKNOD_AFTER_INODE);
@@ -760,6 +782,7 @@ mod tests {
                 b"dir",
                 &SetAttributes::default(),
                 mkdir_op,
+                0,
             )
             .await
             .unwrap();
@@ -775,6 +798,7 @@ mod tests {
                 b"dir",
                 &SetAttributes::default(),
                 mkdir_op,
+                0,
             )
             .await
             .unwrap();
@@ -792,6 +816,7 @@ mod tests {
                 &SetAttributes::default(),
                 None,
                 mknod_op,
+                0,
             )
             .await
             .unwrap();
@@ -816,6 +841,7 @@ mod tests {
                 &SetAttributes::default(),
                 None,
                 mknod_op,
+                0,
             )
             .await
             .unwrap();

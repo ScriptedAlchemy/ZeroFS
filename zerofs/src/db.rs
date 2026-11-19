@@ -606,6 +606,86 @@ impl Db {
         self.get_bytes_at(key, DurabilityLevel::Memory).await
     }
 
+    /// Read two distinct, ascending keys from one committed view. Permission
+    /// checks use this to keep inode mode/ownership and its ACL in agreement.
+    pub(crate) async fn get_pair_snapshot(
+        &self,
+        first: &Bytes,
+        second: &Bytes,
+    ) -> Result<(Option<Bytes>, Option<Bytes>)> {
+        self.get_pair_snapshot_after_first(first, second, std::future::ready(()))
+            .await
+    }
+
+    /// The hook lets regressions commit or refresh the database between reads;
+    /// the serving path uses an immediately ready future.
+    async fn get_pair_snapshot_after_first(
+        &self,
+        first: &Bytes,
+        second: &Bytes,
+        after_first: impl std::future::Future<Output = ()>,
+    ) -> Result<(Option<Bytes>, Option<Bytes>)> {
+        self.check_lease()?;
+        anyhow::ensure!(
+            first < second,
+            "snapshot pair keys must be strictly ascending"
+        );
+        let pair = match &self.inner {
+            SlateDbHandle::ReadWrite(db) => {
+                let snapshot = db.snapshot().await?;
+                let options = ReadOptions {
+                    durability_filter: DurabilityLevel::Memory,
+                    cache_blocks: true,
+                    ..Default::default()
+                };
+                let first_value = snapshot.get_with_options(first, &options).await?;
+                after_first.await;
+                let second_value = snapshot.get_with_options(second, &options).await?;
+                (first_value, second_value)
+            }
+            SlateDbHandle::ReadOnly(readers) => {
+                // DbReader has no point-read snapshot API. One scan retains
+                // its immutable reader state and sequence through seek, even
+                // if background refresh or a reader swap runs between keys.
+                let reader = readers.load_full();
+                let options = ScanOptions {
+                    durability_filter: DurabilityLevel::Memory,
+                    read_ahead_bytes: 1,
+                    cache_blocks: true,
+                    max_fetch_tasks: 1,
+                    ..Default::default()
+                };
+                let mut iter = reader
+                    .scan_with_options(first.clone()..=second.clone(), &options)
+                    .await?;
+                let row = iter.next().await?;
+                after_first.await;
+                let pair = match row {
+                    None => (None, None),
+                    // If the first key is absent, the first row may already
+                    // be the second key. Seeking backward to it is invalid.
+                    Some(row) if row.key == *second => (None, Some(row.value)),
+                    Some(row) => {
+                        let first_value = (row.key == *first).then_some(row.value);
+                        iter.seek(second).await?;
+                        let second_value = iter
+                            .next()
+                            .await?
+                            .filter(|row| row.key == *second)
+                            .map(|row| row.value);
+                        (first_value, second_value)
+                    }
+                };
+                drop(iter);
+                drop(reader);
+                pair
+            }
+        };
+        // Never publish values captured across loss of serving authority.
+        self.check_lease()?;
+        Ok(pair)
+    }
+
     /// Point read for commit-worker internal work.
     ///
     /// Unlike a serving read, this waits through a recoverable lease
@@ -1188,6 +1268,9 @@ async fn forward_scan<S: ScanSource>(
         }
     }
 }
+
+#[cfg(test)]
+mod permission_snapshot_tests;
 
 #[cfg(test)]
 mod warm_tracker_tests {

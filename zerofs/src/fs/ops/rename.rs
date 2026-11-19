@@ -10,7 +10,7 @@ use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId};
 use crate::fs::mutation::types::{ConflictKey, ConflictScope};
 use crate::fs::name_mode::NameMatch;
-use crate::fs::permissions::{AccessMode, Credentials, check_access, check_sticky_bit_delete};
+use crate::fs::permissions::{AccessMode, Credentials, check_sticky_bit_delete};
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::AuthContext;
 use crate::fs::{
@@ -470,7 +470,8 @@ impl ZeroFS {
             if !matches!(&dir_inode, Inode::Directory(_)) {
                 return Err(FsError::NotDirectory);
             }
-            check_access(&dir_inode, &creds, AccessMode::Execute)?;
+            self.check_inode_access(dirid, &dir_inode, &creds, AccessMode::Execute)
+                .await?;
             if matches!(&dir_inode, Inode::Directory(dir) if dir.nlink == 0) {
                 return Err(FsError::StaleHandle);
             }
@@ -653,13 +654,16 @@ impl ZeroFS {
         // hard-link aliases and every actual publication retain the normal
         // write and sticky-directory checks.
         let verify_in_place = verification.is_some() && same_entry && from_name == to_name;
-        if !verify_in_place {
-            check_access(&from_dir, &creds, AccessMode::Write)?;
-        }
-        check_access(&from_dir, &creds, AccessMode::Execute)?;
+        let required = if verify_in_place {
+            AccessMode::Execute
+        } else {
+            AccessMode::WriteExecute
+        };
+        self.check_inode_access(from_dirid, &from_dir, &creds, required)
+            .await?;
         if let Some(ref to_dir) = to_dir {
-            check_access(to_dir, &creds, AccessMode::Write)?;
-            check_access(to_dir, &creds, AccessMode::Execute)?;
+            self.check_inode_access(to_dirid, to_dir, &creds, AccessMode::WriteExecute)
+                .await?;
         }
         if !verify_in_place {
             check_sticky_bit_delete(&from_dir, &source_inode, &creds)?;

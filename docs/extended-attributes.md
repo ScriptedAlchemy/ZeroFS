@@ -43,13 +43,17 @@ bounded by the count cap.
 | `trusted.*` | The caller must have uid 0. | The caller must have uid 0. |
 | `security.capability` | Reads return `ENODATA` and listings omit the name, including for pre-existing values. | Sets return `EOPNOTSUPP`. The caller must have uid 0 to remove a stored value. |
 | Other `security.*` | Any caller may read or list these attributes. | The caller must have uid 0. |
-| `system.*` | ZeroFS returns `EOPNOTSUPP`. | ZeroFS returns `EOPNOTSUPP`. |
+| `system.posix_acl_access`, `system.posix_acl_default` | Any caller may read or list these. Reads of the access ACL take the owner, mask and other entries from the current mode. | The caller must be the owner or uid 0. The value is validated and enforced. |
+| `system.nfs4_acl_xdr` | Reads return `ENODATA`; ZeroFS does not store the value. | The caller must be the owner or uid 0. ZeroFS translates the value to POSIX ACLs or returns `EOPNOTSUPP`. |
+| Other `system.*` | ZeroFS returns `EOPNOTSUPP`. | ZeroFS returns `EOPNOTSUPP`. |
 
 Only regular files and directories may carry `user.*` attributes. Access to that
 namespace on symlinks, FIFOs, sockets, or device nodes returns `EPERM`, including
 for uid 0. On a directory with the sticky bit, only the owner or uid 0 may set or
 remove `user.*` attributes. Unknown namespace prefixes return `EOPNOTSUPP`.
-Storing these attributes does not implement POSIX ACL enforcement.
+[permissions-and-acl-contract.md](permissions-and-acl-contract.md) describes
+ACL storage, enforcement, inheritance and NFSv4 translation. ACL writes ignore
+`XATTR_CREATE` and `XATTR_REPLACE`, as Linux does.
 
 A set with flags zero creates or replaces an attribute. `XATTR_CREATE` requires the
 attribute to be absent and returns `EEXIST` if it exists. `XATTR_REPLACE` requires it
@@ -84,8 +88,13 @@ both encode size zero and flags `XATTR_REPLACE`, with no value write. Therefore
 empty replacement through that client removes the attribute. A server cannot
 preserve both operations from the identical request. The
 [Linux 7.0 wire receipt](evidence/pr84-acceptance-20261118/README.md)
-records the exact bytes and source path. This remains an incompatible acceptance
-requirement when kernel 9P is required; the FUSE result does not satisfy it.
+records the exact bytes and source path. The
+[mounted matrix receipt](evidence/acl-xattr-20261119/README.md) repeats the
+result on a real kernel 9P mount with the app's options: the empty replacement
+returns success and the attribute is then absent. FUSE stores the empty value.
+No server change can satisfy an empty-replacement check through the kernel
+client. A release gate that requires it on kernel 9P tests an incompatible
+requirement; test that case through FUSE instead.
 
 ZeroFS does not deduplicate xattr set and remove across HA failover. `Tclunk` has no
 operation id. Retrying a successful create-only set may return `EEXIST`; retrying a
@@ -99,6 +108,8 @@ filesystem fsync cutoff covers a completed mutation.
 `ninep-client`. Linux caps an attribute value at 65,536 bytes before a request
 reaches ZeroFS, even though the core and 9P store accept 2,097,152 bytes.
 NFSv3 and the separate Rust kernel client have no xattr API in this change.
+The FUSE client negotiates `FUSE_POSIX_ACL`, so the kernel reads and evaluates
+`system.posix_acl_*` through these calls.
 
 Client and server must both include extended-attribute support. A new client
 connected to a server from `main` receives `EOPNOTSUPP` for get and list. That

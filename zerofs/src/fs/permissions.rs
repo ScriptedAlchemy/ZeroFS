@@ -1,16 +1,10 @@
+pub(crate) mod acl;
+pub(crate) mod nfs4;
+
 use super::errors::FsError;
 use super::inode::{DirectoryInode, Inode, InodeAttrs};
 use super::types::{AuthContext, SetGid};
 
-const S_IRUSR: u32 = 0o400;
-const S_IWUSR: u32 = 0o200;
-const S_IXUSR: u32 = 0o100;
-const S_IRGRP: u32 = 0o040;
-const S_IWGRP: u32 = 0o020;
-const S_IXGRP: u32 = 0o010;
-const S_IROTH: u32 = 0o004;
-const S_IWOTH: u32 = 0o002;
-const S_IXOTH: u32 = 0o001;
 const S_ISVTX: u32 = 0o1000;
 
 #[derive(Debug, Clone, Copy)]
@@ -37,6 +31,9 @@ impl Credentials {
             gid_known: auth.gid_known,
             groups: [0; 16],
             groups_count: auth.gids.len().min(16),
+            // Dropping a restrictive ACL group must not make OTHER appear to
+            // be the caller's applicable class. Unknown groups fail closed
+            // when an access ACL could distinguish their permissions.
             groups_complete: auth.groups_complete && !groups_truncated,
             groups_truncated,
         };
@@ -57,7 +54,7 @@ impl Credentials {
         self.is_known_member_of_group(gid) || (!self.groups_complete && !self.groups_truncated)
     }
 
-    fn is_known_member_of_group(&self, gid: u32) -> bool {
+    pub(crate) fn is_known_member_of_group(&self, gid: u32) -> bool {
         if self.gid_known && self.gid == gid {
             return true;
         }
@@ -103,56 +100,75 @@ pub enum AccessMode {
     Read,
     Write,
     Execute,
+    ReadWrite,
+    WriteExecute,
 }
 
-pub(crate) fn check_access(
+impl AccessMode {
+    /// An operation's complete permission request. With POSIX ACLs, checking
+    /// each bit separately can combine grants from different group entries.
+    pub(crate) const fn bits(self) -> u16 {
+        match self {
+            Self::Read => 4,
+            Self::Write => 2,
+            Self::Execute => 1,
+            Self::ReadWrite => 6,
+            Self::WriteExecute => 3,
+        }
+    }
+}
+
+/// Linux `generic_permission` with an optional access ACL. `acl` is the
+/// stored ACL; owner, mask and other permissions come from the inode mode.
+pub(crate) fn check_access_with_acl(
     inode: &Inode,
     creds: &Credentials,
     mode: AccessMode,
+    acl: Option<&acl::PosixAcl>,
 ) -> Result<(), FsError> {
     let (uid, gid, file_mode) = (inode.uid(), inode.gid(), inode.mode());
 
     if creds.uid == 0 {
         // Root can search a directory even when none of its mode bits grant
         // search access. The execute-bit requirement applies to files only.
-        if let AccessMode::Execute = mode
-            && !inode.is_directory()
-            && file_mode & 0o111 == 0
-        {
+        if mode.bits() & 1 != 0 && !inode.is_directory() && file_mode & 0o111 == 0 {
             return Err(FsError::PermissionDenied);
         }
         return Ok(());
     }
 
-    let permission_bits = match mode {
-        AccessMode::Read => (S_IRUSR, S_IRGRP, S_IROTH),
-        AccessMode::Write => (S_IWUSR, S_IWGRP, S_IWOTH),
-        AccessMode::Execute => (S_IXUSR, S_IXGRP, S_IXOTH),
-    };
+    if let Some(acl) = acl
+        && creds.uid != uid
+    {
+        return if acl.with_mode(file_mode).permits(uid, gid, creds, mode) {
+            Ok(())
+        } else {
+            Err(FsError::PermissionDenied)
+        };
+    }
 
-    if creds.uid == uid {
-        if file_mode & permission_bits.0 != 0 {
-            return Ok(());
-        }
+    let want = u32::from(mode.bits());
+    let grants = |bits: u32| bits & want == want;
+    let allowed = if creds.uid == uid {
+        grants(file_mode >> 6)
     } else if creds.is_known_member_of_group(gid) {
-        if file_mode & permission_bits.1 != 0 {
-            return Ok(());
-        }
+        grants(file_mode >> 3)
     } else if creds.groups_truncated {
         // Local truncation does not prove a kernel already authorized this
         // request. The caller may belong to either remaining class.
-        if file_mode & permission_bits.1 != 0 && file_mode & permission_bits.2 != 0 {
-            return Ok(());
-        }
+        grants(file_mode >> 3) && grants(file_mode)
     } else if !creds.groups_complete {
-        if file_mode & (permission_bits.1 | permission_bits.2) != 0 {
-            return Ok(());
-        }
-    } else if file_mode & permission_bits.2 != 0 {
-        return Ok(());
+        // Preserve the existing kernel-authorized unknown-group fallback,
+        // but do not assemble one request from different permission classes.
+        grants(file_mode >> 3) || grants(file_mode)
+    } else {
+        grants(file_mode)
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(FsError::PermissionDenied)
     }
-
-    Err(FsError::PermissionDenied)
 }
 
 pub(crate) fn check_ownership(inode: &Inode, creds: &Credentials) -> Result<(), FsError> {
@@ -187,13 +203,14 @@ pub(crate) fn can_set_times(
     inode: &Inode,
     creds: &Credentials,
     setting_to_current_time: bool,
+    acl: Option<&acl::PosixAcl>,
 ) -> Result<(), FsError> {
     if creds.uid == 0 || creds.uid == inode.uid() {
         return Ok(());
     }
 
     if setting_to_current_time {
-        return check_access(inode, creds, AccessMode::Write);
+        return check_access_with_acl(inode, creds, AccessMode::Write, acl);
     }
 
     Err(FsError::OperationNotPermitted)
@@ -232,9 +249,12 @@ mod tests {
         });
         for mode in [0o000, 0o444, 0o600, 0o666] {
             let inode = directory(mode);
-            assert_eq!(check_access(&inode, &root, AccessMode::Execute), Ok(()));
             assert_eq!(
-                check_access(&inode, &owner, AccessMode::Execute),
+                check_access_with_acl(&inode, &root, AccessMode::Execute, None),
+                Ok(())
+            );
+            assert_eq!(
+                check_access_with_acl(&inode, &owner, AccessMode::Execute, None),
                 Err(FsError::PermissionDenied),
                 "an ordinary owner still needs directory search permission"
             );
@@ -255,11 +275,199 @@ mod tests {
             } else {
                 Ok(())
             };
-            assert_eq!(check_access(&inode, &root, AccessMode::Execute), expected);
-            assert_eq!(check_access(&inode, &root, AccessMode::Read), Ok(()));
-            assert_eq!(check_access(&inode, &root, AccessMode::Write), Ok(()));
+            assert_eq!(
+                check_access_with_acl(&inode, &root, AccessMode::Execute, None),
+                expected
+            );
+            assert_eq!(
+                check_access_with_acl(&inode, &root, AccessMode::Read, None),
+                Ok(())
+            );
+            assert_eq!(
+                check_access_with_acl(&inode, &root, AccessMode::Write, None),
+                Ok(())
+            );
+            assert_eq!(
+                check_access_with_acl(&inode, &root, AccessMode::ReadWrite, None),
+                Ok(())
+            );
+            assert_eq!(
+                check_access_with_acl(&inode, &root, AccessMode::WriteExecute, None),
+                expected
+            );
         }
     }
+
+    #[test]
+    fn combined_requests_require_every_bit_from_one_permission_class() {
+        let owner = Credentials::from_auth_context(&AuthContext {
+            uid: 1000,
+            gid: 1000,
+            groups_complete: true,
+            groups_truncated: false,
+            ..AuthContext::default()
+        });
+        let group = Credentials { uid: 2000, ..owner };
+        let other = Credentials { gid: 2000, ..group };
+        let unknown = Credentials {
+            groups_complete: false,
+            groups_truncated: false,
+            ..other
+        };
+        for (creds, mode, allowed) in [
+            (owner, 0o400, false),
+            (owner, 0o600, true),
+            (group, 0o040, false),
+            (group, 0o060, true),
+            (other, 0o004, false),
+            (other, 0o006, true),
+            (unknown, 0o042, false),
+            (unknown, 0o060, true),
+            (unknown, 0o006, true),
+        ] {
+            assert_eq!(
+                check_access_with_acl(&directory(mode), &creds, AccessMode::ReadWrite, None)
+                    .is_ok(),
+                allowed,
+                "mode {mode:o} for {creds:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn combined_acl_requests_do_not_union_matching_group_entries() {
+        let creds = Credentials::from_auth_context(&AuthContext {
+            uid: 2000,
+            gid: 300,
+            gids: vec![300, 301],
+            groups_complete: true,
+            groups_truncated: false,
+            ..AuthContext::default()
+        });
+        for (first, second, combined, bits) in [
+            (
+                AccessMode::Read,
+                AccessMode::Write,
+                AccessMode::ReadWrite,
+                6,
+            ),
+            (
+                AccessMode::Write,
+                AccessMode::Execute,
+                AccessMode::WriteExecute,
+                3,
+            ),
+        ] {
+            let inode = directory(u32::from(bits) << 3);
+            let acl = acl::PosixAcl::from_parts(
+                7,
+                &[],
+                0,
+                &[(300, first.bits()), (301, second.bits())],
+                bits,
+                0,
+            );
+            assert_eq!(
+                check_access_with_acl(&inode, &creds, first, Some(&acl)),
+                Ok(())
+            );
+            assert_eq!(
+                check_access_with_acl(&inode, &creds, second, Some(&acl)),
+                Ok(())
+            );
+            assert_eq!(
+                check_access_with_acl(&inode, &creds, combined, Some(&acl)),
+                Err(FsError::PermissionDenied)
+            );
+            let one_grant = acl::PosixAcl::from_parts(7, &[], 0, &[(300, bits), (301, 0)], bits, 0);
+            assert_eq!(
+                check_access_with_acl(&inode, &creds, combined, Some(&one_grant)),
+                Ok(())
+            );
+        }
+    }
+
+    #[test]
+    fn combined_acl_requests_preserve_named_user_precedence_and_mask() {
+        let named = Credentials::from_auth_context(&AuthContext {
+            uid: 2000,
+            gid: 300,
+            groups_complete: true,
+            ..AuthContext::default()
+        });
+        // A permissive group must never supplement a matching named user.
+        let named_read = acl::PosixAcl::from_parts(6, &[(2000, 4)], 0, &[(300, 6)], 6, 0);
+        assert_eq!(
+            check_access_with_acl(
+                &directory(0o660),
+                &named,
+                AccessMode::ReadWrite,
+                Some(&named_read)
+            ),
+            Err(FsError::PermissionDenied)
+        );
+        let named_read_write = acl::PosixAcl::from_parts(6, &[(2000, 6)], 0, &[(300, 6)], 6, 0);
+        // The mask comes from the inode and limits the complete request.
+        for (mode, expected) in [(0o640, Err(FsError::PermissionDenied)), (0o660, Ok(()))] {
+            assert_eq!(
+                check_access_with_acl(
+                    &directory(mode),
+                    &named,
+                    AccessMode::ReadWrite,
+                    Some(&named_read_write)
+                ),
+                expected
+            );
+        }
+        // Ownership still wins over any named or group entry.
+        let owner = Credentials { uid: 1000, ..named };
+        assert_eq!(
+            check_access_with_acl(
+                &directory(0o460),
+                &owner,
+                AccessMode::ReadWrite,
+                Some(&named_read_write)
+            ),
+            Err(FsError::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn truncated_groups_do_not_bypass_restrictive_acl_entries() {
+        let auth = AuthContext {
+            uid: 2000,
+            gid: 2000,
+            gids: (300..317).collect(),
+            groups_complete: true,
+            groups_truncated: false,
+            ..AuthContext::default()
+        };
+        let creds = Credentials::from_auth_context(&auth);
+        assert_eq!(creds.groups_count, 16);
+        assert!(!creds.groups_complete);
+        assert!(creds.groups_truncated);
+        let inode = directory(0o777);
+        let restrictive = acl::PosixAcl::from_parts(7, &[], 7, &[(316, 0)], 7, 7);
+        assert_eq!(
+            check_access_with_acl(&inode, &creds, AccessMode::Read, Some(&restrictive)),
+            Err(FsError::PermissionDenied)
+        );
+        let unrestricted = acl::PosixAcl::from_parts(7, &[], 7, &[(316, 7)], 7, 7);
+        assert_eq!(
+            check_access_with_acl(&inode, &creds, AccessMode::Read, Some(&unrestricted)),
+            Ok(())
+        );
+        let complete = Credentials::from_auth_context(&AuthContext {
+            gids: vec![316],
+            ..auth
+        });
+        assert!(complete.groups_complete);
+        assert_eq!(
+            check_access_with_acl(&inode, &complete, AccessMode::Read, Some(&restrictive)),
+            Err(FsError::PermissionDenied)
+        );
+    }
+
     #[test]
     fn locally_truncated_groups_do_not_gain_mode_or_group_authority() {
         let creds = Credentials::from_auth_context(&AuthContext {
@@ -276,18 +484,18 @@ mod tests {
         // The caller really belongs to the denied owning group, but its ID
         // fell beyond the inline list. Falling through to OTHER would allow.
         assert_eq!(
-            check_access(&omitted_group_inode, &creds, AccessMode::Read),
+            check_access_with_acl(&omitted_group_inode, &creds, AccessMode::Read, None),
             Err(FsError::PermissionDenied)
         );
         for mode in [0o640, 0o604] {
             assert_eq!(
-                check_access(&directory(mode), &creds, AccessMode::Read),
+                check_access_with_acl(&directory(mode), &creds, AccessMode::Read, None),
                 Err(FsError::PermissionDenied)
             );
         }
         // If both possible classes allow the request, truncation is harmless.
         assert_eq!(
-            check_access(&directory(0o644), &creds, AccessMode::Read),
+            check_access_with_acl(&directory(0o644), &creds, AccessMode::Read, None),
             Ok(())
         );
         assert!(!creds.is_member_of_group(1000));
@@ -321,7 +529,7 @@ mod tests {
         let roundtrip = Credentials::from_auth_context(&auth);
         assert!(roundtrip.groups_truncated);
         assert_eq!(
-            check_access(&directory(0o640), &roundtrip, AccessMode::Read),
+            check_access_with_acl(&directory(0o640), &roundtrip, AccessMode::Read, None),
             Err(FsError::PermissionDenied)
         );
         assert!(!roundtrip.is_member_of_group(1000));
@@ -349,7 +557,7 @@ mod tests {
         });
         assert!(!creds.groups_truncated);
         assert_eq!(
-            check_access(&directory(0o640), &creds, AccessMode::Read),
+            check_access_with_acl(&directory(0o640), &creds, AccessMode::Read, None),
             Ok(())
         );
         assert!(creds.is_member_of_group(1000));
@@ -357,7 +565,7 @@ mod tests {
         assert!(!roundtrip.groups_complete);
         assert!(!roundtrip.groups_truncated);
         assert_eq!(
-            check_access(&directory(0o604), &roundtrip, AccessMode::Read),
+            check_access_with_acl(&directory(0o604), &roundtrip, AccessMode::Read, None),
             Ok(())
         );
     }

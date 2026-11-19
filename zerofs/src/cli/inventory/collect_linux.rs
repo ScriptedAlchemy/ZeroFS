@@ -147,6 +147,7 @@ fn acl_probes(mut probe: impl FnMut(&str) -> Field<Option<RawBytes>>) -> Field<V
             format,
             raw: probe(name).format_probe(),
             decoded: Field::unavailable(Reason::NotDecoded),
+            posix_translation: None,
         })
         .collect(),
     )
