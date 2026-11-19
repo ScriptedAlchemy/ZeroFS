@@ -416,10 +416,11 @@ async fn xattr_wire_plain_dialect_rejects_private_remove_flag() {
     errno(c.create(2, 0, XATTR_REMOVE_ZEROFS).await, 22);
 }
 
-/// The frames Linux v9fs sends for `setfacl` and `getfacl` when the mount is
-/// not `access=client` (fs/9p/acl.c `v9fs_iop_set_acl` and `v9fs_iop_get_acl`
-/// forward the ACL as a plain xattr with flags 0). The server must store,
-/// serve and enforce them; `setfacl -b` sends size 0 with flags 0.
+/// The frames `v9fs_iop_set_acl` and `v9fs_iop_get_acl` (fs/9p/acl.c) build
+/// for a mount that is not `access=client`: the ACL as a plain xattr with
+/// flags 0, and size 0 with flags 0 for `setfacl -b`. Linux 7.0 refuses ACL
+/// calls on such a mount before they reach v9fs, so these frames come from
+/// other 9P clients; the server must still store, serve and enforce them.
 #[tokio::test]
 async fn xattr_wire_plain_dialect_carries_linux_v9fs_acl_frames() {
     use crate::fs::inode::InodeAttrs;

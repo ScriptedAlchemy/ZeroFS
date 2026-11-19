@@ -7,7 +7,8 @@ rebase; the counts are from that run.
 
 ## Where the tests ran
 
-All builds and tests ran in Docker on Zack's Mac Studio. Docker context
+Unless a section names another host, builds and tests ran in Docker on Zack's
+Mac Studio. Docker context
 `desktop-linux` (Docker Desktop 29.4.1). The host is arm64 and the images were
 built and run as native `linux/arm64`, so no emulation was involved. The Docker
 VM kernel is `6.12.76-linuxkit`, with `CONFIG_9P_FS=y`, `CONFIG_NET_9P_FD=y`
@@ -42,7 +43,8 @@ setpriv --reuid=1000 --regid=1000 --clear-groups /target/debug/build/zerofs/<has
 ## Mounted matrix
 
 [mount-matrix.jsonl](mount-matrix.jsonl) is the output of
-`scripts/acl_xattr_mount_e2e.py` in a disposable container with
+`scripts/acl_xattr_mount_e2e.py`, at the revision before the kernel 9P
+refusal and NFSv4 write checks were added, in a disposable container with
 `CAP_SYS_ADMIN`, `/dev/fuse` and no network. The script starts a debug
 `zerofs` server on a file store inside the container, then mounts it two ways.
 The kernel 9P mount uses the app's package options
@@ -102,26 +104,43 @@ server. The server also denies other after the restart. The wire test
 `fs/9p/acl.c` sends for `setfacl`, `getfacl` and `setfacl -b` when a mount is
 not `access=client`, and checks storage, enforcement and removal.
 
+## Kernel 9P with POSIX ACL support, x86-64
+
+Host `ubuntu-main`, x86_64, kernel `7.0.0-28-generic`, read at
+2026-11-19T06:15:25Z. Its config has `CONFIG_9P_FS_POSIX_ACL=y` and builds
+`9p`, `9pnet` and `9pnet_fd` as modules, which loaded only through the mount.
+The debug `zerofs` was built natively with `cargo build --locked -p zerofs
+--bin zerofs` in a container from `rust:1.100.0-bookworm`. The matrix ran in a
+disposable container with `--network none`, `CAP_SYS_ADMIN` through the docker
+group (no sudo), `/dev/fuse`, and the host's `/boot/config-7.0.0-28-generic`
+bind-mounted read-only. The output is
+[mount-matrix-ubuntu-main-x86_64.jsonl](mount-matrix-ubuntu-main-x86_64.jsonl).
+All 74 checks passed.
+
+The run answered the open question from the Studio run. With the app's
+`access=user` options, a kernel that has `CONFIG_9P_FS_POSIX_ACL=y` still
+refuses ACL calls on the mount:
+
+- `setfacl` fails with "Operation not supported".
+- `getxattr("system.posix_acl_access")` fails with errno 95.
+- `getfacl` prints an ACL built from the mode.
+- A write of `system.nfs4_acl_xdr` fails with errno 95.
+
+The cause, from Linux v9fs: it marks a superblock as ACL-capable only for
+`access=client,posixacl`, and the kernel's ACL calls require that mark. This
+receipt did not capture the wire, so it does not show whether any frame left
+the client. The contract now says ACLs, including NFSv4 translation, must be
+written through the FUSE client.
+
+The same run repeated the FUSE ACL suite, the restart check, and the
+cross-client checks on x86-64. It also wrote a TrueNAS `NFS4_RESTRICTED`
+preset (`owner@` full control, `group@` modify, both inherited by files and
+directories) to `system.nfs4_acl_xdr` through FUSE. ZeroFS translated it to
+`user::rwx,group::rwx,other::---` with the same default ACL. A member of the
+owning group could create a file, and other could not list the directory.
+
 ## Open items
 
-- Not verified: a real-mount kernel 9P `setfacl` and `getfacl` run. It needs a
-  client kernel with `CONFIG_9P_FS_POSIX_ACL=y`. Access to the Spark was not
-  available to this lane: a `BatchMode=yes` connection to 192.168.0.63 at
-  2026-11-19T05:10:32Z was refused with "Host key verification failed", and
-  the lane did not add the host key. On a host where that option is set, with a
-  `zerofs` binary built from this branch, the app owner can run:
-
-  ```sh
-  zcat /proc/config.gz | grep CONFIG_9P_FS_POSIX_ACL   # or grep it in /boot/config-$(uname -r)
-  docker run --rm --name zerofs-acl-e2e-$(date +%s) --network none --cap-add SYS_ADMIN \
-    --device /dev/fuse --security-opt apparmor=unconfined \
-    -v "$PWD/scripts:/scripts:ro" -v /path/to/zerofs:/zerofs:ro <image with python3, acl, fuse3, util-linux> \
-    python3 -I /scripts/acl_xattr_mount_e2e.py /zerofs
-  ```
-
-  If `/proc/config.gz` is absent inside the container, the script skips the
-  kernel 9P ACL suite. In that case, bind-mount the host's kernel config, or
-  run the script on the host as root in a disposable directory.
 - Not verified: the inventory against an OpenZFS dataset with
   `acltype=nfsv4`. The NFSv4 translation was tested with byte layouts encoded
   from OpenZFS `zpl_xattr.c` (truenas/zfs `truenas/zfs-2.4-release`), not with

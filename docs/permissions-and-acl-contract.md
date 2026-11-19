@@ -20,6 +20,10 @@ reads. Three options exist for such a source.
 | Translate NFSv4 ACLs to enforced POSIX ACLs, refusing every case that would change a read, write or execute decision | Implemented. Described below. |
 | Keep NFSv4 ACLs as inert bytes | Not offered. ZeroFS never stores an NFSv4 ACL it does not enforce. Copying without ACLs needs an explicit operator waiver, which the copy tool must record. |
 
+The copy tool must write ACLs, including `system.nfs4_acl_xdr`, through the
+ZeroFS FUSE client. The kernel 9P mount refuses ACL writes (see "Client-side
+checks").
+
 The operator must decide, per source tree, between translation and a waiver.
 `zerofs inventory`, run where the source's NFSv4 ACLs are visible, reports the
 translation result for every entry (see "Checking a source tree" below). A tree
@@ -80,13 +84,17 @@ effective decision is the stricter of the client's and the server's.
   ACLs from the server and evaluates them, so named-user and named-group grants
   work. The kernel still applies the umask when it creates files, so a new file
   under a default ACL can get a narrower mode than on a local filesystem.
-- The Linux kernel 9P client with the package's `access=user` mount checks only
-  mode bits locally. The kernel forwards `setfacl` and `getfacl` to the server,
-  and the server enforces the ACL. A named user or named group therefore
-  receives no more than the mode's group or other bits allow on that mount,
-  because the kernel sees that caller as group or other. Restrictions always
-  hold. Linux supports ACL evaluation in the 9P client only with
-  `access=client,posixacl`, which the app rejected for other reasons.
+- The Linux kernel 9P client with the package's `access=user` mount cannot
+  read or set ACLs. v9fs marks a superblock as ACL-capable only for
+  `access=client,posixacl`, which the app rejected for other reasons, and the
+  kernel's ACL calls require that flag. `setfacl` and a read of
+  `system.posix_acl_access` fail with `EOPNOTSUPP`, and `getfacl` shows an ACL
+  built from the mode. A write of `system.nfs4_acl_xdr` also fails with
+  `EOPNOTSUPP`. The caller always gets that error, so an ACL is never
+  silently dropped. The kernel checks only mode bits locally, so a named user
+  or named group receives no more than the mode's group or other bits on that
+  mount. The server still enforces every stored ACL for requests from that
+  mount, so restrictions always hold.
 - NFSv3 clients cannot read or set ACLs. The server enforces stored ACLs on
   every NFS operation that reaches a permission check.
 

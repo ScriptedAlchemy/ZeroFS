@@ -110,6 +110,11 @@ def xattr_matrix(client, root):
 
 
 def acl_suite(client, root):
+    # The kernel 9P client with access=user checks mode bits locally and
+    # never sets SB_POSIXACL, so a named entry grants no more than the mode's
+    # group or other bits on that mount; the server still enforces the ACL.
+    # FUSE negotiates FUSE_POSIX_ACL, so named grants take effect there.
+    grant = client != "kernel-9p"
     base = os.path.join(root, f"acl-{client}")
     os.mkdir(base, 0o755)
     os.chown(base, OWNER, OWNER)
@@ -128,9 +133,9 @@ def acl_suite(client, root):
           got=oct(os.stat(f).st_mode & 0o777))
     decisions = {
         "owner write": (can(OWNER, [OWNER], "write", f), True),
-        "named user read": (can(NAMED, [], "read", f), True),
-        "named user write": (can(NAMED, [], "write", f), True),
-        "named group read": (can(STRANGER, [TEAM], "read", f), True),
+        "named user read": (can(NAMED, [], "read", f), grant),
+        "named user write": (can(NAMED, [], "write", f), grant),
+        "named group read": (can(STRANGER, [TEAM], "read", f), grant),
         "named group write": (can(STRANGER, [TEAM], "write", f), False),
         "owning group read": (can(STRANGER, [OWNER], "read", f), False),
         "other read": (can(STRANGER, [], "read", f), False),
@@ -144,7 +149,7 @@ def acl_suite(client, root):
     check(f"{client}: chmod rewrites mask",
           acl == f"user::rw-,user:{NAMED}:rw-,group::---,group:{TEAM}:r--,mask::r--,other::---", got=acl)
     check(f"{client}: named user write after chmod", not can(NAMED, [], "write", f))
-    check(f"{client}: named user read after chmod", can(NAMED, [], "read", f))
+    check(f"{client}: named user read after chmod", can(NAMED, [], "read", f) == grant)
 
     # Non-owners cannot change the ACL.
     r = as_user(NAMED, [], ["setfacl", "-m", "o::rwx", f])
@@ -163,7 +168,8 @@ def acl_suite(client, root):
     cacl = getfacl(child)
     emit("inherited_file", client=client, acl=cacl, mode=oct(os.stat(child).st_mode & 0o7777))
     check(f"{client}: file inherits named entry", f"user:{NAMED}:rwx" in cacl, got=cacl)
-    check(f"{client}: named user creates via access ACL", can(NAMED, [], "create", os.path.join(d, "by-named")))
+    check(f"{client}: named user creates via access ACL",
+          can(NAMED, [], "create", os.path.join(d, "by-named")) == grant)
     sub = os.path.join(d, "sub")
     owner("sh", "-c", 'umask 022; mkdir "$1"', "sh", sub)
     check(f"{client}: directory inherits default", getfacl(sub, default=True) == dacl,
@@ -177,19 +183,76 @@ def acl_suite(client, root):
           sacl == f"user::rwx,user:{NAMED}:rwx,group::r-x,mask::r-x,other::---", got=sacl)
     check(f"{client}: named user write narrowed by umask", not can(NAMED, [], "create", os.path.join(sub, "n")))
     owner("setfacl", "-m", "m::rwx", sub)
-    check(f"{client}: named user creates after mask widened", can(NAMED, [], "create", os.path.join(sub, "n")))
+    check(f"{client}: named user creates after mask widened",
+          can(NAMED, [], "create", os.path.join(sub, "n")) == grant)
     check(f"{client}: stranger cannot create", not can(STRANGER, [], "create", os.path.join(sub, "x")))
     check(f"{client}: stranger cannot list", not can(STRANGER, [], "list", sub))
     return f, d
 
 
 def kernel_9p_acl_support():
+    """Read the running kernel's config from /proc/config.gz, or from
+    /boot/config-<release> (bind-mount it read-only into a container)."""
+    import gzip
+    for opener, path in ((gzip.open, "/proc/config.gz"), (open, f"/boot/config-{os.uname().release}")):
+        try:
+            with opener(path, "rt") as config:
+                return "CONFIG_9P_FS_POSIX_ACL=y" in config.read()
+        except OSError:
+            continue
+    return None
+
+
+def kernel_9p_acl_refusal(root, config_has_acl):
+    """With the app's access=user options, the kernel refuses ACL calls
+    before they reach the server: setfacl fails with EOPNOTSUPP, and getfacl
+    falls back to the mode. Nothing is silently dropped."""
+    base = os.path.join(root, "acl-refusal")
+    os.mkdir(base, 0o755)
+    os.chown(base, OWNER, OWNER)
+    f = os.path.join(base, "file")
+    as_user(OWNER, [OWNER], ["sh", "-c", 'umask 077; : > "$1"', "sh", f])
+    r = as_user(OWNER, [OWNER], ["setfacl", "-m", f"u:{NAMED}:rw-", f])
+    emit("kernel_9p_acl_calls", config_9p_fs_posix_acl=config_has_acl, options=KERNEL_9P,
+         setfacl_exit=r.returncode, setfacl_stderr=r.stderr.strip())
+    check("kernel-9p: setfacl refused with EOPNOTSUPP on access=user",
+          r.returncode != 0 and "Operation not supported" in r.stderr, stderr=r.stderr.strip())
     try:
-        import gzip
-        with gzip.open("/proc/config.gz", "rt") as config:
-            return "CONFIG_9P_FS_POSIX_ACL=y" in config.read()
-    except OSError:
-        return None
+        os.getxattr(f, "system.posix_acl_access")
+        got = "ok"
+    except OSError as e:
+        got = errno.errorcode.get(e.errno, str(e.errno))
+    # EOPNOTSUPP and ENOTSUP are both errno 95 on Linux.
+    check("kernel-9p: getxattr of the ACL refused", got in ("EOPNOTSUPP", "ENOTSUP"), got=got)
+    check("kernel-9p: getfacl falls back to the mode", getfacl(f) == "user::rw-,group::---,other::---",
+          got=getfacl(f))
+
+
+def nfs4_write(client, root, expect_ok):
+    """Write a TrueNAS NFS4_RESTRICTED ACL (owner@ FULL_CONTROL, group@
+    MODIFY, both inherited by files and directories) the way a copy tool
+    would, then read the POSIX result."""
+    import struct
+    full, modify = 0x1F01FF, 0x1301BF
+    ace = lambda kind, flags, iflag, mask, who: struct.pack(">5I", kind, flags, iflag, mask, who)
+    value = struct.pack(">2I", 0, 2) + ace(0, 0x3, 1, full, 1) + ace(0, 0x3 | 0x40, 1, modify, 2)
+    d = os.path.join(root, f"nfs4-{client}")
+    os.mkdir(d, 0o700)
+    os.chown(d, OWNER, OWNER)
+    r = as_user(OWNER, [OWNER], ["python3", "-c",
+                "import os,sys; os.setxattr(sys.argv[1], 'system.nfs4_acl_xdr', bytes.fromhex(sys.argv[2]))",
+                d, value.hex()])
+    got = "ok" if r.returncode == 0 else r.stderr.strip().splitlines()[-1]
+    emit("nfs4_write", client=client, result=got)
+    if expect_ok:
+        check(f"{client}: NFSv4 restricted preset translated", r.returncode == 0, stderr=r.stderr.strip())
+        check(f"{client}: translated access ACL", getfacl(d) == "user::rwx,group::rwx,other::---", got=getfacl(d))
+        check(f"{client}: translated default ACL",
+              getfacl(d, default=True) == "user::rwx,group::rwx,other::---", got=getfacl(d, default=True))
+        check(f"{client}: owning group member creates", can(STRANGER, [OWNER], "create", os.path.join(d, "g")))
+        check(f"{client}: other cannot list", not can(STRANGER, [], "list", d))
+    else:
+        check(f"{client}: NFSv4 write refused, not stored", r.returncode != 0, got=got)
 
 
 def cross_client(kroot, froot, f_rel):
@@ -222,7 +285,7 @@ def persisted(client, f, d):
     check(f"{client}: default ACL after restart",
           getfacl(d, default=True) == f"user::rwx,user:{NAMED}:rwx,group::r-x,mask::rwx,other::---",
           got=getfacl(d, default=True))
-    check(f"{client}: named read after restart", can(NAMED, [], "read", f))
+    check(f"{client}: named read after restart", can(NAMED, [], "read", f) == (client != "kernel-9p"))
     check(f"{client}: other denied after restart", not can(STRANGER, [], "read", f))
 
 
@@ -312,7 +375,7 @@ enabled = false
 
 def main():
     fixture = Fixture(sys.argv[1])
-    emit("provenance", kernel=os.uname().release, kernel_9p_options=KERNEL_9P, fixture=fixture.root)
+    emit("provenance", kernel=os.uname().release, machine=os.uname().machine, kernel_9p_options=KERNEL_9P, fixture=fixture.root)
     try:
         fixture.start()
         clients = [("kernel-9p", fixture.kmnt), ("fuse", fixture.fmnt)]
@@ -321,12 +384,15 @@ def main():
         acl_clients = [("fuse", fixture.fmnt)]
         support = kernel_9p_acl_support()
         emit("kernel_9p_client_posix_acl", config_9p_fs_posix_acl=support)
-        if support:
+        if support and "posixacl" in KERNEL_9P and "access=client" in KERNEL_9P:
             acl_clients.insert(0, ("kernel-9p", fixture.kmnt))
         else:
-            emit("skipped", scope="kernel-9p setfacl/getfacl suite",
-                 reason="client kernel built without CONFIG_9P_FS_POSIX_ACL; setfacl fails in the client")
+            # v9fs sets SB_POSIXACL only for access=client,posixacl, and the
+            # VFS refuses ACL calls without it. Assert that refusal instead.
+            kernel_9p_acl_refusal(fixture.kmnt, support)
         saved = {client: acl_suite(client, mnt) for client, mnt in acl_clients}
+        nfs4_write("fuse", fixture.fmnt, expect_ok=True)
+        nfs4_write("kernel-9p", fixture.kmnt, expect_ok=False)
         cross_client(fixture.kmnt, fixture.fmnt, os.path.relpath(saved["fuse"][0], fixture.fmnt))
         fixture.stop()
         fixture.start()

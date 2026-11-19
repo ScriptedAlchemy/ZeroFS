@@ -1,0 +1,87 @@
+{"event": "provenance", "fixture": "/tmp/zerofs-acl-e2e-aq0mktla", "kernel": "7.0.0-28-generic", "kernel_9p_options": "trans=unix,version=9p2000.L,msize=1048576,cache=none,access=user,nodev,nosuid", "machine": "x86_64"}
+{"event": "check", "expected": "ok", "got": "ok", "name": "kernel-9p: xattr create", "ok": true}
+{"event": "check", "expected": "EEXIST", "got": "EEXIST", "name": "kernel-9p: xattr create existing", "ok": true}
+{"event": "check", "expected": "ok", "got": "ok", "name": "kernel-9p: xattr replace", "ok": true}
+{"event": "check", "expected": "b'value'", "got": "b'value'", "name": "kernel-9p: xattr read replaced", "ok": true}
+{"event": "check", "expected": "ENODATA", "got": "ENODATA", "name": "kernel-9p: xattr replace missing", "ok": true}
+{"event": "check", "expected": "ok", "got": "ok", "name": "kernel-9p: xattr empty set flags 0", "ok": true}
+{"event": "check", "expected": "b''", "got": "b''", "name": "kernel-9p: xattr read empty set", "ok": true}
+{"event": "check", "expected": "ok", "got": "ok", "name": "kernel-9p: xattr empty create", "ok": true}
+{"event": "check", "expected": "b''", "got": "b''", "name": "kernel-9p: xattr read empty create", "ok": true}
+{"event": "check", "expected": "ok", "got": "ok", "name": "kernel-9p: xattr empty replace", "ok": true}
+{"case": "empty XATTR_REPLACE behaves as removal", "client": "kernel-9p", "event": "known_incompatible"}
+{"event": "check", "expected": "ENODATA", "got": "ENODATA", "name": "kernel-9p: xattr read after empty replace", "ok": true}
+{"event": "check", "expected": false, "got": false, "name": "kernel-9p: xattr listed after empty replace", "ok": true}
+{"event": "check", "expected": "ok", "got": "ok", "name": "kernel-9p: xattr remove", "ok": true}
+{"event": "check", "expected": "ENODATA", "got": "ENODATA", "name": "kernel-9p: xattr read removed", "ok": true}
+{"event": "check", "expected": "ENODATA", "got": "ENODATA", "name": "kernel-9p: xattr remove missing", "ok": true}
+{"client": "kernel-9p", "event": "xattr_matrix", "results": {"create": "ok", "create existing": "EEXIST", "empty create": "ok", "empty replace": "ok", "empty set flags 0": "ok", "listed after empty replace": "False", "read after empty replace": "ENODATA", "read empty create": "b''", "read empty set": "b''", "read removed": "ENODATA", "read replaced": "b'value'", "remove": "ok", "remove missing": "ENODATA", "replace": "ok", "replace missing": "ENODATA"}}
+{"event": "check", "expected": "ok", "got": "ok", "name": "fuse: xattr create", "ok": true}
+{"event": "check", "expected": "EEXIST", "got": "EEXIST", "name": "fuse: xattr create existing", "ok": true}
+{"event": "check", "expected": "ok", "got": "ok", "name": "fuse: xattr replace", "ok": true}
+{"event": "check", "expected": "b'value'", "got": "b'value'", "name": "fuse: xattr read replaced", "ok": true}
+{"event": "check", "expected": "ENODATA", "got": "ENODATA", "name": "fuse: xattr replace missing", "ok": true}
+{"event": "check", "expected": "ok", "got": "ok", "name": "fuse: xattr empty set flags 0", "ok": true}
+{"event": "check", "expected": "b''", "got": "b''", "name": "fuse: xattr read empty set", "ok": true}
+{"event": "check", "expected": "ok", "got": "ok", "name": "fuse: xattr empty create", "ok": true}
+{"event": "check", "expected": "b''", "got": "b''", "name": "fuse: xattr read empty create", "ok": true}
+{"event": "check", "expected": "ok", "got": "ok", "name": "fuse: xattr empty replace", "ok": true}
+{"event": "check", "expected": "b''", "got": "b''", "name": "fuse: xattr read after empty replace", "ok": true}
+{"event": "check", "expected": true, "got": true, "name": "fuse: xattr listed after empty replace", "ok": true}
+{"event": "check", "expected": "ok", "got": "ok", "name": "fuse: xattr remove", "ok": true}
+{"event": "check", "expected": "ENODATA", "got": "ENODATA", "name": "fuse: xattr read removed", "ok": true}
+{"event": "check", "expected": "ENODATA", "got": "ENODATA", "name": "fuse: xattr remove missing", "ok": true}
+{"client": "fuse", "event": "xattr_matrix", "results": {"create": "ok", "create existing": "EEXIST", "empty create": "ok", "empty replace": "ok", "empty set flags 0": "ok", "listed after empty replace": "True", "read after empty replace": "b''", "read empty create": "b''", "read empty set": "b''", "read removed": "ENODATA", "read replaced": "b'value'", "remove": "ok", "remove missing": "ENODATA", "replace": "ok", "replace missing": "ENODATA"}}
+{"config_9p_fs_posix_acl": true, "event": "kernel_9p_client_posix_acl"}
+{"config_9p_fs_posix_acl": true, "event": "kernel_9p_acl_calls", "options": "trans=unix,version=9p2000.L,msize=1048576,cache=none,access=user,nodev,nosuid", "setfacl_exit": 1, "setfacl_stderr": "setfacl: /tmp/zerofs-acl-e2e-aq0mktla/kernel/acl-refusal/file: Operation not supported"}
+{"event": "check", "name": "kernel-9p: setfacl refused with EOPNOTSUPP on access=user", "ok": true, "stderr": "setfacl: /tmp/zerofs-acl-e2e-aq0mktla/kernel/acl-refusal/file: Operation not supported"}
+{"event": "check", "got": "ENOTSUP", "name": "kernel-9p: getxattr of the ACL refused", "ok": true}
+{"event": "check", "got": "user::rw-,group::---,other::---", "name": "kernel-9p: getfacl falls back to the mode", "ok": true}
+{"event": "check", "name": "fuse: setfacl access", "ok": true, "stderr": ""}
+{"event": "check", "got": "user::rw-,user:2000:rw-,group::---,group:300:r--,mask::rw-,other::---", "name": "fuse: getfacl access round trip", "ok": true}
+{"event": "check", "got": "0o660", "name": "fuse: mode group bits are the mask", "ok": true}
+{"event": "check", "expected": true, "got": true, "name": "fuse: owner write", "ok": true}
+{"event": "check", "expected": true, "got": true, "name": "fuse: named user read", "ok": true}
+{"event": "check", "expected": true, "got": true, "name": "fuse: named user write", "ok": true}
+{"event": "check", "expected": true, "got": true, "name": "fuse: named group read", "ok": true}
+{"event": "check", "expected": false, "got": false, "name": "fuse: named group write", "ok": true}
+{"event": "check", "expected": false, "got": false, "name": "fuse: owning group read", "ok": true}
+{"event": "check", "expected": false, "got": false, "name": "fuse: other read", "ok": true}
+{"event": "check", "got": "user::rw-,user:2000:rw-,group::---,group:300:r--,mask::r--,other::---", "name": "fuse: chmod rewrites mask", "ok": true}
+{"event": "check", "name": "fuse: named user write after chmod", "ok": true}
+{"event": "check", "name": "fuse: named user read after chmod", "ok": true}
+{"event": "check", "name": "fuse: non-owner setfacl refused", "ok": true, "stderr": "setfacl: /tmp/zerofs-acl-e2e-aq0mktla/fuse/acl-fuse/file: Operation not permitted"}
+{"event": "check", "name": "fuse: setfacl default", "ok": true, "stderr": ""}
+{"event": "check", "got": "user::rwx,user:2000:rwx,group::r-x,mask::rwx,other::---", "name": "fuse: getfacl default round trip", "ok": true}
+{"acl": "user::rw-,user:2000:rwx,group::r-x,mask::r--,other::---", "client": "fuse", "event": "inherited_file", "mode": "0o640"}
+{"event": "check", "got": "user::rw-,user:2000:rwx,group::r-x,mask::r--,other::---", "name": "fuse: file inherits named entry", "ok": true}
+{"event": "check", "name": "fuse: named user creates via access ACL", "ok": true}
+{"event": "check", "got": "user::rwx,user:2000:rwx,group::r-x,mask::rwx,other::---", "name": "fuse: directory inherits default", "ok": true}
+{"acl": "user::rwx,user:2000:rwx,group::r-x,mask::r-x,other::---", "client": "fuse", "event": "inherited_directory", "mode": "0o750"}
+{"event": "check", "got": "user::rwx,user:2000:rwx,group::r-x,mask::r-x,other::---", "name": "fuse: inherited directory mask narrowed by umask", "ok": true}
+{"event": "check", "name": "fuse: named user write narrowed by umask", "ok": true}
+{"event": "check", "name": "fuse: named user creates after mask widened", "ok": true}
+{"event": "check", "name": "fuse: stranger cannot create", "ok": true}
+{"event": "check", "name": "fuse: stranger cannot list", "ok": true}
+{"client": "fuse", "event": "nfs4_write", "result": "ok"}
+{"event": "check", "name": "fuse: NFSv4 restricted preset translated", "ok": true, "stderr": ""}
+{"event": "check", "got": "user::rwx,group::rwx,other::---", "name": "fuse: translated access ACL", "ok": true}
+{"event": "check", "got": "user::rwx,group::rwx,other::---", "name": "fuse: translated default ACL", "ok": true}
+{"event": "check", "name": "fuse: owning group member creates", "ok": true}
+{"event": "check", "name": "fuse: other cannot list", "ok": true}
+{"client": "kernel-9p", "event": "nfs4_write", "result": "OSError: [Errno 95] Operation not supported: '/tmp/zerofs-acl-e2e-aq0mktla/kernel/nfs4-kernel-9p'"}
+{"event": "check", "got": "OSError: [Errno 95] Operation not supported: '/tmp/zerofs-acl-e2e-aq0mktla/kernel/nfs4-kernel-9p'", "name": "kernel-9p: NFSv4 write refused, not stored", "ok": true}
+{"event": "check", "name": "kernel-9p: owner read of FUSE-set ACL file", "ok": true}
+{"event": "check", "name": "kernel-9p: other denied on FUSE-set ACL file", "ok": true}
+{"allowed": false, "event": "kernel_9p_named_user_read", "note": "denied locally by mode bits; documented in permissions-and-acl-contract.md"}
+{"event": "check", "name": "kernel-9p: named user limited by local mode check", "ok": true}
+{"event": "check", "name": "fuse: setfacl named deny", "ok": true, "stderr": ""}
+{"event": "check", "name": "kernel-9p: other read allowed by mode", "ok": true}
+{"event": "check", "name": "kernel-9p: server denies named user that mode bits allow", "ok": true}
+{"event": "check", "got": "user::rw-,user:2000:rw-,group::---,group:300:r--,mask::r--,other::---", "name": "fuse: access ACL after restart", "ok": true}
+{"event": "check", "got": "user::rwx,user:2000:rwx,group::r-x,mask::rwx,other::---", "name": "fuse: default ACL after restart", "ok": true}
+{"event": "check", "name": "fuse: named read after restart", "ok": true}
+{"event": "check", "name": "fuse: other denied after restart", "ok": true}
+{"event": "check", "name": "kernel-9p: other denied after restart", "ok": true}
+{"event": "fixture_removed", "mounted": [], "path": "/tmp/zerofs-acl-e2e-aq0mktla"}
+{"event": "summary", "failures": []}
