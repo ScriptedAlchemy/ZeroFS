@@ -24,7 +24,15 @@ impl SpaceRefresher {
         let runner_cancel = cancel.clone();
         let notify = ssd.physical_waiter_notify();
         let handle = tokio::spawn(async move {
-            run(runner_cancel, ssd, space, notify).await;
+            run(
+                runner_cancel,
+                ssd,
+                space,
+                notify,
+                #[cfg(test)]
+                None,
+            )
+            .await;
         });
         Arc::new(Self {
             cancel,
@@ -56,15 +64,24 @@ async fn run(
     ssd: Arc<SsdAdmission>,
     space: Arc<PhysicalSpaceSampler>,
     notify: Arc<tokio::sync::Notify>,
+    #[cfg(test)] mut after_idle_check: Option<Box<dyn FnOnce() + Send>>,
 ) {
     loop {
         if cancel.is_cancelled() {
             return;
         }
+        // Admission broadcasts when a physical waiter first arrives. Capture
+        // that generation before checking the queue, including an arrival
+        // between the check and this future's first poll.
+        let physical_waiter = notify.notified();
         if !ssd.has_min_free_waiters() {
+            #[cfg(test)]
+            if let Some(after_idle_check) = after_idle_check.take() {
+                after_idle_check();
+            }
             tokio::select! {
                 _ = cancel.cancelled() => return,
-                _ = notify.notified() => {}
+                _ = physical_waiter => {}
             }
             continue;
         }
@@ -127,6 +144,55 @@ mod tests {
         assert_eq!(admission.outstanding_physical_claims(), 60);
         drop(first);
         refresher.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn waiter_queued_between_idle_check_and_subscription_starts_sampling() {
+        let admission = Arc::new(SsdAdmission::new(1_000, 8, 100, 50, 100).unwrap());
+        let first = admission
+            .reserve(request(40), sample(1, 150))
+            .await
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let space = Arc::new(PhysicalSpaceSampler::new(temp.path()));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let notify = admission.physical_waiter_notify();
+        let (idle, waiting) = tokio::sync::oneshot::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        let refresher = tokio::spawn(super::run(
+            cancel.clone(),
+            Arc::clone(&admission),
+            space,
+            Arc::clone(&notify),
+            Some(Box::new(move || {
+                idle.send(()).unwrap();
+                let _ = paused.recv();
+            })),
+        ));
+        waiting.await.unwrap();
+
+        // Enqueue a real reservation after the refresher found no physical
+        // waiters, and prove its notification ran before the refresher resumes.
+        let queued = notify.notified();
+        let mut blocked = Box::pin(admission.reserve(request(20), sample(1, 150)));
+        assert!(futures::poll!(blocked.as_mut()).is_pending());
+        queued.await;
+        assert!(admission.has_min_free_waiters());
+        resume.send(()).unwrap();
+
+        // The real sampler observes the temporary filesystem's free space.
+        // There is no second queued writer or artificial notification to wake
+        // a refresher that missed the sole reservation's arrival.
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), &mut blocked).await;
+        cancel.cancel();
+        refresher.await.unwrap();
+        let granted = outcome
+            .expect("refresher lost the new physical waiter and never sampled free space")
+            .expect("physical reservation must be granted");
+        assert_eq!(granted.request().physical_reservation_bytes, 20);
+        assert_eq!(admission.outstanding_physical_claims(), 60);
+        drop(granted);
+        drop(first);
     }
 
     #[tokio::test]
