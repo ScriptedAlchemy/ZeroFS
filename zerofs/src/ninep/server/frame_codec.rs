@@ -1,6 +1,6 @@
 use super::session::PENDING_REQUEST_TASK_BYTES;
 use crate::fs::inode::Inode;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use ninep_proto::{
     DekuBytes, DirEntry, DirEntryPlus, Message, P9_COUNT_FIELD_LEN, P9_HEADER_SIZE, P9_IOHDRSZ,
     P9_MAX_MSIZE, P9_MIN_MESSAGE_SIZE, P9_OP_ENVELOPE_LEN, P9_OP_FLAG_RETRY, P9_OP_ID_LEN,
@@ -509,13 +509,29 @@ where
         }
         return Ok(Some((Bytes::copy_from_slice(prefix), charged)));
     }
-    let mut frame = Vec::with_capacity(frame_len);
+    let mut frame = BytesMut::with_capacity(frame_len);
     frame.extend_from_slice(prefix);
-    frame.resize(frame_len, 0);
-    tokio::select! {
-        biased;
-        _ = shutdown.cancelled() => return Ok(None),
-        result = reader.read_exact(&mut frame[prefix_len..]) => { result?; }
+    // The body is initialized by AsyncRead, rather than zero-filled and then
+    // immediately overwritten. Keep the read bounded even if the allocator
+    // gives BytesMut more capacity than requested: the next frame must remain
+    // available for its own admission decision.
+    let mut body = reader.take((frame_len - prefix_len) as u64);
+    while frame.len() < frame_len {
+        let received = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return Ok(None),
+            result = body.read_buf(&mut frame) => result?,
+        };
+        if received == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated 9P request body",
+            )
+            .into());
+        }
     }
-    Ok(Some((Bytes::from(frame), charged)))
+    Ok(Some((frame.freeze(), charged)))
 }
+
+#[cfg(test)]
+mod reader_tests;

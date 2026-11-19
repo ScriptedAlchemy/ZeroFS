@@ -787,10 +787,20 @@ fn start_9p_request(
         let response_bytes = match parsed {
             Ok(parsed) => {
                 drop(frame);
-                debug!(
-                    "Received message type {} tag {}: {:?}",
-                    parsed.type_, parsed.tag, parsed.body
-                );
+                match &parsed.body {
+                    Message::Twrite(write) => debug!(
+                        message_type = parsed.type_,
+                        tag = parsed.tag,
+                        fid = write.fid,
+                        offset = write.offset,
+                        count = write.count,
+                        "Received Twrite"
+                    ),
+                    _ => debug!(
+                        "Received message type {} tag {}: {:?}",
+                        parsed.type_, parsed.tag, parsed.body
+                    ),
+                }
                 let response = Arc::clone(&request_lease.state.abandonment)
                     .scope(handler.handle_message_with_received_admission(
                         tag,
