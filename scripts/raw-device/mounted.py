@@ -20,6 +20,7 @@ ZEROFS = "/input/zerofs"
 PROBE = "/input/zerofs-raw-device"
 MIB = 1 << 20
 CHUNK = 4 * MIB
+RAW_BLOCK = 4096  # Raw v1 record header and payload alignment.
 SIZES = {"small": 32 * MIB, "large": 96 * MIB}
 RESERVES = {"small": 16 * MIB, "large": 8 * MIB}
 
@@ -40,7 +41,8 @@ def require_fuse():
     try:
         if not fuse.exists():
             os.mknod(fuse, stat.S_IFCHR | 0o600, os.makedev(10, 229))
-        if fuse.stat().st_rdev != os.makedev(10, 229):
+        mode = fuse.stat()
+        if not stat.S_ISCHR(mode.st_mode) or mode.st_rdev != os.makedev(10, 229):
             raise RuntimeError("unexpected FUSE device identity")
         with fuse.open("r+b", buffering=0):
             pass
@@ -252,15 +254,25 @@ def qualify(root, members):
     assert after["large"]["used_bytes"] - before["large"]["used_bytes"] == sum(
         entry["size"] for entry in new
     ), after
-    assert after["large"]["space"]["filesystem_free_bytes"] < before["large"]["space"]["filesystem_free_bytes"], after
+    physical_spent = (
+        before["large"]["space"]["filesystem_free_bytes"]
+        - after["large"]["space"]["filesystem_free_bytes"]
+    )
+    expected_cost = sum(
+        RAW_BLOCK * (1 + (entry["size"] + RAW_BLOCK - 1) // RAW_BLOCK) for entry in new
+    )
+    assert physical_spent == expected_cost, (physical_spent, expected_cost, new)
     record("reserve_spill", smaller_reserve_bytes=RESERVES["small"],
            smaller_available_bytes=small["available_bytes"], larger_new_objects=len(new),
-           larger_new_bytes=sum(entry["size"] for entry in new))
+           larger_new_bytes=sum(entry["size"] for entry in new),
+           larger_raw_log_bytes=physical_spent)
 
     with mounted(configs[3]) as path:
         verify(path, digest, chunks, "cold_restart")
-    _, restarted = snapshot(configs[3], members, "cold_restart")
+    restarted_status, restarted = snapshot(configs[3], members, "cold_restart")
     assert restarted == final, restarted
+    for member in SIZES:
+        assert restarted_status[member]["space"] == after[member]["space"], restarted_status
 
 
 def main():
