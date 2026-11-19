@@ -1,9 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::raw_database::RawDatabase;
-    use redb::{
-        Builder, Durability, ReadableDatabase, ReadableTableMetadata, TableDefinition,
-    };
+    use redb::{Builder, Durability, ReadableDatabase, ReadableTableMetadata, TableDefinition};
     use std::io;
     use zerofs_raw_device::journal_region::TransactionRegion;
     use zerofs_raw_device::{Identity, Role};
