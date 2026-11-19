@@ -1715,10 +1715,6 @@ impl Journal {
         self.publish_prepared(prepared)
     }
 
-    pub(crate) fn read_blob(&self, sequence: Sequence) -> Result<Vec<u8>> {
-        self.read_blob_bounded(sequence, u64::MAX)
-    }
-
     /// Read and verify the exact bytes returned to the caller in one pass.
     /// The caller's bound is checked against the durable record before any
     /// payload allocation. This lets bounded atomic uploads avoid verifying a
@@ -3318,6 +3314,7 @@ mod tests {
         FenceClass, JournalIdentity, LocalEtag, MutationKind, MutationMode, MutationRecord,
     };
     use crate::writeback::payload::VerifiedPayload;
+    use crate::writeback::test_util::assert_journal_payload;
     use bytes::Bytes;
     use futures::StreamExt;
     use redb::{Database, ReadableDatabase, ReadableTable};
@@ -3516,7 +3513,7 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(recovered.read_blob(1).unwrap(), b"retained");
+        assert_journal_payload(&recovered, 1, b"retained");
         assert_eq!(std::fs::read(outside.join("sentinel")).unwrap(), b"outside");
         assert!(!outside.join("journal.redb").exists());
     }
@@ -3552,8 +3549,8 @@ mod tests {
             .commit_put(put_record(2, "segments/2", b"after"), b"after")
             .unwrap();
 
-        assert_eq!(journal.read_blob(1).unwrap(), b"before");
-        assert_eq!(journal.read_blob(2).unwrap(), b"after");
+        assert_journal_payload(&journal, 1, b"before");
+        assert_journal_payload(&journal, 2, b"after");
         assert_eq!(blob_files_below(&retained).len(), 2);
         assert!(blob_files_below(&outside).is_empty());
         assert_eq!(std::fs::read(outside.join("sentinel")).unwrap(), b"outside");
@@ -3682,7 +3679,7 @@ mod tests {
         assert_eq!(snapshot.local_seq, 1);
         assert_eq!(snapshot.remote_seq, 0);
         assert_eq!(snapshot.records, vec![committed]);
-        assert_eq!(reopened.read_blob(1).unwrap(), b"payload");
+        assert_journal_payload(&reopened, 1, b"payload");
     }
 
     #[test]
@@ -3910,8 +3907,8 @@ mod tests {
         assert_eq!(snapshot.local_bytes_completed, 8);
         assert_eq!(snapshot.records, committed);
         assert_eq!(snapshot.pending_blob_count, 0);
-        assert_eq!(journal.read_blob(1).unwrap(), b"one");
-        assert_eq!(journal.read_blob(3).unwrap(), b"three");
+        assert_journal_payload(&journal, 1, b"one");
+        assert_journal_payload(&journal, 3, b"three");
     }
 
     #[test]
@@ -4009,14 +4006,14 @@ mod tests {
 
         assert!(!root.join("blobs/00/stale.blob").exists());
         assert_ne!(committed[0].blob_path(), committed[1].blob_path());
-        assert_eq!(journal.read_blob(1).unwrap(), b"one");
-        assert_eq!(journal.read_blob(2).unwrap(), b"two");
+        assert_journal_payload(&journal, 1, b"one");
+        assert_journal_payload(&journal, 2, b"two");
         assert_eq!(journal.snapshot().unwrap().pending_blob_count, 0);
         drop(journal);
 
         let recovered = Journal::open(&root, identity("bucket-a")).unwrap();
         assert_eq!(recovered.progress().unwrap().local_seq, 2);
-        assert_eq!(recovered.read_blob(2).unwrap(), b"two");
+        assert_journal_payload(&recovered, 2, b"two");
     }
 
     #[test]
@@ -4503,7 +4500,7 @@ mod tests {
         assert_eq!(snapshot.identity, identity("bucket-a"));
         assert_eq!(snapshot.local_seq, 2);
         assert_eq!(snapshot.remote_seq, 1);
-        assert_eq!(reopened.read_blob(2).unwrap(), b"pending");
+        assert_journal_payload(&reopened, 2, b"pending");
         assert_eq!(
             reopened
                 .remote_object_etag(predecessor, 1)
@@ -4970,7 +4967,7 @@ mod tests {
         let reopened = Journal::open(&root, identity("bucket-a")).unwrap();
         let snapshot = reopened.snapshot().unwrap();
         assert_eq!(snapshot.local_seq, 1, "the lost commits are not visible");
-        assert_eq!(reopened.read_blob(1).unwrap(), b"kept");
+        assert_journal_payload(&reopened, 1, b"kept");
         drop(reopened);
         let reopened = Journal::open_existing(&root).unwrap();
         assert_eq!(reopened.snapshot().unwrap().local_seq, 1);
@@ -5025,7 +5022,13 @@ mod tests {
 
             let recovered = Journal::open(&root, identity("bucket-a")).unwrap();
             assert_eq!(recovered.snapshot().unwrap().local_seq, 1, "{case}");
-            assert_eq!(recovered.read_blob(1).unwrap(), b"pending", "{case}");
+            assert_eq!(
+                recovered
+                    .read_blob_bounded(1, b"pending".len() as u64)
+                    .unwrap(),
+                b"pending",
+                "{case}"
+            );
         }
     }
 
@@ -5286,7 +5289,7 @@ mod tests {
         let reopened = reopened
             .expect("a child forked during the identity read must not keep the journal locked");
         assert_eq!(reopened.snapshot().unwrap().local_seq, 1);
-        assert_eq!(reopened.read_blob(1).unwrap(), b"pending");
+        assert_journal_payload(&reopened, 1, b"pending");
         drop(reopened);
 
         // The child still holds everything it inherited, and pins nothing.
@@ -5355,7 +5358,7 @@ mod tests {
 
         assert!(!tmp_file.exists());
         assert!(blob.exists());
-        assert_eq!(reopened.read_blob(1).unwrap(), b"good");
+        assert_journal_payload(&reopened, 1, b"good");
     }
 
     #[test]
@@ -5880,9 +5883,10 @@ mod tests {
             "every member needs its own slice: {offsets:?}"
         );
         for sequence in 1..=8_u64 {
-            assert_eq!(
-                journal.read_blob(sequence).unwrap(),
-                format!("payload-{sequence}").into_bytes()
+            assert_journal_payload(
+                &journal,
+                sequence,
+                &format!("payload-{sequence}").into_bytes(),
             );
         }
         assert_eq!(journal.progress().unwrap().local_seq, 8);
@@ -5921,7 +5925,7 @@ mod tests {
             file.seek(SeekFrom::Start(first_slice.offset)).unwrap();
             file.write_all(b"X").unwrap();
         }
-        assert_eq!(journal.read_blob(2).unwrap(), second);
+        assert_journal_payload(&journal, 2, &second);
         assert!(journal.open_verified_blob(1).is_err());
     }
 
@@ -6195,8 +6199,8 @@ mod tests {
 
         assert_eq!(published_blob_files(&journal).len(), 1);
         assert_eq!(committed[1].blob_path(), None);
-        assert_eq!(journal.read_blob(1).unwrap(), b"one");
-        assert_eq!(journal.read_blob(3).unwrap(), b"three");
+        assert_journal_payload(&journal, 1, b"one");
+        assert_journal_payload(&journal, 3, b"three");
         let container = journal.root().join(
             super::BlobRef::parse(committed[0].blob_path().unwrap())
                 .unwrap()
@@ -6243,8 +6247,8 @@ mod tests {
         let snapshot = recovered.snapshot().unwrap();
         assert_eq!(snapshot.local_seq, 2);
         assert_eq!(snapshot.pending_blob_count, 0);
-        assert_eq!(recovered.read_blob(1).unwrap(), b"payload-1");
-        assert_eq!(recovered.read_blob(2).unwrap(), b"payload-2");
+        assert_journal_payload(&recovered, 1, b"payload-1");
+        assert_journal_payload(&recovered, 2, b"payload-2");
     }
 
     /// The production crash shape: a container is written straight to its
@@ -6275,7 +6279,7 @@ mod tests {
         assert!(!torn.exists(), "the torn container must be unlinked");
         assert!(container.exists());
         assert_eq!(recovered.progress().unwrap().local_seq, 3);
-        assert_eq!(recovered.read_blob(2).unwrap(), b"payload-2");
+        assert_journal_payload(&recovered, 2, b"payload-2");
     }
 
     /// A batch may end with records that hold no payload. The container must
@@ -6383,7 +6387,7 @@ mod tests {
             container.exists(),
             "sequence 2 still needs the container's bytes"
         );
-        assert_eq!(journal.read_blob(2).unwrap(), b"two");
+        assert_journal_payload(&journal, 2, b"two");
 
         journal.mark_remote(2, Some("etag-2".to_owned())).unwrap();
         journal.remove_remote_prefix(2).unwrap();
@@ -6462,7 +6466,7 @@ mod tests {
             vec![3, 4, 5]
         );
         assert_eq!(journal.progress().unwrap().local_seq, 5);
-        assert_eq!(journal.read_blob(4).unwrap(), b"payload-4");
+        assert_journal_payload(&journal, 4, b"payload-4");
     }
 
     /// A database commit error is ambiguous: redb may report an I/O error
@@ -6493,14 +6497,14 @@ mod tests {
             container.exists(),
             "an ambiguous commit error must not delete a potentially committed container"
         );
-        assert_eq!(journal.read_blob(1).unwrap(), b"payload-1");
-        assert_eq!(journal.read_blob(2).unwrap(), b"payload-2");
+        assert_journal_payload(&journal, 1, b"payload-1");
+        assert_journal_payload(&journal, 2, b"payload-2");
         drop(journal);
 
         let recovered = Journal::open(&root, identity("bucket-a")).unwrap();
         assert_eq!(recovered.progress().unwrap().local_seq, 2);
-        assert_eq!(recovered.read_blob(1).unwrap(), b"payload-1");
-        assert_eq!(recovered.read_blob(2).unwrap(), b"payload-2");
+        assert_journal_payload(&recovered, 1, b"payload-1");
+        assert_journal_payload(&recovered, 2, b"payload-2");
     }
 
     /// The crash window the pipeline opens: a container is durable, its batch
@@ -6531,8 +6535,8 @@ mod tests {
             "a container staged but never committed must be unlinked"
         );
         assert_eq!(recovered.progress().unwrap().local_seq, 2);
-        assert_eq!(recovered.read_blob(1).unwrap(), b"payload-1");
-        assert_eq!(recovered.read_blob(2).unwrap(), b"payload-2");
+        assert_journal_payload(&recovered, 1, b"payload-1");
+        assert_journal_payload(&recovered, 2, b"payload-2");
     }
 
     /// Staging takes the expected first sequence from its caller so a
@@ -6633,7 +6637,7 @@ mod tests {
 
         assert!(container.exists(), "the committed container must survive");
         assert!(!interrupted.exists());
-        assert_eq!(recovered.read_blob(4).unwrap(), b"payload-4");
+        assert_journal_payload(&recovered, 4, b"payload-4");
     }
 
     /// Journals written before containers store one whole-file blob per
@@ -6673,7 +6677,7 @@ mod tests {
         drop(journal);
 
         let recovered = Journal::open(&root, identity("bucket-a")).unwrap();
-        assert_eq!(recovered.read_blob(1).unwrap(), b"legacy-payload");
+        assert_journal_payload(&recovered, 1, b"legacy-payload");
 
         // A new batch appended after the legacy record uses containers, and
         // both forms coexist in one journal.
@@ -6681,8 +6685,8 @@ mod tests {
             .publish_batch(prepare_puts(&recovered, 2..=3))
             .unwrap();
         assert!(committed[0].blob_path().unwrap().contains(".blobs#"));
-        assert_eq!(recovered.read_blob(1).unwrap(), b"legacy-payload");
-        assert_eq!(recovered.read_blob(3).unwrap(), b"payload-3");
+        assert_journal_payload(&recovered, 1, b"legacy-payload");
+        assert_journal_payload(&recovered, 3, b"payload-3");
 
         recovered.mark_remote(1, Some("etag-1".to_owned())).unwrap();
         recovered.remove_remote_prefix(1).unwrap();
@@ -6690,7 +6694,7 @@ mod tests {
             !legacy_path.exists(),
             "a fully drained legacy blob is still pruned per record"
         );
-        assert_eq!(recovered.read_blob(2).unwrap(), b"payload-2");
+        assert_journal_payload(&recovered, 2, b"payload-2");
     }
 
     /// A container is reclaimable only once every member is remote-committed.
@@ -6720,7 +6724,9 @@ mod tests {
                 sequence + 1
             );
             assert_eq!(
-                journal.read_blob(4).unwrap(),
+                journal
+                    .read_blob_bounded(4, b"payload-4".len() as u64)
+                    .unwrap(),
                 b"payload-4",
                 "an undrained member must stay readable"
             );
@@ -6759,8 +6765,8 @@ mod tests {
         let recovered = Journal::open(&root, identity("bucket-a")).unwrap();
 
         assert!(container.exists());
-        assert_eq!(recovered.read_blob(3).unwrap(), b"payload-3");
-        assert_eq!(recovered.read_blob(4).unwrap(), b"payload-4");
+        assert_journal_payload(&recovered, 3, b"payload-3");
+        assert_journal_payload(&recovered, 4, b"payload-4");
         let snapshot = recovered.snapshot().unwrap();
         assert_eq!(snapshot.remote_seq, 2);
         assert_eq!(snapshot.local_seq, 4);

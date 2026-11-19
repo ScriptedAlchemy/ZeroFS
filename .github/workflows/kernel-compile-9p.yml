@@ -199,22 +199,15 @@ jobs:
 
       - name: Download Linux kernel
         run: |
+          name="linux-${ZEROFS_CI_KERNEL}.tar"
+          archive="$RUNNER_TEMP/$name"
+          python3 "$GITHUB_WORKSPACE/scripts/ci/fetch-linux-source.py" \
+            --version "$ZEROFS_CI_KERNEL" --output "$archive"
           cd /mnt/zerofs
-          kernel_pattern='^[1-9][0-9]*\.[0-9]+(\.[0-9]+)?(-rc[1-9][0-9]*)?$'
-          [[ "$ZEROFS_CI_KERNEL" =~ $kernel_pattern ]]
-          kernel_major=${ZEROFS_CI_KERNEL%%.*}
-          if [[ "$ZEROFS_CI_KERNEL" == *-rc* ]]; then
-            archive="linux-${ZEROFS_CI_KERNEL}.tar.gz"
-            source_url="https://codeload.github.com/torvalds/linux/tar.gz/refs/tags/v${ZEROFS_CI_KERNEL}"
-          else
-            archive="linux-${ZEROFS_CI_KERNEL}.tar.xz"
-            source_url="https://cdn.kernel.org/pub/linux/kernel"
-            source_url+="/v${kernel_major}.x/$archive"
-          fi
-          curl --fail --location --retry 5 --retry-all-errors \
-            --output "$archive" "$source_url"
-          tar -xf "$archive"
-          rm "$archive"
+          cp "$archive" "$name"
+          cmp "$archive" "$name"
+          tar -xf "$name"
+          rm "$name"
           [[ -d "linux-${ZEROFS_CI_KERNEL}" ]]
 
       - name: Compile kernel

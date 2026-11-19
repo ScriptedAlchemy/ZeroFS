@@ -17,11 +17,6 @@ class ReleasePGOWorkflowTests(unittest.TestCase):
         self.assertIn('sudo zpool create testpool "$ZEROFS_CI_NBD_DEVICE"', self.profile)
         self.assertNotIn("/dev/nbd0", self.profile)
 
-    def test_kernel_workloads_use_persistent_pinned_tarball(self):
-        url = "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/snapshot/linux-7.2-rc1.tar.gz"
-        self.assertEqual(self.source.count(url), 5)
-        self.assertNotIn("https://git.kernel.org/torvalds/t/", self.source)
-
     @classmethod
     def setUpClass(cls):
         cls.source = WORKFLOW.read_text()

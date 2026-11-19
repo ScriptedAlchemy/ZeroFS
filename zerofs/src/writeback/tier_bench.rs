@@ -58,7 +58,7 @@ struct LocalTierReport {
     ssd_write_seconds: f64,
     ssd_write_mib_per_second: f64,
     ssd_drain_after_ram_ack_seconds: f64,
-    /// Reads the on-disk journal blob through `Journal::read_blob`, which is a
+    /// Reads the on-disk journal blob through `Journal::read_blob_bounded`, which is a
     /// buffered read of a file this same process wrote seconds earlier — in
     /// practice served by the OS page cache, not raw SSD media. Treat this as
     /// a hot-cache journal replay figure, not a device-level read rate.
@@ -254,7 +254,7 @@ async fn read_ssd_journal(
             let mut index = reader;
             while index < object_count {
                 let sequence = index_to_sequence[index];
-                let readback = journal.read_blob(sequence)?;
+                let readback = journal.read_blob_bounded(sequence, payload_bytes as u64)?;
                 let readback_digest: [u8; 32] = Sha256::digest(&readback).into();
                 anyhow::ensure!(
                     readback_digest == digests[index],

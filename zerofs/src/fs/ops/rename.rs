@@ -44,6 +44,10 @@ pub(crate) enum VerifiedRenameOutcome {
 #[derive(Default)]
 struct RenameCompletion {
     moved: bool,
+    #[cfg_attr(
+        not(any(feature = "webui", test)),
+        expect(dead_code, reason = "only verified rename consumes the hash outcome")
+    )]
     verification: Option<VerifiedRenameOutcome>,
 }
 

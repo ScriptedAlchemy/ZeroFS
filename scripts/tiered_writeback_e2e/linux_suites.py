@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import sys
 
 from .config import HarnessConfig, validate_owned_path
-from .integrity import IntegrityError, floors_for, sha256_file
+from .integrity import floors_for
 from .protocols import (
     NFS_PORT,
     NINEP_PORT,
@@ -49,20 +50,11 @@ TOOL_REPOSITORIES = {
 
 # Kernel scenarios may download exactly this archive and must verify its
 # SHA-256 before extraction.
-KERNEL_ARCHIVE_URL = "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.tar.xz"
+KERNEL_VERSION = "6.18"
 KERNEL_ARCHIVE_SHA256 = (
     "9106a4605da9e31ff17659d958782b815f9591ab308d03b0ee21aad6c7dced4b"
 )
-KERNEL_SOURCE_DIRNAME = "linux-6.18"
-
-
-def verify_kernel_archive(path: Path, *, expected: str = KERNEL_ARCHIVE_SHA256) -> str:
-    digest = sha256_file(Path(path))
-    if digest != expected:
-        raise IntegrityError(
-            f"kernel archive {path} hash mismatch: expected {expected}, got {digest}"
-        )
-    return digest
+KERNEL_SOURCE_DIRNAME = f"linux-{KERNEL_VERSION}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,7 +98,7 @@ def tool_checkout_steps(config: HarnessConfig, name: str) -> tuple[Step, ...]:
 
 def kernel_archive_steps(config: HarnessConfig, extract_to: Path) -> tuple[Step, ...]:
     archive = validate_owned_path(
-        config.tools_root / "linux-6.18.tar.xz", config.resource_root
+        config.tools_root / f"{KERNEL_SOURCE_DIRNAME}.tar.xz", config.resource_root
     )
     return (
         Step(
@@ -114,16 +106,16 @@ def kernel_archive_steps(config: HarnessConfig, extract_to: Path) -> tuple[Step,
             ("mkdir", "-p", str(config.tools_root)),
         ),
         Step(
-            "download the pinned kernel archive",
-            ("curl", "-fsSL", "--output", str(archive), KERNEL_ARCHIVE_URL),
-        ),
-        Step(
-            "verify the kernel archive SHA-256 before extraction",
+            "download and verify the pinned kernel archive",
             (
-                "bash",
-                "-c",
-                f"echo '{KERNEL_ARCHIVE_SHA256}  {archive}' | "
-                "sha256sum --check --strict",
+                sys.executable,
+                str(Path(__file__).resolve().parents[1] / "ci/fetch-linux-source.py"),
+                "--version",
+                KERNEL_VERSION,
+                "--output",
+                str(archive),
+                "--sha256",
+                KERNEL_ARCHIVE_SHA256,
             ),
         ),
         Step(

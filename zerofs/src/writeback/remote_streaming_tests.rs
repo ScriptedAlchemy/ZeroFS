@@ -2,6 +2,7 @@ use super::*;
 use crate::segment_store::{ConditionalMultipartCreate, GeneratedSegmentCreate};
 use crate::writeback::journaler::LocalJournaler;
 use crate::writeback::model::JournalIdentity;
+use crate::writeback::test_util::assert_journal_payload;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future;
@@ -752,7 +753,7 @@ async fn shipping_sftp_recovery_case(large: bool, fault: usize, stop_during_clea
     assert!(scheduler.barrier().progress.current_terminal().is_none());
     assert_eq!(journal.progress().unwrap().local_seq, 1);
     assert_eq!(journal.progress().unwrap().remote_seq, 0);
-    assert_eq!(journal.read_blob(1).unwrap(), payload);
+    assert_journal_payload(&journal, 1, &payload);
     assert_eq!(
         server.writes.load(Ordering::SeqCst),
         1,
@@ -764,7 +765,7 @@ async fn shipping_sftp_recovery_case(large: bool, fault: usize, stop_during_clea
             .expect("cleanup recovery must not hang shutdown")
             .unwrap();
         assert_eq!(journal.progress().unwrap().remote_seq, 0);
-        assert_eq!(journal.read_blob(1).unwrap(), payload);
+        assert_journal_payload(&journal, 1, &payload);
         // Allow the bounded Drop fallback to settle before pool shutdown.
         server.outage.store(false, Ordering::SeqCst);
     } else {
@@ -776,7 +777,7 @@ async fn shipping_sftp_recovery_case(large: bool, fault: usize, stop_during_clea
         if fault == 4 {
             assert!(result.unwrap_err().to_string().contains("different bytes"));
             assert_eq!(journal.progress().unwrap().remote_seq, 0);
-            assert_eq!(journal.read_blob(1).unwrap(), payload);
+            assert_journal_payload(&journal, 1, &payload);
             assert!(scheduler.shutdown().await.is_err());
         } else {
             result.unwrap();

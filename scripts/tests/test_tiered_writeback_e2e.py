@@ -1222,26 +1222,6 @@ class LinuxSuiteTests(HarnessCase):
             },
         )
 
-    def test_kernel_archive_pin_matches_the_contract(self) -> None:
-        self.assertEqual(
-            linux_suites.KERNEL_ARCHIVE_URL,
-            "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.tar.xz",
-        )
-        self.assertEqual(
-            linux_suites.KERNEL_ARCHIVE_SHA256,
-            "9106a4605da9e31ff17659d958782b815f9591ab308d03b0ee21aad6c7dced4b",
-        )
-
-    def test_kernel_archive_verification_rejects_a_mismatched_hash(self) -> None:
-        archive = self.base / "linux-6.18.tar.xz"
-        archive.write_bytes(b"definitely not the kernel")
-        with self.assertRaises(IntegrityError):
-            linux_suites.verify_kernel_archive(archive)
-        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-        self.assertEqual(
-            linux_suites.verify_kernel_archive(archive, expected=digest), digest
-        )
-
     def test_kernel_plans_verify_the_archive_before_extraction(self) -> None:
         config = self.make_config()
         context = ScenarioContext(
@@ -1250,18 +1230,26 @@ class LinuxSuiteTests(HarnessCase):
             zerofs_config=self.zerofs_config,
         )
         plan = SCENARIOS["kernel-compile-nfs"](context)
-        rendered = [" ".join(step.argv) for step in plan.steps]
-        verify_index = next(
-            index
-            for index, text in enumerate(rendered)
-            if linux_suites.KERNEL_ARCHIVE_SHA256 in text
+        download = next(
+            (index, step.argv)
+            for index, step in enumerate(plan.steps)
+            if len(step.argv) > 1 and Path(step.argv[1]).name == "fetch-linux-source.py"
         )
-        extract_index = next(
-            index for index, text in enumerate(rendered) if text.startswith("tar ")
+        extract = next(
+            (index, step.argv)
+            for index, step in enumerate(plan.steps)
+            if step.argv[0] == "tar"
         )
-        self.assertLess(verify_index, extract_index)
-        download = next(text for text in rendered if "curl" in text)
-        self.assertIn(linux_suites.KERNEL_ARCHIVE_URL, download)
+        self.assertLess(download[0], extract[0])
+        archive = config.tools_root / "linux-6.18.tar.xz"
+        self.assertEqual(
+            download[1][2:],
+            (
+                "--version", "6.18", "--output", str(archive), "--sha256",
+                "9106a4605da9e31ff17659d958782b815f9591ab308d03b0ee21aad6c7dced4b",
+            ),
+        )
+        self.assertEqual(extract[1][-1], str(archive))
 
     def test_tool_checkouts_stay_under_the_resource_root_tools_dir(self) -> None:
         config = self.make_config()

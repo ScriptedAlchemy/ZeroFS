@@ -570,7 +570,9 @@ impl OverlayIndex {
                 let worker_read = Arc::clone(&payload_read);
                 let bytes = tokio::task::spawn_blocking(move || {
                     let _payload_read = worker_read;
-                    journal.read_blob(sequence).map(Bytes::from)
+                    journal
+                        .read_blob_bounded(sequence, BLOB_CACHE_INLINE_MAX_BYTES)
+                        .map(Bytes::from)
                 })
                 .await
                 .map_err(|error| generic_error(format!("journal read task failed: {error}")))?
