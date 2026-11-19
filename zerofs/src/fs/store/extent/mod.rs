@@ -108,6 +108,17 @@ impl DecodedExtentKey {
     }
 }
 
+fn build_decoded_extent_cache(capacity: usize) -> Cache<DecodedExtentKey, Bytes> {
+    // Foyer admits an entry even when it exceeds its individual shard's
+    // budget. Keep the usual eight shards for ordinary cache sizes, but do
+    // not split a small budget into pieces smaller than one complete extent.
+    let shards = (capacity / EXTENT_SIZE).clamp(1, 8);
+    CacheBuilder::new(capacity)
+        .with_shards(shards)
+        .with_weighter(|_: &DecodedExtentKey, data: &Bytes| data.len())
+        .build()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CachedExtentLocation {
     Hole,
@@ -252,8 +263,29 @@ impl ExtentStore {
     }
 
     fn decoded_insert(&self, id: InodeId, extent: u64, loc: crate::segment::FrameLoc, data: Bytes) {
+        if data.len() > self.decoded_extent_cache.capacity() {
+            return;
+        }
         self.decoded_extent_cache
             .insert(DecodedExtentKey::new(id, extent, loc), data);
+    }
+
+    /// Write staging uses shallow slices of a possibly much larger request.
+    /// A byte-weighted cache must own only the bytes it charges: retaining one
+    /// slice after its peers are evicted must not pin the entire request.
+    fn decoded_insert_written(
+        &self,
+        id: InodeId,
+        extent: u64,
+        loc: crate::segment::FrameLoc,
+        data: &Bytes,
+    ) {
+        // Skip the copy when the configured whole-cache budget cannot fit an
+        // extent. Foyer can otherwise retain an oversized insertion itself.
+        if data.len() > self.decoded_extent_cache.capacity() {
+            return;
+        }
+        self.decoded_insert(id, extent, loc, Bytes::copy_from_slice(data));
     }
 
     pub(crate) fn new(
@@ -274,9 +306,7 @@ impl ExtentStore {
             .build();
         let (decoded_extent_cache_bytes, extent_location_cache_bytes) =
             split_extent_read_budget(decoded_extent_cache_bytes);
-        let decoded_extent_cache = CacheBuilder::new(decoded_extent_cache_bytes)
-            .with_weighter(|_: &DecodedExtentKey, data: &Bytes| data.len())
-            .build();
+        let decoded_extent_cache = build_decoded_extent_cache(decoded_extent_cache_bytes);
         let extent_location_cache = ExtentLocationCache::new(
             db.clone(),
             extent_location_cache_bytes,

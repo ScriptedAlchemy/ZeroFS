@@ -1062,7 +1062,7 @@ impl ExtentStore {
                     // plaintext before metadata commit is safe: a failed
                     // transaction leaves this entry unreachable, while a
                     // successful one becomes read-ready without a decode pass.
-                    self.decoded_insert(id, *extent, loc, data.clone());
+                    self.decoded_insert_written(id, *extent, loc, data);
                     // Credit the frame just appended: both live and total.
                     self.seg_delta(txn, loc.segid, loc.byte_len as i64, loc.byte_len as i64);
                 }
@@ -1648,6 +1648,109 @@ mod tests {
     use slatedb::object_store::ObjectStore;
     use slatedb::object_store::memory::InMemory;
     use tokio::sync::Semaphore;
+
+    #[tokio::test]
+    async fn cached_write_extent_does_not_retain_the_entire_request() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct TrackedRequest {
+            bytes: Vec<u8>,
+            dropped: Arc<AtomicBool>,
+        }
+
+        impl AsRef<[u8]> for TrackedRequest {
+            fn as_ref(&self) -> &[u8] {
+                &self.bytes
+            }
+        }
+
+        impl Drop for TrackedRequest {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::Release);
+            }
+        }
+
+        let (store, db) = make().await;
+        let inode = 47;
+        let extents = 32;
+        let dropped = Arc::new(AtomicBool::new(false));
+        let request = Bytes::from_owner(TrackedRequest {
+            bytes: vec![0x5a; extents * EXTENT_SIZE],
+            dropped: Arc::clone(&dropped),
+        });
+        write_committed(&store, &db, inode, 0, &request, 0).await;
+        drop(request);
+
+        // Leave exactly one extent resident, as a hot small read would after
+        // the rest of a large write falls out of the clean cache.
+        for extent in 1..extents as u64 {
+            let loc = frameloc_of(&store, &db, inode, extent).await.unwrap();
+            store
+                .decoded_extent_cache
+                .remove(&super::super::DecodedExtentKey::new(inode, extent, loc));
+        }
+        assert_eq!(store.decoded_extent_cache.usage(), EXTENT_SIZE);
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "a cached 32 KiB slice must not retain the 1 MiB request allocation"
+        );
+        let loc = frameloc_of(&store, &db, inode, 0).await.unwrap();
+        let cached = store.decoded_get(inode, 0, loc).unwrap();
+        assert_eq!(cached.as_ref(), &[0x5a; EXTENT_SIZE]);
+        assert_eq!(store.get(inode, 0).await.unwrap().unwrap(), cached);
+    }
+
+    #[tokio::test]
+    async fn undersized_decoded_cache_skips_write_and_read_population() {
+        for capacity in [0, EXTENT_SIZE - 1] {
+            let (mut store, db) = make().await;
+            store.decoded_extent_cache = super::super::build_decoded_extent_cache(capacity);
+            let data = Bytes::from(vec![0x6b; EXTENT_SIZE]);
+            write_committed(&store, &db, 19, 0, &data, 0).await;
+            assert_eq!(store.decoded_extent_cache.usage(), 0);
+            store.seal_open().await.unwrap();
+            assert_eq!(store.get(19, 0).await.unwrap().unwrap(), data);
+            assert_eq!(store.decoded_extent_cache.usage(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn small_decoded_cache_budgets_fit_complete_extents_per_shard() {
+        let (mut store, _db) = make().await;
+        let data = Bytes::from(vec![0x73; EXTENT_SIZE]);
+        for capacity in (1..=8).flat_map(|extents| {
+            [
+                extents * EXTENT_SIZE,
+                extents * EXTENT_SIZE + EXTENT_SIZE / 2,
+            ]
+        }) {
+            store.decoded_extent_cache = super::super::build_decoded_extent_cache(capacity);
+            assert_eq!(
+                store.decoded_extent_cache.shards(),
+                (capacity / EXTENT_SIZE).min(8)
+            );
+            // Exercise both write population and already-owned decoded reads
+            // across many identities, enough to fill every available shard.
+            for extent in 0..128 {
+                let loc = FrameLoc {
+                    segid: Segid::new(1, 1),
+                    frame_index: extent as u32,
+                    byte_offset: extent * EXTENT_SIZE as u64,
+                    byte_len: EXTENT_SIZE as u32,
+                };
+                if extent % 2 == 0 {
+                    store.decoded_insert_written(1, extent, loc, &data);
+                } else {
+                    store.decoded_insert(1, extent, loc, Bytes::copy_from_slice(&data));
+                }
+                assert!(
+                    store.decoded_extent_cache.usage() <= capacity,
+                    "cache usage exceeds the {capacity}-byte whole-cache budget"
+                );
+            }
+            assert!(store.decoded_extent_cache.usage() > 0);
+        }
+    }
 
     fn staged_deletes(mut txn: Transaction) -> (Vec<Bytes>, Vec<(InodeId, u64)>) {
         let _ = txn.take_seg_deltas();
