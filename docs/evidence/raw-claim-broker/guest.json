@@ -1,0 +1,38 @@
+{
+  "engine_sha256": "9f9f083616b30f9c978f06f06b4e6ddf7a6e2c2e1ab47efef196b182bf8410ca",
+  "probe_sha256": "b635606f8042dac4b9083be09bc1b6e933076dd688a9ff254486de2f6c95e917",
+  "kernel_sha256": "f61ffe7df59927e682895fee72d643b7ffa64e0f33e27a354ad967b85d41dae1",
+  "emulator": {
+    "model_offset_in_elf": 11927524,
+    "changed_bytes": 14,
+    "original_bytes_hex": "51454d55204e564d65204374726c00",
+    "substituted_bytes_hex": "435431303030503353534438000000",
+    "stock_sha256": "8a35ccba41582fc6c38b9df85fc9e35fa1d42f414d2d7d8090ee9b2f5e7c0854",
+    "fixture_sha256": "18de5e7df7e0213a02138e6e0edb63c0941d7c90250db3c0f37f20cadb0bef74"
+  },
+  "base_images_unchanged": true,
+  "observations": [
+    "BROKER_VM_REFUSED isolated-pid-only",
+    "BROKER_VM_REFUSED isolated-mount-only",
+    "BROKER_VM_HOST pidns=pid:[4026531836] mntns=mnt:[4026531832] socket=0:20001:660",
+    "BROKER_VM_REFUSED wrong-uid-even-with-socket-group",
+    "BROKER_VM_CLIENT uid=20001 gid=20001 groups=20001 pidns=pid:[4026532167] mntns=mnt:[4026532166] cgroup=0::/ host_root=absent devices=absent host_sysfs=absent capabilities=0",
+    "BROKER_VM_REFUSED missing-transport",
+    "BROKER_VM_REFUSED premature-disconnect",
+    "BROKER_VM_REFUSED missing-fd",
+    "BROKER_VM_REFUSED substituted-file",
+    "BROKER_VM_REFUSED substituted-sequence",
+    "BROKER_VM_REFUSED substituted-broker",
+    "BROKER_VM_REFUSED run-before-pool-init",
+    "BROKER_VM_READY authority=true catalog=true key_envelope=true journal=true included_companion_bytes=1610612736",
+    "BROKER_VM_REFUSED mismatched-member",
+    "BROKER_VM_REFUSED exclusive",
+    "BROKER_VM_AFTER_DISCONNECT uploaded_and_flushed_sha256=68c31a27a353e77c311d7892fbfe1a718dca21d52175b65103543d33b25f2315  /state/original",
+    "BROKER_VM_REFUSED no-broker-reopen",
+    "BROKER_VM_RESTART recovered_sha256=68c31a27a353e77c311d7892fbfe1a718dca21d52175b65103543d33b25f2315  /state/copy",
+    "BROKER_VM_SOCKET_REPLACED old=89 new=94",
+    "BROKER_VM_CGROUP limit=8589934592 swap_limit=0 swap_peak=0 peak=216526848 events=low=0 high=0 max=0 oom=0 oom_kill=0 oom_group_kill=0 sock_throttled=0 ",
+    "BROKER_VM_PASS"
+  ],
+  "verified_removed": "/var/tmp/zerofs-claim-ns.oo8i5as0"
+}
