@@ -12,7 +12,7 @@ use crate::fs::inode::{
 };
 use crate::fs::mutation::types::{ConflictKey, ConflictScope};
 use crate::fs::permissions::{
-    AccessMode, Credentials, check_access, new_entry_gid, strip_sgid_unless_member, validate_mode,
+    AccessMode, Credentials, new_entry_gid, strip_sgid_unless_member, validate_mode,
 };
 #[cfg(test)]
 use crate::fs::store::directory::COOKIE_FIRST_ENTRY;
@@ -87,8 +87,10 @@ impl ZeroFS {
         let (parent_and_name, cookie) = tokio::join!(parent_and_name, cookie_read);
         let (mut dir_inode, exists) = parent_and_name?;
 
-        check_access(&dir_inode, creds, AccessMode::Write)?;
-        check_access(&dir_inode, creds, AccessMode::Execute)?;
+        self.check_inode_access(dirid, &dir_inode, creds, AccessMode::Write)
+            .await?;
+        self.check_inode_access(dirid, &dir_inode, creds, AccessMode::Execute)
+            .await?;
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
@@ -109,7 +111,7 @@ impl ZeroFS {
                 let (now_sec, now_nsec) = get_current_time();
 
                 let new_gid = new_entry_gid(dir, &attr.gid, creds);
-                let final_mode = strip_sgid_unless_member(
+                let mut final_mode = strip_sgid_unless_member(
                     dir,
                     match &attr.mode {
                         SetMode::Set(m) => validate_mode(*m),
@@ -118,6 +120,7 @@ impl ZeroFS {
                     new_gid,
                     creds,
                 );
+                let inherited_acls = self.inherited_acls(dirid, false, &mut final_mode).await?;
 
                 let file_inode = Inode::File(FileInode {
                     size: 0,
@@ -156,6 +159,7 @@ impl ZeroFS {
                     },
                 );
                 self.inode_store.save(&mut txn, file_id, &file_inode)?;
+                inherited_acls.stage(self, &mut txn, file_id);
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::CREATE_AFTER_INODE);
@@ -277,8 +281,10 @@ impl ZeroFS {
             self.directory_store.exists(dirid, name)
         )?;
 
-        check_access(&dir_inode, creds, AccessMode::Write)?;
-        check_access(&dir_inode, creds, AccessMode::Execute)?;
+        self.check_inode_access(dirid, &dir_inode, creds, AccessMode::Write)
+            .await?;
+        self.check_inode_access(dirid, &dir_inode, creds, AccessMode::Execute)
+            .await?;
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
@@ -301,6 +307,7 @@ impl ZeroFS {
                 if dir.mode & 0o2000 != 0 {
                     new_mode |= 0o2000;
                 }
+                let inherited_acls = self.inherited_acls(dirid, true, &mut new_mode).await?;
 
                 let new_uid = match &attr.uid {
                     SetUid::Set(u) => *u,
@@ -356,6 +363,7 @@ impl ZeroFS {
                 );
                 self.inode_store
                     .save(&mut txn, new_dir_id, &new_dir_inode_enum)?;
+                inherited_acls.stage(self, &mut txn, new_dir_id);
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::MKDIR_AFTER_INODE);
@@ -482,8 +490,10 @@ impl ZeroFS {
             self.directory_store.exists(dirid, name)
         )?;
 
-        check_access(&dir_inode, creds, AccessMode::Write)?;
-        check_access(&dir_inode, creds, AccessMode::Execute)?;
+        self.check_inode_access(dirid, &dir_inode, creds, AccessMode::Write)
+            .await?;
+        self.check_inode_access(dirid, &dir_inode, creds, AccessMode::Execute)
+            .await?;
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
@@ -506,7 +516,7 @@ impl ZeroFS {
                 };
 
                 let new_gid = new_entry_gid(dir, &attr.gid, creds);
-                let final_mode = strip_sgid_unless_member(
+                let mut final_mode = strip_sgid_unless_member(
                     dir,
                     if let SetMode::Set(m) = attr.mode {
                         validate_mode(m)
@@ -516,6 +526,7 @@ impl ZeroFS {
                     new_gid,
                     creds,
                 );
+                let inherited_acls = self.inherited_acls(dirid, false, &mut final_mode).await?;
 
                 let special_inode = SpecialInode {
                     mtime: now_sec,
@@ -564,6 +575,7 @@ impl ZeroFS {
                 );
 
                 self.inode_store.save(&mut txn, special_id, &inode)?;
+                inherited_acls.stage(self, &mut txn, special_id);
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::MKNOD_AFTER_INODE);

@@ -192,6 +192,8 @@ pub struct ZeroFS {
     /// connections (a retry may arrive on a new one); on a standby it is also fed
     /// by the replication stream.
     pub(crate) dedup: Arc<crate::dedup::DedupCache>,
+    /// Whether this volume stores POSIX or NFSv4 ACLs. See `fs/ops/xattr/acl.rs`.
+    pub(crate) acl_state: Arc<ops::AclState>,
 }
 
 impl ZeroFS {

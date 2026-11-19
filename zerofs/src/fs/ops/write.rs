@@ -11,7 +11,7 @@ use crate::fs::mutation::types::{
     PendingAppend, PrepareWriteMember, PrepareWriteRequest, PreparedBatchResult,
     PreparedWriteBatch, PreparedWriteMember,
 };
-use crate::fs::permissions::{AccessMode, Credentials, check_access};
+use crate::fs::permissions::{AccessMode, Credentials};
 use crate::fs::store::ExtentStore;
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{AuthContext, FileAttributes, InodeWithId};
@@ -305,7 +305,8 @@ pub(crate) async fn prepare_write_with_append(
         match &inode {
             Inode::File(file) => {
                 if request.check_permissions && creds.uid != file.uid {
-                    check_access(&inode, &creds, AccessMode::Write)?;
+                    fs.check_inode_access(member.id, &inode, &creds, AccessMode::Write)
+                        .await?;
                 }
             }
             _ => return Err(FsError::IsDirectory),

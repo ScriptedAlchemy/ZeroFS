@@ -9,7 +9,7 @@ use crate::dedup::DedupResult;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId, SymlinkInode};
 use crate::fs::mutation::types::{ConflictKey, ConflictScope};
-use crate::fs::permissions::{AccessMode, Credentials, check_access, new_entry_gid};
+use crate::fs::permissions::{AccessMode, Credentials, new_entry_gid};
 use crate::fs::store::inode::MAX_HARDLINKS_PER_INODE;
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{AuthContext, FileAttributes, InodeWithId, SetAttributes, SetMode, SetUid};
@@ -68,8 +68,10 @@ impl ZeroFS {
             self.directory_store.exists(dirid, linkname)
         )?;
 
-        check_access(&dir_inode, creds, AccessMode::Write)?;
-        check_access(&dir_inode, creds, AccessMode::Execute)?;
+        self.check_inode_access(dirid, &dir_inode, creds, AccessMode::Write)
+            .await?;
+        self.check_inode_access(dirid, &dir_inode, creds, AccessMode::Execute)
+            .await?;
 
         let dir = match &mut dir_inode {
             Inode::Directory(d) => d,
@@ -251,8 +253,10 @@ impl ZeroFS {
             self.directory_store.exists(linkdirid, linkname)
         )?;
 
-        check_access(&link_dir_inode, &creds, AccessMode::Write)?;
-        check_access(&link_dir_inode, &creds, AccessMode::Execute)?;
+        self.check_inode_access(linkdirid, &link_dir_inode, &creds, AccessMode::Write)
+            .await?;
+        self.check_inode_access(linkdirid, &link_dir_inode, &creds, AccessMode::Execute)
+            .await?;
 
         let mut link_dir = match link_dir_inode {
             Inode::Directory(d) => d,

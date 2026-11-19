@@ -561,6 +561,16 @@ impl Filesystem for Fuse9P {
         // capability it handles POSIX locks locally and never calls getlk/setlk.
         let _ = config.add_capabilities(InitFlags::FUSE_POSIX_LOCKS);
 
+        // Have the kernel evaluate the server's POSIX ACLs in its permission
+        // checks. Without this, `default_permissions` checks mode bits only,
+        // so a named-user or named-group ACL grant would be denied locally.
+        // The server stores and inherits ACLs and keeps the mode in step; the
+        // kernel still applies the umask, so files created under a default
+        // ACL may get a narrower mode than on a local filesystem.
+        if let Err(unsupported) = config.add_capabilities(InitFlags::FUSE_POSIX_ACL) {
+            debug!("kernel does not support FUSE_POSIX_ACL ({unsupported:?}); mode bits only");
+        }
+
         // PARALLEL_DIROPS adds no staleness, so it is always on; it
         // only removes a client-side bottleneck.
         let _ = config.add_capabilities(InitFlags::FUSE_PARALLEL_DIROPS);

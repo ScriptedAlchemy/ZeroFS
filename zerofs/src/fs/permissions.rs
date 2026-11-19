@@ -1,3 +1,6 @@
+pub(crate) mod acl;
+pub(crate) mod nfs4;
+
 use super::errors::FsError;
 use super::inode::{DirectoryInode, Inode, InodeAttrs};
 use super::types::{AuthContext, SetGid};
@@ -98,10 +101,25 @@ pub enum AccessMode {
     Execute,
 }
 
+#[cfg(test)]
+/// Mode-bit check for an inode the caller has not looked up an ACL for.
+/// Paths that can reach an inode carrying a POSIX access ACL must use
+/// `ZeroFS::check_inode_access` instead.
 pub(crate) fn check_access(
     inode: &Inode,
     creds: &Credentials,
     mode: AccessMode,
+) -> Result<(), FsError> {
+    check_access_with_acl(inode, creds, mode, None)
+}
+
+/// Linux `generic_permission` with an optional access ACL. `acl` is the
+/// stored ACL; owner, mask and other permissions come from the inode mode.
+pub(crate) fn check_access_with_acl(
+    inode: &Inode,
+    creds: &Credentials,
+    mode: AccessMode,
+    acl: Option<&acl::PosixAcl>,
 ) -> Result<(), FsError> {
     let (uid, gid, file_mode) = (inode.uid(), inode.gid(), inode.mode());
 
@@ -115,6 +133,16 @@ pub(crate) fn check_access(
             return Err(FsError::PermissionDenied);
         }
         return Ok(());
+    }
+
+    if let Some(acl) = acl
+        && creds.uid != uid
+    {
+        return if acl.with_mode(file_mode).permits(uid, gid, creds, mode) {
+            Ok(())
+        } else {
+            Err(FsError::PermissionDenied)
+        };
     }
 
     let permission_bits = match mode {
@@ -174,13 +202,14 @@ pub(crate) fn can_set_times(
     inode: &Inode,
     creds: &Credentials,
     setting_to_current_time: bool,
+    acl: Option<&acl::PosixAcl>,
 ) -> Result<(), FsError> {
     if creds.uid == 0 || creds.uid == inode.uid() {
         return Ok(());
     }
 
     if setting_to_current_time {
-        return check_access(inode, creds, AccessMode::Write);
+        return check_access_with_acl(inode, creds, AccessMode::Write, acl);
     }
 
     Err(FsError::OperationNotPermitted)

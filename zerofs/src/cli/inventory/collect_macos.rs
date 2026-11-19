@@ -72,6 +72,7 @@ pub(super) fn acl(fd: BorrowedFd<'_>) -> Field<Vec<RawAcl>> {
         format: "macos-extended-text",
         raw: raw.format_probe(),
         decoded: Field::unavailable(Reason::NotDecoded),
+        posix_translation: None,
     }])
 }
 

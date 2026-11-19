@@ -1505,11 +1505,8 @@ impl ZeroFS {
         overlay.project_inode(id, &mut inode);
         if let Some(auth) = auth {
             let creds = crate::fs::permissions::Credentials::from_auth_context(auth);
-            crate::fs::permissions::check_access(
-                &inode,
-                &creds,
-                crate::fs::permissions::AccessMode::Read,
-            )?;
+            self.check_inode_access(id, &inode, &creds, crate::fs::permissions::AccessMode::Read)
+                .await?;
         }
         let Inode::File(file) = &inode else {
             return Err(FsError::IsDirectory);

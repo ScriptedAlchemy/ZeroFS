@@ -13,7 +13,8 @@ use crate::fs::inode::{Inode, InodeAttrs, InodeId, MAX_DEVICE_MAJOR, MAX_DEVICE_
 use crate::fs::mutation::overlay::IdentifiedWrite;
 use crate::fs::mutation::types::{RequestIdentity, RequestLifetime};
 use crate::fs::name_mode::NameMatch;
-use crate::fs::permissions::{AccessMode, Credentials, check_access};
+use crate::fs::permissions::acl::PosixAcl;
+use crate::fs::permissions::{AccessMode, Credentials, check_access_with_acl};
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{
     AuthContext, FallocateMode, FileAttributes, FileType, InodeWithId, SetAttributes, SetGid,
@@ -379,7 +380,12 @@ fn parse_rebind_credentials(n_uname: u32, payload: &[u8]) -> P9Result<Option<Cre
 /// client can satisfy a read from its inode-wide page cache without sending a
 /// subsequent `Tread`, so deferring permission enforcement until I/O would let
 /// one user's cached pages bypass another user's access check.
-fn check_open_access(inode: &Inode, creds: &Credentials, flags: u32) -> P9Result<()> {
+fn check_open_access(
+    inode: &Inode,
+    creds: &Credentials,
+    flags: u32,
+    acl: Option<&PosixAcl>,
+) -> P9Result<()> {
     let access_mode = flags & LINUX_O_ACCMODE;
     if access_mode == LINUX_O_ACCMODE {
         return Err(P9Error::InvalidArgument);
@@ -391,10 +397,10 @@ fn check_open_access(inode: &Inode, creds: &Credentials, flags: u32) -> P9Result
         return Ok(());
     }
     if access_mode != LINUX_O_WRONLY {
-        check_access(inode, creds, AccessMode::Read)?;
+        check_access_with_acl(inode, creds, AccessMode::Read, acl)?;
     }
     if access_mode == LINUX_O_WRONLY || access_mode == LINUX_O_RDWR || flags & LINUX_O_TRUNC != 0 {
-        check_access(inode, creds, AccessMode::Write)?;
+        check_access_with_acl(inode, creds, AccessMode::Write, acl)?;
     }
     Ok(())
 }
@@ -1312,7 +1318,9 @@ impl NinePHandler {
             if !parent.is_directory() {
                 return Err(Self::rebind_authorization_error(replay));
             }
-            check_access(&parent, creds, AccessMode::Execute)
+            self.filesystem
+                .check_inode_access(parent_id, &parent, creds, AccessMode::Execute)
+                .await
                 .map_err(|_| Self::rebind_authorization_error(replay))?;
             current_id = parent_id;
             current = parent;
@@ -1370,7 +1378,9 @@ impl NinePHandler {
             // Keep hardlink rebinding O(1). Resolving an arbitrary alias would
             // require a namespace-wide reverse search because hardlinked
             // inodes intentionally retain no parent pointer.
-            check_access(&root, &creds, AccessMode::Execute)
+            self.filesystem
+                .check_inode_access(tr.root_inode, &root, &creds, AccessMode::Execute)
+                .await
                 .map_err(|_| Self::rebind_authorization_error(replay))?;
         } else if tr.inode_id != tr.root_inode {
             self.authorize_rebind_ancestry(&creds, tr.inode_id, tr.root_inode, &inode, replay)
@@ -1443,7 +1453,9 @@ impl NinePHandler {
         let Inode::Directory(dir) = &inode else {
             return Err(P9Error::NotADirectory);
         };
-        check_access(&inode, creds, AccessMode::Execute)?;
+        self.filesystem
+            .check_inode_access(current_id, &inode, creds, AccessMode::Execute)
+            .await?;
         if name == b"." {
             return Ok(current_id);
         }
@@ -1751,7 +1763,8 @@ impl NinePHandler {
             if replay_reopen && inode.nlink() == 0 {
                 return Err(FsError::StaleHandle.into());
             }
-            check_open_access(&inode, &creds, tl.flags)
+            let acl = self.filesystem.access_acl(inode_id, &inode, &creds).await?;
+            check_open_access(&inode, &creds, tl.flags, acl.as_ref())
                 .map_err(|error| Self::map_replay_open_error(replay_reopen, error))?;
             let qid = inode_to_qid(&inode, inode_id);
             let mut state = self.session_for_update()?;
@@ -1812,7 +1825,11 @@ impl NinePHandler {
             if replay_reopen && inode.nlink() == 0 {
                 return Err(FsError::StaleHandle.into());
             }
-            check_open_access(&inode, &src_fid.creds, tl.flags)
+            let acl = self
+                .filesystem
+                .access_acl(src_fid.inode_id, &inode, &src_fid.creds)
+                .await?;
+            check_open_access(&inode, &src_fid.creds, tl.flags, acl.as_ref())
                 .map_err(|error| Self::map_replay_open_error(replay_reopen, error))?;
             let qid = inode_to_qid(&inode, src_fid.inode_id);
             let mut state = self.session_for_update()?;

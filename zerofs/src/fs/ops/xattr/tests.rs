@@ -79,7 +79,12 @@ fn names_values_and_flags_are_bounded() {
     for n in [b"".as_slice(), b"user.\0a", b"user."] {
         assert!(matches!(XattrName::new(n), Err(FsError::InvalidArgument)));
     }
-    for n in [b"system.posix_acl_access".as_slice(), b"other.key", b"key"] {
+    for n in [
+        b"system.other".as_slice(),
+        b"system.nfs4_acl",
+        b"other.key",
+        b"key",
+    ] {
         assert!(matches!(XattrName::new(n), Err(FsError::NotSupported)));
     }
     assert!(XattrName::new(&[b"user.".as_slice(), &[b'x'; 250]].concat()).is_ok());

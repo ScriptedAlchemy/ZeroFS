@@ -10,7 +10,7 @@ use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
 use crate::fs::mutation::types::{ConflictKey, ConflictScope};
 use crate::fs::name_mode::NameMatch;
-use crate::fs::permissions::{AccessMode, Credentials, check_access, check_sticky_bit_delete};
+use crate::fs::permissions::{AccessMode, Credentials, check_sticky_bit_delete};
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::AuthContext;
 use crate::fs::{
@@ -192,7 +192,8 @@ impl ZeroFS {
             if !matches!(&dir_inode, Inode::Directory(_)) {
                 return Err(FsError::NotDirectory);
             }
-            check_access(&dir_inode, &creds, AccessMode::Execute)?;
+            self.check_inode_access(dirid, &dir_inode, &creds, AccessMode::Execute)
+                .await?;
             if matches!(&dir_inode, Inode::Directory(dir) if dir.nlink == 0) {
                 return Err(FsError::StaleHandle);
             }
@@ -242,8 +243,10 @@ impl ZeroFS {
         }
 
         let mut dir_inode = self.inode_store.get(dirid).await?;
-        check_access(&dir_inode, &creds, AccessMode::Write)?;
-        check_access(&dir_inode, &creds, AccessMode::Execute)?;
+        self.check_inode_access(dirid, &dir_inode, &creds, AccessMode::Write)
+            .await?;
+        self.check_inode_access(dirid, &dir_inode, &creds, AccessMode::Execute)
+            .await?;
 
         if !matches!(&dir_inode, Inode::Directory(_)) {
             return Err(FsError::NotDirectory);

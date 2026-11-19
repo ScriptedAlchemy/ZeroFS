@@ -54,6 +54,9 @@ struct Manifest<W> {
     hash: Sha256,
     entries: u64,
     non_utf8_names: u64,
+    acl_formats: BTreeMap<String, u64>,
+    nfs4_accepted: u64,
+    nfs4_refused: u64,
     reasons: BTreeMap<String, u64>,
     complete: bool,
 }
@@ -65,6 +68,9 @@ impl<W: Write> Manifest<W> {
             hash: Sha256::new(),
             entries: 0,
             non_utf8_names: 0,
+            acl_formats: BTreeMap::new(),
+            nfs4_accepted: 0,
+            nfs4_refused: 0,
             reasons: BTreeMap::new(),
             complete: true,
         }
@@ -88,11 +94,31 @@ impl<W: Write> Manifest<W> {
             if std::str::from_utf8(path.rsplit(|b| *b == b'/').next().unwrap()).is_err() {
                 self.non_utf8_names += 1;
             }
+            self.count_acls(value);
         }
         self.count_unavailable(value)?;
         self.writer.write_all(bytes)?;
         self.hash.update(bytes);
         Ok(())
+    }
+
+    fn count_acls(&mut self, entry: &Value) {
+        let Some(acls) = entry["acl"]["value"].as_array() else {
+            return;
+        };
+        for acl in acls {
+            if acl["raw"]["status"] != "observed" || acl["raw"]["value"].is_null() {
+                continue;
+            }
+            if let Some(format) = acl["format"].as_str() {
+                *self.acl_formats.entry(format.to_owned()).or_default() += 1;
+            }
+            match acl["posix_translation"]["status"].as_str() {
+                Some("accepted") => self.nfs4_accepted += 1,
+                Some("refused") => self.nfs4_refused += 1,
+                _ => {}
+            }
+        }
     }
 
     fn count_unavailable(&mut self, value: &Value) -> Result<()> {
@@ -123,9 +149,20 @@ impl<W: Write> Manifest<W> {
 
     fn finish(mut self) -> Result<bool> {
         let complete = self.complete;
+        if self.nfs4_refused > 0 {
+            eprintln!(
+                "warning: {} entries carry NFSv4 ACLs that ZeroFS refuses to translate; \
+                 see posix_translation in their records and \
+                 docs/permissions-and-acl-contract.md",
+                self.nfs4_refused
+            );
+        }
         self.emit(&Record::Summary(Summary {
             entries: self.entries,
             non_utf8_names: self.non_utf8_names,
+            acl_formats: self.acl_formats.clone(),
+            nfs4_acl_translations_accepted: self.nfs4_accepted,
+            nfs4_acl_translations_refused: self.nfs4_refused,
             unavailable_by_reason: self.reasons.clone(),
             complete,
         }))?;

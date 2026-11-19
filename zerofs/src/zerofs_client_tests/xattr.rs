@@ -45,6 +45,42 @@ impl WireClient {
         }))
         .await
     }
+    async fn create_named(&mut self, fid: u32, name: &[u8], size: u64, flags: u32) -> Message {
+        self.rpc(Message::Txattrcreate(Txattrcreate {
+            fid,
+            name: P9String::new(name.to_vec()),
+            size,
+            flags,
+        }))
+        .await
+    }
+    async fn read_named(&mut self, newfid: u32, name: &[u8]) -> Result<Vec<u8>, u32> {
+        match self
+            .rpc(Message::Txattrwalk(Txattrwalk {
+                fid: 1,
+                newfid,
+                name: P9String::new(name.to_vec()),
+            }))
+            .await
+        {
+            Message::Rxattrwalk(_) => {}
+            Message::Rlerror(e) => return Err(e.ecode),
+            other => panic!("unexpected {other:?}"),
+        }
+        let data = match self
+            .rpc(Message::Tread(Tread {
+                fid: newfid,
+                offset: 0,
+                count: 4096,
+            }))
+            .await
+        {
+            Message::Rread(r) => r.data.to_vec(),
+            other => panic!("unexpected {other:?}"),
+        };
+        self.clunk(newfid).await;
+        Ok(data)
+    }
     async fn write(&mut self, fid: u32, offset: u64, data: &[u8]) -> Message {
         self.rpc(Message::Twrite(Twrite {
             fid,
@@ -378,4 +414,108 @@ async fn xattr_wire_plain_dialect_rejects_private_remove_flag() {
     let (mut c, _, _) = wire_setup().await;
     c.clone_file(2).await;
     errno(c.create(2, 0, XATTR_REMOVE_ZEROFS).await, 22);
+}
+
+/// The frames Linux v9fs sends for `setfacl` and `getfacl` when the mount is
+/// not `access=client` (fs/9p/acl.c `v9fs_iop_set_acl` and `v9fs_iop_get_acl`
+/// forward the ACL as a plain xattr with flags 0). The server must store,
+/// serve and enforce them; `setfacl -b` sends size 0 with flags 0.
+#[tokio::test]
+async fn xattr_wire_plain_dialect_carries_linux_v9fs_acl_frames() {
+    use crate::fs::inode::InodeAttrs;
+    use crate::fs::permissions::acl::{POSIX_ACL_ACCESS, POSIX_ACL_DEFAULT, PosixAcl};
+    use crate::fs::types::AuthContext;
+    let (mut c, fs, id) = wire_setup().await;
+    let acl = PosixAcl::from_text("u::rw-,u:2000:r--,g::---,m::r--,o::---").to_bytes();
+    c.clone_file(2).await;
+    assert!(matches!(
+        c.create_named(2, POSIX_ACL_ACCESS, acl.len() as u64, 0)
+            .await,
+        Message::Rxattrcreate(_)
+    ));
+    assert!(matches!(c.write(2, 0, &acl).await, Message::Rwrite(_)));
+    assert!(matches!(c.clunk(2).await, Message::Rclunk(_)));
+    assert_eq!(
+        c.read_named(3, POSIX_ACL_ACCESS).await.unwrap(),
+        acl.to_vec()
+    );
+    assert_eq!(fs.inode_store.get(id).await.unwrap().mode() & 0o777, 0o640);
+    let named = AuthContext {
+        uid: 2000,
+        gid: 2000,
+        gid_known: true,
+        gids: vec![],
+        groups_complete: true,
+    };
+    assert!(fs.read_file(&named, id, 0, 1).await.is_ok());
+    let list = c.read_named(4, b"").await.unwrap();
+    assert!(
+        list.windows(POSIX_ACL_ACCESS.len())
+            .any(|w| w == POSIX_ACL_ACCESS)
+    );
+
+    // A default ACL on a regular file is refused at commit with EACCES.
+    let default = PosixAcl::from_text("u::rwx,g::r-x,o::---").to_bytes();
+    c.clone_file(5).await;
+    assert!(matches!(
+        c.create_named(5, POSIX_ACL_DEFAULT, default.len() as u64, 0)
+            .await,
+        Message::Rxattrcreate(_)
+    ));
+    c.write(5, 0, &default).await;
+    errno(c.clunk(5).await, 13);
+
+    // `setfacl -b`: size 0, flags 0, no Twrite.
+    c.clone_file(6).await;
+    assert!(matches!(
+        c.create_named(6, POSIX_ACL_ACCESS, 0, 0).await,
+        Message::Rxattrcreate(_)
+    ));
+    assert!(matches!(c.clunk(6).await, Message::Rclunk(_)));
+    assert_eq!(c.read_named(7, POSIX_ACL_ACCESS).await, Err(61));
+    assert_eq!(
+        fs.read_file(&named, id, 0, 1).await.err(),
+        Some(crate::fs::errors::FsError::PermissionDenied)
+    );
+}
+
+/// Linux v9fs encodes an empty `XATTR_REPLACE` and `removexattr` as the same
+/// frames, so a plain session keeps removal. This pins the server behaviour
+/// the kernel 9P mount matrix observed.
+#[tokio::test]
+async fn xattr_wire_plain_dialect_empty_replace_frames_remove() {
+    let (mut c, fs, id) = wire_setup().await;
+    c.clone_file(2).await;
+    assert!(matches!(c.create(2, 1, 0).await, Message::Rxattrcreate(_)));
+    c.write(2, 0, b"v").await;
+    assert!(matches!(c.clunk(2).await, Message::Rclunk(_)));
+    // Size 0, flags XATTR_REPLACE, no Twrite: identical for both syscalls.
+    c.clone_file(3).await;
+    assert!(matches!(c.create(3, 0, 2).await, Message::Rxattrcreate(_)));
+    assert!(matches!(c.clunk(3).await, Message::Rclunk(_)));
+    assert_eq!(
+        fs.xattr_store.get(id, b"user.key").await,
+        Err(crate::fs::errors::FsError::NoData)
+    );
+    // Size 0 with flags 0 or XATTR_CREATE stores an empty value.
+    for (fid, flags) in [(4, 0), (5, 1)] {
+        if flags == 1 {
+            c.clone_file(9).await;
+            assert!(matches!(c.create(9, 0, 2).await, Message::Rxattrcreate(_)));
+            assert!(matches!(c.clunk(9).await, Message::Rclunk(_)));
+        }
+        c.clone_file(fid).await;
+        assert!(matches!(
+            c.create(fid, 0, flags).await,
+            Message::Rxattrcreate(_)
+        ));
+        assert!(matches!(c.clunk(fid).await, Message::Rclunk(_)));
+        assert!(
+            fs.xattr_store
+                .get(id, b"user.key")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
 }

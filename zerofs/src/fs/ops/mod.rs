@@ -16,6 +16,7 @@ mod remove;
 mod rename;
 mod setattr;
 mod xattr;
+pub(crate) use xattr::AclState;
 pub use xattr::{XATTR_VALUE_MAX, XattrName, XattrSetMode, XattrValue};
 pub(crate) mod write;
 

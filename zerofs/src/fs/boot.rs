@@ -275,12 +275,14 @@ impl ZeroFS {
             tracer: AccessTracer::new(),
             object_tracer,
             dedup,
+            acl_state: Default::default(),
         };
 
         // Reclaim durable orphans before a writer starts serving.
         if !db.is_read_only() {
             fs.drain_orphans().await?;
         }
+        fs.report_acl_state().await?;
 
         Ok(fs)
     }
