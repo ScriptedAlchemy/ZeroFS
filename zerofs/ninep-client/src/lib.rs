@@ -537,6 +537,22 @@ struct PendingRequest {
     _admission: Option<AdmissionPermit>,
 }
 
+/// Reader and writer tasks retain the connection independently of the caller.
+/// Until negotiation transfers it to a client or the probe drain, cancellation
+/// must explicitly stop those tasks instead of only dropping the caller's Arc.
+struct ConnectingTransport {
+    conn: Arc<Conn>,
+    transferred: bool,
+}
+
+impl Drop for ConnectingTransport {
+    fn drop(&mut self) {
+        if !self.transferred {
+            self.conn.shutdown();
+        }
+    }
+}
+
 impl Conn {
     /// Stops both transport tasks.
     fn shutdown(&self) {
@@ -969,7 +985,7 @@ impl NinePClient {
         counters: Arc<TrafficCounters>,
         msize_mismatch_warned: Arc<AtomicBool>,
     ) -> ClientResult<(Arc<Conn>, u32)> {
-        let transport = dial(target).await?;
+        let transport_kind = dial(target).await?;
         let (writer_tx, writer_rx) = mpsc::channel::<OutboundFrame>(P9_CHANNEL_SIZE);
         let conn = Arc::new(Conn {
             writer_tx,
@@ -987,8 +1003,12 @@ impl NinePClient {
             send_progress: SendProgress::new(),
             counters,
         });
+        let mut transport = ConnectingTransport {
+            conn: Arc::clone(&conn),
+            transferred: false,
+        };
 
-        match transport {
+        match transport_kind {
             #[cfg(not(target_arch = "wasm32"))]
             DialedTransport::Native { read, write } => {
                 spawn_writer(
@@ -1023,20 +1043,14 @@ impl NinePClient {
                             "9P reconnect candidate still negotiates msize {msize}; logical session requires {required}"
                         );
                     }
-                    conn.shutdown();
                     return Err(ClientError::Unexpected("version"));
                 }
+                transport.transferred = true;
                 Ok((conn, msize))
             }
-            // Healthy socket but the handshake failed/stalled; tear down so the fd is not leaked.
-            Ok(Err(e)) => {
-                conn.shutdown();
-                Err(e)
-            }
-            Err(_) => {
-                conn.shutdown();
-                Err(ClientError::Disconnected)
-            }
+            // The guard closes failed, timed-out, and cancelled handshakes.
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(ClientError::Disconnected),
         }
     }
 
@@ -3874,6 +3888,130 @@ mod target_dial_tests {
         assert_eq!(successes, 1);
         assert_eq!(failures, 1);
         accept.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_connection_negotiation_closes_the_transport() {
+        for cancel_at_lineage in [false, true] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let attempt = tokio::spawn(NinePClient::connect_tcp(addr, 64 * 1024));
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let version = recv_message(&mut stream).await;
+            assert!(matches!(version.body, Message::Tversion(_)));
+            if cancel_at_lineage {
+                send_message(
+                    &mut stream,
+                    version.tag,
+                    Message::Rversion(Rversion {
+                        msize: 64 * 1024,
+                        version: P9String::new(VERSION_9P2000L_ZEROFS.to_vec()),
+                    }),
+                )
+                .await;
+                let lineage = recv_message(&mut stream).await;
+                assert!(matches!(lineage.body, Message::Tgetlineage(_)));
+            }
+
+            attempt.abort();
+            assert!(matches!(attempt.await, Err(error) if error.is_cancelled()));
+            let mut byte = [0u8; 1];
+            let closed = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+                .await
+                .expect("cancelled negotiation left its transport tasks and socket alive")
+                .unwrap();
+            assert_eq!(
+                closed, 0,
+                "cancelled negotiation sent unexpected trailing data"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_multi_target_probe_closes_every_started_transport() {
+        let first = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let second = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let targets = vec![
+            Target::Tcp(first.local_addr().unwrap()),
+            Target::Tcp(second.local_addr().unwrap()),
+        ];
+        let attempt = tokio::spawn(NinePClient::connect_multi(targets, 64 * 1024));
+        let (mut first, _) = first.accept().await.unwrap();
+        let (mut second, _) = second.accept().await.unwrap();
+        assert!(matches!(
+            recv_message(&mut first).await.body,
+            Message::Tversion(_)
+        ));
+        assert!(matches!(
+            recv_message(&mut second).await.body,
+            Message::Tversion(_)
+        ));
+
+        attempt.abort();
+        assert!(matches!(attempt.await, Err(error) if error.is_cancelled()));
+        for stream in [&mut first, &mut second] {
+            let mut byte = [0u8; 1];
+            let closed = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+                .await
+                .expect("cancelled target probe kept one of its started transports alive")
+                .unwrap();
+            assert_eq!(closed, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn negotiated_transport_survives_until_the_client_is_dropped() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let version = recv_message(&mut stream).await;
+            send_message(
+                &mut stream,
+                version.tag,
+                Message::Rversion(Rversion {
+                    msize: 64 * 1024,
+                    version: P9String::new(VERSION_9P2000L_ZEROFS.to_vec()),
+                }),
+            )
+            .await;
+            let lineage = recv_message(&mut stream).await;
+            send_message(
+                &mut stream,
+                lineage.tag,
+                Message::Rgetlineage(Rgetlineage {
+                    token: 1,
+                    writer_epoch: 1,
+                }),
+            )
+            .await;
+            let getattr = recv_message(&mut stream).await;
+            assert!(matches!(getattr.body, Message::Tgetattr(_)));
+            send_message(
+                &mut stream,
+                getattr.tag,
+                Message::Rgetattr(Rgetattr {
+                    valid: GETATTR_ALL,
+                    stat: Stat {
+                        size: 17,
+                        ..Stat::default()
+                    },
+                }),
+            )
+            .await;
+            let mut byte = [0u8; 1];
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+                    .await
+                    .expect("dropping the connected client must close the transferred transport")
+                    .unwrap(),
+                0
+            );
+        });
+        let client = NinePClient::connect_tcp(addr, 64 * 1024).await.unwrap();
+        assert_eq!(client.getattr(7, GETATTR_ALL).await.unwrap().size, 17);
+        drop(client);
+        server.await.unwrap();
     }
 
     #[tokio::test]
