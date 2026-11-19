@@ -26,6 +26,9 @@ MANIFEST = Path("/input/memory_raw_fixture.toml")
 CGROUP = Path("/sys/fs/cgroup")
 MIB = 1 << 20
 CHUNK = 4 * MIB
+# Stay below the candidate's 4 MiB seal threshold after framing, so the
+# held write does not leave a small trailing segment that either member fits.
+NAS_FIT_PAYLOAD = 2 * MIB
 RAW_BLOCK = 4096  # Raw v1 record header and payload alignment.
 SIZES = {"small": 32 * MIB, "large": 96 * MIB}
 RESERVES = {"small": 16 * MIB, "large": 8 * MIB}
@@ -176,11 +179,11 @@ def append(path, digest, index):
     digest.update(body)
 
 
-def verify(path, digest, chunks, phase):
+def verify(path, digest, expected_size, phase):
     with path.open("rb") as file:
         size = os.fstat(file.fileno()).st_size
         actual = hashlib.file_digest(file, "sha256").hexdigest()
-    assert size == chunks * CHUNK and actual == digest.hexdigest(), (size, actual)
+    assert size == expected_size and actual == digest.hexdigest(), (size, actual)
     record("mounted_hash", phase=phase, bytes=size, sha256=actual)
 
 
@@ -383,9 +386,9 @@ def qualify_nas_fit(root, members, memory_limit, p3):
     initialized = json.loads(run(ZEROFS, "pool", "init", "-c", initial))
     assert initialized["pool_id"] == p3[2] and initialized["mapped_objects"] == 0, initialized
     before, placements = snapshot(held, members, "held_before_write")
-    assert not placements and all(0 < m["available_bytes"] < CHUNK for m in before.values()), before
+    assert not placements and all(0 < m["available_bytes"] < NAS_FIT_PAYLOAD for m in before.values()), before
 
-    body = random.Random(0).randbytes(CHUNK)
+    body = random.Random(0).randbytes(NAS_FIT_PAYLOAD)
     digest = hashlib.sha256(body)
     with mounted(held, crash=True) as (path, server):
         report_webui(held)
@@ -400,7 +403,7 @@ def qualify_nas_fit(root, members, memory_limit, p3):
 
     with mounted(replay) as (path, _):
         start = time.monotonic_ns()
-        verify(path, digest, 1, "held_cold_replay")
+        verify(path, digest, len(body), "held_cold_replay")
         record("mounted_replay_read_timing", read_verify_ns=time.monotonic_ns() - start)
         sample_cgroup("held_cold_replay")
     replayed = inspect_p3(p3, "held_cold_replay")
@@ -415,10 +418,10 @@ def qualify_nas_fit(root, members, memory_limit, p3):
         drained = time.monotonic_ns()
         record("mounted_destage_timing", startup_ns=ready - start, drain_barrier_ns=drained - ready,
                total_ns=drained - start)
-        verify(path, digest, 1, "after_destage")
+        verify(path, digest, len(body), "after_destage")
         sample_cgroup("after_destage")
     status, placed = snapshot(destage, members, "after_destage")
-    assert placed and sum(entry["size"] for entry in placed.values()) >= CHUNK, placed
+    assert placed and sum(entry["size"] for entry in placed.values()) >= len(body), placed
     for key, member in status.items():
         entries = [entry for entry in placed.values() if entry["member_id"] == key]
         physical_spent = (
@@ -429,7 +432,7 @@ def qualify_nas_fit(root, members, memory_limit, p3):
                        for entry in entries)
         assert physical_spent == expected, (key, physical_spent, expected)
     with mounted(cold) as (path, _):
-        verify(path, digest, 1, "destaged_cold_restart")
+        verify(path, digest, len(body), "destaged_cold_restart")
         sample_cgroup("destaged_cold_restart")
     cold_status, restarted = snapshot(cold, members, "destaged_cold_restart")
     assert restarted == placed, restarted
@@ -468,12 +471,12 @@ def qualify(root, members, memory_limit, p3):
         for _ in range(2):
             append(path, digest, chunks)
             chunks += 1
-        verify(path, digest, chunks, "initial")
+        verify(path, digest, chunks * CHUNK, "initial")
     _, initial = snapshot(configs[0], members, "initial")
     assert {entry["member_id"] for entry in initial.values()} == SIZES.keys(), initial
 
     with mounted(configs[1]) as (path, _):
-        verify(path, digest, chunks, "first_restart")
+        verify(path, digest, chunks * CHUNK, "first_restart")
         while chunks < 16:
             append(path, digest, chunks)
             chunks += 1
@@ -498,7 +501,7 @@ def qualify(root, members, memory_limit, p3):
         for _ in range(2):
             append(path, digest, chunks)
             chunks += 1
-        verify(path, digest, chunks, "overflow")
+        verify(path, digest, chunks * CHUNK, "overflow")
     after, final = snapshot(configs[2], members, "after_overflow")
     assert all(final.get(key) == entry for key, entry in at_reserve.items()), final
     new = [entry for key, entry in final.items() if key not in at_reserve]
@@ -533,7 +536,7 @@ def qualify(root, members, memory_limit, p3):
            larger_retirement_reserved_bytes_added=retirement_added)
 
     with mounted(configs[3]) as (path, _):
-        verify(path, digest, chunks, "cold_restart")
+        verify(path, digest, chunks * CHUNK, "cold_restart")
     restarted_status, restarted = snapshot(configs[3], members, "cold_restart")
     assert restarted == final, restarted
     for member in SIZES:

@@ -54,3 +54,46 @@ default AppArmor profile refused the FUSE mount syscall. The passing run
 disabled that profile only for the disposable Spark container. It kept its
 read-only image and fixture binds, private network namespace, narrowly scoped
 device rules, cgroup and capability limits. Studio retains its default profile.
+
+## P3 NAS-fit crash, replay and destage
+
+[Spark NAS-fit attempt 2](spark-nas-fit-98e0081f-attempt-2.log) passed with the
+package-featured engine, probe and runtime manifest from exact source
+`98e0081f33c63f66c5e91706c87bb231a26efc6d`. The 8 GiB cgroup admitted the
+7,504 MiB requirement for both reserve settings with zero swap. The container,
+including the fixture, FUSE process and tmpfs loop backing, peaked at
+542,642,176 bytes (517.5 MiB). Its two-CPU quota showed zero throttled periods.
+All sampled memory event counts and swap usage were zero. The index and all
+eight referenced WebUI assets returned HTTP 200 with the expected content
+types recorded in the receipt.
+
+The 32 MiB and 96 MiB members initialized at the manifest's 16 MiB and 8 MiB
+reserves. With both reserves raised to capacity minus 256 KiB, each member had
+241,664 allocatable bytes. The 2 MiB ordinary FUSE write returned in
+10.48 ms. Fsync returned in 14.57 ms and SIGKILL followed in 0.091 ms.
+The offline catalog showed zero payload placements after the kill and after
+the restart with raised reserves. The cold mounted read matched all
+2,097,152 bytes in 37.49 ms including SHA-256 verification. The P3 journal
+contained 3,608,576 bytes at both checkpoints.
+
+After reopening the same loops and identities with their original reserves,
+the administrative drain barrier returned in 5.79 ms after mount readiness
+(310.24 ms including startup). Offline inspection verified one 2,167,450-byte
+raw segment on the smaller member taking 2,174,976 raw log bytes. The final
+cold restart matched that catalog entry and its raw object SHA-256. The file
+SHA-256 was identical before and after destage
+(`4a6ded0a8e23b872621fd07521873a3c5847663a0657a59e1345de073c90865d`).
+The P3 journal shrank to 114,688 bytes. The raw catalog and authority remained
+populated, and the wrapped key was found only in the key region. No directory
+cache, journal, catalog, authority, or key shadow appeared. All four FUSE
+mounts were removed, all three loops autocleared, and the container and its
+transfer and scratch directories were removed.
+
+[NAS-fit attempt 1](spark-nas-fit-98e0081f-attempt-1.log) preserved the same
+admission, exact pin and zero-swap setup. The 4 MiB write exceeded the 4 MiB
+seal threshold after framing. The catalog was empty immediately after
+SIGKILL, and the held cold read matched, but replay placed a 33,075-byte
+trailing segment that fit below the held headroom. The passing retry used
+2 MiB to keep the encoded write below the seal threshold and retained the
+original held reserves. The receipts include the fixture's synthetic
+encryption password as part of the exact rendered manifest.
