@@ -224,6 +224,13 @@ impl SegmentStore {
             Err(error) if crate::retrying_object_store::is_no_space(&error) => {
                 Err(write_failure(&error))
             }
+            // A refused exact target cannot be reconciled by bytes alone.
+            Err(error)
+                if target.is_some()
+                    && crate::retrying_object_store::has_permanent_source(&error) =>
+            {
+                Err(write_failure(&error))
+            }
             // A create whose success response was lost can return either a
             // transport error or AlreadyExists on a lower-layer retry. Exact
             // readback is the only safe way to reconcile either response.

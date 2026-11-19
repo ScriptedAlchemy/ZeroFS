@@ -1186,6 +1186,19 @@ impl PoolObjectStore {
         outcome
     }
 
+    fn check_existing_segment_target(
+        previous: Option<&Entry>,
+        target: &SegmentTarget,
+    ) -> object_store::Result<()> {
+        if previous.is_some_and(|entry| entry.physical.member_id() != Some(target.0.as_str())) {
+            return Err(refusal(format!(
+                "existing segment is not on its requested member {}",
+                target.0
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn register_segment_target(
         &self,
         location: &Path,
@@ -1198,6 +1211,7 @@ impl PoolObjectStore {
         }
         let _guard = self.key_lock(location).write_owned().await;
         let previous = self.visible(location).await?;
+        Self::check_existing_segment_target(previous.as_ref(), target)?;
         Self::check_mode(location, &PutMode::Create, previous.as_ref())?;
         self.bind_segment_target(location, &target.0).await
     }
@@ -1219,8 +1233,12 @@ impl PoolObjectStore {
     ) -> object_store::Result<PutResult> {
         let _guard = self.key_lock(&location).write_owned().await;
         let previous = self.visible(&location).await?;
+        let target = options.extensions.get::<SegmentTarget>();
+        if let Some(target) = target {
+            Self::check_existing_segment_target(previous.as_ref(), target)?;
+        }
         Self::check_mode(&location, &options.mode, previous.as_ref())?;
-        if let Some(SegmentTarget(member)) = options.extensions.get::<SegmentTarget>() {
+        if let Some(SegmentTarget(member)) = target {
             if !matches!(options.mode, PutMode::Create) {
                 return Err(unsupported("segment targets require conditional creation"));
             }
@@ -1300,8 +1318,12 @@ impl PoolObjectStore {
             .ok_or_else(|| unsupported("pool multipart requires a declared payload length"))?;
         let _guard = self.key_lock(&location).write_owned().await;
         let previous = self.visible(&location).await?;
+        let target = options.extensions.get::<SegmentTarget>();
+        if let Some(target) = target {
+            Self::check_existing_segment_target(previous.as_ref(), target)?;
+        }
         Self::check_mode(&location, &PutMode::Create, previous.as_ref())?;
-        if let Some(SegmentTarget(member)) = options.extensions.get::<SegmentTarget>() {
+        if let Some(SegmentTarget(member)) = target {
             self.bind_segment_target(&location, member).await?;
         }
         let upload = self

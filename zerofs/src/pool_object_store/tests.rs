@@ -3229,3 +3229,33 @@ async fn writeback_replays_segment_to_persisted_member_before_any_pool_put() {
     assert_eq!(read(&pool, &key).await, body);
     replay.lifecycle.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn targeted_seal_refuses_identical_bytes_already_on_another_member() {
+    let fixture = Fixture::new(1024);
+    let pool = fixture.initialize().await;
+    let segid = Segid::new(41, 707);
+    let key = segment(segid.counter);
+    let publisher = crate::segment_store::SegmentStore::new(
+        Arc::new(object_store::prefix::PrefixStore::new(
+            Arc::new(pool.clone()),
+            Path::from("db"),
+        )),
+        crate::frame_codec::FrameCodec::new(
+            &[0x87; 32],
+            crate::segment::SEGMENT_INFO,
+            crate::config::CompressionConfig::default(),
+        ),
+        segid.epoch,
+        None,
+    );
+    let body = Bytes::from_static(b"same bytes");
+    publisher.put_segment(segid, body.clone()).await.unwrap();
+    assert!(
+        publisher
+            .put_segment_at_target(segid, body, Some(&SegmentTarget("hdd-b".into())))
+            .await
+            .is_err()
+    );
+    assert_eq!(placement(&pool, &key).await, "hdd-a");
+}
