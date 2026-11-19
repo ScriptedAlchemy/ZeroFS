@@ -33,6 +33,24 @@ fsync, NFS stable writes or COMMIT, or block FLUSH/FUA. A fast transfer followed
 by a long final flush means that durability work remains after the ordinary
 write responses; measure both phases when comparing policies.
 
+### Finite journal capacity
+
+The `small-nas-journal-v1` profile fixes object writeback at 128 MiB of dirty
+RAM and a 512 MiB dirty-journal budget, independently of the NVMe drive's
+physical capacity. These are separate from the filesystem RAM limit in the
+Storage editor. The profile's validation in [config.rs](../zerofs/src/config.rs)
+requires that geometry; changing the filesystem RAM setting does not enlarge
+the journal.
+
+The local journal can absorb a burst while the HDD destination drains. Once
+its capacity or free-space admission limit is reached, new work is paced by
+destination progress. A larger sustained copy therefore measures both the
+software path and the finite buffer's drain rate. Logical file size alone does
+not predict the boundary because compression and journal overhead affect the
+stored bytes. A larger journal needs a configuration with the corresponding
+memory admission and capacity validation; the bounded profile does not silently
+use all free space on the P3.
+
 ### Packaged NVMe/TCP target
 
 The target is maintained in the separate TrueNAS app repository. The fixture's
