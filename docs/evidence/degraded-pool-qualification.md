@@ -98,9 +98,11 @@ the cutoff, and this lane had no known outstanding artifacts there at cutoff.
 2. Reserve the entire admitted remainder on the bound member, accounting for
    its quota, free-space reserve, health, concurrent reservations and seal
    overhead. Reject or backpressure unsatisfiable writes without spilling.
-3. Partition the frame-packing lanes by destination and persist the destination
-   through sealing, conditional upload and writeback replay. Test interrupted
-   publication and replay with the target unavailable.
+3. Partition the frame-packing lanes by destination and carry the destination
+   through sealing and the writeback journal, including before the first
+   remote publication attempt. Once a target-aware put reaches the pool,
+   the catalog preserves its target on later attempts. Test interrupted
+   publication and journal replay with the target unavailable.
 4. Keep compaction, reclaim, and migration within the binding. Any operation
    that changes the binding needs a whole-file relocation protocol. Test loss
    of either disk with files spanning multiple segments and test that all

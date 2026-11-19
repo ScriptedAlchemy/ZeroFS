@@ -113,6 +113,15 @@ that binding. The allocator has no complete file length or inode ownership at
 admission, so the current placement modes provide segment-level capacity
 admission.
 
+The pool has an internal exact-target contract for new conditional segment
+uploads. A caller that provides a target persists it in the catalog before
+capacity admission. Later ordinary or multipart puts for the same logical
+segment key honor that target, including after reclaim or restart. The
+allocator checks the target's health, quota and filesystem reserve and
+refuses allocations it cannot satisfy. Segment migration cannot move a
+targeted segment to another member. There is currently no filesystem placement
+mode that emits these targets.
+
 Set `segment_placement = "round_robin_local"` in `[storage.pool]` to rotate new
 immutable segment reservations across eligible local members. Rotation follows
 configuration order and resumes after restart from the last local reservation
