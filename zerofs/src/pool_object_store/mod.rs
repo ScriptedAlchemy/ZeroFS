@@ -35,7 +35,7 @@ use object_store::{
     PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, UploadPart,
 };
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
@@ -796,14 +796,7 @@ impl PoolObjectStore {
         let relative = if prefix.is_empty() {
             path.as_ref()
         } else {
-            let Some(relative) = path
-                .as_ref()
-                .strip_prefix(prefix)
-                .and_then(|s| s.strip_prefix('/'))
-            else {
-                return None;
-            };
-            relative
+            path.as_ref().strip_prefix(prefix)?.strip_prefix('/')?
         };
         Segid::from_object_key(relative)
     }
@@ -846,6 +839,10 @@ impl PoolObjectStore {
             })
     }
 
+    pub(crate) fn unavailable_at_startup(&self, id: &str) -> bool {
+        self.inner.unavailable.as_deref() == Some(id)
+    }
+
     async fn probe_local_member(
         &self,
         member: &PoolMember,
@@ -868,7 +865,7 @@ impl PoolObjectStore {
     }
 
     async fn ensure_member(&self, id: &str, writing: bool) -> object_store::Result<()> {
-        if self.inner.unavailable.as_deref() == Some(id) {
+        if self.unavailable_at_startup(id) {
             return Err(refusal(format!(
                 "pool member {id} is unavailable until restart"
             )));

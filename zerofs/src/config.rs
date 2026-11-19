@@ -561,7 +561,7 @@ pub struct ReplicationConfig {
     pub(crate) replication_listen: Option<String>,
     /// One-startup authorization to replace durable HA ownership.
     /// All former participants must be stopped before this is enabled.
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) force_recovery: bool,
 }
 
@@ -701,10 +701,6 @@ pub struct StorageConfig {
     pub(crate) pool: Option<StoragePoolConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) readiness: Option<crate::storage_readiness::ReadinessConfig>,
-}
-
-fn is_false(value: &bool) -> bool {
-    !value
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

@@ -103,7 +103,7 @@ fn verify_except(
     for device in &config.devices {
         if excluded
             .as_ref()
-            .is_some_and(|role| device.roles.as_slice() == [role.clone()])
+            .is_some_and(|role| device.roles.as_slice() == std::slice::from_ref(role))
             && !device.boot
         {
             continue;

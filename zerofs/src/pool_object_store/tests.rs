@@ -1,4 +1,4 @@
-use super::{PoolMember, PoolObjectStore};
+use super::{MemberPreflight, PoolMember, PoolObjectStore};
 use crate::config::SegmentPlacement;
 use crate::segment::Segid;
 use crate::segment_store::{ConditionalMultipartCreate, GeneratedSegmentCreate};
