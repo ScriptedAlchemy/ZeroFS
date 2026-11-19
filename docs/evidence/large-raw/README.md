@@ -134,3 +134,20 @@ harness checks the proven remote frontier after a restart and takes additional
 cgroup snapshots at the data evidence boundaries. The complete workload,
 both cold hashes, actual assertion and verified Docker cleanup are in the
 [final engine receipt](spark-143fb0c8-final.log).
+
+## Missing original journal control
+
+An independent initialized pool with the same raw geometry and engine
+completed the refusal and restoration check. Both `pool verify-raw` and
+`zerofs run` reported that the original raw P3 journal was missing and
+left the replacement headers unchanged. The authority, key, and catalog
+regions retained their measured state. Offline readiness succeeded again
+after restoring the original headers. The control verified cleanup of its
+three loop mappings, exact runtime scratch, container, volume and shared
+binary transfer stage. The original and final workload containers and volumes
+were independently checked absent as well. The
+[control receipt](spark-143fb0c8-journal-refusal.log) records exit 0.
+
+```sh
+scripts/test-raw-device-large.sh --journal-refusal /path/to/bin
+```
