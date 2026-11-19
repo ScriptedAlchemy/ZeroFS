@@ -18,6 +18,7 @@ use std::{
 use subtle::ConstantTimeEq;
 
 const TOKEN_ENV: &str = "ZEROFS_WRITE_ACK_ADMIN_TOKEN_FILE";
+const BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 type Failure = (StatusCode, &'static str);
 type Response = Result<([(header::HeaderName, &'static str); 1], Json<Status>), Failure>;
 
@@ -192,14 +193,18 @@ async fn save(State(editor): State<Arc<Editor>>, request: Request) -> Response {
             "Settings request in progress",
         )
     })?;
-    let bytes = axum::body::to_bytes(request.into_body(), write_ack::MAX_DOCUMENT)
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "Settings document exceeds its size limit",
-            )
-        })?;
+    let bytes = tokio::time::timeout(
+        BODY_READ_TIMEOUT,
+        axum::body::to_bytes(request.into_body(), write_ack::MAX_DOCUMENT),
+    )
+    .await
+    .map_err(|_| (StatusCode::REQUEST_TIMEOUT, "Settings body timed out"))?
+    .map_err(|_| {
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Settings document exceeds its size limit",
+        )
+    })?;
     let doc: Document = serde_json::from_slice(&bytes)
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid settings document"))?;
     tokio::task::spawn_blocking(move || {
@@ -307,6 +312,68 @@ mod tests {
         let code = response.status();
         let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
         (code, bytes.to_vec())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_body_releases_editor_admission_without_saving() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let private = root_path.join("private");
+        std::fs::create_dir(&private).unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = base(&root_path);
+        let path = private.join("ack.json");
+        let token = "a".repeat(64);
+        let router = instance(&config, &path, Some([b'a'; 64]));
+        let polled = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&polled);
+        let stalled = Body::from_stream(futures::stream::poll_fn(move |_| {
+            seen.store(true, Ordering::Release);
+            std::task::Poll::<Option<Result<bytes::Bytes, std::io::Error>>>::Pending
+        }));
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/settings/write-ack")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(stalled)
+            .unwrap();
+        let saving = tokio::spawn(router.clone().oneshot(req));
+        while !polled.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        let same = "http://localhost:8088";
+        assert_eq!(
+            request(&router, Method::GET, "", same, Value::Null).await.0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let response = tokio::time::timeout(Duration::from_secs(1), saving)
+            .await
+            .expect("an incomplete body must not retain the editor admission indefinitely")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert!(!path.exists());
+        assert_eq!(
+            request(&router, Method::GET, "", same, Value::Null).await.0,
+            StatusCode::OK
+        );
+        let body = json!({"version":1,"filesystem":{"write_ack_mode":"materialized"}});
+        assert_eq!(
+            request(&router, Method::PUT, &token, same, body.clone())
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&std::fs::read(&path).unwrap()).unwrap(),
+            body
+        );
     }
 
     #[tokio::test]
