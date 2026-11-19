@@ -1345,6 +1345,7 @@ mod tests {
     use crate::writeback::admission::{Admission, AdmissionError};
     use crate::writeback::reservation::{SsdAdmission, SsdReservationRequest};
     use crate::writeback::space_sample::{PhysicalSpaceSample, PhysicalSpaceSampler};
+    use crate::writeback::test_util::assert_journal_payload;
 
     impl LocalJournaler {
         /// Test-only submit that mirrors the production admission path:
@@ -3159,8 +3160,8 @@ mod tests {
 
         let recovered = Journal::open(&root, identity).unwrap();
         assert_eq!(recovered.progress().unwrap().local_seq, 2);
-        assert_eq!(recovered.read_blob(1).unwrap(), b"x");
-        assert_eq!(recovered.read_blob(2).unwrap(), b"x");
+        assert_journal_payload(&recovered, 1, b"x");
+        assert_journal_payload(&recovered, 2, b"x");
     }
 
     #[tokio::test]
@@ -3515,7 +3516,7 @@ mod tests {
 
         barrier.wait_local(1).await.unwrap();
         assert_eq!(journal.progress().unwrap().local_seq, 1);
-        assert_eq!(journal.read_blob(1).unwrap(), b"payload");
+        assert_journal_payload(&journal, 1, b"payload");
         journaler.shutdown().await.unwrap();
     }
 
@@ -3605,8 +3606,8 @@ mod tests {
         release_tx.send(()).unwrap();
 
         barrier.wait_local(2).await.unwrap();
-        assert_eq!(journal.read_blob(1).unwrap(), b"payload");
-        assert_eq!(journal.read_blob(2).unwrap(), b"again");
+        assert_journal_payload(&journal, 1, b"payload");
+        assert_journal_payload(&journal, 2, b"again");
         journaler.shutdown().await.unwrap();
     }
 
@@ -3839,8 +3840,8 @@ mod tests {
         drop(commit_release_tx);
 
         barrier.wait_local(2).await.unwrap();
-        assert_eq!(journal.read_blob(1).unwrap(), b"payload");
-        assert_eq!(journal.read_blob(2).unwrap(), b"again");
+        assert_journal_payload(&journal, 1, b"payload");
+        assert_journal_payload(&journal, 2, b"again");
         journaler.shutdown().await.unwrap();
     }
 
@@ -3945,7 +3946,7 @@ mod tests {
         )
         .expect("the journal must reopen on the committed prefix");
         assert_eq!(recovered.progress().unwrap().local_seq, 1);
-        assert_eq!(recovered.read_blob(1).unwrap(), b"payload");
+        assert_journal_payload(&recovered, 1, b"payload");
         assert!(recovered.mutation(2).unwrap().is_none());
     }
 
@@ -3982,7 +3983,7 @@ mod tests {
 
         barrier.wait_local(1).await.unwrap();
         assert_eq!(journal.snapshot().unwrap().local_seq, 1);
-        assert_eq!(journal.read_blob(1).unwrap(), b"payload");
+        assert_journal_payload(&journal, 1, b"payload");
         assert_eq!(admission.used_bytes(), 0);
         journaler.shutdown().await.unwrap();
     }

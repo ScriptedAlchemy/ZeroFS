@@ -1,0 +1,179 @@
+{
+  "kernel": "7.0.0-28-generic",
+  "binary_sha256": "e34814d3319450e00b5c349df60481ec5ccc4aab31917a584cfec07c7461901c",
+  "payload_sha256": "bed9a73ec5bee8de1df800b5de43c79f44fc3a42b3ead3ee155ba56c624109ce",
+  "mount_client_pid": 1912,
+  "surviving_reader_fd": 4,
+  "repetitions": [
+    {
+      "iteration": 1,
+      "first_read": "exact payload",
+      "close_errnos": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "server_pid": 1935,
+      "mount_client_pid": 1912,
+      "surviving_reader_fd": 4
+    },
+    {
+      "iteration": 2,
+      "first_read": "exact payload",
+      "close_errnos": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "server_pid": 1979,
+      "mount_client_pid": 1912,
+      "surviving_reader_fd": 4
+    },
+    {
+      "iteration": 3,
+      "first_read": "exact payload",
+      "close_errnos": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "server_pid": 2023,
+      "mount_client_pid": 1912,
+      "surviving_reader_fd": 4
+    },
+    {
+      "iteration": 4,
+      "first_read": "exact payload",
+      "close_errnos": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "server_pid": 2067,
+      "mount_client_pid": 1912,
+      "surviving_reader_fd": 4
+    },
+    {
+      "iteration": 5,
+      "first_read": "exact payload",
+      "close_errnos": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "server_pid": 2113,
+      "mount_client_pid": 1912,
+      "surviving_reader_fd": 4
+    },
+    {
+      "iteration": 6,
+      "first_read": "exact payload",
+      "close_errnos": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "server_pid": 2159,
+      "mount_client_pid": 1912,
+      "surviving_reader_fd": 4
+    },
+    {
+      "iteration": 7,
+      "first_read": "exact payload",
+      "close_errnos": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "server_pid": 2204,
+      "mount_client_pid": 1912,
+      "surviving_reader_fd": 4
+    },
+    {
+      "iteration": 8,
+      "first_read": "exact payload",
+      "close_errnos": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "server_pid": 2248,
+      "mount_client_pid": 1912,
+      "surviving_reader_fd": 4
+    },
+    {
+      "iteration": 9,
+      "first_read": "exact payload",
+      "close_errnos": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "server_pid": 2293,
+      "mount_client_pid": 1912,
+      "surviving_reader_fd": 4
+    },
+    {
+      "iteration": 10,
+      "first_read": "exact payload",
+      "close_errnos": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "server_pid": 2343,
+      "mount_client_pid": 1912,
+      "surviving_reader_fd": 4
+    }
+  ]
+}

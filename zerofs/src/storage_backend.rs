@@ -1,6 +1,8 @@
 //! Build the configured storage graph and retain every transport's lifecycle.
 
 use crate::config::Settings;
+use crate::metadata_fault::{LocalMetadataStore, MetadataFault};
+use crate::operator_required::operator_required;
 use crate::parse_object_store::{ObjectStoreScheme, ParsedStore, parse_url_opts};
 use crate::pool_object_store::{CATALOG_FILE_NAME, PoolMember, PoolObjectStore};
 use crate::sftp_transport::SftpSessionPool;
@@ -69,6 +71,24 @@ pub(crate) struct OpenedStorage {
     pub(crate) path: Path,
     pub(crate) sftp_pool: Option<BackendSessions>,
     pub(crate) pool: Option<PoolObjectStore>,
+    /// Trips on the first non-transient local I/O error of the metadata
+    /// store. It never trips for a remote metadata store.
+    pub(crate) metadata_fault: MetadataFault,
+}
+
+/// A `file://` metadata store reports its local I/O failures through
+/// [`LocalMetadataStore`]; remote metadata stores keep their own classification.
+fn guard_local_metadata(
+    url: &url::Url,
+    store: Box<dyn ObjectStore>,
+    fault: &MetadataFault,
+) -> Box<dyn ObjectStore> {
+    if url.scheme() != "file" {
+        return store;
+    }
+    #[cfg(test)]
+    let store = crate::fault_store::native_errno::wrap(store);
+    Box::new(LocalMetadataStore::new(Arc::from(store), fault.clone()))
 }
 
 pub(crate) async fn open_storage(settings: &Settings) -> Result<OpenedStorage> {
@@ -88,12 +108,16 @@ pub(crate) async fn open_storage(settings: &Settings) -> Result<OpenedStorage> {
         settings.sftp.as_ref(),
     )
     .await?;
+    let metadata_fault = MetadataFault::default();
+    let store = guard_local_metadata(&url, store, &metadata_fault);
     if url.scheme() == "file" {
         let marker = path.clone().join(".zerofs-pool").join("identity");
         match store.head(&marker).await {
-            Ok(_) => anyhow::bail!(
-                "this volume has a permanent storage pool; restore [storage.pool] and its original catalog instead of opening the metadata directory alone"
-            ),
+            Ok(_) => {
+                return Err(operator_required(anyhow::anyhow!(
+                    "this volume has a permanent storage pool; restore [storage.pool] and its original catalog instead of opening the metadata directory alone"
+                )));
+            }
             Err(object_store::Error::NotFound { .. }) => {}
             Err(error) => return Err(error.into()),
         }
@@ -103,6 +127,7 @@ pub(crate) async fn open_storage(settings: &Settings) -> Result<OpenedStorage> {
         path,
         sftp_pool: sftp_pool.map(BackendSessions::single),
         pool: None,
+        metadata_fault,
     })
 }
 
@@ -118,22 +143,36 @@ pub(crate) async fn open_pool_storage(
         .as_ref()
         .context("[storage.pool] is not configured")?;
     settings.validate()?;
+    crate::storage_readiness::verify(settings)?;
+    crate::storage_readiness::verify_open_paths(
+        settings,
+        &[
+            (
+                crate::storage_readiness::RoleName::Catalog,
+                config.catalog_dir.join(CATALOG_FILE_NAME),
+            ),
+            (
+                crate::storage_readiness::RoleName::Catalog,
+                config.catalog_dir.join("pool.lock"),
+            ),
+        ],
+    )?;
     validate_directories(settings)?;
     if !initialize && !config.catalog_dir.join(CATALOG_FILE_NAME).is_file() {
-        anyhow::bail!(
+        return Err(operator_required(anyhow::anyhow!(
             "pool catalog is missing: initialize a new pool with `zerofs pool init`, or restore an existing pool's catalog; normal startup never recreates it"
-        );
+        )));
     }
+    let authority_url = settings.storage.url.parse()?;
+    let authority =
+        parse_url_opts(&authority_url, settings.cloud_provider_env_vars(), None).await?;
     let ParsedStore {
         store: authority,
         path,
         sftp_pool: authority_sessions,
-    } = parse_url_opts(
-        &settings.storage.url.parse()?,
-        settings.cloud_provider_env_vars(),
-        None,
-    )
-    .await?;
+    } = bind_readiness_root(settings, &authority_url, authority)?;
+    let metadata_fault = MetadataFault::default();
+    let authority = guard_local_metadata(&authority_url, authority, &metadata_fault);
     debug_assert!(authority_sessions.is_none(), "pool metadata must be local");
     let mut sessions = BackendSessions {
         pools: Vec::new(),
@@ -158,6 +197,15 @@ pub(crate) async fn open_pool_storage(
             } else {
                 parse_url_opts(&url, options, None).await?
             };
+            let parsed = bind_readiness_root(settings, &url, parsed)?;
+            #[cfg(test)]
+            let parsed = match scheme {
+                ObjectStoreScheme::Local => ParsedStore {
+                    store: crate::fault_store::native_errno::wrap(parsed.store),
+                    ..parsed
+                },
+                _ => parsed,
+            };
             if let Some(pool) = parsed.sftp_pool {
                 sessions.pools.push(pool);
             }
@@ -175,25 +223,19 @@ pub(crate) async fn open_pool_storage(
                 },
                 min_free_bytes: member.reserve_free_bytes()?,
                 health_device: member.health_device.clone(),
+                free_space: None,
             });
         }
-        Ok(if initialize {
-            PoolObjectStore::initialize(
-                Arc::from(authority),
-                path.clone(),
-                config.catalog_dir.clone(),
-                members,
-            )
-            .await?
-        } else {
-            PoolObjectStore::open(
-                Arc::from(authority),
-                path.clone(),
-                config.catalog_dir.clone(),
-                members,
-            )
-            .await?
-        })
+        Ok(PoolObjectStore::open_with_preflight(
+            Arc::from(authority),
+            path.clone(),
+            config.catalog_dir.clone(),
+            members,
+            config.segment_placement,
+            initialize,
+            |pool_id| crate::storage_readiness::verify_pool_paths(settings, pool_id),
+        )
+        .await?)
     }
     .await;
     match result {
@@ -203,6 +245,7 @@ pub(crate) async fn open_pool_storage(
                 store: Box::new(pool.clone()),
                 path,
                 sftp_pool: (!sessions.pools.is_empty()).then_some(sessions),
+                metadata_fault,
             },
             pool,
         )),
@@ -211,6 +254,22 @@ pub(crate) async fn open_pool_storage(
             Err(cleanup) => Err(crate::cli::attach_cleanup_errors(error, vec![cleanup])),
         },
     }
+}
+
+fn bind_readiness_root(
+    settings: &Settings,
+    url: &url::Url,
+    mut parsed: ParsedStore,
+) -> Result<ParsedStore> {
+    if settings.storage.readiness.is_some() {
+        let root = url
+            .to_file_path()
+            .map_err(|_| anyhow::anyhow!("invalid local storage URL"))?;
+        parsed.store = Box::new(
+            crate::local_object_store::LocalConditionalStore::new().with_readiness_root(root),
+        );
+    }
+    Ok(parsed)
 }
 
 fn local_directory(url: &url::Url) -> Result<PathBuf> {

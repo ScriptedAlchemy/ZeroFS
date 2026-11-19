@@ -2,6 +2,7 @@ use super::*;
 use crate::segment_store::{ConditionalMultipartCreate, GeneratedSegmentCreate};
 use crate::writeback::journaler::LocalJournaler;
 use crate::writeback::model::JournalIdentity;
+use crate::writeback::test_util::assert_journal_payload;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future;
@@ -23,6 +24,7 @@ struct RecordingMultipartStore {
     put_opts_calls: AtomicUsize,
     multipart_calls: AtomicUsize,
     part_sizes: Arc<Mutex<Vec<usize>>>,
+    mutate_journal_on_range: Mutex<Option<(std::fs::File, u64)>>,
 }
 
 impl Display for RecordingMultipartStore {
@@ -61,6 +63,15 @@ impl ObjectStore for RecordingMultipartStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
+        if options.range.is_some()
+            && let Some((mut file, offset)) = self.mutate_journal_on_range.lock().unwrap().take()
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            // A range GET follows the initial full journal verification. Edit
+            // that same inode, not its pathname, to exercise the open cursor.
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            file.write_all(b"X").unwrap();
+        }
         self.inner.get_opts(location, options).await
     }
 
@@ -742,7 +753,7 @@ async fn shipping_sftp_recovery_case(large: bool, fault: usize, stop_during_clea
     assert!(scheduler.barrier().progress.current_terminal().is_none());
     assert_eq!(journal.progress().unwrap().local_seq, 1);
     assert_eq!(journal.progress().unwrap().remote_seq, 0);
-    assert_eq!(journal.read_blob(1).unwrap(), payload);
+    assert_journal_payload(&journal, 1, &payload);
     assert_eq!(
         server.writes.load(Ordering::SeqCst),
         1,
@@ -754,7 +765,7 @@ async fn shipping_sftp_recovery_case(large: bool, fault: usize, stop_during_clea
             .expect("cleanup recovery must not hang shutdown")
             .unwrap();
         assert_eq!(journal.progress().unwrap().remote_seq, 0);
-        assert_eq!(journal.read_blob(1).unwrap(), payload);
+        assert_journal_payload(&journal, 1, &payload);
         // Allow the bounded Drop fallback to settle before pool shutdown.
         server.outage.store(false, Ordering::SeqCst);
     } else {
@@ -766,7 +777,7 @@ async fn shipping_sftp_recovery_case(large: bool, fault: usize, stop_during_clea
         if fault == 4 {
             assert!(result.unwrap_err().to_string().contains("different bytes"));
             assert_eq!(journal.progress().unwrap().remote_seq, 0);
-            assert_eq!(journal.read_blob(1).unwrap(), payload);
+            assert_journal_payload(&journal, 1, &payload);
             assert!(scheduler.shutdown().await.is_err());
         } else {
             result.unwrap();
@@ -848,6 +859,7 @@ async fn remote_replay_streams_payload_larger_than_the_window_in_bounded_parts()
         put_opts_calls: AtomicUsize::new(0),
         multipart_calls: AtomicUsize::new(0),
         part_sizes: Arc::new(Mutex::new(Vec::new())),
+        mutate_journal_on_range: Mutex::new(None),
     });
 
     apply_record_with_tracked_cleanup(store.clone(), Arc::clone(&journal), record)
@@ -891,6 +903,7 @@ async fn remote_replay_at_the_window_boundary_keeps_atomic_put_semantics() {
         put_opts_calls: AtomicUsize::new(0),
         multipart_calls: AtomicUsize::new(0),
         part_sizes: Arc::new(Mutex::new(Vec::new())),
+        mutate_journal_on_range: Mutex::new(None),
     });
 
     apply_record_with_tracked_cleanup(store.clone(), Arc::clone(&journal), record)
@@ -912,6 +925,276 @@ async fn remote_replay_at_the_window_boundary_keeps_atomic_put_semantics() {
             .as_ref(),
         payload.as_slice()
     );
+}
+
+#[tokio::test]
+async fn remote_small_replay_rejects_corrupt_journal_before_put() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    for truncate in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(temp.path().join("journal"), identity()).unwrap());
+        let payload = b"verified journal payload";
+        let record = crate::writeback::test_util::put_record(
+            1,
+            "small-object",
+            payload,
+            MutationMode::Create,
+            FenceClass::Fence,
+            0x1000,
+            1_786_435_200_000,
+        );
+        let record = journal.commit_put(record, payload).unwrap();
+        let (relative, slice) = record.blob_path().unwrap().split_once('#').unwrap();
+        let (offset, _) = slice.split_once('+').unwrap();
+        let offset = offset.parse::<u64>().unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(journal.root().join(relative))
+            .unwrap();
+        if truncate {
+            file.set_len(offset + payload.len() as u64 - 1).unwrap();
+        } else {
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            file.write_all(b"X").unwrap();
+        }
+        let remote_root = temp.path().join("remote");
+        std::fs::create_dir(&remote_root).unwrap();
+        let store = Arc::new(RecordingMultipartStore {
+            inner: Arc::new(LocalFileSystem::new_with_prefix(&remote_root).unwrap()),
+            put_opts_calls: AtomicUsize::new(0),
+            multipart_calls: AtomicUsize::new(0),
+            part_sizes: Arc::new(Mutex::new(Vec::new())),
+            mutate_journal_on_range: Mutex::new(None),
+        });
+
+        let error = apply_record_with_tracked_cleanup(store.clone(), Arc::clone(&journal), record)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("mismatch"), "{error}");
+        assert!(is_terminal_remote_error(&error), "{error}");
+        assert_eq!(store.put_opts_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.multipart_calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            store.inner.head(&Path::from("small-object")).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+    }
+}
+
+#[tokio::test]
+async fn reconciliation_rehashes_compared_bytes_before_retiring_journal() {
+    for corrupt_after_verification in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(temp.path().join("journal"), identity()).unwrap());
+        // Two comparison ranges are essential: a single range was already a
+        // full-payload stream and therefore already checked the final hash.
+        let payload = vec![0x6b; REMOTE_STREAM_CHUNK_BYTES + 17];
+        let target = Path::from("reconciled-object");
+        let record = crate::writeback::test_util::put_record(
+            1,
+            target.as_ref(),
+            &payload,
+            MutationMode::Create,
+            FenceClass::Fence,
+            0x1000,
+            1_786_435_200_000,
+        );
+        let record = journal.commit_put(record, &payload).unwrap();
+        let (relative, slice) = record.blob_path().unwrap().split_once('#').unwrap();
+        let (offset, _) = slice.split_once('+').unwrap();
+        let offset = offset.parse::<u64>().unwrap();
+        let path = journal.root().join(relative);
+        let mutation = corrupt_after_verification.then(|| {
+            (
+                std::fs::OpenOptions::new().write(true).open(&path).unwrap(),
+                offset,
+            )
+        });
+        let remote_root = temp.path().join("remote");
+        std::fs::create_dir(&remote_root).unwrap();
+        let store = Arc::new(RecordingMultipartStore {
+            inner: Arc::new(LocalFileSystem::new_with_prefix(&remote_root).unwrap()),
+            put_opts_calls: AtomicUsize::new(0),
+            multipart_calls: AtomicUsize::new(0),
+            part_sizes: Arc::new(Mutex::new(Vec::new())),
+            mutate_journal_on_range: Mutex::new(mutation),
+        });
+        let mut remote_payload = payload.clone();
+        if corrupt_after_verification {
+            remote_payload[0] = b'X';
+        }
+        store
+            .inner
+            .put(&target, remote_payload.into())
+            .await
+            .unwrap();
+
+        let remote: Arc<dyn ObjectStore> = store.clone();
+        let overlay = OverlayIndex::new(remote.clone());
+        let admission = Admission::new(64 * 1024 * 1024);
+        let space = Arc::new(PhysicalSpaceSampler::new(journal.root().to_path_buf()));
+        let sample = space.sample().await.unwrap();
+        let ssd = Arc::new(
+            SsdAdmission::recover(
+                64 * 1024 * 1024,
+                64,
+                95,
+                85,
+                0,
+                journal.pending_ssd_reservations().unwrap(),
+                Some(sample),
+            )
+            .unwrap(),
+        );
+        let reserved = ssd.snapshot();
+        let journaler = LocalJournaler::start_with_observer_and_space(
+            journal.clone(),
+            admission.clone(),
+            4,
+            1,
+            None,
+            space.clone(),
+        )
+        .unwrap();
+        let scheduler = RemoteScheduler::start(
+            remote,
+            journal.clone(),
+            overlay,
+            admission,
+            ssd.clone(),
+            space,
+            journaler.barrier(),
+            1,
+        )
+        .unwrap();
+
+        let result =
+            tokio::time::timeout(Duration::from_secs(10), scheduler.barrier().wait_remote(1))
+                .await
+                .expect("reconciliation must complete or report permanent corruption");
+        if corrupt_after_verification {
+            let error =
+                result.expect_err("matching changed bytes must not retire the committed payload");
+            assert!(
+                error.to_string().contains("changed while streaming"),
+                "{error}"
+            );
+            assert!(scheduler.shutdown().await.is_err());
+            assert_eq!(journal.progress().unwrap().remote_seq, 0);
+            let retained = journal.mutation(1).unwrap().unwrap();
+            assert_eq!(retained.retry_count, 1);
+            assert_eq!(retained.payload(), record.payload());
+            assert!(path.exists(), "the corrupt journal must remain available");
+            assert_eq!(ssd.snapshot().used_ssd_bytes, reserved.used_ssd_bytes);
+            assert_eq!(ssd.snapshot().used_operations, reserved.used_operations);
+        } else {
+            result.unwrap();
+            scheduler.shutdown().await.unwrap();
+            assert_eq!(journal.progress().unwrap().remote_seq, 1);
+            assert_eq!(ssd.snapshot().used_ssd_bytes, 0);
+            assert_eq!(ssd.snapshot().used_operations, 0);
+        }
+        assert!(store.mutate_journal_on_range.lock().unwrap().is_none());
+        assert_eq!(store.put_opts_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(store.multipart_calls.load(Ordering::SeqCst), 0);
+        journaler.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn corrupt_local_journal_stops_scheduler_without_releasing_dirty_capacity() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let temp = tempfile::tempdir().unwrap();
+    let journal = Arc::new(Journal::open(temp.path().join("journal"), identity()).unwrap());
+    let payload = b"committed journal payload";
+    let record = crate::writeback::test_util::put_record(
+        1,
+        "corrupt-local-object",
+        payload,
+        MutationMode::Create,
+        FenceClass::Fence,
+        0x1000,
+        1_786_435_200_000,
+    );
+    let record = journal.commit_put(record, payload).unwrap();
+    let (relative, slice) = record.blob_path().unwrap().split_once('#').unwrap();
+    let (offset, _) = slice.split_once('+').unwrap();
+    let offset = offset.parse::<u64>().unwrap();
+    let path = journal.root().join(relative);
+    let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    file.write_all(b"X").unwrap();
+    let corrupted = std::fs::read(&path).unwrap();
+
+    let remote_root = temp.path().join("remote");
+    std::fs::create_dir(&remote_root).unwrap();
+    let store = Arc::new(RecordingMultipartStore {
+        inner: Arc::new(LocalFileSystem::new_with_prefix(&remote_root).unwrap()),
+        put_opts_calls: AtomicUsize::new(0),
+        multipart_calls: AtomicUsize::new(0),
+        part_sizes: Arc::new(Mutex::new(Vec::new())),
+        mutate_journal_on_range: Mutex::new(None),
+    });
+    let remote: Arc<dyn ObjectStore> = store.clone();
+    let overlay = OverlayIndex::new(remote.clone());
+    let admission = Admission::new(64 * 1024 * 1024);
+    let space = Arc::new(PhysicalSpaceSampler::new(journal.root().to_path_buf()));
+    let sample = space.sample().await.unwrap();
+    let ssd = Arc::new(
+        SsdAdmission::recover(
+            64 * 1024 * 1024,
+            64,
+            95,
+            85,
+            0,
+            journal.pending_ssd_reservations().unwrap(),
+            Some(sample),
+        )
+        .unwrap(),
+    );
+    let reserved = ssd.snapshot();
+    let journaler = LocalJournaler::start_with_observer_and_space(
+        journal.clone(),
+        admission.clone(),
+        4,
+        1,
+        None,
+        space.clone(),
+    )
+    .unwrap();
+    let scheduler = RemoteScheduler::start(
+        remote,
+        journal.clone(),
+        overlay,
+        admission,
+        ssd.clone(),
+        space,
+        journaler.barrier(),
+        1,
+    )
+    .unwrap();
+
+    let error = tokio::time::timeout(Duration::from_secs(10), scheduler.barrier().wait_remote(1))
+        .await
+        .expect("known corrupt local bytes must stop replay, not retry forever")
+        .unwrap_err();
+    assert!(error.to_string().contains("hash mismatch"), "{error}");
+    assert_eq!(scheduler.barrier().progress.sequence(), 0);
+    assert!(scheduler.shutdown().await.is_err());
+    assert_eq!(journal.progress().unwrap().remote_seq, 0);
+    let retained = journal.mutation(1).unwrap().unwrap();
+    assert_eq!(
+        retained.retry_count, 1,
+        "one failure is persisted before terminalization"
+    );
+    assert_eq!(std::fs::read(path).unwrap(), corrupted);
+    assert_eq!(ssd.snapshot().used_ssd_bytes, reserved.used_ssd_bytes);
+    assert_eq!(ssd.snapshot().used_operations, reserved.used_operations);
+    assert_eq!(store.put_opts_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(store.multipart_calls.load(Ordering::SeqCst), 0);
+    journaler.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -1010,6 +1293,7 @@ async fn large_create_aborts_when_backend_ignores_conditional_multipart_capabili
         put_opts_calls: AtomicUsize::new(0),
         multipart_calls: AtomicUsize::new(0),
         part_sizes: Arc::new(Mutex::new(Vec::new())),
+        mutate_journal_on_range: Mutex::new(None),
     });
 
     let error = apply_record_with_tracked_cleanup(store.clone(), journal, record)
@@ -1042,6 +1326,7 @@ async fn ignored_conditional_capability_is_terminal_without_advancing_worker_fro
         put_opts_calls: AtomicUsize::new(0),
         multipart_calls: AtomicUsize::new(0),
         part_sizes: Arc::new(Mutex::new(Vec::new())),
+        mutate_journal_on_range: Mutex::new(None),
     });
     let remote: Arc<dyn ObjectStore> = store.clone();
     let overlay = OverlayIndex::new(remote.clone());
@@ -1105,6 +1390,7 @@ async fn large_update_fails_closed_before_multipart_initiation() {
         put_opts_calls: AtomicUsize::new(0),
         multipart_calls: AtomicUsize::new(0),
         part_sizes: Arc::new(Mutex::new(Vec::new())),
+        mutate_journal_on_range: Mutex::new(None),
     });
     let predecessor_result = store
         .put(&target, predecessor.clone().into())
@@ -1158,6 +1444,7 @@ async fn already_applied_large_update_reconciles_before_unsupported_transfer_gat
         put_opts_calls: AtomicUsize::new(0),
         multipart_calls: AtomicUsize::new(0),
         part_sizes: Arc::new(Mutex::new(Vec::new())),
+        mutate_journal_on_range: Mutex::new(None),
     });
     store
         .put(&target, Bytes::from(payload.clone()).into())

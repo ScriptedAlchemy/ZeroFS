@@ -1,0 +1,57 @@
+[runtime]
+memory_limit_gb = 6.979321856
+
+[cache]
+dir = "@CACHE@"
+disk_size_gb = 0.064
+memory_size_gb = 0.001
+warm_metadata = "off"
+
+[storage]
+url = "file://@ROOT@/metadata"
+encryption_password = "synthetic-journal-fixture-key"
+
+[storage.pool]
+segment_placement = "round_robin_local"
+catalog_dir = "@ROOT@/catalog"
+
+[[storage.pool.members]]
+id = "member-a"
+url = "file://@MEMBER_A@"
+capacity_gb = 8.0
+reserve_free_gb = 0.01
+
+[[storage.pool.members]]
+id = "member-b"
+url = "file://@MEMBER_B@"
+capacity_gb = 8.0
+reserve_free_gb = 0.01
+
+[filesystem]
+name_mode = "insensitive"
+compression = "lz4"
+ignore_fsync = false
+write_ack_mode = "materialized"
+
+[lsm]
+sync_writes = false
+
+[servers.ninep]
+addresses = []
+unix_socket = "@NINEP@"
+
+[servers.rpc]
+addresses = []
+unix_socket = "@RPC@"
+
+[servers.webui]
+addresses = ["@WEBUI@"]
+uid = 1000
+gid = 1000
+
+[telemetry]
+enabled = false
+
+
+[prometheus]
+addresses = ["@METRICS@"]

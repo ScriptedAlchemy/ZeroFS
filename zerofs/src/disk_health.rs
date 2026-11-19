@@ -418,6 +418,7 @@ mod tests {
                 local_path: None,
                 min_free_bytes: 0,
                 health_device: None,
+                free_space: None,
             })
             .collect();
         let pool = PoolObjectStore::initialize(

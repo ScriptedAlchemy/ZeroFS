@@ -61,6 +61,9 @@ Counters that track cumulative operations since server start:
 | `zerofs_bytes_read_total` | counter | Total bytes read |
 | `zerofs_bytes_written_total` | counter | Total bytes written |
 | `zerofs_total_operations` | counter | Total operations across all types |
+| `zerofs_segment_cache_integrity_refetches_total` | counter | Cached segment reads that failed frame authentication or decoding and were read once more from the object store, labeled `outcome="recovered"` or `outcome="failed"` |
+
+The read cache stores a ranged response after checking only its length. If a response arrives with the right length and wrong bytes, the read that decodes it fails authentication. ZeroFS then drops the cached parts for that range and reads the range once more, bypassing the cache. If the requested frames authenticate, it caches only the parts that lie wholly inside those frames. A part that also holds bytes of a neighbouring frame stays uncached, because that read did not authenticate them. A `failed` outcome means the second copy also failed, and the read returned an I/O error. A rising `recovered` count means bytes are being damaged after they leave the stored object, for example on the network path, in a proxy, or on the cache disk.
 
 ### Garbage Collection
 

@@ -9,11 +9,13 @@ use crate::dedup::DedupResult;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId};
 use crate::fs::mutation::types::{ConflictKey, ConflictScope};
+use crate::fs::name_mode::NameMatch;
 use crate::fs::permissions::{AccessMode, Credentials, check_access, check_sticky_bit_delete};
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::AuthContext;
 use crate::fs::{
     EXTENT_SIZE, SMALL_FILE_TOMBSTONE_THRESHOLD, ZeroFS, get_current_time, validate_filename,
+    validate_filename_length,
 };
 use ::tracing::debug;
 use std::sync::atomic::Ordering;
@@ -38,6 +40,17 @@ pub(crate) enum VerifiedRenameOutcome {
     Mismatch(VerifiedFileContent),
 }
 
+/// In-memory completion details; the durable replay result remains `Rename`.
+#[derive(Default)]
+struct RenameCompletion {
+    moved: bool,
+    #[cfg_attr(
+        not(any(feature = "webui", test)),
+        expect(dead_code, reason = "only verified rename consumes the hash outcome")
+    )]
+    verification: Option<VerifiedRenameOutcome>,
+}
+
 #[cfg(test)]
 struct VerifiedRenamePause {
     filesystem: usize,
@@ -50,7 +63,75 @@ struct VerifiedRenamePause {
 static VERIFIED_RENAME_PAUSE: std::sync::OnceLock<std::sync::Mutex<Option<VerifiedRenamePause>>> =
     std::sync::OnceLock::new();
 
+#[cfg(test)]
+static DIRECTORY_RENAME_PAUSE: std::sync::OnceLock<std::sync::Mutex<Option<VerifiedRenamePause>>> =
+    std::sync::OnceLock::new();
+
+fn set_rename_backpointer(inode: &mut Inode, parent: InodeId, name: &[u8]) {
+    match inode {
+        Inode::Directory(d) => {
+            d.parent = parent;
+            d.name = Some(name.to_vec());
+        }
+        Inode::File(f) => {
+            if f.nlink == 1 {
+                f.parent = Some(parent);
+                f.name = Some(name.to_vec());
+            }
+        }
+        Inode::Symlink(s) => {
+            if s.nlink == 1 {
+                s.parent = Some(parent);
+                s.name = Some(name.to_vec());
+            }
+        }
+        Inode::Fifo(s) | Inode::Socket(s) | Inode::CharDevice(s) | Inode::BlockDevice(s) => {
+            if s.nlink == 1 {
+                s.parent = Some(parent);
+                s.name = Some(name.to_vec());
+            }
+        }
+    }
+}
+
 impl ZeroFS {
+    fn record_rename(
+        &self,
+        source_inode: &Inode,
+        trace_old_path: Option<String>,
+        to_dirid: InodeId,
+        to_name: &[u8],
+    ) {
+        match source_inode {
+            Inode::File(_) => {
+                self.stats.files_renamed.fetch_add(1, Ordering::Relaxed);
+            }
+            Inode::Directory(_) => {
+                self.stats
+                    .directories_renamed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Inode::Symlink(_) => {
+                self.stats.links_renamed.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
+        self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+
+        // Emit the rename event with the old and new paths.
+        if let Some(old_path) = trace_old_path {
+            let inode_store = self.inode_store.clone();
+            let tracer = self.tracer.clone();
+            let to_name = String::from_utf8_lossy(to_name).to_string();
+            tokio::spawn(async move {
+                let to_dir_path = inode_store.resolve_path_lossy(to_dirid).await;
+                let new_path = format!("{}/{}", to_dir_path.trim_end_matches('/'), to_name);
+                tracer.emit_with_path(old_path, FileOperation::Rename { new_path });
+            });
+        }
+    }
+
     #[cfg(test)]
     fn pause_verified_rename_after_hash_for_test(
         &self,
@@ -130,13 +211,16 @@ impl ZeroFS {
             auth,
             from_dirid,
             from_name,
+            NameMatch::Folded,
             to_dirid,
             to_name,
             [0; 16],
             true,
+            None,
             Some(expected),
         )
         .await?
+        .verification
         .ok_or(FsError::IoError)
     }
 
@@ -227,11 +311,80 @@ impl ZeroFS {
         to_name: &[u8],
         op_id: crate::dedup::OpId,
     ) -> Result<(), FsError> {
+        self.rename_idempotent_matching(
+            auth,
+            from_dirid,
+            from_name,
+            NameMatch::Folded,
+            to_dirid,
+            to_name,
+            op_id,
+        )
+        .await
+    }
+
+    /// [`Self::rename_idempotent`] with `source_match` applied to the source
+    /// name while the rename holds its directory locks. The destination is
+    /// always resolved by the folded key, so a fold-equal destination is the
+    /// source itself (a case-only rename) or an entry to replace.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn rename_idempotent_matching(
+        &self,
+        auth: &AuthContext,
+        from_dirid: u64,
+        from_name: &[u8],
+        source_match: NameMatch,
+        to_dirid: u64,
+        to_name: &[u8],
+        op_id: crate::dedup::OpId,
+    ) -> Result<(), FsError> {
         self.rename_with_options(
-            auth, from_dirid, from_name, to_dirid, to_name, op_id, true, None,
+            auth,
+            from_dirid,
+            from_name,
+            source_match,
+            to_dirid,
+            to_name,
+            op_id,
+            true,
+            None,
+            None,
         )
         .await
         .map(|_| ())
+    }
+
+    /// Rename the entry only if it still names the inode held by a protocol
+    /// fid. Its cached path may have been reused after another client moved
+    /// the original inode. The precondition and entry-cookie recheck stay
+    /// inside the ordinary rename's fence and inode-lock boundary.
+    /// Returns whether this call moved the entry; replay and same-inode
+    /// hard-link no-ops return false so callers do not retarget their fid.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn rename_inode_idempotent(
+        &self,
+        auth: &AuthContext,
+        from_dirid: u64,
+        from_name: &[u8],
+        to_dirid: u64,
+        to_name: &[u8],
+        expected_source: InodeId,
+        op_id: crate::dedup::OpId,
+    ) -> Result<bool, FsError> {
+        self.rename_with_options(
+            auth,
+            from_dirid,
+            from_name,
+            NameMatch::Folded,
+            to_dirid,
+            to_name,
+            op_id,
+            true,
+            Some(expected_source),
+            None,
+        )
+        .await
+        .map(|result| result.moved)
     }
 
     /// Atomic no-replace rename tagged with an idempotency op-id.
@@ -245,7 +398,16 @@ impl ZeroFS {
         op_id: crate::dedup::OpId,
     ) -> Result<(), FsError> {
         self.rename_with_options(
-            auth, from_dirid, from_name, to_dirid, to_name, op_id, false, None,
+            auth,
+            from_dirid,
+            from_name,
+            NameMatch::Folded,
+            to_dirid,
+            to_name,
+            op_id,
+            false,
+            None,
+            None,
         )
         .await
         .map(|_| ())
@@ -257,17 +419,23 @@ impl ZeroFS {
         auth: &AuthContext,
         from_dirid: u64,
         from_name: &[u8],
+        source_match: NameMatch,
         to_dirid: u64,
         to_name: &[u8],
         op_id: crate::dedup::OpId,
         replace_existing: bool,
+        expected_source: Option<InodeId>,
         verification: Option<VerifiedFileExpectation>,
-    ) -> Result<Option<VerifiedRenameOutcome>, FsError> {
+    ) -> Result<RenameCompletion, FsError> {
         if from_name.is_empty() || to_name.is_empty() {
             return Err(FsError::InvalidArgument);
         }
 
-        validate_filename(from_name)?;
+        validate_filename_length(from_name)?;
+        validate_filename_length(to_name)?;
+        if to_name == b"." || to_name == b".." {
+            return Err(FsError::Exists);
+        }
         validate_filename(to_name)?;
 
         // Replay a completed rename before resolving source and target names.
@@ -275,24 +443,11 @@ impl ZeroFS {
             .replay_dedup_result(&op_id, DedupResult::into_rename)?
             .is_some()
         {
-            return Ok(None);
+            return Ok(RenameCompletion::default());
         }
 
         if from_name == b"." || from_name == b".." {
             return Err(FsError::InvalidArgument);
-        }
-        if to_name == b"." || to_name == b".." {
-            return Err(FsError::Exists);
-        }
-
-        if verification.is_none() && from_dirid == to_dirid && from_name == to_name {
-            // No-op renames still publish a durable replay result.
-            if crate::dedup::has_op_id(&op_id) {
-                let mut txn = self.db.new_transaction()?;
-                txn.set_dedup_result(op_id, DedupResult::Rename);
-                self.write_coordinator.commit(txn).await?;
-            }
-            return Ok(None);
         }
 
         debug!(
@@ -304,6 +459,22 @@ impl ZeroFS {
         );
 
         let creds = Credentials::from_auth_context(auth);
+
+        // Resolve names only after checking search permission on their parent
+        // directories. Otherwise ENOENT (source) or EEXIST (no-replace target)
+        // reveals names the caller cannot search. The locked checks below
+        // still revalidate search and write access before any mutation.
+        for dirid in std::iter::once(from_dirid).chain((to_dirid != from_dirid).then_some(to_dirid))
+        {
+            let dir_inode = self.inode_store.get(dirid).await?;
+            if !matches!(&dir_inode, Inode::Directory(_)) {
+                return Err(FsError::NotDirectory);
+            }
+            check_access(&dir_inode, &creds, AccessMode::Execute)?;
+            if matches!(&dir_inode, Inode::Directory(dir) if dir.nlink == 0) {
+                return Err(FsError::StaleHandle);
+            }
+        }
 
         // Look up all inode IDs without holding any locks
         let (source_inode_id, source_cookie) = match self
@@ -317,12 +488,15 @@ impl ZeroFS {
                     .replay_dedup_result(&op_id, DedupResult::into_rename)?
                     .is_some()
                 {
-                    return Ok(None);
+                    return Ok(RenameCompletion::default());
                 }
                 return Err(error);
             }
         };
 
+        if expected_source.is_some_and(|expected| expected != source_inode_id) {
+            return Err(FsError::StaleHandle);
+        }
         if verification.is_some_and(|expected| {
             expected.inode != source_inode_id || expected.entry_cookie != source_cookie
         }) {
@@ -344,6 +518,22 @@ impl ZeroFS {
         };
         let target_inode_id = target_entry.map(|(id, _)| id);
 
+        // Directory moves can form a cycle even when their immediate inode
+        // lock sets are disjoint: moving A beneath a descendant of C while C
+        // moves beneath a descendant of A. Serialize topology changes before
+        // taking any mutation fence or inode lock, and retain this guard until
+        // the queued commit applies. File renames do not change ancestry.
+        let directory_rename_guard = if self.inode_store.get(source_inode_id).await?.is_directory()
+        {
+            Some(
+                std::sync::Arc::clone(&self.directory_rename_lock)
+                    .lock_owned()
+                    .await,
+            )
+        } else {
+            None
+        };
+
         let mut all_inodes_to_lock = vec![from_dirid, source_inode_id];
         if from_dirid != to_dirid {
             all_inodes_to_lock.push(to_dirid);
@@ -362,23 +552,28 @@ impl ZeroFS {
         if let Some(target_id) = target_inode_id {
             fence_keys.push(ConflictKey::Inode(target_id));
         }
-        let _fence = self.fence_metadata(ConflictScope::new(fence_keys)).await?;
-        let _guards = self.lock_manager.acquire_multi(all_inodes_to_lock).await;
+        let fence = self.fence_metadata(ConflictScope::new(fence_keys)).await?;
+        let guards = self.lock_manager.acquire_multi(all_inodes_to_lock).await;
 
         // Recheck replay state after waiting for inode locks.
         if self
             .replay_dedup_result(&op_id, DedupResult::into_rename)?
             .is_some()
         {
-            return Ok(None);
+            return Ok(RenameCompletion::default());
         }
 
-        // Re-verify inside lock that entries still point to same inodes
+        // Re-verify inside lock that entries still point to same inodes. An
+        // exact-spelling source rule is checked here, where no other rename
+        // can split the folded entry from its stored spelling.
         let (verified_source_id, verified_source_cookie) = self
             .directory_store
-            .get_entry_with_cookie(from_dirid, from_name)
+            .get_entry_matching(from_dirid, from_name, source_match)
             .await?;
-        if verified_source_id != source_inode_id || verified_source_cookie != source_cookie {
+        if verified_source_id != source_inode_id
+            || verified_source_cookie != source_cookie
+            || expected_source.is_some_and(|expected| expected != verified_source_id)
+        {
             return Err(FsError::StaleHandle);
         }
         if verification.is_some_and(|expected| {
@@ -396,19 +591,47 @@ impl ZeroFS {
             Err(FsError::NotFound) => None,
             Err(e) => return Err(e),
         };
-        if !replace_existing && verified_target_entry.is_some() {
+        let same_entry = from_dirid == to_dirid
+            && verified_target_entry == Some((source_inode_id, source_cookie));
+        if !replace_existing && verified_target_entry.is_some() && !same_entry {
             return Err(FsError::Exists);
         }
         if verified_target_entry.map(|(id, _)| id) != target_inode_id {
             return Err(FsError::StaleHandle);
         }
-        let target_cookie = verified_target_entry.map(|(_, cookie)| cookie);
+        // A case-only rename finds its own entry under the new spelling and
+        // replaces nothing.
+        let replaced_entry = verified_target_entry.filter(|_| !same_entry || from_name == to_name);
+        let target_inode_id = replaced_entry.map(|(id, _)| id);
+        let target_cookie = replaced_entry.map(|(_, cookie)| cookie);
 
         let mut source_inode = self.inode_store.get(source_inode_id).await?;
         if matches!(source_inode, Inode::Directory(_))
             && self.is_ancestor_of(source_inode_id, to_dirid).await?
         {
             return Err(FsError::InvalidArgument);
+        }
+
+        #[cfg(test)]
+        {
+            let pause = {
+                let mut slot = DIRECTORY_RENAME_PAUSE
+                    .get_or_init(|| std::sync::Mutex::new(None))
+                    .lock()
+                    .unwrap();
+                let filesystem = std::sync::Arc::as_ptr(&self.db) as usize;
+                if slot.as_ref().is_some_and(|pause| {
+                    pause.filesystem == filesystem && pause.inode == source_inode_id
+                }) {
+                    slot.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(pause) = pause {
+                let _ = pause.reached.send(());
+                let _ = pause.resume.await;
+            }
         }
 
         let mut from_dir = self.inode_store.get(from_dirid).await?;
@@ -424,14 +647,23 @@ impl ZeroFS {
             return Err(FsError::StaleHandle);
         }
 
-        check_access(&from_dir, &creds, AccessMode::Write)?;
+        // A verification-only upload commit reads this exact entry without
+        // changing its name. It needs parent search and file read access,
+        // not authority to remove the entry. Ordinary same-name renames,
+        // hard-link aliases and every actual publication retain the normal
+        // write and sticky-directory checks.
+        let verify_in_place = verification.is_some() && same_entry && from_name == to_name;
+        if !verify_in_place {
+            check_access(&from_dir, &creds, AccessMode::Write)?;
+        }
         check_access(&from_dir, &creds, AccessMode::Execute)?;
         if let Some(ref to_dir) = to_dir {
             check_access(to_dir, &creds, AccessMode::Write)?;
             check_access(to_dir, &creds, AccessMode::Execute)?;
         }
-
-        check_sticky_bit_delete(&from_dir, &source_inode, &creds)?;
+        if !verify_in_place {
+            check_sticky_bit_delete(&from_dir, &source_inode, &creds)?;
+        }
 
         // POSIX: Moving directories in sticky directories requires ownership of the moved directory
         if from_dirid != to_dirid
@@ -448,8 +680,10 @@ impl ZeroFS {
             }
         }
 
-        // POSIX specifies that renaming one hard link over another link to the
-        // same inode succeeds without changing either directory entry. Keep
+        // Renaming an entry to itself, or one hard link over another link to
+        // the same inode, succeeds without changing either directory entry.
+        // Even an identical-name request must first resolve the source with
+        // its spelling rule under the directory lock. Keep
         // the normal directory permission and sticky-bit checks above (and
         // check the target directory's sticky policy for a cross-directory
         // rename), then publish only the replay result.
@@ -475,9 +709,12 @@ impl ZeroFS {
                     VerifiedRenameOutcome::Published(actual)
                 }
             } else {
-                return Ok(None);
+                return Ok(RenameCompletion::default());
             };
-            return Ok(Some(outcome));
+            return Ok(RenameCompletion {
+                moved: false,
+                verification: Some(outcome),
+            });
         }
 
         // Capture old path before rename for tracing (name will change after)
@@ -526,7 +763,10 @@ impl ZeroFS {
             self.pause_verified_rename_after_hash_if_requested(source_inode_id)
                 .await;
             if actual.size != expected.size || expected.sha256 != Some(actual.sha256) {
-                return Ok(Some(VerifiedRenameOutcome::Mismatch(actual)));
+                return Ok(RenameCompletion {
+                    moved: false,
+                    verification: Some(VerifiedRenameOutcome::Mismatch(actual)),
+                });
             }
             Some(actual)
         } else {
@@ -587,7 +827,7 @@ impl ZeroFS {
                         self.orphan_store.add(&mut txn, target_id);
                         target_deferred = true;
                     } else {
-                        self.inode_store.delete(&mut txn, target_id);
+                        self.delete_inode(&mut txn, target_id).await?;
                     }
                 };
             }
@@ -633,7 +873,7 @@ impl ZeroFS {
                                 .fetch_add(1, Ordering::Relaxed);
                         }
 
-                        self.inode_store.delete(&mut txn, target_id);
+                        self.delete_inode(&mut txn, target_id).await?;
                         quota_settlement = Some(crate::fs::quota::QuotaSettlement::Shrink {
                             quota: std::sync::Arc::clone(&self.quota),
                             bytes: file.size,
@@ -652,7 +892,7 @@ impl ZeroFS {
                         self.orphan_store.add(&mut txn, target_id);
                         target_deferred = true;
                     } else {
-                        self.inode_store.delete(&mut txn, target_id);
+                        self.delete_inode(&mut txn, target_id).await?;
                         self.directory_store.delete_directory(&mut txn, target_id);
                     }
                 }
@@ -680,7 +920,7 @@ impl ZeroFS {
                         self.orphan_store.add(&mut txn, target_id);
                         target_deferred = true;
                     } else {
-                        self.inode_store.delete(&mut txn, target_id);
+                        self.delete_inode(&mut txn, target_id).await?;
                     }
                 }
                 Inode::Fifo(mut special) => {
@@ -722,38 +962,10 @@ impl ZeroFS {
         #[cfg(feature = "failpoints")]
         fail_point!(fp::RENAME_AFTER_SOURCE_UNLINK);
 
-        let dir_changed = from_dirid != to_dirid;
         let (now_sec, now_nsec) = get_current_time();
-        match &mut source_inode {
-            Inode::Directory(d) => {
-                if dir_changed {
-                    d.parent = to_dirid;
-                }
-                d.name = Some(to_name.to_vec());
-            }
-            Inode::File(f) => {
-                if f.nlink == 1 {
-                    f.parent = Some(to_dirid);
-                    f.name = Some(to_name.to_vec());
-                }
-            }
-            Inode::Symlink(s) => {
-                if s.nlink == 1 {
-                    // A symlink that fell from two links to one can still be
-                    // parentless with a reference entry. Renaming that final
-                    // alias embeds it again, even within the same directory,
-                    // so restore both halves of its namespace identity.
-                    s.parent = Some(to_dirid);
-                    s.name = Some(to_name.to_vec());
-                }
-            }
-            Inode::Fifo(s) | Inode::Socket(s) | Inode::CharDevice(s) | Inode::BlockDevice(s) => {
-                if s.nlink == 1 {
-                    s.parent = Some(to_dirid);
-                    s.name = Some(to_name.to_vec());
-                }
-            }
-        }
+        set_rename_backpointer(&mut source_inode, to_dirid, to_name);
+        // Linux updates the renamed inode's ctime (ext4_rename, simple_rename_timestamp).
+        source_inode.set_ctime(now_sec, now_nsec);
 
         let new_cookie = if from_dirid == to_dirid {
             source_cookie
@@ -763,11 +975,10 @@ impl ZeroFS {
                 .await?
         };
 
-        let embed_inode = if source_inode.nlink() == 1 {
-            Some(&source_inode)
-        } else {
-            None
-        };
+        // A directory's nlink counts its subdirectories, but it has one entry,
+        // so its entry embeds it as mkdir does.
+        let embed_inode =
+            (source_inode.is_directory() || source_inode.nlink() == 1).then_some(&source_inode);
         self.directory_store.add(
             &mut txn,
             to_dirid,
@@ -820,8 +1031,7 @@ impl ZeroFS {
                     from_dirid,
                     &from_dir,
                 )
-                .await
-                .ok();
+                .await?;
         }
 
         if let Some(ref mut to_dir) = to_dir {
@@ -851,8 +1061,7 @@ impl ZeroFS {
             if let Some((parent_id, dir_name)) = to_dir_update_info {
                 self.directory_store
                     .update_inode_in_entry(&mut txn, parent_id, &dir_name, to_dirid, to_dir)
-                    .await
-                    .ok();
+                    .await?;
             }
         }
 
@@ -867,49 +1076,27 @@ impl ZeroFS {
             )
         };
         self.write_coordinator
-            .commit_with_settlement(txn, settlement)
+            .commit_with_settlement(txn, settlement, (directory_rename_guard, fence, guards))
             .await?;
 
         #[cfg(feature = "failpoints")]
         fail_point!(fp::RENAME_AFTER_COMMIT);
 
-        match source_inode {
-            Inode::File(_) => {
-                self.stats.files_renamed.fetch_add(1, Ordering::Relaxed);
-            }
-            Inode::Directory(_) => {
-                self.stats
-                    .directories_renamed
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            Inode::Symlink(_) => {
-                self.stats.links_renamed.fetch_add(1, Ordering::Relaxed);
-            }
-            _ => {}
-        }
-        self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
-        self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+        self.record_rename(&source_inode, trace_old_path, to_dirid, to_name);
 
-        // Emit rename event with old path and new path
-        if let Some(old_path) = trace_old_path {
-            let inode_store = self.inode_store.clone();
-            let tracer = self.tracer.clone();
-            let to_name = String::from_utf8_lossy(to_name).to_string();
-            tokio::spawn(async move {
-                let to_dir_path = inode_store.resolve_path_lossy(to_dirid).await;
-                let new_path = format!("{}/{}", to_dir_path.trim_end_matches('/'), to_name);
-                tracer.emit_with_path(old_path, FileOperation::Rename { new_path });
-            });
-        }
-
-        Ok(verified_content.map(VerifiedRenameOutcome::Published))
+        Ok(RenameCompletion {
+            moved: true,
+            verification: verified_content.map(VerifiedRenameOutcome::Published),
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
 
-    use super::{VerifiedFileExpectation, VerifiedRenameOutcome};
+    use super::{
+        DIRECTORY_RENAME_PAUSE, VerifiedFileExpectation, VerifiedRenameOutcome, VerifiedRenamePause,
+    };
     use crate::dedup::DedupResult;
     use crate::fs::inode::Inode;
     use crate::fs::key_codec::KeyCodec;
@@ -933,6 +1120,102 @@ mod tests {
             size: data.len() as u64,
             sha256: Some(sha2::Sha256::digest(data).into()),
         }
+    }
+
+    #[tokio::test]
+    async fn rename_requires_parent_search_before_resolving_names() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let creds = test_creds();
+        let restricted = fs
+            .mkdir(
+                &creds,
+                0,
+                b"restricted",
+                &SetAttributes {
+                    mode: SetMode::Set(0o700),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .0;
+        let secret = fs
+            .create(&creds, restricted, b"secret", &SetAttributes::default())
+            .await
+            .unwrap()
+            .0;
+        let source = fs
+            .create(&creds, 0, b"source", &SetAttributes::default())
+            .await
+            .unwrap()
+            .0;
+        let stranger = AuthContext {
+            uid: 2000,
+            gid: 2000,
+            gid_known: true,
+            gids: vec![],
+            groups_complete: true,
+            groups_truncated: false,
+        };
+
+        for name in [b"missing".as_slice(), b"secret".as_slice()] {
+            assert_eq!(
+                fs.rename(&stranger, restricted, name, 0, b"published")
+                    .await,
+                Err(FsError::PermissionDenied),
+                "source search permission must hide both present and missing names"
+            );
+            assert_eq!(
+                fs.rename_noreplace_idempotent(&stranger, 0, b"source", restricted, name, [0; 16])
+                    .await,
+                Err(FsError::PermissionDenied),
+                "target search permission must precede the no-replace existence check"
+            );
+        }
+        assert_eq!(fs.lookup(&creds, 0, b"source").await.unwrap(), source);
+        assert_eq!(
+            fs.lookup(&creds, restricted, b"secret").await.unwrap(),
+            secret
+        );
+        assert_eq!(
+            fs.lookup(&creds, 0, b"published").await,
+            Err(FsError::NotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn inode_rename_rejects_reused_names_but_replays_completed_operations() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let creds = test_creds();
+        let auth: AuthContext = (&test_auth()).into();
+        let original = fs
+            .create(&creds, 0, b"source", &SetAttributes::default())
+            .await
+            .unwrap()
+            .0;
+        let op_id = [0x62; 16];
+        fs.rename_inode_idempotent(&auth, 0, b"source", 0, b"target", original, op_id)
+            .await
+            .unwrap();
+        let replacement = fs
+            .create(&creds, 0, b"source", &SetAttributes::default())
+            .await
+            .unwrap()
+            .0;
+
+        // A lost reply may be retried after another caller reuses the name.
+        // Replay reports the original success without moving the replacement.
+        fs.rename_inode_idempotent(&auth, 0, b"source", 0, b"target", original, op_id)
+            .await
+            .unwrap();
+        // A fresh operation using the old fid must reject that same path.
+        assert_eq!(
+            fs.rename_inode_idempotent(&auth, 0, b"source", 0, b"target", original, [0x63; 16],)
+                .await,
+            Err(FsError::StaleHandle)
+        );
+        assert_eq!(fs.lookup(&creds, 0, b"source").await.unwrap(), replacement);
+        assert_eq!(fs.lookup(&creds, 0, b"target").await.unwrap(), original);
     }
 
     #[tokio::test]
@@ -975,6 +1258,52 @@ mod tests {
         assert!(matches!(result, Err(FsError::InvalidArgument)));
         assert!(fs.lookup(&test_creds(), 0, b"source").await.is_ok());
         assert!(fs.lookup(&test_creds(), 0, b"target").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn exact_same_name_rename_checks_the_source_before_recording_success() {
+        use crate::fs::name_mode::{NameMatch, NameMode};
+
+        let fs = ZeroFS::new_in_memory_with_name_mode(NameMode::Insensitive)
+            .await
+            .unwrap();
+        let creds = test_creds();
+        let auth = AuthContext::from(&creds);
+        let (file, _) = fs
+            .create(&creds, 0, b"Stored", &SetAttributes::default())
+            .await
+            .unwrap();
+        let before = bincode::serialize(&fs.inode_store.get(file).await.unwrap()).unwrap();
+
+        for name in [b"missing".as_slice(), b"stored"] {
+            let op_id = [0x71; 16];
+            assert_eq!(
+                fs.rename_idempotent_matching(&auth, 0, name, NameMatch::Exact, 0, name, op_id)
+                    .await,
+                Err(FsError::NotFound),
+                "same-name rename must resolve its exact source"
+            );
+            assert!(fs.dedup.get(&op_id).is_none());
+        }
+
+        let op_id = [0x72; 16];
+        fs.rename_idempotent_matching(&auth, 0, b"Stored", NameMatch::Exact, 0, b"Stored", op_id)
+            .await
+            .unwrap();
+        assert!(matches!(fs.dedup.get(&op_id), Some(DedupResult::Rename)));
+        assert_eq!(fs.lookup(&creds, 0, b"Stored").await.unwrap(), file);
+        assert_eq!(
+            bincode::serialize(&fs.inode_store.get(file).await.unwrap()).unwrap(),
+            before,
+            "a valid same-name rename must leave the inode unchanged"
+        );
+
+        // A successful retry remains replayable after its original source
+        // disappears, just like every other idempotent rename.
+        fs.remove(&auth, 0, b"Stored").await.unwrap();
+        fs.rename_idempotent_matching(&auth, 0, b"Stored", NameMatch::Exact, 0, b"Stored", op_id)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1383,6 +1712,58 @@ mod tests {
             .expect("renamed symlink must be present");
         assert_eq!(renamed.fileid, symlink_id);
         assert_eq!(renamed.attr.mode & 0o777, 0o701);
+    }
+
+    #[tokio::test]
+    async fn concurrent_directory_moves_cannot_create_a_cycle_between_disjoint_subtrees() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let creds = test_creds();
+        let auth: AuthContext = (&test_auth()).into();
+        let attrs = SetAttributes::default();
+        let p = fs.mkdir(&creds, 0, b"P", &attrs).await.unwrap().0;
+        let q = fs.mkdir(&creds, 0, b"Q", &attrs).await.unwrap().0;
+        let a = fs.mkdir(&creds, p, b"A", &attrs).await.unwrap().0;
+        let c = fs.mkdir(&creds, q, b"C", &attrs).await.unwrap().0;
+        let d = fs.mkdir(&creds, a, b"D", &attrs).await.unwrap().0;
+        let b = fs.mkdir(&creds, c, b"B", &attrs).await.unwrap().0;
+
+        // A -> C/B and C -> A/D have disjoint immediate inode lock sets.
+        // Pause the first move after its ancestry check so the second would
+        // otherwise commit a now-invalidating topology change underneath it.
+        let (reached, waiting) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = tokio::sync::oneshot::channel();
+        let previous = DIRECTORY_RENAME_PAUSE
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap()
+            .replace(VerifiedRenamePause {
+                filesystem: Arc::as_ptr(&fs.db) as usize,
+                inode: a,
+                reached,
+                resume: resumed,
+            });
+        assert!(previous.is_none());
+
+        let moving = Arc::clone(&fs);
+        let moving_auth = auth.clone();
+        let first =
+            tokio::spawn(async move { moving.rename(&moving_auth, p, b"A", b, b"A").await });
+        waiting.await.unwrap();
+        let moving = Arc::clone(&fs);
+        let mut second = tokio::spawn(async move { moving.rename(&auth, q, b"C", d, b"C").await });
+        let early = tokio::time::timeout(std::time::Duration::from_secs(2), &mut second).await;
+        resume.send(()).unwrap();
+        assert_eq!(first.await.unwrap(), Ok(()));
+        let second = match early {
+            Ok(result) => result.unwrap(),
+            Err(_) => second.await.unwrap(),
+        };
+        assert_eq!(second, Err(FsError::InvalidArgument));
+        assert_eq!(fs.lookup(&creds, p, b"A").await, Err(FsError::NotFound));
+        assert_eq!(fs.lookup(&creds, q, b"C").await.unwrap(), c);
+        assert_eq!(fs.lookup(&creds, b, b"A").await.unwrap(), a);
+        assert_eq!(fs.lookup(&creds, a, b"D").await.unwrap(), d);
+        assert_eq!(fs.lookup(&creds, d, b"C").await, Err(FsError::NotFound));
     }
 
     #[tokio::test]
@@ -2098,5 +2479,87 @@ mod tests {
             fs.lookup(&test_creds(), 0, b"published").await.unwrap(),
             file
         );
+    }
+    #[tokio::test]
+    async fn recase_without_replace_and_verified_rename_keep_their_contracts() {
+        use crate::fs::name_mode::NameMode;
+        use crate::fs::name_mode_tests::assert_preserved;
+        use sha2::{Digest, Sha256};
+        let fs = ZeroFS::new_in_memory_with_name_mode(NameMode::Insensitive)
+            .await
+            .unwrap();
+        let creds = test_creds();
+        let auth = AuthContext::from(&creds);
+        let (id, _) = fs
+            .create(&creds, 0, b"Foo", &SetAttributes::default())
+            .await
+            .unwrap();
+        let (_, cookie) = fs.entry_identity(0, b"foo").await.unwrap();
+        let expected = VerifiedFileExpectation {
+            inode: id,
+            entry_cookie: cookie,
+            size: 0,
+            sha256: Some(Sha256::digest([]).into()),
+        };
+        let wrong = VerifiedFileExpectation {
+            size: 1,
+            ..expected
+        };
+        assert!(matches!(
+            fs.rename_verified(&auth, 0, b"Foo", 0, b"foo", wrong)
+                .await
+                .unwrap(),
+            VerifiedRenameOutcome::Mismatch(_)
+        ));
+        assert_preserved(&fs, 0, b"Foo", id).await;
+        fs.rename_noreplace_idempotent(&auth, 0, b"Foo", 0, b"foo", [1; 16])
+            .await
+            .unwrap();
+        assert_preserved(&fs, 0, b"foo", id).await;
+        fs.rename_verified(&auth, 0, b"foo", 0, b"Foo", expected)
+            .await
+            .unwrap();
+        assert_preserved(&fs, 0, b"Foo", id).await;
+        let before = bincode::serialize(&fs.inode_store.get(id).await.unwrap()).unwrap();
+        fs.rename_verified(&auth, 0, b"Foo", 0, b"Foo", expected)
+            .await
+            .unwrap();
+        assert_eq!(
+            bincode::serialize(&fs.inode_store.get(id).await.unwrap()).unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_updates_the_ctime_of_the_renamed_inode() {
+        use crate::fs::inode::InodeAttrs;
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let creds = test_creds();
+        let auth = AuthContext::from(&creds);
+        let attrs = SetAttributes::default();
+        let (dir, _) = fs.mkdir(&creds, 0, b"dir", &attrs).await.unwrap();
+        let (file, _) = fs.create(&creds, 0, b"a", &attrs).await.unwrap();
+        for (from_dir, from, to_dir, to) in [(0, b"a", 0, b"b"), (0, b"b", dir, b"c")] {
+            let before = fs.inode_store.get(file).await.unwrap();
+            fs.rename(&auth, from_dir, from, to_dir, to).await.unwrap();
+            let after = fs.inode_store.get(file).await.unwrap();
+            assert!((after.ctime(), after.ctime_nsec()) > (before.ctime(), before.ctime_nsec()));
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_keeps_the_embedded_copy_of_a_moved_directory() {
+        use crate::fs::name_mode_tests::assert_preserved;
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let creds = test_creds();
+        let auth = AuthContext::from(&creds);
+        let attrs = SetAttributes::default();
+        let (dest, _) = fs.mkdir(&creds, 0, b"dest", &attrs).await.unwrap();
+        let (moved, _) = fs.mkdir(&creds, 0, b"a", &attrs).await.unwrap();
+        assert_preserved(&fs, 0, b"a", moved).await;
+        fs.rename(&auth, 0, b"a", 0, b"b").await.unwrap();
+        assert_preserved(&fs, 0, b"b", moved).await;
+        fs.rename(&auth, 0, b"b", dest, b"c").await.unwrap();
+        assert_preserved(&fs, dest, b"c", moved).await;
     }
 }

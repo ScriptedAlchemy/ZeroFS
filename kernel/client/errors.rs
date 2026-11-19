@@ -14,6 +14,11 @@ pub(super) fn protocol_errno() -> Error {
     errno!(EPROTO)
 }
 
+/// Errno for a request this client never sends.
+pub(super) fn unsupported_request_errno() -> Error {
+    errno!(EOPNOTSUPP)
+}
+
 /// Errno for a codec failure on a request that never reached the wire.
 ///
 /// Nothing was transmitted, so the failure says nothing about the peer and the

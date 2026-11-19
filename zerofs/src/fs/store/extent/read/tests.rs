@@ -3,6 +3,32 @@ use super::*;
 use crate::config::CompressionConfig;
 use slatedb::config::{PutOptions, WriteOptions};
 
+#[test]
+fn read_ahead_plan_clips_at_maximum_file_size() {
+    let first = u64::MAX - 16;
+    let (state, plan) = plan_read_ahead((first, first, 1), first, 8);
+    assert_eq!(plan, Some((u64::MAX - 8, u64::MAX)));
+    let (state, plan) = plan_read_ahead(state, u64::MAX - 8, 8);
+    assert_eq!(state.0, u64::MAX);
+    assert_eq!(state.1, u64::MAX);
+    assert_eq!(plan, None);
+}
+
+#[tokio::test]
+async fn read_ahead_chunk_clips_at_maximum_file_size() {
+    let (store, _db) = make().await;
+    assert!(store.trigger_read_ahead(1, u64::MAX - 17, 1).is_none());
+    let read_ahead = store
+        .trigger_read_ahead(1, u64::MAX - 16, 1)
+        .expect("a sequential read should prefetch the remaining prefix");
+    read_ahead.await.unwrap();
+    assert_eq!(store.read_ahead.get(&1).unwrap().1, u64::MAX);
+    assert_eq!(
+        store.prefetch_sem.available_permits(),
+        READ_AHEAD_MAX_CONCURRENT
+    );
+}
+
 #[tokio::test]
 async fn contiguous_multiextent_read_is_one_ranged_get() {
     let (writer, db, object_store) = make_with_compression(CompressionConfig::Lz4).await;

@@ -1,0 +1,71 @@
+[package]
+name = "foyer-storage"
+description = "storage engine for foyer - Hybrid cache for Rust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+authors.workspace = true
+license.workspace = true
+readme.workspace = true
+exclude.workspace = true
+
+[features]
+default = ["tokio/runtime-tokio"]
+serde = ["dep:serde"]
+clap = ["dep:clap"]
+tracing = ["dep:fastrace", "foyer-common/tracing", "foyer-memory/tracing"]
+nightly = ["allocator-api2/nightly", "hashbrown/nightly"]
+test_utils = []
+deadlock = ["parking_lot/deadlock_detection"]
+strict_assertions = [
+  "foyer-common/strict_assertions",
+  "foyer-memory/strict_assertions",
+]
+
+[dependencies]
+allocator-api2 = { workspace = true }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true, optional = true }
+equivalent = { workspace = true }
+fastant = { workspace = true, features = ["atomic"] }
+fastrace = { workspace = true, optional = true }
+foyer-common = { workspace = true }
+foyer-memory = { workspace = true }
+fs4 = { workspace = true }
+futures-core = { workspace = true }
+futures-util = { workspace = true }
+hashbrown = { workspace = true }
+itertools = { workspace = true }
+libc = { workspace = true }
+lz4 = { workspace = true }
+mea = { workspace = true }
+parking_lot = { workspace = true }
+pin-project = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["macros"] }
+tracing = { workspace = true }
+twox-hash = { workspace = true }
+zstd = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+core_affinity = { workspace = true }
+io-uring = { workspace = true }
+
+[dev-dependencies]
+bytesize = { workspace = true }
+foyer-memory = { workspace = true, features = ["test_utils"] }
+tempfile = { workspace = true }
+test-log = { workspace = true, features = ["trace", "color"] }
+tokio = { workspace = true }
+
+[lints]
+workspace = true
+
+[[test]]
+name = "storage_fuzzy_test"
+required-features = ["test_utils"]

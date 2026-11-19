@@ -31,7 +31,7 @@ jobs:
           sudo apt-get install -y acl attr automake bc dbench dump e2fsprogs fio gawk \
             gcc git indent libacl1-dev libaio-dev libcap-dev libgdbm-dev libtool \
             libtool-bin liburing-dev libuuid1 lvm2 make psmisc python3 quota sed \
-            uuid-dev uuid-runtime xfsprogs linux-headers-$(uname -r) sqlite3 \
+            uuid-dev uuid-runtime xfsprogs "linux-headers-$(uname -r)" sqlite3 \
             libgdbm-compat-dev fuse3
           sudo apt-get install -y exfatprogs f2fs-tools ocfs2-tools udftools xfsdump \
             xfslibs-dev || true
@@ -60,24 +60,12 @@ jobs:
           # Put the binary on a stable path the helper can find.
           sudo cp zerofs/target/ci/zerofs /usr/local/bin/zerofs
 
-          # mount(8) invokes this as: mount.fuse.zerofs <target> <mountpoint> [-o ..].
-          # The FUSE client is long-lived, so detach it (setsid) and return once
-          # the mount is live so xfstests' mount/umount cycle works.
-          sudo tee /sbin/mount.fuse.zerofs > /dev/null << 'HELPER'
-          #!/bin/bash
-          DEV="$1"
-          MNT="$2"
-          ZEROFS_BIN="${ZEROFS_BIN:-/usr/local/bin/zerofs}"
-          setsid "$ZEROFS_BIN" mount --access all --writeback false "$DEV" "$MNT" \
-            </dev/null >>/tmp/zerofs-mount.log 2>&1 &
-          for i in $(seq 1 100); do
-            mountpoint -q "$MNT" && exit 0
-            sleep 0.1
-          done
-          echo "mount.fuse.zerofs: $MNT did not become a mountpoint" >&2
-          exit 1
-          HELPER
-          sudo chmod +x /sbin/mount.fuse.zerofs
+          sudo install -m 755 scripts/ci/xfstests-fuse-mount.sh /sbin/mount.fuse.zerofs
+
+      - name: Verify xfstests mount lifetime
+        run: |
+          sudo python3 scripts/test-xfstests-fuse-lifecycle.py \
+            --binary /usr/local/bin/zerofs --helper /sbin/mount.fuse.zerofs
 
       - name: Build pinned MinIO fixture
         uses: ./.github/actions/build-minio-fixture
@@ -95,7 +83,7 @@ jobs:
             zerofs-minio-ci:local server /data
 
           # Wait for MinIO to be ready
-          for i in {1..30}; do
+          for _attempt in {1..30}; do
             if curl -f http://localhost:9000/minio/health/live; then
               echo "MinIO is ready"
               break
@@ -146,7 +134,7 @@ jobs:
           echo $! > /tmp/zerofs-test.pid
 
           echo "Waiting for ZeroFS TEST instance to start..."
-          for i in {1..30}; do
+          for _attempt in {1..30}; do
             if [ -S /tmp/zerofs-test.9p.sock ]; then
               echo "ZeroFS TEST instance is ready"
               break
@@ -194,7 +182,7 @@ jobs:
           echo $! > /tmp/zerofs-scratch.pid
 
           echo "Waiting for ZeroFS SCRATCH instance to start..."
-          for i in {1..30}; do
+          for _attempt in {1..30}; do
             if [ -S /tmp/zerofs-scratch.9p.sock ]; then
               echo "ZeroFS SCRATCH instance is ready"
               break
@@ -304,15 +292,16 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
+          sudo systemctl stop zerofs-xfstests-mnt-test.service zerofs-xfstests-mnt-scratch.service || true
           sudo umount /mnt/test || true
           sudo umount /mnt/scratch || true
           sudo pkill -f "zerofs mount" || true
 
           if [ -f /tmp/zerofs-test.pid ]; then
-            kill $(cat /tmp/zerofs-test.pid) || true
+            kill "$(cat /tmp/zerofs-test.pid)" || true
           fi
           if [ -f /tmp/zerofs-scratch.pid ]; then
-            kill $(cat /tmp/zerofs-scratch.pid) || true
+            kill "$(cat /tmp/zerofs-scratch.pid)" || true
           fi
           pkill -f "zerofs-test.toml" || true
           pkill -f "zerofs-scratch.toml" || true

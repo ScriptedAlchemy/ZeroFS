@@ -1,0 +1,4 @@
+{"event": "executables", "sha256": {"zerofs": "f87f22822760dea612c03ea4b6b54ca276d1e748d83bfcc420419d7d879fa0fb", "zerofs-nvmf-tgt": "e6e3c23ea94571f77ebda295adc3b05c327c0fd2be657a3c971e5a0982070b2c", "zerofs_nvme_probe": "bf262a5940d08f8f074337a9c99e6088ff210a678acf4ee8dcadce466d5a15bb"}}
+{"event": "mount", "mountinfo": "1293 1365 0:72 / /fixture/preflight/mount rw,nosuid,nodev,relatime - fuse unix:/fixture/preflight/ninep.sock rw,user_id=0,group_id=0,default_permissions", "scenario": "preflight"}
+{"event": "preflight_mount_verified"}
+{"event": "case_cleanup", "fills_present": false, "mount_present": false, "processes": [], "scenario": "preflight"}

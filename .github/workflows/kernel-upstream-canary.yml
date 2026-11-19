@@ -2,7 +2,6 @@ name: kernel-upstream-canary
 
 on:
   pull_request:
-    branches: ["main", "develop"]
     paths:
       - "kernel/**"
       - ".github/workflows/kernel-upstream-canary.yml"

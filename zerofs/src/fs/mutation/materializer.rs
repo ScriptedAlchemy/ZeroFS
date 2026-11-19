@@ -283,7 +283,7 @@ impl Materializer {
             // Attribute previews are part of the lane-owned visibility tail.
             // Retire them before releasing any hold so a replacement lane
             // generation cannot start while the prior preview is still live.
-            self.retire_inodes(&inodes);
+            self.retire_inodes(&inodes).await;
         }
         for (_, release) in holds {
             let _ = release.send(());
@@ -319,6 +319,28 @@ impl Materializer {
     }
 
     #[cfg(test)]
+    pub(crate) async fn hold_inode_lane_for_test(
+        self: &Arc<Self>,
+        inode: u64,
+    ) -> oneshot::Sender<()> {
+        let (acquired, ready) = oneshot::channel();
+        let (release, held) = oneshot::channel();
+        self.enqueue_lane(
+            inode,
+            LaneJob::Hold {
+                acquired,
+                release: held,
+            },
+        )
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        release
+    }
+
+    #[cfg(test)]
     fn enqueue_probe(
         self: &Arc<Self>,
         inode: u64,
@@ -349,7 +371,7 @@ impl Materializer {
         let inodes = batch_inodes(&batch);
         let result = self.apply_caught(cutoff, batch, accepted_write).await;
         if result.is_ok() {
-            self.retire_inodes(&inodes);
+            self.retire_inodes(&inodes).await;
         }
         result
     }
@@ -526,15 +548,15 @@ impl Materializer {
         self.inner.progress.record_materialized(cutoff)
     }
 
-    fn retire_inodes(&self, inodes: &BTreeSet<u64>) {
+    async fn retire_inodes(&self, inodes: &BTreeSet<u64>) {
         for inode in inodes {
-            self.retire_inode(*inode);
+            self.retire_inode(*inode).await;
         }
     }
 
-    fn retire_inode(&self, inode: u64) {
+    async fn retire_inode(&self, inode: u64) {
         if let Some(overlay) = self.inner.overlay.upgrade() {
-            overlay.retire_inode(inode);
+            overlay.retire_inode(inode).await;
         }
     }
 
@@ -583,7 +605,7 @@ async fn run_lane_job(materializer: &Materializer, _inode: u64, job: LaneJob) {
                 // Canonical apply, attribute-preview retirement, and the reply
                 // form one lane-owned completion. A new generation cannot be
                 // installed before this tail finishes.
-                materializer.retire_inode(_inode);
+                materializer.retire_inode(_inode).await;
             }
             let _ = reply.send(result);
         }
@@ -735,6 +757,280 @@ mod tests {
             .await
             .unwrap()
             .0
+    }
+
+    async fn hold_inode_lane(fs: &ZeroFS, inode: u64) -> oneshot::Sender<()> {
+        fs.materializer
+            .get()
+            .unwrap()
+            .hold_inode_lane_for_test(inode)
+            .await
+    }
+
+    async fn acknowledged_metadata_handoff(
+        prefix: &'static [u8],
+        attributes_only: bool,
+        cancel_read: bool,
+    ) {
+        let (fs, auth) = filesystem().await;
+        let file = create_file(&fs, &auth, b"metadata-handoff").await;
+        if !prefix.is_empty() {
+            fs.write(&auth, file, 0, &Bytes::from_static(prefix))
+                .await
+                .unwrap();
+        }
+        let expected = [prefix, b"tail"].concat();
+        let release_apply = hold_inode_lane(&fs, file).await;
+        fs.write_ack(
+            &auth,
+            file,
+            prefix.len() as u64,
+            &Bytes::from_static(b"tail"),
+        )
+        .await
+        .unwrap();
+        let cutoff = fs.capture_mutation_cutoff();
+        let (read_reached, read_resume) = fs
+            .volatile_overlay
+            .get()
+            .unwrap()
+            .pause_metadata_read_for_test();
+        let reader = tokio::spawn({
+            let fs = Arc::clone(&fs);
+            let auth = auth.clone();
+            async move {
+                if attributes_only {
+                    let inode = fs.visible_inode(file).await.unwrap();
+                    let crate::fs::inode::Inode::File(file) = inode else {
+                        panic!("expected regular file");
+                    };
+                    (file.size, None)
+                } else {
+                    let (data, eof) = fs.read_file(&auth, file, 0, 16).await.unwrap();
+                    assert!(eof);
+                    (data.len() as u64, Some(data))
+                }
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), read_reached)
+            .await
+            .unwrap()
+            .unwrap();
+        release_apply.send(()).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            fs.materializer
+                .get()
+                .unwrap()
+                .progress()
+                .wait_materialized(cutoff),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let (canonical, _) = fs
+            .read_file_inner_canonical(Some(&auth), file, 0, 16)
+            .await
+            .unwrap();
+        assert_eq!(canonical.as_ref(), expected);
+        // Canonical apply has finished. Retirement must still wait for the
+        // reader that captured the old inode, including for getattr alone.
+        let mut drained = Box::pin(fs.quiesce_overlay_inode(file));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut drained)
+                .await
+                .is_err(),
+            "retirement passed a reader holding pre-apply inode metadata"
+        );
+        if cancel_read {
+            reader.abort();
+            assert!(reader.await.unwrap_err().is_cancelled());
+            drop(read_resume);
+        } else {
+            read_resume.send(()).unwrap();
+            let (size, bytes) = tokio::time::timeout(Duration::from_secs(2), reader)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(size, expected.len() as u64);
+            if let Some(bytes) = bytes {
+                assert_eq!(bytes.as_ref(), expected);
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(2), drained)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let overlay = fs
+                    .volatile_overlay
+                    .get()
+                    .unwrap()
+                    .lifecycle_census_for_test();
+                let materializer = fs.materializer.get().unwrap().lifecycle_census_for_test();
+                if overlay.runtimes == 0
+                    && overlay.visible_attrs == 0
+                    && materializer.lanes == 0
+                    && materializer.active_workers == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed or cancelled reader retained its runtime or materializer lane");
+    }
+
+    #[tokio::test]
+    async fn reads_preserve_acknowledged_growth_across_retirement() {
+        acknowledged_metadata_handoff(b"base", false, false).await;
+    }
+
+    #[tokio::test]
+    async fn empty_file_reads_preserve_acknowledged_growth_across_retirement() {
+        acknowledged_metadata_handoff(b"", false, false).await;
+    }
+
+    #[tokio::test]
+    async fn getattr_preserves_acknowledged_growth_across_retirement() {
+        acknowledged_metadata_handoff(b"base", true, false).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_metadata_read_releases_retirement() {
+        acknowledged_metadata_handoff(b"base", true, true).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_data_read_releases_retirement() {
+        acknowledged_metadata_handoff(b"base", false, true).await;
+    }
+
+    #[tokio::test]
+    async fn volatile_write_projects_mode_and_times_before_apply() {
+        use crate::fs::types::{FileAttributes, InodeWithId, SetMode, SetTime, Timestamp};
+        let (fs, auth) = filesystem().await;
+        let file = create_file(&fs, &auth, b"setid-visibility").await;
+        fs.write(&auth, file, 0, &Bytes::from_static(b"abcd"))
+            .await
+            .unwrap();
+        fs.setattr(
+            &test_creds(),
+            file,
+            &SetAttributes {
+                mode: SetMode::Set(0o6777),
+                mtime: SetTime::SetToClientTime(Timestamp {
+                    seconds: 1,
+                    nanoseconds: 0,
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let release_apply = hold_inode_lane(&fs, file).await;
+        let writer = AuthContext {
+            uid: 1001,
+            gid: 1001,
+            ..auth.clone()
+        };
+        let acknowledged = fs
+            .write_ack(&writer, file, 0, &Bytes::from_static(b"wxyz"))
+            .await
+            .unwrap();
+        assert_eq!(acknowledged.mode & 0o6000, 0);
+        let metadata = |attrs: &FileAttributes| {
+            (
+                attrs.size,
+                attrs.mode,
+                (attrs.mtime.seconds, attrs.mtime.nanoseconds),
+                (attrs.ctime.seconds, attrs.ctime.nanoseconds),
+            )
+        };
+        let inode = fs.visible_inode(file).await.unwrap();
+        let visible: FileAttributes = InodeWithId {
+            inode: &inode,
+            id: file,
+        }
+        .into();
+        assert_eq!(metadata(&visible), metadata(&acknowledged));
+        let listing = fs.readdir(&auth, 0, 0, 16).await.unwrap();
+        let listed = listing
+            .entries
+            .iter()
+            .find(|entry| entry.fileid == file)
+            .unwrap();
+        assert_eq!(metadata(&listed.attr), metadata(&acknowledged));
+        let (bytes, _) = fs.read_file(&auth, file, 0, 4).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"wxyz");
+        release_apply.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), fs.quiesce_overlay_inode(file))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn contiguous_appends_are_visible_while_apply_is_held_and_yield_to_lock_waiters() {
+        let (fs, auth) = filesystem().await;
+        let file = create_file(&fs, &auth, b"queued-appends").await;
+        let (acquired, ready) = oneshot::channel();
+        let (release, held) = oneshot::channel();
+        fs.materializer
+            .get()
+            .unwrap()
+            .enqueue_lane(
+                file,
+                LaneJob::Hold {
+                    acquired,
+                    release: held,
+                },
+            )
+            .unwrap();
+        ready.await.unwrap();
+        let payload: Vec<u8> = (0..=255).collect();
+        let queued = async {
+            for (i, byte) in payload.iter().enumerate() {
+                let attrs = fs
+                    .write_ack(&auth, file, i as u64, &Bytes::copy_from_slice(&[*byte]))
+                    .await
+                    .unwrap();
+                assert_eq!(attrs.size, (i + 1) as u64);
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(2), queued)
+            .await
+            .expect("appends waited for apply");
+        let (visible, eof) = fs.read_file(&auth, file, 0, 257).await.unwrap();
+        assert!(eof);
+        assert_eq!(visible.as_ref(), payload);
+        let extra = Bytes::from_static(b"x");
+        // The cap forces this request back through canonical lock acquisition.
+        // Cancelling that wait must leave the already acknowledged prefix intact.
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                fs.write_ack(&auth, file, 256, &extra)
+            )
+            .await
+            .is_err()
+        );
+        let mut flush = Box::pin(fs.wait_inode_durability(file));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut flush)
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), flush)
+            .await
+            .unwrap()
+            .unwrap();
+        let (stored, eof) = fs.read_file(&auth, file, 0, 257).await.unwrap();
+        assert!(eof);
+        assert_eq!(stored.as_ref(), payload);
     }
 
     async fn prepare(

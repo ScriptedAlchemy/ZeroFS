@@ -81,6 +81,7 @@ fn root_auth() -> AuthContext {
         gid_known: true,
         gids: Vec::new(),
         groups_complete: true,
+        groups_truncated: false,
     }
 }
 
@@ -154,6 +155,11 @@ impl AdminRpcServer {
     pub fn with_nbd_export_protection(mut self, enabled: bool) -> Self {
         self.protect_nbd_exports = enabled;
         self
+    }
+
+    fn is_reserved(&self, name: &[u8], reserved: &[u8]) -> bool {
+        let mode = self.fs.name_mode();
+        mode.key(name) == mode.key(reserved)
     }
 
     /// Construct a successful response only with current serving authority.
@@ -475,7 +481,8 @@ impl AdminService for AdminRpcServer {
             interval_ms,
         )))
         .map(move |_| {
-            let (used_bytes, used_inodes) = global_stats.get_totals();
+            // The totals are absent, not a partial sum, when a stats shard was unreadable at boot.
+            let usage = global_stats.known_totals();
             let mem = JemallocMemStats::read();
             Ok(proto::StatsSnapshot {
                 timestamp: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
@@ -497,8 +504,8 @@ impl AdminService for AdminRpcServer {
                 gc_extents_deleted: fs_stats.gc_extents_deleted.load(Ordering::Relaxed),
                 gc_runs: fs_stats.gc_runs.load(Ordering::Relaxed),
                 total_operations: fs_stats.total_operations.load(Ordering::Relaxed),
-                used_bytes,
-                used_inodes,
+                used_bytes: usage.map(|(bytes, _)| bytes),
+                used_inodes: usage.map(|(_, inodes)| inodes),
                 max_bytes,
                 jemalloc_allocated: mem.allocated,
                 jemalloc_resident: mem.resident,
@@ -550,7 +557,10 @@ impl AdminService for AdminRpcServer {
         // Anything under /.zerofs_trash would be deleted by the next sweep
         // with no error returned to anyone; refuse upfront, mirroring the
         // RemoveDirectory guard.
-        if components.first() == Some(&TRASH_DIR_NAME) {
+        if components
+            .first()
+            .is_some_and(|name| self.is_reserved(name, TRASH_DIR_NAME))
+        {
             return Err(Status::invalid_argument(format!(
                 "refusing to create {:?}: /{} is reserved",
                 req.path,
@@ -639,13 +649,13 @@ impl AdminService for AdminRpcServer {
                 "refusing to remove the filesystem root",
             ));
         };
-        if components[0] == TRASH_DIR_NAME {
+        if self.is_reserved(components[0], TRASH_DIR_NAME) {
             return Err(Status::invalid_argument(format!(
                 "refusing to remove {path:?}: /{} is reserved",
                 String::from_utf8_lossy(TRASH_DIR_NAME)
             )));
         }
-        if self.protect_nbd_exports && components[0] == NBD_DIR_NAME {
+        if self.protect_nbd_exports && self.is_reserved(components[0], NBD_DIR_NAME) {
             return Err(Status::invalid_argument(format!(
                 "refusing to remove {path:?}: /.nbd is reserved while volatile NBD acknowledgement is active"
             )));
@@ -814,6 +824,22 @@ mod tests {
         lease: Option<Arc<crate::replication::Lease>>,
         write_ack: Option<crate::fs::mutation::config::FilesystemWriteAckSettings>,
     ) -> (Arc<ZeroFS>, Arc<CheckpointManager>) {
+        make_fs_with_options(
+            lease,
+            write_ack,
+            crate::fs::name_mode::NameMode::Sensitive,
+            &[],
+        )
+        .await
+    }
+
+    async fn make_fs_with_options(
+        lease: Option<Arc<crate::replication::Lease>>,
+        write_ack: Option<crate::fs::mutation::config::FilesystemWriteAckSettings>,
+        name_mode: crate::fs::name_mode::NameMode,
+        // Raw records written to the database before the filesystem boots from it.
+        preexisting: &[(bytes::Bytes, &[u8])],
+    ) -> (Arc<ZeroFS>, Arc<CheckpointManager>) {
         let test_key = [0u8; 32];
         let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
             Arc::new(slatedb::object_store::memory::InMemory::new());
@@ -829,6 +855,9 @@ mod tests {
                 .await
                 .unwrap(),
         );
+        for (key, value) in preexisting {
+            slatedb.put(key, value).await.unwrap();
+        }
         let db_handle = SlateDbHandle::ReadWrite(slatedb);
         let mut fs = ZeroFS::new_with_slatedb_and_lease(
             db_handle.clone(),
@@ -849,6 +878,7 @@ mod tests {
             ),
             None,
             crate::config::StoreProfile::default(),
+            name_mode,
         )
         .await
         .unwrap();
@@ -961,6 +991,103 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("trash directory was not drained");
+    }
+
+    /// The first sample from the real StreamStats RPC, decoded by the real client.
+    async fn first_stats_sample(client: &RpcClient) -> proto::StatsSnapshot {
+        client
+            .stream_stats(250)
+            .await
+            .unwrap()
+            .message()
+            .await
+            .unwrap()
+            .expect("StreamStats ended before its first sample")
+    }
+
+    #[tokio::test]
+    async fn stream_stats_sends_known_usage_as_present() {
+        let (_fs, client, shutdown, _dir) = setup().await;
+        let sample = first_stats_sample(&client).await;
+        // Nothing has read file data yet, so the read counter is zero.
+        assert_eq!(sample.bytes_read, 0);
+        assert!(sample.used_bytes.is_some());
+        assert!(sample.used_inodes.is_some());
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn stream_stats_omits_usage_when_a_stats_shard_is_unreadable() {
+        // Three bytes cannot decode as a stats shard, so the filesystem boots without
+        // knowing that shard's share of the usage totals.
+        let shard = crate::fs::key_codec::KeyCodec::new().stats_shard_key(3);
+        let (fs, checkpoint_manager) = make_fs_with_options(
+            None,
+            None,
+            crate::fs::name_mode::NameMode::Sensitive,
+            &[(shard, b"bad".as_slice())],
+        )
+        .await;
+        assert!(fs.quota.is_poisoned());
+        assert!(matches!(
+            fs.quota.reserve(1),
+            Err(crate::fs::errors::FsError::IoError)
+        ));
+        let (client, shutdown, _dir) = setup_fs(fs, checkpoint_manager, false).await;
+        let sample = first_stats_sample(&client).await;
+        // The fields are absent on the wire. Prost decodes an optional field to None
+        // only when the field was not sent.
+        assert_eq!(sample.used_bytes, None);
+        assert_eq!(sample.used_inodes, None);
+        // The process-lifetime I/O counters do not depend on the shards.
+        assert_eq!(sample.bytes_read, 0);
+        shutdown.cancel();
+    }
+
+    /// Two StatsSnapshot fields with the other presence. used_bytes is declared as
+    /// releases before it gained presence declared it. bytes_read is declared as an
+    /// earlier build of this change declared it, with explicit presence.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct OtherPresenceStats {
+        #[prost(uint64, optional, tag = "13")]
+        bytes_read: Option<u64>,
+        #[prost(uint64, tag = "20")]
+        used_bytes: u64,
+    }
+
+    #[test]
+    fn stats_presence_decodes_both_ways_with_peers_of_the_other_presence() {
+        use prost::Message;
+        // A peer of the other presence reading this server sees a sent value as
+        // itself. This server sends no zero bytes_read and no unknown used_bytes,
+        // so the peer sees an absent bytes_read and the 0 an old client always saw.
+        for (bytes_read, expected) in [(7, Some(7)), (0, None)] {
+            let new = proto::StatsSnapshot {
+                bytes_read,
+                used_bytes: None,
+                ..Default::default()
+            };
+            let other = OtherPresenceStats::decode(new.encode_to_vec().as_slice()).unwrap();
+            assert_eq!(
+                other,
+                OtherPresenceStats {
+                    bytes_read: expected,
+                    used_bytes: 0
+                }
+            );
+        }
+        // This client reading a peer of the other presence sees every bytes_read,
+        // including an explicit zero, as its value. An old server never sends a zero
+        // used_bytes, so only a nonzero one arrives as present.
+        for (bytes_read, used_bytes, expected) in [(Some(0), 5, (0, Some(5))), (None, 0, (0, None))]
+        {
+            let other = OtherPresenceStats {
+                bytes_read,
+                used_bytes,
+            };
+            let new = proto::StatsSnapshot::decode(other.encode_to_vec().as_slice()).unwrap();
+            assert_eq!((new.bytes_read, new.used_bytes), expected);
+        }
     }
 
     #[tokio::test]
@@ -1266,6 +1393,33 @@ mod tests {
             error.to_string().contains("reserved"),
             "unexpected error: {error}"
         );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn insensitive_reserved_name_aliases_are_refused() {
+        let (fs, checkpoints) =
+            make_fs_with_options(None, None, crate::fs::name_mode::NameMode::Insensitive, &[])
+                .await;
+        let (client, shutdown, _dir) = setup_fs(Arc::clone(&fs), checkpoints, true).await;
+        for path in ["/.ZEROFS_TRASH", "/.ZeroFS_Trash/child"] {
+            let error = client
+                .create_directory(path, 0o700, 0, 0)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("reserved"), "{error}");
+            let error = client.remove_directory(path).await.unwrap_err();
+            assert!(error.to_string().contains("reserved"), "{error}");
+        }
+        client
+            .create_directory("/.nbd/export", 0o700, 0, 0)
+            .await
+            .unwrap();
+        for path in ["/.NBD", "/.NbD/export"] {
+            let error = client.remove_directory(path).await.unwrap_err();
+            assert!(error.to_string().contains("reserved"), "{error}");
+        }
+        assert!(resolve_path(&fs, "/.nbd/export").await.is_ok());
         shutdown.cancel();
     }
 

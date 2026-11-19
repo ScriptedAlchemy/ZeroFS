@@ -1,0 +1,112 @@
+--- a/stress-metamix.c
++++ b/stress-metamix.c
+@@ -61,6 +61,17 @@
+ 		return -1;
+ 	else
+ 		return 0;
++}
++
++static int stress_metamix_open(const char *path, int flags)
++{
++	int fd;
++
++	do {
++		fd = open(path, flags, S_IRUSR | S_IWUSR);
++	} while ((fd < 0) && (errno == EINTR) && stress_continue_flag());
++
++	return fd;
+ }
+ 
+ /*
+@@ -92,7 +103,9 @@
+ 
+ 	stress_fs_temp_filename(filename, sizeof(filename), args->name,
+                 args->pid, args->instance, stress_mwc32() ^ instance);
+-	if ((fd = open(filename, O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR)) < 0) {
++	if ((fd = stress_metamix_open(filename, O_WRONLY | O_CREAT | O_EXCL)) < 0) {
++		if (errno == EINTR)
++			return EXIT_SUCCESS;
+ 		ret = stress_exit_status(errno);
+ 		pr_fail("%s: open for write %s failed, errno=%d (%s)%s\n",
+ 			args->name, filename, errno, strerror(errno), fs_type);
+@@ -186,8 +199,10 @@
+ 		goto err_unlink;
+ 	}
+ 
+-	fd = open(filename, O_RDONLY);
++	fd = stress_metamix_open(filename, O_RDONLY);
+ 	if (UNLIKELY(fd < 0)) {
++		if (errno == EINTR)
++			goto err_unlink;
+ 		pr_fail("%s: open for read %s failed, errno=%d (%s)%s\n",
+ 			args->name, filename, errno, strerror(errno), fs_type);
+ 		rc = EXIT_FAILURE;
+@@ -204,7 +219,9 @@
+ 	(void)close(fd);
+ 
+ #if defined(O_DIRECTORY)
+-	fd = open(temp_dir, O_RDONLY | O_DIRECTORY);
++	fd = stress_metamix_open(temp_dir, O_RDONLY | O_DIRECTORY);
++	if ((fd < 0) && (errno == EINTR))
++		goto err_unlink;
+ 	if (fd != -1) {
+ 		if (shim_fsync(fd) < 0) {
+ 			if (UNLIKELY((errno != EINTR) && (errno != ENOSYS) && (errno != EBADF))) {
+@@ -224,8 +241,10 @@
+ 	/* Re-order seek position in quasi-random order */
+ 	qsort((void *)file_info, n, sizeof(file_info_t), stress_metamix_cmp);
+ 
+-	fd = open(filename, O_RDONLY);
++	fd = stress_metamix_open(filename, O_RDONLY);
+ 	if (UNLIKELY(fd < 0)) {
++		if (errno == EINTR)
++			goto err_unlink;
+ 		pr_fail("%s: open for read %s failed, errno=%d (%s)%s\n",
+ 			args->name, filename, errno, strerror(errno), fs_type);
+ 		rc = EXIT_FAILURE;
+@@ -243,8 +262,12 @@
+ 			goto err_close;
+ 		}
+ 
+-		rret = read(fd, buf, data_len);
++		do {
++			rret = read(fd, buf, data_len);
++		} while ((rret < 0) && (errno == EINTR) && stress_continue_flag());
+ 		if (UNLIKELY(rret < 0)) {
++			if ((errno == EINTR) && !stress_continue_flag())
++				goto err_close;
+ 			pr_fail("%s: read failure, errno=%d (%s)%s\n",
+ 				args->name, errno, strerror(errno), fs_type);
+ 			rc = EXIT_FAILURE;
+--- a/stress-open.c
++++ b/stress-open.c
+@@ -1183,9 +1183,9 @@
+ 				/* Other error occurred, retry */
+ 			}
+ 			if (fds[i] >= 0) {
+-				if (fds[i] > (int)max_fd)
++				if ((unsigned int)fds[i] > max_fd)
+ 					max_fd = (unsigned int)fds[i];
+-				if (fds[i] < (int)min_fd)
++				if ((unsigned int)fds[i] < min_fd)
+ 					min_fd = (unsigned int)fds[i];
+ 			}
+ 			stress_fs_fdinfo_read(mypid, fds[i]);
+@@ -1197,6 +1197,8 @@
+ 		}
+ close_all:
+ 		n = i;
++		if (n == 0)
++			continue;
+ 
+ 		/*
+ 		 *  try fast close of a range, fall back to
+@@ -1209,7 +1211,7 @@
+ 		 *  close a random fd to see if close range
+ 		 *  or close break on a duplicated close
+ 		 */
+-		i = stress_mwc32modn(max_fd - min_fd + 1) + min_fd;
++		i = stress_mwc32modn((uint32_t)n);
+ 		(void)close(fds[i]);
+ 
+ 		ret = shim_close_range(min_fd, max_fd, 0);

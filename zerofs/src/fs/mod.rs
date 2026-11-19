@@ -7,6 +7,8 @@ pub mod inode;
 pub mod key_codec;
 pub mod lock_manager;
 pub mod metrics;
+pub mod name_mode;
+mod name_uppercase;
 pub mod permissions;
 pub mod stats;
 pub mod store;
@@ -26,7 +28,9 @@ use self::flush_coordinator::FlushCoordinator;
 use self::lock_manager::KeyedLockManager;
 use self::metrics::FileSystemStats;
 use self::stats::FileSystemGlobalStats;
-use self::store::{DirectoryStore, ExtentStore, InodeStore, OrphanStore, TombstoneStore};
+use self::store::{
+    DirectoryStore, ExtentStore, InodeStore, OrphanStore, TombstoneStore, XattrStore,
+};
 use self::tracing::AccessTracer;
 use self::write_coordinator::WriteCoordinator;
 use crate::db::Db;
@@ -40,6 +44,7 @@ pub use self::gc::GarbageCollector;
 pub use handle::OpenHandle;
 #[cfg(feature = "webui")]
 pub(crate) use ops::{VerifiedFileContent, VerifiedFileExpectation, VerifiedRenameOutcome};
+pub use ops::{XATTR_VALUE_MAX, XattrName, XattrSetMode, XattrValue};
 
 use self::errors::FsError;
 use self::inode::InodeId;
@@ -86,8 +91,23 @@ const NAME_MAX: usize = 255;
 /// count as a negative signed value and miscompute inode usage on the mount.
 pub(crate) const TOTAL_INODES: u64 = 1 << 48;
 
-/// Names are opaque bytes to the fs; only the [`NAME_MAX`] length is enforced.
+/// Names are opaque bytes, excluding path separators, NUL and dot components.
+/// [`NAME_MAX`] applies to the preserved name's byte length.
 pub(crate) fn validate_filename(filename: &[u8]) -> Result<(), FsError> {
+    validate_filename_length(filename)?;
+    if filename.is_empty()
+        || filename == b"."
+        || filename == b".."
+        || filename.contains(&b'/')
+        || filename.contains(&0)
+    {
+        Err(FsError::InvalidArgument)
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_filename_length(filename: &[u8]) -> Result<(), FsError> {
     if filename.len() > NAME_MAX {
         Err(FsError::NameTooLong)
     } else {
@@ -97,12 +117,14 @@ pub(crate) fn validate_filename(filename: &[u8]) -> Result<(), FsError> {
 
 #[derive(Clone)]
 pub struct ZeroFS {
+    name_mode: name_mode::NameMode,
     pub db: Arc<Db>,
     pub extent_store: ExtentStore,
     pub directory_store: DirectoryStore,
     pub inode_store: InodeStore,
     pub tombstone_store: TombstoneStore,
     pub orphan_store: OrphanStore,
+    pub xattr_store: XattrStore,
     /// In-memory, process-global open-file pins for each inode. Empty after a
     /// restart by construction; used to pick the defer-vs-delete branch in
     /// `remove`/`rename`.
@@ -114,7 +136,15 @@ pub struct ZeroFS {
     /// start the drainer just let sends buffer). `Arc<Mutex<..>>` keeps the
     /// vestigial `ZeroFS: Clone` derive working.
     reclaim_rx: Arc<Mutex<Option<UnboundedReceiver<InodeId>>>>,
+    /// Tells the reclaim drainer to close its queue and finish queued work.
+    reclaim_shutdown: tokio_util::sync::CancellationToken,
+    /// The drainer's join handle, so shutdown can wait for its final drain.
+    reclaim_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     pub lock_manager: Arc<KeyedLockManager<InodeId>>,
+    /// Serializes directory moves while their ancestry is checked and changed.
+    /// Immediate-parent inode locks alone cannot exclude a cycle formed by
+    /// two moves whose sources and destinations are in disjoint subtrees.
+    pub(crate) directory_rename_lock: Arc<tokio::sync::Mutex<()>>,
     pub stats: Arc<FileSystemStats>,
     pub global_stats: Arc<FileSystemGlobalStats>,
     pub flush_coordinator: FlushCoordinator,
@@ -164,6 +194,12 @@ pub struct ZeroFS {
     pub(crate) dedup: Arc<crate::dedup::DedupCache>,
 }
 
+impl ZeroFS {
+    pub fn name_mode(&self) -> name_mode::NameMode {
+        self.name_mode
+    }
+}
+
 #[derive(Clone)]
 pub struct CacheConfig {
     pub(crate) root_folder: PathBuf,
@@ -178,6 +214,115 @@ mod tests {
     use crate::fs::inode::FileInode;
 
     use crate::fs::inode::Inode;
+
+    #[test]
+    fn filename_validation_preserves_opaque_bytes_and_length_limit() {
+        assert_eq!(validate_filename(b"\xffname"), Ok(()));
+        assert_eq!(validate_filename(&[b'a'; NAME_MAX]), Ok(()));
+        assert_eq!(
+            validate_filename(&[b'a'; NAME_MAX + 1]),
+            Err(FsError::NameTooLong)
+        );
+        for name in [b"".as_slice(), b".", b"..", b"a/b", b"a\0b"] {
+            assert_eq!(validate_filename(name), Err(FsError::InvalidArgument));
+        }
+    }
+
+    #[tokio::test]
+    async fn namespace_mutations_reject_invalid_names() {
+        use super::test_util::{test_auth, test_creds};
+        use super::types::{FileType, SetAttributes};
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let attrs = SetAttributes::default();
+        let creds = test_creds();
+        let auth = test_auth();
+        let (file, _) = fs.create(&creds, 0, b"valid", &attrs).await.unwrap();
+        for name in [b"".as_slice(), b".", b"..", b"a/b", b"a\0b"] {
+            assert_eq!(
+                fs.create(&creds, 0, name, &attrs).await.unwrap_err(),
+                FsError::InvalidArgument
+            );
+            assert_eq!(
+                fs.mkdir(&creds, 0, name, &attrs).await.unwrap_err(),
+                FsError::InvalidArgument
+            );
+            assert_eq!(
+                fs.mknod(&creds, 0, name, FileType::Fifo, &attrs, None)
+                    .await
+                    .unwrap_err(),
+                FsError::InvalidArgument
+            );
+            assert_eq!(
+                fs.symlink(&creds, 0, name, b"target", &attrs)
+                    .await
+                    .unwrap_err(),
+                FsError::InvalidArgument
+            );
+            assert_eq!(
+                fs.link(&auth, file, 0, name).await,
+                Err(FsError::InvalidArgument)
+            );
+            assert_eq!(
+                fs.rename(&auth, 0, name, 0, b"other").await,
+                Err(if name.is_empty() || name == b"." || name == b".." {
+                    FsError::InvalidArgument
+                } else {
+                    FsError::NotFound
+                })
+            );
+            assert_eq!(
+                fs.rename(&auth, 0, b"valid", 0, name).await,
+                Err(if name == b"." || name == b".." {
+                    FsError::Exists
+                } else {
+                    FsError::InvalidArgument
+                })
+            );
+        }
+        assert_eq!(fs.lookup(&creds, 0, b"valid").await.unwrap(), file);
+    }
+
+    #[tokio::test]
+    async fn legacy_invalid_names_can_be_removed_and_renamed() {
+        use super::test_util::{test_auth, test_creds};
+        use super::types::SetAttributes;
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let creds = test_creds();
+        let auth = test_auth();
+        for name in [b"old/name".as_slice(), b"old\0name"] {
+            for rename in [false, true] {
+                let (id, _) = fs
+                    .create(&creds, 0, b"seed", &SetAttributes::default())
+                    .await
+                    .unwrap();
+                let (_, cookie) = fs
+                    .directory_store
+                    .get_entry_with_cookie(0, b"seed")
+                    .await
+                    .unwrap();
+                let mut inode = fs.inode_store.get(id).await.unwrap();
+                let Inode::File(file) = &mut inode else {
+                    unreachable!()
+                };
+                file.name = Some(name.to_vec());
+                let mut txn = fs.db.new_transaction().unwrap();
+                fs.directory_store
+                    .unlink_entry(&mut txn, 0, b"seed", cookie);
+                fs.inode_store.save(&mut txn, id, &inode).unwrap();
+                fs.directory_store
+                    .add(&mut txn, 0, name, id, cookie, Some(&inode));
+                fs.write_coordinator.commit(txn).await.unwrap();
+                if rename {
+                    fs.rename(&auth, 0, name, 0, b"rescued").await.unwrap();
+                    assert_eq!(fs.lookup(&creds, 0, b"rescued").await.unwrap(), id);
+                    fs.remove(&auth, 0, b"rescued").await.unwrap();
+                } else {
+                    fs.remove(&auth, 0, name).await.unwrap();
+                }
+                assert_eq!(fs.lookup(&creds, 0, name).await, Err(FsError::NotFound));
+            }
+        }
+    }
 
     #[tokio::test]
     async fn test_allocate_inode() {
@@ -276,3 +421,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod name_mode_tests;

@@ -1,0 +1,9 @@
+{
+  "kernel": "7.0.0-28-generic",
+  "binary_sha256": "e34814d3319450e00b5c349df60481ec5ccc4aab31917a584cfec07c7461901c",
+  "earlier_sha256": "b2b14cf1a69451337919814cc2c4311eed22b35402a4be4a8fcd5d1efb7c56ee",
+  "reuse_errno": 28,
+  "delete_and_flush_seconds": 0.00532163493335247,
+  "earlier_hash_after_sigkill": "b2b14cf1a69451337919814cc2c4311eed22b35402a4be4a8fcd5d1efb7c56ee",
+  "old_target_hash_after_sigkill": "aa27e56650d7a8c19a9a497a409d76299f0740809ff52f3e7570368a818b25be"
+}

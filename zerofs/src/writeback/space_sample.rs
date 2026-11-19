@@ -7,6 +7,7 @@
 use crate::writeback::anchored_dir::AnchoredDir;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone)]
@@ -28,8 +29,7 @@ pub(crate) struct PhysicalSpaceSampler {
     writeback_dir: PathBuf,
     source: SpaceSource,
     next_generation: AtomicU64,
-    latest_generation: AtomicU64,
-    latest_available: AtomicU64,
+    latest: Mutex<Option<PhysicalSpaceSample>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -53,8 +53,7 @@ impl PhysicalSpaceSampler {
             source: SpaceSource::Path(writeback_dir.clone()),
             writeback_dir,
             next_generation: AtomicU64::new(1),
-            latest_generation: AtomicU64::new(0),
-            latest_available: AtomicU64::new(0),
+            latest: Mutex::new(None),
         }
     }
 
@@ -63,8 +62,7 @@ impl PhysicalSpaceSampler {
             writeback_dir: writeback_dir.display().to_path_buf(),
             source: SpaceSource::Anchored(writeback_dir),
             next_generation: AtomicU64::new(1),
-            latest_generation: AtomicU64::new(0),
-            latest_available: AtomicU64::new(0),
+            latest: Mutex::new(None),
         }
     }
 
@@ -75,20 +73,15 @@ impl PhysicalSpaceSampler {
     }
 
     pub(crate) fn latest_generation(&self) -> u64 {
-        self.latest_generation.load(Ordering::Acquire)
+        self.latest_sample().map_or(0, |sample| sample.generation)
     }
 
     /// Last successful probe, if any. Never invents a generation.
     pub(crate) fn latest_sample(&self) -> Option<PhysicalSpaceSample> {
-        let generation = self.latest_generation();
-        if generation == 0 {
-            None
-        } else {
-            Some(PhysicalSpaceSample {
-                generation,
-                available_bytes: self.latest_available.load(Ordering::Acquire),
-            })
-        }
+        *self
+            .latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Probe the canonical writeback directory and publish the next generation.
@@ -112,13 +105,26 @@ impl PhysicalSpaceSampler {
             source,
         })?;
         let generation = self.next_generation.fetch_add(1, Ordering::AcqRel);
-        publish_latest(&self.latest_generation, generation);
-        self.latest_available
-            .store(available_bytes, Ordering::Release);
-        Ok(PhysicalSpaceSample {
+        let sample = PhysicalSpaceSample {
             generation,
             available_bytes,
-        })
+        };
+        self.publish_sample(sample);
+        Ok(sample)
+    }
+
+    fn publish_sample(&self, sample: PhysicalSpaceSample) {
+        // Probes may finish publication out of order on different threads.
+        // Keep the generation and its byte count together: separate atomics
+        // can pair a fresh generation with an older, larger free-space value,
+        // allowing stale-sample retries to over-admit physical reservations.
+        let mut latest = self
+            .latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if latest.is_none_or(|current| sample.generation > current.generation) {
+            *latest = Some(sample);
+        }
     }
 
     // Landed-but-not-wired: called once stale-sample rejection is wired.
@@ -139,21 +145,11 @@ impl PhysicalSpaceSampler {
     }
 }
 
-fn publish_latest(latest: &AtomicU64, generation: u64) {
-    let mut current = latest.load(Ordering::Acquire);
-    while generation > current {
-        match latest.compare_exchange_weak(current, generation, Ordering::AcqRel, Ordering::Acquire)
-        {
-            Ok(_) => return,
-            Err(actual) => current = actual,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{PhysicalSpaceSampler, SpaceSampleError};
+    use super::{PhysicalSpaceSample, PhysicalSpaceSampler, SpaceSampleError};
     use crate::writeback::anchored_dir::AnchoredDir;
+    use crate::writeback::reservation::{ReservationError, SsdAdmission, SsdReservationRequest};
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
@@ -191,6 +187,44 @@ mod tests {
         assert_eq!(*generations.first().unwrap(), 1);
         assert_eq!(*generations.last().unwrap(), 32);
         assert_eq!(sampler.latest_generation(), 32);
+    }
+
+    #[test]
+    fn late_sample_cannot_relabel_stale_free_space_as_the_latest_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let sampler = PhysicalSpaceSampler::new(temp.path());
+        // The older probe acquired generation 1, then its thread paused before
+        // publication while the next caller observed the disk filling up.
+        sampler.publish_sample(PhysicalSpaceSample {
+            generation: 2,
+            available_bytes: 50,
+        });
+        sampler.publish_sample(PhysicalSpaceSample {
+            generation: 1,
+            available_bytes: 1_000,
+        });
+        // A stale admission retries with latest_sample(). Returning generation
+        // 2 with the older free-byte count would bypass its freshness check and
+        // allow a claim that the latest observation cannot accommodate.
+        let latest = sampler.latest_sample().unwrap();
+        let admission = SsdAdmission::new(1_000, 8, 90, 70, 0).unwrap();
+        let result = admission.try_reserve(
+            SsdReservationRequest {
+                ssd_reservation_bytes: 200,
+                physical_reservation_bytes: 200,
+                operations: 1,
+            },
+            latest,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(ReservationError::TooLargePhysical { available: 50, .. })
+            ),
+            "the newest sample must not admit more than its observed free space: {latest:?}"
+        );
+        assert_eq!(latest.generation, 2);
+        assert_eq!(latest.available_bytes, 50);
     }
 
     #[tokio::test]

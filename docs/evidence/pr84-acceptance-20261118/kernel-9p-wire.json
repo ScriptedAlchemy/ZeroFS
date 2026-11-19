@@ -1,0 +1,53 @@
+{
+  "kernel": "7.0.0-28-generic",
+  "set_empty_result": {
+    "errno": 61
+  },
+  "remove_result": {
+    "errno": 61
+  },
+  "xattrcreate_requests": [
+    {
+      "phase": "startup",
+      "type": 32,
+      "fid": 3,
+      "name": "user.probe",
+      "size": 6,
+      "flags": 0,
+      "frame_hex": "23000000200000030000000a00757365722e70726f6265060000000000000000000000",
+      "semantic_body_hex": "0a00757365722e70726f6265060000000000000000000000"
+    },
+    {
+      "phase": "set-empty-replace",
+      "type": 32,
+      "fid": 3,
+      "name": "user.probe",
+      "size": 0,
+      "flags": 2,
+      "frame_hex": "23000000200000030000000a00757365722e70726f6265000000000000000002000000",
+      "semantic_body_hex": "0a00757365722e70726f6265000000000000000002000000"
+    },
+    {
+      "phase": "restore",
+      "type": 32,
+      "fid": 3,
+      "name": "user.probe",
+      "size": 6,
+      "flags": 0,
+      "frame_hex": "23000000200000030000000a00757365722e70726f6265060000000000000000000000",
+      "semantic_body_hex": "0a00757365722e70726f6265060000000000000000000000"
+    },
+    {
+      "phase": "remove",
+      "type": 32,
+      "fid": 3,
+      "name": "user.probe",
+      "size": 0,
+      "flags": 2,
+      "frame_hex": "23000000200000030000000a00757365722e70726f6265000000000000000002000000",
+      "semantic_body_hex": "0a00757365722e70726f6265000000000000000002000000"
+    }
+  ],
+  "indistinguishable": true,
+  "write_requests_in_zero_size_phases": []
+}

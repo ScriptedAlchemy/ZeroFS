@@ -2,7 +2,6 @@ name: Cross Compile
 
 on:
   pull_request:
-    branches: ["main", "develop"]
   workflow_dispatch:
 
 env:
@@ -68,10 +67,6 @@ jobs:
             arch: arm64
             os: ubuntu-latest
             platform: linux
-          - target: x86_64-apple-darwin
-            arch: x86_64
-            os: macos-15-intel
-            platform: darwin
           - target: aarch64-apple-darwin
             arch: aarch64
             os: macos-latest

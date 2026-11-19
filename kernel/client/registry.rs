@@ -808,14 +808,16 @@ pub(super) fn request_fids(request: &Request<'_>) -> ([u32; 2], usize) {
         | Request::Tclunk { fid }
         | Request::Tstatfs { fid }
         | Request::Tlock { fid, .. }
-        | Request::Tgetlock { fid, .. } => ([fid, 0], 1),
+        | Request::Tgetlock { fid, .. }
+        | Request::Txattrcreate { fid, .. } => ([fid, 0], 1),
         Request::Tmkdirattr { dfid, .. }
         | Request::Tsymlinkattr { dfid, .. }
         | Request::Tmknodattr { dfid, .. } => ([dfid, 0], 1),
         Request::Tunlinkat { dirfid, .. } => ([dirfid, 0], 1),
         Request::Twalkgetattr { fid, newfid, .. }
         | Request::Tlopenat { fid, newfid, .. }
-        | Request::Tlopenatread { fid, newfid, .. } => ([fid, newfid], 2),
+        | Request::Tlopenatread { fid, newfid, .. }
+        | Request::Txattrwalk { fid, newfid, .. } => ([fid, newfid], 2),
         Request::Tlcreateattr { dfid, newfid, .. } => ([dfid, newfid], 2),
         Request::Tlinkattr { dfid, fid, .. } => ([dfid, fid], 2),
         Request::Trenameat {

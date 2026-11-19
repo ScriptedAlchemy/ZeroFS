@@ -1,49 +1,48 @@
-import { Activity, Database, HardDrive, Loader2, Zap, Weight } from "lucide-react";
+import { Activity, Database, HardDrive, Zap, Weight } from "lucide-react";
 import { useTitle } from "../hooks/use-title";
 import { useStatsStream } from "../hooks/use-stats";
+import type { StatsSnapshot } from "../lib/grpc/gen/admin_pb";
 import { formatSize } from "../lib/format";
 import { StatCard } from "../components/dashboard/StatCard";
 import { IOChart } from "../components/dashboard/IOChart";
-import { IOPSChart } from "../components/dashboard/IOPSChart";
 import { OperationCounters } from "../components/dashboard/OperationCounters";
 import { GCStats } from "../components/dashboard/GCStats";
 import { FileAccessTracer } from "../components/dashboard/FileAccessTracer";
 
+// The server omits a counter it cannot state; show that instead of a 0.
+const reported = (value: bigint | undefined, show: (value: bigint) => string) =>
+  value === undefined ? "Unavailable" : show(value);
+
 export function DashboardPage() {
   useTitle("Monitor");
-  const { snapshot, history, error } = useStatsStream(1000);
-
-  if (error) {
-    return (
-      <div className="p-6">
-        <div className="card-surface rounded-lg p-5">
-          <p className="text-destructive text-sm font-mono">{error.message}</p>
-        </div>
-      </div>
-    );
-  }
-
-  if (!snapshot) {
-    return (
-      <div className="flex flex-col items-center justify-center h-full gap-3 text-muted">
-        <Loader2 size={20} className="animate-spin" />
-        <span className="text-sm">Connecting to stats stream...</span>
-      </div>
-    );
-  }
+  const { latest, history, receivedAt } = useStatsStream(1000);
 
   return (
     <div className="p-6 space-y-5 max-w-[1400px] overflow-hidden">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <h1 className="text-lg font-semibold">Monitor</h1>
-          <span className="flex items-center gap-1.5 text-xs text-success bg-success/10 px-2 py-0.5 rounded-full">
-            <span className="w-1.5 h-1.5 rounded-full bg-success animate-pulse" />
-            Live
+      <div className="flex items-center gap-3">
+        <h1 className="text-lg font-semibold">Monitor</h1>
+        {latest.state === "known" && receivedAt && (
+          <span className="text-xs text-muted-foreground">
+            Sample received <time dateTime={receivedAt.toISOString()}>{receivedAt.toLocaleString()}</time>
           </span>
-        </div>
+        )}
       </div>
+      {latest.state === "known" ? (
+        <StatsPanels snapshot={latest.value} history={history} />
+      ) : (
+        <div role="status" className="card-surface rounded-lg p-5 text-sm">
+          <p>{latest.reason}</p>
+          {receivedAt && <p className="text-muted-foreground">Last sample received {receivedAt.toLocaleString()}.</p>}
+        </div>
+      )}
+      <FileAccessTracer />
+    </div>
+  );
+}
 
+function StatsPanels({ snapshot, history }: { snapshot: StatsSnapshot; history: StatsSnapshot[] }) {
+  return (
+    <>
       <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-4">
         <StatCard
           title="Total Operations"
@@ -62,18 +61,18 @@ export function DashboardPage() {
         />
         <StatCard
           title="Storage Used"
-          value={formatSize(snapshot.usedBytes)}
+          value={reported(snapshot.usedBytes, formatSize)}
           icon={<Weight size={18} strokeWidth={1.5} />}
         />
         <StatCard
           title="Inodes Used"
-          value={snapshot.usedInodes.toLocaleString()}
+          value={reported(snapshot.usedInodes, (n) => n.toLocaleString())}
           icon={<Database size={18} strokeWidth={1.5} />}
         />
       </div>
 
-      <IOChart history={history} />
-      <IOPSChart history={history} />
+      <IOChart history={history} metric="throughput" />
+      <IOChart history={history} metric="iops" />
 
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
         <OperationCounters snapshot={snapshot} />
@@ -112,8 +111,6 @@ export function DashboardPage() {
           </dl>
         </div>
       </div>
-
-      <FileAccessTracer />
-    </div>
+    </>
   );
 }

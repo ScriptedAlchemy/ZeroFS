@@ -144,8 +144,11 @@ message StatsSnapshot {
     uint64 gc_chunks_deleted = 17;
     uint64 gc_runs = 18;
     uint64 total_operations = 19;
-    uint64 used_bytes = 20;
-    uint64 used_inodes = 21;
+    // used_bytes and used_inodes carry explicit presence. A server omits a
+    // value it cannot state and sends a real zero as zero, so a client can
+    // tell the two apart.
+    optional uint64 used_bytes = 20;
+    optional uint64 used_inodes = 21;
     uint64 max_bytes = 22;
     // jemalloc memory stats
     uint64 jemalloc_allocated = 23;

@@ -1,0 +1,25 @@
+    Blocking waiting for file lock on build directory
+    Finished `ci` profile [optimized] target(s) in 8.75s
+     Running unittests src/lib.rs (/var/tmp/zerofs-nas-journal.1XHScyY3/target/ci/deps/zerofs-59b7112322a285ce)
+
+running 18 tests
+test cli::memory_budget::admission_tests::admission_cannot_be_disabled_with_an_unknown_runtime_setting ... ok
+test cli::memory_budget::admission_tests::admission_receipt_rejects_planning_only_memory_configuration ... ok
+test cli::memory_budget::admission_tests::bounded_journal_keeps_an_independent_budget_and_rejects_shape_changes ... ok
+test cli::memory_budget::admission_tests::brake_at_the_admission_minimum_includes_normal_engine_residency ... ok
+test cli::memory_budget::admission_tests::equivalent_cache_floor_and_explicit_gc_defaults_match_the_package ... ok
+test cli::memory_budget::admission_tests::exact_minimum_does_not_shrink_with_the_envelope ... ok
+test cli::memory_budget::admission_tests::exact_standard_ninep_lookup_keeps_the_package_policy ... ok
+test cli::memory_budget::admission_tests::json_receipt_distinguishes_empirical_coverage_from_legacy_policy ... ok
+test cli::memory_budget::admission_tests::package_profile_uses_its_measured_policy_and_fits_eight_gib ... ok
+test cli::memory_budget::admission_tests::pool_and_direct_write_mode_are_part_of_the_measured_envelope ... ok
+test cli::memory_budget::admission_tests::real_nas_declarations_and_memory_neutral_identity_settings_are_admitted ... ok
+test cli::memory_budget::admission_tests::receipt_and_rejection_report_every_term_and_source ... ok
+test cli::memory_budget::admission_tests::reserve_overrides_enforce_upward_only_floors_and_finite_byte_values ... ok
+test cli::memory_budget::admission_tests::reserve_overrides_raise_required_bytes_and_headroom_lowers_the_brake ... ok
+test cli::memory_budget::admission_tests::shared_volatile_writes_charge_both_stages_without_recharging_matching_aliases ... ok
+test cli::memory_budget::admission_tests::startup_receipt_states_empirical_stored_state_coverage ... ok
+test cli::memory_budget::admission_tests::unmeasured_configurations_keep_legacy_reserves_and_report_first_bound ... ok
+test cli::memory_budget::admission_tests::writeback_profiles_keep_legacy_reserves_including_worker_variations ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 2704 filtered out; finished in 0.03s

@@ -76,6 +76,18 @@ impl DeferredOrphanReclaim {
 }
 
 impl ZeroFS {
+    /// Stage deletion of an inode. The caller holds its inode lock and owns
+    /// the transaction that removes its namespace and data references.
+    pub(crate) async fn delete_inode(
+        &self,
+        txn: &mut crate::db::Transaction,
+        id: InodeId,
+    ) -> Result<(), FsError> {
+        self.xattr_store.delete_all(txn, id).await?;
+        self.inode_store.delete(txn, id);
+        Ok(())
+    }
+
     pub(crate) fn deferred_orphan_reclaim(&self, inode_id: InodeId) -> DeferredOrphanReclaim {
         DeferredOrphanReclaim {
             inode_id,
@@ -83,10 +95,10 @@ impl ZeroFS {
         }
     }
 
-    /// Increment the open-handle count for `id`. MUST be invoked under
-    /// `lock_manager.acquire(id)` together with the inode-liveness `get`, so
-    /// that the increment and the "is the inode alive" check are serialized
-    /// against `remove`/`rename`'s defer-vs-delete decision on the same id.
+    /// Increment the open-handle count for `id`. Hold the inode lock alongside
+    /// the liveness read to order the increment against last unlink. A linked
+    /// directory can also be pinned under its parent's lock after validating
+    /// the entry, since directory removal and replacement take that lock too.
     // Public for library integration and DST harnesses.
     #[allow(dead_code)]
     pub fn open_handle_inc(&self, id: InodeId) {
@@ -113,9 +125,8 @@ impl ZeroFS {
     }
 
     /// Increment the open-handle count and return a guard that releases it on
-    /// drop; the caller stores it in the fid slot. Like `open_handle_inc`, must
-    /// be called under `lock_manager.acquire(id)` alongside the liveness `get`,
-    /// so the increment is ordered against `remove`/`rename`'s defer decision.
+    /// drop. The caller must order the increment against last unlink as
+    /// described by `open_handle_inc`, then store the guard in the fid slot.
     // Called by external library harnesses.
     #[allow(dead_code)]
     pub fn new_open_handle(&self, id: InodeId) -> OpenHandle {
@@ -137,14 +148,45 @@ impl ZeroFS {
             None => return, // already started
         };
         let weak = Arc::downgrade(self);
-        tokio::spawn(async move {
-            while let Some(id) = rx.recv().await {
+        let shutdown = self.reclaim_shutdown.clone();
+        let handle = tokio::spawn(async move {
+            let mut closed = false;
+            loop {
+                let id = tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled(), if !closed => {
+                        // Refuse new notifications, then finish everything queued before shutdown.
+                        rx.close();
+                        closed = true;
+                        continue;
+                    }
+                    id = rx.recv() => id,
+                };
+                let Some(id) = id else {
+                    return;
+                };
                 match weak.upgrade() {
                     Some(fs) => fs.reclaim_if_unreferenced(id).await,
-                    None => break,
+                    None => return,
                 }
             }
         });
+        *self.reclaim_task.lock().unwrap() = Some(handle);
+    }
+
+    /// Finishes queued orphan reclaims and stops the drainer.
+    ///
+    /// Join the serving tasks first, so that dropping their last open handles
+    /// queues those inodes before the queue closes. Once this returns, no
+    /// reclaim can mutate metadata after the final database close.
+    pub(crate) async fn shutdown_reclaim_drainer(&self) {
+        self.reclaim_shutdown.cancel();
+        let handle = self.reclaim_task.lock().unwrap().take();
+        if let Some(handle) = handle {
+            // A join error means the drainer already exited, which also rules
+            // out a race with the database close.
+            let _ = handle.await;
+        }
     }
 
     /// Synchronous decrement-then-reclaim. Production drives this through the
@@ -167,7 +209,7 @@ impl ZeroFS {
         #[cfg(feature = "failpoints")]
         fail_point!(fp::RECLAIM_BEFORE_LOCK);
 
-        let _fence = match self
+        let fence = match self
             .fence_metadata(ConflictScope::single(ConflictKey::Inode(id)))
             .await
         {
@@ -177,7 +219,7 @@ impl ZeroFS {
                 return;
             }
         };
-        let _guard = self.lock_manager.acquire(id).await;
+        let guard = self.lock_manager.acquire(id).await;
 
         if self.open_handle_count(id) > 0 {
             return;
@@ -189,15 +231,20 @@ impl ZeroFS {
         #[cfg(feature = "failpoints")]
         fail_point!(fp::RECLAIM_HOLDING_LOCK_BEFORE_DELETE);
 
-        if let Err(e) = self.reclaim_orphan_inode(id).await {
+        if let Err(e) = self.reclaim_orphan_inode(id, (fence, guard)).await {
             error!("Deferred reclaim of orphan inode {} failed: {:?}", id, e);
         }
     }
 
     /// Reclaim a single deferred-orphan inode `id`: delete its inode record,
     /// its extents (small files) or add a tombstone (large files), subtract its
-    /// stats, and remove its orphan-set entry.
-    async fn reclaim_orphan_inode(&self, id: InodeId) -> Result<(), FsError> {
+    /// stats, and remove its orphan-set entry. `held` is the inode's fence and
+    /// lock, released only after the reclaim's commit applies.
+    async fn reclaim_orphan_inode(
+        &self,
+        id: InodeId,
+        held: impl Send + 'static,
+    ) -> Result<(), FsError> {
         match self.inode_store.get(id).await {
             Ok(Inode::File(file)) if file.nlink == 0 => {
                 let mut txn = self.db.new_transaction()?;
@@ -212,7 +259,7 @@ impl ZeroFS {
                         .tombstones_created
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                self.inode_store.delete(&mut txn, id);
+                self.delete_inode(&mut txn, id).await?;
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::CLUNK_AFTER_RECLAIM_INODE_DELETE);
@@ -226,6 +273,7 @@ impl ZeroFS {
                             quota: std::sync::Arc::clone(&self.quota),
                             bytes: file.size,
                         }),
+                        held,
                     )
                     .await?;
                 self.stats.files_deleted.fetch_add(1, Ordering::Relaxed);
@@ -234,14 +282,14 @@ impl ZeroFS {
             Ok(Inode::Symlink(s)) if s.nlink == 0 => {
                 // Dataless orphan
                 let mut txn = self.db.new_transaction()?;
-                self.inode_store.delete(&mut txn, id);
+                self.delete_inode(&mut txn, id).await?;
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::CLUNK_AFTER_RECLAIM_INODE_DELETE);
 
                 txn.add_inode_count_delta(id, -1);
                 self.orphan_store.remove(&mut txn, id);
-                self.write_coordinator.commit(txn).await?;
+                self.write_coordinator.commit_holding(txn, held).await?;
                 self.stats.links_deleted.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
@@ -256,7 +304,7 @@ impl ZeroFS {
                     return Ok(());
                 }
                 let mut txn = self.db.new_transaction()?;
-                self.inode_store.delete(&mut txn, id);
+                self.delete_inode(&mut txn, id).await?;
                 self.directory_store.delete_directory(&mut txn, id);
 
                 #[cfg(feature = "failpoints")]
@@ -264,7 +312,7 @@ impl ZeroFS {
 
                 txn.add_inode_count_delta(id, -1);
                 self.orphan_store.remove(&mut txn, id);
-                self.write_coordinator.commit(txn).await?;
+                self.write_coordinator.commit_holding(txn, held).await?;
                 self.stats
                     .directories_deleted
                     .fetch_add(1, Ordering::Relaxed);
@@ -278,14 +326,14 @@ impl ZeroFS {
             {
                 // Dataless orphan
                 let mut txn = self.db.new_transaction()?;
-                self.inode_store.delete(&mut txn, id);
+                self.delete_inode(&mut txn, id).await?;
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::CLUNK_AFTER_RECLAIM_INODE_DELETE);
 
                 txn.add_inode_count_delta(id, -1);
                 self.orphan_store.remove(&mut txn, id);
-                self.write_coordinator.commit(txn).await?;
+                self.write_coordinator.commit_holding(txn, held).await?;
                 Ok(())
             }
             Ok(_) | Err(FsError::NotFound) => {
@@ -296,7 +344,7 @@ impl ZeroFS {
                 if self.orphan_store.contains(id).await? {
                     let mut txn = self.db.new_transaction()?;
                     self.orphan_store.remove(&mut txn, id);
-                    self.write_coordinator.commit(txn).await?;
+                    self.write_coordinator.commit_holding(txn, held).await?;
                 }
                 Ok(())
             }
@@ -380,6 +428,63 @@ mod tests {
         })
         .await
         .expect("orphan reclaim did not finish");
+    }
+
+    // Shutdown must finish the reclaims already queued and then refuse new
+    // ones, so no reclaim can mutate metadata after the final database close.
+    #[tokio::test]
+    async fn reclaim_drainer_shutdown_waits_for_queued_work_and_closes_queue() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        fs.start_reclaim_drainer();
+        let file_id = make_file(&fs, b"shutdown-orphan", b"data").await;
+
+        let open = {
+            let _guard = fs.lock_manager.acquire(file_id).await;
+            fs.new_open_handle(file_id)
+        };
+        fs.remove(&(&test_auth()).into(), 0, b"shutdown-orphan")
+            .await
+            .unwrap();
+
+        // Hold the inode lock so the queued reclaim cannot finish until the
+        // test releases it.
+        let inode_guard = fs.lock_manager.acquire(file_id).await;
+        drop(open);
+        let shutdown_fs = Arc::clone(&fs);
+        let shutdown = tokio::spawn(async move {
+            shutdown_fs.shutdown_reclaim_drainer().await;
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !fs.reclaim_shutdown.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reclaim drainer was not asked to stop");
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown returned before the queued reclaim finished"
+        );
+
+        drop(inode_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(3), shutdown)
+            .await
+            .expect("reclaim drainer shutdown timed out")
+            .unwrap();
+
+        assert!(matches!(
+            fs.inode_store.get(file_id).await,
+            Err(FsError::NotFound)
+        ));
+        assert!(orphan_ids(&fs).await.is_empty());
+        assert!(
+            fs.reclaim_tx.send(file_id).is_err(),
+            "shutdown must refuse reclaim work that could race the database close"
+        );
     }
 
     /// The deterministic repro: open a fid, unlink the name, the open fid must

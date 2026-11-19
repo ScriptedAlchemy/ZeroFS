@@ -49,9 +49,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::Semaphore;
 use tracing::error;
-pub(crate) use write::MAX_INFLIGHT_SEALS;
-pub(crate) use write::SEAL_THRESHOLD;
-use write::{OPEN_SEGMENT_LANES, OpenLane, OpenSegment, SealingGeneration, TAIL_CACHE_BYTES};
+pub(crate) use write::OPEN_SEGMENT_LANES;
+pub(crate) use write::{DEFAULT_DIRECT_SEGMENT_BYTES, MAX_INFLIGHT_SEALS, SEAL_THRESHOLD};
+use write::{OpenLane, OpenSegment, SealingGeneration, TAIL_CACHE_BYTES};
 
 pub(super) const PARALLEL_EXTENT_OPS: usize = 20;
 
@@ -106,6 +106,17 @@ impl DecodedExtentKey {
             byte_len: loc.byte_len,
         }
     }
+}
+
+fn build_decoded_extent_cache(capacity: usize) -> Cache<DecodedExtentKey, Bytes> {
+    // Foyer admits an entry even when it exceeds its individual shard's
+    // budget. Keep the usual eight shards for ordinary cache sizes, but do
+    // not split a small budget into pieces smaller than one complete extent.
+    let shards = (capacity / EXTENT_SIZE).clamp(1, 8);
+    CacheBuilder::new(capacity)
+        .with_shards(shards)
+        .with_weighter(|_: &DecodedExtentKey, data: &Bytes| data.len())
+        .build()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,6 +177,9 @@ pub struct ExtentStore {
     seal_upload_sem: Arc<Semaphore>,
     /// Bounds finalized segment buffers resident in `sealing`, including failures.
     seal_residency_sem: Arc<Semaphore>,
+    /// Why generations in `sealing` are still unpublished, so a writer that
+    /// needs residency answers at once instead of waiting on full storage.
+    seal_failures: Arc<write::SealFailures>,
     /// Deadline after which each currently-dead segment may be deleted:
     /// recorded the first pass it's seen dead, from the latest expiry of the
     /// checkpoints active then, so reclamation outlasts anything that could
@@ -249,8 +263,29 @@ impl ExtentStore {
     }
 
     fn decoded_insert(&self, id: InodeId, extent: u64, loc: crate::segment::FrameLoc, data: Bytes) {
+        if data.len() > self.decoded_extent_cache.capacity() {
+            return;
+        }
         self.decoded_extent_cache
             .insert(DecodedExtentKey::new(id, extent, loc), data);
+    }
+
+    /// Write staging uses shallow slices of a possibly much larger request.
+    /// A byte-weighted cache must own only the bytes it charges: retaining one
+    /// slice after its peers are evicted must not pin the entire request.
+    fn decoded_insert_written(
+        &self,
+        id: InodeId,
+        extent: u64,
+        loc: crate::segment::FrameLoc,
+        data: &Bytes,
+    ) {
+        // Skip the copy when the configured whole-cache budget cannot fit an
+        // extent. Foyer can otherwise retain an oversized insertion itself.
+        if data.len() > self.decoded_extent_cache.capacity() {
+            return;
+        }
+        self.decoded_insert(id, extent, loc, Bytes::copy_from_slice(data));
     }
 
     pub(crate) fn new(
@@ -271,9 +306,7 @@ impl ExtentStore {
             .build();
         let (decoded_extent_cache_bytes, extent_location_cache_bytes) =
             split_extent_read_budget(decoded_extent_cache_bytes);
-        let decoded_extent_cache = CacheBuilder::new(decoded_extent_cache_bytes)
-            .with_weighter(|_: &DecodedExtentKey, data: &Bytes| data.len())
-            .build();
+        let decoded_extent_cache = build_decoded_extent_cache(decoded_extent_cache_bytes);
         let extent_location_cache = ExtentLocationCache::new(
             db.clone(),
             extent_location_cache_bytes,
@@ -311,6 +344,7 @@ impl ExtentStore {
             sealing: Arc::new(Mutex::new(BTreeMap::new())),
             seal_upload_sem: Arc::new(Semaphore::new(max_inflight_seals)),
             seal_residency_sem: Arc::new(Semaphore::new(max_inflight_seals)),
+            seal_failures: Arc::new(write::SealFailures::default()),
             delete_at: Arc::new(Mutex::new(HashMap::new())),
             nominations: Arc::new(Mutex::new(NominationSet::default())),
             nominations_enabled: Arc::new(AtomicBool::new(false)),
@@ -469,10 +503,22 @@ impl ExtentStore {
     /// Commit a txn that may carry seg-count deltas. In production this hands off to
     /// the commit worker (the sole segcount writer); with no coordinator (unit tests)
     /// we are the only writer, so materialize the deltas and commit directly.
-    async fn commit_via_coordinator(&self, mut txn: Transaction) -> Result<(), FsError> {
+    async fn commit_via_coordinator(&self, txn: Transaction) -> Result<(), FsError> {
+        self.commit_holding_via_coordinator(txn, ()).await
+    }
+
+    /// [`Self::commit_via_coordinator`] that releases `held` (the caller's
+    /// inode lock) only after the commit applies. See
+    /// [`crate::fs::write_coordinator::HeldUntilApplied`].
+    async fn commit_holding_via_coordinator(
+        &self,
+        mut txn: Transaction,
+        held: impl Send + 'static,
+    ) -> Result<(), FsError> {
         if let Some(coord) = self.coordinator.get() {
-            return coord.commit(txn).await;
+            return coord.commit_holding(txn, held).await;
         }
+        let _held = held;
         // Unit-test fallback: retain the same publication lifetime the real
         // coordinator carries across its merged database write.
         let extent_ref_guard = txn.take_extent_ref_guard();
@@ -484,6 +530,13 @@ impl ExtentStore {
         let mut batch = txn.into_inner();
         let (_, footprint_delta) =
             crate::fs::write_coordinator::stage_seg_deltas(&self.db, deltas, &mut batch).await?;
+        // A pinned underflow against an absent counter stages no row, and
+        // SlateDB rejects an empty batch. The commit worker skips the write
+        // in the same case.
+        if batch.is_empty() {
+            drop(extent_ref_guard);
+            return Ok(());
+        }
         let extent_location_cache_guard =
             self.invalidate_extent_location_cache(extent_location_cache_updates.keys().copied());
         self.db

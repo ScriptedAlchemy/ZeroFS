@@ -639,15 +639,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bytestream"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04f720842a717d6afaf69fee2dc69b771edc165f12cc3eb1b0e8eeef53a86454"
-dependencies = [
- "byteorder",
-]
-
-[[package]]
 name = "camino"
 version = "1.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1963,8 +1954,6 @@ dependencies = [
 [[package]]
 name = "foyer-storage"
 version = "0.22.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1983f1db3d0710e9c9d5fc116d9202dccd41a2d1e032572224f1aff5520aa958"
 dependencies = [
  "allocator-api2",
  "anyhow",
@@ -6583,9 +6572,9 @@ dependencies = [
 
 [[package]]
 name = "unicase"
-version = "2.9.0"
+version = "2.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
+checksum = "357cc3acc6a036009fd6c973ed009037c732d60d0b4f6c673e9041497482a28f"
 
 [[package]]
 name = "unicode-ident"
@@ -7602,6 +7591,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "icu_normalizer",
  "indicatif",
  "libc",
  "lz4_flex",
@@ -7636,6 +7626,7 @@ dependencies = [
  "slatedb",
  "slatedb-common",
  "socket2",
+ "subtle",
  "tempfile",
  "thiserror 2.0.19",
  "tikv-jemalloc-ctl",
@@ -7654,8 +7645,10 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "unicase",
  "url",
  "uuid",
+ "walkdir",
  "zerofs-client",
  "zerofs_nfsserve",
  "zstd",
@@ -7727,21 +7720,19 @@ dependencies = [
 [[package]]
 name = "zerofs_nfsserve"
 version = "0.20.0"
-source = "git+https://github.com/ScriptedAlchemy/nfsserve.git?rev=0c19924faa3b09041d198d167785a7de80ea48b5#0c19924faa3b09041d198d167785a7de80ea48b5"
+source = "git+https://github.com/ScriptedAlchemy/nfsserve.git?rev=0f7d4f6666979d9ba683ae3288b2c8ee19cc3634#0f7d4f6666979d9ba683ae3288b2c8ee19cc3634"
 dependencies = [
  "anyhow",
  "async-trait",
  "byteorder",
- "bytestream",
  "filetime",
  "futures",
  "num-derive",
  "num-traits",
- "smallvec",
+ "rustix",
  "tokio",
  "tokio-util",
  "tracing",
- "tracing-attributes",
 ]
 
 [[package]]

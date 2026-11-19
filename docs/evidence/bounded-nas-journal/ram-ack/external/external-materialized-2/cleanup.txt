@@ -1,0 +1,5 @@
+zerofs-external-qNoiNVKw-client
+container absent zerofs-external-qNoiNVKw-client
+zerofs-external-qNoiNVKw-service
+container absent zerofs-external-qNoiNVKw-service
+scratch absent /var/tmp/zerofs-external.qNoiNVKw

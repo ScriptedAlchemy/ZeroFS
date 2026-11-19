@@ -425,7 +425,7 @@ impl ExtentStore {
             // Drains queued writes too: the CAS below reads the stored
             // FrameLoc from the database, which a submitted-but-unapplied
             // overwrite has not reached yet.
-            let _guard = self.lock_inode_settled(inode).await;
+            let guard = self.lock_inode_settled(inode).await;
             let mut txn = self.db.new_transaction()?;
             txn.hold_extent_ref_guard(Arc::clone(&extent_ref_guard));
             let mut any = false;
@@ -462,7 +462,7 @@ impl ExtentStore {
                 }
             }
             if any {
-                self.commit_via_coordinator(txn).await?;
+                self.commit_holding_via_coordinator(txn, guard).await?;
             }
         }
 

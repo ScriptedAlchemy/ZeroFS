@@ -15,8 +15,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::ops::Range;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::task::{Context, Poll};
 
 use crate::alloc_rss;
 
@@ -31,6 +33,90 @@ pub struct SkipPartsCache;
 /// shared in-flight registry still apply.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CacheRangeOnly;
+
+/// Marker in `GetOptions::extensions` for a bounded GET whose earlier cached
+/// bytes failed frame authentication or decoding. The store drops the cached
+/// parts covering the range, fences fetches already in flight for the object,
+/// and reads the part-aligned range from the backend without caching it. The
+/// response carries an [`AuthenticatedRefetch`] that the caller admits after
+/// the requested range authenticates. Admission caches only the parts that lie
+/// wholly inside the requested range. A part that also holds bytes outside it
+/// stays uncached, because the caller's check did not cover those bytes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RefetchCorruptRange;
+
+/// Response extension of a [`RefetchCorruptRange`] GET. [`Self::admit`] caches
+/// each refetched part whose every byte lies inside the requested range;
+/// dropping it caches nothing. Admission is skipped if the object was
+/// invalidated after the refetch began.
+#[derive(Clone)]
+pub(crate) struct AuthenticatedRefetch(Arc<RefetchAdmission>);
+
+struct RefetchAdmission {
+    parts: HybridCache<PartKey, Bytes>,
+    part_counts: Cache<Path, usize>,
+    admission_cap_bytes: u64,
+    part_size_bytes: usize,
+    location: Path,
+    generation: CacheGeneration,
+    read: ReadLease,
+    start_part: PartId,
+    /// Part-aligned bytes, starting at `start_part`.
+    bytes: Bytes,
+    /// The requested range, the only bytes the caller authenticated.
+    verified: Range<u64>,
+    object_size: u64,
+}
+
+impl AuthenticatedRefetch {
+    pub(crate) fn admit(&self) {
+        let admission = &*self.0;
+        let ctx = AdmissionCtx {
+            parts: &admission.parts,
+            part_counts: &admission.part_counts,
+            admission_cap_bytes: admission.admission_cap_bytes,
+            part_size_bytes: admission.part_size_bytes,
+        };
+        let part_size = admission.part_size_bytes as u64;
+        admission.read.publish(|| {
+            for (i, part) in admission
+                .bytes
+                .chunks(admission.part_size_bytes)
+                .enumerate()
+            {
+                let start = (admission.start_part + i) as u64 * part_size;
+                let end = start + part.len() as u64;
+                let whole = part.len() == admission.part_size_bytes || end == admission.object_size;
+                if !whole || start < admission.verified.start || end > admission.verified.end {
+                    continue;
+                }
+                // Copy the part, so a cached part never pins the whole response.
+                ctx.admit_part(
+                    &admission.location,
+                    &admission.generation,
+                    admission.start_part + i,
+                    Bytes::copy_from_slice(part),
+                );
+            }
+        });
+    }
+}
+
+impl Debug for AuthenticatedRefetch {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthenticatedRefetch")
+            .field("location", &self.0.location)
+            .field("start_part", &self.0.start_part)
+            .field("len", &self.0.bytes.len())
+            .finish()
+    }
+}
+
+// Keep the current Foyer cache policy isolated from legacy binaries, including
+// after a rollback and subsequent upgrade; those binaries ignore our marker.
+pub(crate) const LEGACY_PARTS_CACHE_DIR: &str = "parts_cache";
+pub(crate) const PARTS_CACHE_DIR: &str = "parts_cache_v1";
+pub(crate) const PARTS_CACHE_LAYOUT_FILE: &str = ".zerofs-parts-cache-layout";
 
 const DEFAULT_PART_SIZE_BYTES: usize = 128 * 1024;
 const HEADS_CAPACITY_ENTRIES: usize = 16 * 1024;
@@ -504,7 +590,7 @@ impl ReadLease {
 }
 
 struct PrefetchingMultipartUpload {
-    inner: Box<dyn MultipartUpload>,
+    inner: Arc<tokio::sync::Mutex<Box<dyn MultipartUpload>>>,
     location: Path,
     heads: Cache<Path, Arc<CachedHead>>,
     generations: Cache<Path, CacheGeneration>,
@@ -521,45 +607,84 @@ impl Debug for PrefetchingMultipartUpload {
     }
 }
 
-struct InvalidateOnDrop<'a> {
-    location: &'a Path,
-    heads: &'a Cache<Path, Arc<CachedHead>>,
-    generations: &'a Cache<Path, CacheGeneration>,
+struct InvalidateOnDrop {
+    location: Path,
+    heads: Cache<Path, Arc<CachedHead>>,
+    generations: Cache<Path, CacheGeneration>,
     state: Arc<ObjectState>,
-    access_tracker: &'a Cache<Path, Arc<Mutex<AccessHistory>>>,
+    access_tracker: Cache<Path, Arc<Mutex<AccessHistory>>>,
 }
 
-impl Drop for InvalidateOnDrop<'_> {
+impl Drop for InvalidateOnDrop {
     fn drop(&mut self) {
         let mut revision = self.state.revision.lock().unwrap();
         *revision = uuid::Uuid::new_v4();
-        self.heads.remove(self.location);
-        self.generations.remove(self.location);
-        self.access_tracker.remove(self.location);
+        self.heads.remove(&self.location);
+        self.generations.remove(&self.location);
+        self.access_tracker.remove(&self.location);
+    }
+}
+
+/// Native backends may finish after their caller is cancelled. Keep the
+/// backend future and its final invalidation together until it settles, so a
+/// read during that interval cannot leave the previous bytes cached forever.
+/// A separate caller guard also invalidates immediately on cancellation.
+async fn settle_mutation<T: Send + 'static>(
+    invalidate: impl Send + 'static,
+    operation: impl std::future::Future<Output = object_store::Result<T>> + Send + 'static,
+) -> object_store::Result<T> {
+    tokio::spawn(async move {
+        let _invalidate = invalidate;
+        operation.await
+    })
+    .await
+    .map_err(|source| object_store::Error::Generic {
+        store: "PrefetchingObjectStore",
+        source: Box::new(source),
+    })?
+}
+
+impl PrefetchingMultipartUpload {
+    fn invalidation_guard(&self) -> InvalidateOnDrop {
+        InvalidateOnDrop {
+            location: self.location.clone(),
+            heads: self.heads.clone(),
+            generations: self.generations.clone(),
+            state: ReadLease::acquire(&self.states, &self.generations, &self.location).state,
+            access_tracker: self.access_tracker.clone(),
+        }
     }
 }
 
 #[async_trait]
 impl MultipartUpload for PrefetchingMultipartUpload {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
-        self.inner.put_part(data)
+        match self.inner.try_lock() {
+            // put_part returns an owned future. Release the upload mutex
+            // immediately so parts keep their existing parallelism.
+            Ok(mut inner) => inner.put_part(data),
+            Err(_) => futures::future::ready(Err(object_store::Error::Generic {
+                store: "PrefetchingObjectStore",
+                source: "multipart completion or abort is still settling".into(),
+            }))
+            .boxed(),
+        }
     }
 
     async fn complete(&mut self) -> object_store::Result<PutResult> {
         // Readers can refill the old head while this upload is in progress.
         // Invalidate on every completion outcome, including cancellation.
-        let _invalidate = InvalidateOnDrop {
-            location: &self.location,
-            heads: &self.heads,
-            generations: &self.generations,
-            state: ReadLease::acquire(&self.states, &self.generations, &self.location).state,
-            access_tracker: &self.access_tracker,
-        };
-        self.inner.complete().await
+        let _invalidate = self.invalidation_guard();
+        let settled = self.invalidation_guard();
+        // Transfer ownership before the spawn can yield. Otherwise cancelling
+        // this first poll could let put_part change the upload before the
+        // completion task has been scheduled and acquired its lock.
+        let mut inner = Arc::clone(&self.inner).lock_owned().await;
+        settle_mutation(settled, async move { inner.complete().await }).await
     }
 
     async fn abort(&mut self) -> object_store::Result<()> {
-        self.inner.abort().await
+        self.inner.lock().await.abort().await
     }
 }
 
@@ -748,11 +873,83 @@ struct DeleteStreamCleanup {
     eviction: EvictionCtx,
 }
 
+impl DeleteStreamCleanup {
+    fn invalidate_pending(&self) {
+        let pending: Vec<_> = self.pending.lock().unwrap().keys().cloned().collect();
+        for path in pending {
+            self.eviction.evict_location(&path);
+        }
+    }
+}
+
 impl Drop for DeleteStreamCleanup {
     fn drop(&mut self) {
         let pending = std::mem::take(&mut *self.pending.lock().unwrap());
         for (path, _) in pending {
             self.eviction.evict_location(&path);
+        }
+    }
+}
+
+/// Cancellation stops pulling new input paths, while a detached owner drains
+/// the backend's already-admitted batch and performs its final invalidations.
+/// This preserves backend batching and covers native deletes that finish only
+/// after the consumer drops its result stream.
+type DeleteInput = Arc<Mutex<Option<BoxStream<'static, object_store::Result<Path>>>>>;
+
+struct SettlingDeleteStream {
+    inner: Option<BoxStream<'static, object_store::Result<Path>>>,
+    input: DeleteInput,
+    pending: Arc<Mutex<HashMap<Path, usize>>>,
+    eviction: EvictionCtx,
+    runtime: Option<tokio::runtime::Handle>,
+}
+
+impl futures::Stream for SettlingDeleteStream {
+    type Item = object_store::Result<Path>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.runtime.is_none() {
+            this.runtime = tokio::runtime::Handle::try_current().ok();
+        }
+        let Some(inner) = this.inner.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let result = inner.poll_next_unpin(cx);
+        if matches!(result, Poll::Ready(None)) {
+            // Settle ambiguous error results even if the consumer retains the
+            // exhausted stream, and release its original source promptly.
+            this.inner.take();
+            let input = this.input.lock().unwrap().take();
+            drop(input);
+        }
+        result
+    }
+}
+
+impl Drop for SettlingDeleteStream {
+    fn drop(&mut self) {
+        // Drop the original source immediately. The retained backend sees
+        // EOF on its next input poll and cannot dispatch another path.
+        let input = self.input.lock().unwrap().take();
+        drop(input);
+        let pending: Vec<_> = self.pending.lock().unwrap().keys().cloned().collect();
+        if pending.is_empty() {
+            return;
+        }
+        // An operation may already have applied without an acknowledgement.
+        // Evict now as well as when the retained backend future settles.
+        for path in pending {
+            self.eviction.evict_location(&path);
+        }
+        if let Some(runtime) = self
+            .runtime
+            .take()
+            .or_else(|| tokio::runtime::Handle::try_current().ok())
+            && let Some(mut inner) = self.inner.take()
+        {
+            runtime.spawn(async move { while inner.next().await.is_some() {} });
         }
     }
 }
@@ -999,14 +1196,182 @@ impl PrefetchingObjectStore {
 
     /// Keep invalidation ownership across an awaited backend mutation. A
     /// cancelled request may have committed remotely before its future drops.
-    fn invalidation_guard<'a>(&'a self, location: &'a Path) -> InvalidateOnDrop<'a> {
+    fn invalidation_guard(&self, location: &Path) -> InvalidateOnDrop {
         InvalidateOnDrop {
-            location,
-            heads: &self.heads,
-            generations: &self.generations,
+            location: location.clone(),
+            heads: self.heads.clone(),
+            generations: self.generations.clone(),
             state: self.read_lease(location).state,
-            access_tracker: &self.access_tracker,
+            access_tracker: self.access_tracker.clone(),
         }
+    }
+
+    /// Serve a [`RefetchCorruptRange`] GET. Cached bytes for the range failed
+    /// authentication, so they are dropped before the backend read. Rotating
+    /// the object revision makes every fetch already in flight refuse to
+    /// publish, because such a fetch may carry the same corrupt response.
+    /// Removing the registry slots keeps later reads from joining one. The
+    /// backend bytes are returned uncached. Once the requested range
+    /// authenticates, the caller admits the parts that lie wholly inside it
+    /// through [`AuthenticatedRefetch`].
+    async fn refetch_corrupt_range(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        let Some(GetRange::Bounded(requested)) = options.range.clone() else {
+            return Err(object_store::Error::Generic {
+                store: "PrefetchingObjectStore",
+                source: "an integrity refetch needs a bounded range".into(),
+            });
+        };
+        if requested.start >= requested.end {
+            return Err(object_store::Error::Generic {
+                store: "PrefetchingObjectStore",
+                source: format!("inconsistent range {}..{}", requested.start, requested.end).into(),
+            });
+        }
+        let aligned = self.align_range(&requested, self.part_size_bytes);
+        let part_size = self.part_size_bytes as u64;
+        let start_part: PartId = (aligned.start / part_size)
+            .try_into()
+            .expect("part id exceeds usize");
+        let end_part: PartId = (aligned.end / part_size)
+            .try_into()
+            .expect("part id exceeds usize");
+
+        // Eviction takes the lease before the backend read, so an overwrite
+        // or delete that lands during the read fences admission.
+        let (read, expected) = self.evict_corrupt_parts(location, start_part..end_part);
+
+        let result = self
+            .inner
+            .get_opts(
+                location,
+                GetOptions {
+                    range: Some(GetRange::Bounded(aligned.clone())),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let meta = result.meta.clone();
+        let attributes = result.attributes.clone();
+        let fetched = result.range.clone();
+        let generation = read.generation(&meta);
+        if let Some(expected) = expected
+            && !same_object_identity(&expected, &meta)
+        {
+            return Err(object_store::Error::Generic {
+                store: "PrefetchingObjectStore",
+                source: format!("object {location} changed identity during an integrity refetch")
+                    .into(),
+            });
+        }
+        let bytes = result.bytes().await?;
+        // Check only the length, as on every ranged read. The caller owns the
+        // frame keys and checks authenticity.
+        let fetched_len = fetched.end.saturating_sub(fetched.start);
+        if fetched.start != aligned.start || bytes.len() as u64 != fetched_len {
+            return Err(object_store::Error::Generic {
+                store: "PrefetchingObjectStore",
+                source: format!(
+                    "integrity refetch of {location} returned {} bytes for {fetched:?}, \
+                     requested {aligned:?}",
+                    bytes.len()
+                )
+                .into(),
+            });
+        }
+        let start = (requested.start - aligned.start) as usize;
+        if start >= bytes.len() {
+            return Err(object_store::Error::Generic {
+                store: "PrefetchingObjectStore",
+                source: format!("range start {} >= size {}", requested.start, meta.size).into(),
+            });
+        }
+        let end = ((requested.end.min(fetched.end)) - aligned.start) as usize;
+        let payload = bytes.slice(start..end);
+        let verified = requested.start..requested.start + (end - start) as u64;
+        let mut extensions = object_store::Extensions::default();
+        extensions.insert(AuthenticatedRefetch(Arc::new(RefetchAdmission {
+            parts: self.parts.clone(),
+            part_counts: self.part_counts.clone(),
+            admission_cap_bytes: self.admission_cap_bytes,
+            part_size_bytes: self.part_size_bytes,
+            location: location.clone(),
+            generation,
+            read,
+            start_part,
+            bytes,
+            verified: verified.clone(),
+            object_size: meta.size,
+        })));
+        Ok(GetResult {
+            payload: GetResultPayload::Stream(stream::once(async move { Ok(payload) }).boxed()),
+            meta,
+            range: verified,
+            attributes,
+            extensions,
+        })
+    }
+
+    /// Drop the cached parts in `part_ids` for the object's current
+    /// generation and fence fetches already in flight. Returns a lease on the
+    /// new revision and the metadata the cached parts belonged to, when it is
+    /// still known.
+    fn evict_corrupt_parts(
+        &self,
+        location: &Path,
+        part_ids: Range<PartId>,
+    ) -> (ReadLease, Option<ObjectMeta>) {
+        let state = self.read_lease(location).state;
+        let mut revision = state.revision.lock().unwrap();
+        let head = self.read_head(location).map(|(meta, _)| meta);
+        let generation = head
+            .as_ref()
+            .map(|meta| CacheGeneration::from_meta(meta, *revision))
+            .or_else(|| {
+                self.generations
+                    .get(location)
+                    .map(|entry| entry.value().clone())
+            });
+        if let Some(generation) = &generation {
+            let mut fetches = self.fetches.lock().unwrap();
+            for part_id in part_ids {
+                let key = PartKey::new(location, self.part_size_bytes, generation, part_id);
+                // `remove` drops the memory entry and the disk-tier index entry.
+                self.parts.remove(&key);
+                fetches.remove(&key);
+            }
+        }
+        let next = uuid::Uuid::new_v4();
+        *revision = next;
+        // An unversioned generation embeds the revision. Move the remembered
+        // generation along with it so a later lease cannot reopen the old
+        // instance and its unverified parts. Versioned keys do not change.
+        if let Some(CacheGeneration::Unversioned {
+            size,
+            modified_nanos,
+            ..
+        }) = generation
+        {
+            self.generations.insert(
+                location.clone(),
+                CacheGeneration::Unversioned {
+                    cache_instance: next,
+                    size,
+                    modified_nanos,
+                },
+            );
+        }
+        drop(revision);
+        (
+            ReadLease {
+                state,
+                revision: next,
+            },
+            head,
+        )
     }
 
     /// Backend GET that does not `save_get_result`, `read_part`, or
@@ -1906,6 +2271,16 @@ impl PrefetchingObjectStore {
     }
 }
 
+/// Whether `fetched` is the same object incarnation as `cached`. Unversioned
+/// stores only expose size and modification time.
+fn same_object_identity(cached: &ObjectMeta, fetched: &ObjectMeta) -> bool {
+    if cached.e_tag.is_some() || cached.version.is_some() {
+        cached.e_tag == fetched.e_tag && cached.version == fetched.version
+    } else {
+        cached.size == fetched.size && cached.last_modified == fetched.last_modified
+    }
+}
+
 impl Debug for PrefetchingObjectStore {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("PrefetchingObjectStore")
@@ -1928,6 +2303,9 @@ impl ObjectStore for PrefetchingObjectStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
+        if options.extensions.get::<RefetchCorruptRange>().is_some() {
+            return self.refetch_corrupt_range(location, options).await;
+        }
         if options.extensions.get::<SkipPartsCache>().is_some() {
             return self.get_opts_uncached(location, options).await;
         }
@@ -1944,7 +2322,13 @@ impl ObjectStore for PrefetchingObjectStore {
         // parts cache once the upload commits.
         let cached = payload.clone();
         let invalidate = self.invalidation_guard(location);
-        let result = self.inner.put_opts(location, payload, opts).await?;
+        let settled = self.invalidation_guard(location);
+        let inner = Arc::clone(&self.inner);
+        let target = location.clone();
+        let result = settle_mutation(settled, async move {
+            inner.put_opts(&target, payload, opts).await
+        })
+        .await?;
         drop(invalidate);
         self.write_through(location, cached, &result);
         Ok(result)
@@ -1958,7 +2342,7 @@ impl ObjectStore for PrefetchingObjectStore {
         self.invalidate(location);
         let inner = self.inner.put_multipart_opts(location, opts).await?;
         Ok(Box::new(PrefetchingMultipartUpload {
-            inner,
+            inner: Arc::new(tokio::sync::Mutex::new(inner)),
             location: location.clone(),
             heads: self.heads.clone(),
             generations: self.generations.clone(),
@@ -1976,6 +2360,12 @@ impl ObjectStore for PrefetchingObjectStore {
         // observed, and invalidate any unacknowledged paths when the stream
         // is dropped. Count repeated paths rather than losing a later delete.
         let pending = Arc::new(Mutex::new(HashMap::<Path, usize>::new()));
+        let input = Arc::new(Mutex::new(Some(locations)));
+        let source = Arc::clone(&input);
+        let locations = stream::poll_fn(move |cx| match source.lock().unwrap().as_mut() {
+            Some(locations) => locations.poll_next_unpin(cx),
+            None => Poll::Ready(None),
+        });
         let input_pending = Arc::clone(&pending);
         let input_eviction = self.eviction_ctx();
         let tracked = locations.map(move |result| {
@@ -1991,10 +2381,11 @@ impl ObjectStore for PrefetchingObjectStore {
             result
         });
         let cleanup = DeleteStreamCleanup {
-            pending,
+            pending: Arc::clone(&pending),
             eviction: self.eviction_ctx(),
         };
-        self.inner
+        let inner = self
+            .inner
             .delete_stream(tracked.boxed())
             .map(move |result| {
                 if let Ok(path) = &result {
@@ -2006,10 +2397,23 @@ impl ObjectStore for PrefetchingObjectStore {
                             pending.remove(path);
                         }
                     }
+                } else {
+                    // An error does not prove that deletion did not apply.
+                    // Its path may be unavailable, so invalidate every admitted
+                    // target now, even if the caller keeps the stream alive.
+                    cleanup.invalidate_pending();
                 }
                 result
             })
-            .boxed()
+            .boxed();
+        SettlingDeleteStream {
+            inner: Some(inner),
+            input,
+            pending,
+            eviction: self.eviction_ctx(),
+            runtime: tokio::runtime::Handle::try_current().ok(),
+        }
+        .boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
@@ -2035,7 +2439,13 @@ impl ObjectStore for PrefetchingObjectStore {
         options: CopyOptions,
     ) -> object_store::Result<()> {
         let invalidate = self.invalidation_guard(to);
-        let result = self.inner.copy_opts(from, to, options).await;
+        let settled = self.invalidation_guard(to);
+        let inner = Arc::clone(&self.inner);
+        let (from, to) = (from.clone(), to.clone());
+        let result = settle_mutation(settled, async move {
+            inner.copy_opts(&from, &to, options).await
+        })
+        .await;
         drop(invalidate);
         result
     }
@@ -2048,7 +2458,13 @@ impl ObjectStore for PrefetchingObjectStore {
     ) -> object_store::Result<()> {
         let invalidate_from = self.invalidation_guard(from);
         let invalidate_to = self.invalidation_guard(to);
-        let result = self.inner.rename_opts(from, to, options).await;
+        let settled = (self.invalidation_guard(from), self.invalidation_guard(to));
+        let inner = Arc::clone(&self.inner);
+        let (from, to) = (from.clone(), to.clone());
+        let result = settle_mutation(settled, async move {
+            inner.rename_opts(&from, &to, options).await
+        })
+        .await;
         drop(invalidate_to);
         drop(invalidate_from);
         result
@@ -2061,6 +2477,7 @@ mod tests {
     use foyer::{BlockEngineConfig, FsDeviceBuilder, HybridCacheBuilder, PsyncIoEngineConfig};
     use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
+    use std::sync::atomic::Ordering;
     use tempfile::TempDir;
 
     async fn make_store(
@@ -2703,6 +3120,993 @@ mod tests {
         );
     }
 
+    /// A sealed segment behind a fault store and the parts cache, read through
+    /// a `SegmentStore` the way `ExtentStore` reads file data.
+    struct CorruptionFixture {
+        cache: Arc<PrefetchingObjectStore>,
+        backend: Arc<dyn ObjectStore>,
+        controls: Arc<crate::fault_store::FaultControls>,
+        reader: crate::segment_store::SegmentStore,
+        frames: Vec<(u64, u64, Bytes)>,
+        locations: Vec<(u64, u64, crate::segment::FrameLoc)>,
+        object: Bytes,
+        _dir: TempDir,
+    }
+
+    const CORRUPTION_PART: usize = 4 * 1024;
+
+    fn corruption_codec() -> crate::frame_codec::FrameCodec {
+        crate::frame_codec::FrameCodec::new(
+            &[7; 32],
+            crate::segment::SEGMENT_INFO,
+            crate::config::CompressionConfig::Lz4,
+        )
+    }
+
+    impl CorruptionFixture {
+        async fn new() -> Self {
+            use crate::segment_store::SegmentStore;
+
+            let codec = corruption_codec;
+            let mem = Arc::new(InMemory::new());
+            // Seal straight into the backend so the parts cache starts cold;
+            // sealing through the cache would warm it with the good bytes.
+            let writer = SegmentStore::new(mem.clone(), codec(), 5, None);
+            let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+            let frames: Vec<(u64, u64, Bytes)> = (0..4u64)
+                .map(|extent| {
+                    let bytes: Vec<u8> = (0..6000)
+                        .map(|_| {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 7;
+                            seed ^= seed << 17;
+                            seed as u8
+                        })
+                        .collect();
+                    (1, extent, Bytes::from(bytes))
+                })
+                .collect();
+            let locations = writer.seal(&frames).await.unwrap();
+            let path = Path::from(locations[0].2.segid.object_key());
+            let object = mem.get(&path).await.unwrap().bytes().await.unwrap();
+            let (faulty, controls) = crate::fault_store::FaultStore::new(mem);
+            let backend: Arc<dyn ObjectStore> = faulty;
+            let (cache, dir) = store_over(backend.clone(), CORRUPTION_PART).await;
+            let cache = Arc::new(cache);
+            let reader = SegmentStore::new(cache.clone(), codec(), 6, None);
+            Self {
+                cache,
+                backend,
+                controls,
+                reader,
+                frames,
+                locations,
+                object,
+                _dir: dir,
+            }
+        }
+
+        /// Read through a new store and reader over `parts`, as a restarted
+        /// process would. The backend and its fault controls are kept.
+        fn attach(&mut self, parts: HybridCache<PartKey, Bytes>) {
+            self.cache = Arc::new(PrefetchingObjectStore::with_options(
+                self.backend.clone(),
+                parts,
+                CORRUPTION_PART,
+            ));
+            self.reader = crate::segment_store::SegmentStore::new(
+                self.cache.clone(),
+                corruption_codec(),
+                6,
+                None,
+            );
+        }
+
+        /// Keys of the cache parts covering the whole frame run.
+        fn run_part_keys(&self) -> Vec<PartKey> {
+            let generation = cached_generation(&self.cache, &self.path());
+            let (offset, len) = self.run_bounds();
+            let first = offset as usize / CORRUPTION_PART;
+            let last = (offset as usize + len as usize).div_ceil(CORRUPTION_PART);
+            (first..last)
+                .map(|part| PartKey::new(&self.path(), CORRUPTION_PART, &generation, part))
+                .collect()
+        }
+
+        fn path(&self) -> Path {
+            Path::from(self.locations[0].2.segid.object_key())
+        }
+
+        fn run_bounds(&self) -> (u64, u32) {
+            let first = self.locations[0].2;
+            let last = self.locations.last().unwrap().2;
+            let end = last.byte_offset + u64::from(last.byte_len);
+            (first.byte_offset, (end - first.byte_offset) as u32)
+        }
+
+        fn slots(&self) -> Vec<(u64, u64)> {
+            self.locations.iter().map(|(i, e, _)| (*i, *e)).collect()
+        }
+
+        async fn read(&self) -> Result<Vec<Bytes>, crate::segment_store::SegmentStoreError> {
+            let (offset, len) = self.run_bounds();
+            let first = self.locations[0].2;
+            self.reader
+                .read_run(first.segid, offset, len, first.frame_index, &self.slots())
+                .await
+        }
+
+        fn assert_frames(&self, got: &[Bytes]) {
+            assert_eq!(got.len(), self.frames.len());
+            for (got, (_, _, want)) in got.iter().zip(&self.frames) {
+                assert_eq!(got, want);
+            }
+        }
+
+        async fn read_frame(
+            &self,
+            index: usize,
+        ) -> Result<Vec<Bytes>, crate::segment_store::SegmentStoreError> {
+            let (inode, extent, loc) = self.locations[index];
+            self.reader
+                .read_run(
+                    loc.segid,
+                    loc.byte_offset,
+                    loc.byte_len,
+                    loc.frame_index,
+                    &[(inode, extent)],
+                )
+                .await
+        }
+
+        /// Cached parts covering the run whose bytes differ from the stored
+        /// object, and the number of covering parts cached at all.
+        async fn cached_part_mismatches(&self) -> (Vec<usize>, usize) {
+            let (offset, len) = self.run_bounds();
+            let first = offset as usize / CORRUPTION_PART;
+            let last = (offset as usize + len as usize).div_ceil(CORRUPTION_PART);
+            let mut bad = Vec::new();
+            let mut cached = 0;
+            for part in first..last {
+                if let Some(bytes) = self.cache.cached_part(&self.path(), part).await {
+                    let start = part * CORRUPTION_PART;
+                    let end = (start + CORRUPTION_PART).min(self.object.len());
+                    if bytes.as_ref() != &self.object[start..end] {
+                        bad.push(part);
+                    }
+                    cached += 1;
+                }
+            }
+            (bad, cached)
+        }
+
+        /// Every part covering the run is either absent or holds the object's
+        /// true bytes; returns how many were cached.
+        async fn assert_cache_holds_only_true_bytes(&self) -> usize {
+            let (bad, cached) = self.cached_part_mismatches().await;
+            assert!(
+                bad.is_empty(),
+                "cache parts {bad:?} differ from the stored object"
+            );
+            cached
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Neighbour {
+        Before,
+        After,
+    }
+
+    /// The retry returns the requested frame intact, but bytes of a
+    /// neighbouring frame in the same cache parts are corrupt. The repair must
+    /// not cache those unauthenticated bytes, or the neighbour's next read
+    /// fails from the cache.
+    async fn repair_does_not_cache_unauthenticated_neighbour_bytes(neighbour: Neighbour) {
+        let fixture = CorruptionFixture::new().await;
+        let target = 1;
+        let loc = fixture.locations[target].2;
+        let run = loc.byte_offset..loc.byte_offset + u64::from(loc.byte_len);
+        let part = CORRUPTION_PART as u64;
+        assert!(
+            !run.start.is_multiple_of(part) && !run.end.is_multiple_of(part),
+            "the target frame must share its first and last cache parts with neighbours"
+        );
+        let (flip, neighbour_index) = match neighbour {
+            Neighbour::Before => (run.start - run.start % part..run.start, target - 1),
+            Neighbour::After => (run.end..run.end.next_multiple_of(part), target + 1),
+        };
+
+        // The first fetch is corrupt throughout. The retry is intact inside
+        // the target frame and corrupt only in the neighbouring bytes.
+        fixture.controls.corrupt_gets(1);
+        fixture.controls.corrupt_range_in_gets(1, flip);
+        let got = fixture
+            .read_frame(target)
+            .await
+            .expect("the requested frame is intact on the retry");
+        assert_eq!(got, vec![fixture.frames[target].2.clone()]);
+        assert_eq!(fixture.reader.integrity_refetches(), 1);
+
+        let (bad, _) = fixture.cached_part_mismatches().await;
+        let neighbour_read = fixture.read_frame(neighbour_index).await;
+        assert!(
+            bad.is_empty() && fixture.reader.integrity_refetches() == 1,
+            "the repair cached unauthenticated parts {bad:?}; the neighbour read \
+             needed {} integrity refetches in total and returned {:?}",
+            fixture.reader.integrity_refetches(),
+            neighbour_read.as_ref().map(|frames| frames.len()),
+        );
+        assert_eq!(
+            neighbour_read.unwrap(),
+            vec![fixture.frames[neighbour_index].2.clone()]
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_does_not_cache_corrupt_bytes_before_the_run() {
+        repair_does_not_cache_unauthenticated_neighbour_bytes(Neighbour::Before).await;
+    }
+
+    #[tokio::test]
+    async fn repair_does_not_cache_corrupt_bytes_after_the_run() {
+        repair_does_not_cache_unauthenticated_neighbour_bytes(Neighbour::After).await;
+    }
+
+    /// The parts cache exactly as the server builds it, over `dir`.
+    async fn open_production_parts_cache(dir: &std::path::Path) -> HybridCache<PartKey, Bytes> {
+        crate::cli::server::build_parts_hybrid(
+            dir,
+            MEM,
+            256 * 1024 * 1024,
+            &tokio::runtime::Handle::current(),
+            crate::cache_metrics::FoyerMetricsRegistry::default(),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn open_parts_cache_without_a_tombstone_log(
+        dir: &std::path::Path,
+    ) -> HybridCache<PartKey, Bytes> {
+        // The previous server configuration: the same device and block
+        // size, with no tombstone log partition or layout marker.
+        HybridCacheBuilder::new()
+            .with_name("test-previous-parts")
+            .memory(MEM)
+            .with_weighter(|_: &PartKey, v: &Bytes| v.len())
+            .storage()
+            .with_io_engine_config(PsyncIoEngineConfig::new())
+            .with_engine_config(
+                BlockEngineConfig::new(
+                    foyer::DeviceBuilder::build(
+                        FsDeviceBuilder::new(dir.join(LEGACY_PARTS_CACHE_DIR))
+                            .with_capacity(256 * 1024 * 1024),
+                    )
+                    .unwrap(),
+                )
+                .with_block_size(64 * 1024 * 1024),
+            )
+            .build()
+            .await
+            .unwrap()
+    }
+
+    /// Fill a legacy directory with the layout used before tombstone logging.
+    /// Closing flushes the memory tier to disk.
+    async fn write_parts_cache_without_a_tombstone_log(
+        dir: &std::path::Path,
+        parts: impl IntoIterator<Item = (PartKey, Bytes)>,
+    ) {
+        let previous = open_parts_cache_without_a_tombstone_log(dir).await;
+        for (key, value) in parts {
+            previous.insert(key, value);
+        }
+        previous.close().await.unwrap();
+    }
+
+    fn upgrade_part_key(part: usize) -> PartKey {
+        PartKey::new(
+            &Path::from("segments/upgrade"),
+            4096,
+            &CacheGeneration::Versioned {
+                e_tag: Some("upgrade".into()),
+                version: None,
+            },
+            part,
+        )
+    }
+
+    /// These bytes, interpreted as tombstone records, carry u64::MAX sequences.
+    fn all_ones_part() -> Bytes {
+        Bytes::from(vec![0xff; 4096])
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parts_cache_migration_and_rollbacks_start_cold() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Path::from("segments/upgrade");
+        let generation = CacheGeneration::Versioned {
+            e_tag: Some("upgrade".into()),
+            version: None,
+        };
+        let value = |part: usize| {
+            // If old data is mistaken for tombstones, these bytes become
+            // u64::MAX sequences and deterministically expose the overflow.
+            let mut bytes = vec![0xff; 4096];
+            bytes[0] = part as u8;
+            Bytes::from(bytes)
+        };
+        let previous = open_parts_cache_without_a_tombstone_log(dir.path()).await;
+        for part in 0..64 {
+            previous.insert(PartKey::new(&path, 4096, &generation, part), value(part));
+        }
+        previous.close().await.unwrap();
+        drop(previous);
+
+        // Confirm the legacy writer produced a recoverable disk cache before
+        // testing the format change, and leave an unrelated file beside it.
+        let previous = open_parts_cache_without_a_tombstone_log(dir.path()).await;
+        let mut recovered = 0;
+        for part in 0..64 {
+            let key = PartKey::new(&path, 4096, &generation, part);
+            if let Some(entry) = previous.get(&key).await.unwrap() {
+                assert_eq!(entry.value(), &value(part));
+                recovered += 1;
+            }
+        }
+        assert!(recovered > 0, "legacy entries must have reached disk");
+        previous.close().await.unwrap();
+        drop(previous);
+        let legacy = dir.path().join(LEGACY_PARTS_CACHE_DIR);
+        let foreign = legacy.join("foyer-storage-direct-fs-backup");
+        std::fs::write(&foreign, b"keep").unwrap();
+
+        let upgraded = open_production_parts_cache(dir.path()).await;
+        assert!(!legacy.join("foyer-storage-direct-fs-00000000").exists());
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"keep");
+        for part in 0..64 {
+            let key = PartKey::new(&path, 4096, &generation, part);
+            assert!(
+                upgraded.get(&key).await.unwrap().is_none(),
+                "the incompatible old cache must be discarded before recovery"
+            );
+            upgraded.insert(key, value(part));
+        }
+        // The disk tier remains usable within this process even though its
+        // index will deliberately not be recovered by the next process.
+        upgraded.memory().flush().await;
+        upgraded.storage().wait().await;
+        upgraded.memory().clear();
+        for part in 0..64 {
+            let key = PartKey::new(&path, 4096, &generation, part);
+            assert!(!upgraded.memory().contains(&key));
+            assert_eq!(
+                upgraded.get(&key).await.unwrap().unwrap().value(),
+                &value(part)
+            );
+        }
+        upgraded.close().await.unwrap();
+        drop(upgraded);
+
+        // Even a compatible reopen is deliberately cold. Both removed entries
+        // and otherwise valid entries from the previous process stay absent.
+        let reopened = open_production_parts_cache(dir.path()).await;
+        for part in 0..64 {
+            let key = PartKey::new(&path, 4096, &generation, part);
+            assert!(reopened.get(&key).await.unwrap().is_none());
+        }
+        reopened.close().await.unwrap();
+        drop(reopened);
+
+        // An old binary ignores the new marker and writes its old layout
+        // again. Its namespace remains isolated during a rollback and
+        // subsequent upgrade, and neither namespace is recovered as warm data.
+        let downgraded = open_parts_cache_without_a_tombstone_log(dir.path()).await;
+        for part in 0..64 {
+            downgraded.insert(
+                PartKey::new(&path, 4096, &generation, part),
+                Bytes::from(vec![0xff; 4096]),
+            );
+        }
+        downgraded.close().await.unwrap();
+        drop(downgraded);
+        assert!(legacy.join("foyer-storage-direct-fs-00000000").is_file());
+
+        let upgraded = open_production_parts_cache(dir.path()).await;
+        for part in 0..64 {
+            let key = PartKey::new(&path, 4096, &generation, part);
+            assert!(upgraded.get(&key).await.unwrap().is_none());
+        }
+        assert!(!legacy.join("foyer-storage-direct-fs-00000000").exists());
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"keep");
+        upgraded.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parts_cache_restarts_cold_after_multiple_deletion_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let generation = CacheGeneration::Versioned {
+            e_tag: Some("deletions".into()),
+            version: None,
+        };
+        let key = |part| PartKey::new(&Path::from("segments/deletions"), 4096, &generation, part);
+        let value = Bytes::from(vec![0x42; 4096]);
+        let parts = open_production_parts_cache(dir.path()).await;
+        for part in 0..900 {
+            parts.insert(key(part), value.clone());
+        }
+        parts.memory().flush().await;
+        parts.storage().wait().await;
+        parts.memory().clear();
+        assert_eq!(parts.get(&key(0)).await.unwrap().unwrap().value(), &value);
+        assert_eq!(parts.get(&key(899)).await.unwrap().unwrap().value(), &value);
+        // These batches crossed multiple pages in the former tombstone log.
+        for part in 0..600 {
+            parts.remove(&key(part));
+        }
+        parts.storage().wait().await;
+        for part in 0..600 {
+            assert!(parts.get(&key(part)).await.unwrap().is_none());
+        }
+        assert_eq!(parts.get(&key(899)).await.unwrap().unwrap().value(), &value);
+        parts.close().await.unwrap();
+        drop(parts);
+
+        let parts = open_production_parts_cache(dir.path()).await;
+        for part in 0..900 {
+            assert!(
+                parts.get(&key(part)).await.unwrap().is_none(),
+                "both deleted parts and the live control must restart cold"
+            );
+        }
+        // Model ordinary backend refills after the cold restart, then another
+        // deletion batch and restart without allowing earlier data to return.
+        for part in 600..900 {
+            parts.insert(key(part), value.clone());
+        }
+        parts.memory().flush().await;
+        parts.storage().wait().await;
+        parts.memory().clear();
+        assert_eq!(parts.get(&key(600)).await.unwrap().unwrap().value(), &value);
+        for part in 600..800 {
+            parts.remove(&key(part));
+        }
+        parts.storage().wait().await;
+        for part in 0..800 {
+            assert!(parts.get(&key(part)).await.unwrap().is_none());
+        }
+        assert_eq!(parts.get(&key(899)).await.unwrap().unwrap().value(), &value);
+        parts.close().await.unwrap();
+        drop(parts);
+
+        let parts = open_production_parts_cache(dir.path()).await;
+        for part in 0..900 {
+            assert!(parts.get(&key(part)).await.unwrap().is_none());
+        }
+        parts.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parts_cache_restarts_cold_after_tombstone_ring_sized_removals() {
+        let dir = tempfile::tempdir().unwrap();
+        let generation = CacheGeneration::Versioned {
+            e_tag: Some("deletion-wrap".into()),
+            version: None,
+        };
+        let key = |part| {
+            PartKey::new(
+                &Path::from("segments/deletion-wrap"),
+                4096,
+                &generation,
+                part,
+            )
+        };
+        let parts = open_production_parts_cache(dir.path()).await;
+        parts.insert(key(0), Bytes::from_static(b"removed"));
+        parts.insert(key(1), Bytes::from_static(b"live control"));
+        parts.memory().flush().await;
+        parts.storage().wait().await;
+        parts.memory().clear();
+        assert_eq!(
+            parts.get(&key(0)).await.unwrap().unwrap().value(),
+            &Bytes::from_static(b"removed")
+        );
+        parts.remove(&key(0));
+        // The former 256 MiB device's log held 65,536 tombstones. Removing
+        // absent keys also consumed slots and overwrote this part's deletion.
+        for part in 2..65_538 {
+            parts.remove(&key(part));
+        }
+        parts.storage().wait().await;
+        assert!(parts.get(&key(0)).await.unwrap().is_none());
+        assert_eq!(
+            parts.get(&key(1)).await.unwrap().unwrap().value(),
+            &Bytes::from_static(b"live control")
+        );
+        parts.close().await.unwrap();
+        drop(parts);
+
+        let parts = open_production_parts_cache(dir.path()).await;
+        assert!(parts.get(&key(0)).await.unwrap().is_none());
+        assert!(
+            parts.get(&key(1)).await.unwrap().is_none(),
+            "the live control is also absent under the cold-restart policy"
+        );
+        parts.close().await.unwrap();
+    }
+
+    /// Preserve the all-ones upgrade regression that exposed sequence overflow
+    /// when an old data partition was interpreted as a tombstone log.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_all_ones_parts_are_discarded_on_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        write_parts_cache_without_a_tombstone_log(
+            dir.path(),
+            (0..4).map(|part| (upgrade_part_key(part), all_ones_part())),
+        )
+        .await;
+
+        let previous = open_parts_cache_without_a_tombstone_log(dir.path()).await;
+        for part in 0..4 {
+            assert_eq!(
+                previous
+                    .get(&upgrade_part_key(part))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+                &all_ones_part(),
+            );
+        }
+        previous.close().await.unwrap();
+        drop(previous);
+
+        let upgraded = open_production_parts_cache(dir.path()).await;
+        for part in 0..4 {
+            assert!(
+                upgraded
+                    .get(&upgrade_part_key(part))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        upgraded.close().await.unwrap();
+    }
+
+    /// After upgrade, replacement must supersede old disk bytes within the
+    /// process, and neither version may be replayed by subsequent processes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replaced_part_stays_replaced_after_upgrading_a_cache_without_a_tombstone_log() {
+        let dir = tempfile::tempdir().unwrap();
+        write_parts_cache_without_a_tombstone_log(
+            dir.path(),
+            (0..4).map(|part| (upgrade_part_key(part), all_ones_part())),
+        )
+        .await;
+        let replaced = upgrade_part_key(100);
+        let stale = Bytes::from(vec![1; 4096]);
+        let replacement = Bytes::from(vec![2; 4096]);
+
+        let parts = open_production_parts_cache(dir.path()).await;
+        for part in 101..108 {
+            parts.insert(upgrade_part_key(part), Bytes::from(vec![3; 4096]));
+        }
+        parts.insert(replaced.clone(), stale.clone());
+        parts.memory().flush().await;
+        parts.storage().wait().await;
+        parts.memory().clear();
+        assert_eq!(parts.get(&replaced).await.unwrap().unwrap().value(), &stale);
+
+        parts.remove(&replaced);
+        parts.insert(replaced.clone(), replacement.clone());
+        parts.memory().flush().await;
+        parts.storage().wait().await;
+        parts.memory().clear();
+        assert_eq!(
+            parts.get(&replaced).await.unwrap().unwrap().value(),
+            &replacement
+        );
+        parts.close().await.unwrap();
+        drop(parts);
+
+        for reopen in 0..2 {
+            let parts = open_production_parts_cache(dir.path()).await;
+            assert!(
+                parts.get(&replaced).await.unwrap().is_none(),
+                "reopen {reopen} must not replay either version",
+            );
+            parts.close().await.unwrap();
+        }
+    }
+
+    /// Put a corrupt run on the disk tier only, repair it, then reopen the
+    /// cache. Returns the integrity refetches the read after reopening needed.
+    /// `earlier_parts` unrelated parts are cached before the corrupt run, as
+    /// a running server caches other objects first.
+    async fn repair_a_corrupt_disk_tier_part(dir: TempDir, earlier_parts: usize) -> u64 {
+        let mut fixture = CorruptionFixture::new().await;
+        let (offset, len) = fixture.run_bounds();
+        let run = offset as usize..offset as usize + len as usize;
+        let mut cached_range = GetOptions {
+            range: Some(GetRange::Bounded(run.start as u64..run.end as u64)),
+            ..Default::default()
+        };
+        cached_range.extensions.insert(CacheRangeOnly);
+
+        // Admit one corrupt response through the ordinary cached read path,
+        // then flush it to disk while keeping this cache instance open.
+        let parts = open_production_parts_cache(dir.path()).await;
+        for part in 0..earlier_parts {
+            parts.insert(upgrade_part_key(1000 + part), Bytes::from(vec![3; 4096]));
+        }
+        fixture.attach(parts.clone());
+        fixture.controls.corrupt_gets(1);
+        let poisoned = fixture
+            .cache
+            .get_opts(&fixture.path(), cached_range)
+            .await
+            .unwrap();
+        assert_ne!(
+            poisoned.bytes().await.unwrap().as_ref(),
+            &fixture.object[run.clone()]
+        );
+        let keys = fixture.run_part_keys();
+        parts.memory().flush().await;
+        parts.storage().wait().await;
+        parts.memory().clear();
+
+        // Verify that the disk holds the poisoned bytes, then evict only the
+        // memory tier. A hybrid `remove` would also delete the disk entries
+        // and bypass the repair path.
+        let mut poisoned_parts = 0;
+        for key in &keys {
+            assert!(!parts.memory().contains(key), "{key:?} is in memory");
+            assert!(parts.storage().may_contains(key), "{key:?} is not on disk");
+            let entry = parts
+                .get(key)
+                .await
+                .unwrap()
+                .expect("part must load from disk");
+            let start = key.part_id * CORRUPTION_PART;
+            let end = (start + CORRUPTION_PART).min(fixture.object.len());
+            if entry.value().as_ref() != &fixture.object[start..end] {
+                poisoned_parts += 1;
+            }
+            drop(entry);
+            parts.memory().remove(key);
+            assert!(!parts.memory().contains(key));
+        }
+        assert!(
+            poisoned_parts > 0,
+            "the disk tier must contain corrupt bytes"
+        );
+        fixture.attach(parts.clone());
+        // Learn the object metadata without a data read, as a warm process
+        // would already have it.
+        fixture.cache.head(&fixture.path()).await.unwrap();
+        let gets = fixture.controls.get_count();
+        fixture.assert_frames(&fixture.read().await.unwrap());
+        assert_eq!(fixture.reader.integrity_refetches(), 1);
+        assert_eq!(
+            fixture.controls.get_count(),
+            gets + 1,
+            "the first decode used the disk tier and the only backend read was the retry"
+        );
+        assert!(
+            fixture.assert_cache_holds_only_true_bytes().await > 0,
+            "repair must admit authenticated complete parts"
+        );
+        parts.memory().flush().await;
+        parts.storage().wait().await;
+        parts.memory().clear();
+        let mut repaired_on_disk = 0;
+        for key in &keys {
+            assert!(!parts.memory().contains(key));
+            if let Some(entry) = parts.get(key).await.unwrap() {
+                let start = key.part_id * CORRUPTION_PART;
+                let end = (start + CORRUPTION_PART).min(fixture.object.len());
+                assert_eq!(entry.value().as_ref(), &fixture.object[start..end]);
+                repaired_on_disk += 1;
+                drop(entry);
+                parts.memory().remove(key);
+            }
+        }
+        assert!(
+            repaired_on_disk > 0,
+            "repaired parts must be readable from disk"
+        );
+        fixture.assert_frames(&fixture.read().await.unwrap());
+        assert_eq!(
+            fixture.reader.integrity_refetches(),
+            1,
+            "reading the repaired disk tier must not need another integrity refetch"
+        );
+        parts.close().await.unwrap();
+        drop(parts);
+
+        // Every reopen is intentionally cold, including repaired live entries.
+        let parts = open_production_parts_cache(dir.path()).await;
+        for key in &keys {
+            assert!(parts.get(key).await.unwrap().is_none());
+        }
+        fixture.attach(parts.clone());
+        fixture.cache.head(&fixture.path()).await.unwrap();
+        fixture.assert_frames(&fixture.read().await.unwrap());
+        let refetches = fixture.reader.integrity_refetches();
+        parts.close().await.unwrap();
+        refetches
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn corrupt_disk_tier_part_stays_repaired_across_a_cache_reopen() {
+        assert_eq!(
+            repair_a_corrupt_disk_tier_part(tempfile::tempdir().unwrap(), 0).await,
+            0,
+            "a part the repair deleted came back from disk after the cache reopened"
+        );
+    }
+
+    /// The same repair after migrating a legacy directory written without
+    /// a tombstone log, with unrelated parts admitted before the corrupt run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn corrupt_part_stays_repaired_after_upgrading_a_cache_without_a_tombstone_log() {
+        let dir = tempfile::tempdir().unwrap();
+        write_parts_cache_without_a_tombstone_log(
+            dir.path(),
+            (0..4).map(|part| (upgrade_part_key(part), all_ones_part())),
+        )
+        .await;
+        assert_eq!(
+            repair_a_corrupt_disk_tier_part(dir, 64).await,
+            0,
+            "a part the repair deleted came back from disk after the cache reopened"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupted_cached_segment_part_is_refetched_once_and_replaced() {
+        let fixture = CorruptionFixture::new().await;
+        fixture.controls.corrupt_gets(1);
+
+        let got = fixture
+            .read()
+            .await
+            .expect("one uncached retry must recover a corrupted cached part");
+        fixture.assert_frames(&got);
+        assert_eq!(
+            fixture.controls.get_count(),
+            2,
+            "one cold GET and exactly one retry"
+        );
+        assert_eq!(fixture.reader.integrity_refetches(), 1);
+        assert!(
+            fixture.assert_cache_holds_only_true_bytes().await > 0,
+            "the parts inside the authenticated run should be cached"
+        );
+
+        // Parts the run shares with the segment's other bytes were left
+        // uncached, so the first later read may fetch them once, normally.
+        fixture.assert_frames(&fixture.read().await.unwrap());
+        let gets = fixture.controls.get_count();
+        for _ in 0..3 {
+            fixture.assert_frames(&fixture.read().await.unwrap());
+        }
+        assert_eq!(
+            fixture.reader.integrity_refetches(),
+            1,
+            "later reads need no further integrity refetch"
+        );
+        assert_eq!(
+            fixture.controls.get_count(),
+            gets,
+            "later reads are served from the cache"
+        );
+        fixture.assert_cache_holds_only_true_bytes().await;
+    }
+
+    #[tokio::test]
+    async fn corrupt_retry_returns_the_integrity_error_without_looping() {
+        let fixture = CorruptionFixture::new().await;
+        fixture.controls.corrupt_gets(2);
+
+        let error = fixture
+            .read()
+            .await
+            .expect_err("a corrupt retry must not be accepted");
+        assert!(
+            matches!(error, crate::segment_store::SegmentStoreError::Segment(_)),
+            "expected a frame integrity error, got {error:?}"
+        );
+        assert_eq!(
+            fixture.controls.get_count(),
+            2,
+            "one cold GET and exactly one retry"
+        );
+        fixture.assert_cache_holds_only_true_bytes().await;
+
+        fixture.assert_frames(&fixture.read().await.unwrap());
+        assert_eq!(fixture.controls.get_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn uncached_segment_reads_are_unchanged() {
+        let fixture = CorruptionFixture::new().await;
+        let (offset, len) = fixture.run_bounds();
+        let first = fixture.locations[0].2;
+        let slots = fixture.slots();
+
+        fixture.controls.corrupt_gets(1);
+        let result = fixture
+            .reader
+            .read_compressed_run(first.segid, offset, len, first.frame_index, &slots)
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(crate::segment_store::SegmentStoreError::Segment(_))
+            ),
+            "compaction reads authenticate the bytes they fetched"
+        );
+        assert_eq!(
+            fixture.controls.get_count(),
+            1,
+            "no retry for uncached reads"
+        );
+        assert_eq!(fixture.assert_cache_holds_only_true_bytes().await, 0);
+
+        fixture
+            .reader
+            .read_compressed_run(first.segid, offset, len, first.frame_index, &slots)
+            .await
+            .unwrap();
+        assert_eq!(fixture.controls.get_count(), 2);
+
+        fixture.assert_frames(&fixture.read().await.unwrap());
+        assert_eq!(
+            fixture.controls.get_count(),
+            3,
+            "a clean cached read does not retry"
+        );
+    }
+
+    async fn integrity_refetch_fences_an_older_in_flight_fetch(unversioned: bool) {
+        const PART: usize = 4 * 1024;
+        let mem = Arc::new(InMemory::new());
+        let path = Path::from("segments/in-flight-corruption");
+        let body: Vec<u8> = (0..4 * PART).map(|i| (i % 251) as u8).collect();
+        mem.put(&path, body.clone().into()).await.unwrap();
+        let backend: Arc<dyn ObjectStore> = Arc::new(DelayRecordingStore {
+            inner: mem,
+            ranges: Arc::new(std::sync::Mutex::new(Vec::new())),
+            delay: std::time::Duration::ZERO,
+            body_gate: None,
+            unversioned,
+        });
+        let (faulty, controls) = crate::fault_store::FaultStore::new(backend);
+        let (store, _dir) = store_over(faulty, PART).await;
+        let store = Arc::new(store);
+        let ranged = |range: Range<u64>| {
+            let mut options = GetOptions {
+                range: Some(GetRange::Bounded(range)),
+                ..Default::default()
+            };
+            options.extensions.insert(CacheRangeOnly);
+            options
+        };
+        let target = 2 * PART as u64..3 * PART as u64;
+        let want = &body[2 * PART..3 * PART];
+
+        // Learn the object generation so the next read leads a window fetch.
+        let first = store.get_opts(&path, ranged(0..PART as u64)).await.unwrap();
+        assert_eq!(first.bytes().await.unwrap().as_ref(), &body[..PART]);
+
+        // An older fetch of the same part receives a corrupt body and stalls
+        // before it can publish.
+        controls.corrupt_gets(1);
+        controls.hold_get_bodies(1);
+        let before = controls.get_count();
+        let stale = {
+            let store = store.clone();
+            let path = path.clone();
+            let options = ranged(target.clone());
+            tokio::spawn(async move { store.get_opts(&path, options).await?.bytes().await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while controls.get_count() == before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the stale fetch never reached the backend");
+
+        let mut options = GetOptions {
+            range: Some(GetRange::Bounded(target.clone())),
+            ..Default::default()
+        };
+        options.extensions.insert(RefetchCorruptRange);
+        let mut refetched = store.get_opts(&path, options).await.unwrap();
+        let admission = refetched
+            .extensions
+            .remove::<AuthenticatedRefetch>()
+            .expect("an aligned refetch is admissible");
+        assert_eq!(refetched.bytes().await.unwrap().as_ref(), want);
+        admission.admit();
+
+        controls.release_get_bodies();
+        let stale = stale.await.unwrap().unwrap();
+        assert_ne!(
+            stale.as_ref(),
+            want,
+            "the stale fetch carried corrupt bytes"
+        );
+
+        assert_eq!(
+            store.cached_part(&path, 2).await.as_deref(),
+            Some(want),
+            "the older fetch must not replace the authenticated part"
+        );
+        let gets = controls.get_count();
+        let again = store.get_opts(&path, ranged(target)).await.unwrap();
+        assert_eq!(again.bytes().await.unwrap().as_ref(), want);
+        assert_eq!(
+            controls.get_count(),
+            gets,
+            "the repaired part is served from cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn integrity_refetch_fences_an_older_in_flight_fetch_versioned() {
+        integrity_refetch_fences_an_older_in_flight_fetch(false).await;
+    }
+
+    #[tokio::test]
+    async fn integrity_refetch_fences_an_older_in_flight_fetch_unversioned() {
+        integrity_refetch_fences_an_older_in_flight_fetch(true).await;
+    }
+
+    #[tokio::test]
+    async fn unadmitted_integrity_refetch_caches_nothing() {
+        let fixture = CorruptionFixture::new().await;
+        // Poison the cache through an ordinary cached read.
+        fixture.controls.corrupt_gets(1);
+        let (offset, len) = fixture.run_bounds();
+        let range = offset..offset + u64::from(len);
+        let mut options = GetOptions {
+            range: Some(GetRange::Bounded(range.clone())),
+            ..Default::default()
+        };
+        options.extensions.insert(CacheRangeOnly);
+        let poisoned = fixture
+            .cache
+            .get_opts(&fixture.path(), options)
+            .await
+            .unwrap();
+        assert_ne!(
+            poisoned.bytes().await.unwrap().as_ref(),
+            &fixture.object[offset as usize..(offset + u64::from(len)) as usize]
+        );
+
+        let mut options = GetOptions {
+            range: Some(GetRange::Bounded(range)),
+            ..Default::default()
+        };
+        options.extensions.insert(RefetchCorruptRange);
+        let refetched = fixture
+            .cache
+            .get_opts(&fixture.path(), options)
+            .await
+            .unwrap();
+        drop(refetched);
+        assert_eq!(
+            fixture.assert_cache_holds_only_true_bytes().await,
+            0,
+            "the refetch evicts the corrupt parts and caches nothing until admitted"
+        );
+    }
+
     #[tokio::test]
     async fn late_cold_reader_waits_for_discovery_payload() {
         const MIB: usize = 1024 * 1024;
@@ -3108,7 +4512,9 @@ mod tests {
         for fail in [false, true] {
             store.head(&path).await.unwrap();
             let mut upload = PrefetchingMultipartUpload {
-                inner: Box::new(UnsuccessfulCompletion { fail }),
+                inner: Arc::new(tokio::sync::Mutex::new(Box::new(UnsuccessfulCompletion {
+                    fail,
+                }))),
                 location: path.clone(),
                 heads: store.heads.clone(),
                 generations: store.generations.clone(),
@@ -3125,6 +4531,40 @@ mod tests {
             assert!(store.read_head(&path).is_none());
             assert!(store.generations.get(&path).is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_multipart_completion_owns_upload_before_its_worker_runs() {
+        let (store, _, _dir) = make_store(DEFAULT_PART_SIZE_BYTES, MEM, DISK).await;
+        let mut upload = PrefetchingMultipartUpload {
+            inner: Arc::new(tokio::sync::Mutex::new(Box::new(UnsuccessfulCompletion {
+                fail: false,
+            }))),
+            location: Path::from("multipart-owned-completion"),
+            heads: store.heads.clone(),
+            generations: store.generations.clone(),
+            states: store.object_states.clone(),
+            access_tracker: store.access_tracker.clone(),
+        };
+        // One unpolled part must not prevent issuing the next parallel part.
+        let first = upload.put_part(Bytes::from_static(b"first").into());
+        let second = upload.put_part(Bytes::from_static(b"second").into());
+        let (first, second) = futures::join!(first, second);
+        first.unwrap();
+        second.unwrap();
+
+        let mut completion = Box::pin(upload.complete());
+        assert!(futures::poll!(&mut completion).is_pending());
+        drop(completion);
+        // No yield: the task has not run on this current-thread runtime.
+        // Completion must already own the upload at its first await boundary.
+        assert!(
+            upload
+                .put_part(Bytes::from_static(b"late").into())
+                .await
+                .is_err(),
+            "a cancelled completion admitted another part before its worker ran"
+        );
     }
 
     #[tokio::test]
@@ -5610,6 +7050,7 @@ mod tests {
         proceed: Arc<tokio::sync::Notify>,
         applied: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
+        fail_ack: bool,
     }
 
     impl Display for DelayedDeleteAckStore {
@@ -5650,6 +7091,7 @@ mod tests {
             let proceed = Arc::clone(&self.proceed);
             let applied = Arc::clone(&self.applied);
             let release = Arc::clone(&self.release);
+            let fail_ack = self.fail_ack;
             locations
                 .then(move |result| {
                     let inner = Arc::clone(&inner);
@@ -5664,7 +7106,14 @@ mod tests {
                         object_store::ObjectStoreExt::delete(inner.as_ref(), &path).await?;
                         applied.notify_one();
                         release.notified().await;
-                        Ok(path)
+                        if fail_ack {
+                            Err(object_store::Error::Generic {
+                                store: "DelayedDeleteAckStore",
+                                source: "deletion applied but acknowledgement failed".into(),
+                            })
+                        } else {
+                            Ok(path)
+                        }
                     }
                 })
                 .boxed()
@@ -5715,6 +7164,7 @@ mod tests {
             proceed: Arc::clone(&proceed),
             applied: Arc::clone(&applied),
             release: Arc::new(tokio::sync::Notify::new()),
+            fail_ack: false,
         });
         let (store, _dir) = store_over(backend, 64 * 1024).await;
         let path = Path::from("delete-cancel-after-apply");
@@ -5748,6 +7198,248 @@ mod tests {
         assert!(store.read_head(&path).is_none());
         assert!(store.cached_part(&path, 0).await.is_none());
         assert!(store.get(&path).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_delete_ack_invalidates_before_the_stream_is_dropped() {
+        let inner = Arc::new(InMemory::new());
+        let path = Path::from("delete-error-after-apply");
+        inner
+            .put(&path, Bytes::from_static(b"old").into())
+            .await
+            .unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let proceed = Arc::new(tokio::sync::Notify::new());
+        let applied = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let backend = Arc::new(DelayedDeleteAckStore {
+            inner: inner.clone(),
+            entered: entered.clone(),
+            proceed: proceed.clone(),
+            applied: applied.clone(),
+            release: release.clone(),
+            fail_ack: true,
+        });
+        let (store, _dir) = store_over(backend, DEFAULT_PART_SIZE_BYTES).await;
+        let mut deleting = store.delete_stream(stream::iter([Ok(path.clone())]).boxed());
+        assert!(futures::poll!(deleting.next()).is_pending());
+        entered.notified().await;
+        store.get(&path).await.unwrap().bytes().await.unwrap();
+        proceed.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let next = deleting.next();
+            tokio::pin!(next);
+            assert!(futures::poll!(&mut next).is_pending());
+            applied.notified().await;
+            release.notify_one();
+            next.await.unwrap()
+        })
+        .await
+        .expect("delete acknowledgement did not settle");
+        assert!(result.is_err());
+        assert!(inner.head(&path).await.is_err());
+        assert!(
+            store.get(&path).await.is_err(),
+            "a failed acknowledgement retained deleted bytes until stream drop"
+        );
+        assert!(deleting.next().await.is_none());
+        assert!(deleting.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_native_mutations_evict_after_backend_settles() {
+        use fs4::fs_std::FileExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let native = Arc::new(crate::local_object_store::LocalConditionalStore::new());
+        let (store, _cache_dir) = store_over(native.clone(), DEFAULT_PART_SIZE_BYTES).await;
+        for operation in [
+            "delete",
+            "delete_off_runtime",
+            "put",
+            "copy",
+            "rename",
+            "multipart",
+        ] {
+            let is_delete = operation.starts_with("delete");
+            let file = root.path().join(format!("target-{operation}"));
+            let target = Path::from_absolute_path(&file).unwrap();
+            let source =
+                Path::from_absolute_path(root.path().join(format!("source-{operation}"))).unwrap();
+            native
+                .put(&target, Bytes::from_static(b"old payload").into())
+                .await
+                .unwrap();
+            native
+                .put(&source, Bytes::from_static(b"replacement").into())
+                .await
+                .unwrap();
+            assert_eq!(
+                store.get(&target).await.unwrap().bytes().await.unwrap(),
+                Bytes::from_static(b"old payload")
+            );
+            store.head(&source).await.unwrap();
+            let mut upload = if operation == "multipart" {
+                let mut upload = store.put_multipart(&target).await.unwrap();
+                upload
+                    .put_part(Bytes::from_static(b"replacement").into())
+                    .await
+                    .unwrap();
+                Some(upload)
+            } else {
+                None
+            };
+
+            // The real native worker retains its parent lock and I/O after
+            // the async receiver disappears. Hold that lock to put caller
+            // cancellation before the actual mutation, not after publication.
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(root.path().join(crate::local_object_store::LOCK_FILE))
+                .unwrap();
+            FileExt::lock_exclusive(&lock).unwrap();
+            let mut pending: Pin<
+                Box<dyn std::future::Future<Output = object_store::Result<()>> + Send>,
+            > = match operation {
+                "delete" | "delete_off_runtime" => Box::pin(store.delete(&target)),
+                "put" => Box::pin(async {
+                    store
+                        .put(&target, Bytes::from_static(b"replacement").into())
+                        .await
+                        .map(|_| ())
+                }),
+                "copy" => Box::pin(store.copy(&source, &target)),
+                "rename" => Box::pin(store.rename(&source, &target)),
+                "multipart" => {
+                    Box::pin(async { upload.as_mut().unwrap().complete().await.map(|_| ()) })
+                }
+                _ => unreachable!(),
+            };
+            assert!(futures::poll!(&mut pending).is_pending());
+            if operation == "delete_off_runtime" {
+                std::thread::scope(|scope| scope.spawn(move || drop(pending)).join().unwrap());
+            } else {
+                drop(pending);
+            }
+
+            // Refill the predecessor after the caller's drop invalidation.
+            assert_eq!(std::fs::read(&file).unwrap(), b"old payload");
+            assert_eq!(
+                store.get(&target).await.unwrap().bytes().await.unwrap(),
+                Bytes::from_static(b"old payload")
+            );
+            if operation == "rename" {
+                store.head(&source).await.unwrap();
+            }
+            drop(lock);
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let visible = match store.get(&target).await {
+                        Ok(result) => Some(result.bytes().await.unwrap()),
+                        Err(object_store::Error::NotFound { .. }) => None,
+                        Err(error) => panic!("unexpected {operation} read failure: {error}"),
+                    };
+                    let settled = if is_delete {
+                        visible.is_none() && !file.exists()
+                    } else {
+                        visible.as_deref() == Some(b"replacement".as_slice())
+                            && std::fs::read(&file).unwrap() == b"replacement"
+                    };
+                    if settled {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("cancelled {operation} left the predecessor cached"));
+            if operation == "rename" {
+                assert!(
+                    store.head(&source).await.is_err(),
+                    "rename source stayed cached"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_delete_stream_settles_only_admitted_paths() {
+        let inner = Arc::new(InMemory::new());
+        let first = Path::from("admitted-delete");
+        let second = Path::from("unpolled-delete");
+        for path in [&first, &second] {
+            inner
+                .put(path, Bytes::from_static(b"payload").into())
+                .await
+                .unwrap();
+        }
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let proceed = Arc::new(tokio::sync::Notify::new());
+        let applied = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let backend = Arc::new(DelayedDeleteAckStore {
+            inner: inner.clone(),
+            entered: entered.clone(),
+            proceed: proceed.clone(),
+            applied: applied.clone(),
+            release: release.clone(),
+            fail_ack: false,
+        });
+        let (store, _dir) = store_over(backend, DEFAULT_PART_SIZE_BYTES).await;
+        let unpolled = store.delete_stream(stream::iter([Ok(second.clone())]).boxed());
+        drop(unpolled);
+        assert!(
+            inner.head(&second).await.is_ok(),
+            "an unpolled stream dispatched a delete"
+        );
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct InputDrop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for InputDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let source_drop = InputDrop(dropped.clone());
+        let pulled = count.clone();
+        let input = stream::iter([Ok(first.clone()), Ok(second.clone())]).inspect(move |_| {
+            let _source = &source_drop;
+            pulled.fetch_add(1, Ordering::SeqCst);
+        });
+        let mut deleting = store.delete_stream(input.boxed());
+        assert!(futures::poll!(deleting.next()).is_pending());
+        entered.notified().await;
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        drop(deleting);
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "cancelled stream retained its input source"
+        );
+        // The first delete is still pending. A refill must be evicted when
+        // its retained owner observes completion, without pulling `second`.
+        store.get(&first).await.unwrap().bytes().await.unwrap();
+        proceed.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), applied.notified())
+            .await
+            .expect("admitted deletion stopped when its caller was cancelled");
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while store.read_head(&first).is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("settled deletion failed to invalidate its refill");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "cancelled stream pulled a new path"
+        );
+        assert!(inner.head(&first).await.is_err());
+        assert!(inner.head(&second).await.is_ok());
+        assert!(store.get(&first).await.is_err());
     }
 
     #[tokio::test]

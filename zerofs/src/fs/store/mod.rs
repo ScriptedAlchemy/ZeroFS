@@ -11,3 +11,5 @@ pub use extent::{ChainOutcome, ExtentStore, PassOutcome, PassStatus};
 pub use inode::InodeStore;
 pub use orphan::OrphanStore;
 pub use tombstone::TombstoneStore;
+pub mod xattr;
+pub use xattr::XattrStore;

@@ -1,0 +1,896 @@
+{
+  "schema_version": 1,
+  "scope": "Host-local diagnostics from the seventh PR84 review. No new NAS performance measurements or full-PR acceptance claim.",
+  "baseline_commit": "20fc0f403ead3166cb6a42b4d45c98676858cd75",
+  "nas_reference": {
+    "engine_commit": "560eaae7d54e21f5b3c3171ea17e4b086e9c51b9",
+    "configuration_source": "Operator-reported trial settings; not changed or remeasured by this review",
+    "cpu_quota": 8,
+    "filesystem_volatile_bytes": 268435456,
+    "ssd_journal_bytes": 536870912,
+    "smb_flush_policy": "SSD-backed",
+    "new_nas_run_for_these_changes": false
+  },
+  "host": {
+    "architecture": "x86_64",
+    "os": "Linux",
+    "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+    "process_clock_ticks_per_second": 100
+  },
+  "harness_location_note": "The named harnesses existed in the review session scratch workspace. They are not included as repository tools. Source hashes identify measurement snapshots, which may precede later error-handling or test-only additions.",
+  "journal_preload": {
+    "harness": "pass7-journal-harness",
+    "profile": "normal development dependencies; harness rustc opt-level0, debuginfo0, codegen-units32",
+    "production_source_sha256": {
+      "zerofs/src/writeback/journal.rs": "98f88d759d0364717058a5707328f614885af0fe180ca5fd3068fd4386231f22",
+      "zerofs/src/writeback/remote.rs": "05e70f3f4d006e38222a88b622f72882173a0a44c5c628acbbc8994325230792"
+    },
+    "probe_source_sha256": "cf44ecd7894219953f8855e4b816edd5ccc066ef6977051c8aa1f98b48ad6a49",
+    "raw_log_sha256": "a73e6c38b40fd1d88cacb8a7b35dbace8095ba83f87b10f6428d488199167cb6",
+    "method": {
+      "payload_bytes": 33554432,
+      "pairs": 8,
+      "order": "old/new on even rounds, new/old on odd rounds",
+      "cache_state": "hot local journal file written during setup",
+      "old": "open_verified_blob on blocking worker, then range_stream in16MiB chunks retained through collection",
+      "new": "read_blob_bounded on blocking worker,36MiB limit",
+      "cpu_clock": "getrusage(RUSAGE_SELF), user plus system",
+      "verification": "Each collected payload compared byte-for-byte after timing",
+      "excludes": [
+        "backend PUT",
+        "network",
+        "physical disk throughput",
+        "full writeback scheduler"
+      ],
+      "physical_io_syscall_counts": "unavailable; ptrace restriction prevented strace"
+    },
+    "source_observation_full_payload_verification_passes": {
+      "old": 2,
+      "new": 1
+    },
+    "summary": {
+      "old": {
+        "runs": 8,
+        "median_seconds": 0.6880768675,
+        "median_cpu_seconds": 0.6872930000000002
+      },
+      "new": {
+        "runs": 8,
+        "median_seconds": 0.356970268,
+        "median_cpu_seconds": 0.35240700000000014
+      },
+      "cpu_reduction_percent": 48.725361672532664,
+      "wall_reduction_percent": 48.120582908565815,
+      "measurement_scope": "Normal dev-profile hot-cache32MiB preload only. No backend publication/network or NAS performance measured."
+    },
+    "samples": [
+      {
+        "mode": "old",
+        "round": 0,
+        "bytes": 33554432,
+        "seconds": 0.733173105,
+        "cpu_seconds": 0.7332700000000001
+      },
+      {
+        "mode": "new",
+        "round": 0,
+        "bytes": 33554432,
+        "seconds": 0.374676824,
+        "cpu_seconds": 0.3746569999999998
+      },
+      {
+        "mode": "new",
+        "round": 1,
+        "bytes": 33554432,
+        "seconds": 0.35759241,
+        "cpu_seconds": 0.3523080000000003
+      },
+      {
+        "mode": "old",
+        "round": 1,
+        "bytes": 33554432,
+        "seconds": 0.689984196,
+        "cpu_seconds": 0.6895880000000001
+      },
+      {
+        "mode": "old",
+        "round": 2,
+        "bytes": 33554432,
+        "seconds": 0.655734178,
+        "cpu_seconds": 0.6556190000000002
+      },
+      {
+        "mode": "new",
+        "round": 2,
+        "bytes": 33554432,
+        "seconds": 0.329201537,
+        "cpu_seconds": 0.32919000000000054
+      },
+      {
+        "mode": "new",
+        "round": 3,
+        "bytes": 33554432,
+        "seconds": 0.372543288,
+        "cpu_seconds": 0.36854999999999993
+      },
+      {
+        "mode": "old",
+        "round": 3,
+        "bytes": 33554432,
+        "seconds": 0.693892699,
+        "cpu_seconds": 0.6935400000000005
+      },
+      {
+        "mode": "old",
+        "round": 4,
+        "bytes": 33554432,
+        "seconds": 0.686169539,
+        "cpu_seconds": 0.6849980000000002
+      },
+      {
+        "mode": "new",
+        "round": 4,
+        "bytes": 33554432,
+        "seconds": 0.349977895,
+        "cpu_seconds": 0.345739
+      },
+      {
+        "mode": "new",
+        "round": 5,
+        "bytes": 33554432,
+        "seconds": 0.327276148,
+        "cpu_seconds": 0.32724500000000045
+      },
+      {
+        "mode": "old",
+        "round": 5,
+        "bytes": 33554432,
+        "seconds": 0.660506577,
+        "cpu_seconds": 0.6605620000000005
+      },
+      {
+        "mode": "old",
+        "round": 6,
+        "bytes": 33554432,
+        "seconds": 0.654102761,
+        "cpu_seconds": 0.6541229999999993
+      },
+      {
+        "mode": "new",
+        "round": 6,
+        "bytes": 33554432,
+        "seconds": 0.356348126,
+        "cpu_seconds": 0.352506
+      },
+      {
+        "mode": "new",
+        "round": 7,
+        "bytes": 33554432,
+        "seconds": 0.39114592,
+        "cpu_seconds": 0.39093399999999967
+      },
+      {
+        "mode": "old",
+        "round": 7,
+        "bytes": 33554432,
+        "seconds": 0.740527614,
+        "cpu_seconds": 0.7405120000000007
+      }
+    ]
+  },
+  "native_worker_dispatch": {
+    "harness": "pass7-local-workers-harness",
+    "profile": "normal development dependencies; harness rustc opt-level0, debuginfo0, codegen-units32",
+    "production_source_sha256": {
+      "zerofs/src/local_object_store.rs": "1db843e2751dd9d7cef5384138e68058fb3cc7397c18d926e9d7b1b24c64c74d",
+      "zerofs/src/local_object_store/worker.rs": "0ef2fb39c3dbac5fb378aff8b6c7d6491c5ce229bfbb96471aad6ecc60ce03aa"
+    },
+    "probe_source_sha256": "59887e1d9bb5f47d1664643568f06c844a00e4b354c5d3a73b2a3fdcf6d7f3f7",
+    "raw_log_sha256": "afee57a8c604aab3fa3bdae830ff6dd14fa3876e218e84d5ba9d1809cce3408d",
+    "method": {
+      "operations_per_sample": 2000,
+      "pairs": 8,
+      "order": "reused/spawned on even rounds, spawned/reused on odd rounds",
+      "operation": "sequential no-op dispatch returning native thread ID",
+      "cpu_clock": "/proc/self/stat user plus system ticks divided by100;10ms resolution",
+      "runtime": "current-thread Tokio caller; operations on native threads outside Tokio",
+      "maximum_workers": 32,
+      "idle_timeout_seconds": 10,
+      "excludes": [
+        "filesystem IO",
+        "copy throughput",
+        "NAS performance"
+      ]
+    },
+    "summary": {
+      "spawned": {
+        "median_seconds": 0.19399751999999998,
+        "median_cpu_seconds": 0.12000000000000005,
+        "distinct_threads_each_sample": [
+          2000,
+          2000,
+          2000,
+          2000,
+          2000,
+          2000,
+          2000,
+          2000
+        ]
+      },
+      "reused": {
+        "median_seconds": 0.170502588,
+        "median_cpu_seconds": 0.11499999999999999,
+        "distinct_threads_each_sample": [
+          3,
+          3,
+          3,
+          12,
+          13,
+          13,
+          13,
+          13
+        ]
+      },
+      "scope": "2000 no-op native-worker dispatches per sample, 8 alternating pairs, process CPU ticks; not disk or NAS throughput"
+    },
+    "samples": [
+      {
+        "cpu_seconds": 0.11,
+        "distinct_threads": 3,
+        "operations": 2000,
+        "round": 0,
+        "seconds": 0.183466944,
+        "variant": "reused"
+      },
+      {
+        "cpu_seconds": 0.21000000000000002,
+        "distinct_threads": 2000,
+        "operations": 2000,
+        "round": 0,
+        "seconds": 0.426926023,
+        "variant": "spawned"
+      },
+      {
+        "cpu_seconds": 0.12,
+        "distinct_threads": 2000,
+        "operations": 2000,
+        "round": 1,
+        "seconds": 0.189506356,
+        "variant": "spawned"
+      },
+      {
+        "cpu_seconds": 0.13999999999999996,
+        "distinct_threads": 3,
+        "operations": 2000,
+        "round": 1,
+        "seconds": 0.230420759,
+        "variant": "reused"
+      },
+      {
+        "cpu_seconds": 0.09999999999999998,
+        "distinct_threads": 3,
+        "operations": 2000,
+        "round": 2,
+        "seconds": 0.106353981,
+        "variant": "reused"
+      },
+      {
+        "cpu_seconds": 0.1200000000000001,
+        "distinct_threads": 2000,
+        "operations": 2000,
+        "round": 2,
+        "seconds": 0.18298728,
+        "variant": "spawned"
+      },
+      {
+        "cpu_seconds": 0.1299999999999999,
+        "distinct_threads": 2000,
+        "operations": 2000,
+        "round": 3,
+        "seconds": 0.2144535,
+        "variant": "spawned"
+      },
+      {
+        "cpu_seconds": 0.21999999999999997,
+        "distinct_threads": 12,
+        "operations": 2000,
+        "round": 3,
+        "seconds": 0.237807671,
+        "variant": "reused"
+      },
+      {
+        "cpu_seconds": 0.19000000000000017,
+        "distinct_threads": 13,
+        "operations": 2000,
+        "round": 4,
+        "seconds": 0.529902209,
+        "variant": "reused"
+      },
+      {
+        "cpu_seconds": 0.15999999999999992,
+        "distinct_threads": 2000,
+        "operations": 2000,
+        "round": 4,
+        "seconds": 0.210836197,
+        "variant": "spawned"
+      },
+      {
+        "cpu_seconds": 0.1100000000000001,
+        "distinct_threads": 2000,
+        "operations": 2000,
+        "round": 5,
+        "seconds": 0.198488684,
+        "variant": "spawned"
+      },
+      {
+        "cpu_seconds": 0.11999999999999988,
+        "distinct_threads": 13,
+        "operations": 2000,
+        "round": 5,
+        "seconds": 0.154753938,
+        "variant": "reused"
+      },
+      {
+        "cpu_seconds": 0.1100000000000001,
+        "distinct_threads": 13,
+        "operations": 2000,
+        "round": 6,
+        "seconds": 0.157538232,
+        "variant": "reused"
+      },
+      {
+        "cpu_seconds": 0.10999999999999988,
+        "distinct_threads": 2000,
+        "operations": 2000,
+        "round": 6,
+        "seconds": 0.163342702,
+        "variant": "spawned"
+      },
+      {
+        "cpu_seconds": 0.08999999999999986,
+        "distinct_threads": 2000,
+        "operations": 2000,
+        "round": 7,
+        "seconds": 0.135688851,
+        "variant": "spawned"
+      },
+      {
+        "cpu_seconds": 0.10000000000000009,
+        "distinct_threads": 13,
+        "operations": 2000,
+        "round": 7,
+        "seconds": 0.113233789,
+        "variant": "reused"
+      }
+    ]
+  },
+  "frame_codec": {
+    "harness": "pass7-codec-probe",
+    "profile": "opt-level3, codegen-units1, pinned dependencies, System allocator",
+    "before_source_sha256": "e20165cada80f028d63b7eb79e6ae4d7218384d4318cd3c77199d65b93f34a6a",
+    "after_source_sha256": "084c0d29ac7cd64b3f5f824892588cb692f0592581324fa4cbfeb813cdf76dce",
+    "cargo_lock_sha256": "8092ca286d2a6fadfecd1fd572010c876883526d11b76ed932d5eff8b81b59ca",
+    "probe_source_sha256": "1009c9bd8acaf8c118812546a72903483869bd2034b60fcf8944f7ec21e27ec1",
+    "raw_log_sha256": "8abb90a725674d9f765456eca1269dc2dcc990fcd73c71c315a043bf80c430fb",
+    "method": {
+      "frame_bytes": 32768,
+      "frames_per_sample": 8192,
+      "pairs": 7,
+      "affinity_cpu": 8,
+      "order": "before/after on even iterations, after/before on odd iterations",
+      "warmup_pairs_per_case": 64,
+      "allocation_count_frames_per_case": 32,
+      "cpu_clock": "clock_gettime(CLOCK_PROCESS_CPUTIME_ID)",
+      "allocation_scope": "Rust allocator requests only; zstd C allocations excluded",
+      "inputs": "xorshift-generated high-entropy bytes and repeated0xAB bytes",
+      "timing_limit": "Mixed small CPU changes; elapsed samples can be descheduled; no NAS or complete-write throughput claim"
+    },
+    "samples_and_summaries": [
+      {
+        "after_allocations": {
+          "allocs_per_frame": 2.0,
+          "reallocs_per_frame": 1.0,
+          "requested_bytes_per_frame": 77242.0
+        },
+        "after_cpu_seconds": [
+          0.307360851,
+          0.301888277,
+          0.30100259100000004,
+          0.3159674250000002,
+          0.2790308509999999,
+          0.2987474589999999,
+          0.2935436720000002
+        ],
+        "after_relocation_allocations": {
+          "allocs_per_frame": 1.0,
+          "reallocs_per_frame": 0.0,
+          "requested_bytes_per_frame": 32942.0
+        },
+        "after_seconds": [
+          0.307452174,
+          0.302043987,
+          0.30117046,
+          0.315967913,
+          0.279502961,
+          0.325193753,
+          0.293543965
+        ],
+        "before_allocations": {
+          "allocs_per_frame": 3.0,
+          "reallocs_per_frame": 1.0,
+          "requested_bytes_per_frame": 110104.0
+        },
+        "before_cpu_seconds": [
+          0.30502649,
+          0.30986509800000006,
+          0.32351094699999994,
+          0.30295340400000015,
+          0.29250279400000023,
+          0.30476423399999986,
+          0.2891580789999999
+        ],
+        "before_relocation_allocations": {
+          "allocs_per_frame": 2.0,
+          "reallocs_per_frame": 0.0,
+          "requested_bytes_per_frame": 65860.0
+        },
+        "before_seconds": [
+          0.305069574,
+          0.329206556,
+          0.323766954,
+          0.302967745,
+          0.292503375,
+          0.305623024,
+          0.289434292
+        ],
+        "codec": "lz4",
+        "frame_bytes": 32768,
+        "frames_per_sample": 8192,
+        "input": "noise",
+        "iterations": 7,
+        "median_after_cpu_seconds": 0.30100259100000004,
+        "median_after_seconds": 0.302043987,
+        "median_before_cpu_seconds": 0.30476423399999986,
+        "median_before_seconds": 0.305069574,
+        "median_cpu_reduction_percent": 1.2342796760067998,
+        "median_elapsed_reduction_percent": 0.9917695037001573
+      },
+      {
+        "after_allocations": {
+          "allocs_per_frame": 2.0,
+          "reallocs_per_frame": 1.0,
+          "requested_bytes_per_frame": 44484.0
+        },
+        "after_cpu_seconds": [
+          0.039953718999999666,
+          0.044052355999999904,
+          0.041468047000000396,
+          0.04186472000000041,
+          0.041323345000000344,
+          0.0410888620000005,
+          0.04459069700000029
+        ],
+        "after_relocation_allocations": {
+          "allocs_per_frame": 1.0,
+          "reallocs_per_frame": 0.0,
+          "requested_bytes_per_frame": 184.0
+        },
+        "after_seconds": [
+          0.03995559,
+          0.044064703,
+          0.041469749,
+          0.041867057,
+          0.041325553,
+          0.041090499,
+          0.044729797
+        ],
+        "before_allocations": {
+          "allocs_per_frame": 3.0,
+          "reallocs_per_frame": 1.0,
+          "requested_bytes_per_frame": 44588.0
+        },
+        "before_cpu_seconds": [
+          0.0398771309999999,
+          0.05187869699999936,
+          0.045541790999999776,
+          0.04281443100000004,
+          0.0451272110000005,
+          0.04340559300000013,
+          0.040455834999999496
+        ],
+        "before_relocation_allocations": {
+          "allocs_per_frame": 2.0,
+          "reallocs_per_frame": 0.0,
+          "requested_bytes_per_frame": 344.0
+        },
+        "before_seconds": [
+          0.0398962,
+          0.051879935,
+          0.045578006,
+          0.042816014,
+          0.045129972,
+          0.043422255,
+          0.040457503
+        ],
+        "codec": "lz4",
+        "frame_bytes": 32768,
+        "frames_per_sample": 8192,
+        "input": "repeated",
+        "iterations": 7,
+        "median_after_cpu_seconds": 0.041468047000000396,
+        "median_after_seconds": 0.041469749,
+        "median_before_cpu_seconds": 0.04340559300000013,
+        "median_before_seconds": 0.043422255,
+        "median_cpu_reduction_percent": 4.463816448722935,
+        "median_elapsed_reduction_percent": 4.49655597112587
+      },
+      {
+        "after_allocations": {
+          "allocs_per_frame": 1.0,
+          "reallocs_per_frame": 1.0,
+          "requested_bytes_per_frame": 65810.0
+        },
+        "after_cpu_seconds": [
+          0.518175576,
+          0.48514247499999996,
+          0.4016500789999995,
+          0.39895709799999945,
+          0.38418699000000167,
+          0.39525513299999915,
+          0.39733348799999924
+        ],
+        "after_relocation_allocations": {
+          "allocs_per_frame": 1.0,
+          "reallocs_per_frame": 0.0,
+          "requested_bytes_per_frame": 32822.0
+        },
+        "after_seconds": [
+          0.518287373,
+          0.48515367,
+          0.424790853,
+          0.399054848,
+          0.384285039,
+          0.424885316,
+          0.397344614
+        ],
+        "before_allocations": {
+          "allocs_per_frame": 3.0,
+          "reallocs_per_frame": 0.0,
+          "requested_bytes_per_frame": 98548.0
+        },
+        "before_cpu_seconds": [
+          0.42964362499999975,
+          0.40874737200000055,
+          0.39057601900000005,
+          0.39887631499999987,
+          0.4046447880000006,
+          0.3982752240000007,
+          0.3933336979999993
+        ],
+        "before_relocation_allocations": {
+          "allocs_per_frame": 2.0,
+          "reallocs_per_frame": 0.0,
+          "requested_bytes_per_frame": 65620.0
+        },
+        "before_seconds": [
+          0.443977644,
+          0.408989372,
+          0.390682023,
+          0.398886747,
+          0.40465505,
+          0.398345355,
+          0.393370905
+        ],
+        "codec": "zstd1",
+        "frame_bytes": 32768,
+        "frames_per_sample": 8192,
+        "input": "noise",
+        "iterations": 7,
+        "median_after_cpu_seconds": 0.39895709799999945,
+        "median_after_seconds": 0.424790853,
+        "median_before_cpu_seconds": 0.39887631499999987,
+        "median_before_seconds": 0.398886747,
+        "median_cpu_reduction_percent": -0.020252643980533946,
+        "median_elapsed_reduction_percent": -6.494100441998407
+      },
+      {
+        "after_allocations": {
+          "allocs_per_frame": 2.0,
+          "reallocs_per_frame": 0.0,
+          "requested_bytes_per_frame": 33051.0
+        },
+        "after_cpu_seconds": [
+          0.05035856199999955,
+          0.05013511900000012,
+          0.04792305700000021,
+          0.05443952999999979,
+          0.05087402100000027,
+          0.04693436600000034,
+          0.04852852700000021
+        ],
+        "after_relocation_allocations": {
+          "allocs_per_frame": 1.0,
+          "reallocs_per_frame": 0.0,
+          "requested_bytes_per_frame": 63.0
+        },
+        "after_seconds": [
+          0.051258241,
+          0.05013702,
+          0.047924835,
+          0.054440907,
+          0.050895278,
+          0.046935548,
+          0.056299364
+        ],
+        "before_allocations": {
+          "allocs_per_frame": 3.0,
+          "reallocs_per_frame": 0.0,
+          "requested_bytes_per_frame": 33030.0
+        },
+        "before_cpu_seconds": [
+          0.05243698399999985,
+          0.04679331100000006,
+          0.15516441599999986,
+          0.17051696799999938,
+          0.051827635999998733,
+          0.053789335999999466,
+          0.061542234999999224
+        ],
+        "before_relocation_allocations": {
+          "allocs_per_frame": 2.0,
+          "reallocs_per_frame": 0.0,
+          "requested_bytes_per_frame": 102.0
+        },
+        "before_seconds": [
+          0.052460884,
+          0.04679501,
+          0.155829564,
+          0.17051803,
+          0.051851376,
+          0.064187657,
+          0.075496895
+        ],
+        "codec": "zstd1",
+        "frame_bytes": 32768,
+        "frames_per_sample": 8192,
+        "input": "repeated",
+        "iterations": 7,
+        "median_after_cpu_seconds": 0.05013511900000012,
+        "median_after_seconds": 0.050895278,
+        "median_before_cpu_seconds": 0.053789335999999466,
+        "median_before_seconds": 0.064187657,
+        "median_cpu_reduction_percent": 6.793571499003792,
+        "median_elapsed_reduction_percent": 20.70862159682818
+      },
+      {
+        "after_allocations": {
+          "allocs_per_frame": 1.0,
+          "reallocs_per_frame": 1.0,
+          "requested_bytes_per_frame": 65810.0
+        },
+        "after_cpu_seconds": [
+          0.435956366000001,
+          0.4114612389999994,
+          0.40686173499999967,
+          0.42469912699999846,
+          0.41622980100000007,
+          0.42169790600000034,
+          0.4211936709999975
+        ],
+        "after_relocation_allocations": {
+          "allocs_per_frame": 1.0,
+          "reallocs_per_frame": 0.0,
+          "requested_bytes_per_frame": 32822.0
+        },
+        "after_seconds": [
+          0.43670977,
+          0.411534149,
+          0.406871725,
+          0.424734105,
+          0.43228283,
+          0.421707577,
+          0.421204176
+        ],
+        "before_allocations": {
+          "allocs_per_frame": 3.0,
+          "reallocs_per_frame": 0.0,
+          "requested_bytes_per_frame": 98548.0
+        },
+        "before_cpu_seconds": [
+          0.42246321100000017,
+          0.4760215530000007,
+          0.4505841040000007,
+          0.4219012220000007,
+          0.458124368,
+          0.4343634509999994,
+          0.42201648300000016
+        ],
+        "before_relocation_allocations": {
+          "allocs_per_frame": 2.0,
+          "reallocs_per_frame": 0.0,
+          "requested_bytes_per_frame": 65620.0
+        },
+        "before_seconds": [
+          0.42255291,
+          0.476031125,
+          0.467401914,
+          0.425456542,
+          0.458852096,
+          0.434410972,
+          0.422026632
+        ],
+        "codec": "zstd3",
+        "frame_bytes": 32768,
+        "frames_per_sample": 8192,
+        "input": "noise",
+        "iterations": 7,
+        "median_after_cpu_seconds": 0.4211936709999975,
+        "median_after_seconds": 0.421707577,
+        "median_before_cpu_seconds": 0.4343634509999994,
+        "median_before_seconds": 0.434410972,
+        "median_cpu_reduction_percent": 3.031972411509809,
+        "median_elapsed_reduction_percent": 2.924280420799319
+      },
+      {
+        "after_allocations": {
+          "allocs_per_frame": 2.0,
+          "reallocs_per_frame": 0.0,
+          "requested_bytes_per_frame": 33051.0
+        },
+        "after_cpu_seconds": [
+          0.060501698999999576,
+          0.057073221999999646,
+          0.06331985899999992,
+          0.05977657000000036,
+          0.05967184400000036,
+          0.05981863599999926,
+          0.05744156899999808
+        ],
+        "after_relocation_allocations": {
+          "allocs_per_frame": 1.0,
+          "reallocs_per_frame": 0.0,
+          "requested_bytes_per_frame": 63.0
+        },
+        "after_seconds": [
+          0.070828371,
+          0.057075316,
+          0.063321368,
+          0.059792005,
+          0.059673659,
+          0.059819562,
+          0.057442962
+        ],
+        "before_allocations": {
+          "allocs_per_frame": 3.0,
+          "reallocs_per_frame": 0.0,
+          "requested_bytes_per_frame": 33030.0
+        },
+        "before_cpu_seconds": [
+          0.05740005399999859,
+          0.05733683700000114,
+          0.06069683499999812,
+          0.06031559799999897,
+          0.06621270899999843,
+          0.05806932499999817,
+          0.05651192100000202
+        ],
+        "before_relocation_allocations": {
+          "allocs_per_frame": 2.0,
+          "reallocs_per_frame": 0.0,
+          "requested_bytes_per_frame": 102.0
+        },
+        "before_seconds": [
+          0.063228031,
+          0.057338856,
+          0.060698222,
+          0.060317333,
+          0.066215695,
+          0.058356301,
+          0.056514114
+        ],
+        "codec": "zstd3",
+        "frame_bytes": 32768,
+        "frames_per_sample": 8192,
+        "input": "repeated",
+        "iterations": 7,
+        "median_after_cpu_seconds": 0.05977657000000036,
+        "median_after_seconds": 0.059792005,
+        "median_before_cpu_seconds": 0.05806932499999817,
+        "median_before_seconds": 0.060317333,
+        "median_cpu_reduction_percent": -2.940011787638719,
+        "median_elapsed_reduction_percent": 0.8709403646875447
+      }
+    ]
+  },
+  "ninep_io_context": {
+    "harness": "pass7-protocol-harness",
+    "profile": "normal development dependencies; no Rust optimization flag",
+    "production_source_sha256": {
+      "zerofs/src/ninep/handler.rs": "21416765486a8f392bd21b5f129686ab07473819055ec5393d54bb91b08b600b",
+      "zerofs/src/fs/permissions.rs": "95f977708ba0c945ac4cc91228ad8b1588063904e165533f489814e20aeae036"
+    },
+    "probe_source_sha256": "54b238b976ca8825ebfe9544a4654887b3118199b3f356ac32c697b835bc55fb",
+    "production_definitions": [
+      "Credentials",
+      "Fid",
+      "IoFidContext",
+      "fid_allows_read",
+      "fid_allows_write",
+      "session_state",
+      "get_fid",
+      "get_fid_io_context"
+    ],
+    "fixture_reductions": [
+      "SessionState and FidSlot carry only fields the two getter bodies read; resource guards are outside this isolated allocation probe.",
+      "Only BadFid error variant is needed for successful lookup fixtures.",
+      "Single-thread System allocator counting; setup and first Bytes sharing promotion excluded."
+    ],
+    "scope": "Per-lookup allocation count, not throughput or open-handle lifecycle; lifecycle is checked by separate actual-source integration tests.",
+    "measurements": [
+      {
+        "depth": 0,
+        "iterations": 10000,
+        "old_allocations": 0,
+        "old_allocated_bytes": 0,
+        "new_allocations": 0,
+        "new_allocated_bytes": 0
+      },
+      {
+        "depth": 1,
+        "iterations": 10000,
+        "old_allocations": 10000,
+        "old_allocated_bytes": 320000,
+        "new_allocations": 0,
+        "new_allocated_bytes": 0
+      },
+      {
+        "depth": 8,
+        "iterations": 10000,
+        "old_allocations": 10000,
+        "old_allocated_bytes": 2560000,
+        "new_allocations": 0,
+        "new_allocated_bytes": 0
+      },
+      {
+        "depth": 48,
+        "iterations": 10000,
+        "old_allocations": 10000,
+        "old_allocated_bytes": 15360000,
+        "new_allocations": 0,
+        "new_allocated_bytes": 0
+      }
+    ]
+  },
+  "decoded_cache": {
+    "harness": "pass7-cache-retention",
+    "probe_source_sha256": "ba83148a2c81e94acc97d04d737b9c373b361058ccc3e41c925ac8c0ed320e49",
+    "scope": "Pinned Bytes/Foyer backing-owner retention counterexample; one surviving32KiB entry from a1MiB request",
+    "samples": [
+      {
+        "copy_extent": false,
+        "cache_weight_bytes": 32768,
+        "request_backing_retained_bytes": 1048576
+      },
+      {
+        "copy_extent": true,
+        "cache_weight_bytes": 32768,
+        "request_backing_retained_bytes": 0
+      }
+    ],
+    "production_tradeoff": "Write cache population copies each extent into owned bytes; normal read-populated frames already own decoded data",
+    "small_budget_policy": "shared cache builder uses clamp(capacity/EXTENT_SIZE,1,8) shards and skips entries larger than whole capacity"
+  },
+  "contiguous_presized_writes": {
+    "evidence_type": "source rationale and focused correctness regressions; no timing benchmark",
+    "rule": "Nonempty contiguous single-inode accepted writes may reuse the prior projection only while its exact Weak canonical guard upgrades",
+    "unchanged_guards": [
+      "256-write continuation limit",
+      "permission checks",
+      "logical quota growth",
+      "same-inode FIFO materialization through commit",
+      "partial-extent overlap waits",
+      "replay and cancellation fallback"
+    ],
+    "final_integration_gate": "reported separately by the review owner"
+  }
+}

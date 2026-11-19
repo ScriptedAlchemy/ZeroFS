@@ -1,0 +1,2 @@
+container absent zerofs-sustained-CAVaVCH2
+scratch absent /var/tmp/zerofs-sustained-run.CAVaVCH2

@@ -32,26 +32,28 @@ fn zerofs_binary() -> PathBuf {
     if let Ok(bin) = std::env::var("ZEROFS_BIN") {
         return PathBuf::from(bin);
     }
-    // target/debug/deps/integration-... -> target/debug/zerofs
-    let exe = std::env::current_exe().expect("current_exe");
-    let debug_dir = exe
-        .parent()
-        .and_then(Path::parent)
-        .expect("test executable outside target dir");
-    let candidate = debug_dir.join("zerofs");
-    if candidate.exists() {
-        return candidate;
-    }
+    // Cargo writes final binaries to <target dir>/debug even when it runs
+    // test executables from target/debug/build/<package>/<hash>/out.
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("workspace root");
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map_or_else(|| workspace.join("target"), PathBuf::from);
+    let candidate = target_dir.join("debug").join("zerofs");
+    if candidate.exists() {
+        return candidate;
+    }
     let status = Command::new(env!("CARGO"))
         .args(["build", "-p", "zerofs", "--bin", "zerofs"])
         .current_dir(workspace)
         .status()
         .expect("failed to run cargo build -p zerofs");
     assert!(status.success(), "cargo build -p zerofs failed");
-    assert!(candidate.exists(), "zerofs binary missing after build");
+    assert!(
+        candidate.exists(),
+        "zerofs binary missing at {} after build",
+        candidate.display()
+    );
     candidate
 }
 

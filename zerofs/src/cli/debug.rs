@@ -5,7 +5,6 @@ use crate::db::SlateDbHandle;
 use crate::fs::CacheConfig;
 use crate::fs::key_codec::{EXTENT_DOMAIN, KeyCodec, KeyPrefix, META_DOMAIN, ParsedKey};
 use crate::key_management;
-#[cfg(test)]
 use crate::storage_backend::{OpenedStorage, open_storage};
 use crate::storage_class_object_store::with_storage_class;
 use anyhow::{Context, Result};
@@ -113,8 +112,9 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
         path: path_from_url,
         sftp_pool,
         pool: _,
+        metadata_fault,
     } = open_storage(&settings).await?;
-    let command_result: Result<()> = async move {
+    let command = async move {
         let object_store = with_storage_class(
             Arc::from(object_store),
             settings.storage.storage_class.as_deref(),
@@ -126,6 +126,7 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
             crate::bucket_identity::BucketIdentity::get_or_create(&object_store, &actual_db_path)
                 .await?;
 
+        crate::storage_readiness::verify_bucket_paths(&settings, &bucket.cache_directory_name())?;
         let cache_config = CacheConfig {
             root_folder: cache_config.root_folder.join(bucket.cache_directory_name()),
             ..cache_config
@@ -137,9 +138,14 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("Password validation failed: {}", e))?;
 
         let db_path = Path::from(actual_db_path.clone());
-        let encryption_key =
-            key_management::load_or_init_encryption_key(&object_store, &db_path, &password, false)
-                .await?;
+        let encryption_key = key_management::load_or_init_encryption_key_with_mode(
+            &object_store,
+            &db_path,
+            &password,
+            settings.name_mode(),
+            false,
+        )
+        .await?;
 
         let block_transformer: Arc<dyn BlockTransformer> =
             ZeroFsBlockTransformer::new_arc(&encryption_key, settings.compression());
@@ -231,8 +237,9 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
         db.close().await.context("Failed to close debug database")?;
 
         Ok(())
-    }
-    .await;
+    };
+    // SlateDB retries a failed metadata read without limit.
+    let command_result: Result<()> = metadata_fault.bound(command).await;
 
     finish_with_sftp_cleanup(
         sftp_pool.as_ref(),
@@ -242,14 +249,14 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
     .await
 }
 
-pub async fn reseed_writeback_predecessor(
-    config_path: PathBuf,
-    journal_path: PathBuf,
-    path: String,
-    sequence: u64,
-) -> Result<()> {
-    let settings = Settings::from_file(&config_path)
+fn load_journal_recovery_settings(config_path: &std::path::Path) -> Result<Settings> {
+    let settings = Settings::from_file(config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
+    if settings.storage.readiness.is_some() {
+        anyhow::bail!(
+            "storage readiness refuses --journal recovery because the supplied journal's filesystem binding cannot be verified"
+        );
+    }
     if !settings
         .writeback
         .as_ref()
@@ -257,11 +264,22 @@ pub async fn reseed_writeback_predecessor(
     {
         anyhow::bail!("[writeback] must be enabled in the supplied config");
     }
+    Ok(settings)
+}
+
+pub async fn reseed_writeback_predecessor(
+    config_path: PathBuf,
+    journal_path: PathBuf,
+    path: String,
+    sequence: u64,
+) -> Result<()> {
+    let settings = load_journal_recovery_settings(&config_path)?;
     let OpenedStorage {
         store: remote,
         sftp_pool,
         path: database_path,
         pool: _,
+        metadata_fault: _,
     } = open_storage(&settings).await?;
     let remote = with_storage_class(Arc::from(remote), settings.storage.storage_class.as_deref());
     let location = Path::parse(&path).context("invalid remote predecessor path")?;
@@ -327,20 +345,13 @@ pub async fn accept_remote_writeback_branch(
     }
     let local_sha256 = parse_sha256(&expected_local_sha256, "local SHA-256")?;
     let remote_sha256 = parse_sha256(&expected_remote_sha256, "remote SHA-256")?;
-    let settings = Settings::from_file(&config_path)
-        .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
-    if !settings
-        .writeback
-        .as_ref()
-        .is_some_and(|writeback| writeback.enabled)
-    {
-        anyhow::bail!("[writeback] must be enabled in the supplied config");
-    }
+    let settings = load_journal_recovery_settings(&config_path)?;
     let OpenedStorage {
         store: remote,
         sftp_pool,
         path: database_path,
         pool: _,
+        metadata_fault: _,
     } = open_storage(&settings).await?;
     let remote = with_storage_class(Arc::from(remote), settings.storage.storage_class.as_deref());
     let location = Path::parse(&manifest_path).context("invalid divergent manifest path")?;
@@ -410,6 +421,24 @@ pub async fn accept_remote_writeback_branch(
 
 fn hex_sha256(digest: [u8; 32]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Scan the clean-cache files at or under `path`, print the report, and
+/// return the exit status it calls for.
+pub fn scan_cache_files(
+    path: &std::path::Path,
+    json: bool,
+    live: bool,
+    legacy: bool,
+) -> Result<i32> {
+    use crate::cli::server::cache_scan;
+    let report = cache_scan::scan_cache_files(path, cache_scan::ScanOptions { live, legacy })?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", cache_scan::render(&report));
+    }
+    Ok(report.exit_status)
 }
 
 #[cfg(test)]
@@ -699,10 +728,11 @@ mod tests {
         BucketIdentity::get_or_create(&remote, &prefix)
             .await
             .unwrap();
-        key_management::load_or_init_encryption_key(
+        key_management::load_or_init_encryption_key_with_mode(
             &remote,
             &Path::from(prefix.clone()),
             password,
+            settings.name_mode(),
             false,
         )
         .await
@@ -714,6 +744,119 @@ mod tests {
         let config = temp.path().join(format!("config-{namespace}.toml"));
         fs::write(&config, toml::to_string(&settings).unwrap()).unwrap();
         (config, remote, prefix, identity)
+    }
+
+    async fn readiness_recovery_config(
+        temp: &TempDir,
+    ) -> (PathBuf, Arc<dyn ObjectStore>, String, JournalIdentity) {
+        let (config, remote, prefix, identity) = recovery_config(temp, "a", "a-password").await;
+        let mut document = serde_json::to_value(Settings::from_file(&config).unwrap()).unwrap();
+        let base = temp.path().to_path_buf();
+        let fast = base.join("fast");
+        let catalog = base.join("catalog");
+        let member = base.join("member");
+        for root in [
+            &catalog,
+            &member,
+            &fast.join("cache"),
+            &fast.join("journal"),
+        ] {
+            fs::create_dir_all(root).unwrap();
+        }
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&catalog, fs::Permissions::from_mode(0o700)).unwrap();
+        document["cache"]["dir"] = serde_json::json!(fast.join("cache"));
+        document["writeback"]["dir"] = serde_json::json!(fast.join("journal"));
+        document["storage"]["pool"] = serde_json::json!({
+            "catalog_dir": catalog,
+            "members": [{"id": "data", "url": url::Url::from_directory_path(member).unwrap().as_str(),
+                "capacity_gb": 0.01, "reserve_free_gb": 0.001}]
+        });
+        document["storage"]["readiness"] = serde_json::json!({
+            "strict": false, "authority": "durable", "catalog": "durable", "cache": "fast", "journal": "fast",
+            "members": {"data": "durable"},
+            "reserves": [
+                {"filesystem": "durable", "bytes": 1_000_000},
+                {"filesystem": "fast", "bytes": 1_000_000}
+            ],
+            "filesystems": [
+                {"id": "durable", "profile": "hdd-cmr", "mountpoint": base,
+                    "identity": {"kind": "zfs", "pool_guid": "101", "dataset_guid": "201"}},
+                {"id": "fast", "profile": "nvme", "mountpoint": fast,
+                    "identity": {"kind": "uuid", "uuid": "47166772-65c1-4ecf-8066-935452891add"}}
+            ]
+        });
+        fs::write(&config, toml::to_string(&document).unwrap()).unwrap();
+        let settings = Settings::from_file(&config).unwrap();
+        drop(
+            crate::storage_backend::open_pool_storage(&settings, true)
+                .await
+                .unwrap(),
+        );
+        (config, remote, prefix, identity)
+    }
+
+    #[tokio::test]
+    async fn readiness_refuses_relocated_recovery_journals_before_mutation() {
+        for (strict, accept) in [(false, false), (true, false), (false, true), (true, true)] {
+            let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+            let (config, remote, prefix, identity) = readiness_recovery_config(&temp).await;
+            let mut document: toml::Value =
+                toml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+            document["storage"]["readiness"]["strict"] = toml::Value::Boolean(strict);
+            fs::write(&config, toml::to_string(&document).unwrap()).unwrap();
+            let journal_path = temp.path().join("relocated-journal");
+            let (object, local, payload): (String, &[u8], &[u8]) = if accept {
+                (
+                    format!("{prefix}/manifest/00000000000000000007.manifest"),
+                    b"local manifest",
+                    b"remote manifest",
+                )
+            } else {
+                (
+                    format!("{prefix}/recovery/predecessor"),
+                    b"local predecessor",
+                    b"remote predecessor",
+                )
+            };
+            remote
+                .put(&Path::from(object.as_str()), payload.into())
+                .await
+                .unwrap();
+            let journal = Journal::open(&journal_path, identity).unwrap();
+            journal
+                .commit_put(recovery_put(1, &object, local), local)
+                .unwrap();
+            if !accept {
+                journal.mark_remote(1, None).unwrap();
+            }
+            drop(journal);
+            let before = stopped_journal_files(&journal_path);
+            let result = if accept {
+                accept_remote_writeback_branch(
+                    config,
+                    journal_path.clone(),
+                    0,
+                    1,
+                    object,
+                    hex_sha256(Sha256::digest(local).into()),
+                    hex_sha256(Sha256::digest(payload).into()),
+                    true,
+                )
+                .await
+            } else {
+                reseed_writeback_predecessor(config, journal_path.clone(), object, 1).await
+            };
+            assert!(
+                result.is_err(),
+                "readiness must refuse relocated recovery journals, strict={strict} accept={accept}"
+            );
+            assert!(
+                format!("{:#}", result.unwrap_err())
+                    .contains("storage readiness refuses --journal recovery")
+            );
+            assert_eq!(stopped_journal_files(&journal_path), before);
+        }
     }
 
     #[tokio::test]

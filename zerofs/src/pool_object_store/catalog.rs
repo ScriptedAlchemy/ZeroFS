@@ -6,7 +6,9 @@
 
 use super::health::{MemberHealth, SegmentFault, SmartSample};
 use super::{EvacuationCapacity, PoolMember, PoolMemberStatus, PoolPlacement, PoolStatus};
-use anyhow::{Context, Result, bail};
+use crate::config::SegmentPlacement;
+use crate::operator_required::operator_required;
+use anyhow::{Context, Result, anyhow, bail};
 use fs4::fs_std::FileExt;
 use object_store::path::Path;
 use redb::{
@@ -22,9 +24,19 @@ use uuid::Uuid;
 
 use crate::writeback::anchored_dir::AnchoredDir;
 
+#[cfg(test)]
+pub(crate) mod survival_test_support;
+
 #[derive(Debug, thiserror::Error)]
 #[error("no pool member has sufficient capacity and local free-space reserve")]
 pub(super) struct NoCapacity;
+
+#[derive(Debug, thiserror::Error)]
+#[error("no pool member is available for placement: {member}: {reason}")]
+pub(super) struct NoAvailableMember {
+    member: String,
+    reason: String,
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("automatic evacuation stopped: multiple devices have unfinished evacuation")]
@@ -41,6 +53,7 @@ pub const CATALOG_FILE_NAME: &str = "pool.redb";
 const HEALTH: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_member_health_v1");
 const FAULTS: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_segment_faults_v1");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_meta");
+const LAST_LOCAL_RESERVATION: &str = "last_local_reservation";
 const MEMBERS: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_members");
 const OBJECTS: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_objects");
 const UPLOADS: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_uploads");
@@ -227,14 +240,14 @@ impl Catalog {
     ) -> Result<Self> {
         let existed = root.join(CATALOG_FILE_NAME).try_exists()?;
         if !existed && !initialize {
-            bail!(
+            return Err(operator_required(anyhow!(
                 "pool catalog is missing; use `zerofs pool init` for a new pool, or restore the existing catalog"
-            );
+            )));
         }
         if !existed && marker.is_some() {
-            bail!(
+            return Err(operator_required(anyhow!(
                 "authority belongs to an existing pool but its catalog is missing; restore that catalog instead of initializing a new pool"
-            );
+            )));
         }
         let anchored = if initialize {
             AnchoredDir::open_or_create_absolute(root, 0o700)?
@@ -260,7 +273,9 @@ impl Catalog {
         let (file, database_existed) =
             anchored.open_owner_file(CATALOG_FILE_NAME.as_ref(), true)?;
         if !database_existed && marker.is_some() {
-            bail!("existing pool catalog disappeared while opening it");
+            return Err(operator_required(anyhow!(
+                "existing pool catalog disappeared while opening it"
+            )));
         }
         let database = Builder::new()
             .create_file(file)
@@ -285,35 +300,39 @@ impl Catalog {
                     catalog_directory: catalog_directory.clone(),
                     initialized: false,
                 },
-                None => bail!(
-                    "pool catalog has no identity; explicit initialization or recovery is required"
-                ),
+                None => {
+                    return Err(operator_required(anyhow!(
+                        "pool catalog has no identity; explicit initialization or recovery is required"
+                    )));
+                }
             };
             if identity.format != 1 || identity.authority_prefix != prefix {
-                bail!("pool catalog format or authority prefix does not match this configuration");
+                return Err(operator_required(anyhow!(
+                    "pool catalog format or authority prefix does not match this configuration"
+                )));
             }
             if identity.catalog_directory != catalog_directory {
-                bail!(
+                return Err(operator_required(anyhow!(
                     "pool is bound to a different catalog directory; restore the catalog at {} instead of opening a moved or copied catalog at {}",
                     identity.catalog_directory,
                     catalog_directory,
-                );
+                )));
             }
             if let Some(marker) = marker {
                 if marker != identity.marker()? {
-                    bail!(
+                    return Err(operator_required(anyhow!(
                         "pool catalog does not belong to this authority (pool identity mismatch)"
-                    );
+                    )));
                 }
             } else if identity.initialized {
-                bail!(
+                return Err(operator_required(anyhow!(
                     "pool authority identity marker is missing; refusing to recreate an existing pool"
-                );
+                )));
             }
             if !initialize && !identity.initialized {
-                bail!(
+                return Err(operator_required(anyhow!(
                     "pool initialization did not finish; rerun `zerofs pool init` with the original configuration"
-                );
+                )));
             }
             table.insert("identity", bincode::serialize(&identity)?.as_slice())?;
             identity
@@ -325,7 +344,9 @@ impl Catalog {
                 .map(|v| bincode::deserialize(v.value()))
                 .transpose()?;
             if version.is_some_and(|v| v != 1) {
-                bail!("unsupported pool health version");
+                return Err(operator_required(anyhow!(
+                    "unsupported pool health version"
+                )));
             }
             meta.insert("health_format", bincode::serialize(&1_u32)?.as_slice())?;
         }
@@ -654,6 +675,8 @@ impl Catalog {
         size: u64,
         members: &[PoolMember],
         target: Option<&str>,
+        skip: &BTreeSet<String>,
+        placement: SegmentPlacement,
     ) -> Result<Upload> {
         let mut tx = self.database.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
@@ -674,14 +697,40 @@ impl Catalog {
                     .checked_add(record.reserved)
                     .context("local pool reservation overflow")?;
             }
-            let mut chosen = None;
-            for member in members
+            let rotate = target.is_none() && placement == SegmentPlacement::RoundRobinLocal;
+            let (locals, start) = if rotate {
+                let meta = tx.open_table(META)?;
+                let last = meta.get(LAST_LOCAL_RESERVATION)?.and_then(|last| {
+                    members
+                        .iter()
+                        .position(|member| member.id.as_bytes() == last.value())
+                });
+                (members, last.map_or(0, |index| index + 1))
+            } else {
+                (&[][..], 0)
+            };
+            let candidates = locals[start..]
                 .iter()
-                .filter(|m| target.is_none_or(|id| id == m.id))
-            {
-                if health_in(&tx, &member.id)?.quarantine.is_some()
-                    || health_in(&tx, &member.id)?.monitoring_error.is_some()
-                {
+                .chain(&locals[..start])
+                .filter(|member| member.local_path.is_some())
+                .chain(members.iter().filter(|member| {
+                    target.is_none_or(|id| id == member.id)
+                        && (!rotate || member.local_path.is_none())
+                }));
+            let mut chosen = None;
+            let mut unavailable = None;
+            let mut capacity_limited = false;
+            for member in candidates {
+                let health = health_in(&tx, &member.id)?;
+                if let Some(reason) = health.quarantine.or(health.monitoring_error) {
+                    unavailable = Some(NoAvailableMember {
+                        member: member.id.clone(),
+                        reason,
+                    });
+                    continue;
+                }
+                if skip.contains(&member.id) {
+                    capacity_limited = true;
                     continue;
                 }
                 let mut record: MemberRecord = bincode::deserialize(
@@ -694,33 +743,46 @@ impl Catalog {
                     .used
                     .checked_add(record.reserved)
                     .context("pool usage overflow")?;
-                if record.capacity.saturating_sub(occupied) < size {
-                    continue;
-                }
-                if let Some(path) = &member.local_path {
-                    let Ok(available) = fs4::available_space(path) else {
-                        continue;
-                    };
-                    // Outstanding reservations may not have reached the device
-                    // yet. Counting all of them is deliberately conservative.
-                    let required = member
-                        .min_free_bytes
-                        .checked_add(local_reserved)
-                        .and_then(|n| n.checked_add(size))
-                        .context("pool free-space reservation overflow")?;
-                    if available < required {
+                // Outstanding reservations may not have reached the device
+                // yet. Counting all of them is deliberately conservative.
+                let physical = match member.filesystem_space() {
+                    None => None,
+                    Some(Ok(space)) => Some(super::space::physical_room(
+                        space,
+                        member.min_free_bytes,
+                        local_reserved,
+                    )),
+                    Some(Err(error)) => {
+                        unavailable = Some(NoAvailableMember {
+                            member: member.id.clone(),
+                            reason: format!("could not read filesystem space: {error}"),
+                        });
                         continue;
                     }
+                };
+                let declared = record.capacity.saturating_sub(occupied);
+                if super::space::room(declared, physical).is_none_or(|room| room < size) {
+                    capacity_limited = true;
+                    continue;
                 }
                 record.reserved = record
                     .reserved
                     .checked_add(size)
                     .context("pool reservation overflow")?;
                 table.insert(member.id.as_str(), bincode::serialize(&record)?.as_slice())?;
+                if rotate && member.local_path.is_some() {
+                    // Advance only for a local reservation, in the same transaction
+                    // as the capacity charge and upload record.
+                    tx.open_table(META)?
+                        .insert(LAST_LOCAL_RESERVATION, member.id.as_bytes())?;
+                }
                 chosen = Some(member.id.clone());
                 break;
             }
-            let member_id = chosen.ok_or(NoCapacity)?;
+            let member_id = chosen.ok_or_else(|| match unavailable {
+                Some(failure) if !capacity_limited => anyhow!(failure),
+                _ => anyhow!(NoCapacity),
+            })?;
             let id = Uuid::new_v4().to_string();
             Upload {
                 physical_key: format!(".zerofs-pool/{}/objects/{id}", self.identity.pool_id),
@@ -1033,8 +1095,11 @@ impl Catalog {
         &self,
         order: &[PoolMember],
         active: Option<&super::EvacuationProgress>,
+        full: &BTreeMap<String, i64>,
     ) -> Result<PoolStatus> {
         let tx = self.database.begin_read()?;
+        // Read the clock after the snapshot opens, so no observation in it is later.
+        let generated_ms = chrono::Utc::now().timestamp_millis();
         let mut counts = BTreeMap::<String, u64>::new();
         let mut mapped_objects = 0_u64;
         let mut quarantined_leftovers = Vec::new();
@@ -1216,6 +1281,7 @@ impl Catalog {
                     ..Default::default()
                 },
                 available_bytes: 0,
+                space: Default::default(),
                 health,
                 safe_to_remove,
                 safe_to_pull_with_known_loss,
@@ -1226,7 +1292,7 @@ impl Catalog {
                 evacuation,
             });
         }
-        super::capacity::assess(order, &mut members, &evacuation_segments);
+        super::capacity::assess(order, &mut members, &evacuation_segments, full);
         let multiple_failures = members
             .iter()
             .filter(|member| {
@@ -1260,6 +1326,7 @@ impl Catalog {
             .context("pending count overflow")?;
         Ok(PoolStatus {
             pool_id: self.identity.pool_id.clone(),
+            generated_ms,
             members,
             pending_operations,
             mapped_objects,
@@ -1386,6 +1453,7 @@ mod catalog_lock_tests {
             local_path: None,
             min_free_bytes: 0,
             health_device: None,
+            free_space: None,
         };
         catalog.configure_members(&[member]).unwrap();
         catalog.finish_initialization().unwrap();
@@ -1556,8 +1624,9 @@ mod legacy_health_compatibility {
             local_path: None,
             min_free_bytes: 0,
             health_device: None,
+            free_space: None,
         };
-        let status = catalog.status(&[config], None).unwrap();
+        let status = catalog.status(&[config], None, &BTreeMap::new()).unwrap();
         assert_eq!(status.mapped_objects, 1);
         assert_eq!(status.members[0].used_bytes, 7);
         assert!(status.members[0].health.quarantine.is_none());
@@ -1614,6 +1683,7 @@ mod empty_quarantine_tests {
                 local_path: None,
                 min_free_bytes: 0,
                 health_device: None,
+                free_space: None,
             })
             .collect::<Vec<_>>();
         catalog.configure_members(&members).unwrap();
@@ -1629,7 +1699,14 @@ mod empty_quarantine_tests {
         size: u64,
     ) -> Entry {
         let upload = catalog
-            .reserve(location, size, members, Some(member))
+            .reserve(
+                location,
+                size,
+                members,
+                Some(member),
+                &BTreeSet::new(),
+                SegmentPlacement::FirstFit,
+            )
             .unwrap();
         let entry = Entry {
             physical: Physical::Member {
@@ -1680,7 +1757,14 @@ mod empty_quarantine_tests {
         assert_eq!(catalog.empty_ownership_scans.load(Ordering::Relaxed), 1);
         assert!(
             catalog
-                .reserve("new-data", 0, &members, Some("old"))
+                .reserve(
+                    "new-data",
+                    0,
+                    &members,
+                    Some("old"),
+                    &BTreeSet::new(),
+                    SegmentPlacement::FirstFit
+                )
                 .is_err()
         );
         let marker = catalog.identity.marker().unwrap();
@@ -1706,7 +1790,14 @@ mod empty_quarantine_tests {
         let (_root, catalog, members) = fixture();
         let zero = insert(&catalog, &members, "zero-data", "old", 0);
         let upload = catalog
-            .reserve("zero-upload", 0, &members, Some("old"))
+            .reserve(
+                "zero-upload",
+                0,
+                &members,
+                Some("old"),
+                &BTreeSet::new(),
+                SegmentPlacement::FirstFit,
+            )
             .unwrap();
         insert(&catalog, &members, "current-data", "current", 8);
         quarantine(&catalog);

@@ -1,0 +1,38 @@
+diff --git a/zerofs/src/pool_full_tests.rs b/zerofs/src/pool_full_tests.rs
+index dd6b6b04..4cb17816 100644
+--- a/zerofs/src/pool_full_tests.rs
++++ b/zerofs/src/pool_full_tests.rs
+@@ -805,3 +805,33 @@ async fn ninep_fsync_on_a_full_pool_returns_enospc_not_eio() {
+     })
+     .await;
+ }
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn deleting_a_closed_file_releases_space_for_the_same_pending_flush() {
++    deadline(async {
++        let test = "delete-reuse";
++        let f = fixture(
++            (50_000_000, plenty()),
++            (50_000_000, local(RESERVE / 2)),
++            StoreProfile::default(),
++        ).await;
++        let previous = create(&f.fs, "previous").await;
++        let previous_data = Bytes::from_static(b"earlier flushed data");
++        write(test, &f.fs, previous, &previous_data).await.unwrap();
++        fsync(test, &f.fs, previous).await.unwrap();
++        let deleted = create(&f.fs, "delete-me").await;
++        let data = payload(42, 32 * MIB);
++        write(test, &f.fs, deleted, &data).await.unwrap();
++        fsync(test, &f.fs, deleted).await.unwrap();
++        let pending = create(&f.fs, "replacement").await;
++        write(test, &f.fs, pending, &data).await.unwrap();
++        assert_eq!(fsync(test, &f.fs, pending).await, Err(FsError::NoSpace));
++        let before = status(&f.pool).await;
++        bounded(test, "delete closed file", f.fs.remove(&auth(), 0, b"delete-me")).await.unwrap();
++        assert_eq!(read(&f.fs, previous, previous_data.len() as u64).await, previous_data);
++        let result = fsync(test, &f.fs, pending).await;
++        assert_eq!(read(&f.fs, previous, previous_data.len() as u64).await, previous_data);
++        assert_eq!(result, Ok(()), "before={before}; after={}", status(&f.pool).await);
++        assert_eq!(read(&f.fs, pending, data.len() as u64).await, data);
++    }).await;
++}

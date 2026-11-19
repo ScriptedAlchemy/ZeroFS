@@ -10,7 +10,11 @@ pub mod debug;
 pub mod fatrace;
 pub mod flush;
 mod init;
-mod memory_budget;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) mod inventory;
+pub(crate) mod memory_budget;
+#[cfg(test)]
+mod metadata_fault_tests;
 pub mod monitor;
 pub mod nbd;
 pub mod otrace;
@@ -29,6 +33,26 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Inventory source metadata as JSON Lines without a server or configuration
+    ///
+    /// Reads may update atime; only a read-only mount prevents this. Exit 3 means
+    /// the inventory is incomplete. The name rule uses the OpenZFS insensitive fold.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Inventory {
+        root: PathBuf,
+        /// Read regular file contents to compute SHA-256 (disabled by default)
+        #[arg(long, value_enum)]
+        hash: Option<inventory::HashAlgorithm>,
+        /// Limit entry starts per second (unlimited by default)
+        #[arg(long)]
+        max_entries_per_second: Option<std::num::NonZeroU32>,
+        /// Existing scratch parent outside the source root, required when memory caps are exceeded
+        #[arg(long)]
+        work_dir: Option<PathBuf>,
+        /// Continue a partial manifest after its last complete directory, writing a new manifest
+        #[arg(long)]
+        resume_from: Option<PathBuf>,
+    },
     /// Upload a file or directory directly over ZeroFS 9P
     Upload {
         /// 9P server address: host[:port], tcp://host:port, unix:/path, or ws:// URL
@@ -70,6 +94,7 @@ pub enum Commands {
         path: PathBuf,
     },
     /// Run the filesystem server
+    #[command(after_help = crate::operator_required::run_exit_status_help())]
     Run {
         #[arg(short, long)]
         config: PathBuf,
@@ -79,6 +104,11 @@ pub enum Commands {
         /// Open from a specific checkpoint by name (read-only mode)
         #[arg(long, conflicts_with = "read_only")]
         checkpoint: Option<String>,
+    },
+    /// Report memory admission and empirical stored-state coverage as JSON
+    MemoryStatus {
+        #[arg(short, long)]
+        config: PathBuf,
     },
     /// Change the encryption password
     ///
@@ -176,7 +206,29 @@ pub enum Commands {
         /// filesystem. The directory must already exist.
         #[arg(long)]
         aname: Option<String>,
+        /// Seconds file operations wait for a lost 9P server before they fail
+        /// with EIO (1 to 120), counted from when the mount notices the loss.
+        /// A failover or restart inside this window is invisible to
+        /// applications. After it, operations fail promptly until a server
+        /// answers again. A process blocked on the mount, even one sent
+        /// SIGKILL, is released when this window ends.
+        #[arg(long, default_value = "30", value_parser = parse_reconnect_timeout)]
+        reconnect_timeout: ninep_client::ReconnectTimeout,
     },
+}
+
+#[cfg(target_os = "linux")]
+fn parse_reconnect_timeout(
+    value: &str,
+) -> std::result::Result<ninep_client::ReconnectTimeout, String> {
+    let max = ninep_client::ReconnectTimeout::MAX.as_secs();
+    value
+        .parse::<u64>()
+        .ok()
+        .and_then(|seconds| {
+            ninep_client::ReconnectTimeout::new(std::time::Duration::from_secs(seconds))
+        })
+        .ok_or_else(|| format!("reconnect timeout must be whole seconds from 1 to {max}"))
 }
 
 fn parse_transfer_jobs(value: &str) -> std::result::Result<usize, String> {
@@ -269,6 +321,38 @@ pub enum DebugCommands {
     ListKeys {
         #[arg(short, long)]
         config: PathBuf,
+    },
+    /// Scan clean-cache files a server left behind for undefined bytes.
+    ///
+    /// Finds the raw-parts cache (parts_cache_v1) and the decoded-block cache
+    /// (hybrid_cache_v1) at or under PATH and checks that every blob index
+    /// tail past its last record, and every entry's padding up to the next
+    /// 4 KiB page, is zero. Those bytes carry no data, so the check decrypts
+    /// nothing and needs no password or key; this command takes none.
+    ///
+    /// It opens files read-only and changes, repairs or deletes nothing. It
+    /// refuses a cache whose ownership lock is missing or held by a running
+    /// server, because a blob being written can look torn; stop the server
+    /// first, or pass --live to scan a snapshot anyway. Caches written before the
+    /// zeroed padding are reported as such and counted only with --legacy.
+    ///
+    /// Exit status: 0 when every scanned byte is zero and every cache had
+    /// entries to scan; 3 when non-zero bytes were found; 4 when a cache had
+    /// no entries on disk, was not scanned, or held an incomplete blob, which
+    /// is not evidence that it is clean; 1 on an error.
+    ScanCacheFiles {
+        /// The [cache] dir from the server's config, one namespace inside it
+        /// (bucket_...), or one cache directory.
+        path: PathBuf,
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Scan even while a server holds the cache; the result is a snapshot.
+        #[arg(long)]
+        live: bool,
+        /// Also count the bytes of caches written by earlier builds.
+        #[arg(long)]
+        legacy: bool,
     },
     /// Explicitly repair one pruned writeback predecessor from remote HEAD.
     ///
@@ -520,6 +604,45 @@ mod tests {
         assert!(expected_local_sha256.starts_with("f999"));
         assert!(expected_remote_sha256.starts_with("0f3f"));
         assert!(confirm_abandon_maintenance_tail);
+    }
+
+    #[test]
+    fn scan_cache_files_takes_a_path_and_no_password() {
+        let cli = Cli::try_parse_from([
+            "zerofs",
+            "debug",
+            "scan-cache-files",
+            "/var/cache/zerofs",
+            "--json",
+            "--live",
+            "--legacy",
+        ])
+        .unwrap();
+        let Commands::Debug {
+            subcommand:
+                DebugCommands::ScanCacheFiles {
+                    path,
+                    json,
+                    live,
+                    legacy,
+                },
+        } = cli.command
+        else {
+            panic!("expected scan-cache-files command");
+        };
+        assert_eq!(path, PathBuf::from("/var/cache/zerofs"));
+        assert!(json && live && legacy);
+        assert!(
+            Cli::try_parse_from([
+                "zerofs",
+                "debug",
+                "scan-cache-files",
+                "/var/cache/zerofs",
+                "--password",
+                "x",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

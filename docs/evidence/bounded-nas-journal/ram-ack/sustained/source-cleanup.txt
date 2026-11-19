@@ -1,0 +1,4 @@
+source absent /var/tmp/zerofs-sustained.6r8kRuYw/source
+executable copy absent /var/tmp/zerofs-sustained.6r8kRuYw/zerofs
+private root absent /var/tmp/zerofs-sustained.6r8kRuYw
+parent build scratch retained /var/tmp/zerofs-ram-ack.6idAFVNq

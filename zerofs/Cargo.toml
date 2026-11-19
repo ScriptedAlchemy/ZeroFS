@@ -24,6 +24,8 @@ members = [
     "zerofs-client-web",
     "zerofs-ffi",
 ]
+# A patched dependency, not a member: its tests and lints stay upstream's.
+exclude = ["vendor/foyer-storage"]
 
 # Single source of truth for the release version. The zerofs-csi image is
 # tagged with the repo release tag and layers on the zerofs image of that
@@ -63,7 +65,7 @@ default = ["vendored-protoc"]
 tokio-console = ["dep:console-subscriber"]
 failpoints = ["dep:fail"]
 vendored-protoc = ["dep:protobuf-src"]
-webui = ["dep:rust-embed", "dep:axum", "dep:tonic-web", "dep:tower-http"]
+webui = ["dep:rust-embed", "dep:axum", "dep:tonic-web", "dep:tower-http", "dep:subtle"]
 hotpath-profile = ["dep:hotpath"]
 
 
@@ -78,7 +80,7 @@ slatedb = { git = "https://github.com/Barre/slatedb.git", rev = "230ade681f1fdf0
     "foyer",
 ] }
 slatedb-common = { git = "https://github.com/Barre/slatedb.git", rev = "230ade681f1fdf0f85fc1c2cb6c118575a83ceb1" }
-zerofs_nfsserve = { git = "https://github.com/ScriptedAlchemy/nfsserve.git", rev = "0c19924faa3b09041d198d167785a7de80ea48b5" }
+zerofs_nfsserve = { git = "https://github.com/ScriptedAlchemy/nfsserve.git", rev = "0f7d4f6666979d9ba683ae3288b2c8ee19cc3634" }
 tikv-jemallocator = "0.7"
 tikv-jemalloc-ctl = { version = "0.7", features = [
     "stats",
@@ -113,6 +115,7 @@ futures = "0.3"
 chacha20poly1305 = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"
+subtle = { version = "2.6", optional = true }
 lz4_flex = "0.12"
 zstd = "0.13"
 anyhow = "1.0"
@@ -126,6 +129,8 @@ comfy-table = "7.1"
 num-format = "0.4"
 libc = "0.2"
 rustix = { version = "1.1.4", features = ["fs"] }
+icu_normalizer = { version = "2.1", default-features = false, features = ["compiled_data"] }
+unicase = "2.10"
 dashmap = "6.1"
 uuid = { version = "1.17", features = ["v4", "serde"] }
 toml = "0.9"
@@ -157,6 +162,7 @@ tonic-web = { version = "0.13", optional = true }
 tower-http = { version = "0.6", features = ["cors"], optional = true }
 foyer = "0.22"
 fs4 = "0.13.1"
+walkdir = "2.5"
 russh = { version = "0.65.1", features = ["aws-lc-rs"] }
 russh-sftp = "2.4"
 tempfile = "3.21"
@@ -167,6 +173,11 @@ tempfile = "3.21"
 fuser = { version = "0.17", default-features = false }
 # The `zerofs mount` FUSE path uses the low-level 9P client directly.
 ninep-client = { path = "ninep-client" }
+
+# foyer-storage 0.22.3 as published, carried in-tree so it can be patched.
+# See vendor/README.md.
+[patch.crates-io]
+foyer-storage = { path = "vendor/foyer-storage" }
 
 [build-dependencies]
 tonic-prost-build = "0.14"

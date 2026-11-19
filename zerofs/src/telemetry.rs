@@ -35,6 +35,13 @@ impl PostHogEvent {
             self.properties.insert(key.to_string(), v);
         }
     }
+
+    fn insert_usage(&mut self, stats: &FileSystemGlobalStats) {
+        if let Some((used_bytes, used_inodes)) = stats.known_totals() {
+            self.insert_prop("used_bytes", used_bytes);
+            self.insert_prop("used_inodes", used_inodes);
+        }
+    }
 }
 
 async fn capture(client: &reqwest::Client, event: PostHogEvent) {
@@ -152,12 +159,9 @@ pub fn start_periodic_reporting(
             tokio::select! {
                 _ = shutdown.cancelled() => break,
                 _ = interval.tick() => {
-                    let (used_bytes, used_inodes) = global_stats.get_totals();
-
                     let mut event = PostHogEvent::new("filesystem_stats", &distinct_id);
                     event.insert_prop("version", &version);
-                    event.insert_prop("used_bytes", used_bytes);
-                    event.insert_prop("used_inodes", used_inodes);
+                    event.insert_usage(&global_stats);
                     event.insert_prop("max_bytes", max_bytes);
                     event.insert_prop("compression", &compression);
                     event.insert_prop("cache_disk_gb", cache_disk_gb);
@@ -196,4 +200,55 @@ fn determine_protocols(servers: &crate::config::ServerConfig) -> Vec<String> {
         protocols.push("nbd".into());
     }
     protocols
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+    use crate::fs::key_codec::KeyCodec;
+    use crate::fs::stats::StatsShardData;
+
+    #[test]
+    fn known_usage_including_zero_is_present_in_the_event() {
+        let stats = FileSystemGlobalStats::new(Arc::new(KeyCodec::new()));
+        for (used_bytes, used_inodes) in [(0, 0), (321, 7)] {
+            stats.load_shard(
+                1,
+                &StatsShardData {
+                    used_bytes,
+                    used_inodes,
+                },
+            );
+            let mut event = PostHogEvent::new("filesystem_stats", "test-id");
+            event.insert_usage(&stats);
+            let encoded = serde_json::to_value(&event).unwrap();
+            assert_eq!(encoded["properties"]["used_bytes"], used_bytes);
+            assert_eq!(encoded["properties"]["used_inodes"], used_inodes);
+        }
+    }
+
+    #[test]
+    fn unknown_usage_is_omitted_without_losing_the_event() {
+        let stats = FileSystemGlobalStats::new(Arc::new(KeyCodec::new()));
+        stats.load_shard(
+            1,
+            &StatsShardData {
+                used_bytes: 321,
+                used_inodes: 7,
+            },
+        );
+        stats.load_shard_record(3, b"bad");
+        let mut event = PostHogEvent::new("filesystem_stats", "test-id");
+        event.insert_prop("version", "test-version");
+        event.insert_prop("max_bytes", 4096);
+        event.insert_usage(&stats);
+        let encoded = serde_json::to_value(&event).unwrap();
+        let properties = encoded["properties"].as_object().unwrap();
+        assert!(!properties.contains_key("used_bytes"));
+        assert!(!properties.contains_key("used_inodes"));
+        assert_eq!(encoded["event"], "filesystem_stats");
+        assert_eq!(encoded["distinct_id"], "test-id");
+        assert_eq!(properties["version"], "test-version");
+        assert_eq!(properties["max_bytes"], 4096);
+    }
 }

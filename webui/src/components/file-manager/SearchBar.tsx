@@ -2,6 +2,7 @@ import { useState, useRef, useCallback, useEffect, useLayoutEffect } from "react
 import { Search, X, Loader2 } from "lucide-react";
 import * as Dialog from "@radix-ui/react-dialog";
 import { p9client, type SearchResult } from "../../lib/zerofs/client";
+import { formatError } from "../../lib/errors";
 import { Button } from "../ui/Button";
 import { ToolbarButton } from "./Toolbar";
 import { FileIcon } from "./FileIcon";
@@ -18,6 +19,7 @@ export function SearchBar({ currentPath, onNavigate, onSelectFile }: SearchBarPr
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchResult[]>([]);
   const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState("");
   const [focusIdx, setFocusIdx] = useState(-1);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
@@ -27,6 +29,7 @@ export function SearchBar({ currentPath, onNavigate, onSelectFile }: SearchBarPr
     (q: string) => {
       abortRef.current?.abort();
       setResults([]);
+      setSearchError("");
 
       if (q.length < 2) {
         setSearching(false);
@@ -49,7 +52,9 @@ export function SearchBar({ currentPath, onNavigate, onSelectFile }: SearchBarPr
           },
           abort.signal,
         )
-        .catch(() => {})
+        .catch((error: unknown) => {
+          if (!abort.signal.aborted) setSearchError(formatError(error));
+        })
         .finally(() => {
           if (!abort.signal.aborted) setSearching(false);
         });
@@ -160,10 +165,11 @@ export function SearchBar({ currentPath, onNavigate, onSelectFile }: SearchBarPr
               </Button>
             </div>
 
+            {searchError && <p role="alert" className="px-4 py-2 text-sm text-destructive">{searchError}</p>}
             <div ref={listRef} className="overflow-auto flex-1">
               {query.length < 2 ? (
                 <p className="px-4 py-6 text-sm text-muted text-center">Type at least 2 characters to search</p>
-              ) : results.length === 0 ? (
+              ) : results.length === 0 && !searchError ? (
                 <div className="px-4 py-6 text-sm text-muted text-center">
                   {searching ? (
                     <span className="flex items-center justify-center gap-2">

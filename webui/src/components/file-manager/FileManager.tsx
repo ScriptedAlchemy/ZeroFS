@@ -4,7 +4,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Loader2, Upload } from "lucide-react";
 import { useDirectory, useMkdir, useRemove, useRename, useTrafficStats } from "../../hooks/use-ninep";
-import { p9client, type FileEntry } from "../../lib/zerofs/client";
+import { isErrno, p9client, type FileEntry } from "../../lib/zerofs/client";
 import { formatError } from "../../lib/errors";
 import { joinPath } from "../../lib/format";
 import { Breadcrumb } from "./Breadcrumb";
@@ -22,6 +22,8 @@ interface FileManagerProps {
   path: string;
   onNavigate: (path: string) => void;
 }
+
+const RAW_NAME_DISPLAY_LIMIT = 50;
 
 export function FileManager({ path, onNavigate }: FileManagerProps) {
   const [view, setViewState] = useState<"grid" | "list">(() => {
@@ -73,7 +75,8 @@ export function FileManager({ path, onNavigate }: FileManagerProps) {
   const isNarrow = splitWidth > 0 && splitWidth < 700;
 
   const qc = useQueryClient();
-  const { data: entries, isLoading, isFetching, error } = useDirectory(path);
+  const { data: listing, isLoading, isFetching, error } = useDirectory(path);
+  const entries = listing?.entries;
   const [spinKey, setSpinKey] = useState(0);
   const wasFetching = useRef(false);
   useEffect(() => {
@@ -115,7 +118,7 @@ export function FileManager({ path, onNavigate }: FileManagerProps) {
     handleFolderUpload,
     fileInputRef,
     overwritePrompt,
-  } = useUploads(path, entries);
+  } = useUploads(path);
 
   const fullPath = useCallback((name: string) => joinPath(path, name), [path]);
 
@@ -222,7 +225,7 @@ export function FileManager({ path, onNavigate }: FileManagerProps) {
           await mkdirMut.mutateAsync({ path: fullPath(name) });
           toast.success(`Created folder ${name}`);
         } else {
-          await p9client.writeFile(fullPath(name), new Uint8Array(0));
+          await p9client.createFile(fullPath(name));
           qc.invalidateQueries({ queryKey: ["9p", "ls", path] });
           toast.success(`Created file ${name}`);
         }
@@ -246,16 +249,17 @@ export function FileManager({ path, onNavigate }: FileManagerProps) {
         setRenameTarget(null);
         return;
       }
-      if (entries?.some((e) => e.name === newName)) {
-        const confirmed = await new Promise<boolean>((resolve) => setRenameConfirm({ newName, resolve }));
-        setRenameConfirm(null);
-        if (!confirmed) return;
-      }
+      const args = { oldPath: fullPath(renameTarget), newPath: fullPath(newName) };
       try {
-        await renameMut.mutateAsync({
-          oldPath: fullPath(renameTarget),
-          newPath: fullPath(newName),
-        });
+        try {
+          await renameMut.mutateAsync(args);
+        } catch (error) {
+          if (!isErrno(error, 17)) throw error;
+          const confirmed = await new Promise<boolean>((resolve) => setRenameConfirm({ newName, resolve }));
+          setRenameConfirm(null);
+          if (!confirmed) return;
+          await renameMut.mutateAsync({ ...args, replace: true });
+        }
         toast.success(`Renamed to ${newName}`);
         if (selectedRef.current.has(renameTarget)) {
           setSelected((prev) => {
@@ -273,13 +277,12 @@ export function FileManager({ path, onNavigate }: FileManagerProps) {
       }
       setRenameTarget(null);
     },
-    [renameTarget, fullPath, renameMut, entries, previewFileRef, setPreviewFileRaw],
+    [renameTarget, fullPath, renameMut, previewFileRef, setPreviewFileRaw],
   );
 
   const handleMoveToDir = useCallback(
-    async (entryName: string, targetDir: string) => {
-      if (targetDir === path) return;
-      const oldPath = fullPath(entryName);
+    async (oldPath: string, targetDir: string) => {
+      const entryName = oldPath.split("/").pop()!;
       const newPath = joinPath(targetDir, entryName);
       if (oldPath === newPath) return;
       try {
@@ -291,7 +294,7 @@ export function FileManager({ path, onNavigate }: FileManagerProps) {
         toast.error(`Failed to move ${entryName}`, { description: formatError(err) });
       }
     },
-    [path, fullPath, renameMut],
+    [renameMut],
   );
 
   return (
@@ -366,7 +369,7 @@ export function FileManager({ path, onNavigate }: FileManagerProps) {
               </div>
             ) : error ? (
               <div className="flex items-center justify-center h-64 text-destructive text-sm">{formatError(error)}</div>
-            ) : entries && entries.length === 0 && !isFetching ? (
+            ) : listing && listing.entries.length === 0 && listing.rawNames.length === 0 && !isFetching ? (
               <div className="flex flex-col items-center justify-center h-64 gap-3 text-muted">
                 <Upload size={32} strokeWidth={1} className="text-muted-foreground/40" />
                 <span className="text-base">This folder is empty</span>
@@ -375,25 +378,39 @@ export function FileManager({ path, onNavigate }: FileManagerProps) {
                 </span>
               </div>
             ) : entries ? (
-              <div className="relative h-full overflow-hidden">
-                <FileBrowser
-                  entries={entries}
-                  currentPath={path}
-                  view={view}
-                  selectedNames={selected}
-                  onOpen={handleOpen}
-                  onSelect={handleSelect}
-                  onSelectAll={() => setSelected(new Set(entries?.map((e) => e.name) ?? []))}
-                  onClearSelection={() => setSelected(new Set())}
-                  getContextActions={getContextActions}
-                  onMoveToDir={handleMoveToDir}
-                  renameTarget={renameTarget}
-                  onRename={handleRename}
-                  onRenameCancel={() => setRenameTarget(null)}
-                  inlineCreate={createDialog}
-                  onCreate={handleCreate}
-                  onCreateCancel={() => setCreateDialog(null)}
-                />
+              <div className="relative flex h-full flex-col overflow-hidden">
+                {listing && listing.rawNames.length > 0 && (
+                  <details className="max-h-40 shrink-0 overflow-auto border-b border-border px-3 py-2 text-sm">
+                    <summary className="cursor-pointer">
+                      {listing.rawNames.length} {listing.rawNames.length === 1 ? "filename" : "filenames"} outside UTF-8. View raw bytes
+                    </summary>
+                    <p className="mt-2 text-muted">Use a native byte-aware client to act on these entries.</p>
+                    {listing.rawNames.length > RAW_NAME_DISPLAY_LIMIT && <p>Showing the first {RAW_NAME_DISPLAY_LIMIT} names.</p>}
+                    <ul className="mt-1 break-all font-mono">
+                      {listing.rawNames.slice(0, RAW_NAME_DISPLAY_LIMIT).map((hex) => <li key={hex}>{hex}</li>)}
+                    </ul>
+                  </details>
+                )}
+                <div className="min-h-0 flex-1">
+                  <FileBrowser
+                    entries={entries}
+                    currentPath={path}
+                    view={view}
+                    selectedNames={selected}
+                    onOpen={handleOpen}
+                    onSelect={handleSelect}
+                    onSelectAll={() => setSelected(new Set(entries?.map((e) => e.name) ?? []))}
+                    onClearSelection={() => setSelected(new Set())}
+                    getContextActions={getContextActions}
+                    onMoveToDir={handleMoveToDir}
+                    renameTarget={renameTarget}
+                    onRename={handleRename}
+                    onRenameCancel={() => setRenameTarget(null)}
+                    inlineCreate={createDialog}
+                    onCreate={handleCreate}
+                    onCreateCancel={() => setCreateDialog(null)}
+                  />
+                </div>
                 {isFetching && (
                   <div className="absolute inset-0 bg-background/60 flex items-center justify-center z-20">
                     <Loader2 size={20} className="animate-spin text-muted-foreground" />

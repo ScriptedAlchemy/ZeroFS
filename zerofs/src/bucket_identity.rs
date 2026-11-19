@@ -2,7 +2,7 @@ use slatedb::object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, pa
 use std::sync::Arc;
 use uuid::Uuid;
 
-const BUCKET_ID_MARKER: &str = ".zerofs_bucket_id";
+pub(crate) const BUCKET_ID_MARKER: &str = ".zerofs_bucket_id";
 
 /// Manages bucket identity to ensure cache isolation between different bucket instances
 #[derive(Debug, Clone)]

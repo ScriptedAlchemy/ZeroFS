@@ -108,10 +108,10 @@ There are two encryption domains.
     The on-disk cache (default `~/.cache/zerofs`) has two tiers with different security postures:
 
     <Properties>
-      <Property name="File Data (parts_cache/)" type="encrypted">
+      <Property name="File Data (parts_cache_v1/)" type="encrypted">
         The raw-parts cache stores object bytes exactly as fetched: segment frames stay **compressed and encrypted** on the local cache disk. File contents never touch the local disk in plaintext.
       </Property>
-      <Property name="Metadata Blocks (hybrid_cache/)" type="plaintext">
+      <Property name="Metadata Blocks (hybrid_cache_v1/)" type="plaintext">
         The decoded-block cache stores **decrypted, decompressed** metadata SST blocks so metadata reads don't pay the decrypt cost.
       </Property>
     </Properties>

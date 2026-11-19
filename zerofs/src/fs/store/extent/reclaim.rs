@@ -1345,6 +1345,45 @@ mod tests {
         assert_eq!(store.read(1, 0, 1000).await.unwrap().as_ref(), &[1u8; 1000]);
     }
 
+    // A debit larger than the counter's live bytes means the counter missed a
+    // credit. The commit path pins the segment fully live instead of writing a
+    // dead `(0, total)` row, so reclaim never selects it on the counter.
+    #[tokio::test]
+    async fn underflowing_debit_pins_the_segment_live() {
+        let (store, db) = make().await;
+        let mut model = Vec::new();
+        write_and_check(&store, &db, &mut model, 0, &[1u8; 1000]).await;
+        store.seal_open().await.unwrap();
+        let seg = frameloc_of(&store, &db, 1, 0).await.unwrap().segid;
+        let (live, total) = segcount_pair_of(&store, &db, seg).await;
+        assert!(live > 0 && total >= live);
+
+        let mut txn = db.new_transaction().unwrap();
+        txn.add_seg_delta(
+            &store.key_codec.segcount_key(seg.epoch, seg.counter),
+            -(live as i64) - 1,
+            0,
+        );
+        commit(&store, txn).await;
+        assert_eq!(segcount_pair_of(&store, &db, seg).await, (total, total));
+
+        let (deleted, _) = store.reclaim_segments(Utc::now(), None).await.unwrap();
+        assert_eq!(deleted, 0);
+        assert!(store.segments.list_segments().await.unwrap().contains(&seg));
+        assert_eq!(store.read(1, 0, 1000).await.unwrap().as_ref(), &[1u8; 1000]);
+
+        // A debit against an absent counter writes no row. The orphan sweep,
+        // which verifies every pointer, keeps ownership of that object.
+        let uncounted = Segid::new(seg.epoch, seg.counter + 1000);
+        let key = store
+            .key_codec
+            .segcount_key(uncounted.epoch, uncounted.counter);
+        let mut txn = db.new_transaction().unwrap();
+        txn.add_seg_delta(&key, -1, 0);
+        commit(&store, txn).await;
+        assert!(db.get_bytes(&key).await.unwrap().is_none());
+    }
+
     #[tokio::test]
     async fn verify_uses_inode_grouped_scans_not_per_frame_point_reads() {
         let (store, db) = make().await;

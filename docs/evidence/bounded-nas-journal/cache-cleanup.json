@@ -1,0 +1,92 @@
+{
+  "builder": "default",
+  "removed_history": "fipt9rbsh5fgj2rmlonn61f77",
+  "removed": [
+    {
+      "CreatedAt": "2026-11-18 22:06:26.615030382 +0000 UTC",
+      "Description": "local source for context",
+      "ID": "i44p1k27y587cm4x8k054h6r0",
+      "LastUsedAt": "16 minutes ago",
+      "Mutable": true,
+      "Parents": null,
+      "Reclaimable": true,
+      "Shared": false,
+      "Size": "36.86kB",
+      "Type": "source.local",
+      "UsageCount": 1
+    },
+    {
+      "CreatedAt": "2026-11-18 22:06:26.586706645 +0000 UTC",
+      "Description": "local source for context",
+      "ID": "lw9afm15x0uexnzuqxbt3u29v",
+      "LastUsedAt": "16 minutes ago",
+      "Mutable": true,
+      "Parents": null,
+      "Reclaimable": true,
+      "Shared": false,
+      "Size": "4.096kB",
+      "Type": "source.local",
+      "UsageCount": 1
+    },
+    {
+      "CreatedAt": "2026-11-18 22:06:53.580607404 +0000 UTC",
+      "Description": "[spdk-build 3/4] COPY nvme-tcp/build-spdk.sh nvme-tcp/spdk-zerofs-aio.patch nvme-tcp/initiator-probe.c nvme-tcp/initiator-probe.mk /build/",
+      "ID": "r7ia1zznhgock1957nm5uttbf",
+      "LastUsedAt": "16 minutes ago",
+      "Mutable": false,
+      "Parents": [
+        "x90njwdfz0oy6fj3mje3tktv2"
+      ],
+      "Reclaimable": true,
+      "Shared": false,
+      "Size": "41.95kB",
+      "Type": "regular",
+      "UsageCount": 1
+    },
+    {
+      "CreatedAt": "2026-11-18 22:08:38.916509181 +0000 UTC",
+      "Description": "mount / from exec /bin/sh -c sh /build/build-spdk.sh /source /out     && mkdir -p /out/notice/dpdk /out/notice/isa-l     && cp -R /source/LICENSE /source/licenses /build/spdk-zerofs-aio.patch /out/SPDK_SOURCE /out/notice/     && cp -R /source/dpdk/license/. /out/notice/dpdk/     && cp /source/isa-l/LICENSE /out/notice/isa-l/     && git -C /source submodule status dpdk isa-l > /out/notice/SPDK_SUBMODULES     && cd /out && sha256sum zerofs-nvmf-tgt > notice/SHA256SUMS",
+      "ID": "s738g0yx5va2kaxltvbme7imd",
+      "LastUsedAt": "16 minutes ago",
+      "Mutable": false,
+      "Parents": [
+        "r7ia1zznhgock1957nm5uttbf"
+      ],
+      "Reclaimable": true,
+      "Shared": false,
+      "Size": "802.4MB",
+      "Type": "regular",
+      "UsageCount": 1
+    },
+    {
+      "CreatedAt": "2026-11-18 22:06:53.487758888 +0000 UTC",
+      "Description": "mount / from exec /bin/sh -c apt-get update && apt-get install -y --no-install-recommends     autoconf automake build-essential ca-certificates git help2man libaio-dev libncurses-dev     libnuma-dev libssl-dev libtool meson nasm ninja-build pkg-config python3-jinja2     python3-pyelftools python3-tabulate python3-yaml uuid-dev     && rm -rf /var/lib/apt/lists/*",
+      "ID": "x90njwdfz0oy6fj3mje3tktv2",
+      "LastUsedAt": "16 minutes ago",
+      "Mutable": false,
+      "Parents": [
+        "n8icrq5xana2b707ekbhig7p3"
+      ],
+      "Reclaimable": true,
+      "Shared": false,
+      "Size": "638.1MB",
+      "Type": "regular",
+      "UsageCount": 1
+    },
+    {
+      "CreatedAt": "2026-11-18 22:06:26.030253462 +0000 UTC",
+      "Description": "local source for dockerfile",
+      "ID": "zj5e50kjag730avv0q90pl00a",
+      "LastUsedAt": "16 minutes ago",
+      "Mutable": true,
+      "Parents": null,
+      "Reclaimable": true,
+      "Shared": false,
+      "Size": "16.38kB",
+      "Type": "source.local",
+      "UsageCount": 1
+    }
+  ],
+  "unrelated_ids_preserved": 734,
+  "unrelated_ids_missing": 0
+}

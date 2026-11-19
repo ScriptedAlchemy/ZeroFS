@@ -10,6 +10,7 @@ use crate::fs::inode::{Inode, InodeId};
 use crate::fs::lock_manager::MultiLockGuard;
 use crate::fs::types::{AuthContext, FileAttributes};
 use bytes::Bytes;
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 /// One member of a logical write request, before validation.
@@ -56,10 +57,21 @@ pub(crate) struct PreparedWriteBatch {
     pub(crate) start_time: Instant,
     pub(crate) members: Vec<PreparedWriteMember>,
     pub(crate) replayed: Option<PreparedBatchResult>,
-    pub(crate) guards: Option<MultiLockGuard<InodeId>>,
+    pub(crate) guards: Option<Arc<MultiLockGuard<InodeId>>>,
     /// Protocol replay ownership. Before submission it remains caller-owned;
     /// submission transfers the one typed owner into the canonical worker.
     pub(crate) commit_ownership: crate::fs::write_coordinator::CommitOwnership,
+}
+
+/// The last published single-inode write projection, including its byte-range
+/// end (which may precede EOF). Only an outstanding prepared batch can keep the
+/// canonical inode lock alive. The hint alone never retains a lock.
+pub(crate) struct PendingAppend {
+    pub(crate) inode: Inode,
+    pub(crate) id: InodeId,
+    pub(crate) end: u64,
+    pub(crate) writes: usize,
+    pub(crate) guards: Weak<MultiLockGuard<InodeId>>,
 }
 
 /// One result boundary for the whole batch.

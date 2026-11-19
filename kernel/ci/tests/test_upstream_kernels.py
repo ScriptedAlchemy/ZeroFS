@@ -1,12 +1,15 @@
+import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from upstream_kernels import (  # noqa: E402
     ResolutionError,
+    fetch_repository_tags,
     parse_tag_refs,
     resolve_matrix,
 )
@@ -70,6 +73,23 @@ class UpstreamKernelTests(unittest.TestCase):
         )
 
         self.assertEqual(parse_tag_refs(refs), {"v6.18", "v7.2-rc5"})
+
+    def test_uses_the_mirror_when_the_first_source_times_out(self):
+        answered = subprocess.CompletedProcess([], 0, stdout="abc\trefs/tags/v7.2\n")
+        timed_out = subprocess.TimeoutExpired(["git"], 60)
+
+        with mock.patch("subprocess.run", side_effect=[timed_out, answered]) as run:
+            tags = fetch_repository_tags(("https://first", "https://mirror"))
+
+        self.assertEqual(tags, {"v7.2"})
+        self.assertEqual(run.call_args_list[1].args[0][-1], "https://mirror")
+
+    def test_fails_when_no_source_answers(self):
+        timed_out = subprocess.TimeoutExpired(["git"], 60)
+
+        with mock.patch("subprocess.run", side_effect=[timed_out, timed_out]):
+            with self.assertRaises(ResolutionError):
+                fetch_repository_tags(("https://first", "https://mirror"))
 
 
 if __name__ == "__main__":

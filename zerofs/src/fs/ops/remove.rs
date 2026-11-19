@@ -9,11 +9,12 @@ use crate::dedup::DedupResult;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
 use crate::fs::mutation::types::{ConflictKey, ConflictScope};
+use crate::fs::name_mode::NameMatch;
 use crate::fs::permissions::{AccessMode, Credentials, check_access, check_sticky_bit_delete};
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::AuthContext;
 use crate::fs::{
-    EXTENT_SIZE, SMALL_FILE_TOMBSTONE_THRESHOLD, ZeroFS, get_current_time, validate_filename,
+    EXTENT_SIZE, SMALL_FILE_TOMBSTONE_THRESHOLD, ZeroFS, get_current_time, validate_filename_length,
 };
 use std::sync::atomic::Ordering;
 
@@ -97,6 +98,7 @@ impl ZeroFS {
             auth,
             dirid,
             name,
+            NameMatch::Folded,
             [0; 16],
             None,
             Some((expected_inode, expected_cookie)),
@@ -126,38 +128,49 @@ impl ZeroFS {
         name: &[u8],
         op_id: crate::dedup::OpId,
     ) -> Result<(), FsError> {
-        self.remove_idempotent_inner(auth, dirid, name, op_id, None, None)
+        self.remove_idempotent_inner(auth, dirid, name, NameMatch::Folded, op_id, None, None)
             .await
             .map(|_| ())
     }
 
     /// Remove with `unlinkat(2)`'s expected target kind enforced after the
     /// directory entry and target inode have been revalidated under their
-    /// mutation locks.
+    /// mutation locks. `name_match` applies to that locked revalidation.
     #[allow(dead_code)] // Used by the binary-only 9P handler.
     pub(crate) async fn remove_idempotent_checked(
         &self,
         auth: &AuthContext,
         dirid: InodeId,
         name: &[u8],
+        name_match: NameMatch,
         op_id: crate::dedup::OpId,
         remove_directory: bool,
     ) -> Result<(), FsError> {
-        self.remove_idempotent_inner(auth, dirid, name, op_id, Some(remove_directory), None)
-            .await
-            .map(|_| ())
+        self.remove_idempotent_inner(
+            auth,
+            dirid,
+            name,
+            name_match,
+            op_id,
+            Some(remove_directory),
+            None,
+        )
+        .await
+        .map(|_| ())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn remove_idempotent_inner(
         &self,
         auth: &AuthContext,
         dirid: InodeId,
         name: &[u8],
+        name_match: NameMatch,
         op_id: crate::dedup::OpId,
         expected_directory: Option<bool>,
         expected_entry: Option<(InodeId, u64)>,
     ) -> Result<bool, FsError> {
-        validate_filename(name)?;
+        validate_filename_length(name)?;
 
         // Replay a completed remove before resolving the missing entry.
         if self
@@ -212,13 +225,13 @@ impl ZeroFS {
                 .await;
         }
 
-        let _fence = self
+        let fence = self
             .fence_metadata(ConflictScope::new([
                 ConflictKey::Directory(dirid),
                 ConflictKey::Inode(file_id),
             ]))
             .await?;
-        let _guards = self.lock_manager.acquire_multi(vec![dirid, file_id]).await;
+        let guards = self.lock_manager.acquire_multi(vec![dirid, file_id]).await;
 
         // Recheck replay state after waiting for inode locks.
         if self
@@ -239,10 +252,12 @@ impl ZeroFS {
             return Err(FsError::StaleHandle);
         }
 
-        // Re-check inside lock to verify entry still points to same inode
+        // Re-check inside lock to verify entry still points to same inode.
+        // An exact-spelling rule is checked here, where no rename can split
+        // the folded entry from its stored spelling.
         let verified_entry = self
             .directory_store
-            .get_entry_with_cookie(dirid, name)
+            .get_entry_matching(dirid, name, name_match)
             .await;
         let (verified_id, verified_cookie) = match verified_entry {
             Ok(entry) => entry,
@@ -342,7 +357,7 @@ impl ZeroFS {
                                     .fetch_add(1, Ordering::Relaxed);
                             }
 
-                            self.inode_store.delete(&mut txn, file_id);
+                            self.delete_inode(&mut txn, file_id).await?;
 
                             #[cfg(feature = "failpoints")]
                             fail_point!(fp::REMOVE_AFTER_INODE_DELETE);
@@ -367,7 +382,7 @@ impl ZeroFS {
                             #[cfg(feature = "failpoints")]
                             fail_point!(fp::REMOVE_AFTER_ORPHAN_ADD);
                         } else {
-                            self.inode_store.delete(&mut txn, file_id);
+                            self.delete_inode(&mut txn, file_id).await?;
 
                             #[cfg(feature = "failpoints")]
                             fail_point!(fp::RMDIR_AFTER_INODE_DELETE);
@@ -408,7 +423,7 @@ impl ZeroFS {
                             #[cfg(feature = "failpoints")]
                             fail_point!(fp::REMOVE_AFTER_ORPHAN_ADD);
                         } else {
-                            self.inode_store.delete(&mut txn, file_id);
+                            self.delete_inode(&mut txn, file_id).await?;
                             self.stats.links_deleted.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -436,7 +451,7 @@ impl ZeroFS {
                             #[cfg(feature = "failpoints")]
                             fail_point!(fp::REMOVE_AFTER_ORPHAN_ADD);
                         } else {
-                            self.inode_store.delete(&mut txn, file_id);
+                            self.delete_inode(&mut txn, file_id).await?;
                         }
                     }
                 }
@@ -500,7 +515,7 @@ impl ZeroFS {
                     )
                 };
                 self.write_coordinator
-                    .commit_with_settlement(txn, settlement)
+                    .commit_with_settlement(txn, settlement, (fence, guards))
                     .await?;
 
                 #[cfg(feature = "failpoints")]
@@ -529,6 +544,7 @@ mod tests {
     use crate::test_helpers::test_helpers_mod::test_auth;
 
     use crate::fs::key_codec::KeyCodec;
+    use crate::fs::name_mode::NameMatch;
 
     use crate::fs::types::{AuthContext, SetAttributes, SetMode};
     use bytes::Bytes;
@@ -615,13 +631,13 @@ mod tests {
         let auth = (&test_auth()).into();
 
         let file_as_directory = fs
-            .remove_idempotent_checked(&auth, 0, b"file", [0; 16], true)
+            .remove_idempotent_checked(&auth, 0, b"file", NameMatch::Folded, [0; 16], true)
             .await;
         assert!(matches!(file_as_directory, Err(FsError::NotDirectory)));
         assert!(fs.lookup(&test_creds(), 0, b"file").await.is_ok());
 
         let directory_as_file = fs
-            .remove_idempotent_checked(&auth, 0, b"directory", [0; 16], false)
+            .remove_idempotent_checked(&auth, 0, b"directory", NameMatch::Folded, [0; 16], false)
             .await;
         assert!(matches!(directory_as_file, Err(FsError::IsDirectory)));
         assert!(fs.lookup(&test_creds(), 0, b"directory").await.is_ok());

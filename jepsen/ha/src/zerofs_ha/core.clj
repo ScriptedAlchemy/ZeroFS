@@ -467,9 +467,9 @@
 
 (defn await-inode-accounting!
   "Poll statfs after namespace mutations stop until its inode excess is gone.
-  The expected count preserves the offset measured by the baseline read. Completed
-  create results pin their inodes for 150 seconds, and unlink defers reclamation
-  while a pin remains. The remaining timeout covers expiry processing and serial
+  The expected count preserves the offset measured by the baseline read. A completed
+  create pins its inode for 150 seconds unless the creating session clunks the fid
+  it opened, and unlink defers reclamation while a pin remains. The remaining timeout covers expiry processing and serial
   orphan reclamation. An undercount returns immediately for the statfs checker to
   report."
   [dir {:keys [used-inodes all-inodes]}]

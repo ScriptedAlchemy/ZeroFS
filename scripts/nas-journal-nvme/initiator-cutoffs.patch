@@ -1,0 +1,88 @@
+--- initiator-probe.c
++++ initiator-probe.c
+@@ -12,6 +12,7 @@
+ 	bool quiet;
+ 	bool complete;
+ 	bool error;
++	uint64_t submitted_at;
+ };
+ 
+ static void
+@@ -22,7 +23,9 @@
+ 	result->complete = true;
+ 	result->error = spdk_nvme_cpl_is_error(completion);
+ 	if (!result->quiet || result->error) {
+-		printf("NVMe completion sct=%u sc=%u\n", completion->status.sct, completion->status.sc);
++		printf("NVMe completion sct=%u sc=%u elapsed_ns=%.0f\n", completion->status.sct,
++		       completion->status.sc, (double)(spdk_get_ticks() - result->submitted_at) *
++		       1e9 / spdk_get_ticks_hz());
+ 		fflush(stdout);
+ 	}
+ }
+@@ -52,6 +55,7 @@
+ 	int rc;
+ 
+ 	memset(buffer, write ? value : 0xff, SECTOR);
++	result.submitted_at = spdk_get_ticks();
+ 	if (write) {
+ 		rc = spdk_nvme_ns_cmd_write(ns, qpair, buffer, lba, 1, completed, &result,
+ 					   fua ? SPDK_NVME_IO_FLAGS_FORCE_UNIT_ACCESS : 0);
+@@ -79,7 +83,7 @@
+ static int
+ flush(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair, bool expect_error, bool quiet)
+ {
+-	struct result result = {.quiet = quiet};
++	struct result result = {.quiet = quiet, .submitted_at = spdk_get_ticks()};
+ 	int rc = spdk_nvme_ns_cmd_flush(ns, qpair, completed, &result);
+ 
+ 	if (!quiet) {
+@@ -140,6 +144,7 @@
+ 	struct spdk_uuid uuid;
+ 	uint8_t *buffer = NULL;
+ 	bool deny, discover, seed, verify, concurrent, verify_concurrent, fault;
++	bool fua_cutoff, flush_cutoff, verify_fua, verify_flush;
+ 	int rc = 1;
+ 
+ 	if (argc != 10) {
+@@ -153,7 +158,12 @@
+ 	concurrent = strcmp(argv[1], "concurrent") == 0;
+ 	verify_concurrent = strcmp(argv[1], "verify-concurrent") == 0;
+ 	fault = strcmp(argv[1], "fault-fua") == 0 || strcmp(argv[1], "fault-flush") == 0;
+-	if (!(deny || discover || seed || verify || concurrent || verify_concurrent || fault) || spdk_uuid_parse(&uuid, argv[7]) != 0) {
++	fua_cutoff = strcmp(argv[1], "cutoff-fua") == 0;
++	flush_cutoff = strcmp(argv[1], "cutoff-flush") == 0;
++	verify_fua = strcmp(argv[1], "verify-fua") == 0;
++	verify_flush = strcmp(argv[1], "verify-flush") == 0;
++	if (!(deny || discover || seed || verify || concurrent || verify_concurrent || fault ||
++	      fua_cutoff || flush_cutoff || verify_fua || verify_flush) || spdk_uuid_parse(&uuid, argv[7]) != 0) {
+ 		return 2;
+ 	}
+ 	spdk_env_opts_init(&env);
+@@ -218,6 +228,27 @@
+ 	}
+ 	puts("authenticated and matched namespace geometry");
+ 	fflush(stdout);
++	if (fua_cutoff || flush_cutoff) {
++		rc = block(ns, qpair, buffer, fua_cutoff ? 3 : 8, fua_cutoff ? 0x75 : 0x6b,
++			   true, fua_cutoff, false, false) ||
++		     (flush_cutoff && flush(ns, qpair, false, false));
++		if (rc == 0) {
++			puts(fua_cutoff ? "ACK FUA" : "ACK FLUSH");
++			fflush(stdout);
++			/* Hold the live connection open for the supervisor's SIGKILL. */
++			rc = getchar() == EOF;
++		}
++		goto exit_qpair;
++	}
++	if (verify_fua || verify_flush) {
++		rc = block(ns, qpair, buffer, 2, 0, false, false, false, false) ||
++		     block(ns, qpair, buffer, 3, verify_fua ? 0x75 : 0, false, false, false, false) ||
++		     block(ns, qpair, buffer, 4, 0, false, false, false, false) ||
++		     block(ns, qpair, buffer, 7, 0, false, false, false, false) ||
++		     block(ns, qpair, buffer, 8, verify_flush ? 0x6b : 0, false, false, false, false) ||
++		     block(ns, qpair, buffer, 9, 0, false, false, false, false);
++		goto exit_qpair;
++	}
+ 	if (concurrent) {
+ 		rc = exercise_concurrent_io(ns, qpair, buffer);
+ 		goto exit_qpair;

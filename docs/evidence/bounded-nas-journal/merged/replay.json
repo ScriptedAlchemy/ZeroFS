@@ -1,0 +1,1328 @@
+{
+  "accounting_scope": "Non-atomic scoped regular-file stat samples. Apparent bytes sum st_size. Allocated bytes sum st_blocks * 512. Component names use the first child beneath a role or its bucket namespace. No directories, ballast, cgroup, filesystem metadata, unlinked files or physical-media durability accounting.",
+  "ballast_releases": {
+    "member-a": {
+      "unlink_completed_seconds": 17.98757196497172,
+      "unlink_started_seconds": 17.95950953499414
+    },
+    "member-b": {
+      "unlink_completed_seconds": 18.016097338986583,
+      "unlink_started_seconds": 17.987585654947907
+    }
+  },
+  "binary_sha256": "bd87fd6e387afb775d5d7805e45b79b2d8c14854461c5ae88283fe4d1d3f83ee",
+  "cleanup_verified": true,
+  "drain_remote_bytes_delta": 255179293,
+  "drain_seconds": 0.7074128410313278,
+  "engine_config_sha256": "a1e0fcf39f5dfd38d9dc529efa9932f5b576d911822d0db129899f3eb3cbb464",
+  "file_mib": 36,
+  "files": 6,
+  "fixture": "Fixture",
+  "kernel": "7.0.0-28-generic",
+  "scope": "synthetic local tmpfs destinations, native userspace 9P2000.L file I/O",
+  "simultaneous_member_reservations_observed": false,
+  "status": "passed",
+  "timeline": [
+    {
+      "elapsed_seconds": 0.3990880569908768,
+      "stage": "startup",
+      "writeback": {
+        "accepted_sequence": 9,
+        "dirty_ram_bytes": 0,
+        "dirty_ssd_capacity_bytes": 536870912,
+        "dirty_ssd_operations": 0,
+        "dirty_ssd_reserved_bytes": 0,
+        "local_sequence": 9,
+        "remote_bytes_completed_total": 1619,
+        "remote_sequence": 9,
+        "retries_total": 0,
+        "ssd_admission_paced": 0,
+        "terminal_error": 0
+      }
+    },
+    {
+      "elapsed_seconds": 0.4042970120208338,
+      "members": {
+        "member-a": {
+          "available_bytes": 258431360,
+          "objects": 0,
+          "pending_uploads": 0,
+          "reserved_bytes": 0,
+          "space": {
+            "declared_exceeds_filesystem": true,
+            "filesystem_free_bytes": 268431360,
+            "filesystem_total_bytes": 268435456,
+            "full": null
+          },
+          "used_bytes": 0
+        },
+        "member-b": {
+          "available_bytes": 258431360,
+          "objects": 0,
+          "pending_uploads": 0,
+          "reserved_bytes": 0,
+          "space": {
+            "declared_exceeds_filesystem": true,
+            "filesystem_free_bytes": 268431360,
+            "filesystem_total_bytes": 268435456,
+            "full": null
+          },
+          "used_bytes": 0
+        }
+      },
+      "stage": "startup"
+    },
+    {
+      "accounting": {
+        "cache": {
+          "allocated_bytes": 4096,
+          "apparent_bytes": 2147483754,
+          "components": {
+            "bucket_7baf8f90/.zerofs-clean-cache.lock": {
+              "allocated_bytes": 0,
+              "apparent_bytes": 0,
+              "regular_files": 1
+            },
+            "bucket_7baf8f90/hybrid_cache_v1": {
+              "allocated_bytes": 0,
+              "apparent_bytes": 1073741824,
+              "regular_files": 16
+            },
+            "bucket_7baf8f90/parts_cache_v1": {
+              "allocated_bytes": 4096,
+              "apparent_bytes": 1073741930,
+              "regular_files": 17
+            }
+          },
+          "regular_files": 34
+        },
+        "catalog": {
+          "allocated_bytes": 57344,
+          "apparent_bytes": 548864,
+          "components": {
+            "pool.lock": {
+              "allocated_bytes": 0,
+              "apparent_bytes": 0,
+              "regular_files": 1
+            },
+            "pool.redb": {
+              "allocated_bytes": 57344,
+              "apparent_bytes": 548864,
+              "regular_files": 1
+            }
+          },
+          "regular_files": 2
+        },
+        "journal": {
+          "allocated_bytes": 65536,
+          "apparent_bytes": 180224,
+          "components": {
+            "bucket_7baf8f90/LOCK": {
+              "allocated_bytes": 0,
+              "apparent_bytes": 0,
+              "regular_files": 1
+            },
+            "bucket_7baf8f90/journal.redb": {
+              "allocated_bytes": 65536,
+              "apparent_bytes": 180224,
+              "regular_files": 1
+            }
+          },
+          "regular_files": 2
+        },
+        "member-a": {
+          "allocated_bytes": 4096,
+          "apparent_bytes": 108,
+          "components": {
+            ".zerofs-pool": {
+              "allocated_bytes": 4096,
+              "apparent_bytes": 108,
+              "regular_files": 2
+            }
+          },
+          "regular_files": 2
+        },
+        "member-b": {
+          "allocated_bytes": 4096,
+          "apparent_bytes": 108,
+          "components": {
+            ".zerofs-pool": {
+              "allocated_bytes": 4096,
+              "apparent_bytes": 108,
+              "regular_files": 2
+            }
+          },
+          "regular_files": 2
+        },
+        "metadata": {
+          "allocated_bytes": 45056,
+          "apparent_bytes": 1901,
+          "components": {
+            "(root dotfiles)": {
+              "allocated_bytes": 4096,
+              "apparent_bytes": 36,
+              "regular_files": 2
+            },
+            ".zerofs-pool": {
+              "allocated_bytes": 4096,
+              "apparent_bytes": 122,
+              "regular_files": 2
+            },
+            "compacted": {
+              "allocated_bytes": 4096,
+              "apparent_bytes": 469,
+              "regular_files": 2
+            },
+            "compactions": {
+              "allocated_bytes": 12288,
+              "apparent_bytes": 110,
+              "regular_files": 4
+            },
+            "manifest": {
+              "allocated_bytes": 16384,
+              "apparent_bytes": 1040,
+              "regular_files": 5
+            },
+            "wal": {
+              "allocated_bytes": 0,
+              "apparent_bytes": 0,
+              "regular_files": 2
+            },
+            "zerofs.key": {
+              "allocated_bytes": 4096,
+              "apparent_bytes": 124,
+              "regular_files": 1
+            }
+          },
+          "regular_files": 18
+        }
+      },
+      "elapsed_seconds": 0.40948138595558703,
+      "stage": "startup"
+    },
+    {
+      "ballast": "/a/zjn-ttaausfr/ballast",
+      "ballast_bytes": 267382784,
+      "elapsed_seconds": 0.49841440201271325,
+      "free_bytes": 1048576,
+      "stage": "hold"
+    },
+    {
+      "ballast": "/b/zjn-154ceqnf/ballast",
+      "ballast_bytes": 267382784,
+      "elapsed_seconds": 0.5846214559860528,
+      "free_bytes": 1048576,
+      "stage": "hold"
+    },
+    {
+      "elapsed_seconds": 0.5906820909585804,
+      "members": {
+        "member-a": {
+          "available_bytes": 0,
+          "objects": 0,
+          "pending_uploads": 0,
+          "reserved_bytes": 0,
+          "space": {
+            "declared_exceeds_filesystem": true,
+            "filesystem_free_bytes": 1048576,
+            "filesystem_total_bytes": 268435456,
+            "full": {
+              "reason": "below_free_space_reserve"
+            }
+          },
+          "used_bytes": 0
+        },
+        "member-b": {
+          "available_bytes": 0,
+          "objects": 0,
+          "pending_uploads": 0,
+          "reserved_bytes": 0,
+          "space": {
+            "declared_exceeds_filesystem": true,
+            "filesystem_free_bytes": 1048576,
+            "filesystem_total_bytes": 268435456,
+            "full": {
+              "reason": "below_free_space_reserve"
+            }
+          },
+          "used_bytes": 0
+        }
+      },
+      "stage": "hold"
+    },
+    {
+      "bytes": 37748736,
+      "create_and_write_seconds": 0.1446816410170868,
+      "elapsed_seconds": 0.9270045249722898,
+      "expected_sha256": "984bd6944960702e70d97ea2f43a2be862b5501be59e2c519bcdc45a10c139d1",
+      "file": "journal-case-00",
+      "fsync_seconds": 0.05563551094383001,
+      "stage": "write-and-fsync"
+    },
+    {
+      "bytes": 37748736,
+      "create_and_write_seconds": 0.13368857407476753,
+      "elapsed_seconds": 1.260701386956498,
+      "expected_sha256": "ed308275cc7ad43d5b51d7505e44dca9d4f2fea591b4b2314eecf621f8571061",
+      "file": "journal-case-01",
+      "fsync_seconds": 0.060843347921036184,
+      "stage": "write-and-fsync"
+    },
+    {
+      "bytes": 37748736,
+      "create_and_write_seconds": 0.15763316093944013,
+      "elapsed_seconds": 1.5991097779478878,
+      "expected_sha256": "bae947c3a6125ed55329ac97ccb40d6baec54ec2e22a38785f6801d796016f07",
+      "file": "journal-case-02",
+      "fsync_seconds": 0.042298016021959484,
+      "stage": "write-and-fsync"
+    },
+    {
+      "bytes": 37748736,
+      "create_and_write_seconds": 0.12089655303861946,
+      "elapsed_seconds": 2.2389760490041226,
+      "expected_sha256": "eaebfd67164921c8117890a92df0c9211213a2fa1d4d569cfd64b3e0b2e8d5be",
+      "file": "journal-case-03",
+      "fsync_seconds": 0.38085426902398467,
+      "stage": "write-and-fsync"
+    },
+    {
+      "bytes": 37748736,
+      "create_and_write_seconds": 0.12836816592607647,
+      "elapsed_seconds": 2.5620896510081366,
+      "expected_sha256": "3de1d291fa00ee0fe8ce7855518e9132b3e12ca4e4d40dd85725807c86d7daad",
+      "file": "journal-case-04",
+      "fsync_seconds": 0.0555072600254789,
+      "stage": "write-and-fsync"
+    },
+    {
+      "bytes": 37748736,
+      "create_and_write_seconds": 0.12410607398487628,
+      "elapsed_seconds": 2.8809431469999254,
+      "expected_sha256": "8b186aec842d7893ce82547b51aa0ae4685ce1180b602aa6bfe0ca3a291a2e60",
+      "file": "journal-case-05",
+      "fsync_seconds": 0.05612649896647781,
+      "stage": "write-and-fsync"
+    },
+    {
+      "elapsed_seconds": 2.8885474510025233,
+      "members": {
+        "member-a": {
+          "available_bytes": 0,
+          "objects": 0,
+          "pending_uploads": 0,
+          "reserved_bytes": 0,
+          "space": {
+            "declared_exceeds_filesystem": true,
+            "filesystem_free_bytes": 1048576,
+            "filesystem_total_bytes": 268435456,
+            "full": {
+              "reason": "below_free_space_reserve"
+            }
+          },
+          "used_bytes": 0
+        },
+        "member-b": {
+          "available_bytes": 0,
+          "objects": 0,
+          "pending_uploads": 0,
+          "reserved_bytes": 0,
+          "space": {
+            "declared_exceeds_filesystem": true,
+            "filesystem_free_bytes": 1048576,
+            "filesystem_total_bytes": 268435456,
+            "full": {
+              "reason": "below_free_space_reserve"
+            }
+          },
+          "used_bytes": 0
+        }
+      },
+      "stage": "pre-kill-backlog",
+      "writeback": {
+        "accepted_sequence": 48,
+        "dirty_ram_bytes": 42100,
+        "dirty_ssd_capacity_bytes": 536870912,
+        "dirty_ssd_operations": 39,
+        "dirty_ssd_reserved_bytes": 256138556,
+        "local_sequence": 48,
+        "remote_bytes_completed_total": 1619,
+        "remote_sequence": 9,
+        "retries_total": 15,
+        "ssd_admission_paced": 0,
+        "terminal_error": 0
+      }
+    },
+    {
+      "accounting": {
+        "cache": {
+          "allocated_bytes": 228810752,
+          "apparent_bytes": 2147483754,
+          "components": {
+            "bucket_7baf8f90/.zerofs-clean-cache.lock": {
+              "allocated_bytes": 0,
+              "apparent_bytes": 0,
+              "regular_files": 1
+            },
+            "bucket_7baf8f90/hybrid_cache_v1": {
+              "allocated_bytes": 0,
+              "apparent_bytes": 1073741824,
+              "regular_files": 16
+            },
+            "bucket_7baf8f90/parts_cache_v1": {
+              "allocated_bytes": 228810752,
+              "apparent_bytes": 1073741930,
+              "regular_files": 17
+            }
+          },
+          "regular_files": 34
+        },
+        "catalog": {
+          "allocated_bytes": 57344,
+          "apparent_bytes": 548864,
+          "components": {
+            "pool.lock": {
+              "allocated_bytes": 0,
+              "apparent_bytes": 0,
+              "regular_files": 1
+            },
+            "pool.redb": {
+              "allocated_bytes": 57344,
+              "apparent_bytes": 548864,
+              "regular_files": 1
+            }
+          },
+          "regular_files": 2
+        },
+        "journal": {
+          "allocated_bytes": 255336448,
+          "apparent_bytes": 255340914,
+          "components": {
+            "bucket_7baf8f90/LOCK": {
+              "allocated_bytes": 0,
+              "apparent_bytes": 0,
+              "regular_files": 1
+            },
+            "bucket_7baf8f90/blobs": {
+              "allocated_bytes": 255238144,
+              "apparent_bytes": 255160690,
+              "regular_files": 26
+            },
+            "bucket_7baf8f90/journal.redb": {
+              "allocated_bytes": 98304,
+              "apparent_bytes": 180224,
+              "regular_files": 1
+            }
+          },
+          "regular_files": 28
+        },
+        "member-a": {
+          "allocated_bytes": 4096,
+          "apparent_bytes": 108,
+          "components": {
+            ".zerofs-pool": {
+              "allocated_bytes": 4096,
+              "apparent_bytes": 108,
+              "regular_files": 2
+            }
+          },
+          "regular_files": 2
+        },
+        "member-b": {
+          "allocated_bytes": 4096,
+          "apparent_bytes": 108,
+          "components": {
+            ".zerofs-pool": {
+              "allocated_bytes": 4096,
+              "apparent_bytes": 108,
+              "regular_files": 2
+            }
+          },
+          "regular_files": 2
+        },
+        "metadata": {
+          "allocated_bytes": 45056,
+          "apparent_bytes": 1901,
+          "components": {
+            "(root dotfiles)": {
+              "allocated_bytes": 4096,
+              "apparent_bytes": 36,
+              "regular_files": 2
+            },
+            ".zerofs-pool": {
+              "allocated_bytes": 4096,
+              "apparent_bytes": 122,
+              "regular_files": 2
+            },
+            "compacted": {
+              "allocated_bytes": 4096,
+              "apparent_bytes": 469,
+              "regular_files": 2
+            },
+            "compactions": {
+              "allocated_bytes": 12288,
+              "apparent_bytes": 110,
+              "regular_files": 4
+            },
+            "manifest": {
+              "allocated_bytes": 16384,
+              "apparent_bytes": 1040,
+              "regular_files": 5
+            },
+            "wal": {
+              "allocated_bytes": 0,
+              "apparent_bytes": 0,
+              "regular_files": 2
+            },
+            "zerofs.key": {
+              "allocated_bytes": 4096,
+              "apparent_bytes": 124,
+              "regular_files": 1
+            }
+          },
+          "regular_files": 18
+        }
+      },
+      "elapsed_seconds": 2.8956708499463275,
+      "stage": "pre-kill-backlog"
+    },
+    {
+      "elapsed_seconds": 2.927307134028524,
+      "exit_signal": "SIGKILL",
+      "stage": "pre-kill-backlog"
+    },
+    {
+      "elapsed_seconds": 2.9441220129374415,
+      "prior_clean_cache_removed": true,
+      "stage": "pre-kill-backlog"
+    },
+    {
+      "elapsed_seconds": 5.648125387029722,
+      "expected_sha256": "984bd6944960702e70d97ea2f43a2be862b5501be59e2c519bcdc45a10c139d1",
+      "file": "journal-case-00",
+      "read_seconds": 2.3021881149616092,
+      "sha256": "984bd6944960702e70d97ea2f43a2be862b5501be59e2c519bcdc45a10c139d1",
+      "stage": "recover-still-held"
+    },
+    {
+      "elapsed_seconds": 8.04788698500488,
+      "expected_sha256": "ed308275cc7ad43d5b51d7505e44dca9d4f2fea591b4b2314eecf621f8571061",
+      "file": "journal-case-01",
+      "read_seconds": 2.3996848659589887,
+      "sha256": "ed308275cc7ad43d5b51d7505e44dca9d4f2fea591b4b2314eecf621f8571061",
+      "stage": "recover-still-held"
+    },
+    {
+      "elapsed_seconds": 10.456648112973198,
+      "expected_sha256": "bae947c3a6125ed55329ac97ccb40d6baec54ec2e22a38785f6801d796016f07",
+      "file": "journal-case-02",
+      "read_seconds": 2.4086746979737654,
+      "sha256": "bae947c3a6125ed55329ac97ccb40d6baec54ec2e22a38785f6801d796016f07",
+      "stage": "recover-still-held"
+    },
+    {
+      "elapsed_seconds": 12.945924293017015,
+      "expected_sha256": "eaebfd67164921c8117890a92df0c9211213a2fa1d4d569cfd64b3e0b2e8d5be",
+      "file": "journal-case-03",
+      "read_seconds": 2.4891753980191424,
+      "sha256": "eaebfd67164921c8117890a92df0c9211213a2fa1d4d569cfd64b3e0b2e8d5be",
+      "stage": "recover-still-held"
+    },
+    {
+      "elapsed_seconds": 15.43844465201255,
+      "expected_sha256": "3de1d291fa00ee0fe8ce7855518e9132b3e12ca4e4d40dd85725807c86d7daad",
+      "file": "journal-case-04",
+      "read_seconds": 2.4924272779608145,
+      "sha256": "3de1d291fa00ee0fe8ce7855518e9132b3e12ca4e4d40dd85725807c86d7daad",
+      "stage": "recover-still-held"
+    },
+    {
+      "elapsed_seconds": 17.945257787941955,
+      "expected_sha256": "8b186aec842d7893ce82547b51aa0ae4685ce1180b602aa6bfe0ca3a291a2e60",
+      "file": "journal-case-05",
+      "read_seconds": 2.5067333560436964,
+      "sha256": "8b186aec842d7893ce82547b51aa0ae4685ce1180b602aa6bfe0ca3a291a2e60",
+      "stage": "recover-still-held"
+    },
+    {
+      "elapsed_seconds": 17.95179864903912,
+      "members": {
+        "member-a": {
+          "available_bytes": 0,
+          "objects": 0,
+          "pending_uploads": 0,
+          "reserved_bytes": 0,
+          "space": {
+            "declared_exceeds_filesystem": true,
+            "filesystem_free_bytes": 1048576,
+            "filesystem_total_bytes": 268435456,
+            "full": {
+              "reason": "below_free_space_reserve"
+            }
+          },
+          "used_bytes": 0
+        },
+        "member-b": {
+          "available_bytes": 0,
+          "objects": 0,
+          "pending_uploads": 0,
+          "reserved_bytes": 0,
+          "space": {
+            "declared_exceeds_filesystem": true,
+            "filesystem_free_bytes": 1048576,
+            "filesystem_total_bytes": 268435456,
+            "full": {
+              "reason": "below_free_space_reserve"
+            }
+          },
+          "used_bytes": 0
+        }
+      },
+      "stage": "recover-still-held",
+      "writeback": {
+        "accepted_sequence": 58,
+        "dirty_ram_bytes": 0,
+        "dirty_ssd_capacity_bytes": 536870912,
+        "dirty_ssd_operations": 49,
+        "dirty_ssd_reserved_bytes": 256407839,
+        "local_sequence": 58,
+        "remote_bytes_completed_total": 1619,
+        "remote_sequence": 9,
+        "retries_total": 54,
+        "ssd_admission_paced": 0,
+        "terminal_error": 0
+      }
+    },
+    {
+      "accounting": {
+        "cache": {
+          "allocated_bytes": 232558592,
+          "apparent_bytes": 2147483754,
+          "components": {
+            "bucket_7baf8f90/.zerofs-clean-cache.lock": {
+              "allocated_bytes": 0,
+              "apparent_bytes": 0,
+              "regular_files": 1
+            },
+            "bucket_7baf8f90/hybrid_cache_v1": {
+              "allocated_bytes": 0,
+              "apparent_bytes": 1073741824,
+              "regular_files": 16
+            },
+            "bucket_7baf8f90/parts_cache_v1": {
+              "allocated_bytes": 232558592,
+              "apparent_bytes": 1073741930,
+              "regular_files": 17
+            }
+          },
+          "regular_files": 34
+        },
+        "catalog": {
+          "allocated_bytes": 53248,
+          "apparent_bytes": 303104,
+          "components": {
+            "pool.lock": {
+              "allocated_bytes": 0,
+              "apparent_bytes": 0,
+              "regular_files": 1
+            },
+            "pool.redb": {
+              "allocated_bytes": 53248,
+              "apparent_bytes": 303104,
+              "regular_files": 1
+            }
+          },
+          "regular_files": 2
+        },
+        "journal": {
+          "allocated_bytes": 255369216,
+          "apparent_bytes": 255359517,
+          "components": {
+            "bucket_7baf8f90/LOCK": {
+              "allocated_bytes": 0,
+              "apparent_bytes": 0,
+              "regular_files": 1
+            },
+            "bucket_7baf8f90/blobs": {
+              "allocated_bytes": 255270912,
+              "apparent_bytes": 255179293,
+              "regular_files": 35
+            },
+            "bucket_7baf8f90/journal.redb": {
+              "allocated_bytes": 98304,
+              "apparent_bytes": 180224,
+              "regular_files": 1
+            }
+          },
+          "regular_files": 37
+        },
+        "member-a": {
+          "allocated_bytes": 4096,
+          "apparent_bytes": 108,
+          "components": {
+            ".zerofs-pool": {
+              "allocated_bytes": 4096,
+              "apparent_bytes": 108,
+              "regular_files": 2
+            }
+          },
+          "regular_files": 2
+        },
+        "member-b": {
+          "allocated_bytes": 4096,
+          "apparent_bytes": 108,
+          "components": {
+            ".zerofs-pool": {
+              "allocated_bytes": 4096,
+              "apparent_bytes": 108,
+              "regular_files": 2
+            }
+          },
+          "regular_files": 2
+        },
+        "metadata": {
+          "allocated_bytes": 45056,
+          "apparent_bytes": 1901,
+          "components": {
+            "(root dotfiles)": {
+              "allocated_bytes": 4096,
+              "apparent_bytes": 36,
+              "regular_files": 2
+            },
+            ".zerofs-pool": {
+              "allocated_bytes": 4096,
+              "apparent_bytes": 122,
+              "regular_files": 2
+            },
+            "compacted": {
+              "allocated_bytes": 4096,
+              "apparent_bytes": 469,
+              "regular_files": 2
+            },
+            "compactions": {
+              "allocated_bytes": 12288,
+              "apparent_bytes": 110,
+              "regular_files": 4
+            },
+            "manifest": {
+              "allocated_bytes": 16384,
+              "apparent_bytes": 1040,
+              "regular_files": 5
+            },
+            "wal": {
+              "allocated_bytes": 0,
+              "apparent_bytes": 0,
+              "regular_files": 2
+            },
+            "zerofs.key": {
+              "allocated_bytes": 4096,
+              "apparent_bytes": 124,
+              "regular_files": 1
+            }
+          },
+          "regular_files": 18
+        }
+      },
+      "elapsed_seconds": 17.959412603988312,
+      "stage": "recover-still-held"
+    },
+    {
+      "committed_bytes_delta": {
+        "member-a": 0,
+        "member-b": 0
+      },
+      "elapsed_seconds": 18.023108256980777,
+      "members": {
+        "member-a": {
+          "available_bytes": 258431360,
+          "objects": 0,
+          "pending_uploads": 0,
+          "reserved_bytes": 0,
+          "space": {
+            "declared_exceeds_filesystem": true,
+            "filesystem_free_bytes": 268431360,
+            "filesystem_total_bytes": 268435456,
+            "full": null
+          },
+          "used_bytes": 0
+        },
+        "member-b": {
+          "available_bytes": 258431360,
+          "objects": 0,
+          "pending_uploads": 0,
+          "reserved_bytes": 0,
+          "space": {
+            "declared_exceeds_filesystem": true,
+            "filesystem_free_bytes": 268431360,
+            "filesystem_total_bytes": 268435456,
+            "full": null
+          },
+          "used_bytes": 0
+        }
+      },
+      "stage": "release-and-drain",
+      "writeback": {
+        "accepted_sequence": 58,
+        "dirty_ram_bytes": 0,
+        "dirty_ssd_capacity_bytes": 536870912,
+        "dirty_ssd_operations": 49,
+        "dirty_ssd_reserved_bytes": 256407839,
+        "local_sequence": 58,
+        "remote_bytes_completed_total": 1619,
+        "remote_sequence": 9,
+        "retries_total": 54,
+        "ssd_admission_paced": 0,
+        "terminal_error": 0
+      }
+    },
+    {
+      "committed_bytes_delta": {
+        "member-a": 8839595,
+        "member-b": 0
+      },
+      "elapsed_seconds": 18.1305842139991,
+      "members": {
+        "member-a": {
+          "available_bytes": 215957949,
+          "objects": 1,
+          "pending_uploads": 0,
+          "reserved_bytes": 0,
+          "space": {
+            "declared_exceeds_filesystem": true,
+            "filesystem_free_bytes": 259588096,
+            "filesystem_total_bytes": 268435456,
+            "full": null
+          },
+          "used_bytes": 8839595
+        },
+        "member-b": {
+          "available_bytes": 224801213,
+          "objects": 0,
+          "pending_uploads": 1,
+          "reserved_bytes": 33630147,
+          "space": {
+            "declared_exceeds_filesystem": true,
+            "filesystem_free_bytes": 268431360,
+            "filesystem_total_bytes": 268435456,
+            "full": null
+          },
+          "used_bytes": 0
+        }
+      },
+      "stage": "release-and-drain",
+      "writeback": {
+        "accepted_sequence": 58,
+        "dirty_ram_bytes": 0,
+        "dirty_ssd_capacity_bytes": 536870912,
+        "dirty_ssd_operations": 49,
+        "dirty_ssd_reserved_bytes": 256407839,
+        "local_sequence": 58,
+        "remote_bytes_completed_total": 1619,
+        "remote_sequence": 9,
+        "retries_total": 54,
+        "ssd_admission_paced": 0,
+        "terminal_error": 0
+      }
+    },
+    {
+      "committed_bytes_delta": {
+        "member-a": 51309294,
+        "member-b": 42469742
+      },
+      "elapsed_seconds": 18.238336103968322,
+      "members": {
+        "member-a": {
+          "available_bytes": 207112576,
+          "objects": 3,
+          "pending_uploads": 0,
+          "reserved_bytes": 0,
+          "space": {
+            "declared_exceeds_filesystem": true,
+            "filesystem_free_bytes": 217112576,
+            "filesystem_total_bytes": 268435456,
+            "full": null
+          },
+          "used_bytes": 51309294
+        },
+        "member-b": {
+          "available_bytes": 215955840,
+          "objects": 2,
+          "pending_uploads": 0,
+          "reserved_bytes": 0,
+          "space": {
+            "declared_exceeds_filesystem": true,
+            "filesystem_free_bytes": 225955840,
+            "filesystem_total_bytes": 268435456,
+            "full": null
+          },
+          "used_bytes": 42469742
+        }
+      },
+      "stage": "release-and-drain",
+      "writeback": {
+        "accepted_sequence": 58,
+        "dirty_ram_bytes": 0,
+        "dirty_ssd_capacity_bytes": 536870912,
+        "dirty_ssd_operations": 46,
+        "dirty_ssd_reserved_bytes": 213850082,
+        "local_sequence": 58,
+        "remote_bytes_completed_total": 42484146,
+        "remote_sequence": 12,
+        "retries_total": 54,
+        "ssd_admission_paced": 0,
+        "terminal_error": 0
+      }
+    },
+    {
+      "committed_bytes_delta": {
+        "member-a": 84939441,
+        "member-b": 84939424
+      },
+      "elapsed_seconds": 18.34523975395132,
+      "members": {
+        "member-a": {
+          "available_bytes": 173480320,
+          "objects": 4,
+          "pending_uploads": 0,
+          "reserved_bytes": 0,
+          "space": {
+            "declared_exceeds_filesystem": true,
+            "filesystem_free_bytes": 183480320,
+            "filesystem_total_bytes": 268435456,
+            "full": null
+          },
+          "used_bytes": 84939441
+        },
+        "member-b": {
+          "available_bytes": 173480320,
+          "objects": 4,
+          "pending_uploads": 0,
+          "reserved_bytes": 0,
+          "space": {
+            "declared_exceeds_filesystem": true,
+            "filesystem_free_bytes": 183480320,
+            "filesystem_total_bytes": 268435456,
+            "full": null
+          },
+          "used_bytes": 84939424
+        }
+      },
+      "stage": "release-and-drain",
+      "writeback": {
+        "accepted_sequence": 58,
+        "dirty_ram_bytes": 0,
+        "dirty_ssd_capacity_bytes": 536870912,
+        "dirty_ssd_operations": 42,
+        "dirty_ssd_reserved_bytes": 171252466,
+        "local_sequence": 58,
+        "remote_bytes_completed_total": 84981466,
+        "remote_sequence": 16,
+        "retries_total": 54,
+        "ssd_admission_paced": 0,
+        "terminal_error": 0
+      }
+    },
+    {
+      "committed_bytes_delta": {
+        "member-a": 93779036,
+        "member-b": 118569577
+      },
+      "elapsed_seconds": 18.452450398006476,
+      "members": {
+        "member-a": {
+          "available_bytes": 164637056,
+          "objects": 5,
+          "pending_uploads": 0,
+          "reserved_bytes": 0,
+          "space": {
+            "declared_exceeds_filesystem": true,
+            "filesystem_free_bytes": 174637056,
+            "filesystem_total_bytes": 268435456,
+            "full": null
+          },
+          "used_bytes": 93779036
+        },
+        "member-b": {
+          "available_bytes": 139848064,
+          "objects": 5,
+          "pending_uploads": 0,
+          "reserved_bytes": 0,
+          "space": {
+            "declared_exceeds_filesystem": true,
+            "filesystem_free_bytes": 149848064,
+            "filesystem_total_bytes": 268435456,
+            "full": null
+          },
+          "used_bytes": 118569577
+        }
+      },
+      "stage": "release-and-drain",
+      "writeback": {
+        "accepted_sequence": 58,
+        "dirty_ram_bytes": 0,
+        "dirty_ssd_capacity_bytes": 536870912,
+        "dirty_ssd_operations": 29,
+        "dirty_ssd_reserved_bytes": 85865345,
+        "local_sequence": 58,
+        "remote_bytes_completed_total": 170042649,
+        "remote_sequence": 29,
+        "retries_total": 54,
+        "ssd_admission_paced": 0,
+        "terminal_error": 0
+      }
+    },
+    {
+      "committed_bytes_delta": {
+        "member-a": 102618631,
+        "member-b": 152199724
+      },
+      "elapsed_seconds": 18.559792023035698,
+      "members": {
+        "member-a": {
+          "available_bytes": 155793792,
+          "objects": 6,
+          "pending_uploads": 0,
+          "reserved_bytes": 0,
+          "space": {
+            "declared_exceeds_filesystem": true,
+            "filesystem_free_bytes": 165793792,
+            "filesystem_total_bytes": 268435456,
+            "full": null
+          },
+          "used_bytes": 102618631
+        },
+        "member-b": {
+          "available_bytes": 106215808,
+          "objects": 6,
+          "pending_uploads": 0,
+          "reserved_bytes": 0,
+          "space": {
+            "declared_exceeds_filesystem": true,
+            "filesystem_free_bytes": 116215808,
+            "filesystem_total_bytes": 268435456,
+            "full": null
+          },
+          "used_bytes": 152199724
+        }
+      },
+      "stage": "release-and-drain",
+      "writeback": {
+        "accepted_sequence": 58,
+        "dirty_ram_bytes": 0,
+        "dirty_ssd_capacity_bytes": 536870912,
+        "dirty_ssd_operations": 16,
+        "dirty_ssd_reserved_bytes": 42932891,
+        "local_sequence": 58,
+        "remote_bytes_completed_total": 212649145,
+        "remote_sequence": 42,
+        "retries_total": 54,
+        "ssd_admission_paced": 0,
+        "terminal_error": 0
+      }
+    },
+    {
+      "committed_bytes_delta": {
+        "member-a": 102618631,
+        "member-b": 152199724
+      },
+      "elapsed_seconds": 18.666864044964314,
+      "members": {
+        "member-a": {
+          "available_bytes": 155793792,
+          "objects": 6,
+          "pending_uploads": 0,
+          "reserved_bytes": 0,
+          "space": {
+            "declared_exceeds_filesystem": true,
+            "filesystem_free_bytes": 165793792,
+            "filesystem_total_bytes": 268435456,
+            "full": null
+          },
+          "used_bytes": 102618631
+        },
+        "member-b": {
+          "available_bytes": 106215808,
+          "objects": 6,
+          "pending_uploads": 0,
+          "reserved_bytes": 0,
+          "space": {
+            "declared_exceeds_filesystem": true,
+            "filesystem_free_bytes": 116215808,
+            "filesystem_total_bytes": 268435456,
+            "full": null
+          },
+          "used_bytes": 152199724
+        }
+      },
+      "stage": "release-and-drain",
+      "writeback": {
+        "accepted_sequence": 58,
+        "dirty_ram_bytes": 0,
+        "dirty_ssd_capacity_bytes": 536870912,
+        "dirty_ssd_operations": 0,
+        "dirty_ssd_reserved_bytes": 0,
+        "local_sequence": 58,
+        "remote_bytes_completed_total": 255180912,
+        "remote_sequence": 58,
+        "retries_total": 54,
+        "ssd_admission_paced": 0,
+        "terminal_error": 0
+      }
+    },
+    {
+      "accounting": {
+        "cache": {
+          "allocated_bytes": 232558592,
+          "apparent_bytes": 2147483754,
+          "components": {
+            "bucket_7baf8f90/.zerofs-clean-cache.lock": {
+              "allocated_bytes": 0,
+              "apparent_bytes": 0,
+              "regular_files": 1
+            },
+            "bucket_7baf8f90/hybrid_cache_v1": {
+              "allocated_bytes": 0,
+              "apparent_bytes": 1073741824,
+              "regular_files": 16
+            },
+            "bucket_7baf8f90/parts_cache_v1": {
+              "allocated_bytes": 232558592,
+              "apparent_bytes": 1073741930,
+              "regular_files": 17
+            }
+          },
+          "regular_files": 34
+        },
+        "catalog": {
+          "allocated_bytes": 73728,
+          "apparent_bytes": 94208,
+          "components": {
+            "pool.lock": {
+              "allocated_bytes": 0,
+              "apparent_bytes": 0,
+              "regular_files": 1
+            },
+            "pool.redb": {
+              "allocated_bytes": 73728,
+              "apparent_bytes": 94208,
+              "regular_files": 1
+            }
+          },
+          "regular_files": 2
+        },
+        "journal": {
+          "allocated_bytes": 73728,
+          "apparent_bytes": 98304,
+          "components": {
+            "bucket_7baf8f90/LOCK": {
+              "allocated_bytes": 0,
+              "apparent_bytes": 0,
+              "regular_files": 1
+            },
+            "bucket_7baf8f90/journal.redb": {
+              "allocated_bytes": 73728,
+              "apparent_bytes": 98304,
+              "regular_files": 1
+            }
+          },
+          "regular_files": 2
+        },
+        "member-a": {
+          "allocated_bytes": 102641664,
+          "apparent_bytes": 102618739,
+          "components": {
+            ".zerofs-pool": {
+              "allocated_bytes": 102641664,
+              "apparent_bytes": 102618739,
+              "regular_files": 9
+            }
+          },
+          "regular_files": 9
+        },
+        "member-b": {
+          "allocated_bytes": 152219648,
+          "apparent_bytes": 152199832,
+          "components": {
+            ".zerofs-pool": {
+              "allocated_bytes": 152219648,
+              "apparent_bytes": 152199832,
+              "regular_files": 9
+            }
+          },
+          "regular_files": 9
+        },
+        "metadata": {
+          "allocated_bytes": 499712,
+          "apparent_bytes": 362839,
+          "components": {
+            "(root dotfiles)": {
+              "allocated_bytes": 4096,
+              "apparent_bytes": 36,
+              "regular_files": 2
+            },
+            ".zerofs-pool": {
+              "allocated_bytes": 4096,
+              "apparent_bytes": 122,
+              "regular_files": 2
+            },
+            "compacted": {
+              "allocated_bytes": 380928,
+              "apparent_bytes": 326185,
+              "regular_files": 19
+            },
+            "compactions": {
+              "allocated_bytes": 45056,
+              "apparent_bytes": 7462,
+              "regular_files": 12
+            },
+            "manifest": {
+              "allocated_bytes": 61440,
+              "apparent_bytes": 28910,
+              "regular_files": 16
+            },
+            "wal": {
+              "allocated_bytes": 0,
+              "apparent_bytes": 0,
+              "regular_files": 3
+            },
+            "zerofs.key": {
+              "allocated_bytes": 4096,
+              "apparent_bytes": 124,
+              "regular_files": 1
+            }
+          },
+          "regular_files": 55
+        }
+      },
+      "elapsed_seconds": 18.675110557931475,
+      "stage": "release-and-drain"
+    },
+    {
+      "elapsed_seconds": 18.708612794987857,
+      "exit_signal": "SIGKILL",
+      "remote_cut_writeback": {
+        "accepted_sequence": 58,
+        "dirty_ram_bytes": 0,
+        "dirty_ssd_capacity_bytes": 536870912,
+        "dirty_ssd_operations": 0,
+        "dirty_ssd_reserved_bytes": 0,
+        "local_sequence": 58,
+        "remote_bytes_completed_total": 255180912,
+        "remote_sequence": 58,
+        "retries_total": 54,
+        "ssd_admission_paced": 0,
+        "terminal_error": 0
+      },
+      "stage": "offline-destination"
+    },
+    {
+      "distribution": {
+        "member-a": {
+          "allocated_bytes_delta": 102637568,
+          "apparent_bytes_delta": 102618631,
+          "committed_bytes_delta": 102618631,
+          "committed_objects_delta": 6
+        },
+        "member-b": {
+          "allocated_bytes_delta": 152215552,
+          "apparent_bytes_delta": 152199724,
+          "committed_bytes_delta": 152199724,
+          "committed_objects_delta": 6
+        }
+      },
+      "elapsed_seconds": 18.721610764972866,
+      "members": {
+        "member-a": {
+          "available_bytes": 155793792,
+          "objects": 6,
+          "pending_uploads": 0,
+          "reserved_bytes": 0,
+          "space": {
+            "declared_exceeds_filesystem": true,
+            "filesystem_free_bytes": 165793792,
+            "filesystem_total_bytes": 268435456,
+            "full": null
+          },
+          "used_bytes": 102618631
+        },
+        "member-b": {
+          "available_bytes": 106215808,
+          "objects": 6,
+          "pending_uploads": 0,
+          "reserved_bytes": 0,
+          "space": {
+            "declared_exceeds_filesystem": true,
+            "filesystem_free_bytes": 116215808,
+            "filesystem_total_bytes": 268435456,
+            "full": null
+          },
+          "used_bytes": 152199724
+        }
+      },
+      "stage": "offline-destination"
+    },
+    {
+      "elapsed_seconds": 18.737162270001136,
+      "journal_payload_files_after_drain": 0,
+      "original_clean_cache_removed": true,
+      "original_journal_removed": true,
+      "stage": "offline-destination"
+    },
+    {
+      "elapsed_seconds": 19.104607551009394,
+      "expected_sha256": "984bd6944960702e70d97ea2f43a2be862b5501be59e2c519bcdc45a10c139d1",
+      "file": "journal-case-00",
+      "read_seconds": 0.1659179839771241,
+      "sha256": "984bd6944960702e70d97ea2f43a2be862b5501be59e2c519bcdc45a10c139d1",
+      "stage": "independent-read-only-verifier"
+    },
+    {
+      "elapsed_seconds": 19.34297316696029,
+      "expected_sha256": "ed308275cc7ad43d5b51d7505e44dca9d4f2fea591b4b2314eecf621f8571061",
+      "file": "journal-case-01",
+      "read_seconds": 0.23828674398828298,
+      "sha256": "ed308275cc7ad43d5b51d7505e44dca9d4f2fea591b4b2314eecf621f8571061",
+      "stage": "independent-read-only-verifier"
+    },
+    {
+      "elapsed_seconds": 19.549061978934333,
+      "expected_sha256": "bae947c3a6125ed55329ac97ccb40d6baec54ec2e22a38785f6801d796016f07",
+      "file": "journal-case-02",
+      "read_seconds": 0.20601612294558436,
+      "sha256": "bae947c3a6125ed55329ac97ccb40d6baec54ec2e22a38785f6801d796016f07",
+      "stage": "independent-read-only-verifier"
+    },
+    {
+      "elapsed_seconds": 19.750934271956794,
+      "expected_sha256": "eaebfd67164921c8117890a92df0c9211213a2fa1d4d569cfd64b3e0b2e8d5be",
+      "file": "journal-case-03",
+      "read_seconds": 0.20180183101911098,
+      "sha256": "eaebfd67164921c8117890a92df0c9211213a2fa1d4d569cfd64b3e0b2e8d5be",
+      "stage": "independent-read-only-verifier"
+    },
+    {
+      "elapsed_seconds": 19.955401174956933,
+      "expected_sha256": "3de1d291fa00ee0fe8ce7855518e9132b3e12ca4e4d40dd85725807c86d7daad",
+      "file": "journal-case-04",
+      "read_seconds": 0.20439730200450867,
+      "sha256": "3de1d291fa00ee0fe8ce7855518e9132b3e12ca4e4d40dd85725807c86d7daad",
+      "stage": "independent-read-only-verifier"
+    },
+    {
+      "elapsed_seconds": 20.157974586007185,
+      "expected_sha256": "8b186aec842d7893ce82547b51aa0ae4685ce1180b602aa6bfe0ca3a291a2e60",
+      "file": "journal-case-05",
+      "read_seconds": 0.20051636407151818,
+      "sha256": "8b186aec842d7893ce82547b51aa0ae4685ce1180b602aa6bfe0ca3a291a2e60",
+      "stage": "independent-read-only-verifier"
+    },
+    {
+      "elapsed_seconds": 20.224056478007697,
+      "original_cache_absent": true,
+      "original_journal_absent": true,
+      "stage": "independent-read-only-verifier"
+    }
+  ],
+  "timeout_seconds": 300.0,
+  "verifier_config_sha256": "771ef567c178dd20a9a6e6a91d03b1e6597c46d06a6523cc193497b06605d315"
+}

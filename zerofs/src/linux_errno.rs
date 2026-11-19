@@ -4,6 +4,7 @@
 
 pub(crate) const EPERM: u32 = 1;
 pub(crate) const ENOENT: u32 = 2;
+pub(crate) const EINTR: u32 = 4;
 pub(crate) const EIO: u32 = 5;
 pub(crate) const EBADF: u32 = 9;
 pub(crate) const EAGAIN: u32 = 11;
@@ -22,3 +23,6 @@ pub(crate) const ENOTEMPTY: u32 = 39;
 pub(crate) const EOVERFLOW: u32 = 75;
 pub(crate) const EOPNOTSUPP: u32 = 95;
 pub(crate) const ESTALE: u32 = 116;
+pub(crate) const E2BIG: u32 = 7;
+pub(crate) const ERANGE: u32 = 34;
+pub(crate) const ENODATA: u32 = 61;

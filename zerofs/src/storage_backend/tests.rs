@@ -397,3 +397,81 @@ fn unsupported_member_schemes_and_remote_metadata_are_rejected_before_opening_st
     assert!(format!("{error:#}").contains("authoritative metadata"));
     assert!(!fixture.catalog().exists());
 }
+
+/// The retry decision for an errno belongs to the backend that produced it.
+/// A remote store (SFTP, S3, GCS, Azure) keeps retrying an EIO-shaped error,
+/// because there it means a broken connection or an unavailable server. Only
+/// the local metadata store treats EIO as final.
+#[tokio::test]
+async fn only_a_local_metadata_store_stops_retrying_an_eio() {
+    use crate::fault_store::native_errno::{self, Operation};
+    use crate::retrying_object_store::RetryingObjectStore;
+    use std::time::Duration;
+
+    let location = Path::from("boundary-metadata/compacted/one.sst");
+    let stack = |url: &str, fault: &crate::metadata_fault::MetadataFault| {
+        let memory: Box<dyn ObjectStore> = Box::new(object_store::memory::InMemory::new());
+        // A file:// URL gets its injection point from guard_local_metadata.
+        let inner = if url.starts_with("file:") {
+            memory
+        } else {
+            native_errno::wrap(memory)
+        };
+        let guarded = super::guard_local_metadata(&url.parse().unwrap(), inner, fault);
+        RetryingObjectStore::new(Arc::from(guarded))
+    };
+
+    for url in ["sftp://storage.example/zerofs", "s3://bucket/zerofs"] {
+        let fault = crate::metadata_fault::MetadataFault::default();
+        let store = stack(url, &fault);
+        store
+            .put(&location, Bytes::from_static(b"sst body").into())
+            .await
+            .unwrap();
+        let _eio = native_errno::arm(
+            "/boundary-metadata",
+            Operation::Read,
+            "one.sst",
+            libc::EIO,
+            Some(2),
+        );
+        let body = tokio::time::timeout(Duration::from_secs(10), store.get_range(&location, 0..3))
+            .await
+            .expect("a remote EIO must be retried to success")
+            .expect("the third attempt succeeds");
+        assert_eq!(body.as_ref(), b"sst");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), fault.tripped())
+                .await
+                .is_err(),
+            "{url}: a remote store must never report a local metadata failure"
+        );
+    }
+
+    let fault = crate::metadata_fault::MetadataFault::default();
+    let store = stack("file:///boundary-metadata/", &fault);
+    store
+        .put(&location, Bytes::from_static(b"sst body").into())
+        .await
+        .unwrap();
+    let _eio = native_errno::arm(
+        "/boundary-metadata",
+        Operation::Read,
+        "one.sst",
+        libc::EIO,
+        Some(2),
+    );
+    let error = tokio::time::timeout(Duration::from_secs(10), store.get_range(&location, 0..3))
+        .await
+        .expect("a local metadata EIO must not be retried")
+        .expect_err("the first EIO is final");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("/boundary-metadata/compacted/one.sst") && message.contains("EIO"),
+        "{message}"
+    );
+    let recorded = tokio::time::timeout(Duration::from_secs(1), fault.tripped())
+        .await
+        .expect("a local metadata EIO must trip the fault");
+    assert!(recorded.to_string().contains("one.sst"), "{recorded:#}");
+}

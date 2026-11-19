@@ -1,0 +1,91 @@
+{
+  "removed_history": "bs0ye5qja5e1j8w9xvfcaqp3u",
+  "all_baseline_cache_ids_preserved": 734,
+  "all_baseline_history_refs_preserved": 50,
+  "removed_owned_cache_records": [
+    {
+      "CreatedAt": "2026-11-18 22:32:00.906563495 +0000 UTC",
+      "Description": "local source for context",
+      "ID": "4sqkkduz8bd7tfstn3dwz188d",
+      "LastUsedAt": "5 minutes ago",
+      "Mutable": true,
+      "Parents": null,
+      "Reclaimable": true,
+      "Shared": false,
+      "Size": "36.86kB",
+      "Type": "source.local",
+      "UsageCount": 1
+    },
+    {
+      "CreatedAt": "2026-11-18 22:32:00.47450657 +0000 UTC",
+      "Description": "local source for dockerfile",
+      "ID": "a1x82ltu3t30a7vs829y8rwyi",
+      "LastUsedAt": "5 minutes ago",
+      "Mutable": true,
+      "Parents": null,
+      "Reclaimable": true,
+      "Shared": false,
+      "Size": "16.38kB",
+      "Type": "source.local",
+      "UsageCount": 1
+    },
+    {
+      "CreatedAt": "2026-11-18 22:32:27.689810447 +0000 UTC",
+      "Description": "mount / from exec /bin/sh -c apt-get update && apt-get install -y --no-install-recommends     autoconf automake build-essential ca-certificates git help2man libaio-dev libncurses-dev     libnuma-dev libssl-dev libtool meson nasm ninja-build pkg-config python3-jinja2     python3-pyelftools python3-tabulate python3-yaml uuid-dev     && rm -rf /var/lib/apt/lists/*",
+      "ID": "axb6kjrnbhqiy5qrtrwwrs7yv",
+      "LastUsedAt": "5 minutes ago",
+      "Mutable": false,
+      "Parents": [
+        "n8icrq5xana2b707ekbhig7p3"
+      ],
+      "Reclaimable": true,
+      "Shared": false,
+      "Size": "638.1MB",
+      "Type": "regular",
+      "UsageCount": 1
+    },
+    {
+      "CreatedAt": "2026-11-18 22:32:27.772321879 +0000 UTC",
+      "Description": "[spdk-build 3/4] COPY nvme-tcp/build-spdk.sh nvme-tcp/spdk-zerofs-aio.patch nvme-tcp/initiator-probe.c nvme-tcp/initiator-probe.mk /build/",
+      "ID": "gp3c21du3u0ixdkhc3i3jb037",
+      "LastUsedAt": "5 minutes ago",
+      "Mutable": false,
+      "Parents": [
+        "axb6kjrnbhqiy5qrtrwwrs7yv"
+      ],
+      "Reclaimable": true,
+      "Shared": false,
+      "Size": "41.95kB",
+      "Type": "regular",
+      "UsageCount": 1
+    },
+    {
+      "CreatedAt": "2026-11-18 22:34:15.281454139 +0000 UTC",
+      "Description": "mount / from exec /bin/sh -c sh /build/build-spdk.sh /source /out     && mkdir -p /out/notice/dpdk /out/notice/isa-l     && cp -R /source/LICENSE /source/licenses /build/spdk-zerofs-aio.patch /out/SPDK_SOURCE /out/notice/     && cp -R /source/dpdk/license/. /out/notice/dpdk/     && cp /source/isa-l/LICENSE /out/notice/isa-l/     && git -C /source submodule status dpdk isa-l > /out/notice/SPDK_SUBMODULES     && cd /out && sha256sum zerofs-nvmf-tgt > notice/SHA256SUMS",
+      "ID": "ummu9aw1pjg3hplqccx4bz8t8",
+      "LastUsedAt": "5 minutes ago",
+      "Mutable": false,
+      "Parents": [
+        "gp3c21du3u0ixdkhc3i3jb037"
+      ],
+      "Reclaimable": true,
+      "Shared": false,
+      "Size": "802.4MB",
+      "Type": "regular",
+      "UsageCount": 1
+    },
+    {
+      "CreatedAt": "2026-11-18 22:32:00.87657975 +0000 UTC",
+      "Description": "local source for context",
+      "ID": "vf26ocv5cy1lhbigr9itqmi0w",
+      "LastUsedAt": "5 minutes ago",
+      "Mutable": true,
+      "Parents": null,
+      "Reclaimable": true,
+      "Shared": false,
+      "Size": "4.096kB",
+      "Type": "source.local",
+      "UsageCount": 1
+    }
+  ]
+}

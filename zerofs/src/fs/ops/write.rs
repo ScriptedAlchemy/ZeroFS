@@ -8,8 +8,8 @@ use crate::dedup::DedupResult;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
 use crate::fs::mutation::types::{
-    PrepareWriteMember, PrepareWriteRequest, PreparedBatchResult, PreparedWriteBatch,
-    PreparedWriteMember,
+    PendingAppend, PrepareWriteMember, PrepareWriteRequest, PreparedBatchResult,
+    PreparedWriteBatch, PreparedWriteMember,
 };
 use crate::fs::permissions::{AccessMode, Credentials, check_access};
 use crate::fs::store::ExtentStore;
@@ -218,9 +218,23 @@ pub(crate) async fn prepare_write(
     context: &WritePrepareContext<'_>,
     request: PrepareWriteRequest,
 ) -> Result<PreparedWriteBatch, FsError> {
+    prepare_write_with_append(context, request, None)
+        .await
+        .map(|(batch, _)| batch)
+}
+
+/// Contiguous non-overlapping writes on a volatile inode may prepare against
+/// the previous published inode while its exact canonical mutation lock is
+/// still held. The same inode lane applies them in publication order through
+/// commit, including read-modify-write of shared partial extents.
+pub(crate) async fn prepare_write_with_append(
+    context: &WritePrepareContext<'_>,
+    request: PrepareWriteRequest,
+    previous: Option<PendingAppend>,
+) -> Result<(PreparedWriteBatch, usize), FsError> {
     let fs = context.fs;
     if let Some(result) = replayed_batch(fs, &request)? {
-        return Ok(result);
+        return Ok((result, 0));
     }
 
     let mut seen = BTreeSet::new();
@@ -244,8 +258,28 @@ pub(crate) async fn prepare_write(
     }
 
     let creds = Credentials::from_auth_context(&request.auth);
-    let ids: Vec<InodeId> = request.members.iter().map(|member| member.id).collect();
-    let guards = fs.lock_manager.acquire_multi(ids).await;
+    let continuation = previous.and_then(|previous| {
+        let [member] = request.members.as_slice() else {
+            return None;
+        };
+        // Bound bypass of canonical lock waiters even under a continuous stream.
+        if previous.id != member.id
+            || previous.end != member.offset
+            || member.data.is_empty()
+            || previous.writes >= 256
+        {
+            return None;
+        }
+        let guards = previous.guards.upgrade()?;
+        Some((guards, previous.inode, previous.writes))
+    });
+    let (guards, mut projected_inode, previous_writes) = match continuation {
+        Some((guards, inode, writes)) => (guards, Some(inode), writes),
+        None => {
+            let ids = request.members.iter().map(|member| member.id).collect();
+            (Arc::new(fs.lock_manager.acquire_multi(ids).await), None, 0)
+        }
+    };
 
     for member in &request.members {
         let span = ExtentStore::extent_span(member.offset, member.data.len() as u64);
@@ -258,13 +292,16 @@ pub(crate) async fn prepare_write(
 
     if let Some(result) = replayed_batch(fs, &request)? {
         drop(guards);
-        return Ok(result);
+        return Ok((result, 0));
     }
 
     let mut prepared_members = Vec::with_capacity(request.members.len());
 
     for member in &request.members {
-        let mut inode = fs.inode_store.get(member.id).await?;
+        let mut inode = match projected_inode.take() {
+            Some(inode) => inode,
+            None => fs.inode_store.get(member.id).await?,
+        };
         match &inode {
             Inode::File(file) => {
                 if request.check_permissions && creds.uid != file.uid {
@@ -307,7 +344,11 @@ pub(crate) async fn prepare_write(
         let Inode::File(file) = &mut inode else {
             return Err(FsError::IsDirectory);
         };
-        let old_size = fs.overlay_visible_size(member.id, file.size);
+        let old_size = if previous_writes > 0 {
+            file.size
+        } else {
+            fs.overlay_visible_size(member.id, file.size)
+        };
         let end_offset = member
             .offset
             .checked_add(member.data.len() as u64)
@@ -360,14 +401,17 @@ pub(crate) async fn prepare_write(
         });
     }
 
-    Ok(PreparedWriteBatch {
-        op_id: request.op_id,
-        start_time,
-        members: prepared_members,
-        replayed: None,
-        guards: Some(guards),
-        commit_ownership: crate::fs::write_coordinator::CommitOwnership::None,
-    })
+    Ok((
+        PreparedWriteBatch {
+            op_id: request.op_id,
+            start_time,
+            members: prepared_members,
+            replayed: None,
+            guards: Some(guards),
+            commit_ownership: crate::fs::write_coordinator::CommitOwnership::None,
+        },
+        previous_writes + 1,
+    ))
 }
 
 fn replayed_batch(
@@ -609,6 +653,61 @@ mod tests {
         assert!(!batch.is_replayed());
         assert_eq!(batch.members[0].new_size, 3);
         drop(batch);
+    }
+
+    #[tokio::test]
+    async fn queued_appends_keep_the_canonical_lock_and_apply_tails_in_order() {
+        use super::prepare_write_with_append;
+        use crate::fs::mutation::types::PendingAppend;
+        use std::sync::Arc;
+
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (file, _) = fs
+            .create(&test_creds(), 0, b"append", &SetAttributes::default())
+            .await
+            .unwrap();
+        let request = |offset, data| PrepareWriteRequest {
+            members: vec![PrepareWriteMember {
+                id: file,
+                offset,
+                data,
+            }],
+            auth: auth(),
+            op_id: [0; 16],
+            check_permissions: true,
+        };
+        let ctx = fs.write_prepare_context();
+        let mut first = prepare_write(&ctx, request(0, Bytes::from_static(b"first")))
+            .await
+            .unwrap();
+        let hint = PendingAppend {
+            inode: first.members[0].inode.clone(),
+            id: file,
+            end: 5,
+            writes: 1,
+            guards: Arc::downgrade(first.guards.as_ref().unwrap()),
+        };
+        let (mut second, count) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            prepare_write_with_append(&ctx, request(5, Bytes::from_static(b"+second")), Some(hint)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(second.members[0].old_size, 5);
+        assert_eq!(second.members[0].post_attrs.size, 12);
+        assert_eq!(persisted_attrs(&fs, file).await.size, 0);
+        apply_prepared_batch(&fs.write_apply_context(), &mut first)
+            .await
+            .unwrap();
+        assert!(fs.lock_manager.is_locked_for_test(file));
+        apply_prepared_batch(&fs.write_apply_context(), &mut second)
+            .await
+            .unwrap();
+        assert!(!fs.lock_manager.is_locked_for_test(file));
+        let (bytes, _) = fs.read_file(&auth(), file, 0, 12).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"first+second");
     }
 
     #[tokio::test]

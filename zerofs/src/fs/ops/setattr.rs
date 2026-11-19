@@ -39,7 +39,7 @@ impl ZeroFS {
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_setattr)? {
             return Ok(result);
         }
-        let _guard = self.lock_manager.acquire(id).await;
+        let guard = self.lock_manager.acquire(id).await;
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_setattr)? {
             return Ok(result);
         }
@@ -73,7 +73,7 @@ impl ZeroFS {
                 attrs: post_attrs.clone(),
             },
         );
-        self.write_coordinator.commit(txn).await?;
+        self.write_coordinator.commit_holding(txn, guard).await?;
         self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
         Ok(post_attrs)
     }
@@ -133,6 +133,9 @@ impl ZeroFS {
         op_id: crate::dedup::OpId,
         size_authorization: SizeAuthorization,
     ) -> Result<FileAttributes, FsError> {
+        if matches!(setattr.gid, SetGid::InheritOr(_)) {
+            return Err(FsError::InvalidArgument);
+        }
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_setattr)? {
             return Ok(result);
         }
@@ -144,10 +147,10 @@ impl ZeroFS {
             creds.gid,
             &creds.groups[..creds.groups_count]
         );
-        let _fence = self
+        let fence = self
             .fence_metadata(ConflictScope::single(ConflictKey::Inode(id)))
             .await?;
-        let _guard = self.lock_manager.acquire(id).await;
+        let guard = self.lock_manager.acquire(id).await;
         // A same-id call may have completed while this one waited for the inode
         // lock (direct filesystem callers do not pass through the 9P single-flight).
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_setattr)? {
@@ -237,6 +240,12 @@ impl ZeroFS {
                         }
 
                         file.size = new_size;
+                        // Resizing changes file contents just like write or
+                        // fallocate. An unprivileged non-owner must not leave
+                        // the modified file carrying its previous set-ID bits.
+                        if creds.uid != file.uid && creds.uid != 0 {
+                            file.mode &= !0o6000;
+                        }
                         let (now_sec, now_nsec) = get_current_time();
                         file.mtime = now_sec;
                         file.mtime_nsec = now_nsec;
@@ -362,7 +371,7 @@ impl ZeroFS {
                         },
                     };
                     self.write_coordinator
-                        .commit_with_quota(txn, Some(quota))
+                        .commit_with_quota(txn, Some(quota), (fence, guard))
                         .await?;
 
                     #[cfg(feature = "failpoints")]
@@ -596,7 +605,9 @@ impl ZeroFS {
             },
         );
 
-        self.write_coordinator.commit(txn).await?;
+        self.write_coordinator
+            .commit_holding(txn, (fence, guard))
+            .await?;
 
         self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
@@ -619,6 +630,7 @@ impl ZeroFS {
 mod tests {
 
     use crate::fs::errors::FsError;
+    use crate::fs::inode::InodeAttrs;
     use crate::fs::permissions::Credentials;
     use crate::fs::test_util::test_creds;
     use crate::fs::*;
@@ -629,6 +641,81 @@ mod tests {
         SetUid, Timestamp,
     };
     use bytes::Bytes;
+
+    #[tokio::test]
+    async fn non_owner_resize_clears_setid_bits_in_inode_and_directory_entry() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let root_auth = AuthContext::default();
+        let root = Credentials::from_auth_context(&root_auth);
+        let other = Credentials::from_auth_context(&AuthContext {
+            uid: 1001,
+            gid: 1001,
+            ..AuthContext::default()
+        });
+
+        for opened in [false, true] {
+            for size in [8, 48] {
+                let name = format!("setid-{opened}-{size}");
+                let (id, _) = fs
+                    .create(
+                        &root,
+                        0,
+                        name.as_bytes(),
+                        &SetAttributes {
+                            uid: SetUid::Set(1000),
+                            gid: SetGid::Set(1000),
+                            mode: SetMode::Set(0o6777),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                fs.write(&root_auth, id, 0, &Bytes::from_static(b"0123456789abcdef"))
+                    .await
+                    .unwrap();
+                let resize = SetAttributes {
+                    size: SetSize::Set(size),
+                    ..Default::default()
+                };
+                let attrs = if opened {
+                    fs.setattr_opened_idempotent(&other, id, &resize, [0; 16])
+                        .await
+                } else {
+                    fs.setattr(&other, id, &resize).await
+                }
+                .unwrap();
+                assert_eq!(attrs.size, size);
+                assert_eq!(attrs.mode, 0o777, "non-owner resize retained set-ID bits");
+                assert_eq!(fs.inode_store.get(id).await.unwrap().mode(), 0o777);
+                let listing = fs.readdir(&root_auth, 0, 0, 16).await.unwrap();
+                let entry = listing
+                    .entries
+                    .iter()
+                    .find(|entry| entry.fileid == id)
+                    .unwrap();
+                assert_eq!(
+                    entry.attr.mode, 0o777,
+                    "directory entry retained set-ID bits"
+                );
+
+                // A privileged caller can explicitly restore the mode while
+                // resizing; keep ordinary combined-setattr semantics intact.
+                let restored = fs
+                    .setattr(
+                        &root,
+                        id,
+                        &SetAttributes {
+                            mode: SetMode::Set(0o6777),
+                            size: SetSize::Set(64),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(restored.mode, 0o6777);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn test_process_setattr_file_size() {
@@ -800,6 +887,7 @@ mod tests {
             groups: [0; 16],
             groups_count: 0,
             groups_complete: true,
+            groups_truncated: false,
         };
         let result = fs
             .setattr_opened_idempotent(
@@ -879,6 +967,7 @@ mod tests {
             groups: [0; 16],
             groups_count: 0,
             groups_complete: true,
+            groups_truncated: false,
         };
         let atime = Timestamp {
             seconds: 1_234_567_890,

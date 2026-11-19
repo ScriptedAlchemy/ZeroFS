@@ -376,20 +376,22 @@ fn render_total_ops_sparkline(f: &mut Frame, app: &MonitorApp, area: Rect) {
 fn render_storage_gauge(f: &mut Frame, app: &MonitorApp, area: Rect) {
     let (used, max) = match &app.current {
         Some(s) => (s.used_bytes, s.max_bytes),
-        None => (0, 0),
+        None => (None, 0),
     };
-    let ratio = if max > 0 {
-        (used as f64 / max as f64).min(1.0)
-    } else {
-        0.0
+    let ratio = match used {
+        Some(used) if max > 0 => (used as f64 / max as f64).min(1.0),
+        _ => 0.0,
     };
     let label = format!(
         "{} / {} ({} inodes)",
-        format_bytes_human(used),
+        used.map_or_else(|| "unavailable".to_string(), format_bytes_human),
         format_bytes_human(max),
         app.current
             .as_ref()
-            .map(|s| s.used_inodes.to_formatted_string(&Locale::en))
+            .map(|s| s.used_inodes.map_or_else(
+                || "unavailable".to_string(),
+                |n| n.to_formatted_string(&Locale::en)
+            ))
             .unwrap_or_default()
     );
     let color = if ratio > 0.9 {

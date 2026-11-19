@@ -1,0 +1,5 @@
+zerofs-external-kCkHwFGo-client
+container absent zerofs-external-kCkHwFGo-client
+zerofs-external-kCkHwFGo-service
+container absent zerofs-external-kCkHwFGo-service
+scratch absent /var/tmp/zerofs-external.kCkHwFGo

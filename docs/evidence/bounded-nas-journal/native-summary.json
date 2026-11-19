@@ -1,0 +1,157 @@
+{
+  "host": "ubuntu-main",
+  "kernel": "7.0.0-28-generic",
+  "image": "sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b",
+  "scope": "9P Python driver, ZeroFS, metrics sampler, file cache and any tmpfs ballast in one container; single samples may miss component peaks",
+  "cases": {
+    "replay-01": {
+      "status": "failed",
+      "error": {
+        "message": "RuntimeError: CLI ('pool', 'init', '-c', PosixPath('/scratch/zjn-hrp259tr/engine.toml')) exited 1; see processes.log",
+        "stage": "init"
+      },
+      "cleanup_verified": true,
+      "memory.max": 8589934592,
+      "memory.swap.max": 0,
+      "cpu.max": "200000 100000",
+      "memory.peak": 30515200,
+      "memory.events": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0,
+        "sock_throttled": 0
+      },
+      "sampled_component_maxima_bytes": {
+        "anon": 2834432,
+        "file": 360448,
+        "kernel": 1871872
+      },
+      "cause": "catalog directory was created with mode 0755; private mode 0700 required"
+    },
+    "replay-02": {
+      "status": "failed",
+      "error": {
+        "message": "RuntimeError: drained journal still contains payload files: ['bucket_d4ef5c45/blobs/00/000000000000003b-000000000000003b.blobs']",
+        "stage": "offline-destination"
+      },
+      "cleanup_verified": true,
+      "memory.max": 8589934592,
+      "memory.swap.max": 0,
+      "cpu.max": "200000 100000",
+      "memory.peak": 1523957760,
+      "memory.events": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0,
+        "sock_throttled": 0
+      },
+      "sampled_component_maxima_bytes": {
+        "anon": 395038720,
+        "file": 1006080000,
+        "kernel": 20336640
+      },
+      "observation": "All six hashes recovered after the first kill. Both destinations acquired six objects. After graceful shutdown the final database flush left one newer blob under shutdown_flush=local. The final fixture cuts at the drained frontier and rechecks offline."
+    },
+    "replay-03": {
+      "status": "passed",
+      "error": null,
+      "cleanup_verified": true,
+      "memory.max": 8589934592,
+      "memory.swap.max": 0,
+      "cpu.max": "200000 100000",
+      "memory.peak": 1525612544,
+      "memory.events": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0,
+        "sock_throttled": 0
+      },
+      "sampled_component_maxima_bytes": {
+        "anon": 401494016,
+        "file": 1005338624,
+        "kernel": 20885504
+      }
+    },
+    "pressure-01": {
+      "status": "passed",
+      "error": null,
+      "cleanup_verified": true,
+      "memory.max": 8589934592,
+      "memory.swap.max": 0,
+      "cpu.max": "200000 100000",
+      "memory.peak": 2355306496,
+      "memory.events": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0,
+        "sock_throttled": 0
+      },
+      "sampled_component_maxima_bytes": {
+        "anon": 562151424,
+        "file": 1822523392,
+        "kernel": 35135488
+      },
+      "peak_dirty_ssd_reserved_bytes": 503434277,
+      "time_from_release_start_to_same_response_seconds": 0.30706517002545297
+    },
+    "disk-01": {
+      "status": "passed",
+      "error": null,
+      "cleanup_verified": true,
+      "memory.max": 8589934592,
+      "memory.swap.max": 0,
+      "cpu.max": "200000 100000",
+      "memory.peak": 1370374144,
+      "memory.events": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0,
+        "sock_throttled": 0
+      },
+      "sampled_component_maxima_bytes": {
+        "anon": 722935808,
+        "file": 560005120,
+        "kernel": 20045824
+      }
+    },
+    "pressure-02": {
+      "status": "passed",
+      "error": null,
+      "cleanup_verified": true,
+      "memory.max": 8589934592,
+      "memory.swap.max": 0,
+      "cpu.max": "200000 100000",
+      "memory.peak": 2301317120,
+      "memory.events": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0,
+        "sock_throttled": 0
+      },
+      "sampled_component_maxima_bytes": {
+        "anon": 475947008,
+        "file": 1822646272,
+        "kernel": 35266560
+      }
+    }
+  },
+  "tier_bench_first_attempt": "A scratch path containing .. failed directory validation before running the workload. Reran with the canonical absolute path."
+}

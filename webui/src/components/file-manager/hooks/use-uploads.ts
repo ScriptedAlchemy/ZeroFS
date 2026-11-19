@@ -1,8 +1,9 @@
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useContext, useEffect, useRef } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { useUpload } from "../../../hooks/use-ninep";
-import { p9client, type FileEntry } from "../../../lib/zerofs/client";
+import { ActivePage } from "../../../hooks/use-title";
+import { isErrno, p9client } from "../../../lib/zerofs/client";
 import { useFileTransfers } from "../../transfers/use-file-transfers";
 import type { TransferHandle } from "../../transfers/TransferContext";
 import { formatSize, joinPath } from "../../../lib/format";
@@ -12,21 +13,74 @@ import { readDroppedItems, getDirectoriesToCreate } from "../../../lib/folder-up
 
 export interface OverwritePrompt {
   existing: string[];
-  allFiles: File[];
   resolve: (action: "overwrite" | "skip" | "cancel") => void;
 }
 
-export function useUploads(path: string, entries: FileEntry[] | undefined) {
+export function useUploads(path: string) {
   const qc = useQueryClient();
+  const active = useContext(ActivePage);
   const transfers = useFileTransfers();
   const uploadMut = useUpload();
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const [overwritePrompt, setOverwritePrompt] = useState<OverwritePrompt | null>(null);
+  const [overwritePrompts, setOverwritePrompts] = useState<OverwritePrompt[]>([]);
+  const promptScope = useRef<{ path: string; active: boolean; signal: AbortSignal } | null>(null);
+
+  useEffect(() => {
+    const abort = new AbortController();
+    promptScope.current = { path, active, signal: abort.signal };
+    // Approved transfers may continue in the background, but a decision that can
+    // no longer be shown must not leave its upload waiting forever.
+    return () => abort.abort();
+  }, [path, active]);
+
+  const chooseUploadTargets = useCallback(
+    async (names: string[], signal?: AbortSignal) => {
+      const scope = promptScope.current;
+      if (!scope || !scope.active || scope.path !== path || scope.signal.aborted || signal?.aborted)
+        return new Map<string, boolean>();
+      const cancelled = () => scope.signal.aborted || signal?.aborted;
+      const targets = new Map(names.map((name) => [name, false]));
+      const existing = new Set<string>();
+      await pooled([...targets.keys()], 8, async (name) => {
+        if (cancelled()) return;
+        try {
+          await p9client.stat(joinPath(path, name));
+          existing.add(name);
+        } catch (error) {
+          if (!isErrno(error, 2)) throw error;
+        }
+      });
+      if (cancelled()) return new Map<string, boolean>();
+      if (existing.size === 0) return targets;
+      const action = await new Promise<"overwrite" | "skip" | "cancel">((resolve) => {
+        const prompt: OverwritePrompt = {
+          existing: [...targets.keys()].filter((name) => existing.has(name)),
+          resolve: (answer) => {
+            signal?.removeEventListener("abort", cancel);
+            scope.signal.removeEventListener("abort", cancel);
+            setOverwritePrompts((queue) => queue.filter((item) => item !== prompt));
+            resolve(answer);
+          },
+        };
+        const cancel = () => prompt.resolve("cancel");
+        signal?.addEventListener("abort", cancel, { once: true });
+        scope.signal.addEventListener("abort", cancel, { once: true });
+        setOverwritePrompts((queue) => [...queue, prompt]);
+      });
+      if (action === "cancel") return new Map<string, boolean>();
+      for (const name of existing) {
+        if (action === "overwrite") targets.set(name, true);
+        else targets.delete(name);
+      }
+      return targets;
+    },
+    [path],
+  );
 
   const startDownload = useCallback(
     async (filePath: string, isDir = false) => {
       const name = filePath.split("/").pop() ?? "download";
-      const retry = () => startDownload(filePath, isDir);
+      const retry = () => { void startDownload(filePath, isDir); };
 
       if (isDir) {
         const handle = transfers.startDownload(`${name}.zip`, retry);
@@ -42,20 +96,32 @@ export function useUploads(path: string, entries: FileEntry[] | undefined) {
             },
             handle.signal,
           );
+          if (handle.signal.aborted) return;
           totalBytes = files.reduce((sum, f) => sum + f.data.length, 0);
           handle.update(0, 0, `Zipping ${collected} files (${formatSize(totalBytes)})...`);
-          const { zipSync } = await import("fflate");
-          const zipData: Record<string, Uint8Array> = {};
-          for (const f of files) zipData[f.path] = f.data;
-          const zipped = zipSync(zipData);
-          const blob = new Blob([new Uint8Array(zipped)], { type: "application/zip" });
+          const { Zip, ZipDeflate } = await import("fflate");
+          if (handle.signal.aborted) return;
+          const chunks: Uint8Array<ArrayBuffer>[] = [];
+          const zip = new Zip((error, chunk) => {
+            if (error) throw error;
+            chunks.push(new Uint8Array(chunk));
+          });
+          // zipSync flattens filenames through a plain object internally, so
+          // even a null-prototype input cannot safely preserve __proto__.
+          for (const file of files) {
+            const entry = new ZipDeflate(file.path);
+            zip.add(entry);
+            entry.push(file.data, true);
+          }
+          zip.end();
+          const blob = new Blob(chunks, { type: "application/zip" });
           const url = URL.createObjectURL(blob);
           const a = document.createElement("a");
           a.href = url;
           a.download = `${name}.zip`;
           a.click();
           URL.revokeObjectURL(url);
-          handle.update(zipped.length, zipped.length);
+          handle.update(blob.size, blob.size);
           handle.finish();
         } catch (err) {
           if (err instanceof DOMException && err.name === "AbortError") return;
@@ -90,7 +156,7 @@ export function useUploads(path: string, entries: FileEntry[] | undefined) {
       const entryPath = joinPath(path, entryName);
       if (isDir) {
         const doDelete = async () => {
-          const retry = () => doDelete();
+          const retry = () => { void doDelete(); };
           const handle = transfers.startDelete(entryName, retry);
           try {
             const count = await p9client.removeDirRecursive(
@@ -119,12 +185,32 @@ export function useUploads(path: string, entries: FileEntry[] | undefined) {
   );
 
   const doUpload = useCallback(
-    async (filesToUpload: File[]) => {
+    async (filesToUpload: File[], targets: Map<string, boolean>) => {
       const batch = p9client.beginUploadBatch();
       const completed: TransferHandle[] = [];
       await pooled(filesToUpload, 8, async (file) => {
-        const uploadOne = async (mode: "batch" | "standalone") => {
-          const retry = () => uploadOne("standalone");
+        const uploadOne = async (mode: "batch" | "standalone", replace = targets.get(file.name) ?? false) => {
+          const retry = async () => {
+            try {
+              const scope = promptScope.current;
+              if (!scope || !scope.active || scope.path !== path || scope.signal.aborted) {
+                toast.error("Open the upload folder to retry", {
+                  description: `Return to ${path} in Files. If its tab was closed, select ${file.name} for upload again.`,
+                });
+                return false;
+              }
+              // A failed durability barrier can follow a successful publication.
+              // Recheck on every retry: replacing that path still needs approval,
+              // especially if another writer changed it after the failed upload.
+              const retryTargets = await chooseUploadTargets([file.name]);
+              if (!retryTargets.has(file.name)) return false;
+              void uploadOne("standalone", retryTargets.get(file.name));
+              return true;
+            } catch (err) {
+              toast.error("Failed to check upload destination", { description: formatError(err) });
+              return false;
+            }
+          };
           const uploadBatch = mode === "batch" ? batch : undefined;
           const handle = transfers.startUpload(file.name, file.size, retry);
           try {
@@ -134,6 +220,7 @@ export function useUploads(path: string, entries: FileEntry[] | undefined) {
               onProgress: (sent, total) => handle.update(sent, total),
               signal: handle.signal,
               batch: uploadBatch,
+              replace,
             });
             if (uploadBatch) completed.push(handle);
             else handle.finish();
@@ -156,38 +243,23 @@ export function useUploads(path: string, entries: FileEntry[] | undefined) {
         for (const handle of completed) handle.fail(message);
       }
     },
-    [path, uploadMut, transfers],
+    [path, uploadMut, transfers, chooseUploadTargets],
   );
 
   const uploadFiles = useCallback(
     async (files: FileList) => {
       const allFiles = Array.from(files);
-      const existingNames = new Set(entries?.map((e) => e.name) ?? []);
-      const conflicts = allFiles.filter((f) => existingNames.has(f.name));
-
-      if (conflicts.length === 0) {
-        doUpload(allFiles);
-        return;
-      }
-
-      const action = await new Promise<"overwrite" | "skip" | "cancel">((resolve) => {
-        setOverwritePrompt({
-          existing: conflicts.map((f) => f.name),
-          allFiles,
-          resolve,
-        });
-      });
-      setOverwritePrompt(null);
-
-      if (action === "cancel") return;
-      if (action === "overwrite") {
-        doUpload(allFiles);
-      } else {
-        const skipNames = new Set(conflicts.map((f) => f.name));
-        doUpload(allFiles.filter((f) => !skipNames.has(f.name)));
+      try {
+        const targets = await chooseUploadTargets(allFiles.map((file) => file.name));
+        await doUpload(
+          allFiles.filter((file) => targets.has(file.name)),
+          targets,
+        );
+      } catch (err) {
+        toast.error("Failed to check upload destinations", { description: formatError(err) });
       }
     },
-    [entries, doUpload],
+    [chooseUploadTargets, doUpload],
   );
 
   const handleFileUpload = useCallback(
@@ -202,7 +274,7 @@ export function useUploads(path: string, entries: FileEntry[] | undefined) {
     async (items: DataTransferItemList) => {
       try {
         const handle = transfers.startUpload("Scanning folder...", 0);
-        const uploadItems = await readDroppedItems(
+        const found = await readDroppedItems(
           items,
           (progress) => {
             handle.update(0, 0, `${progress.filesFound} files found: ${progress.currentPath}`);
@@ -212,12 +284,28 @@ export function useUploads(path: string, entries: FileEntry[] | undefined) {
 
         if (handle.signal.aborted) return;
 
-        if (uploadItems.length === 0) {
+        if (found.length === 0) {
           handle.finish();
           toast.info("No files found in folder");
           return;
         }
 
+        let targets: Map<string, boolean>;
+        try {
+          targets = await chooseUploadTargets(
+            found.map((item) => item.relativePath),
+            handle.signal,
+          );
+        } catch (err) {
+          handle.fail(formatError(err));
+          return;
+        }
+        if (handle.signal.aborted) return;
+        const uploadItems = found.filter((item) => targets.has(item.relativePath));
+        if (uploadItems.length === 0) {
+          handle.finish();
+          return;
+        }
         const totalBytes = uploadItems.reduce((sum, item) => sum + item.file.size, 0);
         handle.setName(`${uploadItems.length} files`);
         handle.update(0, totalBytes);
@@ -255,6 +343,7 @@ export function useUploads(path: string, entries: FileEntry[] | undefined) {
           const targetPath = joinPath(path, item.relativePath);
           try {
             await p9client.uploadBlob(targetPath, item.file, {
+              replace: targets.get(item.relativePath),
               onProgress: (sent) => {
                 handle.update(bytesUploaded + sent, totalBytes, `${filesUploaded}/${uploadItems.length} files`);
               },
@@ -292,18 +381,16 @@ export function useUploads(path: string, entries: FileEntry[] | undefined) {
         toast.error("Failed to read dropped items", { description: formatError(err) });
       }
     },
-    [path, qc, transfers],
+    [path, qc, transfers, chooseUploadTargets],
   );
 
   return {
     startDownload,
     deleteEntry,
-    doUpload,
     uploadFiles,
     handleFileUpload,
     handleFolderUpload,
     fileInputRef,
-    overwritePrompt,
-    setOverwritePrompt,
+    overwritePrompt: overwritePrompts[0] ?? null,
   };
 }

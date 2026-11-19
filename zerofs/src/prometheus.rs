@@ -517,9 +517,14 @@ fn collect_fs_stats(stats: &FileSystemStats) {
 }
 
 fn collect_global_stats(stats: &FileSystemGlobalStats) {
-    let (used_bytes, used_inodes) = stats.get_totals();
-    gauge!("zerofs_used_bytes").set(used_bytes as f64);
-    gauge!("zerofs_used_inodes").set(used_inodes as f64);
+    let (used_bytes, used_inodes) = stats
+        .known_totals()
+        .map(|(bytes, inodes)| (bytes as f64, inodes as f64))
+        .unwrap_or((f64::NAN, f64::NAN));
+    // Replace any prior sample too: skipping the update would retain a
+    // seemingly valid usage gauge when the persistent totals are unknown.
+    gauge!("zerofs_used_bytes").set(used_bytes);
+    gauge!("zerofs_used_inodes").set(used_inodes);
 }
 
 fn collect_dedup_stats(dedup: &DedupCache) {
@@ -571,12 +576,43 @@ fn collect_segment_gc_stats(stats: &SegmentGcStats) {
 }
 
 fn collect_jemalloc_stats() {
+    let (cap, braking, trips) = crate::alloc_rss::pressure_observation();
+    gauge!("zerofs_memory_pressure_cap_bytes").set(cap as f64);
+    gauge!("zerofs_memory_pressure_active").set(u8::from(braking) as f64);
+    counter!("zerofs_memory_pressure_trips_total").absolute(trips);
     let mem = crate::alloc_rss::JemallocMemStats::read();
     gauge!("zerofs_jemalloc_allocated_bytes").set(mem.allocated as f64);
     gauge!("zerofs_jemalloc_resident_bytes").set(mem.resident as f64);
     gauge!("zerofs_jemalloc_mapped_bytes").set(mem.mapped as f64);
     gauge!("zerofs_jemalloc_retained_bytes").set(mem.retained as f64);
     gauge!("zerofs_jemalloc_metadata_bytes").set(mem.metadata as f64);
+    gauge!("zerofs_jemalloc_arena_page_stats_available")
+        .set(u8::from(mem.arena_pages.is_some()) as f64);
+    if let Some(pages) = mem.arena_pages {
+        for (name, bytes) in [
+            ("zerofs_jemalloc_active_bytes", pages.active_bytes),
+            ("zerofs_jemalloc_dirty_bytes", pages.dirty_bytes),
+            ("zerofs_jemalloc_muzzy_bytes", pages.muzzy_bytes),
+            (
+                "zerofs_jemalloc_small_allocated_bytes",
+                pages.small_allocated_bytes,
+            ),
+            (
+                "zerofs_jemalloc_large_allocated_bytes",
+                pages.large_allocated_bytes,
+            ),
+        ] {
+            gauge!(name).set(bytes as f64);
+        }
+        gauge!("zerofs_jemalloc_arenas").set(pages.arenas as f64);
+        for (mib, count) in crate::alloc_rss::LARGE_EXTENT_MIB
+            .into_iter()
+            .zip(pages.large_extent_counts)
+        {
+            gauge!("zerofs_jemalloc_large_extents", "size_mib" => mib.to_string())
+                .set(count as f64);
+        }
+    }
 }
 
 fn record_cache_metrics(snapshot: &CacheMetricsSnapshot) {
@@ -1429,5 +1465,48 @@ mod tests {
 
         raw_parts.close().await.unwrap();
         decoded_blocks.close().await.unwrap();
+    }
+
+    #[test]
+    fn unknown_usage_replaces_partial_or_stale_gauges_with_nan() {
+        use super::collect_global_stats;
+        use crate::fs::key_codec::KeyCodec;
+        use crate::fs::stats::{FileSystemGlobalStats, StatsShardData};
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let stats = FileSystemGlobalStats::new(Arc::new(KeyCodec::new()));
+        for (used_bytes, used_inodes) in [(0, 0), (321, 7)] {
+            stats.load_shard(
+                1,
+                &StatsShardData {
+                    used_bytes,
+                    used_inodes,
+                },
+            );
+            metrics::with_local_recorder(&recorder, || collect_global_stats(&stats));
+            let rendered = handle.render();
+            for (metric, expected) in [
+                ("zerofs_used_bytes", used_bytes),
+                ("zerofs_used_inodes", used_inodes),
+            ] {
+                assert!(
+                    rendered
+                        .lines()
+                        .any(|line| line == format!("{metric} {expected}")),
+                    "{rendered}"
+                );
+            }
+        }
+
+        stats.load_shard_record(3, b"bad");
+        metrics::with_local_recorder(&recorder, || collect_global_stats(&stats));
+        let rendered = handle.render();
+        for metric in ["zerofs_used_bytes", "zerofs_used_inodes"] {
+            assert!(
+                rendered.lines().any(|line| line == format!("{metric} NaN")),
+                "{rendered}"
+            );
+        }
     }
 }

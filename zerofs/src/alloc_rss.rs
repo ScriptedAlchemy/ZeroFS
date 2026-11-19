@@ -140,12 +140,14 @@ const RESUME_PERMILLE: u128 = 950;
 
 struct Hysteresis {
     over: AtomicBool,
+    trips: AtomicU64,
 }
 
 impl Hysteresis {
     const fn new() -> Self {
         Self {
             over: AtomicBool::new(false),
+            trips: AtomicU64::new(0),
         }
     }
 
@@ -158,7 +160,9 @@ impl Hysteresis {
             // In the band between resume and trip: hold the previous verdict.
             return self.over.load(Ordering::Relaxed);
         };
-        self.over.store(over, Ordering::Relaxed);
+        if !self.over.swap(over, Ordering::Relaxed) && over {
+            self.trips.fetch_add(1, Ordering::Relaxed);
+        }
         over
     }
 }
@@ -166,6 +170,15 @@ impl Hysteresis {
 // One latch shared by every gate: the GC brake and the parts-admission caps
 // are installed from the same validated pressure cap at startup.
 static PRESSURE: Hysteresis = Hysteresis::new();
+
+/// Read the cap, last gate verdict and cumulative trips without sampling pressure.
+pub(crate) fn pressure_observation() -> (u64, bool, u64) {
+    (
+        rss_cap_bytes(),
+        PRESSURE.over.load(Ordering::Relaxed),
+        PRESSURE.trips.load(Ordering::Relaxed),
+    )
+}
 
 pub(crate) fn over_rss_cap_of(cap: u64) -> bool {
     cap > 0 && PRESSURE.check(cap, jemalloc_rss_envelope())
@@ -177,6 +190,47 @@ pub(crate) fn purge_arenas() {
     let _ = unsafe { tikv_jemalloc_ctl::raw::write::<()>(b"arena.*.purge\0", ()) };
 }
 
+/// Large extent sizes, in MiB, counted by `ArenaPageStats::large_extent_counts` in this order.
+pub(crate) const LARGE_EXTENT_MIB: [usize; 4] = [128, 256, 512, 1024];
+
+#[derive(Clone, Copy)]
+pub(crate) struct ArenaPageStats {
+    pub(crate) active_bytes: u64,
+    pub(crate) dirty_bytes: u64,
+    pub(crate) muzzy_bytes: u64,
+    pub(crate) small_allocated_bytes: u64,
+    pub(crate) large_allocated_bytes: u64,
+    pub(crate) arenas: u32,
+    pub(crate) large_extent_counts: [u64; LARGE_EXTENT_MIB.len()],
+}
+
+impl ArenaPageStats {
+    fn read() -> Option<Self> {
+        let read_size = |name: &[u8]| unsafe { tikv_jemalloc_ctl::raw::read::<usize>(name).ok() };
+        let page = read_size(b"arenas.page\0")? as u64;
+        let mut large_extent_counts = [0; LARGE_EXTENT_MIB.len()];
+        let sizes = LARGE_EXTENT_MIB.map(|mib| mib * 1024 * 1024);
+        let classes = unsafe { tikv_jemalloc_ctl::raw::read::<u32>(b"arenas.nlextents\0").ok()? };
+        for index in 0..classes {
+            let name = format!("arenas.lextent.{index}.size\0");
+            let size = read_size(name.as_bytes())?;
+            if let Some(slot) = sizes.iter().position(|value| *value == size) {
+                let name = format!("stats.arenas.4096.lextents.{index}.curlextents\0");
+                large_extent_counts[slot] = read_size(name.as_bytes())? as u64;
+            }
+        }
+        Some(Self {
+            active_bytes: stats::active::read().ok()? as u64,
+            dirty_bytes: (read_size(b"stats.arenas.4096.pdirty\0")? as u64).checked_mul(page)?,
+            muzzy_bytes: (read_size(b"stats.arenas.4096.pmuzzy\0")? as u64).checked_mul(page)?,
+            small_allocated_bytes: read_size(b"stats.arenas.4096.small.allocated\0")? as u64,
+            large_allocated_bytes: read_size(b"stats.arenas.4096.large.allocated\0")? as u64,
+            arenas: unsafe { tikv_jemalloc_ctl::raw::read::<u32>(b"arenas.narenas\0").ok()? },
+            large_extent_counts,
+        })
+    }
+}
+
 /// Snapshot of jemalloc memory statistics, for the RPC status surface and
 /// Prometheus. One epoch advance, then every stat, so the values are fresh
 /// and mutually coherent. Cold-path (scrapes and status calls); the hot
@@ -185,7 +239,7 @@ pub(crate) fn purge_arenas() {
 pub struct JemallocMemStats {
     /// Bytes actively allocated by the application.
     pub(crate) allocated: u64,
-    /// Bytes in physically resident pages mapped by the allocator.
+    /// Allocator residency upper bound, including active pages not physically touched.
     pub(crate) resident: u64,
     /// Bytes in active pages mapped by the allocator.
     pub(crate) mapped: u64,
@@ -193,6 +247,7 @@ pub struct JemallocMemStats {
     pub(crate) retained: u64,
     /// Bytes dedicated to allocator metadata.
     pub(crate) metadata: u64,
+    pub(crate) arena_pages: Option<ArenaPageStats>,
 }
 
 impl JemallocMemStats {
@@ -206,6 +261,7 @@ impl JemallocMemStats {
             mapped: stats::mapped::read().unwrap_or(0) as u64,
             retained: stats::retained::read().unwrap_or(0) as u64,
             metadata: stats::metadata::read().unwrap_or(0) as u64,
+            arena_pages: ArenaPageStats::read(),
         }
     }
 }

@@ -1,5 +1,5 @@
-import { useState, useCallback, useEffect, useRef } from "react";
-import { useTitle } from "../hooks/use-title";
+import { useState, useCallback, useContext, useEffect, useRef } from "react";
+import { ActivePage, useTitle } from "../hooks/use-title";
 import { useLocation, useNavigate } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import { Plus, X, FolderOpen } from "lucide-react";
@@ -8,7 +8,7 @@ import { Tip } from "../components/ui/Tip";
 import { DndContext, closestCenter, PointerSensor, useSensor, useSensors, type DragEndEvent } from "@dnd-kit/core";
 import { SortableContext, horizontalListSortingStrategy, useSortable, arrayMove } from "@dnd-kit/sortable";
 import { FileManager } from "../components/file-manager/FileManager";
-import { DRAG_MIME } from "../components/file-manager/FileBrowser";
+import { DRAG_MIME, draggedPaths } from "../components/file-manager/drag-data";
 import { p9client } from "../lib/zerofs/client";
 import { formatError } from "../lib/errors";
 import { joinPath } from "../lib/format";
@@ -101,6 +101,7 @@ function SortableTab({
 
 export function FilesPage() {
   const location = useLocation();
+  const active = useContext(ActivePage);
   const navigate = useNavigate();
   const qc = useQueryClient();
 
@@ -121,6 +122,9 @@ export function FilesPage() {
   const urlPath = decodeURIComponent(location.pathname.replace(/^\/files/, "") || "/");
   const isTabSwitch = useRef(false);
   useEffect(() => {
+    // KeepAlive leaves this page mounted on Monitor, Storage and Terminal. Their
+    // route names are not filesystem paths and must not update the active tab.
+    if (!active) return;
     if (isTabSwitch.current) {
       isTabSwitch.current = false;
       return;
@@ -131,7 +135,7 @@ export function FilesPage() {
       if (!active || active.path === urlPath) return prev;
       return prev.map((t) => (t.id === activeTabId ? { ...t, path: urlPath, label: labelFromPath(urlPath) } : t));
     });
-  }, [urlPath, activeTabId]);
+  }, [active, urlPath, activeTabId]);
 
   const handleNavigate = useCallback(
     (newPath: string) => {
@@ -202,17 +206,19 @@ export function FilesPage() {
   const handleTabDragOver = useCallback(
     (e: React.DragEvent, tabId: number) => {
       if (!e.dataTransfer.types.includes(DRAG_MIME)) return;
-      if (tabId === activeTabId) return;
       e.preventDefault();
       e.dataTransfer.dropEffect = "move";
+      if (tabId === activeTabId) return;
+      if (switchTimerRef.current && dropTargetTabId === tabId) return;
       setDropTargetTabId(tabId);
 
       if (switchTimerRef.current) clearTimeout(switchTimerRef.current);
       switchTimerRef.current = setTimeout(() => {
+        switchTimerRef.current = null;
         switchTab(tabId);
       }, 600);
     },
-    [activeTabId, switchTab],
+    [activeTabId, dropTargetTabId, switchTab],
   );
 
   const handleTabDragLeave = useCallback((_e: React.DragEvent, tabId: number) => {
@@ -232,15 +238,14 @@ export function FilesPage() {
         switchTimerRef.current = null;
       }
 
-      const raw = e.dataTransfer.getData(DRAG_MIME);
-      if (!raw) return;
-      const names: string[] = JSON.parse(raw);
+      const sourcePaths = draggedPaths(e.dataTransfer);
+      if (sourcePaths.length === 0) return;
 
       const targetTab = tabs.find((t) => t.id === tabId);
       if (!targetTab) return;
 
-      for (const entryName of names) {
-        const sourcePath = joinPath(activeTab.path, entryName);
+      for (const sourcePath of sourcePaths) {
+        const entryName = sourcePath.split("/").pop()!;
         const targetPath = joinPath(targetTab.path, entryName);
         if (sourcePath === targetPath) continue;
         try {
@@ -250,10 +255,11 @@ export function FilesPage() {
           toast.error(`Failed to move ${entryName}`, { description: formatError(err) });
         }
       }
-      qc.invalidateQueries({ queryKey: ["9p", "ls", activeTab.path] });
+      const sourceDirs = new Set(sourcePaths.map((source) => source.slice(0, source.lastIndexOf("/")) || "/"));
+      for (const sourceDir of sourceDirs) qc.invalidateQueries({ queryKey: ["9p", "ls", sourceDir] });
       qc.invalidateQueries({ queryKey: ["9p", "ls", targetTab?.path] });
     },
-    [tabs, activeTab, qc],
+    [tabs, qc],
   );
 
   return (

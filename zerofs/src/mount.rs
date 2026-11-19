@@ -20,7 +20,9 @@ use fuser::{
     ReplyLseek, ReplyOpen, ReplyPoll, ReplyStatfs, ReplyWrite, ReplyXattr, Request, Session,
     SessionACL, TimeOrNow,
 };
-use ninep_client::{ClientError, NinePClient, ReaddirState, SetattrBuilder, SetattrTime, Target};
+use ninep_client::{
+    ClientError, NinePClient, ReaddirState, ReconnectTimeout, SetattrBuilder, SetattrTime, Target,
+};
 #[cfg(test)]
 use ninep_proto::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE};
 use ninep_proto::{
@@ -145,6 +147,10 @@ pub struct MountOptions {
     /// Server-side directory the mount is rooted at (9P attach aname). Empty
     /// (or "/") mounts the whole filesystem.
     pub aname: String,
+    /// How long a FUSE request waits for a lost 9P server before the kernel
+    /// gets `EIO`. The kernel releases the calling process, including one
+    /// sent SIGKILL, only when this daemon answers the request.
+    pub reconnect_timeout: ReconnectTimeout,
 }
 
 /// Who may access the mount.
@@ -225,6 +231,7 @@ struct Fuse9P {
     prefetch: Arc<DashMap<u64, OpenPrefetch>>,
     /// Attribute/entry cache lifetime returned to the kernel.
     ttl: Duration,
+    negative_ttl: Duration,
     /// When true, request the FUSE writeback cache so the kernel buffers writes
     /// and flushes them asynchronously (instead of synchronous write-through).
     writeback: bool,
@@ -510,7 +517,7 @@ async fn resolve_child(
     name: &[u8],
 ) -> Result<(FileAttr, Option<u32>), ClientError> {
     let nf = client.alloc_fid();
-    let stat = match client.walk_getattr(parent_fid, nf, &[name]).await {
+    let stat = match client.walk_getattr_exact(parent_fid, nf, &[name]).await {
         Ok((_qids, stat)) => stat,
         Err(e) => {
             client.free_fid(nf);
@@ -606,6 +613,7 @@ impl Filesystem for Fuse9P {
         let client = Arc::clone(&self.client);
         let inodes = Arc::clone(&self.inodes);
         let ttl = self.ttl;
+        let negative_ttl = self.negative_ttl;
         let identity = UserIdentity::from_request(req);
         let name = name.as_bytes().to_vec();
         let parent = parent.0;
@@ -628,9 +636,9 @@ impl Filesystem for Fuse9P {
                         client.free_fid(fid);
                     }
                 }
-                // Cache misses only in relaxed mode.
-                Err(e) if !ttl.is_zero() && e.to_errno() == libc::ENOENT => {
-                    reply.entry(&ttl, &negative_attr(), Generation(0));
+                // Cache a negative entry only when the negotiated name mode permits it.
+                Err(e) if !negative_ttl.is_zero() && e.to_errno() == libc::ENOENT => {
+                    reply.entry(&negative_ttl, &negative_attr(), Generation(0));
                 }
                 Err(e) => {
                     reply.error(errno(&e));
@@ -1584,34 +1592,91 @@ impl Filesystem for Fuse9P {
     #[allow(clippy::too_many_arguments)]
     fn setxattr(
         &self,
-        _req: &Request,
-        _ino: INodeNo,
-        _name: &OsStr,
-        _value: &[u8],
-        _flags: i32,
-        _position: u32,
+        req: &Request,
+        ino: INodeNo,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        position: u32,
         reply: ReplyEmpty,
     ) {
-        reply.error(Errno::ENOSYS);
+        if position != 0 {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+        let client = Arc::clone(&self.client);
+        let inodes = Arc::clone(&self.inodes);
+        let identity = UserIdentity::from_request(req);
+        let name = name.as_bytes().to_vec();
+        let value = value.to_vec();
+        self.rt.spawn(async move {
+            let result = async {
+                let fid = user_fid(&client, &inodes, identity, ino.0).await?;
+                client.set_xattr(fid, &name, &value, flags as u32).await
+            }
+            .await;
+            match result {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
     }
 
-    fn getxattr(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        _name: &OsStr,
-        _size: u32,
-        reply: ReplyXattr,
-    ) {
-        reply.error(Errno::ENOSYS);
+    fn getxattr(&self, req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        let client = Arc::clone(&self.client);
+        let inodes = Arc::clone(&self.inodes);
+        let identity = UserIdentity::from_request(req);
+        let name = name.as_bytes().to_vec();
+        self.rt.spawn(async move {
+            let result = async {
+                let fid = user_fid(&client, &inodes, identity, ino.0).await?;
+                client.get_xattr(fid, &name).await
+            }
+            .await;
+            match result {
+                Ok(value) if size == 0 => reply.size(value.len() as u32),
+                Ok(value) if value.len() > size as usize => reply.error(Errno::ERANGE),
+                Ok(value) => reply.data(&value),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
     }
 
-    fn listxattr(&self, _req: &Request, _ino: INodeNo, _size: u32, reply: ReplyXattr) {
-        reply.error(Errno::ENOSYS);
+    fn listxattr(&self, req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        let client = Arc::clone(&self.client);
+        let inodes = Arc::clone(&self.inodes);
+        let identity = UserIdentity::from_request(req);
+        self.rt.spawn(async move {
+            let result = async {
+                let fid = user_fid(&client, &inodes, identity, ino.0).await?;
+                client.list_xattrs(fid).await
+            }
+            .await;
+            match result {
+                Ok(value) if size == 0 => reply.size(value.len() as u32),
+                Ok(value) if value.len() > size as usize => reply.error(Errno::ERANGE),
+                Ok(value) => reply.data(&value),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
     }
 
-    fn removexattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
-        reply.error(Errno::ENOSYS);
+    fn removexattr(&self, req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let client = Arc::clone(&self.client);
+        let inodes = Arc::clone(&self.inodes);
+        let identity = UserIdentity::from_request(req);
+        let name = name.as_bytes().to_vec();
+        self.rt.spawn(async move {
+            let result = async {
+                let fid = user_fid(&client, &inodes, identity, ino.0).await?;
+                client.remove_xattr(fid, &name).await
+            }
+            .await;
+            match result {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
     }
 
     fn bmap(&self, _req: &Request, _ino: INodeNo, _blocksize: u32, _idx: u64, reply: ReplyBmap) {
@@ -1899,10 +1964,14 @@ impl Fuse9P {
     }
 }
 
-async fn connect(target: &str, msize: u32) -> Result<Arc<NinePClient>> {
+async fn connect(
+    target: &str,
+    msize: u32,
+    reconnect_timeout: ReconnectTimeout,
+) -> Result<Arc<NinePClient>> {
     // A comma-separated list is an HA node set (dials the leader, re-routes on failover).
     let targets = Target::parse_list(target).map_err(anyhow::Error::msg)?;
-    NinePClient::connect_multi(targets, msize)
+    NinePClient::connect_multi_with(targets, msize, reconnect_timeout)
         .await
         .with_context(|| format!("connecting to 9P server(s) {target}"))
 }
@@ -1932,7 +2001,7 @@ pub async fn run(target: String, mountpoint: PathBuf, opts: MountOptions) -> Res
         .with_writer(std::io::stderr)
         .try_init();
 
-    let client = connect(&target, opts.msize).await?;
+    let client = connect(&target, opts.msize, opts.reconnect_timeout).await?;
     let msize = client.msize();
 
     // Every request binds its own per-user fid by inode id; without --aname
@@ -1969,6 +2038,11 @@ pub async fn run(target: String, mountpoint: PathBuf, opts: MountOptions) -> Res
     // also forces write-through (the writeback cache delays write visibility) and
     // a zero attribute-cache TTL (every lookup/getattr revalidates).
     let strict = !opts.relaxed_consistency;
+    let negative_ttl = if strict || client.case_insensitive() {
+        Duration::ZERO
+    } else {
+        ATTR_TTL
+    };
     let fs = Fuse9P {
         client,
         rt: Handle::current(),
@@ -1979,6 +2053,7 @@ pub async fn run(target: String, mountpoint: PathBuf, opts: MountOptions) -> Res
         dir_reads_plus: Arc::new(DashMap::new()),
         prefetch: Arc::new(DashMap::new()),
         ttl: if strict { Duration::ZERO } else { ATTR_TTL },
+        negative_ttl,
         writeback: opts.writeback && !strict,
         strict,
     };
@@ -3651,6 +3726,7 @@ mod client_tests {
             gid_known: true,
             gids: Vec::new(),
             groups_complete: true,
+            groups_truncated: false,
         };
         let root_creds = Credentials::from_auth_context(&root_auth);
 

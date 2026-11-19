@@ -9,12 +9,10 @@ use crate::dedup::DedupResult;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId, SymlinkInode};
 use crate::fs::mutation::types::{ConflictKey, ConflictScope};
-use crate::fs::permissions::{AccessMode, Credentials, check_access};
+use crate::fs::permissions::{AccessMode, Credentials, check_access, new_entry_gid};
 use crate::fs::store::inode::MAX_HARDLINKS_PER_INODE;
 use crate::fs::tracing::FileOperation;
-use crate::fs::types::{
-    AuthContext, FileAttributes, InodeWithId, SetAttributes, SetGid, SetMode, SetUid,
-};
+use crate::fs::types::{AuthContext, FileAttributes, InodeWithId, SetAttributes, SetMode, SetUid};
 use crate::fs::{ZeroFS, get_current_time, validate_filename};
 use ::tracing::debug;
 use std::sync::atomic::Ordering;
@@ -57,10 +55,10 @@ impl ZeroFS {
             target
         );
 
-        let _fence = self
+        let fence = self
             .fence_metadata(ConflictScope::single(ConflictKey::Directory(dirid)))
             .await?;
-        let _guard = self.lock_manager.acquire(dirid).await;
+        let guard = self.lock_manager.acquire(dirid).await;
         // Direct filesystem callers do not pass through the 9P single-flight.
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_symlink)? {
             return Ok(result);
@@ -97,10 +95,7 @@ impl ZeroFS {
             SetUid::NoChange => creds.uid,
         };
 
-        let gid = match &attr.gid {
-            SetGid::Set(g) => *g,
-            SetGid::NoChange => creds.gid,
-        };
+        let gid = new_entry_gid(dir, &attr.gid, creds);
 
         let (now_sec, now_nsec) = get_current_time();
         let symlink_inode = Inode::Symlink(SymlinkInode {
@@ -174,7 +169,9 @@ impl ZeroFS {
 
         txn.add_inode_count_delta(new_id, 1);
 
-        self.write_coordinator.commit(txn).await?;
+        self.write_coordinator
+            .commit_holding(txn, (fence, guard))
+            .await?;
 
         #[cfg(feature = "failpoints")]
         fail_point!(fp::SYMLINK_AFTER_COMMIT);
@@ -231,13 +228,13 @@ impl ZeroFS {
             fileid, linkdirid, linkname_str
         );
 
-        let _fence = self
+        let fence = self
             .fence_metadata(ConflictScope::new([
                 ConflictKey::Directory(linkdirid),
                 ConflictKey::Inode(fileid),
             ]))
             .await?;
-        let _guards = self
+        let guards = self
             .lock_manager
             .acquire_multi(vec![fileid, linkdirid])
             .await;
@@ -405,7 +402,9 @@ impl ZeroFS {
                 .ok();
         }
 
-        self.write_coordinator.commit(txn).await?;
+        self.write_coordinator
+            .commit_holding(txn, (fence, guards))
+            .await?;
 
         #[cfg(feature = "failpoints")]
         fail_point!(fp::LINK_AFTER_COMMIT);
@@ -440,7 +439,7 @@ mod tests {
     use crate::test_helpers::test_helpers_mod::test_auth;
 
     use crate::fs::store::inode::MAX_HARDLINKS_PER_INODE;
-    use crate::fs::types::{FileType, SetAttributes};
+    use crate::fs::types::{FileType, SetAttributes, SetGid, SetMode};
     use futures::StreamExt;
 
     async fn readlink_at(fs: &ZeroFS, dirid: InodeId, name: &[u8]) -> Vec<u8> {
@@ -874,5 +873,75 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn symlink_inherits_setgid_parent_group() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (dir, _) = fs
+            .mkdir(
+                &test_creds(),
+                0,
+                b"sgid",
+                &SetAttributes {
+                    mode: SetMode::Set(0o2775),
+                    gid: SetGid::Set(2000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let (_, attrs) = fs
+            .symlink(
+                &test_creds(),
+                dir,
+                b"target",
+                b"link",
+                &SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(attrs.gid, 2000, "symlink should inherit the setgid group");
+    }
+
+    #[tokio::test]
+    async fn hardlink_keeps_source_group() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (dir, _) = fs
+            .mkdir(
+                &test_creds(),
+                0,
+                b"sgid",
+                &SetAttributes {
+                    mode: SetMode::Set(0o2775),
+                    gid: SetGid::Set(1000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let (src, _) = fs
+            .create(
+                &test_creds(),
+                0,
+                b"src",
+                &SetAttributes {
+                    gid: SetGid::Set(555),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        fs.link(&(&test_auth()).into(), src, dir, b"hard")
+            .await
+            .unwrap();
+        let inode = fs.inode_store.get(src).await.unwrap();
+        match inode {
+            Inode::File(file) => assert_eq!(file.gid, 555, "hard link must not change the group"),
+            _ => panic!("Expected file inode"),
+        }
     }
 }

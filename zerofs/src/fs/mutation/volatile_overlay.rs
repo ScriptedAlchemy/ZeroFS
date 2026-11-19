@@ -37,7 +37,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 #[cfg(test)]
 use tokio::sync::oneshot;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{Notify, RwLock, RwLockReadGuard};
 use tokio_util::sync::CancellationToken;
 #[cfg(test)]
 use tokio_util::task::TaskTracker;
@@ -316,6 +316,7 @@ impl Drop for RuntimeWorkerCompletion {
 }
 
 pub(crate) struct VolatileWriteRuntime {
+    pub(super) append: tokio::sync::Mutex<Option<super::types::PendingAppend>>,
     state: Mutex<State>,
     changed: Notify,
     /// Completion takes the write side before retiring entries.  A partial
@@ -337,6 +338,47 @@ pub(crate) struct VolatileWriteRuntime {
     idle_retirement_pause: Mutex<Option<IdleRetirementPause>>,
 }
 
+/// Pins acknowledged bytes and their prepared metadata while a reader obtains
+/// the canonical inode and combines it with the volatile view.
+pub(crate) struct VolatileReadGuard<'a> {
+    runtime: &'a VolatileWriteRuntime,
+    _retirement: RwLockReadGuard<'a, ()>,
+}
+
+impl VolatileReadGuard<'_> {
+    #[cfg_attr(
+        feature = "hotpath-profile",
+        hotpath::measure(future = true, label = "zerofs.overlay.read")
+    )]
+    pub(crate) async fn read<F>(self, offset: u64, length: usize, base: F) -> OverlayResult<Bytes>
+    where
+        F: FnOnce() -> BoxFuture<'static, OverlayResult<Bytes>>,
+    {
+        let first = self.runtime.snapshot();
+        if let Some(data) = fully_covered(offset, length, &first) {
+            return Ok(data);
+        }
+
+        let base = base().await?;
+        if base.len() != length {
+            return Err(OverlayError::IoError);
+        }
+        // Terminal state stops admission and durability progress, but accepted
+        // entries stay pinned. Snapshot after the canonical read so any write
+        // that could have partially changed the base is still present in full.
+        let overlay = self.runtime.snapshot();
+        if overlay.is_empty() {
+            return Ok(base);
+        }
+
+        let mut output = BytesMut::from(base.as_ref());
+        for entry in overlay {
+            apply_entry(&mut output, offset, &entry);
+        }
+        Ok(output.freeze())
+    }
+}
+
 impl VolatileWriteRuntime {
     #[cfg(test)]
     pub(crate) fn new(
@@ -348,6 +390,7 @@ impl VolatileWriteRuntime {
         let (ingress, mut ingress_rx) = mpsc::unbounded_channel::<AcceptedWrite>();
         let task_shutdown = CancellationToken::new();
         let runtime = Arc::new(Self {
+            append: tokio::sync::Mutex::new(None),
             state: Mutex::new(State {
                 accepting: true,
                 next_sequence: 0,
@@ -436,6 +479,7 @@ impl VolatileWriteRuntime {
         idle_hook: Option<IdleHook>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            append: tokio::sync::Mutex::new(None),
             state: Mutex::new(State {
                 accepting: true,
                 next_sequence: 0,
@@ -524,7 +568,7 @@ impl VolatileWriteRuntime {
         if admission.permit.bytes != data.len() as u64 {
             return Err(OverlayError::InvalidArgument);
         }
-        if data.is_empty() || offset.checked_add(data.len() as u64).is_none() {
+        if offset.checked_add(data.len() as u64).is_none() {
             return Err(OverlayError::InvalidArgument);
         }
         if self.budget.is_terminal() {
@@ -609,6 +653,8 @@ impl VolatileWriteRuntime {
     pub(crate) fn dirty_end(&self) -> u64 {
         self.snapshot()
             .iter()
+            // Empty writes keep their ordering without extending the file.
+            .filter(|entry| !entry.data.is_empty())
             .map(|entry| entry.offset.saturating_add(entry.data.len() as u64))
             .max()
             .unwrap_or(0)
@@ -666,39 +712,24 @@ impl VolatileWriteRuntime {
         }
     }
 
+    pub(crate) async fn read_guard(&self) -> VolatileReadGuard<'_> {
+        VolatileReadGuard {
+            runtime: self,
+            _retirement: self.retirement.read().await,
+        }
+    }
+
+    pub(super) async fn retire_metadata(&self, retire: impl FnOnce()) {
+        let _retirement = self.retirement.write().await;
+        retire();
+    }
+
+    #[cfg(test)]
     pub(crate) async fn read<F>(&self, offset: u64, length: usize, base: F) -> OverlayResult<Bytes>
     where
         F: FnOnce() -> BoxFuture<'static, OverlayResult<Bytes>>,
     {
-        let _retirement = self.retirement.read().await;
-        let first = self.snapshot();
-        if let Some(data) = fully_covered(offset, length, &first) {
-            return Ok(data);
-        }
-
-        let base = base().await?;
-        if base.len() != length {
-            return Err(OverlayError::IoError);
-        }
-        // Terminal state stops admission and durability progress, but accepted
-        // entries stay pinned. Overlaying that frozen logical view over the
-        // canonical read preserves the last coherent bytes after a partial or
-        // failed materialization instead of turning every read into EIO.
-        // Snapshot after the canonical read while retirement remains pinned.
-        // Any write that could have partially changed the base is therefore
-        // still present here in its complete logical form.
-        let overlay = self.snapshot();
-        if overlay.is_empty() {
-            // Nothing to apply: the canonical bytes are already the answer, so
-            // skip copying them into a mutable buffer.
-            return Ok(base);
-        }
-
-        let mut output = BytesMut::from(base.as_ref());
-        for entry in overlay {
-            apply_entry(&mut output, offset, &entry);
-        }
-        Ok(output.freeze())
+        self.read_guard().await.read(offset, length, base).await
     }
 
     pub(crate) fn stop_admission(&self) -> u64 {
@@ -1087,12 +1118,6 @@ mod tests {
         let budget = VolatileBudget::new(4096, 16);
         let runtime = VolatileWriteRuntime::new(Arc::clone(&budget), 7, materialize);
 
-        let empty = runtime.reserve(0).await.unwrap();
-        let result = runtime.accept_write(empty, 0, Bytes::new()).await;
-        assert!(matches!(result, Err(super::OverlayError::InvalidArgument)));
-        assert_eq!(runtime.accepted_cutoff(), 0);
-        assert_eq!(budget.used_bytes(), 0);
-
         let overflowing = runtime.reserve(4).await.unwrap();
         let result = runtime
             .accept_write(overflowing, u64::MAX - 1, Bytes::from_static(b"tiny"))
@@ -1108,6 +1133,44 @@ mod tests {
         assert!(matches!(result, Err(super::OverlayError::InvalidArgument)));
         assert_eq!(runtime.accepted_cutoff(), 0);
         assert_eq!(budget.used_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_write_keeps_cutoff_without_dirty_data() {
+        let budget = VolatileBudget::new(0, 1);
+        let runtime = VolatileWriteRuntime::new_state_only(Arc::clone(&budget), 7, 0, None);
+        let admission = runtime.reserve(0).await.unwrap();
+        let sequence = runtime
+            .accept_staged_write_enqueued(
+                admission,
+                u64::MAX,
+                Bytes::new(),
+                super::WriteVisibility::published(),
+                |_| Ok(()),
+            )
+            .expect("a zero-length write is a valid ordered no-op");
+        assert_eq!(sequence, 1);
+        assert_eq!(runtime.accepted_cutoff(), sequence);
+        assert_eq!(runtime.dirty_end(), 0, "an empty range never extends EOF");
+        assert_eq!(budget.status().dirty_bytes, 0);
+        assert_eq!(budget.status().dirty_operations, 1);
+        let mut next_admission = Box::pin(runtime.reserve(0));
+        assert!(futures::poll!(next_admission.as_mut()).is_pending());
+        assert_eq!(
+            runtime
+                .read(0, 4, || async { Ok(Bytes::from_static(b"base")) }.boxed())
+                .await
+                .unwrap(),
+            Bytes::from_static(b"base"),
+        );
+
+        runtime.complete(sequence).await;
+        runtime.wait_materialized(sequence).await.unwrap();
+        assert_eq!(budget.status().dirty_bytes, 0);
+        assert_eq!(budget.status().dirty_operations, 0);
+        drop(next_admission.await.unwrap());
+        assert_eq!(budget.status().dirty_operations, 0);
+        assert!(runtime.is_reapable());
     }
 
     #[tokio::test]

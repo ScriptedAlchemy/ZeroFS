@@ -11,6 +11,12 @@ pub enum FsError {
     NotFound,
     #[error("Already exists")]
     Exists,
+    #[error("No such extended attribute")]
+    NoData,
+    #[error("Extended attribute value too large")]
+    TooBig,
+    #[error("Buffer too small")]
+    Range,
     #[error("Invalid argument")]
     InvalidArgument,
     #[error("I/O error")]
@@ -47,6 +53,10 @@ pub enum FsError {
     LeaderRejectedBeforeApply,
     #[error("Server shutting down")]
     ShuttingDown,
+    /// The client cancelled the request before it changed any state. Only a
+    /// 9P `Tflush` produces it, and its reply is never sent.
+    #[error("Request abandoned by its client")]
+    Abandoned,
 }
 
 impl From<bincode::Error> for FsError {
@@ -62,6 +72,8 @@ impl From<FsError> for nfsstat3 {
             FsError::OperationNotPermitted => nfsstat3::NFS3ERR_PERM,
             FsError::NotFound => nfsstat3::NFS3ERR_NOENT,
             FsError::Exists => nfsstat3::NFS3ERR_EXIST,
+            FsError::NoData => nfsstat3::NFS3ERR_NOENT,
+            FsError::TooBig | FsError::Range => nfsstat3::NFS3ERR_INVAL,
             FsError::InvalidArgument => nfsstat3::NFS3ERR_INVAL,
             FsError::IoError => nfsstat3::NFS3ERR_IO,
             FsError::NotEmpty => nfsstat3::NFS3ERR_NOTEMPTY,
@@ -78,6 +90,7 @@ impl From<FsError> for nfsstat3 {
             FsError::LeaderLeaseExpired => nfsstat3::NFS3ERR_IO,
             FsError::LeaderRejectedBeforeApply => nfsstat3::NFS3ERR_IO,
             FsError::ShuttingDown => nfsstat3::NFS3ERR_IO,
+            FsError::Abandoned => nfsstat3::NFS3ERR_IO,
         }
     }
 }
@@ -122,6 +135,9 @@ impl FsError {
             FsError::OperationNotPermitted => crate::linux_errno::EPERM,
             FsError::NotFound => crate::linux_errno::ENOENT,
             FsError::Exists => crate::linux_errno::EEXIST,
+            FsError::NoData => crate::linux_errno::ENODATA,
+            FsError::TooBig => crate::linux_errno::E2BIG,
+            FsError::Range => crate::linux_errno::ERANGE,
             FsError::InvalidArgument => crate::linux_errno::EINVAL,
             FsError::IoError => crate::linux_errno::EIO,
             FsError::NotEmpty => crate::linux_errno::ENOTEMPTY,
@@ -131,7 +147,7 @@ impl FsError {
             FsError::IsDirectory => crate::linux_errno::EISDIR,
             FsError::NotDirectory => crate::linux_errno::ENOTDIR,
             FsError::NameTooLong => crate::linux_errno::ENAMETOOLONG,
-            FsError::NotSupported => crate::linux_errno::ENOSYS,
+            FsError::NotSupported => crate::linux_errno::EOPNOTSUPP,
             FsError::StaleHandle => crate::linux_errno::ESTALE,
             FsError::InvalidData => crate::linux_errno::EIO,
             FsError::ReadOnlyFilesystem => crate::linux_errno::EROFS,
@@ -143,6 +159,7 @@ impl FsError {
             // errno consumers must see an ordinary I/O failure.
             FsError::LeaderRejectedBeforeApply => crate::linux_errno::EIO,
             FsError::ShuttingDown => ninep_proto::P9_ENOTLEADER,
+            FsError::Abandoned => crate::linux_errno::EINTR,
         }
     }
 }
@@ -168,6 +185,9 @@ mod tests {
             (FsError::OperationNotPermitted, 1),
             (FsError::NotFound, 2),
             (FsError::Exists, 17),
+            (FsError::NoData, 61),
+            (FsError::TooBig, 7),
+            (FsError::Range, 34),
             (FsError::InvalidArgument, 22),
             (FsError::IoError, 5),
             (FsError::NotEmpty, 39),
@@ -177,13 +197,14 @@ mod tests {
             (FsError::IsDirectory, 21),
             (FsError::NotDirectory, 20),
             (FsError::NameTooLong, 36),
-            (FsError::NotSupported, 38),
+            (FsError::NotSupported, 95),
             (FsError::StaleHandle, 116),
             (FsError::InvalidData, 5),
             (FsError::ReadOnlyFilesystem, 30),
             (FsError::LeaderLeaseExpired, ninep_proto::P9_ENOTLEADER),
             (FsError::LeaderRejectedBeforeApply, 5),
             (FsError::ShuttingDown, ninep_proto::P9_ENOTLEADER),
+            (FsError::Abandoned, 4),
         ] {
             assert_eq!(error.to_errno(), expected, "{error:?}");
         }

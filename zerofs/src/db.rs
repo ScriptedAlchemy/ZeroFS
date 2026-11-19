@@ -104,12 +104,18 @@ pub static DST_PANIC_ON_WRITE_ERROR: std::sync::atomic::AtomicBool =
 /// Fatal handler for SlateDB write errors.
 /// After a write failure, the database state is unknown. Exit and let
 /// the eventual orchestrator restart the service to rebuild from a known-good state.
-pub(crate) fn exit_on_write_error(err: impl std::fmt::Display) -> ! {
+/// A write that failed because the local metadata store refused it carries
+/// that refusal in its causes, and exits with the status that asks for an
+/// operator instead, because a restart reads the same failing device.
+pub(crate) fn exit_on_write_error(
+    err: impl Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
+) -> ! {
+    let err = err.into();
     if DST_PANIC_ON_WRITE_ERROR.load(std::sync::atomic::Ordering::Relaxed) {
         panic!("dst: simulated process death on write error: {err}");
     }
     tracing::error!("Fatal write error, exiting: {}", err);
-    std::process::exit(1)
+    crate::operator_required::ServerExit::exit_now(err.as_ref())
 }
 
 enum TxOp {

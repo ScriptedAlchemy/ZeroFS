@@ -1,3 +1,4 @@
+use super::frame_codec::frame_admission_bytes;
 use ninep_proto::P9_MAX_MSIZE;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -19,13 +20,20 @@ pub(super) const GLOBAL_TRANSPORT_SESSIONS: usize = 64;
 const MAX_PRE_ADMISSION_MEMORY: usize = GLOBAL_TRANSPORT_SESSIONS * P9_MAX_MSIZE as usize;
 const DOCUMENTED_P9_MEMORY_BOUND: usize = GLOBAL_INFLIGHT_MEMORY + MAX_PRE_ADMISSION_MEMORY;
 #[cfg(any(feature = "webui", test))]
-const WEBSOCKET_RECEIVE_RESERVATION: u32 = 2 * P9_MAX_MSIZE;
+const WEBSOCKET_RECEIVE_RESERVATION: u32 = 3 * P9_MAX_MSIZE;
+
+#[derive(Debug)]
+pub(crate) struct P9XattrPermit {
+    _retained: OwnedSemaphorePermit,
+    _global: OwnedSemaphorePermit,
+}
 
 pub(crate) struct P9GlobalAdmission {
     bytes: Arc<Semaphore>,
     requests: Arc<Semaphore>,
     transports: Arc<Semaphore>,
     receive_bytes: Arc<Semaphore>,
+    xattr_bytes: Arc<Semaphore>,
     pub(super) byte_limit: usize,
     request_limit: usize,
     pub(super) transport_limit: usize,
@@ -39,10 +47,21 @@ pub(crate) struct P9AcceptedWorkTracker {
 struct P9AcceptedWorkInner {
     accepting: AtomicBool,
     tasks: TaskTracker,
+    /// Cancelled when process shutdown stops waiting for accepted work.
+    revoked: CancellationToken,
 }
 
 pub(crate) struct P9AcceptedWorkGuard {
     _token: TaskTrackerToken,
+    revoked: CancellationToken,
+}
+
+impl P9AcceptedWorkGuard {
+    /// Resolves when process shutdown stops waiting for this work
+    /// ([`P9AcceptedWorkTracker::settle`]).
+    pub(crate) fn revoked(&self) -> tokio_util::sync::WaitForCancellationFutureOwned {
+        self.revoked.clone().cancelled_owned()
+    }
 }
 
 impl P9AcceptedWorkTracker {
@@ -51,6 +70,7 @@ impl P9AcceptedWorkTracker {
             inner: Arc::new(P9AcceptedWorkInner {
                 accepting: AtomicBool::new(true),
                 tasks: TaskTracker::new(),
+                revoked: CancellationToken::new(),
             }),
         }
     }
@@ -62,7 +82,10 @@ impl P9AcceptedWorkTracker {
         if !self.inner.accepting.load(Ordering::Acquire) {
             return None;
         }
-        Some(P9AcceptedWorkGuard { _token: token })
+        Some(P9AcceptedWorkGuard {
+            _token: token,
+            revoked: self.inner.revoked.clone(),
+        })
     }
 
     pub(crate) fn stop_accepting(&self) {
@@ -74,7 +97,42 @@ impl P9AcceptedWorkTracker {
         self.inner.tasks.wait().await;
     }
 
-    #[cfg(test)]
+    /// Stop accepting work and wait up to `grace` for accepted work to finish.
+    ///
+    /// Process shutdown drops a request that has made no observable change,
+    /// but a request past its point of no return runs on: it may hold locks
+    /// across a queued commit, and it owes the operation ledger its result.
+    /// This bounds that wait. Work still running after `grace` is revoked:
+    /// its request is dropped without a reply. A commit it already queued is
+    /// unaffected, because the commit owns the request's locks
+    /// ([`crate::fs::write_coordinator::HeldUntilApplied`]) and the final
+    /// close drains the commit queue or reports that it could not.
+    ///
+    /// Returns how many accepted requests were revoked.
+    pub(crate) async fn settle(&self, grace: std::time::Duration) -> usize {
+        self.stop_accepting();
+        if tokio::time::timeout(grace, self.wait()).await.is_ok() {
+            return 0;
+        }
+        let revoked = self.len();
+        self.inner.revoked.cancel();
+        metrics::counter!("zerofs_p9_shutdown_revoked_requests_total").increment(revoked as u64);
+        tracing::error!(
+            revoked,
+            grace_ms = grace.as_millis() as u64,
+            "accepted 9P requests did not finish within the shutdown grace; dropping them \
+             without replies. Commits they queued keep their locks until they apply, and the \
+             final close reports any commit that cannot."
+        );
+        if tokio::time::timeout(grace, self.wait()).await.is_err() {
+            tracing::error!(
+                remaining = self.len(),
+                "accepted work is still running after revocation; the final close bounds it"
+            );
+        }
+        revoked
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.inner.tasks.len()
     }
@@ -98,10 +156,31 @@ impl P9GlobalAdmission {
             requests: Arc::new(Semaphore::new(request_limit)),
             transports: Arc::new(Semaphore::new(transport_limit)),
             receive_bytes: Arc::new(Semaphore::new(transport_limit * P9_MAX_MSIZE as usize)),
+            xattr_bytes: Arc::new(Semaphore::new(byte_limit / 4)),
             byte_limit,
             request_limit,
             transport_limit,
         }
+    }
+
+    /// Retained attribute buffers share the request budget. Limit them to a
+    /// quarter of it so clients can still obtain credit to write and clunk.
+    pub(crate) fn try_admit_xattr(
+        self: &Arc<Self>,
+        bytes: usize,
+    ) -> Result<P9XattrPermit, crate::fs::errors::FsError> {
+        let bytes =
+            u32::try_from(bytes.max(1)).map_err(|_| crate::fs::errors::FsError::RetryLater)?;
+        let retained = Arc::clone(&self.xattr_bytes)
+            .try_acquire_many_owned(bytes)
+            .map_err(|_| crate::fs::errors::FsError::RetryLater)?;
+        let global = Arc::clone(&self.bytes)
+            .try_acquire_many_owned(bytes)
+            .map_err(|_| crate::fs::errors::FsError::RetryLater)?;
+        Ok(P9XattrPermit {
+            _retained: retained,
+            _global: global,
+        })
     }
 
     pub(crate) fn try_admit_transport(self: &Arc<Self>) -> anyhow::Result<P9TransportPermit> {
@@ -127,13 +206,14 @@ impl P9GlobalAdmission {
         shutdown: &CancellationToken,
     ) -> anyhow::Result<P9ReceivePermit> {
         // Tungstenite copies fragmented messages into a growing collector
-        // while retaining the current frame. Charging both maximum buffers
-        // keeps their combined peak inside the shared receive envelope.
+        // while retaining the current frame. One more maximum frame covers
+        // received requests waiting for admission, so the reader can reach
+        // Tflush while ordinary request slots are full.
         self.admit_receive_bytes(WEBSOCKET_RECEIVE_RESERVATION, shutdown)
             .await
     }
 
-    async fn admit_receive_bytes(
+    pub(super) async fn admit_receive_bytes(
         self: &Arc<Self>,
         permits: u32,
         shutdown: &CancellationToken,
@@ -250,6 +330,28 @@ pub(crate) struct P9ConnectionAdmission {
 }
 
 impl P9ConnectionAdmission {
+    pub(super) async fn acquire_task_bytes(
+        &self,
+        bytes: u32,
+        shutdown: &CancellationToken,
+    ) -> anyhow::Result<(OwnedSemaphorePermit, OwnedSemaphorePermit)> {
+        let local = acquire_owned_or_shutdown(Arc::clone(&self.bytes), bytes, shutdown).await?;
+        let global =
+            acquire_owned_or_shutdown(Arc::clone(&self.global.bytes), bytes, shutdown).await?;
+        Ok((local, global))
+    }
+
+    /// Admit one received frame, charged by what its request type can hold.
+    pub(super) async fn admit_frame_or_shutdown(
+        &self,
+        frame: &[u8],
+        shutdown: &CancellationToken,
+    ) -> anyhow::Result<P9AdmissionPermit> {
+        let total = frame_admission_bytes(frame);
+        self.admit_request_or_shutdown(frame.len(), total - frame.len(), shutdown)
+            .await
+    }
+
     #[cfg(test)]
     pub(super) async fn admit_request(
         &self,
@@ -279,24 +381,23 @@ impl P9ConnectionAdmission {
         let permits = u32::try_from(reserved_bytes)
             .map_err(|_| anyhow::anyhow!("9P request memory reservation exceeds u32"))?;
 
-        let global_request =
-            acquire_owned_or_shutdown(Arc::clone(&self.global.requests), 1, shutdown).await?;
+        // Take the connection's slot first. The reader starts a task for every
+        // frame it reads, so a connection can have many frames waiting; they
+        // wait on its own slots, and at most its request limit of them hold
+        // or wait for a process-wide slot.
         let local_request =
             acquire_owned_or_shutdown(Arc::clone(&self.requests), 1, shutdown).await?;
-        let local_bytes =
-            acquire_owned_or_shutdown(Arc::clone(&self.bytes), permits, shutdown).await?;
-        let global_bytes =
-            acquire_owned_or_shutdown(Arc::clone(&self.global.bytes), permits, shutdown).await?;
+        let global_request =
+            acquire_owned_or_shutdown(Arc::clone(&self.global.requests), 1, shutdown).await?;
+        let (local_bytes, global_bytes) = self.acquire_task_bytes(permits, shutdown).await?;
 
-        metrics::gauge!("zerofs_p9_inflight_reserved_bytes").increment(reserved_bytes as f64);
-        metrics::gauge!("zerofs_p9_inflight_requests").increment(1.0);
-        Ok(P9AdmissionPermit {
-            _local_request: local_request,
-            _global_request: global_request,
-            _local_bytes: local_bytes,
-            _global_bytes: global_bytes,
+        Ok(P9AdmissionPermit::shared(
+            local_request,
+            global_request,
+            local_bytes,
+            global_bytes,
             reserved_bytes,
-        })
+        ))
     }
 }
 
@@ -318,6 +419,31 @@ pub(crate) struct P9AdmissionPermit {
     _local_bytes: OwnedSemaphorePermit,
     _global_bytes: OwnedSemaphorePermit,
     reserved_bytes: usize,
+}
+
+impl P9AdmissionPermit {
+    fn shared(
+        local_request: OwnedSemaphorePermit,
+        global_request: OwnedSemaphorePermit,
+        local_bytes: OwnedSemaphorePermit,
+        global_bytes: OwnedSemaphorePermit,
+        reserved_bytes: usize,
+    ) -> Self {
+        metrics::gauge!("zerofs_p9_inflight_reserved_bytes").increment(reserved_bytes as f64);
+        metrics::gauge!("zerofs_p9_inflight_requests").increment(1.0);
+        Self {
+            _local_request: local_request,
+            _global_request: global_request,
+            _local_bytes: local_bytes,
+            _global_bytes: global_bytes,
+            reserved_bytes,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn reserved_bytes(&self) -> usize {
+        self.reserved_bytes
+    }
 }
 
 impl Drop for P9AdmissionPermit {

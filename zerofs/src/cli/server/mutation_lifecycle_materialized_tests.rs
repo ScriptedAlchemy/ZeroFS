@@ -20,6 +20,7 @@ async fn production_close_drains_cancelled_materialized_commit_before_database_c
         groups: [1000; 16],
         groups_count: 1,
         groups_complete: true,
+        groups_truncated: false,
     });
     let file = fs
         .create_exclusive(&auth, 0, b"shutdown-materialized.txt")

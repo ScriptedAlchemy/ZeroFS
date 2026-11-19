@@ -10,9 +10,13 @@ mod create;
 mod io;
 mod link;
 mod lookup;
+#[cfg(test)]
+mod queued_commit_lock_tests;
 mod remove;
 mod rename;
 mod setattr;
+mod xattr;
+pub use xattr::{XATTR_VALUE_MAX, XattrName, XattrSetMode, XattrValue};
 pub(crate) mod write;
 
 #[cfg(feature = "webui")]

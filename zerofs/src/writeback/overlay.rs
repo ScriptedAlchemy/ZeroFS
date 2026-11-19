@@ -12,7 +12,7 @@ use object_store::{
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::RwLock;
+use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VisibleVersion {
@@ -111,6 +111,10 @@ impl BlobCache {
 pub struct OverlayIndex {
     remote: Arc<dyn ObjectStore>,
     state: Arc<RwLock<OverlayState>>,
+    /// Retirement must wait until readers of the selected journal version
+    /// own their bytes or an open descriptor. This gate is separate from
+    /// `state`, so journal I/O never holds up ordinary overlay mutations.
+    payload_retirement: Arc<RwLock<()>>,
     blob_cache: Arc<StdMutex<BlobCache>>,
     #[cfg(test)]
     cleanup_path_visits: Arc<std::sync::atomic::AtomicUsize>,
@@ -130,6 +134,7 @@ impl OverlayIndex {
         Self {
             remote,
             state: Arc::new(RwLock::new(OverlayState::default())),
+            payload_retirement: Arc::new(RwLock::new(())),
             blob_cache: Arc::new(StdMutex::new(BlobCache::default())),
             #[cfg(test)]
             cleanup_path_visits: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -328,6 +333,7 @@ impl OverlayIndex {
     }
 
     pub(crate) async fn remove_remote_prefix(&self, through: Sequence) {
+        let _retirement = self.payload_retirement.write().await;
         let mut state = self.state.write().await;
         let affected = state
             .paths_by_sequence
@@ -403,7 +409,12 @@ impl OverlayIndex {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
+        // Take the lease before selecting a journal entry. Retirement removes
+        // entries under the exclusive gate before its caller unlinks their
+        // blobs. Native workers retain a clone if this GET is cancelled.
+        let payload_read = Arc::new(Arc::clone(&self.payload_retirement).read_owned().await);
         let Some(entry) = self.visible_entry(location).await else {
+            drop(payload_read);
             return self.remote.get_opts(location, options).await;
         };
         let Some(payload) = entry.payload else {
@@ -446,10 +457,14 @@ impl OverlayIndex {
             let PayloadLocation::Journal { journal, sequence } = payload else {
                 unreachable!("journal payload was matched above")
             };
-            let blob = tokio::task::spawn_blocking(move || journal.open_verified_blob(sequence))
-                .await
-                .map_err(|error| generic_error(format!("journal open task failed: {error}")))?
-                .map_err(|error| generic_error(format!("journal blob open failed: {error:#}")))?;
+            let worker_read = Arc::clone(&payload_read);
+            let blob = tokio::task::spawn_blocking(move || {
+                let _payload_read = worker_read;
+                journal.open_verified_blob(sequence)
+            })
+            .await
+            .map_err(|error| generic_error(format!("journal open task failed: {error}")))?
+            .map_err(|error| generic_error(format!("journal blob open failed: {error:#}")))?;
             let stream = blob
                 .range_stream(range.clone(), 1024 * 1024)
                 .map_err(|error| generic_error(format!("journal blob range failed: {error:#}")))?
@@ -460,7 +475,7 @@ impl OverlayIndex {
             GetResultPayload::Stream(stream)
         } else {
             let body = self
-                .load_payload(payload)
+                .load_payload(payload, Arc::clone(&payload_read))
                 .await?
                 .slice(range.start as usize..range.end as usize);
             GetResultPayload::Stream(stream::once(async move { Ok(body) }).boxed())
@@ -537,7 +552,11 @@ impl OverlayIndex {
         })
     }
 
-    async fn load_payload(&self, payload: PayloadLocation) -> object_store::Result<Bytes> {
+    async fn load_payload(
+        &self,
+        payload: PayloadLocation,
+        payload_read: Arc<OwnedRwLockReadGuard<()>>,
+    ) -> object_store::Result<Bytes> {
         match payload {
             PayloadLocation::Pending(payload) => payload
                 .memory_range(0..payload.byte_len() as usize)
@@ -548,8 +567,12 @@ impl OverlayIndex {
                 if let Some(bytes) = self.blob_cache().get(sequence) {
                     return Ok(bytes);
                 }
+                let worker_read = Arc::clone(&payload_read);
                 let bytes = tokio::task::spawn_blocking(move || {
-                    journal.read_blob(sequence).map(Bytes::from)
+                    let _payload_read = worker_read;
+                    journal
+                        .read_blob_bounded(sequence, BLOB_CACHE_INLINE_MAX_BYTES)
+                        .map(Bytes::from)
                 })
                 .await
                 .map_err(|error| generic_error(format!("journal read task failed: {error}")))?
@@ -1275,6 +1298,138 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    fn journal_read_racing_remote_retirement(payload_len: usize, cancel_read: bool) {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let temp = tempfile::tempdir().unwrap();
+                let journal = test_journal(&temp.path().join("writeback"));
+                let location = Path::from("object");
+                let original = Bytes::from(vec![0x31; payload_len]);
+                journal
+                    .commit_put(put_record(1, "object", &original), &original)
+                    .unwrap();
+                let remote = Arc::new(InMemory::new());
+                remote
+                    .put(&location, original.clone().into())
+                    .await
+                    .unwrap();
+                let overlay = OverlayIndex::recover(remote.clone(), journal.clone())
+                    .await
+                    .unwrap();
+
+                // Occupy the runtime's only blocking worker. Polling this GET
+                // selects its journal version and queues the payload open, but
+                // the worker cannot open a descriptor before retirement runs.
+                let (entered, waiting) = tokio::sync::oneshot::channel();
+                let (release, blocked) = std::sync::mpsc::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    entered.send(()).unwrap();
+                    let _ = blocked.recv();
+                });
+                waiting.await.unwrap();
+                let mut reading = Some(Box::pin(overlay.get(&location)));
+                assert!(futures::poll!(reading.as_mut().unwrap().as_mut()).is_pending());
+                if cancel_read {
+                    // The queued native worker must keep its lease after its
+                    // caller disappears, until it has opened/read the payload.
+                    reading.take();
+                }
+
+                // Publication and cleanup follow commit_remote_run's order.
+                journal.mark_remote(1, None).unwrap();
+                let mut retiring = Box::pin(async {
+                    overlay.remove_remote_prefix(1).await;
+                    journal.remove_remote_prefix(1).unwrap();
+                });
+                let retired_before_open = futures::poll!(retiring.as_mut()).is_ready();
+                // Waiting for the native reader must leave the mutable overlay
+                // available to unrelated foreground writes.
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    overlay
+                        .install_memory(put_record(2, "other", b"new"), Bytes::from_static(b"new")),
+                )
+                .await
+                .expect("journal read held the mutable overlay lock")
+                .unwrap();
+                release.send(()).unwrap();
+                blocker.await.unwrap();
+                let result = match reading {
+                    Some(reading) => Some(reading.await),
+                    None => None,
+                };
+                if !retired_before_open {
+                    retiring.await;
+                }
+
+                // The already-selected response must survive both local unlink
+                // and a later remote replacement, including a lazily consumed
+                // large response whose stream owns the opened descriptor.
+                remote
+                    .put(&location, Bytes::from(vec![0x72; payload_len]).into())
+                    .await
+                    .unwrap();
+                if let Some(result) = result {
+                    assert!(
+                        result.is_ok(),
+                        "remote retirement removed an in-flight read's journal payload: {:?}",
+                        result.as_ref().err()
+                    );
+                    assert_eq!(result.unwrap().bytes().await.unwrap(), original);
+                }
+                assert!(
+                    !retired_before_open,
+                    "retirement raced the queued payload open"
+                );
+                assert!(overlay.blob_cache().entries.is_empty());
+                assert!(journal.mutation(1).unwrap().is_none());
+            });
+    }
+
+    #[test]
+    fn inline_journal_read_survives_concurrent_remote_retirement() {
+        journal_read_racing_remote_retirement(1024, false);
+    }
+
+    #[test]
+    fn streaming_journal_read_survives_concurrent_remote_retirement() {
+        journal_read_racing_remote_retirement(
+            super::BLOB_CACHE_INLINE_MAX_BYTES as usize + 1,
+            false,
+        );
+    }
+
+    #[test]
+    fn cancelled_journal_reads_hold_retirement_until_native_work_finishes() {
+        journal_read_racing_remote_retirement(1024, true);
+        journal_read_racing_remote_retirement(
+            super::BLOB_CACHE_INLINE_MAX_BYTES as usize + 1,
+            true,
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_pending_journal_payload_is_not_hidden_by_a_remote_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("writeback");
+        let journal = test_journal(&root);
+        journal
+            .commit_put(put_record(1, "object", b"pending"), b"pending")
+            .unwrap();
+        let overlay = OverlayIndex::recover(remote_with(&[("object", b"pending")]).await, journal)
+            .await
+            .unwrap();
+        remove_journal_blobs(&root);
+
+        let failure = overlay.get(&Path::from("object")).await.unwrap_err();
+        assert!(failure.to_string().contains("missing committed blob"));
+        assert!(overlay.blob_cache().entries.is_empty());
     }
 
     #[tokio::test]

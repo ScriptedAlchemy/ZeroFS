@@ -1,0 +1,8 @@
+    Finished `test` profile [unoptimized] target(s) in 0.40s
+     Running unittests src/lib.rs (/var/tmp/zerofs-nas-journal.1XHScyY3/target/debug/deps/zerofs-4b82db406354e001)
+
+running 1 test
+LOCAL_TIER_RW_BENCH {"total_bytes":67108864,"object_count":64,"payload_bytes":1048576,"writers":2,"readers":2,"local_concurrency":1,"ram_write_seconds":1.095988422,"ram_write_mib_per_second":58.39477745869837,"ram_read_seconds":1.069005442,"ram_read_mib_per_second":59.868731706606226,"ram_read_verified_objects":64,"ssd_write_seconds":1.101335639,"ssd_write_mib_per_second":58.11125848802211,"ssd_drain_after_ram_ack_seconds":0.005347217,"ssd_journal_cached_read_seconds":2.154416339,"ssd_journal_cached_read_mib_per_second":29.706421568315076,"ssd_journal_cached_read_verified_objects":64,"payload_seed_base":"5a45524f46535449"}
+test writeback::tier_bench::bench_writeback_local_tier_read_write ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2721 filtered out; finished in 25.60s

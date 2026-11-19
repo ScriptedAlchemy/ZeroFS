@@ -112,10 +112,10 @@ impl ZeroFS {
             id, offset, length
         );
 
-        let _fence = self
+        let fence = self
             .fence_metadata(ConflictScope::single(ConflictKey::Inode(id)))
             .await?;
-        let _guard = self.lock_manager.acquire(id).await;
+        let guard = self.lock_manager.acquire(id).await;
         let inode = self.inode_store.get(id).await?;
         let creds = Credentials::from_auth_context(auth);
 
@@ -137,9 +137,12 @@ impl ZeroFS {
         self.extent_store
             .zero_range(&mut txn, id, offset, length, file_size)
             .await?;
-        self.write_coordinator.commit(txn).await.inspect_err(|e| {
-            error!("Failed to commit trim batch: {}", e);
-        })?;
+        self.write_coordinator
+            .commit_holding(txn, (fence, guard))
+            .await
+            .inspect_err(|e| {
+                error!("Failed to commit trim batch: {}", e);
+            })?;
 
         self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
         self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
@@ -208,10 +211,10 @@ impl ZeroFS {
         }
         let end = offset.checked_add(length).ok_or(FsError::InvalidArgument)?;
 
-        let _fence = self
+        let fence = self
             .fence_metadata(ConflictScope::single(ConflictKey::Inode(id)))
             .await?;
-        let _guard = self.lock_manager.acquire(id).await;
+        let guard = self.lock_manager.acquire(id).await;
         // Direct filesystem callers do not pass through the 9P single-flight.
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_fallocate)? {
             return Ok(result);
@@ -288,7 +291,11 @@ impl ZeroFS {
         );
 
         self.write_coordinator
-            .commit_with_quota(txn, growth_reservation.map(QuotaSettlement::Growth))
+            .commit_with_quota(
+                txn,
+                growth_reservation.map(QuotaSettlement::Growth),
+                (fence, guard),
+            )
             .await
             .inspect_err(|e| {
                 error!("Failed to commit fallocate batch: {}", e);
@@ -998,6 +1005,7 @@ mod tests {
             gid_known: true,
             gids: Vec::new(),
             groups_complete: true,
+            groups_truncated: false,
         };
         let attrs = fs
             .fallocate_opened(&non_owner, file_id, 0, 1, FallocateMode::PunchHole)
