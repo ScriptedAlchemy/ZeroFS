@@ -38,6 +38,8 @@ PUT_DELAY_MS = 500
 P3_LAYOUT = "61440,128,3072,16,32,848"
 JOURNAL_BUDGET = 10 * GIB
 JOURNAL_HEADERS = 2 * RAW_BLOCK
+JOURNAL_PHYSICAL_RESERVE = 4 * GIB
+JOURNAL_RESIZE_CEILING = int(P3_LAYOUT.split(',')[0]) * MIB - JOURNAL_HEADERS - JOURNAL_PHYSICAL_RESERVE
 SIZES = {"p3": 64 * GIB, "small": 12 * GIB, "large": 16 * GIB}
 RESERVE = 256 * MIB
 WRITEBACK = "zerofs_writeback_"
@@ -207,6 +209,7 @@ def config(root, template, devices, *, held=False):
     root.mkdir()
     (root / "mount").mkdir()
     parsed = tomllib.loads(template)
+    assert int(parsed["writeback"]["min_free_gb"] * 1e9) == JOURNAL_PHYSICAL_RESERVE
     replacements = {
         parsed["cache"]["dir"]: str(root / "unused-clean-cache"),
         parsed["writeback"]["dir"]: str(root / "unused-directory-journal"),
@@ -314,29 +317,53 @@ def monitor(configuration, server):
 
 
 def remote_barrier(configuration, address, expected_bytes):
-    started = time.monotonic_ns()
-    command(ZEROFS, "flush", "-c", configuration, timeout=360)
-    deadline = time.monotonic() + 15
-    while time.monotonic() < deadline:
-        metrics = fetch_metrics(address)
-        if (metrics.keys() == set(METRICS) and metrics["remote_bytes_completed_total"] >= expected_bytes
-                and metrics["accepted_sequence"] == metrics["local_sequence"] == metrics["remote_sequence"]
-                and metrics["dirty_ssd_reserved_bytes"] == metrics["dirty_ram_bytes"]
-                == metrics["ssd_outstanding_physical_claim_bytes"] == 0):
-            record("remote_drain", phase=configuration.parent.name,
-                   elapsed_ns=time.monotonic_ns() - started, metrics=metrics)
-            return metrics
-        time.sleep(0.1)
-    raise RuntimeError(f"remote durability accounting did not settle: {metrics}")
+    started = last_progress = time.monotonic_ns()
+    remote_bytes = 0
+    remote_sequence = 0
+    record("remote_drain_start", phase=configuration.parent.name, metrics=fetch_metrics(address))
+    with tempfile.TemporaryFile() as log, subprocess.Popen(
+        [ZEROFS, "flush", "-c", configuration], stdout=log, stderr=log
+    ) as process:
+        try:
+            while True:
+                metrics = fetch_metrics(address)
+                now = time.monotonic_ns()
+                completed = metrics.get("remote_bytes_completed_total", 0)
+                sequence = metrics.get("remote_sequence", 0)
+                if completed > remote_bytes or sequence > remote_sequence:
+                    remote_bytes, remote_sequence = completed, sequence
+                    last_progress = now
+                code = process.poll()
+                if code:
+                    log.seek(0)
+                    raise RuntimeError(f"remote barrier returned {code}: {log.read().decode(errors='replace')}")
+                if (code == 0 and metrics.keys() == set(METRICS) and completed >= expected_bytes
+                        and metrics["accepted_sequence"] == metrics["local_sequence"] == sequence
+                        and metrics["dirty_ssd_reserved_bytes"] == metrics["dirty_ram_bytes"]
+                        == metrics["ssd_outstanding_physical_claim_bytes"] == 0):
+                    record("remote_drain", phase=configuration.parent.name,
+                           elapsed_ns=now - started, metrics=metrics)
+                    return metrics
+                if now - last_progress > 120_000_000_000 or now - started > 1_800_000_000_000:
+                    raise TimeoutError(f"remote drain exceeded its progress deadline: {metrics}")
+                time.sleep(0.2)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
 
 
 def inspect_p3(binding, phase):
     lines = command(PROBE, "fixture", "p3-v2-inspect", *binding, "p3", P3_LAYOUT)
     state = {key: json.loads(value) for key, value in
              (line.split("=", 1) for line in lines.decode().splitlines())}
-    assert state["journal_bytes"] <= int(P3_LAYOUT.split(",")[0]) * MIB - 2 * RAW_BLOCK
+    assert state["journal_bytes"] <= JOURNAL_RESIZE_CEILING, state
     assert state["envelope_in_keys"] and not state["envelope_in_authority"]
-    record("p3_regions", phase=phase, **state)
+    record("p3_regions", phase=phase, **state, journal_resize_ceiling_bytes=JOURNAL_RESIZE_CEILING,
+           journal_bytes_before_resize_ceiling=JOURNAL_RESIZE_CEILING - state["journal_bytes"])
     return state
 
 
