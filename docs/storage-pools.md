@@ -190,6 +190,31 @@ rejects HA replication. Adding members and maintenance require a server restart
 or a stopped server. It does not perform background cold-data migration or
 per-file pinning; explicit migration controls placement.
 
+## Raw member interface
+
+The target for the three added devices on the NAS is direct ZeroFS ownership of
+physical block devices. The legacy Storage share remains on its original ZFS
+disk. The directory-backed examples and fault fixtures in this document
+describe the reference member adapter and historical trial. Raw-device
+qualification awaits the engine owner's implementation.
+
+| Pool operation | What a raw member must provide |
+| --- | --- |
+| Placement and admission | A stable member ID, allocation health, and allocatable physical bytes for its capacity domain. Report capacity after device metadata and alignment overhead, and expose enough accounting to enforce the configured reserve and quota exactly once. Admission must account for outstanding reservations and return a capacity or health refusal for an unsatisfiable exact target. The pool owns inode bindings and segment routing. |
+| Degraded cold start | Probe the configured physical device and verify stable serial or WWN plus its persistent pool/member identity before admitting I/O. Report missing, wrong, and healthy identities distinctly. An unavailable member stays excluded from writes and its mapped reads return bounded I/O errors. The authority and catalog are still required. |
+| Publication, replay, and reclaim | Create an immutable, uniquely identified segment generation atomically, with a durable flush guarantee before the catalog publishes its locator. A failed or interrupted create must be distinguishable from a committed generation. Delete or reclaim that exact generation idempotently, without reclaiming a live one. Explicit SSD-durable FLUSH requires completion at the SSD durability boundary owned by the writeback path. |
+| Affected-file reporting | Stable catalog locators keyed by member ID. The report resolves segments through authoritative inode and extent metadata and must work without a data-member read or device scan. |
+| Member verification | Length and exact-generation bounded range reads, with distinguishable missing, stale and I/O-error outcomes. The pool compares the body with the catalog SHA-256 and the filesystem authenticates frames on read. |
+
+The reference directory adapter uses path canonicalisation and mount checks,
+marker files, filesystem free-space probes, and staging-file rename with
+durable publication. These checks and mechanics belong to that backend. The
+raw backend supplies the equivalent member facts and operations without
+directory paths, file markers, file listings, or filesystem free-space probes.
+The exact-target catalog record uses a logical member ID and contains no
+filesystem identity or path. No raw device writer or NAS conversion is part of
+this change.
+
 ## SFTP members
 
 The fork's SFTP backend can be a permanent member. Plain FTP and FTPS are not
