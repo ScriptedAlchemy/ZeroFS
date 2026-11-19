@@ -837,10 +837,14 @@ impl StartupContext {
         // the same cache key the read path derives.
         let segment_warm: Option<crate::segment_store::SegmentWarmHook> =
             (!self.store_profile.skip_write_warm).then(|| {
-                Arc::new(move |loc: &Path, bytes: bytes::Bytes, result: &slatedb::object_store::PutResult| {
-                    let full: Path = db_prefix.parts().chain(loc.parts()).collect();
-                    prefetch.warm_object(&full, bytes, result);
-                }) as crate::segment_store::SegmentWarmHook
+                Arc::new(
+                    move |loc: &Path,
+                          bytes: bytes::Bytes,
+                          result: &slatedb::object_store::PutResult| {
+                        let full: Path = db_prefix.parts().chain(loc.parts()).collect();
+                        prefetch.warm_object(&full, bytes, result);
+                    },
+                ) as crate::segment_store::SegmentWarmHook
             });
 
         Ok(OpenOutcome::Opened(DbOpen {

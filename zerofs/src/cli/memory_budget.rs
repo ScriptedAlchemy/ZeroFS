@@ -223,7 +223,9 @@ impl MemoryPolicy {
 
     fn qualification(&self) -> Option<StoredStateQualification> {
         match self.profile {
-            MemoryPolicyProfile::Legacy { .. } | MemoryPolicyProfile::SmallNasJournal { .. } => None,
+            MemoryPolicyProfile::Legacy { .. } | MemoryPolicyProfile::SmallNasJournal { .. } => {
+                None
+            }
             MemoryPolicyProfile::SmallNasPackage => Some(StoredStateQualification {
                 logical_bytes: package_policy::QUALIFIED_LOGICAL_BYTES,
                 regular_files: package_policy::QUALIFIED_REGULAR_FILES,
@@ -307,7 +309,10 @@ fn validate_server_startup_with_limits(
     let configured = settings.runtime_memory_limit_bytes()?;
     let Some(envelope) = select_memory_limit(detected, configured)? else {
         if let Some(profile) = settings.nas_journal_profile() {
-            bail!("{} requires a finite dedicated memory envelope", profile.name());
+            bail!(
+                "{} requires a finite dedicated memory envelope",
+                profile.name()
+            );
         }
         tracing::warn!(
             accounting = policy.accounting(tiers, "unavailable"),

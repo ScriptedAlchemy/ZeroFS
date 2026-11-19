@@ -3264,8 +3264,7 @@ fn verify_file_payload_into(
         vec![0_u8; WINDOW as usize]
     };
     while remaining > 0 {
-        let want =
-            usize::try_from(remaining.min(WINDOW)).context("blob read window overflow")?;
+        let want = usize::try_from(remaining.min(WINDOW)).context("blob read window overflow")?;
         let window = match collect.as_deref_mut() {
             Some(collected) => {
                 let start = collected.len();
@@ -5954,7 +5953,8 @@ mod tests {
         {
             use std::io::{Seek, SeekFrom, Write};
             let mut file = file;
-            file.seek(SeekFrom::Start(slice.offset + slice.len - 1)).unwrap();
+            file.seek(SeekFrom::Start(slice.offset + slice.len - 1))
+                .unwrap();
             file.write_all(b"X").unwrap();
         }
         let error = journal.read_verified_payload(2).unwrap_err();

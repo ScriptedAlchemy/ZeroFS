@@ -162,7 +162,10 @@ fn lock_parents(paths: &[PathBuf]) -> Result<Vec<File>> {
             lock.sync_all().map_err(generic)?;
             sync_directory(&parent)?;
             if let Some(key) = key {
-                durable_entries().lock().expect("durable entry set").insert(key);
+                durable_entries()
+                    .lock()
+                    .expect("durable entry set")
+                    .insert(key);
             }
         }
         locks.push(lock);
@@ -576,7 +579,10 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         std::fs::create_dir(&leaf).unwrap();
         let second = key(&leaf).unwrap();
-        assert_ne!(first, second, "a recreated directory must not reuse its key");
+        assert_ne!(
+            first, second,
+            "a recreated directory must not reuse its key"
+        );
         assert!(!recorded(second));
         sync_ancestry(&leaf).unwrap();
         assert!(recorded(second));

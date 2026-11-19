@@ -227,7 +227,11 @@ impl NasJournalV2Limits {
 
     /// A journal device whose whole filesystem cannot hold the dirty budget
     /// plus its free floor can never reach the configured watermark.
-    pub(crate) fn check_capacity(disk_bytes: u64, min_free_bytes: u64, filesystem_bytes: u64) -> Result<()> {
+    pub(crate) fn check_capacity(
+        disk_bytes: u64,
+        min_free_bytes: u64,
+        filesystem_bytes: u64,
+    ) -> Result<()> {
         let required = disk_bytes
             .checked_add(min_free_bytes)
             .context("journal capacity overflow")?;
@@ -2284,7 +2288,10 @@ impl Settings {
             }
             let journal_filesystem = nearest_existing_ancestor(&wb.dir)?;
             let stats = rustix::fs::statvfs(&journal_filesystem).with_context(|| {
-                format!("failed to inspect journal filesystem at {}", journal_filesystem.display())
+                format!(
+                    "failed to inspect journal filesystem at {}",
+                    journal_filesystem.display()
+                )
             })?;
             NasJournalV2Limits::check_capacity(
                 wb.disk_bytes,
