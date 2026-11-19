@@ -5,6 +5,8 @@ export default defineConfig({
   plugins: [
     {
       name: "wasm-client-test-module",
+      // Keep the mock target identical before and after generating WASM bindings.
+      enforce: "pre",
       resolveId(id) {
         if (id.endsWith("/generated/zerofs-client/zerofs_client")) return "virtual:zerofs-client";
       },
