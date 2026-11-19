@@ -248,7 +248,11 @@ pub(crate) async fn open_pool_storage(
             config.segment_placement,
             initialize,
             |pool_id| {
-                crate::storage_readiness::verify_pool_paths_except(settings, pool_id, missing.as_deref())?;
+                crate::storage_readiness::verify_pool_paths_except(
+                    settings,
+                    pool_id,
+                    missing.as_deref(),
+                )?;
                 Ok(crate::pool_object_store::MemberPreflight::CheckLocal {
                     allow_degraded,
                     missing,
@@ -402,7 +406,10 @@ fn validate_directories(settings: &Settings, missing: Option<&str>) -> Result<()
         let url: url::Url = member.url.parse()?;
         if url.scheme() == "file" {
             let path = if missing == Some(member.id.as_str()) {
-                resolved_path(&url.to_file_path().map_err(|_| anyhow::anyhow!("invalid local storage URL"))?)?
+                resolved_path(
+                    &url.to_file_path()
+                        .map_err(|_| anyhow::anyhow!("invalid local storage URL"))?,
+                )?
             } else {
                 local_directory(&url)?
             };

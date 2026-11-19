@@ -531,7 +531,10 @@ impl Drop for CancelOnDrop {
 pub(crate) enum MemberPreflight {
     #[cfg(test)]
     Lazy,
-    CheckLocal { allow_degraded: bool, missing: Option<String> },
+    CheckLocal {
+        allow_degraded: bool,
+        missing: Option<String>,
+    },
 }
 
 impl PoolObjectStore {
@@ -608,7 +611,10 @@ impl PoolObjectStore {
         let (check_local, allow_degraded, unavailable) = match preflight {
             #[cfg(test)]
             MemberPreflight::Lazy => (false, false, None),
-            MemberPreflight::CheckLocal { allow_degraded, missing } => (true, allow_degraded, missing),
+            MemberPreflight::CheckLocal {
+                allow_degraded,
+                missing,
+            } => (true, allow_degraded, missing),
         };
         let member_indices = members
             .iter()
@@ -650,8 +656,10 @@ impl PoolObjectStore {
             }),
         };
         let configured = pool.inner.members.clone();
-        pool.catalog(move |catalog| catalog.configure_members_except(&configured, unavailable.as_deref()))
-            .await?;
+        pool.catalog(move |catalog| {
+            catalog.configure_members_except(&configured, unavailable.as_deref())
+        })
+        .await?;
         let expected = pool
             .inner
             .catalog
@@ -697,8 +705,11 @@ impl PoolObjectStore {
             if initialize || !record.initialized {
                 // Bind a newly registered HDD before it receives its first segment.
                 pool.ensure_member(&member.id, true).await?;
-            } else if check_local && let Err(issue) = pool.probe_local_member(member, &record).await {
-                if !allow_degraded || unavailable.is_some() || pool.inner.members.len() < 2
+            } else if check_local && let Err(issue) = pool.probe_local_member(member, &record).await
+            {
+                if !allow_degraded
+                    || unavailable.is_some()
+                    || pool.inner.members.len() < 2
                     || pool.inner.safety_failure.is_cancelled()
                 {
                     return Err(issue);
@@ -707,7 +718,9 @@ impl PoolObjectStore {
                 unavailable = Some(member.id.clone());
             }
         }
-        Arc::get_mut(&mut pool.inner).expect("pool has not been shared").unavailable = unavailable;
+        Arc::get_mut(&mut pool.inner)
+            .expect("pool has not been shared")
+            .unavailable = unavailable;
         pool.catalog(Catalog::finish_initialization).await?;
         // Idle remote members are deliberately not opened or probed here.
         pool.warn_declared_beyond_filesystem();
@@ -841,8 +854,11 @@ impl PoolObjectStore {
         member.validate_binding().map_err(permanent)?;
         let pool_id = &self.inner.catalog.identity.pool_id;
         let path = Path::from(format!(".zerofs-pool/{pool_id}/members/{}", member.id));
-        let expected = record.marker(pool_id).map_err(|issue| error(issue.to_string()))?;
-        if read_marker(member.store.as_ref(), &path).await?.as_deref() != Some(expected.as_slice()) {
+        let expected = record
+            .marker(pool_id)
+            .map_err(|issue| error(issue.to_string()))?;
+        if read_marker(member.store.as_ref(), &path).await?.as_deref() != Some(expected.as_slice())
+        {
             return Err(refusal(format!(
                 "pool member {} identity marker is missing or does not match",
                 member.id
@@ -853,7 +869,9 @@ impl PoolObjectStore {
 
     async fn ensure_member(&self, id: &str, writing: bool) -> object_store::Result<()> {
         if self.inner.unavailable.as_deref() == Some(id) {
-            return Err(refusal(format!("pool member {id} is unavailable until restart")));
+            return Err(refusal(format!(
+                "pool member {id} is unavailable until restart"
+            )));
         }
         let member = self.member(id)?;
         if writing && let Err(issue) = member.validate_binding() {
@@ -1758,8 +1776,11 @@ impl PoolObjectStore {
         let full = self.inner.no_space.current(&members);
         let evacuating = self.inner.evacuating.lock().unwrap().clone();
         let snapshot = evacuating.clone();
+        let unavailable = self.inner.unavailable.clone();
         let mut status = self
-            .catalog(move |catalog| catalog.status(&members, snapshot.as_ref(), &full))
+            .catalog(move |catalog| {
+                catalog.status(&members, snapshot.as_ref(), &full, unavailable.as_deref())
+            })
             .await?;
         #[cfg(test)]
         {
@@ -1770,13 +1791,6 @@ impl PoolObjectStore {
             }
         }
         for member in &mut status.members {
-            if self.inner.unavailable.as_ref() == Some(&member.id) {
-                member.unavailable_at_startup = true;
-                member.available_bytes = 0;
-                member.safe_to_remove = false;
-                member.safe_to_pull_with_known_loss = false;
-                continue;
-            }
             if evacuating
                 .as_ref()
                 .is_some_and(|active| active.member_id == member.id)
@@ -1856,41 +1870,62 @@ impl PoolObjectStore {
             .await?
             .into_iter()
             .filter(|p| p.member_id == member)
-            .map(|p| self.segment_id(&p.location).ok_or_else(|| error("invalid segment placement")))
+            .map(|p| {
+                self.segment_id(&p.location)
+                    .ok_or_else(|| error("invalid segment placement"))
+            })
             .collect()
     }
 
-    pub(crate) async fn verify_member(&self, member: &str) -> object_store::Result<MemberVerification> {
+    pub(crate) async fn verify_member(
+        &self,
+        member: &str,
+    ) -> object_store::Result<MemberVerification> {
         self.ensure_member(member, false).await?;
         let mut report = MemberVerification::default();
         let mut after = String::new();
         loop {
             let cursor = after;
-            let page = self.catalog(move |catalog| catalog.placement_page(&cursor)).await?;
+            let page = self
+                .catalog(move |catalog| catalog.placement_page(&cursor))
+                .await?;
             let Some(last) = page.last() else {
                 return Ok(report);
             };
             after = last.location.to_string();
-            for placement in page.into_iter().filter(|placement| placement.member_id == member) {
+            for placement in page
+                .into_iter()
+                .filter(|placement| placement.member_id == member)
+            {
                 let _guard = self.key_lock(&placement.location).read_owned().await;
                 let key = placement.location.to_string();
-                let entry = self.catalog(move |catalog| catalog.lookup(&key)).await?.entry;
-                let Some(entry) = entry.filter(|entry| entry.physical.key() == placement.physical_key) else {
+                let entry = self
+                    .catalog(move |catalog| catalog.lookup(&key))
+                    .await?
+                    .entry;
+                let Some(entry) =
+                    entry.filter(|entry| entry.physical.key() == placement.physical_key)
+                else {
                     return Err(error("pool placement changed during offline verification"));
                 };
                 let result = async {
                     self.validate_physical(&entry.physical)?;
-                    let expected = entry.sha256.ok_or_else(|| error("missing catalog SHA-256"))?;
+                    let expected = entry
+                        .sha256
+                        .ok_or_else(|| error("missing catalog SHA-256"))?;
                     let observed = self.hash_physical(&entry.physical, entry.size).await?;
                     if observed != expected {
                         return Err(permanent(SourceChecksumMismatch));
                     }
                     Ok(())
-                }.await;
+                }
+                .await;
                 match result {
                     Ok(()) => report.verified_segments += 1,
                     Err(issue) => {
-                        report.failures.insert(placement.location.to_string(), issue.to_string());
+                        report
+                            .failures
+                            .insert(placement.location.to_string(), issue.to_string());
                     }
                 }
             }

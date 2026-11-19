@@ -896,3 +896,25 @@ fn statvfs_size_requires_nonzero_representable_bytes() {
         "unavailable",
     );
 }
+
+#[test]
+fn degraded_readiness_keeps_authority_and_catalog_identity_checks() {
+    let mut fixture = Fixture::new();
+    let settings = fixture.parse().unwrap();
+    let member = fixture.path("member data");
+    let authority = fixture.path("authority");
+    let catalog = fixture.path("catalog");
+    fixture.facts.get_mut(&member).unwrap().identity = FilesystemIdentity::Zfs {
+        pool_guid: "102".into(),
+        dataset_guid: "202".into(),
+    };
+
+    assert!(verify_with(&settings, &fixture).is_err());
+    verify_except(&settings, &fixture, Some("data")).unwrap();
+
+    for required in [authority, catalog] {
+        let facts = fixture.facts.remove(&required).unwrap();
+        assert!(verify_except(&settings, &fixture, Some("data")).is_err());
+        fixture.facts.insert(required, facts);
+    }
+}

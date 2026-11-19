@@ -101,7 +101,9 @@ fn verify_except(
         return Ok(());
     }
     for device in &config.devices {
-        if excluded.as_ref().is_some_and(|role| device.roles.as_slice() == [role.clone()])
+        if excluded
+            .as_ref()
+            .is_some_and(|role| device.roles.as_slice() == [role.clone()])
             && !device.boot
         {
             continue;
@@ -269,7 +271,9 @@ pub(crate) fn verify_pool_paths(settings: &Settings, pool_id: &str) -> Result<()
 }
 
 pub(crate) fn verify_pool_paths_except(
-    settings: &Settings, pool_id: &str, missing: Option<&str>,
+    settings: &Settings,
+    pool_id: &str,
+    missing: Option<&str>,
 ) -> Result<()> {
     let Some(config) = &settings.storage.readiness else {
         return Ok(());

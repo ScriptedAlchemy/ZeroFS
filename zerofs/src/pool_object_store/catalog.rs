@@ -385,7 +385,11 @@ impl Catalog {
         self.configure_members_except(members, None)
     }
 
-    pub fn configure_members_except(&self, members: &[PoolMember], unavailable: Option<&str>) -> Result<()> {
+    pub fn configure_members_except(
+        &self,
+        members: &[PoolMember],
+        unavailable: Option<&str>,
+    ) -> Result<()> {
         let mut ids = BTreeSet::new();
         let mut identities = BTreeSet::new();
         for member in members {
@@ -434,7 +438,10 @@ impl Catalog {
                     .transpose()?;
                 if unavailable == Some(member.id.as_str()) {
                     if !existing.is_some_and(|record| record.initialized) {
-                        bail!("unavailable pool member {} was never initialized", member.id);
+                        bail!(
+                            "unavailable pool member {} was never initialized",
+                            member.id
+                        );
                     }
                     continue;
                 }
@@ -1107,6 +1114,7 @@ impl Catalog {
         order: &[PoolMember],
         active: Option<&super::EvacuationProgress>,
         full: &BTreeMap<String, i64>,
+        unavailable: Option<&str>,
     ) -> Result<PoolStatus> {
         let tx = self.database.begin_read()?;
         // Read the clock after the snapshot opens, so no observation in it is later.
@@ -1293,10 +1301,11 @@ impl Catalog {
                 },
                 available_bytes: 0,
                 space: Default::default(),
-                unavailable_at_startup: false,
+                unavailable_at_startup: unavailable == Some(record.id.as_str()),
                 health,
-                safe_to_remove,
-                safe_to_pull_with_known_loss,
+                safe_to_remove: safe_to_remove && unavailable != Some(record.id.as_str()),
+                safe_to_pull_with_known_loss: safe_to_pull_with_known_loss
+                    && unavailable != Some(record.id.as_str()),
                 readable_evacuated,
                 unreadable_objects,
                 pending_uploads,
@@ -1638,7 +1647,9 @@ mod legacy_health_compatibility {
             health_device: None,
             free_space: None,
         };
-        let status = catalog.status(&[config], None, &BTreeMap::new()).unwrap();
+        let status = catalog
+            .status(&[config], None, &BTreeMap::new(), None)
+            .unwrap();
         assert_eq!(status.mapped_objects, 1);
         assert_eq!(status.members[0].used_bytes, 7);
         assert!(status.members[0].health.quarantine.is_none());

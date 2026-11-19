@@ -105,6 +105,14 @@ committed data, pending uploads, and superseded data still awaiting deletion.
 Adding another permanent member adds capacity without changing filesystem paths
 or remapping previously written segments.
 
+Placement currently operates on sealed segments. A file can span segments,
+and a segment can carry extents from several files. Whole-file placement across
+multiple members requires binding an inode before frame packing, carrying the
+binding through upload and recovery, and keeping compaction and reclaim within
+that binding. The allocator has no complete file length or inode ownership at
+admission, so the current placement modes provide segment-level capacity
+admission.
+
 Set `segment_placement = "round_robin_local"` in `[storage.pool]` to rotate new
 immutable segment reservations across eligible local members. Rotation follows
 configuration order and resumes after restart from the last local reservation
@@ -350,6 +358,30 @@ Inspect a running server through its existing admin RPC socket:
 zerofs pool status --endpoint unix:/run/zerofs/admin.sock
 zerofs pool affected --endpoint unix:/run/zerofs/admin.sock --member disk1
 ```
+
+For an existing pool, set `allow_degraded_start = true` in `[storage.pool]` to
+open with one initialized local data member unavailable. Keep its member
+declaration. The authority, its identity marker, the catalog, and the other
+readiness roles are still required. With strict readiness configured, the
+mount and device identity checks apply to every remaining role. A directory
+at the missing mount path without the matching pool member marker cannot
+receive segments. Status sets `unavailable_at_startup` for the excluded member.
+Its mapped segments return I/O errors on cold reads. Restart after restoring
+the member to have it checked again.
+
+Run a full check of the committed segment bodies on one member with the
+server stopped:
+
+```sh
+zerofs pool verify --config zerofs.toml --member disk1
+```
+
+The command reads the exact catalog generations in bounded ranges and compares
+their SHA-256 digests with the committed catalog digests. It outputs a JSON
+count and failures keyed by logical segment path, and exits unsuccessfully if
+any committed body fails verification. Use `pool affected` on the running
+server to identify live and retained-checkpoint file references for the member,
+including when its bodies cannot be read.
 
 Offline `pool status --config zerofs.toml` still takes the catalog's exclusive
 lock and requires a stopped server. Opening storage or running an offline command
