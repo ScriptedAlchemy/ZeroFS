@@ -171,7 +171,11 @@ def member_status(*args):
     assert members.keys() == SIZES.keys(), members
     for member_id, member in members.items():
         assert member["capacity_bytes"] == SIZES[member_id], member
-        assert member["space"]["filesystem_free_bytes"] is not None, member
+        space = member["space"]
+        assert space["filesystem_free_bytes"] is not None, member
+        assert space["retirement_reserved_bytes"] == RAW_BLOCK * member["objects"], member
+        assert member["health"]["quarantine"] is None, member
+        assert member["health"]["monitoring_error"] is None, member
         assert member["reserved_bytes"] == member["pending_uploads"] == member["cleanup_debts"] == 0, member
     return members
 
@@ -234,8 +238,10 @@ def qualify(root, members):
     small = before["small"]
     free = small["space"]["filesystem_free_bytes"]
     assert small["capacity_bytes"] - small["used_bytes"] > CHUNK, small
-    assert RESERVES["small"] <= free < RESERVES["small"] + CHUNK, small
-    assert small["available_bytes"] == free - RESERVES["small"], small
+    retirement = small["space"]["retirement_reserved_bytes"]
+    floor = RESERVES["small"] + retirement
+    assert floor <= free < floor + CHUNK, small
+    assert small["available_bytes"] == free - floor, small
 
     # Two appends with a barrier each force round-robin to reconsider the
     # smaller member even if the first append would naturally go to large.
@@ -250,7 +256,7 @@ def qualify(root, members):
     assert len(new) >= 2 and all(entry["member_id"] == "large" for entry in new), new
     assert all(small["available_bytes"] < entry["size"] for entry in new), new
     assert after["small"]["used_bytes"] == small["used_bytes"], after
-    assert after["small"]["space"]["filesystem_free_bytes"] == free, after
+    assert after["small"]["space"] == small["space"], after
     assert after["large"]["used_bytes"] - before["large"]["used_bytes"] == sum(
         entry["size"] for entry in new
     ), after
@@ -262,10 +268,20 @@ def qualify(root, members):
         RAW_BLOCK * (1 + (entry["size"] + RAW_BLOCK - 1) // RAW_BLOCK) for entry in new
     )
     assert physical_spent == expected_cost, (physical_spent, expected_cost, new)
+    retirement_added = (
+        after["large"]["space"]["retirement_reserved_bytes"]
+        - before["large"]["space"]["retirement_reserved_bytes"]
+    )
+    assert retirement_added == len(new) * RAW_BLOCK, after
+    assert before["large"]["available_bytes"] - after["large"]["available_bytes"] == (
+        physical_spent + retirement_added
+    ), after
     record("reserve_spill", smaller_reserve_bytes=RESERVES["small"],
+           smaller_retirement_reserved_bytes=retirement,
            smaller_available_bytes=small["available_bytes"], larger_new_objects=len(new),
            larger_new_bytes=sum(entry["size"] for entry in new),
-           larger_raw_log_bytes=physical_spent)
+           larger_raw_log_bytes=physical_spent,
+           larger_retirement_reserved_bytes_added=retirement_added)
 
     with mounted(configs[3]) as path:
         verify(path, digest, chunks, "cold_restart")
