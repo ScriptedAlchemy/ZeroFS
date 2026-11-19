@@ -115,8 +115,10 @@ admission.
 
 The pool has an internal exact-target contract for new conditional segment
 uploads. A caller that provides a target persists it in the catalog before
-capacity admission. Later ordinary or multipart puts for the same logical
-segment key honor that target, including after reclaim or restart. The
+capacity admission. Writeback registers explicit generated-segment targets in
+the same catalog before it can acknowledge the journal entry. Replay uses
+the same logical key and inherits the persisted target even when no earlier
+pool put occurred. Later puts honor the target after reclaim or restart. The
 allocator checks the target's health, quota and filesystem reserve and
 refuses allocations it cannot satisfy. Segment migration cannot move a
 targeted segment to another member. There is currently no filesystem placement
