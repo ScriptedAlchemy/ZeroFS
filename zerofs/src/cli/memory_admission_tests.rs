@@ -608,7 +608,7 @@ mod raw_candidate {
         let baseline = validate(root, &config, Some(8 * GIB), "0\n").unwrap();
         let receipt = validate(root, &raised, Some(8 * GIB), "0\n").unwrap();
         assert_eq!(receipt, baseline);
-        assert_eq!(receipt.required_bytes, 7_905_709_056);
+        assert_eq!(receipt.required_bytes, 7_504 * MIB);
         assert!(receipt.required_bytes < 8 * GIB);
         assert_eq!(receipt.hard_limit_bytes, 8 * GIB);
         assert!(receipt.stored_state_qualification.is_none());

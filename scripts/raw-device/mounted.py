@@ -3,10 +3,12 @@
 from collections import Counter
 from contextlib import ExitStack, contextmanager
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
 import random
+import re
 import signal
 import stat
 import subprocess
@@ -309,6 +311,40 @@ def render_nas_config(root, template, members, p3, *, held):
     return rendered
 
 
+def report_webui(config):
+    [address] = tomllib.loads(config.read_text())["servers"]["webui"]["addresses"]
+    host, port = address.split(":")
+    assert host == "127.0.0.1", address
+
+    def fetch(path):
+        connection = http.client.HTTPConnection(host, int(port), timeout=3)
+        try:
+            connection.request("GET", path)
+            response = connection.getresponse()
+            payload = response.read()
+            return {"status": response.status, "content_type": response.getheader("Content-Type"),
+                    "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}, payload
+        finally:
+            connection.close()
+
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            index, body = fetch("/")
+            break
+        except ConnectionRefusedError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.1)
+    references = set(re.findall(rb'(?:src|href)=["\'](/assets/[^"\']+)["\']', body))
+    assets = {path.decode(): fetch(path.decode())[0] for path in sorted(references)}
+    served = index["status"] == 200 and any(
+        asset["status"] == 200 and "javascript" in (asset["content_type"] or "")
+        and asset["bytes"] > 0 for asset in assets.values()
+    )
+    record("webui_assets", index=index, assets=assets, javascript_served=served)
+
+
 def write_fsync_crash(path, server, body):
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
@@ -352,6 +388,7 @@ def qualify_nas_fit(root, members, memory_limit, p3):
     body = random.Random(0).randbytes(CHUNK)
     digest = hashlib.sha256(body)
     with mounted(held, crash=True) as (path, server):
+        report_webui(held)
         sample_cgroup("before_volatile_write")
         write_fsync_crash(path, server, body)
         sample_cgroup("after_sigkill")
