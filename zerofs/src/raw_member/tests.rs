@@ -448,17 +448,10 @@ async fn costs_and_capacity_are_exact() {
     let empty = store.capacity().unwrap();
     assert_eq!(empty.reserve_bytes, BLOCK, "reserve rounds up to a block");
     assert_eq!(empty.device_bytes, SIZE);
-    assert_eq!(empty.log_bytes, SIZE - 2 * BLOCK);
-    assert_eq!(empty.free_bytes, SIZE - 2 * BLOCK);
+    assert!(empty.data_bytes < SIZE);
+    assert_eq!(empty.free_bytes, empty.data_bytes);
     assert_eq!(empty.admissible_bytes, empty.free_bytes - BLOCK);
-    assert_eq!(
-        (
-            empty.appended_bytes,
-            empty.live_objects,
-            empty.delete_debt_bytes
-        ),
-        (0, 0, 0)
-    );
+    assert_eq!((empty.allocated_bytes, empty.live_objects), (0, 0));
 
     for (len, cost) in [
         (0, BLOCK),
@@ -469,30 +462,25 @@ async fn costs_and_capacity_are_exact() {
         assert_eq!(RawMemberStore::put_cost(len), Some(cost));
     }
     assert_eq!(RawMemberStore::put_cost(u64::MAX), None);
-    assert_eq!(RawMemberStore::delete_cost(), BLOCK);
 
     store
         .put(&path("a"), payload(0, 5000).into())
         .await
         .unwrap();
     let one = store.capacity().unwrap();
-    assert_eq!(one.appended_bytes, 3 * BLOCK);
-    assert_eq!(one.delete_debt_bytes, BLOCK);
+    assert_eq!(one.allocated_bytes, 3 * BLOCK);
     assert_eq!(one.live_objects, 1);
-    assert_eq!(one.admissible_bytes, empty.admissible_bytes - 4 * BLOCK);
+    assert_eq!(one.admissible_bytes, empty.admissible_bytes - 3 * BLOCK);
 
-    // An overwrite appends but adds no debt; superseded bytes stay appended.
+    // The old allocation is released when the overwrite commits.
     store.put(&path("a"), payload(1, 10).into()).await.unwrap();
     let over = store.capacity().unwrap();
-    assert_eq!(over.appended_bytes, 5 * BLOCK);
-    assert_eq!(over.delete_debt_bytes, BLOCK);
+    assert_eq!(over.allocated_bytes, 2 * BLOCK);
 
-    // A delete spends exactly the debt it releases.
+    // Deleting the last key returns all of its space.
     store.delete(&path("a")).await.unwrap();
     let deleted = store.capacity().unwrap();
-    assert_eq!(deleted.appended_bytes, 6 * BLOCK);
-    assert_eq!((deleted.delete_debt_bytes, deleted.live_objects), (0, 0));
-    assert_eq!(deleted.admissible_bytes, over.admissible_bytes);
+    assert_eq!(deleted, empty);
 
     // Deleting an absent key writes nothing.
     store.delete(&path("a")).await.unwrap();
@@ -502,7 +490,7 @@ async fn costs_and_capacity_are_exact() {
 /// Fill to the last admissible byte: the exact maximum fits, one byte more
 /// is refused without writing, and deletes always fit above the reserve.
 #[tokio::test]
-async fn exact_fill_never_crosses_the_reserve_and_keeps_deletes_funded() {
+async fn exact_fill_never_crosses_the_reserve_and_allows_deletes() {
     let reserve = 64 * 1024;
     let scratch = Scratch::new(1 << 20);
     let store = scratch.member(scratch.provision(), reserve);
@@ -524,8 +512,8 @@ async fn exact_fill_never_crosses_the_reserve_and_keeps_deletes_funded() {
         created.push(name);
     }
     let full = store.capacity().unwrap();
-    assert!(full.admissible_bytes < 2 * BLOCK);
-    assert!(full.free_bytes >= reserve + full.delete_debt_bytes);
+    assert!(full.admissible_bytes < BLOCK);
+    assert!(full.free_bytes >= reserve);
 
     // Smallest create no longer fits: honest ENOSPC, nothing written.
     let err = store
@@ -556,7 +544,7 @@ async fn exact_fill_never_crosses_the_reserve_and_keeps_deletes_funded() {
         .unwrap();
     assert_eq!(deleted.len(), created.len());
     let empty = store.capacity().unwrap();
-    assert_eq!((empty.live_objects, empty.delete_debt_bytes), (0, 0));
+    assert_eq!(empty.live_objects, 0);
     assert!(empty.free_bytes >= reserve);
     drop(store);
     assert!(scratch.reopen().is_empty());
@@ -582,15 +570,15 @@ async fn concurrent_admission_has_no_false_enospc() {
     });
     let results = futures::future::join_all(puts).await;
     let end = store.capacity().unwrap();
-    let mut appended = 0;
+    let mut allocated = 0;
     for (len, result) in sizes.iter().zip(&results) {
         let cost = RawMemberStore::put_cost(*len).unwrap();
         match result {
-            Ok(_) => appended += cost,
+            Ok(_) => allocated += cost,
             Err(err) => {
                 assert!(is_no_space(err), "{err}");
                 assert!(
-                    end.admissible_bytes < cost + BLOCK,
+                    end.admissible_bytes < cost,
                     "refused a {len}-byte create that still fits"
                 );
             }
@@ -598,9 +586,9 @@ async fn concurrent_admission_has_no_false_enospc() {
     }
     let ok = results.iter().filter(|r| r.is_ok()).count() as u64;
     assert!(ok > 0 && ok < sizes.len() as u64);
-    assert_eq!(end.appended_bytes, appended);
+    assert_eq!(end.allocated_bytes, allocated);
     assert_eq!(end.live_objects, ok);
-    assert!(end.free_bytes >= end.reserve_bytes + end.delete_debt_bytes);
+    assert!(end.free_bytes >= end.reserve_bytes);
 
     drop(store);
     let store = scratch.member(scratch.reopen(), 8192);
@@ -618,34 +606,29 @@ async fn concurrent_admission_has_no_false_enospc() {
 }
 
 #[tokio::test]
-async fn a_store_opened_below_the_floor_keeps_its_debt_and_reports_enospc() {
+async fn a_store_opened_below_the_floor_can_delete_to_recover() {
     let scratch = Scratch::new(1 << 20);
     let store = scratch.member(scratch.provision(), 0);
-    // Fill with no reserve, then reopen demanding a reserve the device no
-    // longer has.
-    let mut n = 0;
-    while store
-        .capacity()
-        .unwrap()
-        .max_put_payload()
-        .is_some_and(|max| max >= 1)
-    {
-        store
-            .put(&path(&format!("f/{n}")), "x".into())
-            .await
-            .unwrap();
-        n += 1;
-    }
+    let size = store.capacity().unwrap().max_put_payload().unwrap();
+    let body = payload(1, size as usize);
+    store
+        .put(&path("filled"), body.clone().into())
+        .await
+        .unwrap();
+    drop(store);
+
+    let store = scratch.member(scratch.reopen(), 64 * 1024);
+    assert_eq!(store.capacity().unwrap().admissible_bytes, 0);
+    let err = store.put(&path("other"), "y".into()).await.unwrap_err();
+    assert!(is_no_space(&err), "{err}");
+    assert_eq!(read(&store, "filled").await, body);
+    store.delete(&path("filled")).await.unwrap();
+    assert!(store.capacity().unwrap().admissible_bytes > 0);
+    store.put(&path("other"), "y".into()).await.unwrap();
     drop(store);
     let store = scratch.member(scratch.reopen(), 64 * 1024);
-    let before = store.capacity().unwrap();
-    assert_eq!(before.admissible_bytes, 0);
-    let err = store.delete(&path("f/0")).await.unwrap_err();
-    assert!(is_no_space(&err), "{err}");
-    let err = store.put(&path("f/0"), "y".into()).await.unwrap_err();
-    assert!(is_no_space(&err), "{err}");
-    assert_eq!(store.capacity().unwrap(), before);
-    assert_eq!(read(&store, "f/0").await, "x");
+    assert_eq!(read(&store, "other").await, "y");
+    assert!(store.head(&path("filled")).await.is_err());
 }
 
 #[tokio::test]
@@ -653,17 +636,16 @@ async fn hostile_sizes_are_refused_without_overflow() {
     assert_eq!(RawMemberStore::put_cost(u64::MAX - 1), None);
     let capacity = RawCapacity {
         device_bytes: 0,
-        log_bytes: 0,
-        appended_bytes: 0,
+        data_bytes: 0,
+        allocated_bytes: 0,
         free_bytes: u64::MAX,
         reserve_bytes: 0,
-        delete_debt_bytes: 0,
         admissible_bytes: u64::MAX,
         live_objects: 0,
     };
     assert_eq!(capacity.max_put_payload(), Some(MAX_OBJECT_LEN));
     let capacity = RawCapacity {
-        admissible_bytes: 2 * BLOCK - 1,
+        admissible_bytes: BLOCK - 1,
         ..capacity
     };
     assert_eq!(capacity.max_put_payload(), None);
@@ -755,10 +737,13 @@ async fn damaged_payload_is_never_returned_even_for_a_distant_range() {
     let store = scratch.member(scratch.provision(), 0);
     let data = payload(9, 3 * 4096);
     store.put(&path("k"), data.into()).await.unwrap();
-    // Record header at block 2; payload starts at block 3. Damage its last block.
+    // Damage the last payload block of the first object.
     scratch
         .file()
-        .write_all_at(&[0xEE], 2 * BLOCK + BLOCK + 2 * 4096 + 1)
+        .write_all_at(
+            &[0xEE],
+            SIZE - store.capacity().unwrap().data_bytes + BLOCK + 2 * BLOCK + 1,
+        )
         .unwrap();
     for result in [
         store.get_range(&path("k"), 0..8).await,
@@ -834,7 +819,7 @@ async fn unstored_features_and_invalid_keys_are_refused() {
         raw_error(&err),
         Some(RawMemberError::InvalidKey(_))
     ));
-    assert_eq!(store.capacity().unwrap().appended_bytes, 0);
+    assert_eq!(store.capacity().unwrap().allocated_bytes, 0);
 }
 
 #[tokio::test]

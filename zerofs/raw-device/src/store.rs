@@ -1,80 +1,108 @@
-//! The store: label handling, log replay, appends, and the flush barrier.
+//! The raw object index, copy-on-write payload allocations and flush barrier.
+mod allocation;
+mod index_log;
 
+use self::allocation::{Allocation, Allocator, Blocks};
+use self::index_log::{ENTRY_CHARGE, IndexWriter};
+use crate::format::{
+    Block, LABEL_SLOTS, LOG_START, Label, SlotState, bank_bytes, check_device_size, data_start,
+    sha256, zero_block,
+};
 use crate::region::Region;
-use std::collections::HashMap;
+use crate::{BLOCK_SIZE, Error, Geometry, Identity, MAX_KEY_LEN, MAX_OBJECT_LEN, Result};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::format::{
-    BLOCK, Block, Kind, LABEL_SLOTS, LOG_START, Label, RecordHeader, SlotState, blocks_for,
-    check_device_size, sha256, zero_block,
-};
-use crate::{BLOCK_SIZE, Error, Geometry, Identity, MAX_KEY_LEN, MAX_OBJECT_LEN, Result};
-
-/// Read size for the provisioning blank scan.
 const SCAN_CHUNK: usize = 1 << 20;
-/// Appends up to this size go to the device as one write.
-const COALESCE_LIMIT: u64 = 256 << 10;
-/// Read size for verified range reads, which hash the whole payload.
 const VERIFY_CHUNK: u64 = 1 << 20;
-/// Bounds hash buckets and owned key bytes independently of device capacity.
-/// A 256 MiB device cannot hit this limit, even with header-only records.
-const MAX_INDEX_KEYS: usize = 65_536;
+const MAX_PENDING_KEYS: usize = 4096;
 
-#[derive(Debug, Clone, Copy)]
+type Index = HashMap<Arc<[u8]>, Arc<Entry>>;
+
+#[derive(Debug, PartialEq, Eq)]
 struct Entry {
-    value_offset: u64,
+    allocation: Allocation,
     info: ObjectInfo,
 }
 
-/// What the log records about one live object.
+struct Retired {
+    allocation: Allocation,
+    len: u64,
+    seq: u64,
+    reader: Weak<Entry>,
+}
+
+impl From<Arc<Entry>> for Retired {
+    fn from(entry: Arc<Entry>) -> Self {
+        Self {
+            allocation: entry.allocation,
+            len: entry.info.len,
+            seq: entry.info.seq,
+            reader: if Arc::strong_count(&entry) > 1 {
+                Arc::downgrade(&entry)
+            } else {
+                Weak::new()
+            },
+        }
+    }
+}
+
+/// Metadata of one live object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectInfo {
     /// Payload length in bytes.
     pub len: u64,
     /// SHA-256 of the whole payload.
     pub sha256: [u8; 32],
-    /// Log sequence number of the put record. Unique within one provisioning
-    /// and strictly larger for every later append.
+    /// Sequence of the PUT, retained when the index is compacted.
     pub seq: u64,
     /// Wall-clock time of the put, in Unix nanoseconds.
     pub modified_unix_nanos: u64,
 }
 
-/// A live object located by [`RawStore::handle`], readable through a
-/// [`RawReader`] without holding the store. Log records are never rewritten
-/// while the store is open, so the handle stays valid after later overwrites
-/// or deletes of its key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A live object located by [`RawStore::handle`]. The allocation is pinned
+/// until the last clone of the handle is dropped, even after overwrite or delete.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectHandle {
-    value_offset: u64,
+    entry: Arc<Entry>,
     pub info: ObjectInfo,
 }
 
-/// Shares the store's device for checksum-verified reads that do not borrow
-/// the store. Only hand it handles from the store that created it.
+/// Reads through handles from the same open store without borrowing it.
 #[derive(Debug, Clone)]
 pub struct RawReader {
     file: Arc<Region>,
+    data_start: u64,
+    nonce: [u8; 16],
 }
 
 impl RawReader {
-    /// Read `ranges` of the object, verifying the whole payload's SHA-256.
-    ///
-    /// The full payload is read in bounded chunks to check the digest, but
-    /// only the requested bytes are retained, so memory stays near the sum of
-    /// the ranges. Each range must lie within the object. Nothing is returned
-    /// unless the digest matches.
+    /// Return only the requested ranges after verifying the whole payload.
     pub fn read_ranges(
         &self,
         handle: &ObjectHandle,
         ranges: &[Range<u64>],
     ) -> Result<Vec<Vec<u8>>> {
-        let len = handle.info.len;
+        self.read(&handle.entry, ranges)
+    }
+
+    fn blocks(&self, entry: &Entry) -> Result<Blocks> {
+        entry.allocation.blocks(
+            &self.file,
+            self.data_start,
+            &self.nonce,
+            entry.info.seq,
+            entry.info.len,
+        )
+    }
+
+    fn read(&self, entry: &Entry, ranges: &[Range<u64>]) -> Result<Vec<Vec<u8>>> {
+        let len = entry.info.len;
         if ranges.iter().any(|r| r.start > r.end || r.end > len) {
             return Err(Error::InvalidArgument("range outside the object"));
         }
@@ -85,41 +113,51 @@ impl RawReader {
         let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
         let mut buf = vec![0u8; VERIFY_CHUNK.min(len) as usize];
         let mut at = 0u64;
-        while at < len {
-            let n = VERIFY_CHUNK.min(len - at);
-            let chunk = &mut buf[..n as usize];
-            self.file.read_exact_at(chunk, handle.value_offset + at)?;
-            sha2::Digest::update(&mut hasher, &*chunk);
-            for (range, dest) in ranges.iter().zip(out.iter_mut()) {
-                let start = range.start.max(at);
-                let end = range.end.min(at + n);
-                if start < end {
-                    dest.extend_from_slice(&chunk[(start - at) as usize..(end - at) as usize]);
+        for run in self.blocks(entry)?.data_runs() {
+            let mut offset = run.start;
+            while offset < run.end && at < len {
+                let n = VERIFY_CHUNK.min(len - at).min(run.end - offset);
+                let chunk = &mut buf[..n as usize];
+                self.file.read_exact_at(chunk, offset)?;
+                sha2::Digest::update(&mut hasher, &*chunk);
+                for (range, dest) in ranges.iter().zip(out.iter_mut()) {
+                    let start = range.start.max(at);
+                    let end = range.end.min(at + n);
+                    if start < end {
+                        dest.extend_from_slice(&chunk[(start - at) as usize..(end - at) as usize]);
+                    }
                 }
+                at += n;
+                offset += n;
             }
-            at += n;
         }
         let digest: [u8; 32] = sha2::Digest::finalize(hasher).into();
-        if digest != handle.info.sha256 {
-            return Err(corrupt(handle.value_offset, "payload checksum mismatch"));
+        if digest != entry.info.sha256 {
+            return Err(corrupt(
+                entry.allocation.start(),
+                "payload checksum mismatch",
+            ));
         }
         Ok(out)
     }
 }
 
-/// A durable key/value object store over one claimed device.
-///
-/// `get` takes `&self` and may run concurrently from several threads. Appends
-/// and `flush` take `&mut self`. Dropping the store does not flush.
+/// A durable key/value object store over one claimed device. Dropping it does
+/// not flush. PUTs are copy-on-write while either label can still reach the
+/// previous value.
 pub struct RawStore {
     file: Arc<Region>,
-    /// The last durable checkpoint.
     label: Label,
-    /// Damaged, blank, or older slot to repair before replacing the good copy.
     stale_slot: Option<u64>,
-    tail: u64,
-    next_seq: u64,
-    index: HashMap<Vec<u8>, Entry>,
+    seq: u64,
+    index: Index,
+    index_charge: usize,
+    // None requests a full snapshot in the other bank. Bound pending key
+    // memory even when the caller flushes after an arbitrarily long batch.
+    pending: Option<HashSet<Arc<[u8]>>>,
+    allocator: Allocator,
+    retired: Vec<Retired>,
+    pinned: Vec<Retired>,
     poisoned: bool,
 }
 
@@ -169,19 +207,29 @@ impl RawStore {
             identity,
             nonce: random_nonce()?,
             durable_tail: LOG_START,
-            record_count: 0,
+            last_seq: 0,
+            bank: 0,
+            bank_generation: 1,
         };
         write_checkpoint(&file, &label)?;
 
-        Ok(Self {
+        Ok(Self::empty(file, label, None))
+    }
+
+    fn empty(file: Region, label: Label, stale_slot: Option<u64>) -> Self {
+        Self {
             file: Arc::new(file),
             label,
-            stale_slot: None,
-            tail: LOG_START,
-            next_seq: 1,
+            stale_slot,
+            seq: label.last_seq,
             index: HashMap::new(),
+            index_charge: 0,
+            pending: Some(HashSet::new()),
+            allocator: Allocator::new(data_start(label.device_size), label.device_size),
+            retired: Vec::new(),
+            pinned: Vec::new(),
             poisoned: false,
-        })
+        }
     }
 
     pub(crate) fn binding(file: &Region, expected: Identity) -> Result<(Label, Option<u64>)> {
@@ -201,132 +249,89 @@ impl RawStore {
                 supplied: device_size,
             });
         }
-
         Ok((label, stale_slot))
     }
 
-    /// Reopen a provisioned device and replay its durable log.
-    ///
-    /// The label must record exactly `expected` and `device_size`. Anything
-    /// appended after the last durable checkpoint is ignored and will be
-    /// overwritten by later appends. Open never writes to the device.
+    /// Reopen a provisioned device and rebuild the live index and allocator.
+    /// Open never writes to the device.
     pub fn open(file: File, device_size: u64, expected: Identity) -> Result<Self> {
         Self::open_region(Region::whole(file, device_size)?, expected)
     }
 
     pub(crate) fn open_region(file: Region, expected: Identity) -> Result<Self> {
         let (label, stale_slot) = Self::binding(&file, expected)?;
-
-        let mut index = HashMap::new();
-        let mut offset = LOG_START;
-        let mut seq: u64 = 1;
-        let mut block = zero_block();
-        while offset < label.durable_tail {
-            if label.durable_tail - offset < BLOCK_SIZE {
-                return Err(corrupt(offset, "durable tail splits a record header"));
+        let mut store = Self::empty(file, label, stale_slot);
+        let reader = store.reader();
+        index_log::replay(&reader.file, &label, |key, entry| {
+            if let Some(entry) = entry {
+                store.reserve_index(key)?;
+                store.insert(key, entry);
+            } else {
+                store.remove(key);
             }
-            read_block(&file, offset, &mut block)?;
-            let header = RecordHeader::decode(&block, &label.nonce, seq)
-                .map_err(|reason| Error::Corrupt { offset, reason })?;
-            let end = offset
-                .checked_add(header.span())
-                .filter(|end| *end <= label.durable_tail)
-                .ok_or_else(|| corrupt(offset, "record extends past the durable tail"))?;
-            if header.kind == Kind::Put {
-                reserve_index(&mut index, &header.key)?;
-            }
-            apply(&mut index, offset, header);
-            offset = end;
-            seq += 1;
+            Ok(())
+        })?;
+        // Historical entries in the index log can point into space that
+        // already belongs to something else. Claim only final live allocations.
+        for entry in store.index.values() {
+            let blocks = reader.blocks(entry)?;
+            store.allocator.claim(blocks.all_runs())?;
         }
-        if seq - 1 != label.record_count {
-            return Err(Error::Corrupt {
-                offset: label.durable_tail,
-                reason: format!(
-                    "label records {} records, log holds {}",
-                    label.record_count,
-                    seq - 1
-                ),
-            });
-        }
-
-        Ok(Self {
-            file: Arc::new(file),
-            tail: label.durable_tail,
-            label,
-            stale_slot,
-            next_seq: seq,
-            index,
-            poisoned: false,
-        })
+        Ok(store)
     }
 
-    /// Append `value` under `key`, replacing any earlier value. Visible to
-    /// `get` at once; durable only after the next successful `flush`.
+    /// Stage a replacement visible to this store. Until FLUSH the last
+    /// committed value remains recoverable.
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.check_writable()?;
+        self.check_healthy()?;
         check_key(key)?;
-        if value.len() as u64 > MAX_OBJECT_LEN {
+        let len = value.len() as u64;
+        if len > MAX_OBJECT_LEN {
             return Err(Error::InvalidArgument("value exceeds MAX_OBJECT_LEN"));
         }
-        let header = RecordHeader {
-            seq: self.next_seq,
-            kind: Kind::Put,
-            key: key.to_vec(),
-            value_len: value.len() as u64,
-            value_sha256: sha256(value),
-            modified_unix_nanos: now_unix_nanos(),
-        };
-        let span = self.reserve(&header)?;
-        reserve_index(&mut self.index, key)?;
-        let at = self.tail;
-        let encoded = header.encode(&self.label.nonce);
-        let written = self.write_record(at, &encoded, value, span);
-        self.poison_on_err(written)?;
+        let seq = self.next_seq()?;
+        self.reserve_index(key)?;
+        self.reclaim()?;
+        let positions = self.allocator.allocate(Self::put_cost(len).unwrap())?;
+        let allocation = Allocation::new(&positions);
+        self.repair_label()?;
+        let written = allocation.write(&self.file, &self.label.nonce, seq, &positions, value);
+        self.poison_on_io(written)?;
 
-        self.tail += span;
-        self.next_seq += 1;
-        apply(&mut self.index, at, header);
+        let entry = Entry {
+            allocation,
+            info: ObjectInfo {
+                len,
+                sha256: sha256(value),
+                seq,
+                modified_unix_nanos: now_unix_nanos(),
+            },
+        };
+        self.seq = seq;
+        let (key, previous) = self.insert(key, entry);
+        self.mark_pending(key);
+        if let Some(previous) = previous {
+            self.retire(previous)?;
+        }
         Ok(())
     }
 
-    /// Append a delete of `key`. Returns `false`, writing nothing, if the key
-    /// is absent. Durable only after the next successful `flush`.
+    /// Stage deletion of a present key. No payload space is needed to delete.
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
-        self.check_writable()?;
+        self.check_healthy()?;
         check_key(key)?;
         if !self.index.contains_key(key) {
             return Ok(false);
         }
-        let header = RecordHeader {
-            seq: self.next_seq,
-            kind: Kind::Delete,
-            key: key.to_vec(),
-            value_len: 0,
-            value_sha256: sha256(&[]),
-            modified_unix_nanos: now_unix_nanos(),
-        };
-        let span = self.reserve(&header)?;
-        let at = self.tail;
-        let written = self
-            .file
-            .write_all_at(&header.encode(&self.label.nonce)[..], at);
-        self.poison_on_err(written)?;
-
-        self.tail += span;
-        self.next_seq += 1;
-        apply(&mut self.index, at, header);
+        self.seq = self.next_seq()?;
+        let (key, entry) = self.remove(key).expect("key was present");
+        self.mark_pending(key);
+        self.retire(entry)?;
         Ok(true)
     }
 
-    /// Make every append so far durable, and repair a degraded label.
-    ///
-    /// Repairs and syncs any stale label slot before replacing the good copy.
-    /// Syncs the log, then writes the next checkpoint to slot 0, syncs, writes
-    /// it to slot 1, and syncs again. Returns only after both slots are
-    /// durable, so damage to either one later cannot roll the store back past
-    /// this flush. Any I/O failure poisons the store; reopen it to recover the
-    /// last durable state.
+    /// Sync the staged payload and index, then publish the checkpoint to both
+    /// labels with a barrier after each. Only then can old blocks be reused.
     pub fn flush(&mut self) -> Result<()> {
         self.flush_with_checkpoint(write_checkpoint)
     }
@@ -335,95 +340,234 @@ impl RawStore {
         &mut self,
         checkpoint: impl FnOnce(&Region, &Label) -> io::Result<()>,
     ) -> Result<()> {
-        self.check_writable()?;
-        if self.tail == self.label.durable_tail && self.stale_slot.is_none() {
-            return Ok(());
+        self.check_healthy()?;
+        self.repair_label()?;
+        if self.seq == self.label.last_seq {
+            return self.reclaim();
         }
-        let next = self.next_checkpoint()?;
-        // Restore redundancy at the selected generation first. Otherwise a
-        // second interrupted flush can leave generations two apart, or tear
-        // the only usable copy while its peer is still damaged.
+        let mut next = self.next_checkpoint()?;
+        let index_tail = self.write_index(&next);
+        next.durable_tail = self.poison_on_io(index_tail)?;
+        let synced = self
+            .file
+            .sync_data()
+            .and_then(|()| checkpoint(&self.file, &next));
+        self.poison_on_io(synced)?;
+        self.label = next;
+        self.pending = Some(HashSet::new());
+        for entry in std::mem::take(&mut self.retired) {
+            self.release_or_pin(entry)?;
+        }
+        self.reclaim()
+    }
+
+    fn repair_label(&mut self) -> Result<()> {
+        // After an interrupted checkpoint the stale slot may still name
+        // extents called free by the selected generation. Repair before
+        // writing either payload or index to any such extent.
         if let Some(slot) = self.stale_slot {
             let repaired = self
                 .file
                 .write_all_at(&self.label.encode(slot)[..], slot * BLOCK_SIZE)
                 .and_then(|()| self.file.sync_data());
-            self.poison_on_err(repaired)?;
+            self.poison_on_io(repaired)?;
             self.stale_slot = None;
         }
-        let synced = self
-            .file
-            .sync_data()
-            .and_then(|()| checkpoint(&self.file, &next));
-        self.poison_on_err(synced)?;
-        self.label = next;
+        Ok(())
+    }
+
+    fn next_checkpoint(&self) -> Result<Label> {
+        let generation = self
+            .label
+            .generation
+            .checked_add(1)
+            .filter(|g| *g < u64::MAX)
+            .ok_or_else(|| corrupt(0, "label generation exhausted"))?;
+        let mut next = Label {
+            generation,
+            last_seq: self.seq,
+            ..self.label
+        };
+        let remaining =
+            self.label.bank_start() + bank_bytes(self.label.device_size) - self.label.durable_tail;
+        if self
+            .pending
+            .as_ref()
+            .is_none_or(|keys| keys.len() as u64 * BLOCK_SIZE > remaining)
+        {
+            next.bank ^= 1;
+            next.bank_generation = generation;
+            next.durable_tail = next.bank_start();
+        }
+        Ok(next)
+    }
+
+    fn write_index(&self, next: &Label) -> io::Result<u64> {
+        let mut writer = IndexWriter::new(&self.file, next);
+        if next.bank == self.label.bank {
+            let keys = self.pending.as_ref().expect("delta needs pending keys");
+            // Deletions go first so replay also fits the live index budget.
+            for key in keys.iter().filter(|key| !self.index.contains_key(*key)) {
+                writer.push(key, None)?;
+            }
+            for key in keys {
+                if let Some(entry) = self.index.get(key) {
+                    writer.push(key, Some(entry))?;
+                }
+            }
+        } else {
+            for (key, entry) in &self.index {
+                writer.push(key, Some(entry))?;
+            }
+        }
+        writer.finish()
+    }
+
+    fn next_seq(&self) -> Result<u64> {
+        self.seq
+            .checked_add(1)
+            .ok_or_else(|| corrupt(0, "object sequence exhausted"))
+    }
+
+    fn reserve_index(&mut self, key: &[u8]) -> Result<()> {
+        if self.index.contains_key(key) {
+            return Ok(());
+        }
+        let size = self.label.device_size;
+        let limit = (bank_bytes(size) / 2).min((size / 25_600).max(8 << 20)) as usize;
+        if self.index_charge + ENTRY_CHARGE + key.len() > limit {
+            return Err(Error::IndexFull { limit });
+        }
+        self.index.try_reserve(1).map_err(io::Error::other)?;
+        Ok(())
+    }
+
+    fn insert(&mut self, key: &[u8], entry: Entry) -> (Arc<[u8]>, Option<Arc<Entry>>) {
+        if let Some((stored_key, _)) = self.index.get_key_value(key) {
+            let key = Arc::clone(stored_key);
+            let previous = self.index.insert(Arc::clone(&key), Arc::new(entry));
+            return (key, previous);
+        }
+        self.index_charge += ENTRY_CHARGE + key.len();
+        let key: Arc<[u8]> = Arc::from(key);
+        self.index.insert(Arc::clone(&key), Arc::new(entry));
+        (key, None)
+    }
+
+    fn remove(&mut self, key: &[u8]) -> Option<(Arc<[u8]>, Arc<Entry>)> {
+        let (key, entry) = self.index.remove_entry(key)?;
+        self.index_charge -= ENTRY_CHARGE + key.len();
+        Some((key, entry))
+    }
+
+    fn mark_pending(&mut self, key: Arc<[u8]>) {
+        if let Some(keys) = &mut self.pending {
+            keys.insert(key);
+            if keys.len() > MAX_PENDING_KEYS {
+                self.pending = None;
+            }
+        }
+    }
+
+    fn retire(&mut self, entry: Arc<Entry>) -> Result<()> {
+        let entry = Retired::from(entry);
+        if entry.seq <= self.label.last_seq {
+            self.retired.push(entry);
+            Ok(())
+        } else {
+            self.release_or_pin(entry)
+        }
+    }
+
+    fn release_or_pin(&mut self, entry: Retired) -> Result<()> {
+        if entry.reader.strong_count() == 0 {
+            self.release(&entry)
+        } else {
+            self.pinned.push(entry);
+            Ok(())
+        }
+    }
+
+    fn release(&mut self, entry: &Retired) -> Result<()> {
+        let blocks = entry
+            .allocation
+            .blocks(
+                &self.file,
+                data_start(self.label.device_size),
+                &self.label.nonce,
+                entry.seq,
+                entry.len,
+            )
+            .inspect_err(|_| self.poisoned = true)?;
+        self.allocator.release(blocks.all_runs());
+        Ok(())
+    }
+
+    /// Make flushed allocations available once their last reader has left.
+    pub fn reclaim(&mut self) -> Result<()> {
+        self.check_healthy()?;
+        let mut index = 0;
+        while index < self.pinned.len() {
+            if self.pinned[index].reader.strong_count() == 0 {
+                let entry = self.pinned.swap_remove(index);
+                self.release(&entry)?;
+            } else {
+                index += 1;
+            }
+        }
         Ok(())
     }
 
     /// Read and verify the value stored under `key`.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        if self.poisoned {
-            return Err(Error::Poisoned);
-        }
-        let Some(entry) = self.index.get(key) else {
-            return Ok(None);
-        };
-        self.read_verified(entry).map(Some)
+        self.check_healthy()?;
+        self.index
+            .get(key)
+            .map(|entry| {
+                self.reader()
+                    .read(entry, std::slice::from_ref(&(0..entry.info.len)))
+                    .map(|mut data| data.pop().expect("one range"))
+            })
+            .transpose()
     }
 
-    /// Metadata of the live object under `key`, without reading its payload.
     pub fn stat(&self, key: &[u8]) -> Option<ObjectInfo> {
         self.index.get(key).map(|entry| entry.info)
     }
 
-    /// Every live object and its metadata, in no particular order.
     pub fn objects(&self) -> impl Iterator<Item = (&[u8], ObjectInfo)> {
         self.index
             .iter()
-            .map(|(key, entry)| (key.as_slice(), entry.info))
+            .map(|(key, entry)| (key.as_ref(), entry.info))
     }
 
-    /// Locate the live object under `key` for reading through a [`RawReader`].
     pub fn handle(&self, key: &[u8]) -> Result<Option<ObjectHandle>> {
-        if self.poisoned {
-            return Err(Error::Poisoned);
-        }
+        self.check_healthy()?;
         Ok(self.index.get(key).map(|entry| ObjectHandle {
-            value_offset: entry.value_offset,
+            entry: Arc::clone(entry),
             info: entry.info,
         }))
     }
 
-    /// A reader sharing this store's device. See [`RawReader`].
     pub fn reader(&self) -> RawReader {
         RawReader {
             file: Arc::clone(&self.file),
+            data_start: data_start(self.label.device_size),
+            nonce: self.label.nonce,
         }
     }
 
-    /// Exact log bytes a put of a `value_len`-byte value appends: one header
-    /// block plus the value rounded up to whole blocks. `None` when that does
-    /// not fit in a `u64`; such a value is refused long before by
-    /// [`crate::MAX_OBJECT_LEN`], but the arithmetic never wraps.
+    /// Exact allocation for a PUT, including its block map allowance.
     pub const fn put_cost(value_len: u64) -> Option<u64> {
-        match value_len.div_ceil(BLOCK_SIZE).checked_mul(BLOCK_SIZE) {
-            Some(payload) => payload.checked_add(BLOCK_SIZE),
-            None => None,
-        }
+        allocation::cost(value_len)
     }
 
-    /// Exact log bytes a delete appends. Deletes never reclaim space.
-    pub const fn delete_cost() -> u64 {
-        BLOCK_SIZE
-    }
-
-    /// Read and verify every live object. Returns how many were checked.
+    /// Reads and verifies every live object.
     pub fn scrub(&self) -> Result<usize> {
-        if self.poisoned {
-            return Err(Error::Poisoned);
-        }
+        self.check_healthy()?;
+        let reader = self.reader();
         for entry in self.index.values() {
-            self.read_verified(entry)?;
+            reader.read(entry, &[])?;
         }
         Ok(self.index.len())
     }
@@ -432,9 +576,8 @@ impl RawStore {
         self.index.contains_key(key)
     }
 
-    /// Live keys, in no particular order.
     pub fn keys(&self) -> impl Iterator<Item = &[u8]> {
-        self.index.keys().map(Vec::as_slice)
+        self.index.keys().map(Arc::as_ref)
     }
 
     pub fn len(&self) -> usize {
@@ -453,9 +596,6 @@ impl RawStore {
         self.poisoned
     }
 
-    /// One label slot was blank, damaged, or one generation behind at open.
-    /// Data is intact, but a second fault could lose the label. The next
-    /// `flush` rewrites both slots and clears this.
     pub fn label_degraded(&self) -> bool {
         self.stale_slot.is_some()
     }
@@ -463,32 +603,14 @@ impl RawStore {
     pub fn geometry(&self) -> Geometry {
         Geometry {
             device_size: self.label.device_size,
-            log_start: LOG_START,
-            tail: self.tail,
+            data_start: data_start(self.label.device_size),
             durable_tail: self.label.durable_tail,
-            free: self.label.device_size - self.tail,
+            free: self.allocator.free(),
             generation: self.label.generation,
         }
     }
 
-    fn next_checkpoint(&self) -> Result<Label> {
-        // u64::MAX is never a valid generation, so the next one must stay
-        // below it.
-        let generation = self
-            .label
-            .generation
-            .checked_add(1)
-            .filter(|g| *g < u64::MAX)
-            .ok_or_else(|| corrupt(0, "label generation exhausted"))?;
-        Ok(Label {
-            generation,
-            durable_tail: self.tail,
-            record_count: self.next_seq - 1,
-            ..self.label
-        })
-    }
-
-    fn check_writable(&self) -> Result<()> {
+    fn check_healthy(&self) -> Result<()> {
         if self.poisoned {
             Err(Error::Poisoned)
         } else {
@@ -496,44 +618,7 @@ impl RawStore {
         }
     }
 
-    fn reserve(&self, header: &RecordHeader) -> Result<u64> {
-        let needed = header.span();
-        let available = self.label.device_size - self.tail;
-        if needed > available {
-            return Err(Error::NoSpace { needed, available });
-        }
-        Ok(needed)
-    }
-
-    fn write_record(&self, at: u64, header: &Block, value: &[u8], span: u64) -> io::Result<()> {
-        if span <= COALESCE_LIMIT {
-            let mut buf = vec![0u8; span as usize];
-            buf[..BLOCK].copy_from_slice(&header[..]);
-            buf[BLOCK..BLOCK + value.len()].copy_from_slice(value);
-            return self.file.write_all_at(&buf, at);
-        }
-        self.file.write_all_at(&header[..], at)?;
-        let value_at = at + BLOCK_SIZE;
-        self.file.write_all_at(value, value_at)?;
-        let padding = blocks_for(value.len() as u64) - value.len() as u64;
-        if padding > 0 {
-            let zeros = vec![0u8; padding as usize];
-            self.file
-                .write_all_at(&zeros, value_at + value.len() as u64)?;
-        }
-        Ok(())
-    }
-
-    fn read_verified(&self, entry: &Entry) -> Result<Vec<u8>> {
-        let mut value = vec![0u8; entry.info.len as usize];
-        self.file.read_exact_at(&mut value, entry.value_offset)?;
-        if sha256(&value) != entry.info.sha256 {
-            return Err(corrupt(entry.value_offset, "payload checksum mismatch"));
-        }
-        Ok(value)
-    }
-
-    fn poison_on_err<T>(&mut self, result: io::Result<T>) -> Result<T> {
+    fn poison_on_io<T>(&mut self, result: io::Result<T>) -> Result<T> {
         result.map_err(|err| {
             self.poisoned = true;
             Error::Io(err)
@@ -541,49 +626,12 @@ impl RawStore {
     }
 }
 
-/// Write `label` to slot 0, sync, then slot 1, sync. The fixed order is what
-/// lets open recognise an interrupted checkpoint: slot 1 is never ahead.
 fn write_checkpoint(file: &Region, label: &Label) -> io::Result<()> {
     for slot in 0..LABEL_SLOTS {
         file.write_all_at(&label.encode(slot)[..], slot * BLOCK_SIZE)?;
         file.sync_data()?;
     }
     Ok(())
-}
-
-fn reserve_index(index: &mut HashMap<Vec<u8>, Entry>, key: &[u8]) -> Result<()> {
-    if index.contains_key(key) {
-        return Ok(());
-    }
-    if index.len() >= MAX_INDEX_KEYS {
-        return Err(Error::IndexFull {
-            limit: MAX_INDEX_KEYS,
-        });
-    }
-    index.try_reserve(1).map_err(io::Error::other)?;
-    Ok(())
-}
-
-fn apply(index: &mut HashMap<Vec<u8>, Entry>, at: u64, header: RecordHeader) {
-    match header.kind {
-        Kind::Put => {
-            index.insert(
-                header.key,
-                Entry {
-                    value_offset: at + BLOCK_SIZE,
-                    info: ObjectInfo {
-                        len: header.value_len,
-                        sha256: header.value_sha256,
-                        seq: header.seq,
-                        modified_unix_nanos: header.modified_unix_nanos,
-                    },
-                },
-            );
-        }
-        Kind::Delete => {
-            index.remove(&header.key);
-        }
-    }
 }
 
 fn check_key(key: &[u8]) -> Result<()> {

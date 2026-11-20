@@ -829,8 +829,8 @@ impl Catalog {
                 .map(|member| (member.id.as_str(), member))
                 .collect();
             if !costed_members.is_empty() {
-                // Raw uploads own record/padding bytes and future deletion
-                // space in addition to their logical quota. UPLOADS is keyed
+                // Raw uploads own allocation overhead in addition to
+                // their logical quota. UPLOADS is keyed
                 // by upload id, so derive this from the outstanding rows only
                 // for custom space sources; directory/SFTP admission never
                 // scans uploads. Keep the durable logical counters unchanged.
@@ -1684,7 +1684,6 @@ mod raw_reservation_tests {
 
         fn put_cost(&self, payload: u64) -> u64 {
             zerofs_raw_device::RawStore::put_cost(payload).unwrap()
-                + zerofs_raw_device::RawStore::delete_cost()
         }
     }
 
@@ -1720,7 +1719,7 @@ mod raw_reservation_tests {
 
     #[test]
     fn pending_raw_uploads_reserve_physical_cost_across_reopen() {
-        for (size, available, cost) in [(1, 16 << 10, 12 << 10), (0, 8 << 10, 8 << 10)] {
+        for (size, available, cost) in [(1, 12 << 10, 8 << 10), (0, 4 << 10, 4 << 10)] {
             let root = tempfile::tempdir().unwrap();
             let path = root.path().join("catalog");
             let catalog = Catalog::open(&path, "db", true, None).unwrap();
@@ -1734,7 +1733,7 @@ mod raw_reservation_tests {
             let second = reserve(&catalog, &members, "second", size, "raw");
             assert!(
                 second.unwrap_err().downcast_ref::<NoCapacity>().is_some(),
-                "each upload must own its record, padding, and future deletion space"
+                "each upload must own its exact rounded allocation"
             );
             drop(catalog);
 
@@ -1756,7 +1755,7 @@ mod raw_reservation_tests {
     fn evacuation_capacity_excludes_pending_raw_upload_overhead() {
         let root = tempfile::tempdir().unwrap();
         let catalog = Catalog::open(&root.path().join("catalog"), "db", true, None).unwrap();
-        let members = vec![member("source", None), member("raw", Some(16 << 10))];
+        let members = vec![member("source", None), member("raw", Some(12 << 10))];
         catalog.configure_members_except(&members, None).unwrap();
         catalog.finish_initialization().unwrap();
         let source = reserve(&catalog, &members, "source-data", 1, "source").unwrap();

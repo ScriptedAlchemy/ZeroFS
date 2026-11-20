@@ -175,40 +175,47 @@ impl RawBinding {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct RawSpace {
+    device: u64,
+    store: crate::raw_member::RawMemberStore,
+}
+
+#[cfg(target_os = "linux")]
+impl RawSpace {
+    pub(crate) fn new(device: u64, store: crate::raw_member::RawMemberStore) -> Self {
+        Self { device, store }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl crate::pool_object_store::FreeSpace for RawSpace {
+    fn observe(&self) -> std::io::Result<crate::pool_object_store::FilesystemSpace> {
+        let state = self.store.capacity().map_err(std::io::Error::other)?;
+        Ok(crate::pool_object_store::FilesystemSpace {
+            filesystem: self.device,
+            committed: 0,
+            available: state.free_bytes,
+            total: state.device_bytes,
+        })
+    }
+
+    fn put_cost(&self, bytes: u64) -> u64 {
+        crate::raw_member::RawMemberStore::put_cost(bytes).unwrap_or(u64::MAX)
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub(super) async fn open_member(
     config: &crate::config::StoragePoolMemberConfig,
     binding: RawBinding,
     exact_size: bool,
 ) -> Result<crate::pool_object_store::PoolMember> {
-    use crate::pool_object_store::{FilesystemSpace, FreeSpace, PoolMember};
+    use crate::pool_object_store::PoolMember;
     use crate::raw_member::RawMemberStore;
     use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
     use zerofs_raw_device::{Identity, RawStore, Role};
-
-    #[derive(Debug)]
-    struct RawSpace {
-        device: u64,
-        store: RawMemberStore,
-    }
-
-    impl FreeSpace for RawSpace {
-        fn observe(&self) -> std::io::Result<FilesystemSpace> {
-            let state = self.store.capacity().map_err(std::io::Error::other)?;
-            Ok(FilesystemSpace {
-                filesystem: self.device,
-                committed: state.delete_debt_bytes,
-                available: state.free_bytes,
-                total: state.device_bytes,
-            })
-        }
-
-        fn put_cost(&self, bytes: u64) -> u64 {
-            RawMemberStore::put_cost(bytes)
-                .and_then(|cost| cost.checked_add(RawMemberStore::delete_cost()))
-                .unwrap_or(u64::MAX)
-        }
-    }
 
     let id = config.id.clone();
     let capacity = config.capacity_bytes()?;
@@ -232,8 +239,6 @@ pub(super) async fn open_member(
             },
         )
         .with_context(|| format!("verify raw member {id}"))?;
-        // The raw log is append-only. A logical overwrite or a catalog delete
-        // cannot make already-appended physical bytes available for reuse.
         let physical_floor = reserve.max(claim.size.saturating_sub(capacity));
         let mut store = RawMemberStore::new(store, claim, physical_floor)?;
         if binding.kind == RawKind::LargeLoop
@@ -252,7 +257,7 @@ pub(super) async fn open_member(
             local_path: None,
             min_free_bytes,
             health_device: None,
-            free_space: Some(Arc::new(RawSpace { device, store })),
+            free_space: Some(Arc::new(RawSpace::new(device, store))),
         })
     })
     .await?

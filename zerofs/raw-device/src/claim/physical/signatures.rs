@@ -185,7 +185,9 @@ mod tests {
             },
             nonce: [3; 16],
             durable_tail: LOG_START,
-            record_count: 0,
+            last_seq: 0,
+            bank: 0,
+            bank_generation: 1,
         };
         let mut first = label.encode(0);
         image.write_all_at(&first[..], 0).unwrap();

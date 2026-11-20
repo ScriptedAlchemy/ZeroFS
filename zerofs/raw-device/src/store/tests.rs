@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::*;
+use crate::format::BLOCK;
 use crate::{MAX_DEVICE_SIZE, MIN_DEVICE_SIZE, Role, format_uuid};
 
 const SIZE: u64 = 4 << 20;
@@ -191,7 +192,7 @@ fn put_flush_reopen_get_round_trips_every_size_class() {
 }
 
 #[test]
-fn unflushed_appends_are_visible_then_lost_on_reopen() {
+fn unflushed_mutations_are_visible_then_lost_on_reopen() {
     let scratch = Scratch::new(SIZE);
     let mut store = provision(&scratch);
     store.put(b"durable", b"one").unwrap();
@@ -207,7 +208,6 @@ fn unflushed_appends_are_visible_then_lost_on_reopen() {
     let mut store = reopen(&scratch);
     assert_eq!(store.get(b"durable").unwrap().unwrap(), b"one");
     assert_eq!(store.get(b"volatile").unwrap(), None);
-    assert_eq!(store.geometry().tail, store.geometry().durable_tail);
 
     // The discarded tail is reused, and the reused region replays cleanly.
     store.put(b"after", b"crash").unwrap();
@@ -564,7 +564,8 @@ fn interrupted_flush() -> (Scratch, Label, Label) {
     store.flush().unwrap();
     store.put(b"pending", b"unacked").unwrap();
     let durable = store.label;
-    let next = store.next_checkpoint().unwrap();
+    let mut next = store.next_checkpoint().unwrap();
+    next.durable_tail = store.write_index(&next).unwrap();
     store.file.sync_data().unwrap();
     drop(store);
     (scratch, durable, next)
@@ -699,7 +700,7 @@ fn slot_states_no_checkpoint_sequence_produces_are_corrupt() {
     // Same generation, different checkpoints.
     let (scratch, durable, _) = interrupted_flush();
     let forked = Label {
-        record_count: 0,
+        last_seq: 0,
         durable_tail: LOG_START,
         ..durable
     };
@@ -749,7 +750,7 @@ fn arbitrary_damage_past_the_tail_and_to_one_slot_never_changes_state() {
     for i in 20..40u64 {
         store.put(&(i % 25).to_le_bytes(), &value(i, 7000)).unwrap();
     }
-    let appended_tail = store.geometry().tail;
+    let bank_end = store.label.bank_start() + bank_bytes(SIZE);
     drop(store);
 
     let mut rng = 0x1234_5678_9abc_def1u64;
@@ -764,7 +765,7 @@ fn arbitrary_damage_past_the_tail_and_to_one_slot_never_changes_state() {
         scratch.read_at(BLOCK_SIZE, BLOCK),
     ];
     for _ in 0..64 {
-        let blocks = (appended_tail + 8 * BLOCK_SIZE - geometry.durable_tail) / BLOCK_SIZE;
+        let blocks = (bank_end - geometry.durable_tail) / BLOCK_SIZE;
         for _ in 0..(next() % 6) {
             let block = geometry.durable_tail + (next() % blocks) * BLOCK_SIZE;
             let at = block + next() % BLOCK_SIZE;
@@ -795,7 +796,7 @@ fn damaged_header_inside_durable_range_is_reported() {
     store.put(b"b", b"2").unwrap();
     store.flush().unwrap();
     drop(store);
-    let second_header = LOG_START + 3 * BLOCK_SIZE;
+    let second_header = LOG_START;
     scratch.write_at(second_header + 40, &[0xEE]);
     match open_err(&scratch) {
         Error::Corrupt { offset, .. } => assert_eq!(offset, second_header),
@@ -810,11 +811,12 @@ fn damaged_payload_fails_get_and_scrub_only_for_that_object() {
     store.put(b"bad", &value(1, 5000)).unwrap();
     store.put(b"good", &value(2, 5000)).unwrap();
     store.flush().unwrap();
+    let bad = store.geometry().data_start;
     drop(store);
-    scratch.write_at(LOG_START + BLOCK_SIZE + 4321, &[0x00, 0x01]);
+    scratch.write_at(bad + BLOCK_SIZE + 4321, &[0x00, 0x01]);
     let store = reopen(&scratch);
     match store.get(b"bad") {
-        Err(Error::Corrupt { offset, .. }) => assert_eq!(offset, LOG_START + BLOCK_SIZE),
+        Err(Error::Corrupt { offset, .. }) => assert_eq!(offset, bad),
         other => panic!("expected Corrupt, got {other:?}"),
     }
     assert_eq!(store.get(b"good").unwrap().unwrap(), value(2, 5000));
@@ -826,19 +828,12 @@ fn records_from_another_provisioning_are_rejected() {
     let scratch = Scratch::new(SIZE);
     drop(provision(&scratch));
     let label = durable_label(&scratch);
-    let foreign = RecordHeader {
-        seq: 1,
-        kind: Kind::Put,
-        key: b"k".to_vec(),
-        value_len: 0,
-        value_sha256: sha256(&[]),
-        modified_unix_nanos: 0,
-    };
-    scratch.write_at(LOG_START, &foreign.encode(&[0x42; 16])[..]);
+    let other = two_acknowledged_flushes();
+    scratch.write_at(LOG_START, &other.read_at(LOG_START, BLOCK));
     let forged = Label {
         generation: label.generation + 1,
         durable_tail: LOG_START + BLOCK_SIZE,
-        record_count: 1,
+        last_seq: 1,
         ..label
     };
     scratch.write_label(0, &forged);
@@ -878,10 +873,7 @@ fn sealed_label_with_impossible_fields_is_corrupt() {
     drop(provision(&scratch));
     let label = durable_label(&scratch);
     for bad in [
-        Label {
-            record_count: u64::MAX,
-            ..label
-        },
+        Label { bank: 2, ..label },
         Label {
             durable_tail: u64::MAX - BLOCK_SIZE + 1,
             ..label
@@ -902,11 +894,11 @@ fn sealed_label_with_impossible_fields_is_corrupt() {
 }
 
 #[test]
-fn record_count_disagreeing_with_the_log_is_corrupt() {
+fn index_entry_with_uncommitted_sequence_is_corrupt() {
     let scratch = two_acknowledged_flushes();
     let label = durable_label(&scratch);
     let bad = Label {
-        record_count: label.record_count - 1,
+        last_seq: label.last_seq - 1,
         ..label
     };
     scratch.write_label(0, &bad);
@@ -918,15 +910,23 @@ fn record_count_disagreeing_with_the_log_is_corrupt() {
 fn oversized_record_length_in_a_header_is_corrupt() {
     let scratch = two_acknowledged_flushes();
     let label = durable_label(&scratch);
-    let huge = RecordHeader {
-        seq: 1,
-        kind: Kind::Put,
-        key: b"old".to_vec(),
-        value_len: u64::MAX,
-        value_sha256: sha256(&[]),
-        modified_unix_nanos: 0,
+    let region = Region::new(scratch.file(), SIZE, 0, SIZE).unwrap();
+    let label = Label {
+        durable_tail: LOG_START,
+        ..label
     };
-    scratch.write_at(LOG_START, &huge.encode(&label.nonce)[..]);
+    let mut writer = IndexWriter::new(&region, &label);
+    let huge = Entry {
+        allocation: Allocation(data_start(SIZE)),
+        info: ObjectInfo {
+            seq: 1,
+            len: u64::MAX,
+            sha256: sha256(&[]),
+            modified_unix_nanos: 0,
+        },
+    };
+    writer.push(b"old", Some(&huge)).unwrap();
+    writer.finish().unwrap();
     assert!(matches!(
         open_err(&scratch),
         Error::Corrupt {
@@ -959,7 +959,10 @@ fn fills_to_no_space_without_damage() {
         }
         other => panic!("expected NoSpace, got {other:?}"),
     }
-    assert_eq!(stored, (MIN_DEVICE_SIZE - LOG_START) / (16 * BLOCK_SIZE));
+    assert_eq!(
+        stored,
+        (MIN_DEVICE_SIZE - store.geometry().data_start) / (16 * BLOCK_SIZE)
+    );
     assert!(!store.is_poisoned());
     store.put(b"tiny", b"").unwrap();
     store.flush().unwrap();
@@ -1090,7 +1093,10 @@ fn range_reads_verify_the_whole_payload_even_outside_the_range() {
     store.flush().unwrap();
     let handle = store.handle(b"k").unwrap().unwrap();
     // Damage the last payload block; ask only for the first bytes.
-    scratch.write_at(LOG_START + BLOCK_SIZE + 2 * 4096 + 7, &[0xFF]);
+    scratch.write_at(
+        store.geometry().data_start + BLOCK_SIZE + 2 * 4096 + 7,
+        &[0xFF],
+    );
     assert!(matches!(
         store.reader().read_ranges(&handle, &[0..16]),
         Err(Error::Corrupt { .. })
@@ -1098,27 +1104,22 @@ fn range_reads_verify_the_whole_payload_even_outside_the_range() {
 }
 
 #[test]
-fn costs_match_the_tail_advance_exactly() {
+fn allocation_cost_is_exact_and_recovered_by_delete() {
     let scratch = Scratch::new(SIZE);
     let mut store = provision(&scratch);
-    for len in [0usize, 1, 4095, 4096, 4097, 300_000] {
-        let before = store.geometry().tail;
+    let empty = store.geometry().free;
+    for len in [0usize, 1, 4095, 4096, 4097, 300_000, 2_200_000] {
         store.put(b"k", &value(len as u64, len)).unwrap();
+        store.flush().unwrap();
         assert_eq!(
-            Some(store.geometry().tail - before),
-            RawStore::put_cost(len as u64),
-            "len {len}"
+            Some(empty - store.geometry().free),
+            RawStore::put_cost(len as u64)
         );
+        assert!(store.delete(b"k").unwrap());
+        store.flush().unwrap();
+        assert_eq!(store.geometry().free, empty);
     }
     assert_eq!(RawStore::put_cost(u64::MAX), None);
-    assert_eq!(RawStore::put_cost(u64::MAX - BLOCK_SIZE), None);
-    assert_eq!(
-        RawStore::put_cost(u64::MAX - 2 * BLOCK_SIZE + 1),
-        Some(u64::MAX - BLOCK_SIZE + 1)
-    );
-    let before = store.geometry().tail;
-    assert!(store.delete(b"k").unwrap());
-    assert_eq!(store.geometry().tail - before, RawStore::delete_cost());
 }
 
 #[test]
@@ -1135,34 +1136,29 @@ fn handles_are_refused_once_poisoned() {
 }
 
 #[test]
-fn live_index_refusal_leaves_tail_and_checkpoint_unchanged() {
+fn live_index_refusal_leaves_free_space_and_checkpoint_unchanged() {
     let scratch = Scratch::new(SIZE);
     let mut store = provision(&scratch);
-    let existing = 0u64.to_le_bytes();
-    store.put(&existing, b"first").unwrap();
+    let mut key = [0; MAX_KEY_LEN];
+    for count in 0..u64::MAX {
+        key[..8].copy_from_slice(&count.to_le_bytes());
+        let before = store.geometry();
+        match store.put(&key, b"item") {
+            Ok(()) => {}
+            Err(Error::IndexFull { .. }) => {
+                assert_eq!(store.geometry(), before);
+                break;
+            }
+            Err(error) => panic!("{error}"),
+        }
+    }
     store.flush().unwrap();
-    let entry = store.index[existing.as_slice()];
-    for i in 1..MAX_INDEX_KEYS as u64 {
-        store.index.insert(i.to_le_bytes().to_vec(), entry);
-    }
-    let before = store.geometry();
-    for _ in 0..2 {
-        assert!(matches!(
-            store.put(b"new key", b"never appended"),
-            Err(Error::IndexFull {
-                limit: MAX_INDEX_KEYS
-            })
-        ));
-        assert_eq!(store.geometry(), before);
-        assert!(!store.is_poisoned());
-    }
-    store.put(&existing, b"replacement").unwrap();
-    assert!(store.delete(&existing).unwrap());
-    store.put(b"new key", b"now fits").unwrap();
+    assert!(store.delete(&[0; MAX_KEY_LEN]).unwrap());
+    store.put(&key, b"now fits").unwrap();
     store.flush().unwrap();
     let reopened = reopen(&scratch);
-    assert_eq!(reopened.get(b"new key").unwrap().unwrap(), b"now fits");
-    assert!(reopened.get(&existing).unwrap().is_none());
+    assert_eq!(reopened.get(&key).unwrap().unwrap(), b"now fits");
+    assert!(reopened.get(&[0; MAX_KEY_LEN]).unwrap().is_none());
 }
 
 #[test]
@@ -1180,3 +1176,5 @@ fn subregion_io_preserves_offsets_above_four_gibibytes() {
     assert_eq!(reopened.get(b"key").unwrap().unwrap(), b"high-offset value");
     assert_eq!(scratch.read_at(0, BLOCK), vec![0; BLOCK]);
 }
+
+mod reclaim;

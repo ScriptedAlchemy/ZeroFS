@@ -40,9 +40,9 @@ def blank_labels(config, role, size):
                 struct.pack_into("<8s16s16sQQQQQ", block, 0, b"ZWBREG02" if kind == 3 else b"ZCTREG02",
                                  pool, member, size, start, length, 1, 0)
             else:
-                struct.pack_into("<8sIIQQ16s16sBB", block, 0, b"ZFSRAWL1", 1, 4096,
+                struct.pack_into("<8sIIQQ16s16sBB", block, 0, b"ZFSRAWL2", 2, 4096,
                                  1, length, pool, member, kind, slot)
-                struct.pack_into("<16sQQ", block, 72, nonce, 8192, 0)
+                struct.pack_into("<16sQQB7xQ", block, 72, nonce, 8192, 0, 0, 1)
             block[-32:] = hashlib.sha256(block[:-32]).digest()
             yield start + slot * 4096, block
         start += length

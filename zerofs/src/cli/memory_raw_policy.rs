@@ -25,10 +25,10 @@ pub(super) const COMPANION_BYTES: u64 = GIB;
 pub(super) const RAW_RESIDENCY_BYTES: u64 = 2 * (3 * 256 * MIB) + 512 * MIB;
 
 pub(super) const NAS_FIT_COMPANION_BYTES: u64 = 3 * GIB / 2;
-// Six live indexes at <= 65,536 keys of <= 1024 bytes each, including
-// hash-table growth and allocation overhead, plus 64 MiB journal and
-// 32 MiB catalog redb caches and room for replay and listing staging.
-pub(super) const NAS_FIT_RESIDENCY_BYTES: u64 = GIB;
+// At the fixed NAS geometry, the reclaiming raw stores use up to 699 MiB
+// of HDD allocation bitmap and 895 MiB of charged HDD live indexes.
+// The remainder covers pending retirements, P3 roles and journal/catalog caches.
+pub(super) const NAS_FIT_RESIDENCY_BYTES: u64 = 2_112 * MIB;
 
 const LEGACY_LAYOUT: [u64; 6] = [96, 32, 88, 8, 16, 16];
 const P3_BYTES: u64 = 1_000_204_886_016;

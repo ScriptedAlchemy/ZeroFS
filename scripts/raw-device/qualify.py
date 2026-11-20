@@ -442,17 +442,19 @@ def journal_boundary():
 
             cache = (*journal[:2], "cache")
             invoke("p3-put-flush", p3, disks[0], cache, plan, "unrelated", data=b"keep")
-            stage(bytes((1 << 20) - 3 * 4096), expect="no space")
-            value = secrets.token_bytes((1 << 20) - 4 * 4096)
+            # Two labels, two 32 KiB index banks, and one map allowance.
+            maximum_payload = (1 << 20) - 2 * (32 << 10) - 3 * 4096
+            stage(bytes(maximum_payload + 1), expect="no space")
+            value = secrets.token_bytes(maximum_payload)
             h = stage(value).decode().strip()
             assert digest(value) == h
             invoke("p3-drain", p3, disks[0], journal, plan, hdd, disks[1], member[1], h)
             assert invoke("p3-pending", p3, disks[0], journal, plan) == b""
-            stage(b"new", expect="no space")
+            assert stage(b"new").decode().strip() == digest(b"new")
             assert invoke("p3-get", p3, disks[0], cache, plan, "unrelated") == b"keep"
             assert invoke("get", hdd, disks[1], member, "segment/" + h) == value
             record(
-                "journal reserves retirement at exact physical boundary, cache isolated; exhausted append log refuses new stage"
+                "full journal drains and reuses freed payload space, cache remains isolated"
             )
 
 

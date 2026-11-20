@@ -1,7 +1,7 @@
 //! Bounded first raw-journal consumer for immutable segments. Each item names
 //! one destination member. The caller owns placement, claims and publication
 //! of the filesystem reference after the object's durability barrier.
-use crate::{BLOCK_SIZE, Error, Identity, RawStore, Result, Role};
+use crate::{Error, Identity, RawStore, Result, Role};
 use sha2::{Digest, Sha256};
 
 const PREFIX: &str = "pending/";
@@ -17,8 +17,8 @@ impl LandingJournal {
         if store.identity().role != Role::Journal {
             return Err(Error::InvalidArgument("expected dedicated journal role"));
         }
-        // This device is exclusively a landing journal in format v1. Refuse
-        // unknown or excessive live records before charging completion space.
+        // This device is exclusively a landing journal. Refuse
+        // unknown or excessive live records before use.
         if store.len() > MAX_PENDING || !store.keys().all(|key| parse_key(key).is_some()) {
             return Err(Error::InvalidArgument(
                 "invalid raw landing journal contents",
@@ -62,14 +62,6 @@ impl LandingJournal {
         if !self.store.contains_key(key.as_bytes()) {
             if self.store.len() >= MAX_PENDING {
                 return Err(Error::InvalidArgument("pending segment limit reached"));
-            }
-            // Every live record needs one further header block for its durable
-            // retirement. Finish previously admitted drains even at capacity.
-            let span = BLOCK_SIZE + (bytes.len() as u64).next_multiple_of(BLOCK_SIZE);
-            let needed = span + (self.store.len() as u64 + 1) * BLOCK_SIZE;
-            let available = self.store.geometry().free;
-            if needed > available {
-                return Err(Error::NoSpace { needed, available });
             }
             self.store.put(key.as_bytes(), bytes)?;
         } else if self.store.get(key.as_bytes())?.as_deref() != Some(bytes) {
