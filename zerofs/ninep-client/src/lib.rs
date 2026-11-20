@@ -813,6 +813,8 @@ pub struct NinePClient {
     /// ambiguous mutation can be resent byte-for-byte.
     msize: u32,
     case_insensitive: bool,
+    /// Keep create request bytes stable across ambiguous retries.
+    create_umask: bool,
     /// Suppresses repeated message-size mismatch warnings for this logical session.
     msize_mismatch_warned: Arc<AtomicBool>,
     fid_ctr: AtomicU32,
@@ -954,6 +956,7 @@ impl NinePClient {
         let client = Arc::new(Self {
             targets,
             case_insensitive: conn.case_insensitive.load(Ordering::Acquire),
+            create_umask: conn.create_umask.load(Ordering::Acquire),
             conn: ArcSwap::new(conn),
             live: AtomicBool::new(true),
             reconnect_timeout,
@@ -1243,7 +1246,7 @@ impl NinePClient {
 
     /// Replays and installs a negotiated replacement connection.
     async fn restore_connection(self: &Arc<Self>, conn: Arc<Conn>) -> ClientResult<()> {
-        self.check_name_mode(&conn)?;
+        self.check_dialect(&conn)?;
         // Settlement and snapshot/replay/install are mutually exclusive.
         let _transition = self.session_transition.lock().await;
         let result = tokio::select! {
@@ -1276,10 +1279,14 @@ impl NinePClient {
         }
     }
 
-    fn check_name_mode(&self, conn: &Conn) -> ClientResult<()> {
+    fn check_dialect(&self, conn: &Conn) -> ClientResult<()> {
         if conn.case_insensitive.load(Ordering::Acquire) != self.case_insensitive {
             conn.shutdown();
             return Err(ClientError::Unexpected("filesystem name mode"));
+        }
+        if conn.create_umask.load(Ordering::Acquire) != self.create_umask {
+            conn.shutdown();
+            return Err(ClientError::Unexpected("create umask dialect"));
         }
         Ok(())
     }
@@ -4485,6 +4492,7 @@ mod session_transition_tests {
         Arc::new(NinePClient {
             targets: Vec::new(),
             case_insensitive: conn.case_insensitive.load(Ordering::Acquire),
+            create_umask: conn.create_umask.load(Ordering::Acquire),
             conn: ArcSwap::new(conn),
             live: AtomicBool::new(true),
             reconnect_timeout: ReconnectTimeout::default(),
@@ -4697,11 +4705,11 @@ mod session_transition_tests {
             candidate
                 .case_insensitive
                 .store(insensitive, Ordering::Release);
-            client.check_name_mode(&candidate).unwrap();
+            client.check_dialect(&candidate).unwrap();
             candidate
                 .case_insensitive
                 .store(!insensitive, Ordering::Release);
-            assert!(client.check_name_mode(&candidate).is_err());
+            assert!(client.check_dialect(&candidate).is_err());
             assert!(candidate.dead.load(Ordering::Acquire));
             assert!(candidate.pending.is_empty());
         }
@@ -4865,6 +4873,71 @@ mod session_transition_tests {
             42
         );
         responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ambiguous_create_rejects_a_changed_umask_dialect_before_retrying() {
+        for create_umask in [false, true] {
+            let (conn, mut requests) = test_conn_with_receiver();
+            conn.create_umask.store(create_umask, Ordering::Release);
+            let client = test_client(Arc::clone(&conn));
+            let mode = 0o040777 | (0o027 << CREATE_UMASK_SHIFT);
+            let mut create = Box::pin(client.mkdir_attr(1, b"child", mode, 0));
+            assert!(futures::poll!(create.as_mut()).is_pending());
+            let first = recv_op_request(&mut requests, "the original create").await;
+            let Message::Tmkdirattr(original) = &first.body else {
+                panic!("expected Tmkdirattr");
+            };
+            assert_eq!(original.mode, if create_umask { mode } else { 0o040750 });
+
+            // The reply was lost. A candidate that changes how mode carries
+            // umask must not be installed, even if its name mode and msize match.
+            conn.connection_lost(&client.reconnect_notify);
+            client.live.store(false, Ordering::Release);
+            let (changed, mut changed_requests) = test_conn_with_receiver();
+            changed.create_umask.store(!create_umask, Ordering::Release);
+            assert!(
+                matches!(
+                    Arc::clone(&client)
+                        .restore_connection(Arc::clone(&changed))
+                        .await,
+                    Err(ClientError::Unexpected("create umask dialect"))
+                ),
+                "a changed dialect must not reinterpret an ambiguous create"
+            );
+            assert!(changed.dead.load(Ordering::Acquire));
+            assert!(changed_requests.try_recv().is_err());
+
+            // A matching candidate still recovers, preserving both the op ID
+            // and the mode that the first server received.
+            let (matching, mut matching_requests) = test_conn_with_receiver();
+            matching.create_umask.store(create_umask, Ordering::Release);
+            Arc::clone(&client)
+                .restore_connection(Arc::clone(&matching))
+                .await
+                .unwrap();
+            client.mark_reconnected();
+            let (created, ()) = tokio::join!(create, async {
+                let retry = recv_op_request(&mut matching_requests, "the retried create").await;
+                let Message::Tmkdirattr(retried) = &retry.body else {
+                    panic!("expected Tmkdirattr");
+                };
+                assert_eq!(retry.op_id, first.op_id);
+                assert_eq!(retry.op_flags, P9_OP_FLAG_RETRY);
+                assert_eq!(retried.mode, original.mode);
+                reply(
+                    &matching,
+                    retry.tag,
+                    Message::Rmkdirattr(Rmkdirattr {
+                        stat: Stat {
+                            qid: qid(42),
+                            ..Default::default()
+                        },
+                    }),
+                );
+            });
+            assert_eq!(created.unwrap().qid.path, 42);
+        }
     }
 
     #[tokio::test]
