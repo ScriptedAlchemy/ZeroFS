@@ -36,7 +36,7 @@ impl Drop for XattrFid<'_> {
 impl NinePClient {
     async fn xattr_fid(&self, fid: u32) -> ClientResult<XattrFid<'_>> {
         self.validate_fids([fid])?;
-        let admission = self.acquire_request_admission().await?;
+        let admission = self.acquire_request_admission(fenced_fids([fid])).await?;
         let conn = loop {
             self.wait_until_live().await?;
             self.check_admitted_request(&admission)?;
@@ -241,7 +241,7 @@ impl NinePClient {
         }
         attr.clunk().await?;
         let registry = self.stateful_requests.lock().unwrap();
-        self.validate_admission_generation(&attr.admission, registry.retirement_generation)?;
+        self.validate_admission(&attr.admission, &registry)?;
         let token = attr.conn.lineage_token.load(Ordering::Relaxed);
         self.note_unsynced(fid, token);
         Ok(())
