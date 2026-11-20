@@ -113,7 +113,7 @@ impl MemoryPolicy {
                 headroom_bytes: package_policy::HEADROOM_BYTES
                     + raw_policy::NAS_FIT_COMPANION_BYTES,
                 residency_source: format!(
-                    "directory package baseline plus 1 GiB for bounded live indexes, redb caches and replay staging; {}",
+                    "directory package baseline plus 2,112 MiB for raw allocation bitmaps, live indexes, retirement and database caches; {}",
                     package_policy::EVIDENCE
                 ),
                 headroom_source: format!(

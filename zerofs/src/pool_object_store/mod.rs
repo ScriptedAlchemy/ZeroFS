@@ -120,7 +120,7 @@ pub struct MemberSpace {
     /// Free bytes the filesystem reports (`statvfs` `f_bavail`), before the
     /// member's free-space reserve.
     pub filesystem_free_bytes: Option<u64>,
-    /// Future tombstone appends on a raw member. Already excluded from available_bytes.
+    /// Member-reported space committed to retirements, excluded from available bytes.
     pub retirement_reserved_bytes: u64,
     /// Size of the filesystem (`statvfs` `f_blocks`).
     pub filesystem_total_bytes: Option<u64>,

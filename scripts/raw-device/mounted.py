@@ -31,11 +31,17 @@ CHUNK = 4 * MIB
 # Stay below the candidate's 4 MiB seal threshold after framing, so the
 # held write does not leave a small trailing segment that either member fits.
 NAS_FIT_PAYLOAD = 2 * MIB
-RAW_BLOCK = 4096  # Raw v1 record header and payload alignment.
+RAW_BLOCK = 4096
 SIZES = {"small": 32 * MIB, "large": 96 * MIB}
 RESERVES = {"small": 16 * MIB, "large": 8 * MIB}
 P3_LAYOUT = "96,32,88,8,16,16"
 P3_SIZE = 256 * MIB
+
+
+def raw_put_cost(size):
+    blocks = (size + RAW_BLOCK - 1) // RAW_BLOCK
+    map_entries = (RAW_BLOCK - 32 - 48) // 8
+    return RAW_BLOCK * (blocks + max(1, (blocks + map_entries - 1) // map_entries))
 
 
 def record(case, **fields):
@@ -198,9 +204,7 @@ def member_status(*args):
         assert member["capacity_bytes"] == SIZES[member_id], member
         space = member["space"]
         assert space["filesystem_free_bytes"] is not None, member
-        # The pool identity marker is live on the raw member and is outside the
-        # segment catalog. It funds a tombstone just like every placed segment.
-        assert space["retirement_reserved_bytes"] == RAW_BLOCK * (1 + member["objects"]), member
+        assert space["retirement_reserved_bytes"] == 0, member
         assert member["health"]["quarantine"] is None, member
         assert member["health"]["monitoring_error"] is None, member
         assert member["reserved_bytes"] == member["pending_uploads"] == member["cleanup_debts"] == 0, member
@@ -459,7 +463,7 @@ def qualify_nas_fit(root, members, memory_limit, p3, *, two_members):
             before[key]["space"]["filesystem_free_bytes"]
             - member["space"]["filesystem_free_bytes"]
         )
-        expected = sum(RAW_BLOCK * (1 + (entry["size"] + RAW_BLOCK - 1) // RAW_BLOCK)
+        expected = sum(raw_put_cost(entry["size"])
                        for entry in entries)
         assert physical_spent == expected, (key, physical_spent, expected)
     with mounted(cold) as (path, _):
@@ -498,7 +502,7 @@ def qualify_nas_spill(root, template, members, p3, digest, initial_size, cross_m
     before, at_reserve = snapshot(fill, members, "nas_reserve_boundary")
     assert all(at_reserve.get(key) == entry for key, entry in cross_member.items()), at_reserve
     small = before["small"]
-    floor = RESERVES["small"] + small["space"]["retirement_reserved_bytes"]
+    floor = RESERVES["small"]
     free = small["space"]["filesystem_free_bytes"]
     assert small["capacity_bytes"] - small["used_bytes"] > payload_size, small
     assert floor <= free < floor + payload_size, small
@@ -520,10 +524,10 @@ def qualify_nas_spill(root, template, members, p3, digest, initial_size, cross_m
     physical_spent = (before["large"]["space"]["filesystem_free_bytes"]
                       - after["large"]["space"]["filesystem_free_bytes"])
     assert physical_spent == sum(
-        RAW_BLOCK * (1 + (entry["size"] + RAW_BLOCK - 1) // RAW_BLOCK) for entry in new
+        raw_put_cost(entry["size"]) for entry in new
     ), (physical_spent, new)
     record("nas_reserve_spill", smaller_allocatable_bytes=small["available_bytes"],
-           larger_raw_log_bytes=physical_spent, placements=new)
+           larger_raw_allocation_bytes=physical_spent, placements=new)
 
     with mounted(cold) as (path, _):
         verify(path, digest, size, "nas_spill_cold")
@@ -580,8 +584,7 @@ def qualify(root, members, memory_limit, p3):
     small = before["small"]
     free = small["space"]["filesystem_free_bytes"]
     assert small["capacity_bytes"] - small["used_bytes"] > CHUNK, small
-    retirement = small["space"]["retirement_reserved_bytes"]
-    floor = RESERVES["small"] + retirement
+    floor = RESERVES["small"]
     assert floor <= free < floor + CHUNK, small
     assert small["available_bytes"] == free - floor, small
 
@@ -607,23 +610,14 @@ def qualify(root, members, memory_limit, p3):
         - after["large"]["space"]["filesystem_free_bytes"]
     )
     expected_cost = sum(
-        RAW_BLOCK * (1 + (entry["size"] + RAW_BLOCK - 1) // RAW_BLOCK) for entry in new
+        raw_put_cost(entry["size"]) for entry in new
     )
     assert physical_spent == expected_cost, (physical_spent, expected_cost, new)
-    retirement_added = (
-        after["large"]["space"]["retirement_reserved_bytes"]
-        - before["large"]["space"]["retirement_reserved_bytes"]
-    )
-    assert retirement_added == len(new) * RAW_BLOCK, after
-    assert before["large"]["available_bytes"] - after["large"]["available_bytes"] == (
-        physical_spent + retirement_added
-    ), after
+    assert before["large"]["available_bytes"] - after["large"]["available_bytes"] == physical_spent, after
     record("reserve_spill", smaller_reserve_bytes=RESERVES["small"],
-           smaller_retirement_reserved_bytes=retirement,
            smaller_available_bytes=small["available_bytes"], larger_new_objects=len(new),
            larger_new_bytes=sum(entry["size"] for entry in new),
-           larger_raw_log_bytes=physical_spent,
-           larger_retirement_reserved_bytes_added=retirement_added)
+           larger_raw_allocation_bytes=physical_spent)
 
     with mounted(configs[3]) as (path, _):
         verify(path, digest, chunks * CHUNK, "cold_restart")

@@ -26,7 +26,7 @@ from uuid import uuid4
 from fixture import device
 from mounted import (
     CGROUP, MIB, PROBE, RAW_BLOCK, ZEROFS, check_admission, check_p3_shadows,
-    mounted, raw_url, record, require_fuse, sample_cgroup,
+    mounted, raw_put_cost, raw_url, record, require_fuse, sample_cgroup,
 )
 
 GIB = 1024 * MIB
@@ -385,7 +385,7 @@ def snapshot(configuration, phase):
         assert member["capacity_bytes"] == SIZES[name], member
         assert member["objects"] == len(selected), member
         assert member["used_bytes"] == sum(entry["size"] for entry in selected), member
-        assert space["retirement_reserved_bytes"] == RAW_BLOCK * (1 + len(selected)), member
+        assert space["retirement_reserved_bytes"] == 0, member
         assert member["reserved_bytes"] == member["pending_uploads"] == member["cleanup_debts"] == 0, member
         assert member["health"]["quarantine"] is None and member["health"]["monitoring_error"] is None, member
     record("pool_accounting", phase=phase, members=members, placed_objects=len(entries))
@@ -414,7 +414,7 @@ def verify_members(devices, baseline, final, entries):
         assert placed.keys() <= seen and len(outside_catalog) == 1, (name, outside_catalog)
         spent = (baseline[name]["space"]["filesystem_free_bytes"]
                  - final[name]["space"]["filesystem_free_bytes"])
-        expected = sum(RAW_BLOCK * (1 + (size + RAW_BLOCK - 1) // RAW_BLOCK)
+        expected = sum(raw_put_cost(size)
                        for size in placed.values())
         assert spent == expected, (name, spent, expected)
         record("member_verified", member=name, bytes=sum(placed.values()), objects=len(placed),

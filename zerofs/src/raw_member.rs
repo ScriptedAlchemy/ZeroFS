@@ -1,43 +1,9 @@
-//! `object_store` adapter over one claimed raw-device [`RawStore`].
+//! Durability and capacity adapter over a claimed raw-device [`RawStore`].
 //!
-//! Every mutation appends to the device log and then flushes, inside one write
-//! lock, before it returns. An `Ok` from PUT, DELETE, COPY or RENAME therefore
-//! means both label slots on the device record it. Readers take the same lock
-//! shared, so they never observe a record that is not yet durable. A failed
-//! append or flush poisons the store, and every later call fails with
-//! [`RawMemberError::Poisoned`]. To recover, reopen the device and build a new
-//! adapter.
-//!
-//! Space is admitted exactly. Mutations are serialised by the write lock, and
-//! each one checks its exact log cost against the free space at that moment:
-//! one header block plus the payload rounded up to whole blocks, from
-//! [`RawStore::put_cost`] and [`RawStore::delete_cost`].
-//!
-//! `reserve_bytes` is a physical floor that no mutation may cross, deletes
-//! included. Instead, every live object funds its own future delete: the
-//! adapter keeps `delete_cost() * live_objects` (the delete debt) free above
-//! the reserve, and a mutation is admitted only if
-//!
-//! ```text
-//! appended bytes + delete_cost() * live objects afterwards <= free - reserve
-//! ```
-//!
-//! A create therefore pays for its record and its eventual tombstone, an
-//! overwrite pays only for its record, and a delete spends exactly the debt
-//! it releases. Once a store meets the invariant, deleting a live object never
-//! fails for space. A store opened already below it refuses creates and
-//! reports deletes it cannot fund as ENOSPC, leaving the debt in place, rather
-//! than crossing the floor. A refusal is reported as
-//! `io::ErrorKind::StorageFull` wrapping [`RawMemberError::NoSpace`], and
-//! nothing is written.
-//!
-//! The log is append-only. Overwrites, updates and deletes add records and
-//! never reclaim the space of the records they supersede: see
-//! [`RawCapacity::appended_bytes`].
-//!
-//! Every read verifies the SHA-256 of the whole payload before returning any
-//! byte, including ranged reads. The payload is hashed in bounded chunks and
-//! only the requested ranges are retained, outside the store lock.
+//! Mutations hold the store's write lock through FLUSH. The exact copy-on-write
+//! allocation must fit above the physical reserve. DELETE uses preallocated
+//! index space and makes its old allocation reusable after FLUSH and any
+//! outstanding reads. Range reads pin the allocation while verifying all bytes.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -67,9 +33,7 @@ const DELETE_BATCH: usize = 64;
 /// Why a raw member operation failed.
 #[derive(Debug)]
 pub enum RawMemberError {
-    /// The mutation does not fit above the reserve. `needed` is its appended
-    /// bytes plus the delete debt left afterwards; `available` is free space
-    /// minus the reserve.
+    /// The staged allocation exceeds the free space above the reserve.
     NoSpace {
         needed: u64,
         available: u64,
@@ -99,7 +63,7 @@ impl fmt::Display for RawMemberError {
                 reserve,
             } => write!(
                 f,
-                "raw member full: need {needed} bytes including delete debt, \
+                "raw member full: need {needed} bytes, \
                  {available} free above the {reserve}-byte reserve"
             ),
             Self::Poisoned => write!(f, "raw member poisoned by an earlier write failure"),
@@ -174,35 +138,39 @@ fn store_err(err: impl Into<RawMemberError>) -> Error {
 pub struct RawCapacity {
     /// Size of the store's region (the whole device, or one P3 region).
     pub device_bytes: u64,
-    /// Region size minus the two label blocks.
-    pub log_bytes: u64,
-    /// Log bytes appended so far, including superseded and delete records.
-    pub appended_bytes: u64,
-    /// Log bytes not yet appended.
+    /// Allocatable area after the labels and index banks.
+    pub data_bytes: u64,
+    /// Data bytes held by objects or readers.
+    pub allocated_bytes: u64,
+    /// Data bytes available for new allocations.
     pub free_bytes: u64,
-    /// Physical floor no mutation crosses.
+    /// Physical floor no allocation crosses.
     pub reserve_bytes: u64,
-    /// `delete_cost() * live_objects`: kept free so every live object can be
-    /// deleted without touching the reserve.
-    pub delete_debt_bytes: u64,
-    /// Room new appends may consume: `free - reserve - delete debt`, floored
-    /// at zero.
+    /// Room new allocations may consume above the reserve.
     pub admissible_bytes: u64,
     /// Live objects.
     pub live_objects: u64,
 }
 
 impl RawCapacity {
-    /// Largest payload a put could store right now, or `None` when not even
-    /// an empty object fits.
-    /// A new key also funds its own delete; an overwrite of an existing key
-    /// can be one tombstone larger.
+    /// Largest payload that can fit above the reserve.
     #[cfg(test)]
     pub fn max_put_payload(&self) -> Option<u64> {
-        let room = self
-            .admissible_bytes
-            .checked_sub(BLOCK_SIZE + RawStore::delete_cost())?;
-        Some((room / BLOCK_SIZE * BLOCK_SIZE).min(MAX_OBJECT_LEN))
+        let room = self.admissible_bytes;
+        if room < BLOCK_SIZE {
+            return None;
+        }
+        let mut low = 0;
+        let mut high = (room / BLOCK_SIZE).min(MAX_OBJECT_LEN / BLOCK_SIZE);
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            if RawStore::put_cost(middle * BLOCK_SIZE).unwrap() <= room {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        Some(low * BLOCK_SIZE)
     }
 }
 
@@ -273,37 +241,24 @@ impl RawMemberStore {
         self.inner.identity
     }
 
-    /// Exact log bytes a put of `value_len` bytes appends, or `None` if that
-    /// overflows. Excludes the delete debt a new key adds.
+    /// Exact bytes a staged allocation requires.
     pub const fn put_cost(value_len: u64) -> Option<u64> {
         RawStore::put_cost(value_len)
     }
 
-    /// Exact log bytes one delete consumes.
-    pub const fn delete_cost() -> u64 {
-        RawStore::delete_cost()
-    }
-
     pub fn capacity(&self) -> std::result::Result<RawCapacity, RawMemberError> {
-        let store = self.inner.read()?;
-        if store.is_poisoned() {
-            return Err(RawMemberError::Poisoned);
-        }
+        let mut store = self.inner.write()?;
+        store.reclaim()?;
         let geometry = store.geometry();
-        let live = store.len() as u64;
-        let debt = delete_debt(live);
+        let data_bytes = geometry.device_size - geometry.data_start;
         Ok(RawCapacity {
             device_bytes: geometry.device_size,
-            log_bytes: geometry.device_size - geometry.log_start,
-            appended_bytes: geometry.tail - geometry.log_start,
+            data_bytes,
+            allocated_bytes: data_bytes - geometry.free,
             free_bytes: geometry.free,
             reserve_bytes: self.inner.reserve,
-            delete_debt_bytes: debt,
-            admissible_bytes: geometry
-                .free
-                .saturating_sub(self.inner.reserve)
-                .saturating_sub(debt),
-            live_objects: live,
+            admissible_bytes: geometry.free.saturating_sub(self.inner.reserve),
+            live_objects: store.len() as u64,
         })
     }
 
@@ -339,11 +294,9 @@ impl Inner {
         Ok(store)
     }
 
-    /// Admit `appended` log bytes that leave `live_after` live objects: the
-    /// append plus the remaining delete debt must fit above the reserve.
-    fn admit(&self, store: &RawStore, appended: u64, live_after: u64) -> Result<()> {
+    fn admit(&self, store: &mut RawStore, needed: u64) -> Result<()> {
+        store.reclaim().map_err(store_err)?;
         let available = store.geometry().free.saturating_sub(self.reserve);
-        let needed = appended.saturating_add(delete_debt(live_after));
         if needed <= available {
             return Ok(());
         }
@@ -358,7 +311,10 @@ impl Inner {
         let key = key(location)?;
         let store = self.read().map_err(store_err)?;
         match store.handle(key).map_err(store_err)? {
-            Some(handle) => Ok((handle, meta(location, &handle.info))),
+            Some(handle) => {
+                let meta = meta(location, &handle.info);
+                Ok((handle, meta))
+            }
             None => Err(not_found(location)),
         }
     }
@@ -390,7 +346,7 @@ impl Inner {
         })
     }
 
-    /// Runs outside the store lock: the handle's record is immutable.
+    /// The handle pins the allocation while the store can accept mutations.
     fn read_ranges(&self, handle: &ObjectHandle, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
         let parts = self.reader.read_ranges(handle, ranges).map_err(store_err)?;
         Ok(parts.into_iter().map(Bytes::from).collect())
@@ -429,8 +385,7 @@ impl Inner {
                 }
             }
         }
-        let live_after = store.len() as u64 + u64::from(existing.is_none());
-        self.admit(&store, cost, live_after)?;
+        self.admit(&mut store, cost)?;
         store.put(key, &value).map_err(store_err)?;
         store.flush().map_err(store_err)?;
         let info = store.stat(key).expect("object just stored");
@@ -453,8 +408,6 @@ impl Inner {
         if present.is_empty() {
             return Ok(());
         }
-        let count = present.len() as u64;
-        self.admit(&store, delete_debt(count), store.len() as u64 - count)?;
         for key in present {
             store.delete(key).map_err(store_err)?;
         }
@@ -480,21 +433,14 @@ impl Inner {
         }
         let len = handle.info.len;
         let put = RawStore::put_cost(len).expect("stored objects are bounded");
-        let appended = put
-            + if remove_source {
-                RawStore::delete_cost()
-            } else {
-                0
-            };
-        let live_after =
-            store.len() as u64 + u64::from(!store.contains_key(to_key)) - u64::from(remove_source);
-        self.admit(&store, appended, live_after)?;
+        self.admit(&mut store, put)?;
         let value = self
             .reader
             .read_ranges(&handle, std::slice::from_ref(&(0..len)))
             .map_err(store_err)?
             .pop()
             .expect("one range requested");
+        drop(handle);
         store.put(to_key, &value).map_err(store_err)?;
         if remove_source {
             store.delete(from_key).map_err(store_err)?;
@@ -527,10 +473,6 @@ impl Inner {
         objects.sort_by(|a, b| a.location.cmp(&b.location));
         Ok(objects)
     }
-}
-
-fn delete_debt(live: u64) -> u64 {
-    live.saturating_mul(RawStore::delete_cost())
 }
 
 fn key(location: &Path) -> Result<&[u8]> {

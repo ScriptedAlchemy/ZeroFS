@@ -17,7 +17,7 @@
 //!   device to one pool UUID, member UUID, and [`Role`].
 //! * [`RawStore::open`] reopens a labelled device. The supplied
 //!   [`Identity`] and device size must match the label exactly.
-//! * [`RawStore::put`] and [`RawStore::delete`] append to the log. GET sees
+//! * [`RawStore::put`] and [`RawStore::delete`] stage changes. GET sees
 //!   them immediately, but they are **not durable** until [`RawStore::flush`]
 //!   returns `Ok`.
 //! * [`RawStore::get`] verifies the SHA-256 of every payload it returns.
@@ -36,9 +36,8 @@
 //!   both slots.
 //! * If both slots are damaged, `open` returns [`Error::Corrupt`] rather than
 //!   guessing.
-//! * Records appended after the last durable checkpoint are discarded on
-//!   reopen, whether complete or torn. Damage inside the durable range is
-//!   never truncated silently: it surfaces as [`Error::Corrupt`].
+//! * Staged index pages are ignored on reopen. Damage in the committed index
+//!   or in a live payload surfaces as [`Error::Corrupt`].
 //!
 //! See `format.rs` for the on-disk layout.
 
@@ -163,18 +162,16 @@ impl fmt::Display for Identity {
     }
 }
 
-/// Where the log stands. Offsets are absolute byte offsets on the device.
+/// Device space and the current committed index checkpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Geometry {
     /// Device size, exactly as supplied and recorded.
     pub device_size: u64,
-    /// First byte of the log region.
-    pub log_start: u64,
-    /// End of everything appended, durable or not.
-    pub tail: u64,
-    /// End of the log as of the last durable checkpoint.
+    /// Start of allocatable payload space, after both index banks.
+    pub data_start: u64,
+    /// Byte offset after the last committed index page in the selected bank.
     pub durable_tail: u64,
-    /// Bytes still available for appends.
+    /// Bytes available for new allocations.
     pub free: u64,
     /// Generation of the last durable checkpoint.
     pub generation: u64,
@@ -186,7 +183,7 @@ pub enum Error {
     Io(io::Error),
     /// The append does not fit. Nothing was written.
     NoSpace { needed: u64, available: u64 },
-    /// A live-key insert exceeds the bounded in-memory index. Nothing was written.
+    /// A live-key insert exceeds the index budget in bytes. Nothing was written.
     IndexFull { limit: usize },
     /// The label binds the device to a different pool, member, or role.
     IdentityMismatch { expected: Identity, found: Identity },
@@ -222,7 +219,7 @@ impl fmt::Display for Error {
                 write!(f, "no space: need {needed} bytes, {available} available")
             }
             Self::IndexFull { limit } => {
-                write!(f, "raw index holds its limit of {limit} live keys")
+                write!(f, "raw index reached its {limit}-byte budget")
             }
             Self::IdentityMismatch { expected, found } => {
                 let mut fields = Vec::new();

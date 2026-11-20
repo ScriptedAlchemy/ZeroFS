@@ -160,6 +160,92 @@ impl Fixture {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_full_raw_member_reuses_space_after_pool_segment_retirement() {
+    use crate::raw_member::RawMemberStore;
+    use crate::storage_backend::raw::RawSpace;
+    use std::fs::OpenOptions;
+    use zerofs_raw_device::{Identity, RawStore, Role};
+
+    const SIZE: u64 = 1 << 20;
+    let fixture = Fixture::new(SIZE);
+    let backing = fixture.catalog.path().join("raw");
+    let file = || {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&backing)
+            .unwrap()
+    };
+    std::fs::File::create(&backing)
+        .unwrap()
+        .set_len(SIZE)
+        .unwrap();
+    let identity = Identity {
+        pool_uuid: [1; 16],
+        member_uuid: [2; 16],
+        role: Role::Data,
+    };
+    let member = |raw| {
+        let raw = RawMemberStore::new(raw, (), 8192).unwrap();
+        let mut member = fixture.member(true);
+        member.store = Arc::new(raw.clone());
+        member.min_free_bytes = 8192;
+        member.free_space = Some(Arc::new(RawSpace::new(1, raw)));
+        member
+    };
+    let raw = RawStore::provision(file(), SIZE, identity).unwrap();
+    let pool = fixture.open_balanced(vec![member(raw)], true).await;
+    let body: &[u8] = &[1; 60_000];
+    let first = pool.status().await.unwrap().members[0].available_bytes;
+    let cost = RawStore::put_cost(body.len() as u64).unwrap();
+    let count = first / cost;
+    assert!(count > 3);
+    for id in 1..=count {
+        create(&pool, &segment(id), body).await;
+    }
+    assert!(
+        pool.put_opts(
+            &segment(count + 1),
+            Bytes::from_static(body).into(),
+            create_options()
+        )
+        .await
+        .is_err()
+    );
+    let full = pool.status().await.unwrap().members[0].available_bytes;
+    assert!(full < cost);
+    assert_eq!(first - full, count * cost);
+
+    for id in 1..=count / 2 {
+        pool.delete(&segment(id)).await.unwrap();
+    }
+    assert_eq!(
+        pool.status().await.unwrap().members[0].available_bytes,
+        full + (count / 2) * cost
+    );
+    for id in count + 1..=count + count / 2 {
+        create(&pool, &segment(id), body).await;
+    }
+    drop(pool);
+    let raw = RawStore::open(file(), SIZE, identity).unwrap();
+    let pool = fixture.open_balanced(vec![member(raw)], false).await;
+    for id in 1..=count / 2 {
+        assert!(matches!(
+            pool.get(&segment(id)).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+    }
+    for id in count / 2 + 1..=count + count / 2 {
+        assert_eq!(read(&pool, &segment(id)).await, body);
+    }
+    assert_eq!(
+        pool.status().await.unwrap().members[0].available_bytes,
+        full
+    );
+}
+
 #[derive(Debug, Default)]
 struct FaultControl {
     offline: AtomicBool,
