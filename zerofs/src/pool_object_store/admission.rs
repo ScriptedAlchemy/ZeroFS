@@ -14,13 +14,19 @@
 //! to segment data, and no later promise can take the bytes it is writing.
 //! Survival bytes count against the member's physical room, not its quota.
 //!
+//! A reservation is counted here from the moment its member is chosen until
+//! a catalog view shows its upload row, which the catalog's reserved bytes
+//! count from then on. Admission therefore reads committed catalog rows and
+//! this ledger, and never waits for a catalog commit.
+//!
 //! Nothing here is durable. A restart forgets every claim and lease, with the
 //! unflushed data they covered; journaled segments are leased again when the
 //! writeback store attaches to the pool.
 use super::PoolMember;
 use crate::segment::Segid;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
+use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum Key {
@@ -28,6 +34,8 @@ pub(super) enum Key {
     Segment(Segid),
     /// A metadata-survival PUT. It costs physical bytes but no quota.
     Survival(u64),
+    /// A reservation, by upload id, whose catalog commit may be in flight.
+    Reserving(Uuid),
 }
 
 #[derive(Debug)]
@@ -75,11 +83,29 @@ pub(super) struct Ledger {
 }
 
 impl Ledger {
+    /// Upload ids of reservations whose catalog commit may be in flight.
+    pub(super) fn reserving(&self) -> impl Iterator<Item = Uuid> + '_ {
+        self.entries.keys().filter_map(|key| match key {
+            Key::Reserving(upload) => Some(*upload),
+            _ => None,
+        })
+    }
+
     /// Promises outside `except` that no catalog reservation counts yet.
-    pub(super) fn admitted(&self, members: &[PoolMember], except: Option<Key>) -> Admitted {
+    /// `committed` names the reserving uploads whose rows the caller's
+    /// catalog view already shows.
+    pub(super) fn admitted(
+        &self,
+        members: &[PoolMember],
+        except: Option<Key>,
+        committed: &BTreeSet<Uuid>,
+    ) -> Admitted {
         let mut admitted = BTreeMap::<String, Promise>::new();
         for (key, entry) in &self.entries {
-            if entry.placing || Some(*key) == except {
+            if entry.placing
+                || Some(*key) == except
+                || matches!(key, Key::Reserving(upload) if committed.contains(upload))
+            {
                 continue;
             }
             let Some(member) = members.iter().find(|member| member.id == entry.member) else {
@@ -122,6 +148,19 @@ impl Ledger {
             bytes,
             placing: false,
         });
+    }
+
+    /// Count `bytes` on `member` for the reservation `upload` until its
+    /// catalog row is visible.
+    pub(super) fn insert_reserving(&mut self, upload: Uuid, member: String, bytes: u64) {
+        self.entries.insert(
+            Key::Reserving(upload),
+            Entry {
+                member,
+                bytes,
+                placing: false,
+            },
+        );
     }
 
     pub(super) fn set_placing(&mut self, segment: Segid, placing: bool) {

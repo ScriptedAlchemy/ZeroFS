@@ -4256,6 +4256,47 @@ async fn claims_and_leases_share_room_with_reservations_exactly() {
     assert_eq!(usage(&pool, &member).await.0, 600);
 }
 
+/// A WRITE is admitted while a placement holds, or waits for, the catalog
+/// writer: admission reads committed rows and the ledger only.
+#[tokio::test]
+async fn admission_does_not_wait_for_a_placement_commit() {
+    let fixture = Fixture::new(1024);
+    let pool = fixture.initialize().await;
+    let writer = pool.inner.catalog.writer();
+    let placing = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            pool.put_opts(
+                &segment(910),
+                Bytes::from(vec![1; 100]).into(),
+                create_options(),
+            )
+            .await
+        }
+    });
+    // Let the placement queue behind the writer.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let claim = tokio::time::timeout(Duration::from_secs(10), pool.admit(600, None)).await;
+    let survival = tokio::time::timeout(
+        Duration::from_secs(10),
+        pool.put_survival(
+            "hdd-a",
+            &Path::from(".zerofs-survival/v1/held-writer"),
+            Bytes::from_static(b"generation").into(),
+            PutOptions::default(),
+        ),
+    )
+    .await;
+    writer.abort().unwrap();
+    claim
+        .expect("admission waited for the catalog writer")
+        .unwrap();
+    survival
+        .expect("survival admission waited for the catalog writer")
+        .unwrap();
+    placing.await.unwrap().unwrap();
+}
+
 /// A journaled segment the pool has not placed keeps its room across a
 /// restart: attaching the writeback store leases it again, and placing it
 /// releases the lease.

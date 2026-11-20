@@ -1103,26 +1103,16 @@ impl PoolObjectStore {
         let ledger = Arc::clone(&self.inner.ledger);
         let upload = self
             .catalog(move |catalog| {
-                // Held across the catalog transaction, so a concurrent claim
-                // cannot promise the bytes this reservation takes.
-                let mut ledger = ledger.lock().unwrap();
-                let own = lease.map(admission::Key::Segment);
-                let admitted = ledger.admitted(&members, own);
-                let prefer = own.and_then(|key| ledger.member_of(key)).map(str::to_owned);
-                let upload = catalog.reserve(
+                catalog.reserve(
                     &key,
                     size,
                     &members,
                     target.as_deref(),
                     &skip,
                     placement,
-                    &admitted,
-                    prefer.as_deref(),
-                )?;
-                if let Some(segment) = lease {
-                    ledger.set_placing(segment, true);
-                }
-                Ok(upload)
+                    &ledger,
+                    lease,
+                )
             })
             .await?;
         #[cfg(test)]
@@ -1286,14 +1276,15 @@ impl PoolObjectStore {
         let ledger = Arc::clone(&self.inner.ledger);
         let id = self
             .catalog(move |catalog| {
+                // Held from the check to the claim, so no two claims are
+                // promised the same bytes.
                 let mut ledger = ledger.lock().unwrap();
-                let admitted = ledger.admitted(&members, None);
                 let member = catalog.admit(
                     bytes,
                     &members,
                     &skip,
                     placement,
-                    &admitted,
+                    &ledger,
                     prefer.as_deref(),
                 )?;
                 Ok(ledger.insert_claim(admission::Key::Claim, member, bytes))
@@ -1322,8 +1313,7 @@ impl PoolObjectStore {
         let key = self
             .catalog(move |catalog| {
                 let mut ledger = ledger.lock().unwrap();
-                let admitted = ledger.admitted(std::slice::from_ref(&target), None);
-                catalog.admit_survival(&target, bytes, &admitted)?;
+                catalog.admit_survival(&target, bytes, &ledger)?;
                 Ok(ledger.insert_claim(admission::Key::Survival, target.id, bytes))
             })
             .await
@@ -2052,7 +2042,14 @@ impl PoolObjectStore {
         let evacuating = self.inner.evacuating.lock().unwrap().clone();
         let snapshot = evacuating.clone();
         let unavailable = self.inner.unavailable.clone();
-        let admitted = self.inner.ledger.lock().unwrap().admitted(&members, None);
+        // A reservation committing right now may also be in the reserved
+        // bytes this report reads next.
+        let admitted =
+            self.inner
+                .ledger
+                .lock()
+                .unwrap()
+                .admitted(&members, None, &BTreeSet::new());
         let mut status = self
             .catalog(move |catalog| {
                 catalog.status(

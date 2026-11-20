@@ -4,7 +4,7 @@
 //! transaction. An unpublished upload remains reserved until its unique object
 //! has been deleted. Superseded objects remain charged until cleanup succeeds.
 
-use super::admission::Admitted;
+use super::admission::{Admitted, Key, Ledger};
 use super::health::{MemberHealth, SegmentFault, SmartSample};
 use super::{EvacuationCapacity, PoolMember, PoolMemberStatus, PoolPlacement, PoolStatus};
 use crate::config::SegmentPlacement;
@@ -12,6 +12,7 @@ use crate::operator_required::operator_required;
 use anyhow::{Context, Result, anyhow, bail};
 use fs4::fs_std::FileExt;
 use object_store::path::Path;
+use crate::segment::Segid;
 use redb::{
     Builder, Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata,
     TableDefinition,
@@ -68,6 +69,110 @@ struct Choice {
     member: String,
     /// Round-robin placement chose this local member.
     rotated: bool,
+}
+
+/// The tables a placement decision reads, opened in a read snapshot or in
+/// the reserving transaction.
+struct Rows<T> {
+    members: T,
+    health: T,
+    meta: T,
+    uploads: T,
+}
+
+impl Rows<redb::ReadOnlyTable<&'static str, &'static [u8]>> {
+    fn committed(tx: &redb::ReadTransaction) -> Result<Self> {
+        Ok(Self {
+            members: tx.open_table(MEMBERS)?,
+            health: tx.open_table(HEALTH)?,
+            meta: tx.open_table(META)?,
+            uploads: tx.open_table(UPLOADS)?,
+        })
+    }
+}
+
+impl<'txn> Rows<redb::Table<'txn, &'static str, &'static [u8]>> {
+    fn reserving(tx: &'txn redb::WriteTransaction) -> Result<Self> {
+        Ok(Self {
+            members: tx.open_table(MEMBERS)?,
+            health: tx.open_table(HEALTH)?,
+            meta: tx.open_table(META)?,
+            uploads: tx.open_table(UPLOADS)?,
+        })
+    }
+}
+
+impl<T: ReadableTable<&'static str, &'static [u8]>> Rows<T> {
+    fn record(&self, member: &str) -> Result<MemberRecord> {
+        Ok(bincode::deserialize(
+            self.members
+                .get(member)?
+                .context("unregistered pool member")?
+                .value(),
+        )?)
+    }
+
+    fn health(&self, member: &str) -> Result<MemberHealth> {
+        Ok(self
+            .health
+            .get(member)?
+            .map(|v| bincode::deserialize(v.value()))
+            .transpose()?
+            .unwrap_or_default())
+    }
+
+    /// Promises in `ledger` outside `except` that these rows do not count. A
+    /// reservation whose upload row is visible here is in the reserved bytes.
+    fn admitted(
+        &self,
+        ledger: &Ledger,
+        members: &[PoolMember],
+        except: Option<Key>,
+    ) -> Result<Admitted> {
+        let mut committed = BTreeSet::new();
+        for upload in ledger.reserving() {
+            if self.uploads.get(upload.to_string().as_str())?.is_some() {
+                committed.insert(upload);
+            }
+        }
+        Ok(ledger.admitted(members, except, &committed))
+    }
+
+    /// Physical bytes promised across local members: claims, leases and
+    /// survival writes in `admitted`, outstanding reservations, and raw
+    /// allocation overhead of pending raw uploads.
+    fn local_reserved(&self, members: &[PoolMember], admitted: &Admitted) -> Result<u64> {
+        // Conservatively share the reservation budget across all local
+        // paths. In particular, two directories on the same filesystem
+        // must not both promise the same currently-free physical bytes.
+        let mut local_reserved = admitted.local_physical(members);
+        for member in members.iter().filter(|member| member.is_local()) {
+            local_reserved = local_reserved
+                .checked_add(self.record(&member.id)?.reserved)
+                .context("local pool reservation overflow")?;
+        }
+        let costed_members: BTreeMap<_, _> = members
+            .iter()
+            .filter(|member| member.free_space.is_some())
+            .map(|member| (member.id.as_str(), member))
+            .collect();
+        if !costed_members.is_empty() {
+            // Raw uploads own allocation overhead in addition to
+            // their logical quota. UPLOADS is keyed
+            // by upload id, so derive this from the outstanding rows only
+            // for custom space sources; directory/SFTP admission never
+            // scans uploads. Keep the durable logical counters unchanged.
+            for row in self.uploads.iter()? {
+                let upload: Upload = bincode::deserialize(row?.1.value())?;
+                if let Some(member) = costed_members.get(upload.member_id.as_str()) {
+                    local_reserved = local_reserved
+                        .checked_add(member.put_cost(upload.size).saturating_sub(upload.size))
+                        .context("local pool physical reservation overflow")?;
+                }
+            }
+        }
+        Ok(local_reserved)
+    }
 }
 const HEALTH: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_member_health_v1");
 const FAULTS: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_segment_faults_v1");
@@ -642,6 +747,12 @@ impl Catalog {
         Ok(())
     }
 
+    /// Hold the single writer, as a commit in its flush does.
+    #[cfg(test)]
+    pub(super) fn writer(&self) -> redb::WriteTransaction {
+        self.database.begin_write().unwrap()
+    }
+
     pub fn blocked_members(&self) -> Result<BTreeSet<String>> {
         let tx = self.database.begin_read()?;
         let mut blocked = BTreeSet::new();
@@ -818,6 +929,10 @@ impl Catalog {
         Ok(())
     }
 
+    /// Reserve `size` bytes for `location` and record its upload. The member
+    /// is chosen and counted under `ledger`, which is released before the
+    /// commit, so admission never waits for this transaction's flush. `lease`
+    /// is the segment's own lease, which the reservation replaces.
     #[allow(clippy::too_many_arguments)]
     pub fn reserve(
         &self,
@@ -827,8 +942,8 @@ impl Catalog {
         target: Option<&str>,
         skip: &BTreeSet<String>,
         placement: SegmentPlacement,
-        admitted: &Admitted,
-        prefer: Option<&str>,
+        ledger: &Mutex<Ledger>,
+        lease: Option<Segid>,
     ) -> Result<Upload> {
         let mut tx = self.database.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
@@ -840,18 +955,27 @@ impl Catalog {
             require_segment_target(bound, target)?;
         }
         let target = bound.as_deref().or(target);
-        let choice = Self::choose(
-            &tx,
-            Request {
-                size,
-                members,
-                target,
-                skip,
-                placement,
-                admitted,
-                prefer,
-            },
-        )?;
+        let own = lease.map(Key::Segment);
+        let mut promises = ledger.lock().unwrap();
+        let choice = {
+            let rows = Rows::reserving(&tx)?;
+            let admitted = rows.admitted(&promises, members, own)?;
+            let prefer = own
+                .and_then(|key| promises.member_of(key))
+                .map(str::to_owned);
+            Self::choose(
+                &rows,
+                Request {
+                    size,
+                    members,
+                    target,
+                    skip,
+                    placement,
+                    admitted: &admitted,
+                    prefer: prefer.as_deref(),
+                },
+            )?
+        };
         {
             let mut table = tx.open_table(MEMBERS)?;
             let mut record: MemberRecord = bincode::deserialize(
@@ -875,10 +999,10 @@ impl Catalog {
             tx.open_table(META)?
                 .insert(LAST_LOCAL_RESERVATION, choice.member.as_bytes())?;
         }
-        let id = Uuid::new_v4().to_string();
+        let id = Uuid::new_v4();
         let upload = Upload {
             physical_key: format!(".zerofs-pool/{}/objects/{id}", self.identity.pool_id),
-            id,
+            id: id.to_string(),
             location: location.to_owned(),
             member_id: choice.member,
             size,
@@ -886,35 +1010,51 @@ impl Catalog {
         };
         tx.open_table(UPLOADS)?
             .insert(upload.id.as_str(), bincode::serialize(&upload)?.as_slice())?;
-        tx.commit()?;
+        // The ledger counts the reservation until a catalog view shows its
+        // upload row, in place of the lease it replaces.
+        promises.insert_reserving(id, upload.member_id.clone(), size);
+        if let Some(segment) = lease {
+            promises.set_placing(segment, true);
+        }
+        drop(promises);
+        let committed = tx.commit();
+        let mut promises = ledger.lock().unwrap();
+        promises.remove(Key::Reserving(id));
+        if committed.is_err()
+            && let Some(segment) = lease
+        {
+            promises.set_placing(segment, false);
+        }
+        committed?;
         Ok(upload)
     }
 
     /// The member a new `size`-byte segment would be placed on now, by the
-    /// same rule as [`Self::reserve`], without recording anything.
+    /// same rule as [`Self::reserve`], without recording anything. It reads
+    /// committed rows, so it never waits for a placement commit.
     pub fn admit(
         &self,
         size: u64,
         members: &[PoolMember],
         skip: &BTreeSet<String>,
         placement: SegmentPlacement,
-        admitted: &Admitted,
+        ledger: &Ledger,
         prefer: Option<&str>,
     ) -> Result<String> {
-        let tx = self.database.begin_write()?;
+        let rows = Rows::committed(&self.database.begin_read()?)?;
+        let admitted = rows.admitted(ledger, members, None)?;
         let choice = Self::choose(
-            &tx,
+            &rows,
             Request {
                 size,
                 members,
                 target: None,
                 skip,
                 placement,
-                admitted,
+                admitted: &admitted,
                 prefer,
             },
         )?;
-        tx.abort()?;
         Ok(choice.member)
     }
 
@@ -924,15 +1064,11 @@ impl Catalog {
     /// targets raw members, which never share a device, so promises on other
     /// members cannot take its bytes. It counts against no quota. A member
     /// without a free-space source has no physical figure and always fits.
-    pub fn admit_survival(
-        &self,
-        member: &PoolMember,
-        size: u64,
-        admitted: &Admitted,
-    ) -> Result<()> {
-        let tx = self.database.begin_write()?;
-        let local_reserved = Self::local_reserved(&tx, std::slice::from_ref(member), admitted)?;
-        tx.abort()?;
+    pub fn admit_survival(&self, member: &PoolMember, size: u64, ledger: &Ledger) -> Result<()> {
+        let rows = Rows::committed(&self.database.begin_read()?)?;
+        let members = std::slice::from_ref(member);
+        let admitted = rows.admitted(ledger, members, None)?;
+        let local_reserved = rows.local_reserved(members, &admitted)?;
         let Some(space) = member.filesystem_space() else {
             return Ok(());
         };
@@ -943,54 +1079,10 @@ impl Catalog {
         Ok(())
     }
 
-    /// Physical bytes promised across local members: claims, leases and
-    /// survival writes in `admitted`, outstanding reservations, and raw
-    /// allocation overhead of pending raw uploads.
-    fn local_reserved(
-        tx: &redb::WriteTransaction,
-        members: &[PoolMember],
-        admitted: &Admitted,
-    ) -> Result<u64> {
-        let table = tx.open_table(MEMBERS)?;
-        // Conservatively share the reservation budget across all local
-        // paths. In particular, two directories on the same filesystem
-        // must not both promise the same currently-free physical bytes.
-        let mut local_reserved = admitted.local_physical(members);
-        for member in members.iter().filter(|member| member.is_local()) {
-            let record: MemberRecord = bincode::deserialize(
-                table
-                    .get(member.id.as_str())?
-                    .context("unregistered pool member")?
-                    .value(),
-            )?;
-            local_reserved = local_reserved
-                .checked_add(record.reserved)
-                .context("local pool reservation overflow")?;
-        }
-        let costed_members: BTreeMap<_, _> = members
-            .iter()
-            .filter(|member| member.free_space.is_some())
-            .map(|member| (member.id.as_str(), member))
-            .collect();
-        if !costed_members.is_empty() {
-            // Raw uploads own allocation overhead in addition to
-            // their logical quota. UPLOADS is keyed
-            // by upload id, so derive this from the outstanding rows only
-            // for custom space sources; directory/SFTP admission never
-            // scans uploads. Keep the durable logical counters unchanged.
-            for row in tx.open_table(UPLOADS)?.iter()? {
-                let upload: Upload = bincode::deserialize(row?.1.value())?;
-                if let Some(member) = costed_members.get(upload.member_id.as_str()) {
-                    local_reserved = local_reserved
-                        .checked_add(member.put_cost(upload.size).saturating_sub(upload.size))
-                        .context("local pool physical reservation overflow")?;
-                }
-            }
-        }
-        Ok(local_reserved)
-    }
-
-    fn choose(tx: &redb::WriteTransaction, request: Request<'_>) -> Result<Choice> {
+    fn choose<T: ReadableTable<&'static str, &'static [u8]>>(
+        rows: &Rows<T>,
+        request: Request<'_>,
+    ) -> Result<Choice> {
         let Request {
             size,
             members,
@@ -1000,12 +1092,10 @@ impl Catalog {
             admitted,
             prefer,
         } = request;
-        let local_reserved = Self::local_reserved(tx, members, admitted)?;
-        let table = tx.open_table(MEMBERS)?;
+        let local_reserved = rows.local_reserved(members, admitted)?;
         let rotate = target.is_none() && placement == SegmentPlacement::RoundRobinLocal;
         let (locals, start) = if rotate {
-            let meta = tx.open_table(META)?;
-            let last = meta.get(LAST_LOCAL_RESERVATION)?.and_then(|last| {
+            let last = rows.meta.get(LAST_LOCAL_RESERVATION)?.and_then(|last| {
                 members
                     .iter()
                     .position(|member| member.id.as_bytes() == last.value())
@@ -1029,7 +1119,7 @@ impl Catalog {
         let mut unavailable = None;
         let mut capacity_limited = false;
         for member in candidates {
-            let health = health_in(tx, &member.id)?;
+            let health = rows.health(&member.id)?;
             if let Some(reason) = health.quarantine.or(health.monitoring_error) {
                 unavailable = Some(NoAvailableMember {
                     member: member.id.clone(),
@@ -1041,12 +1131,7 @@ impl Catalog {
                 capacity_limited = true;
                 continue;
             }
-            let record: MemberRecord = bincode::deserialize(
-                table
-                    .get(member.id.as_str())?
-                    .context("unregistered pool member")?
-                    .value(),
-            )?;
+            let record = rows.record(&member.id)?;
             let occupied = record
                 .used
                 .checked_add(record.reserved)
@@ -1857,7 +1942,7 @@ mod raw_reservation_tests {
             Some(target),
             &BTreeSet::new(),
             SegmentPlacement::FirstFit,
-            &Admitted::default(),
+            &Mutex::default(),
             None,
         )
     }
@@ -1955,6 +2040,111 @@ mod raw_reservation_tests {
                 .evacuation_capacity
                 .sufficient
         );
+    }
+}
+
+#[cfg(test)]
+mod reservation_in_flight_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn fixture() -> (tempfile::TempDir, Catalog, Vec<PoolMember>) {
+        let root = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(&root.path().join("catalog"), "db", true, None).unwrap();
+        let members = vec![PoolMember {
+            id: "disk".into(),
+            identity: "memory://disk".into(),
+            store: Arc::new(object_store::memory::InMemory::new()),
+            capacity_bytes: 1000,
+            local_path: None,
+            min_free_bytes: 0,
+            metadata_headroom_bytes: 0,
+            health_device: None,
+            free_space: None,
+        }];
+        catalog.configure_members_except(&members, None).unwrap();
+        catalog.finish_initialization().unwrap();
+        (root, catalog, members)
+    }
+
+    fn fits(catalog: &Catalog, members: &[PoolMember], ledger: &Mutex<Ledger>, size: u64) -> bool {
+        catalog
+            .admit(
+                size,
+                members,
+                &BTreeSet::new(),
+                SegmentPlacement::FirstFit,
+                &ledger.lock().unwrap(),
+                None,
+            )
+            .is_ok()
+    }
+
+    /// A reservation counts once: in the ledger until a catalog view shows
+    /// its upload row, and in the catalog's reserved bytes from then on.
+    #[test]
+    fn a_reservation_counts_once_before_and_after_its_commit_is_visible() {
+        let (_root, catalog, members) = fixture();
+        let ledger = Mutex::new(Ledger::default());
+
+        // Chosen but not committed: only the ledger knows its 600 bytes.
+        let uncommitted = Uuid::new_v4();
+        ledger
+            .lock()
+            .unwrap()
+            .insert_reserving(uncommitted, "disk".into(), 600);
+        assert!(fits(&catalog, &members, &ledger, 400));
+        assert!(!fits(&catalog, &members, &ledger, 401));
+        ledger.lock().unwrap().remove(Key::Reserving(uncommitted));
+
+        // Committed while the reserver still holds its ledger entry.
+        let upload = catalog
+            .reserve(
+                "data",
+                600,
+                &members,
+                None,
+                &BTreeSet::new(),
+                SegmentPlacement::FirstFit,
+                &ledger,
+                None,
+            )
+            .unwrap();
+        ledger
+            .lock()
+            .unwrap()
+            .insert_reserving(upload.id.parse().unwrap(), "disk".into(), 600);
+        assert!(fits(&catalog, &members, &ledger, 400));
+        assert!(!fits(&catalog, &members, &ledger, 401));
+    }
+
+    /// A reservation leaves nothing in the ledger once it returns, and its
+    /// segment's lease stops counting because the catalog counts it.
+    #[test]
+    fn a_committed_reservation_replaces_its_lease() {
+        let (_root, catalog, members) = fixture();
+        let ledger = Mutex::new(Ledger::default());
+        let segment = Segid::new(41, 7);
+        ledger
+            .lock()
+            .unwrap()
+            .insert_lease(segment, "disk".into(), 600);
+        assert!(!fits(&catalog, &members, &ledger, 401));
+        catalog
+            .reserve(
+                "data",
+                600,
+                &members,
+                None,
+                &BTreeSet::new(),
+                SegmentPlacement::FirstFit,
+                &ledger,
+                Some(segment),
+            )
+            .unwrap();
+        assert_eq!(ledger.lock().unwrap().reserving().count(), 0);
+        assert!(fits(&catalog, &members, &ledger, 400));
+        assert!(!fits(&catalog, &members, &ledger, 401));
     }
 }
 
@@ -2246,7 +2436,7 @@ mod empty_quarantine_tests {
                 Some(member),
                 &BTreeSet::new(),
                 SegmentPlacement::FirstFit,
-                &Admitted::default(),
+                &Mutex::default(),
                 None,
             )
             .unwrap();
@@ -2306,7 +2496,7 @@ mod empty_quarantine_tests {
                     Some("old"),
                     &BTreeSet::new(),
                     SegmentPlacement::FirstFit,
-                    &Admitted::default(),
+                    &Mutex::default(),
                     None
                 )
                 .is_err()
@@ -2341,7 +2531,7 @@ mod empty_quarantine_tests {
                 Some("old"),
                 &BTreeSet::new(),
                 SegmentPlacement::FirstFit,
-                &Admitted::default(),
+                &Mutex::default(),
                 None,
             )
             .unwrap();
