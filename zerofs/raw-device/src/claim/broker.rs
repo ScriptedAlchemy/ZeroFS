@@ -18,6 +18,7 @@ const MAGIC: &[u8; 4] = b"ZCL1";
 const REQUEST_LEN: usize = 37;
 const GRANT_LEN: usize = REQUEST_LEN + 32;
 const REFUSED: &[u8; 4] = b"ERR1";
+const ABSENT: &[u8; 4] = b"ABS1";
 
 #[derive(Clone, Copy)]
 struct Request {
@@ -216,7 +217,14 @@ fn grant(connection: &OwnedFd, uid: u32, gid: u32) -> io::Result<()> {
         "claim request must not supply descriptors",
     )?;
     let request = Request::parse(&bytes[..n])?;
-    let claim = Claim::physical(request.role)?;
+    let claim = match Claim::physical(request.role) {
+        Err(error) if super::is_device_absent(&error) => {
+            let mut response = request.encode();
+            response[..ABSENT.len()].copy_from_slice(ABSENT);
+            return send(connection, &response, None);
+        }
+        result => result?,
+    };
     request.verify_labels(&claim)?;
     let mut response = bytes.to_vec();
     for value in super::physical::held_geometry(&claim.device, request.role.expected_bytes())?
@@ -327,6 +335,13 @@ impl Claim {
         let mut response = [0; 256];
         let (n, fd) = receive(&connection, &mut response)?;
         let response = &response[..n];
+        if let Some(binding) = response.strip_prefix(ABSENT) {
+            require(
+                role != PhysicalRole::Nvme && fd.is_none() && binding == &expected[MAGIC.len()..],
+                "invalid absent-device response",
+            )?;
+            return Err(super::device_absent());
+        }
         if let Some(reason) = response.strip_prefix(REFUSED) {
             require(fd.is_none(), "descriptor in claim refusal")?;
             return Err(io::Error::other(format!(

@@ -152,6 +152,25 @@ impl Machine {
         })
     }
 
+    pub(super) fn confirm_absent(&self, disk: &TrialDisk) -> io::Result<bool> {
+        // A missing primary alias alone can also mean incomplete udev setup.
+        for entry in fs::read_dir(self.root.join("dev/disk/by-id"))? {
+            if entry?
+                .file_name()
+                .to_str()
+                .is_some_and(|alias| alias_roles(alias, disk).0)
+            {
+                return Ok(false);
+            }
+        }
+        for entry in fs::read_dir(self.root.join("sys/block"))? {
+            if self.matches_inventory(&entry?.path(), disk)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn unique_identity(
         &self,
         by_id: &Path,
@@ -197,19 +216,23 @@ impl Machine {
             if entry.file_name() == OsStr::new(name) {
                 continue;
             }
-            let (serial, wwid) = kernel_identity(&other)?;
-            let dev = fs::read_to_string(other.join("dev"))?;
-            let udev = Udev::optional(&self.root, dev.trim())?;
             require(
-                serial.as_deref() != Some(disk.serial)
-                    && udev.serial.as_deref() != Some(disk.serial)
-                    && disk.wwn.is_none_or(|wwn| {
-                        wwid.as_deref() != Some(wwn) && udev.hex_wwn() != Some(wwn)
-                    }),
+                !self.matches_inventory(&other, disk)?,
                 "physical serial or WWN is claimed by multiple whole disks",
             )?;
         }
         Ok(())
+    }
+
+    fn matches_inventory(&self, sys: &Path, disk: &TrialDisk) -> io::Result<bool> {
+        let (serial, wwid) = kernel_identity(sys)?;
+        let dev = fs::read_to_string(sys.join("dev"))?;
+        let udev = Udev::optional(&self.root, dev.trim())?;
+        Ok(serial.as_deref() == Some(disk.serial)
+            || udev.serial.as_deref() == Some(disk.serial)
+            || disk
+                .wwn
+                .is_some_and(|wwn| wwid.as_deref() == Some(wwn) || udev.hex_wwn() == Some(wwn)))
     }
 }
 
@@ -415,6 +438,41 @@ mod tests {
         assert_eq!(PhysicalRole::Hdd18.expected_bytes(), 18_000_207_937_536);
         assert!("2318E6D18CE7".parse::<PhysicalRole>().is_err());
         assert!("/dev/sda".parse::<PhysicalRole>().is_err());
+    }
+
+    #[test]
+    fn a_missing_primary_alias_requires_absence_from_inventory() {
+        let root =
+            std::env::temp_dir().join(format!("zerofs-claim-inventory-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+        let scratch = Scratch(root);
+        let host = Machine {
+            _root: File::open(&scratch.0).unwrap(),
+            root: scratch.0.clone(),
+        };
+        let aliases = host.root.join("dev/disk/by-id");
+        let block = host.root.join("sys/block/fixture");
+        fs::create_dir_all(&aliases).unwrap();
+        fs::create_dir_all(block.join("device")).unwrap();
+        fs::write(block.join("dev"), "7:1").unwrap();
+
+        let disk = TrialDisk::for_role(PhysicalRole::Hdd6);
+        assert!(host.confirm_absent(disk).unwrap());
+        let alternate = aliases.join(format!("wwn-0x{}", disk.wwn.unwrap()));
+        std::os::unix::fs::symlink("../../fixture", &alternate).unwrap();
+        assert!(!host.confirm_absent(disk).unwrap());
+
+        fs::remove_file(alternate).unwrap();
+        fs::write(block.join("device/serial"), disk.serial).unwrap();
+        assert!(!host.confirm_absent(disk).unwrap());
+        fs::remove_file(block.join("dev")).unwrap();
+        assert!(host.confirm_absent(disk).is_err());
     }
 
     #[test]

@@ -41,7 +41,7 @@ The allocator has one bit per 4 KiB data block, at most 30.52 MB per decimal TB.
 | P3 catalog | A separate redb region holds placement, reservations and locators. Ordinary startup requires an existing catalog identity. | Prove restoration or replica recovery after P3 loss. |
 | P3 metadata and keys | The authority store holds the SlateDB objects. The key-envelope path routes to its own store on the same P3. Both retain an exclusive device claim. | Exercise rotation and restore a usable namespace after P3 loss. |
 | P3 scratch and clean cache | Both regions have fixed boundaries. The candidate leaves them unused and runs the clean cache in RAM. The fixture uses private temporary directories for sockets, control files and the mount. | Persistent hot-read retention and scratch allocation/reclamation on raw media. |
-| Loss and identity | Mounted reads returned EIO on the affected file after live media loss. The unaffected file remained readable. Offline migration moved a live segment and verified its destination hash. Cold startup with a missing member refused service before binding its sockets. | Degraded cold startup and hardware qualification of the physical claim and its host exclusions. |
+| Loss and identity | Mounted reads returned EIO on the affected file after live media loss. The unaffected file remained readable. Offline migration moved a live segment and verified its destination hash. Cold startup requires both HDDs by default. Operators can opt into startup with one confirmed absent HDD. | Hardware qualification of the physical claim and its host exclusions. |
 | Clients and admission | The original small synthetic profile admits one exact geometry in a dedicated 8–16 GiB Linux cgroup with zero swap, the package WebUI feature and a provisional 1 GiB companion allowance. | Combined acceptance on the larger candidate with the actual package, transfer rates, and hardware FLUSH/FUA on the raw path. |
 
 The original small synthetic fixture uses a 96 MiB journal, 32 MiB catalog, 88 MiB metadata, 8 MiB keys, 16 MiB scratch and 16 MiB clean-cache layout for this fixture. Object-store and transactional regions have different labels. Opening an incompatible region fails. All-device blank verification applies to initialization of either format. A quick wipe does not establish that the device passes that check.
@@ -53,3 +53,13 @@ The historical mounted receipts used the earlier 8 MiB writeback RAM budget and 
 ## Reproduction
 
 Run `scripts/test-raw-device.sh` on Studio Docker Desktop. It builds the locked standalone crate, runs the unit tests, then starts a separate network-isolated container with loop control and access to block major 7. Owned mappings use Linux autoclear and their backing inode is checked at teardown. The only ext4 volume is a disposable negative control for signature and mounted-device refusal. [Measured results and cleanup](evidence/raw-device-engine/README.md)
+
+Run `scripts/test-raw-device-mounted.sh --degraded-start BIN_DIR` to exercise
+cold startup with one absent member. Supply the Linux `zerofs` and
+`zerofs-raw-device` executables in `BIN_DIR`. The fixture uses a 44 GiB
+cgroup limit and checks the default refusal, byte-exact survivor reads, the
+affected paths and their I/O errors, and all three files after the missing
+member returns.
+
+The upstream SPDK Blobstore at the package's SPDK revision is a separate raw-block allocator with blob IDs, asynchronous I/O channels and metadata synchronization. Its metadata operations use the SPDK thread that loaded the store. Reusing it for payload reclamation remains an option. That integration would need a Rust-to-SPDK service boundary or FFI, exclusive claim transfer, a durable object-key-to-blob index, data-barrier verification and measured memory/CPU admission. This draft uses the positioned-I/O log for the bounded device proof. [Blobstore design](https://github.com/spdk/spdk/blob/0bbb7fe4/doc/blob.md) · [Blobstore API](https://github.com/spdk/spdk/blob/0bbb7fe4/include/spdk/blob.h)
+

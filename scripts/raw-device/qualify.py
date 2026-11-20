@@ -186,7 +186,7 @@ def run():
                 disks[0],
                 identities[0],
                 key,
-                expect="No such file",
+                expect="designated raw device is absent",
             )
             before = digest(disks[1].read_bytes())
             for wrong in (
@@ -338,7 +338,7 @@ def landing():
                 disks[1],
                 ids[1][1],
                 hashes[0],
-                expect="No such file",
+                expect="designated raw device is absent",
             )
             for role in ("authority", "catalog", "key-envelope", "cache", "scratch"):
                 assert (

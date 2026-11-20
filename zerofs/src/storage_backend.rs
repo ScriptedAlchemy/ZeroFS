@@ -8,7 +8,9 @@ use crate::config::Settings;
 use crate::metadata_fault::{LocalMetadataStore, MetadataFault};
 use crate::operator_required::operator_required;
 use crate::parse_object_store::{ObjectStoreScheme, ParsedStore, parse_url_opts};
-use crate::pool_object_store::{CATALOG_FILE_NAME, PoolMember, PoolObjectStore};
+use crate::pool_object_store::{
+    CATALOG_FILE_NAME, PoolMember, PoolObjectStore, UNAVAILABLE_MEMBER_IDENTITY,
+};
 use crate::sftp_transport::SftpSessionPool;
 use crate::storage_class_object_store::with_storage_class;
 use anyhow::{Context, Result};
@@ -150,7 +152,7 @@ pub(crate) async fn open_pool_storage(
         .context("[storage.pool] is not configured")?;
     settings.validate()?;
     let allow_degraded = config.allow_degraded_start && !initialize;
-    let missing = missing_member(settings, config, allow_degraded)?;
+    let mut missing = missing_directory_member(settings, config, allow_degraded)?;
     validate_directories(settings, missing.as_deref())?;
     let authority_url: url::Url = settings.storage.url.parse()?;
     let (authority, catalog_source, raw_journal) = if raw::is_p3(authority_url.scheme()) {
@@ -214,27 +216,33 @@ pub(crate) async fn open_pool_storage(
             let url: url::Url = member.url.parse()?;
             if raw::is_payload(url.scheme()) {
                 let binding = raw::RawBinding::parse(&url)?;
-                members.push(
-                    raw::open_member(member, binding, settings.raw_device_p3_candidate()).await?,
-                );
+                let identity = binding.locator();
+                let opened =
+                    raw::open_member(member, binding, settings.raw_device_p3_candidate()).await;
+                members.push(match opened {
+                    Ok(opened) => opened,
+                    Err(error) if raw::member_absent(&error) => {
+                        if !allow_degraded || missing.is_some() || config.members.len() < 2 {
+                            return Err(operator_required(error));
+                        }
+                        tracing::warn!(member = %member.id, "raw pool member absent at startup");
+                        missing = Some(member.id.clone());
+                        unavailable_member(member, identity)?
+                    }
+                    Err(error) => return Err(error),
+                });
+                continue;
+            }
+            if missing.as_deref() == Some(member.id.as_str()) {
+                members.push(unavailable_member(
+                    member,
+                    UNAVAILABLE_MEMBER_IDENTITY.into(),
+                )?);
                 continue;
             }
             let (scheme, member_path) = ObjectStoreScheme::parse(&url)?;
             let mut options = settings.cloud_provider_env_vars();
             options.extend(member.cloud_provider_env_vars());
-            if missing.as_deref() == Some(member.id.as_str()) {
-                members.push(PoolMember {
-                    id: member.id.clone(),
-                    identity: "unavailable".into(),
-                    store: Arc::new(object_store::memory::InMemory::new()),
-                    capacity_bytes: member.capacity_bytes()?,
-                    local_path: None,
-                    min_free_bytes: member.reserve_free_bytes()?,
-                    health_device: None,
-                    free_space: None,
-                });
-                continue;
-            }
             let identity = member_identity(&url, &options)?;
             let parsed = if scheme == ObjectStoreScheme::Sftp {
                 crate::parse_object_store::build_sftp_store(
@@ -380,7 +388,23 @@ fn resolved_path(path: &FsPath) -> Result<PathBuf> {
     Ok(result)
 }
 
-fn missing_member(
+fn unavailable_member(
+    member: &crate::config::StoragePoolMemberConfig,
+    identity: String,
+) -> Result<PoolMember> {
+    Ok(PoolMember {
+        id: member.id.clone(),
+        identity,
+        store: Arc::new(object_store::memory::InMemory::new()),
+        capacity_bytes: member.capacity_bytes()?,
+        local_path: None,
+        min_free_bytes: member.reserve_free_bytes()?,
+        health_device: None,
+        free_space: None,
+    })
+}
+
+fn missing_directory_member(
     settings: &Settings,
     config: &crate::config::StoragePoolConfig,
     allow_degraded: bool,
