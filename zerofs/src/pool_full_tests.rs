@@ -636,10 +636,14 @@ async fn writes_resume_without_a_restart_when_space_returns() {
         )
         .await;
         let Filled { after, after_data } = refuse_admitted_writes(test, &f).await;
-        // Space returns: the filesystem reports more free bytes than when the
-        // writes failed, and writes succeed again.
+        // Space returns: writes stop failing, and once every write already in
+        // flight has settled, the filesystem reports more free bytes than when
+        // the writes failed. The members stay marked full until then, so this
+        // fsync answers ENOSPC; it waits out any seal still uploading, which
+        // would otherwise record the new free figure in its mark.
         f.a.make_room();
         f.b.make_room();
+        assert_eq!(fsync(test, &f.fs, after).await, Err(FsError::NoSpace));
         f.a.set_available(65 * GIB);
         f.b.set_available(65 * GIB);
         write(test, &f.fs, after, &after_data).await.unwrap();

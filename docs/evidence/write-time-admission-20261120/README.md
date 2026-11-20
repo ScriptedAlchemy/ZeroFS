@@ -75,8 +75,8 @@ covers the restart.
 ## Library checks
 
 `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D
-warnings` passed. `cargo test --lib` passed 2,842 tests, with 0 failed and 55
-ignored, before the codec bound test was added. With admission disabled in the
+warnings` passed. `cargo test --lib` passed 2,843 tests, with 0 failed and 55
+ignored, at the PR head. With admission disabled in the
 fixture, 9 of the 13 full-pool tests fail. With the journal re-lease removed,
 the restart test fails.
 
