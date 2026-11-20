@@ -38,6 +38,8 @@ const P3_LAYOUT_MIB: [u64; 6] = [64, 16, 48, 4, 4, 8];
 const HDD_BYTES: u64 = 64 * MIB;
 const PASSWORD: &str = "raw-metadata-copy-fixture";
 const HDDS: [&str; 2] = ["hdd-a", "hdd-b"];
+/// Metadata headroom on each 64 MiB member, far above one generation.
+const HEADROOM: u64 = 8 * MIB;
 
 struct Fixture {
     root: tempfile::TempDir,
@@ -170,6 +172,7 @@ impl Fixture {
                     "members": members,
                     "metadata_survival": {
                         "format_version": 1,
+                        "headroom_bytes": HEADROOM,
                         "commit_interval_seconds": self.interval_seconds,
                         "final_pause_max_milliseconds": self.final_pause_milliseconds,
                     },
@@ -316,13 +319,17 @@ async fn make_directory(fs: &ZeroFS, parent: u64, name: &str, mode: u32) -> Resu
         .0)
 }
 
-/// The members holding a file's current extents.
-async fn members_of(fs: &ZeroFS, pool: &PoolObjectStore, inode: u64) -> Result<BTreeSet<String>> {
+/// The placements of a file's current extents.
+async fn placements_of(
+    fs: &ZeroFS,
+    pool: &PoolObjectStore,
+    inode: u64,
+) -> Result<Vec<crate::pool_object_store::PoolPlacement>> {
     let Inode::File(file) = fs.inode_store.get(inode).await? else {
         anyhow::bail!("{inode} is not a file");
     };
     let placements = pool.placements().await?;
-    let mut members = BTreeSet::new();
+    let mut found = Vec::new();
     let extent = crate::fs::EXTENT_SIZE as u64;
     for index in 0..file.size.div_ceil(extent) {
         let bytes = fs
@@ -338,9 +345,18 @@ async fn members_of(fs: &ZeroFS, pool: &PoolObjectStore, inode: u64) -> Result<B
             .iter()
             .find(|placement| placement.location.as_ref().ends_with(key.as_str()))
             .context("extent placement")?;
-        members.insert(placement.member_id.clone());
+        found.push(placement.clone());
     }
-    Ok(members)
+    Ok(found)
+}
+
+/// The members holding a file's current extents.
+async fn members_of(fs: &ZeroFS, pool: &PoolObjectStore, inode: u64) -> Result<BTreeSet<String>> {
+    Ok(placements_of(fs, pool, inode)
+        .await?
+        .into_iter()
+        .map(|placement| placement.member_id)
+        .collect())
 }
 
 /// Move every segment of a file to one member.
@@ -896,6 +912,107 @@ async fn payload_a_generation_maps_outlives_its_deletion_and_a_restart() -> Resu
     Ok(())
 }
 
+/// Segment data fills both members until WRITE answers ENOSPC. The metadata
+/// headroom still takes the next generations, so mutations keep working, and
+/// a deleted file's room takes writes again once its generations retire.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pool_full_of_data_still_commits_generations_and_keeps_mutations_open() -> Result<()> {
+    let fixture = Fixture::new().await;
+    let running = fixture.start().await?;
+    let fs = running.fs();
+    let auth = AuthContext::default();
+    let creds = Credentials::from_auth_context(&auth);
+    let attributes = SetAttributes {
+        mode: SetMode::Set(0o644),
+        ..Default::default()
+    };
+    let chunk = payload(9, 256 * 1024);
+    let length = chunk.len() as u64;
+    let (blocked, _) = fs.create(&creds, 0, b"blocked", &attributes).await?;
+    let mut files = Vec::new();
+    loop {
+        ensure!(files.len() < 64, "WRITE never answered ENOSPC");
+        let name = format!("fill-{}", files.len());
+        let (inode, _) = fs.create(&creds, 0, name.as_bytes(), &attributes).await?;
+        files.push(name);
+        for index in 0..12 {
+            match fs.write(&auth, inode, index * length, &chunk).await {
+                Ok(_) => {}
+                Err(FsError::NoSpace) => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let _ = fs.administrative_remote_durability().await?;
+        // A WRITE claims an upper bound, and a flush returns what its segment
+        // did not use. The pool is full once a WRITE is refused after one.
+        if matches!(
+            fs.write(&auth, blocked, 0, &chunk).await,
+            Err(FsError::NoSpace)
+        ) {
+            break;
+        }
+    }
+
+    // Generations land in the headroom that WRITE may not use.
+    running.survival().commit_and_report().await?;
+    make_directory(fs, 0, "after-full", 0o755)
+        .await
+        .context("mkdir on a full pool")?;
+    ensure!(
+        matches!(
+            fs.write(&auth, blocked, 0, &chunk).await,
+            Err(FsError::NoSpace)
+        ),
+        "a generation must not free room for WRITE"
+    );
+    for member in running.pool().status().await?.members {
+        ensure!(
+            member.space.metadata_headroom_used_bytes
+                + member.space.metadata_headroom_remaining_bytes
+                == HEADROOM
+                && member.space.metadata_headroom_remaining_bytes > 0,
+            "{} reports its headroom as {:?}",
+            member.id,
+            member.space
+        );
+    }
+
+    // Reclaimed room refills the headroom before WRITE may use it, so free
+    // more than the headroom on each member: 30 MiB of files.
+    let mut reclaimed = BTreeSet::new();
+    for name in &files[..10] {
+        let inode = fs.lookup(&creds, 0, name.as_bytes()).await?;
+        reclaimed.extend(
+            placements_of(fs, running.pool(), inode)
+                .await?
+                .into_iter()
+                .map(|placement| placement.location),
+        );
+        fs.remove(&auth, 0, name.as_bytes()).await?;
+    }
+    let _ = fs.administrative_remote_durability().await?;
+    for segment in &reclaimed {
+        running.pool().delete(segment).await?;
+    }
+    for _ in 0..2 {
+        running.survival().commit_and_report().await?;
+    }
+    running
+        .pool()
+        .cleanup_released_survival_garbage()
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    fs.write(&auth, blocked, 0, &chunk)
+        .await
+        .context("write after reclaim")?;
+    let _ = fs
+        .administrative_remote_durability()
+        .await
+        .context("flush after reclaim")?;
+    running.stop().await;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn generations_reach_both_members_at_the_configured_cadence() -> Result<()> {
     // Writers wait out each cut instead of being told to retry.
@@ -924,48 +1041,76 @@ async fn generations_reach_both_members_at_the_configured_cadence() -> Result<()
     Ok(())
 }
 
-#[test]
-fn a_raw_pool_refuses_separately_listed_replicas() {
-    let root = tempfile::tempdir().unwrap();
+/// Settings for a one-member raw pool with this survival table.
+fn raw_survival_settings(root: &std::path::Path, survival: serde_json::Value) -> Result<Settings> {
     let pool = Uuid::new_v4();
     let url = |scheme: &str, name: &str, extra: &str| {
         format!(
             "{scheme}://{}/{name}?pool={pool}&member={}{extra}",
-            root.path().display(),
+            root.display(),
             Uuid::new_v4()
         )
     };
-    let load = |survival: serde_json::Value| {
-        let document = serde_json::json!({
-            "cache": {"dir": root.path().join("cache"), "disk_size_gb": 0.0},
-            "storage": {
-                "url": url("raw+p3-testfile", "p3", "&layout_mib=64,16,48,4,4,8"),
-                "encryption_password": PASSWORD,
-                "pool": {
-                    "members": [{
-                        "id": "hdd-a",
-                        "url": url("raw+testfile", "a", ""),
-                        "capacity_gb": 0.064,
-                        "reserve_free_gb": 0.0,
-                    }],
-                    "metadata_survival": survival,
-                },
+    let document = serde_json::json!({
+        "cache": {"dir": root.join("cache"), "disk_size_gb": 0.0},
+        "storage": {
+            "url": url("raw+p3-testfile", "p3", "&layout_mib=64,16,48,4,4,8"),
+            "encryption_password": PASSWORD,
+            "pool": {
+                "members": [{
+                    "id": "hdd-a",
+                    "url": url("raw+testfile", "a", ""),
+                    "capacity_gb": 0.064,
+                    "reserve_free_gb": 0.001,
+                }],
+                "metadata_survival": survival,
             },
-            "servers": {},
-            "telemetry": {"enabled": false},
-        });
-        let config = root.path().join("zerofs.toml");
-        std::fs::write(&config, toml::to_string(&document).unwrap()).unwrap();
-        Settings::from_file(config)
-    };
+        },
+        "servers": {},
+        "telemetry": {"enabled": false},
+    });
+    let config = root.join("zerofs.toml");
+    std::fs::write(&config, toml::to_string(&document).unwrap()).unwrap();
+    Settings::from_file(config)
+}
+
+#[test]
+fn a_raw_pool_refuses_separately_listed_replicas() {
+    let root = tempfile::tempdir().unwrap();
     // Every member of a raw pool holds the generations, so the set is not
     // configurable.
-    load(serde_json::json!({"format_version": 1})).unwrap();
+    raw_survival_settings(
+        root.path(),
+        serde_json::json!({"format_version": 1, "headroom_bytes": HEADROOM}),
+    )
+    .unwrap();
     assert!(
-        load(serde_json::json!({
-            "format_version": 1,
-            "replicas": [{"id": "extra", "device_id": "x", "dir": "/var/lib/extra"}],
-        }))
+        raw_survival_settings(
+            root.path(),
+            serde_json::json!({
+                "format_version": 1,
+                "headroom_bytes": HEADROOM,
+                "replicas": [{"id": "extra", "device_id": "x", "dir": "/var/lib/extra"}],
+            })
+        )
         .is_err()
     );
+}
+
+/// The headroom and the member's reserve must fit in its capacity. The
+/// default 4 GiB does not fit a 64 MB member.
+#[test]
+fn a_metadata_headroom_that_does_not_fit_a_member_is_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let load = |survival: serde_json::Value| raw_survival_settings(root.path(), survival);
+    assert!(load(serde_json::json!({"format_version": 1})).is_err());
+    // 0.064 GB of capacity less the 0.001 GB reserve.
+    let room: u64 = 63_000_000;
+    load(serde_json::json!({"format_version": 1, "headroom_bytes": room - 1})).unwrap();
+    for headroom in [room, i64::MAX as u64] {
+        assert!(
+            load(serde_json::json!({"format_version": 1, "headroom_bytes": headroom})).is_err(),
+            "{headroom} bytes of headroom were accepted"
+        );
+    }
 }

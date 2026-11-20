@@ -73,8 +73,10 @@ dir = "/mnt/disk-a/metadata-replica"
 | `replica_timeout_seconds` | 90 | Deadline for copying a generation to the replicas. |
 | `commit_deadline_seconds` | 180 | Deadline for admitted mutations to finish before a cut. |
 | `checkpoint_lifetime_seconds` | 600 | Lifetime of the database checkpoint a generation pins. |
+| `headroom_bytes` | 4294967296 | Raw devices only. Room on each member above its reserve that only generations may use. |
 
-Validation refuses a raw pool that lists replicas or an authority replica. It
+Validation refuses a raw pool that lists replicas or an authority replica, or
+whose reserve plus `headroom_bytes` does not fit within a member's capacity. It
 refuses a directory pool with no replica, duplicate ids or device ids,
 relative paths, and a replica directory that overlaps the authority, the
 catalog, a member or another replica. A separate `[wal]` store is refused.
@@ -124,6 +126,17 @@ A replica that is full, stale, corrupt or failing latches mutation admission:
 mutations fail with EIO until an operator repairs the replica set. A lost
 replica latches EROFS. A postponed cut and a replica timeout before any
 record do not latch. The next interval retries.
+
+On a raw P3 authority, every member keeps `headroom_bytes` free above its
+reserve for generations, 4 GiB (4,294,967,296 bytes) unless configured.
+Ordinary WRITEs, segment leases and catalog reservations may not use it, so a
+pool full of data answers WRITE with ENOSPC and the next generation still
+commits. A replica is full only once the generations outgrow the headroom.
+The reserve plus the headroom must fit within every member's capacity.
+`headroom_bytes` is refused on a directory authority, whose replicas are not
+pool members. `pool status` reports each member's
+`space.metadata_headroom_used_bytes` and
+`space.metadata_headroom_remaining_bytes`.
 
 Password changes are refused while survival is enabled. Removing the
 configuration table does not disable survival: a writer refuses to start when
@@ -235,9 +248,6 @@ mechanism. Its rows run on the directory backend.
 
 ## Known limits
 
-- **No room kept for generations.** Segment data may fill a raw member up to
-  its reserve. The next generation is then refused as `Full`, which latches
-  EIO for every mutation, although WRITE alone would have answered ENOSPC.
 - **No hardware evidence.** No test here runs on a physical device, an HDD or
   across a real power cut.
 - **Log space.** A raw member's log is append-only. Every commit appends a

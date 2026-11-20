@@ -585,6 +585,7 @@ pub(crate) async fn recover_regions(
             capacity_bytes: capacity,
             local_path: local.filter(|dir| dir.is_dir()),
             min_free_bytes: 0,
+            metadata_headroom_bytes: 0,
             health_device: None,
             free_space: None,
         });
@@ -777,6 +778,7 @@ pub(crate) async fn rebuild_raw_p3(
                     capacity_bytes: capacity,
                     local_path: None,
                     min_free_bytes: 0,
+                    metadata_headroom_bytes: 0,
                     health_device: None,
                     free_space: None,
                 });

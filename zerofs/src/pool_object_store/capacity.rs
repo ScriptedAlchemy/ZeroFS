@@ -77,11 +77,21 @@ fn assess_with(
         }
         let physical = match &observed {
             None => None,
-            Some(Ok(observed)) => Some(space::physical_room(
-                *observed,
-                config.min_free_bytes,
-                local_reserved,
-            )),
+            Some(Ok(observed)) => {
+                // Survival admission counts only this member's promises.
+                let promised = member.reserved_bytes.saturating_add(member.admitted_bytes);
+                let remaining = space::physical_room(*observed, config.min_free_bytes, promised)
+                    .unwrap_or(0)
+                    .min(config.metadata_headroom_bytes);
+                member.space.metadata_headroom_remaining_bytes = remaining;
+                member.space.metadata_headroom_used_bytes =
+                    config.metadata_headroom_bytes - remaining;
+                Some(space::physical_room(
+                    *observed,
+                    config.write_floor(),
+                    local_reserved,
+                ))
+            }
             Some(Err(_)) => None,
         };
         member.space.full = match full.get(&member.id) {
@@ -129,14 +139,14 @@ fn assess_with(
         }
         let budget = filesystems.entry(observed.filesystem).or_insert(Budget {
             available: observed.available,
-            reserve: config.min_free_bytes.saturating_add(observed.committed),
+            reserve: config.write_floor().saturating_add(observed.committed),
             quota: 0,
         });
         // Several roots may share one filesystem: add quotas, never free bytes.
         budget.available = budget.available.min(observed.available);
         budget.reserve = budget
             .reserve
-            .max(config.min_free_bytes.saturating_add(observed.committed));
+            .max(config.write_floor().saturating_add(observed.committed));
         budget.quota = budget.quota.saturating_add(quota);
     }
     let filesystems: BTreeMap<_, _> = filesystems
@@ -207,6 +217,7 @@ mod tests {
                 capacity_bytes: quota,
                 local_path: Some(format!("/{id}").into()),
                 min_free_bytes: 10,
+                metadata_headroom_bytes: 0,
                 health_device: None,
                 free_space: None,
             },

@@ -919,18 +919,19 @@ impl Catalog {
     }
 
     /// Check that a `size`-byte survival object fits physically on `member`
-    /// above its free space reserve and beside every outstanding promise. It
-    /// counts against no quota. A member without a free-space source has no
-    /// physical figure and always fits.
+    /// above its free space reserve and beside every promise on it. It may
+    /// use the metadata headroom that ordinary writes leave free. Survival
+    /// targets raw members, which never share a device, so promises on other
+    /// members cannot take its bytes. It counts against no quota. A member
+    /// without a free-space source has no physical figure and always fits.
     pub fn admit_survival(
         &self,
         member: &PoolMember,
         size: u64,
-        members: &[PoolMember],
         admitted: &Admitted,
     ) -> Result<()> {
         let tx = self.database.begin_write()?;
-        let local_reserved = Self::local_reserved(&tx, members, admitted)?;
+        let local_reserved = Self::local_reserved(&tx, std::slice::from_ref(member), admitted)?;
         tx.abort()?;
         let Some(space) = member.filesystem_space() else {
             return Ok(());
@@ -1057,7 +1058,7 @@ impl Catalog {
                 None => None,
                 Some(Ok(space)) => Some(super::space::physical_room(
                     space,
-                    member.min_free_bytes,
+                    member.write_floor(),
                     local_reserved,
                 )),
                 Some(Err(error)) => {
@@ -1836,6 +1837,7 @@ mod raw_reservation_tests {
             capacity_bytes: 64 << 10,
             local_path: None,
             min_free_bytes: 0,
+            metadata_headroom_bytes: 0,
             health_device: None,
             free_space: available.map(|bytes| Arc::new(RawSpace(bytes)) as _),
         }
@@ -1972,6 +1974,7 @@ mod catalog_lock_tests {
             capacity_bytes: 1024,
             local_path: None,
             min_free_bytes: 0,
+            metadata_headroom_bytes: 0,
             health_device: None,
             free_space: None,
         };
@@ -2150,6 +2153,7 @@ mod legacy_health_compatibility {
             capacity_bytes: 1024,
             local_path: None,
             min_free_bytes: 0,
+            metadata_headroom_bytes: 0,
             health_device: None,
             free_space: None,
         };
@@ -2217,6 +2221,7 @@ mod empty_quarantine_tests {
                 capacity_bytes: 1024,
                 local_path: None,
                 min_free_bytes: 0,
+                metadata_headroom_bytes: 0,
                 health_device: None,
                 free_space: None,
             })

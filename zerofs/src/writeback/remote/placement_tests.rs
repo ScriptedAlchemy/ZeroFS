@@ -31,6 +31,7 @@ impl Fixture {
             capacity_bytes: 1024 * 1024,
             local_path: None,
             min_free_bytes: 0,
+            metadata_headroom_bytes: 0,
             health_device: None,
             free_space: None,
         })

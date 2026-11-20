@@ -165,6 +165,7 @@ fn member(
         capacity_bytes: declared,
         local_path,
         min_free_bytes: RESERVE,
+        metadata_headroom_bytes: 0,
         health_device: None,
         free_space: None,
     };

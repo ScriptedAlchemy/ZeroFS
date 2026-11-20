@@ -88,6 +88,9 @@ pub struct PoolMember {
     pub capacity_bytes: u64,
     pub local_path: Option<PathBuf>,
     pub min_free_bytes: u64,
+    /// Room above `min_free_bytes` that only metadata-survival writes may
+    /// use. Zero where no generations live on the member.
+    pub metadata_headroom_bytes: u64,
     pub health_device: Option<PathBuf>,
     /// Real free space of a local member. `None` reads `statvfs` on
     /// `local_path`; tests inject exact numbers. Unused for remote members.
@@ -136,6 +139,10 @@ pub struct MemberSpace {
     pub declared_exceeds_filesystem: bool,
     /// Why placement skips this member for lack of room; null when it has room.
     pub full: Option<space::Full>,
+    /// Part of the metadata headroom already taken by survival generations.
+    pub metadata_headroom_used_bytes: u64,
+    /// Part of the metadata headroom still free for survival generations.
+    pub metadata_headroom_remaining_bytes: u64,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -1298,9 +1305,9 @@ impl PoolObjectStore {
 
     /// PUT a metadata-survival object into `member`'s own store. Its physical
     /// cost is claimed for as long as the PUT runs, so it never takes room
-    /// promised to segment data, and it stays above the member's reserve like
-    /// every other write. Fails with the typed no-space error, writing
-    /// nothing, when it does not fit.
+    /// promised to segment data on that member. It may use the member's
+    /// metadata headroom but stays above its reserve. Fails with the typed
+    /// no-space error, writing nothing, when it does not fit.
     pub(crate) async fn put_survival(
         &self,
         member: &str,
@@ -1311,13 +1318,12 @@ impl PoolObjectStore {
         let target = self.member(member)?.clone();
         let store = Arc::clone(&target.store);
         let bytes = payload.content_length() as u64;
-        let members = self.inner.members.clone();
         let ledger = Arc::clone(&self.inner.ledger);
         let key = self
             .catalog(move |catalog| {
                 let mut ledger = ledger.lock().unwrap();
-                let admitted = ledger.admitted(&members, None);
-                catalog.admit_survival(&target, bytes, &members, &admitted)?;
+                let admitted = ledger.admitted(std::slice::from_ref(&target), None);
+                catalog.admit_survival(&target, bytes, &admitted)?;
                 Ok(ledger.insert_claim(admission::Key::Survival, target.id, bytes))
             })
             .await

@@ -103,6 +103,7 @@ impl Fixture {
             capacity_bytes: self.capacity,
             local_path: None,
             min_free_bytes: 0,
+            metadata_headroom_bytes: 0,
             health_device: None,
             free_space: None,
         }
@@ -339,6 +340,132 @@ async fn survival_writes_never_take_room_promised_to_segments() {
             .unwrap(),
         Bytes::from_static(b"m")
     );
+}
+
+/// Segment data fills one raw member to its write floor while a WRITE claim
+/// larger than the headroom waits on the other. Ordinary admission refuses
+/// the full member, and survival writes still fit in its headroom.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn survival_writes_use_the_headroom_that_segment_data_may_not() {
+    use crate::raw_member::RawMemberStore;
+    use crate::retrying_object_store::is_no_space;
+    use crate::storage_backend::raw::RawSpace;
+    use zerofs_raw_device::{Identity, RawStore, Role};
+
+    const SIZE: u64 = 1 << 20;
+    const RESERVE: u64 = 8192;
+    const HEADROOM: u64 = 64 << 10;
+    let fixture = Fixture::new(SIZE);
+    let mut raws = Vec::new();
+    let mut members = Vec::new();
+    for (index, first) in [true, false].into_iter().enumerate() {
+        let backing = fixture.catalog.path().join(format!("raw-{index}"));
+        std::fs::File::create(&backing)
+            .unwrap()
+            .set_len(SIZE)
+            .unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&backing)
+            .unwrap();
+        let identity = Identity {
+            pool_uuid: [1; 16],
+            member_uuid: [index as u8 + 2; 16],
+            role: Role::Data,
+        };
+        let raw = RawMemberStore::new(
+            RawStore::provision(file, SIZE, identity).unwrap(),
+            (),
+            RESERVE,
+        )
+        .unwrap();
+        let mut member = fixture.member(first);
+        member.store = Arc::new(raw.clone());
+        member.min_free_bytes = RESERVE;
+        member.metadata_headroom_bytes = HEADROOM;
+        member.free_space = Some(Arc::new(RawSpace::new(index as u64 + 1, raw.clone())));
+        raws.push(raw);
+        members.push(member);
+    }
+    let pool = fixture.open_balanced(members, true).await;
+
+    // Fill hdd-a with one segment as large as ordinary admission allows.
+    let room = pool.status().await.unwrap().members[0].available_bytes;
+    let filled = (1..=room)
+        .rev()
+        .find(|bytes| RawStore::put_cost(*bytes).unwrap() <= room)
+        .unwrap();
+    let claim = pool.admit(filled, Some("hdd-a".into())).await.unwrap();
+    assert_eq!(claim.member(), "hdd-a");
+    claim.fund(Segid::new(41, 960), filled).unwrap();
+    drop(claim);
+    let body = Bytes::from(vec![6; filled as usize]);
+    pool.put_opts(&segment(960), body.clone().into(), create_options())
+        .await
+        .unwrap();
+    assert_eq!(placement(&pool, &segment(960)).await, "hdd-a");
+    let status = pool.status().await.unwrap();
+    assert!(status.members[0].available_bytes < RawStore::put_cost(1).unwrap());
+    assert_eq!(
+        status.members[0].space.metadata_headroom_remaining_bytes,
+        HEADROOM
+    );
+
+    // A WRITE claim larger than the headroom lands on hdd-b instead.
+    let pending = pool
+        .admit(2 * HEADROOM, Some("hdd-a".into()))
+        .await
+        .unwrap();
+    assert_eq!(pending.member(), "hdd-b");
+
+    let survival = |name: &str| Path::from(format!(".zerofs-survival/v1/{name}"));
+    let generation = Bytes::from(vec![7; (HEADROOM / 2) as usize]);
+    pool.put_survival(
+        "hdd-a",
+        &survival("generation"),
+        generation.clone().into(),
+        PutOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        raws[0]
+            .get(&survival("generation"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+        generation
+    );
+    let status = pool.status().await.unwrap();
+    let space = &status.members[0].space;
+    assert!(space.metadata_headroom_used_bytes >= HEADROOM / 2);
+    assert_eq!(
+        space.metadata_headroom_used_bytes + space.metadata_headroom_remaining_bytes,
+        HEADROOM
+    );
+
+    // Survival still never takes the reserve.
+    assert!(is_no_space(
+        &pool
+            .put_survival(
+                "hdd-a",
+                &survival("too-large"),
+                Bytes::from(vec![8; HEADROOM as usize]).into(),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap_err()
+    ));
+    drop(pending);
+
+    // Deleting the segment frees WRITE room on hdd-a again.
+    pool.delete(&segment(960)).await.unwrap();
+    let claim = pool.admit(filled / 2, Some("hdd-a".into())).await.unwrap();
+    assert_eq!(claim.member(), "hdd-a");
 }
 
 #[derive(Debug, Default)]
@@ -1891,6 +2018,7 @@ async fn two_through_five_physical_roots_preserve_exact_unique_placements() {
                 capacity_bytes: 8,
                 local_path: Some(directory.canonicalize().unwrap()),
                 min_free_bytes: 0,
+                metadata_headroom_bytes: 0,
                 health_device: None,
                 free_space: None,
             });
@@ -2186,6 +2314,7 @@ async fn persistent_pool(root: &std::path::Path, initialize: bool) -> PoolObject
             capacity_bytes: 1024 * 1024,
             local_path: Some(root.join(id)),
             min_free_bytes: 0,
+            metadata_headroom_bytes: 0,
             health_device: None,
             free_space: None,
         })
@@ -3569,6 +3698,7 @@ async fn degraded_member_counts_once_in_automatic_evacuation_fences() {
                 capacity_bytes: 128,
                 local_path: None,
                 min_free_bytes: 0,
+                metadata_headroom_bytes: 0,
                 health_device: None,
                 free_space: None,
             });

@@ -2405,6 +2405,22 @@ impl Settings {
             .is_some_and(|scheme| crate::storage_backend::raw::is_p3(&scheme.to_ascii_lowercase()))
     }
 
+    /// Room each pool member keeps free for metadata-survival generations.
+    /// Generations live on the members only on a raw P3 authority.
+    pub(crate) fn metadata_headroom_bytes(&self) -> u64 {
+        if !self.raw_p3_authority() {
+            return 0;
+        }
+        self.storage
+            .pool
+            .as_ref()
+            .and_then(|pool| pool.metadata_survival.as_ref())
+            .map_or(
+                0,
+                crate::metadata_survival::MetadataSurvivalConfig::member_headroom_bytes,
+            )
+    }
+
     pub(crate) fn raw_device_p3_candidate(&self) -> bool {
         self.runtime.as_ref().and_then(|runtime| runtime.profile)
             == Some(RuntimeProfile::RawDeviceP3Candidate)

@@ -82,6 +82,9 @@ const fn default_final_pause() -> u64 {
     1000
 }
 
+/// Metadata headroom kept on each raw pool member unless configured: 4 GiB.
+pub(crate) const DEFAULT_HEADROOM_BYTES: u64 = 4 << 30;
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct MetadataSurvivalConfig {
@@ -96,6 +99,10 @@ pub struct MetadataSurvivalConfig {
     pub(crate) recovery_mode: String,
     #[serde(default)]
     pub(crate) reserve_free_bytes: u64,
+    /// Room on each raw pool member that only generations may use. Defaults
+    /// to [`DEFAULT_HEADROOM_BYTES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) headroom_bytes: Option<u64>,
     #[serde(default = "default_commit_interval")]
     pub(crate) commit_interval_seconds: u64,
     #[serde(default = "default_replica_timeout")]
@@ -135,6 +142,10 @@ fn nested(left: &FsPath, right: &FsPath) -> bool {
 }
 
 impl MetadataSurvivalConfig {
+    pub(crate) fn member_headroom_bytes(&self) -> u64 {
+        self.headroom_bytes.unwrap_or(DEFAULT_HEADROOM_BYTES)
+    }
+
     pub(crate) fn validate(&self, settings: &Settings, pool: &StoragePoolConfig) -> Result<()> {
         ensure!(
             self.format_version == format::FORMAT_VERSION,
@@ -167,8 +178,22 @@ impl MetadataSurvivalConfig {
                     && self.authority_device_id.is_empty(),
                 "on a raw P3 authority every pool member holds the recovery generations; remove authority_replica_id, authority_device_id and [[replicas]]"
             );
+            let headroom = self.member_headroom_bytes();
+            for member in &pool.members {
+                let floor = member.reserve_free_bytes()?.checked_add(headroom);
+                let capacity = member.capacity_bytes()?;
+                ensure!(
+                    floor.is_some_and(|floor| floor < capacity),
+                    "headroom_bytes ({headroom}) and the reserve of pool member {} must fit within its capacity",
+                    member.id
+                );
+            }
             return Ok(());
         }
+        ensure!(
+            self.headroom_bytes.is_none(),
+            "headroom_bytes applies only on a raw P3 authority, where pool members hold the generations"
+        );
         ensure!(
             !self.replicas.is_empty(),
             "at least one metadata replica on an independent device is required besides the authority; survival needs two devices"

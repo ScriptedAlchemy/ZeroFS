@@ -1635,6 +1635,7 @@ mod role_decision_tests {
                 capacity_bytes: CAPACITY,
                 local_path: None,
                 min_free_bytes: 0,
+                metadata_headroom_bytes: 0,
                 health_device: None,
                 free_space: None,
             }],

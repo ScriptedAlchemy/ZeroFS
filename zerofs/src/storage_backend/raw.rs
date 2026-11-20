@@ -263,6 +263,7 @@ pub(super) async fn open_member(
     config: &crate::config::StoragePoolMemberConfig,
     binding: RawBinding,
     exact_size: bool,
+    metadata_headroom_bytes: u64,
 ) -> Result<crate::pool_object_store::PoolMember> {
     use crate::pool_object_store::PoolMember;
     use crate::raw_member::RawMemberStore;
@@ -309,6 +310,7 @@ pub(super) async fn open_member(
             capacity_bytes: capacity,
             local_path: None,
             min_free_bytes,
+            metadata_headroom_bytes,
             health_device: None,
             free_space: Some(Arc::new(RawSpace::new(device, store))),
         })
@@ -321,6 +323,7 @@ pub(super) async fn open_member(
     _: &crate::config::StoragePoolMemberConfig,
     _: RawBinding,
     _: bool,
+    _: u64,
 ) -> Result<crate::pool_object_store::PoolMember> {
     bail!("raw+loop requires Linux")
 }

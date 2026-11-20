@@ -58,6 +58,13 @@ impl FreeSpace for Statvfs {
 }
 
 impl PoolMember {
+    /// The free-space floor for everything except survival writes: the
+    /// reserve plus the metadata headroom.
+    pub(super) fn write_floor(&self) -> u64 {
+        self.min_free_bytes
+            .saturating_add(self.metadata_headroom_bytes)
+    }
+
     pub(super) fn is_local(&self) -> bool {
         self.free_space.is_some() || self.local_path.is_some()
     }
@@ -218,6 +225,7 @@ mod tests {
             capacity_bytes: 1000,
             local_path: available.map(|_| "/member".into()),
             min_free_bytes: 10,
+            metadata_headroom_bytes: 0,
             health_device: None,
             free_space: available.map(|available| std::sync::Arc::new(FixedSpace(available)) as _),
         }

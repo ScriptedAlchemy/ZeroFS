@@ -38,6 +38,7 @@ async fn evacuation_fixture_with_target(
             capacity_bytes: *capacity,
             local_path: None,
             min_free_bytes: 0,
+            metadata_headroom_bytes: 0,
             health_device: None,
             free_space: None,
         })
@@ -531,6 +532,7 @@ async fn fault_fixture(count: usize) -> (tempfile::TempDir, PoolObjectStore, Vec
             capacity_bytes: 64 * 1024,
             local_path: None,
             min_free_bytes: 0,
+            metadata_headroom_bytes: 0,
             health_device: None,
             free_space: None,
         }],

@@ -224,22 +224,35 @@ reservation counts its exact raw allocation, record and alignment included,
 not just its payload bytes. Metadata survival writes its generations into the
 members' own logs. Each of those PUTs first claims its allocation on that
 member and holds the claim until the PUT returns. It must fit above the
-member's reserve beside every other promise, like any other write, but it
-counts against no quota. When it does not fit, it is refused and writes
+member's reserve beside every promise on that member, but it counts against
+no quota. Raw members never share a device, so promises on other members do
+not count against it. When it does not fit, it is refused and writes
 nothing. So a survival write never takes the room an admitted WRITE was
 promised. The payload that retained survival generations pin stays charged as
 cleanup debt. With survival enabled, a deleted file's room therefore returns
 only after the generations that map it retire.
 
-Nothing keeps room back for survival. Segment data can fill a raw pool up to
-its reserve, and the next generation is then refused as full, which latches
-mutations with EIO until an operator repairs the replica set. See
-[metadata survival](metadata-survival.md).
+Each raw member also keeps a metadata headroom above its reserve, set by
+`[storage.pool.metadata_survival] headroom_bytes`. It defaults to 4 GiB
+(4,294,967,296 bytes) when survival is enabled on a raw P3 authority, and is 0
+otherwise. WRITE claims, segment leases and catalog reservations must leave
+the reserve plus the headroom free. Survival writes may use the headroom, but
+never the reserve, which the raw store enforces on every write. So when
+segment data fills the pool, WRITE answers ENOSPC while the next generations
+still commit, and mutations stay open. A generation is refused as full, which
+latches mutations with EIO, only when the generations themselves outgrow the
+headroom. Room that deletions free refills the headroom first, so WRITE room
+returns only once more than the generations' share of the headroom is freed.
+Configuration is refused unless the reserve plus the headroom fit within every
+member's capacity. See [metadata survival](metadata-survival.md).
 
 `zerofs pool status` and the admin JSON report each member's
 `space.filesystem_free_bytes`, `space.filesystem_total_bytes` and
 `space.full`. The last one is null, `write_returned_no_space` with the time
-it filled, or `below_free_space_reserve`.
+it filled, or `below_free_space_reserve`, which counts the metadata headroom
+as part of the reserve. `space.metadata_headroom_used_bytes` and
+`space.metadata_headroom_remaining_bytes` split the headroom into the part
+generations have taken and the part still free.
 
 A declared capacity larger than the filesystem's total size is legitimate
 with thin provisioning or a quota that will grow. The server logs a warning

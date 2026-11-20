@@ -217,8 +217,13 @@ pub(crate) async fn open_pool_storage(
             if raw::is_payload(url.scheme()) {
                 let binding = raw::RawBinding::parse(&url)?;
                 let identity = binding.locator();
-                let opened =
-                    raw::open_member(member, binding, settings.raw_device_p3_candidate()).await;
+                let opened = raw::open_member(
+                    member,
+                    binding,
+                    settings.raw_device_p3_candidate(),
+                    settings.metadata_headroom_bytes(),
+                )
+                .await;
                 members.push(match opened {
                     Ok(opened) => opened,
                     Err(error) if raw::member_absent(&error) => {
@@ -280,6 +285,7 @@ pub(crate) async fn open_pool_storage(
                     None
                 },
                 min_free_bytes: member.reserve_free_bytes()?,
+                metadata_headroom_bytes: 0,
                 health_device: member.health_device.clone(),
                 free_space: None,
             });
@@ -342,6 +348,7 @@ pub(crate) async fn open_raw_member(
         member,
         raw::RawBinding::parse(&url)?,
         settings.raw_device_p3_candidate(),
+        settings.metadata_headroom_bytes(),
     )
     .await
 }
@@ -420,6 +427,7 @@ fn unavailable_member(
         capacity_bytes: member.capacity_bytes()?,
         local_path: None,
         min_free_bytes: member.reserve_free_bytes()?,
+        metadata_headroom_bytes: 0,
         health_device: None,
         free_space: None,
     })
