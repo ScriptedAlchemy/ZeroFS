@@ -5,6 +5,7 @@
 //! index space and makes its old allocation reusable after FLUSH and any
 //! outstanding reads. Range reads pin the allocation while verifying all bytes.
 
+use crate::segment_store::PayloadSha256;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -352,7 +353,13 @@ impl Inner {
         Ok(parts.into_iter().map(Bytes::from).collect())
     }
 
-    fn put(&self, location: &Path, payload: PutPayload, mode: PutMode) -> Result<PutResult> {
+    fn put(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        mode: PutMode,
+        digest: Option<PayloadSha256>,
+    ) -> Result<PutResult> {
         let key = key(location)?;
         let len = payload.content_length() as u64;
         let cost = RawStore::put_cost(len)
@@ -386,7 +393,11 @@ impl Inner {
             }
         }
         self.admit(&mut store, cost)?;
-        store.put(key, &value).map_err(store_err)?;
+        match digest {
+            Some(PayloadSha256(sha256)) => store.put_digested(key, &value, sha256),
+            None => store.put(key, &value),
+        }
+        .map_err(store_err)?;
         store.flush().map_err(store_err)?;
         let info = store.stat(key).expect("object just stored");
         Ok(PutResult {
@@ -567,7 +578,8 @@ impl ObjectStore for RawMemberStore {
         if !self.fixture_put_delay.is_zero() {
             tokio::time::sleep(self.fixture_put_delay).await;
         }
-        self.blocking(move |inner| inner.put(&location, payload, opts.mode))
+        let digest = opts.extensions.get::<PayloadSha256>().copied();
+        self.blocking(move |inner| inner.put(&location, payload, opts.mode, digest))
             .await
     }
 

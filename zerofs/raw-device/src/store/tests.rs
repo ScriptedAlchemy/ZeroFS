@@ -191,6 +191,28 @@ fn put_flush_reopen_get_round_trips_every_size_class() {
     assert_eq!(store.get(b"missing").unwrap(), None);
 }
 
+/// A caller's digest is recorded as given: the right one round-trips across
+/// a reopen, and a wrong one fails every read instead of being trusted.
+#[test]
+fn a_caller_digest_is_recorded_and_checked_by_reads() {
+    let scratch = Scratch::new(SIZE);
+    let mut store = provision(&scratch);
+    let body = value(7, 100_000);
+    store.put_digested(b"right", &body, sha256(&body)).unwrap();
+    store.put_digested(b"wrong", &body, [0x5a; 32]).unwrap();
+    store.put(b"hashed", &body).unwrap();
+    store.flush().unwrap();
+    assert_eq!(
+        store.stat(b"right").unwrap().sha256,
+        store.stat(b"hashed").unwrap().sha256
+    );
+    drop(store);
+
+    let store = reopen(&scratch);
+    assert_eq!(store.get(b"right").unwrap().unwrap(), body);
+    assert!(store.get(b"wrong").is_err());
+}
+
 #[test]
 fn unflushed_mutations_are_visible_then_lost_on_reopen() {
     let scratch = Scratch::new(SIZE);

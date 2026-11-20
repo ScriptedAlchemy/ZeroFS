@@ -283,6 +283,12 @@ impl RawStore {
     /// Stage a replacement visible to this store. Until FLUSH the last
     /// committed value remains recoverable.
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.put_digested(key, value, sha256(value))
+    }
+
+    /// [`Self::put`] for a value whose SHA-256 the caller has already
+    /// checked against these bytes. Reads verify the payload against it.
+    pub fn put_digested(&mut self, key: &[u8], value: &[u8], sha256: [u8; 32]) -> Result<()> {
         self.check_healthy()?;
         check_key(key)?;
         let len = value.len() as u64;
@@ -302,7 +308,7 @@ impl RawStore {
             allocation,
             info: ObjectInfo {
                 len,
-                sha256: sha256(value),
+                sha256,
                 seq,
                 modified_unix_nanos: now_unix_nanos(),
             },

@@ -1476,8 +1476,8 @@ async fn stream_record_to_remote(
         // was hashed. Both file I/O and SHA-256 stay on the blocking worker,
         // and corrupt bytes are rejected before backend publication.
         let blob_journal = Arc::clone(&journal);
-        let collected = tokio::task::spawn_blocking(move || {
-            blob_journal.read_blob_bounded(sequence, REMOTE_SINGLE_PUT_BYTES)
+        let (collected, sha256) = tokio::task::spawn_blocking(move || {
+            blob_journal.read_blob_digested(sequence, REMOTE_SINGLE_PUT_BYTES)
         })
         .await
         .map_err(|error| generic_error(format!("journal read task failed: {error}")))?
@@ -1486,6 +1486,11 @@ async fn stream_record_to_remote(
         options
             .extensions
             .insert(crate::retrying_object_store::CallerOwnsRetries);
+        // The read just checked these bytes against this digest, so the
+        // stores below record it without hashing the payload again.
+        options
+            .extensions
+            .insert(crate::segment_store::PayloadSha256(sha256));
         let result = bounded_remote_step_with_timeout(
             record,
             "bounded atomic put",

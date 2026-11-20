@@ -66,7 +66,32 @@ pub(super) struct RawPayload {
 }
 
 impl RawPayload {
+    /// Open `record`'s payload and verify every chunk against its digest.
     pub(super) fn open(
+        table: ReadOnlyTable<(Sequence, u64), &'static [u8]>,
+        record: &MutationRecord,
+        maximum_bytes: u64,
+    ) -> Result<Self> {
+        let payload = Self::bind(table, record, maximum_bytes)?;
+        payload.verify(|_| ())?;
+        Ok(payload)
+    }
+
+    /// Read `record`'s payload, verified against its digest in the same
+    /// pass: the digest is of exactly the bytes returned.
+    pub(super) fn read(
+        table: ReadOnlyTable<(Sequence, u64), &'static [u8]>,
+        record: &MutationRecord,
+        maximum_bytes: u64,
+    ) -> Result<Vec<u8>> {
+        let payload = Self::bind(table, record, maximum_bytes)?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(usize::try_from(payload.len)?)?;
+        payload.verify(|chunk| bytes.extend_from_slice(chunk))?;
+        Ok(bytes)
+    }
+
+    fn bind(
         table: ReadOnlyTable<(Sequence, u64), &'static [u8]>,
         record: &MutationRecord,
         maximum_bytes: u64,
@@ -75,25 +100,30 @@ impl RawPayload {
             record.blob_path() == Some(RAW_REFERENCE),
             "invalid raw payload reference"
         );
-        let (len, expected) = record.payload().context("mutation has no payload")?;
+        let (len, sha256) = record.payload().context("mutation has no payload")?;
         ensure!(
             len <= maximum_bytes,
             "committed blob exceeds bounded read limit"
         );
-        let payload = Self {
+        Ok(Self {
             table,
             sequence: record.sequence,
             len,
-            sha256: expected,
-        };
+            sha256,
+        })
+    }
+
+    /// Pass every chunk to `visit` in order, then check their count, lengths
+    /// and digest against the record.
+    fn verify(&self, mut visit: impl FnMut(&[u8])) -> Result<()> {
         let mut hasher = Sha256::new();
         let mut bytes = 0;
-        let chunks = payload
+        let chunks = self
             .table
-            .range((payload.sequence, 0)..=(payload.sequence, u64::MAX))?;
+            .range((self.sequence, 0)..=(self.sequence, u64::MAX))?;
         for (index, entry) in (0_u64..).zip(chunks) {
             let (key, chunk) = entry?;
-            let expected_len = (len - bytes).min(CHUNK_BYTES as u64);
+            let expected_len = (self.len - bytes).min(CHUNK_BYTES as u64);
             ensure!(
                 expected_len != 0
                     && key.value().1 == index
@@ -101,12 +131,16 @@ impl RawPayload {
                 JournalBlobIntegrityError::LengthMismatch
             );
             hasher.update(chunk.value());
+            visit(chunk.value());
             bytes += expected_len;
         }
-        ensure!(bytes == len, JournalBlobIntegrityError::LengthMismatch);
+        ensure!(bytes == self.len, JournalBlobIntegrityError::LengthMismatch);
         let actual: [u8; 32] = hasher.finalize().into();
-        ensure!(actual == expected, JournalBlobIntegrityError::HashMismatch);
-        Ok(payload)
+        ensure!(
+            actual == self.sha256,
+            JournalBlobIntegrityError::HashMismatch
+        );
+        Ok(())
     }
 
     pub(super) fn len(&self) -> u64 {
@@ -136,18 +170,5 @@ impl RawPayload {
             .get(within..within + count)
             .context(JournalBlobIntegrityError::LengthMismatch)?;
         Ok(Bytes::copy_from_slice(bytes))
-    }
-
-    pub(super) fn collect(&self) -> Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(usize::try_from(self.len)?)?;
-        for entry in self
-            .table
-            .range((self.sequence, 0)..=(self.sequence, u64::MAX))?
-        {
-            let (_, chunk) = entry?;
-            bytes.extend_from_slice(chunk.value());
-        }
-        Ok(bytes)
     }
 }

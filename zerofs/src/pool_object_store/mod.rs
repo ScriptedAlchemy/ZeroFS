@@ -54,7 +54,7 @@ use crate::config::SegmentPlacement;
 use crate::local_object_store::pool::{GenerationState, PoolObjectCreate};
 use crate::operator_required::{OperatorRequired, requires_operator};
 use crate::segment::Segid;
-use crate::segment_store::ConditionalMultipartCreate;
+use crate::segment_store::{ConditionalMultipartCreate, PayloadSha256};
 
 /// The pool keeps one physical object per ZeroFS segment. Multipart calls keep
 /// zero-copy references to the caller's already sealed segment, not a second
@@ -1158,12 +1158,17 @@ impl PoolObjectStore {
             if cancelled.load(Ordering::Acquire) {
                 return Err(error("pool publication was cancelled before upload"));
             }
-            let digest_payload = payload.clone();
-            let sha256: [u8; 32] = tokio::task::spawn_blocking(move || {
-                let mut hash = Sha256::new();
-                for bytes in digest_payload { hash.update(&bytes); }
-                hash.finalize().into()
-            }).await.map_err(|e| error(format!("pool checksum task failed: {e}")))?;
+            let sha256: [u8; 32] = match options.extensions.get::<PayloadSha256>() {
+                Some(verified) => verified.0,
+                None => {
+                    let digest_payload = payload.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let mut hash = Sha256::new();
+                        for bytes in digest_payload { hash.update(&bytes); }
+                        hash.finalize().into()
+                    }).await.map_err(|e| error(format!("pool checksum task failed: {e}")))?
+                }
+            };
             if let Some(expected) = preserve.as_ref().and_then(|entry| entry.sha256)
                 && expected != sha256 {
                 let key = location.to_string();

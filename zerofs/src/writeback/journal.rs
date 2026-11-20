@@ -1920,8 +1920,22 @@ impl Journal {
         sequence: Sequence,
         maximum_bytes: u64,
     ) -> Result<Vec<u8>> {
+        self.read_blob_digested(sequence, maximum_bytes)
+            .map(|(bytes, _)| bytes)
+    }
+
+    /// [`Self::read_blob_bounded`] with the SHA-256 the returned bytes were
+    /// checked against, for a publisher that records the digest.
+    pub(crate) fn read_blob_digested(
+        &self,
+        sequence: Sequence,
+        maximum_bytes: u64,
+    ) -> Result<(Vec<u8>, [u8; 32])> {
         if self.is_raw() {
-            return self.open_raw_payload(sequence, maximum_bytes)?.collect();
+            let (table, record) = self.raw_payload_rows(sequence)?;
+            let (_, sha256) = record.payload().context("mutation has no payload")?;
+            let bytes = raw_payload::RawPayload::read(table, &record, maximum_bytes)?;
+            return Ok((bytes, sha256));
         }
         let record = self.blob_record(sequence)?;
         let (payload_len, payload_sha256) = record
@@ -1955,6 +1969,18 @@ impl Journal {
         sequence: Sequence,
         maximum_bytes: u64,
     ) -> Result<raw_payload::RawPayload> {
+        let (table, record) = self.raw_payload_rows(sequence)?;
+        raw_payload::RawPayload::open(table, &record, maximum_bytes)
+    }
+
+    /// One snapshot's payload chunks and the record that describes them.
+    fn raw_payload_rows(
+        &self,
+        sequence: Sequence,
+    ) -> Result<(
+        redb::ReadOnlyTable<(Sequence, u64), &'static [u8]>,
+        MutationRecord,
+    )> {
         let read = self.database.begin_read()?;
         let mutations = read.open_table(MUTATIONS)?;
         let encoded = mutations
@@ -7139,6 +7165,66 @@ mod tests {
             copy.write_all_at(&buffer[..count], offset).unwrap();
         }
         copy
+    }
+
+    /// The drain reads a raw payload and its digest in one verified pass, and
+    /// a chunk that no longer matches the record's digest is refused.
+    #[test]
+    fn a_raw_payload_read_returns_the_digest_it_verified() {
+        use redb::ReadableDatabase;
+        use zerofs_raw_device::{Identity, Role, journal_region::TransactionRegion};
+
+        const CAPACITY: u64 = 64 << 20;
+        const ID: Identity = Identity {
+            pool_uuid: [7; 16],
+            member_uuid: [8; 16],
+            role: Role::Journal,
+        };
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(CAPACITY).unwrap();
+        let region =
+            TransactionRegion::provision(file.try_clone().unwrap(), CAPACITY, 0, CAPACITY, ID)
+                .unwrap();
+        let journal = Journal::open_raw(
+            region,
+            JournalIdentity {
+                backend_kind: "raw".to_owned(),
+                ..identity("raw-bucket")
+            },
+        )
+        .unwrap();
+        // Spans three payload chunks.
+        let body = (0..150_000_u32).map(|n| n as u8).collect::<Vec<_>>();
+        let prepared = journal
+            .prepare_verified_put(
+                put_record(1, "segments/1", &body),
+                &VerifiedPayload::new(Bytes::copy_from_slice(&body)),
+            )
+            .unwrap();
+        journal.publish_batch(vec![prepared]).unwrap();
+
+        let (read, digest) = journal.read_blob_digested(1, body.len() as u64).unwrap();
+        assert_eq!(read, body);
+        assert_eq!(digest, <[u8; 32]>::from(Sha256::digest(&body)));
+
+        let tampered = {
+            let read = journal.database.begin_read().unwrap();
+            let chunks = read.open_table(super::raw_payload::PAYLOADS).unwrap();
+            let mut chunk = chunks.get((1, 1)).unwrap().unwrap().value().to_vec();
+            chunk[0] ^= 1;
+            chunk
+        };
+        let write = journal.database.begin_write().unwrap();
+        write
+            .open_table(super::raw_payload::PAYLOADS)
+            .unwrap()
+            .insert((1, 1), tampered.as_slice())
+            .unwrap();
+        write.commit().unwrap();
+        let error = journal
+            .read_blob_digested(1, body.len() as u64)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("hash mismatch"), "{error:#}");
     }
 
     #[test]

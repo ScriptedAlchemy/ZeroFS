@@ -33,6 +33,12 @@ use crate::segment::{
 #[derive(Clone, Debug)]
 pub(crate) struct GeneratedSegmentCreate;
 
+/// The payload's SHA-256, which the caller has already checked against these
+/// exact bytes. A store that records the digest uses it instead of hashing
+/// the payload again; a wrong digest fails the object's later reads.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PayloadSha256(pub(crate) [u8; 32]);
+
 /// Requests the authoritative backend view when reconciling an ambiguous
 /// segment create. Writeback must bypass its attempted local overlay payload.
 #[derive(Clone, Debug)]
