@@ -31,6 +31,9 @@ pub struct TransactionRegion {
     binding: Binding,
     resize_ceiling: u64,
     state: Mutex<State>,
+    /// Holds a flush open between its two waits.
+    #[cfg(test)]
+    flush_hold: Mutex<Option<Arc<std::sync::Barrier>>>,
     // Drop the region descriptor before releasing exclusive device ownership.
     _claim: Option<Arc<dyn Any + Send + Sync>>,
 }
@@ -183,6 +186,8 @@ impl TransactionRegion {
                 stale_slot,
                 poisoned: false,
             }),
+            #[cfg(test)]
+            flush_hold: Mutex::new(None),
             _claim: None,
         }
     }
@@ -232,8 +237,9 @@ impl TransactionRegion {
     }
 
     pub fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
-        let state = self.state()?;
-        let start = data_offset(offset, out.len(), state.length.len)?;
+        // Positioned reads need no exclusion, so the lock covers only the
+        // bounds check and a read never waits for a flush.
+        let start = data_offset(offset, out.len(), self.state()?.length.len)?;
         self.region.read_exact_at(out, start)
     }
 
@@ -293,11 +299,25 @@ impl TransactionRegion {
         Ok(())
     }
 
+    /// Make every completed write durable. The device flush runs without the
+    /// state lock, so `len` and `read` never wait for it. A write that races
+    /// the flush may or may not be covered, as for a file.
     pub fn sync_data(&self) -> io::Result<()> {
-        let mut state = self.state()?;
-        self.repair(&mut state)?;
+        self.repair(&mut *self.state()?)?;
+        #[cfg(test)]
+        if let Some(hold) = self.flush_hold.lock().unwrap().clone() {
+            hold.wait();
+            hold.wait();
+        }
         let result = self.region.sync_data();
-        poison_on_error(&mut state, result)
+        if result.is_err() {
+            // Poison even when another thread poisoned the region first.
+            self.state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .poisoned = true;
+        }
+        result
     }
 
     fn state(&self) -> io::Result<std::sync::MutexGuard<'_, State>> {
@@ -534,6 +554,35 @@ mod tests {
         assert!(weak.upgrade().is_some());
         drop(catalog);
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn length_and_reads_do_not_wait_for_a_flush() {
+        let journal = Arc::new(Media::new().provision());
+        journal.set_len(BLOCK_SIZE).unwrap();
+        journal.write(0, &[0x5a]).unwrap();
+        let hold = Arc::new(std::sync::Barrier::new(2));
+        *journal.flush_hold.lock().unwrap() = Some(Arc::clone(&hold));
+        let flushing = std::thread::spawn({
+            let journal = Arc::clone(&journal);
+            move || journal.sync_data()
+        });
+        hold.wait();
+
+        let (done, observed) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn({
+            let journal = Arc::clone(&journal);
+            move || {
+                let mut byte = [0];
+                journal.read(0, &mut byte).unwrap();
+                done.send((journal.len().unwrap(), byte)).unwrap();
+            }
+        });
+        let seen = observed.recv_timeout(std::time::Duration::from_secs(10));
+        hold.wait();
+        flushing.join().unwrap().unwrap();
+        reader.join().unwrap();
+        assert_eq!(seen, Ok((BLOCK_SIZE, [0x5a])));
     }
 
     #[test]
