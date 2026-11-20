@@ -176,6 +176,18 @@ bounded. It is at most `max_inflight_seals` sealed segments plus one open
 segment per write lane, each no larger than the seal threshold plus one
 write. A write that would need more answers ENOSPC instead of waiting.
 
+Space has to come from outside the filesystem while such data waits. That can
+be a member whose filesystem frees bytes, a grown quota, or another member.
+Deleting files through ZeroFS does not make room then. A deleted body can be
+removed only after a flush makes the deletion durable. That flush first has to
+publish the waiting segments, and they are what need the room. Each flush and
+reclaim pass returns ENOSPC, and the deleted bytes stay charged to their
+member until outside space arrives or the server restarts. A restart discards
+the unflushed data and the unflushed deletions with it. Open readers and
+checkpoints keep the deleted bytes in every case. They stay readable and
+charged after the waiting data is flushed, and they are reclaimed once the
+last of them is gone.
+
 `zerofs pool status` and the admin JSON report each member's
 `space.filesystem_free_bytes`, `space.filesystem_total_bytes` and
 `space.full`. The last one is null, `write_returned_no_space` with the time
