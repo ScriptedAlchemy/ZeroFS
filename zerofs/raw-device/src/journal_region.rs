@@ -269,9 +269,8 @@ impl TransactionRegion {
         self.region.read_exact_at(out, start)
     }
 
-    /// Write into the reserve and start the device write-out, so the next
-    /// `sync_data` has less to wait for. This runs without the state lock, so
-    /// the file's readers and writers never wait for it.
+    /// Write into the reserve. The device write runs without the state lock,
+    /// so the file's readers and writers never wait for it.
     pub fn write_reserve(&self, offset: u64, bytes: &[u8]) -> io::Result<()> {
         let start = self.reserve_offset(offset, bytes.len())?;
         drop(self.state()?);
@@ -281,8 +280,6 @@ impl TransactionRegion {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .poisoned = true;
-        } else {
-            self.region.start_writeback(start, bytes.len());
         }
         result
     }
