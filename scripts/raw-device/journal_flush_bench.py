@@ -8,12 +8,14 @@ from contextlib import ExitStack
 import fcntl
 import hashlib
 import http.client
+import json
 import os
 from pathlib import Path
 import random
 import statistics
 import subprocess
 import tempfile
+import threading
 import time
 from uuid import uuid4
 
@@ -22,17 +24,21 @@ from large_mounted import (
     P3_LAYOUT, PROBE, SIZES, ZEROFS, allocate, command, config, drop_clean_cache,
     initialize_pool, mount_large, write_all,
 )
-from mounted import MIB, record, require_fuse
+from mounted import MIB, record, require_fuse, write_fsync_crash
 
 VOLUME = Path("/fixture-volume")
 TEMPLATE = Path("/input/memory_raw_nas_fit_fixture.toml")
 PAYLOAD = int(os.environ.get("BENCH_PAYLOAD_MIB", "2048")) * MIB
 RUNS = int(os.environ.get("BENCH_RUNS", "3"))
+# Files written at once. One file's writes pass through one engine lane.
+WRITERS = int(os.environ.get("BENCH_WRITERS", "1"))
 IO = MIB
 SHIM_DELAY_US = os.environ.get("BENCH_FLUSH_DELAY_US")
 PERF = os.environ.get("BENCH_PERF") == "1"
 # Pace member PUTs so most of the copy is still in the P3 journal when it is read back.
 MEMBER_PUT_DELAY_MS = os.environ.get("BENCH_MEMBER_PUT_DELAY_MS")
+# Instead of timing copies, SIGKILL the engine after fsync and replay the copy from the journal.
+CRASH_REPLAY = os.environ.get("BENCH_CRASH_REPLAY") == "1"
 ROLES = ("journal", "catalog", "metadata", "key_envelope", "scratch", "cache")
 STAT_FIELDS = (
     "reads", "read_merges", "read_sectors", "read_ms", "writes", "write_merges",
@@ -75,10 +81,13 @@ def publish_counters(address):
         body = connection.getresponse().read().decode()
     finally:
         connection.close()
+    # The phase sums say where the journal's writer spent each batch.
     wanted = ("zerofs_writeback_local_publish_batches_total",
-              "zerofs_writeback_local_publish_records_total")
+              "zerofs_writeback_local_publish_records_total",
+              "zerofs_writeback_local_publish_phase_seconds_sum",
+              "zerofs_writeback_local_publish_phase_seconds_count")
     return {line.split()[0]: float(line.split()[1]) for line in body.splitlines()
-            if line.split(" ", 1)[0] in wanted}
+            if line.split(" ", 1)[0].split("{", 1)[0] in wanted}
 
 
 class ShimLog:
@@ -184,14 +193,39 @@ def chunks(seed):
         yield index.to_bytes(8, "little") + pool[start + 8:start + IO]
 
 
+def sequential_batches(fd):
+    """Time the payload log's pattern: 32 MiB in 4 MiB writes, then one sync."""
+    batch, piece = 32 * MIB, os.urandom(4 * MIB)
+    samples = []
+    for index in range(7):
+        start = time.monotonic_ns()
+        for offset in range(0, batch, len(piece)):
+            os.pwrite(fd, piece, index * batch + offset)
+        os.fdatasync(fd)
+        samples.append(time.monotonic_ns() - start)
+    median = sorted(samples)[len(samples) // 2]
+    return {"median_us": median // 1000, "mb_per_s": batch / 1e6 / (median / 1e9),
+            "count": len(samples)}
+
+
 def flush_latency(root, nodes):
-    """Time 4 KiB and 1 MiB write+fdatasync pairs on a written scratch loop."""
+    """Time write+fdatasync patterns on scratch loops, before the flush shim is loaded."""
+    # The P3 loop's backing file is preallocated and unwritten, as this one is.
+    unwritten = root / "flush-probe-unwritten"
+    allocate(unwritten, 256 * MIB)
+    with device(unwritten, nodes) as node:
+        fd = os.open(node, os.O_RDWR)
+        try:
+            first_write = sequential_batches(fd)
+        finally:
+            os.close(fd)
+    unwritten.unlink()
     backing = root / "flush-probe"
     with backing.open("xb", buffering=0) as file:
         for _ in range(256):
             write_all(file.fileno(), os.urandom(MIB))
         os.fdatasync(file.fileno())
-    result = {}
+    result = {"32m_sequential_first_write": first_write}
     with device(backing, nodes) as node:
         fd = os.open(node, os.O_RDWR)
         try:
@@ -209,17 +243,32 @@ def flush_latency(root, nodes):
                 result[label] = {"median_us": samples[len(samples) // 2] // 1000,
                                  "p90_us": samples[len(samples) * 9 // 10] // 1000,
                                  "count": count}
+            result["32m_sequential_rewrite"] = sequential_batches(fd)
         finally:
             os.close(fd)
     backing.unlink()
     record("loop_flush_latency", **result)
 
 
+def write_file(target, seed, done):
+    with target.open("xb", buffering=0) as file:
+        for chunk in chunks(seed):
+            write_all(file.fileno(), chunk)
+        written = time.monotonic_ns()
+        os.fsync(file.fileno())
+    done[target] = (written, time.monotonic_ns())
+
+
 def run_once(index, bindings, configuration, path, server, address, shim):
-    digest = hashlib.sha256()
-    for chunk in chunks(index):
-        digest.update(chunk)
-    target = path.parent / f"bench-{index}"
+    targets = {path.parent / f"bench-{index}-{writer}": index * WRITERS + writer
+               for writer in range(WRITERS)}
+    digests = {}
+    for target, seed in targets.items():
+        digest = hashlib.sha256()
+        for chunk in chunks(seed):
+            digest.update(chunk)
+        digests[target] = digest.digest()
+    total = PAYLOAD * WRITERS
     client = client_pid()
     before_disk, before_cpu = disk_stats(bindings), cpu_seconds(server.pid)
     before_client = cpu_seconds(client)
@@ -227,47 +276,54 @@ def run_once(index, bindings, configuration, path, server, address, shim):
     profile = start_perf(path.parent.parent, (server.pid, client)) if index == 0 else None
     if shim:
         shim.take()
+    done = {}
+    threads = [threading.Thread(target=write_file, args=(target, seed, done))
+               for target, seed in targets.items()]
     started = time.monotonic_ns()
-    with target.open("xb", buffering=0) as file:
-        for chunk in chunks(index):
-            write_all(file.fileno(), chunk)
-        written = time.monotonic_ns()
-        os.fsync(file.fileno())
-    synced = time.monotonic_ns()
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert set(done) == set(targets), "a writer failed"
+    written = max(times[0] for times in done.values())
+    synced = max(times[1] for times in done.values())
     write = disk_delta(disk_stats(bindings), before_disk)
     write_cpu = cpu_seconds(server.pid) - before_cpu
     client_cpu = cpu_seconds(client) - before_client
     stop_perf(profile)
     after_publish = publish_counters(address)
     p3 = write["p3"]
-    mib = PAYLOAD / MIB
+    mib = total / MIB
     seconds = (synced - started) / 1e9
-    rate = PAYLOAD / 1e6 / seconds
-    record("write_fsync", run=index, bytes=PAYLOAD, seconds=seconds,
+    rate = total / 1e6 / seconds
+    record("write_fsync", run=index, bytes=total, writers=WRITERS, seconds=seconds,
            mb_per_s=rate, fsync_seconds=(synced - written) / 1e9,
            engine_cpu_seconds=write_cpu, client_cpu_seconds=client_cpu,
            engine_peak_resident_bytes=peak_resident_bytes(server.pid),
            p3_writes_per_mib=p3["writes"] / mib, p3_flushes_per_mib=p3["flushes"] / mib,
-           p3_write_amplification=p3["write_sectors"] * 512 / PAYLOAD,
+           p3_write_amplification=p3["write_sectors"] * 512 / total,
            p3_mean_write_kib=p3["write_sectors"] / 2 / max(p3["writes"], 1),
            publish={key: after_publish.get(key, 0) - before_publish.get(key, 0)
                     for key in after_publish},
            p3_regions=shim.take() if shim else None, devices=write)
 
-    with target.open("rb", buffering=0) as file:
-        drop_clean_cache(file.fileno())
+    for target in targets:
+        with target.open("rb", buffering=0) as file:
+            drop_clean_cache(file.fileno())
     # Read back cold, as an 8 GiB copy is on the NAS: no loop or backing page cache.
     evict(bindings)
     before_disk, before_cpu = disk_stats(bindings), cpu_seconds(server.pid)
-    check = hashlib.sha256()
     count = 0
     started = time.monotonic_ns()
-    with target.open("rb", buffering=0) as file:
-        while chunk := file.read(IO):
-            check.update(chunk)
-            count += len(chunk)
+    for target in targets:
+        check = hashlib.sha256()
+        with target.open("rb", buffering=0) as file:
+            while chunk := file.read(IO):
+                check.update(chunk)
+                count += len(chunk)
+        assert check.digest() == digests[target], target
     seconds = (time.monotonic_ns() - started) / 1e9
-    assert count == PAYLOAD and check.digest() == digest.digest(), (index, count)
+    assert count == total, (index, count)
     read = disk_delta(disk_stats(bindings), before_disk)
     record("read_verify", run=index, bytes=count, seconds=seconds,
            mb_per_s=count / 1e6 / seconds,
@@ -277,21 +333,51 @@ def run_once(index, bindings, configuration, path, server, address, shim):
 
     if MEMBER_PUT_DELAY_MS:
         # A paced drain would take minutes; leave it behind the next copy.
-        target.unlink()
+        for target in targets:
+            target.unlink()
         return rate
     started = time.monotonic_ns()
     command(ZEROFS, "flush", "-c", configuration, timeout=1800)
-    target.unlink()
+    for target in targets:
+        target.unlink()
     command(ZEROFS, "flush", "-c", configuration, timeout=1800)
     record("drained", run=index, seconds=(time.monotonic_ns() - started) / 1e9)
     return rate
+
+
+def crash_replay(bindings, configuration):
+    """Kill the engine as fsync returns with the copy still in the P3 journal, then read it back."""
+    body = b"".join(chunks(0))
+    os.environ["ZEROFS_FIXTURE_MEMBER_PUT_DELAY_MS"] = "5000"
+    with mount_large(configuration, crash=True) as (path, server):
+        write_fsync_crash(path.parent / "crash-replay", server, body)
+    del os.environ["ZEROFS_FIXTURE_MEMBER_PUT_DELAY_MS"]
+    # The killed engine left its sockets behind, and the mount waits for them to appear.
+    for stale in configuration.parent.glob("*.sock"):
+        stale.unlink()
+    evict(bindings)
+    held = json.loads(command(ZEROFS, "pool", "verify-raw", "-c", configuration, timeout=300))
+    journal = held["journal_allocation"]
+    assert held["remote_seq"] < held["local_seq"], held
+    assert journal["dirty_blob_bytes"] >= PAYLOAD // 2, journal
+    with mount_large(configuration) as (path, _):
+        check, count = hashlib.sha256(), 0
+        with (path.parent / "crash-replay").open("rb", buffering=0) as file:
+            while chunk := file.read(IO):
+                check.update(chunk)
+                count += len(chunk)
+        assert count == PAYLOAD and check.digest() == hashlib.sha256(body).digest(), count
+        command(ZEROFS, "flush", "-c", configuration, timeout=1800)
+    record("crash_replay", bytes=count, sha256_verified=True, local_seq=held["local_seq"],
+           remote_seq_at_restart=held["remote_seq"], journal_allocation=journal)
 
 
 def main():
     assert Path("/.dockerenv").exists() and os.path.ismount(VOLUME)
     os.umask(0o077)
     require_fuse()
-    record("bench_setup", payload_bytes=PAYLOAD, runs=RUNS, member_put_delay_ms=MEMBER_PUT_DELAY_MS,
+    record("bench_setup", payload_bytes=PAYLOAD, runs=RUNS, writers=WRITERS,
+           member_put_delay_ms=MEMBER_PUT_DELAY_MS,
            binaries=command("sha256sum", ZEROFS, PROBE).decode().splitlines())
     with tempfile.TemporaryDirectory(dir=VOLUME, prefix="bench-") as scratch, \
          tempfile.TemporaryDirectory(dir="/dev", prefix="zerofs-bench-") as node_dir, \
@@ -314,13 +400,17 @@ def main():
             if MEMBER_PUT_DELAY_MS:
                 os.environ["ZEROFS_FIXTURE_MEMBER_PUT_DELAY_MS"] = MEMBER_PUT_DELAY_MS
             shim = install_shim(root, bindings["p3"][0])
-            with mount_large(configuration) as (path, server):
-                address = "127.0.0.1:19091"
-                rates = [run_once(index, bindings, configuration, path, server, address, shim)
-                         for index in range(RUNS)]
-            record("bench_summary", runs=RUNS, payload_bytes=PAYLOAD,
-                   write_fsync_mb_per_s_median=statistics.median(rates),
-                   write_fsync_mb_per_s_min=min(rates), write_fsync_mb_per_s_max=max(rates))
+            if CRASH_REPLAY:
+                crash_replay(bindings, configuration)
+            else:
+                with mount_large(configuration) as (path, server):
+                    address = "127.0.0.1:19091"
+                    rates = [run_once(index, bindings, configuration, path, server, address, shim)
+                             for index in range(RUNS)]
+                record("bench_summary", runs=RUNS, payload_bytes=PAYLOAD, writers=WRITERS,
+                       write_fsync_mb_per_s_median=statistics.median(rates),
+                       write_fsync_mb_per_s_min=min(rates),
+                       write_fsync_mb_per_s_max=max(rates))
         assert not any(nodes.iterdir())
 
 

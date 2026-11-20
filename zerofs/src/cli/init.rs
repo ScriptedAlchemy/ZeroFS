@@ -1402,7 +1402,7 @@ pub(super) async fn raw_pool_journal(
         &writeback,
         &bucket.cache_directory_name(),
     )?;
-    let region = crate::writeback::bootstrap::apply_raw_budget(region, &writeback)?;
+    crate::writeback::bootstrap::validate_raw_budget(&region, &writeback)?;
     tokio::task::spawn_blocking(move || {
         crate::writeback::journal::Journal::open_raw(region, identity)
     })
@@ -1428,7 +1428,7 @@ pub(crate) async fn recreate_raw_pool_journal(
     let writeback = settings
         .writeback_settings(crate::writeback::config::WritebackAccessMode::ReadWrite)?
         .context("raw journal settings are required")?;
-    let region = crate::writeback::bootstrap::apply_raw_budget(region, &writeback)?;
+    crate::writeback::bootstrap::validate_raw_budget(&region, &writeback)?;
     tokio::task::spawn_blocking(move || {
         crate::writeback::journal::Journal::open_raw(region, identity).map(drop)
     })
