@@ -191,6 +191,9 @@ pub struct Journal {
     // the journal's exclusive ownership below.
     database: Database,
     write_gate: JournalWriteGate,
+    shared: SharedCommits,
+    #[cfg(test)]
+    shared_commits: AtomicU64,
     _lock: Option<JournalLock>,
     format_version: u32,
     #[cfg(test)]
@@ -536,6 +539,44 @@ impl Drop for RemoteMarkPause {
     fn drop(&mut self) {
         self.release();
     }
+}
+
+/// How long a remote watermark mark waits for a record batch to carry it
+/// while record batches are committing. Nothing a client waits for depends
+/// on the mark, so the wait only delays the release of drained journal space.
+const REMOTE_MARK_RIDE_WINDOW: Duration = Duration::from_millis(100);
+
+/// A journal write that can share one durable commit with others.
+enum SharedWrite {
+    Records {
+        records: Vec<MutationRecord>,
+        payloads: Vec<(Sequence, VerifiedPayload)>,
+    },
+    RemoteMarks(Vec<(Sequence, Option<String>)>),
+}
+
+/// One queued [`SharedWrite`] and where its caller reads the outcome.
+struct SharedSlot {
+    write: SharedWrite,
+    outcome: Mutex<Option<Result<()>>>,
+    done: Condvar,
+}
+
+impl SharedSlot {
+    fn take_outcome(&self) -> Option<Result<()>> {
+        self.outcome
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
+}
+
+#[derive(Default)]
+struct SharedCommits {
+    /// Writes waiting for the next holder of the write gate, in arrival order.
+    queue: Mutex<Vec<Arc<SharedSlot>>>,
+    /// When a record batch last committed.
+    last_records: Mutex<Option<Instant>>,
 }
 
 #[derive(Debug, Default)]
@@ -1016,6 +1057,9 @@ impl Journal {
             raw_region: None,
             database,
             write_gate: JournalWriteGate::default(),
+            shared: SharedCommits::default(),
+            #[cfg(test)]
+            shared_commits: AtomicU64::new(0),
             _lock: Some(lock),
             format_version: expected_identity.format_version,
             #[cfg(test)]
@@ -1081,6 +1125,9 @@ impl Journal {
             raw_region: Some(region),
             database,
             write_gate: JournalWriteGate::default(),
+            shared: SharedCommits::default(),
+            #[cfg(test)]
+            shared_commits: AtomicU64::new(0),
             _lock: None,
             format_version: expected_identity.format_version,
             #[cfg(test)]
@@ -1831,66 +1878,197 @@ impl Journal {
         records: &[MutationRecord],
         payloads: &[(Sequence, VerifiedPayload)],
     ) -> Result<()> {
-        let Some(last) = records.last() else {
+        if records.is_empty() {
             return Ok(());
-        };
+        }
+        self.commit_shared(SharedWrite::Records {
+            records: records.to_vec(),
+            payloads: payloads.to_vec(),
+        })
+    }
+
+    fn insert_record_batch(
+        transaction: &redb::WriteTransaction,
+        records: &[MutationRecord],
+        payloads: &[(Sequence, VerifiedPayload)],
+    ) -> Result<()> {
+        let last = records.last().context("record batch must not be empty")?;
+        let mut meta = transaction
+            .open_table(META)
+            .context("failed to open journal metadata")?;
+        let current = read_required::<u64>(&meta, LOCAL_SEQ_KEY)?;
+        let mut expected = current.checked_add(1).context("local sequence overflow")?;
+        let mut total_completed =
+            read_optional::<u64>(&meta, LOCAL_BYTES_COMPLETED_KEY)?.unwrap_or_default();
+        let mut table = transaction
+            .open_table(MUTATIONS)
+            .context("failed to open journal mutations")?;
+        for (index, record) in records.iter().enumerate() {
+            if record.sequence != expected {
+                bail!(
+                    "local sequence must advance contiguously from {current} to {expected}, got {}",
+                    record.sequence
+                );
+            }
+            total_completed = total_completed
+                .checked_add(record.payload().map_or(0, |(payload_len, _)| payload_len))
+                .context("local completed byte counter overflow")?;
+            let encoded =
+                bincode::serialize(record).context("failed to encode journal mutation")?;
+            table
+                .insert(record.sequence, encoded.as_slice())
+                .context("failed to store journal mutation")?;
+            if index + 1 < records.len() {
+                expected = expected.checked_add(1).context("local sequence overflow")?;
+            }
+        }
+        if !payloads.is_empty() {
+            let mut chunks = transaction.open_table(raw_payload::PAYLOADS)?;
+            for (sequence, payload) in payloads {
+                raw_payload::insert(&mut chunks, *sequence, payload)?;
+            }
+        }
+        drop(table);
+        write_value(&mut meta, LOCAL_SEQ_KEY, &last.sequence)?;
+        write_value(&mut meta, LOCAL_BYTES_COMPLETED_KEY, &total_completed)?;
+        Ok(())
+    }
+
+    /// Commit `write` durably, sharing the device flush with every other
+    /// shared write queued by then. Each caller returns only after a commit
+    /// that holds its write is durable.
+    ///
+    /// The drain marks the remote watermark while clients write, and the
+    /// journal has one writer, so a mark committing alone takes a whole
+    /// flush from the record batches. A mark that arrives while record
+    /// batches are committing therefore waits, for at most
+    /// [`REMOTE_MARK_RIDE_WINDOW`], for the next batch to carry it.
+    fn commit_shared(&self, write: SharedWrite) -> Result<()> {
+        let rides = matches!(write, SharedWrite::RemoteMarks(_))
+            && self
+                .shared
+                .last_records
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_some_and(|committed| committed.elapsed() < REMOTE_MARK_RIDE_WINDOW);
+        let slot = Arc::new(SharedSlot {
+            write,
+            outcome: Mutex::new(None),
+            done: Condvar::new(),
+        });
+        self.shared
+            .queue
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(Arc::clone(&slot));
+        if rides {
+            let outcome = slot
+                .outcome
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let (mut outcome, _) = slot
+                .done
+                .wait_timeout_while(outcome, REMOTE_MARK_RIDE_WINDOW, |outcome| {
+                    outcome.is_none()
+                })
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(outcome) = outcome.take() {
+                return outcome;
+            }
+        }
         let _write = self.write_gate.lock();
+        // An earlier holder of the gate may have committed this write.
+        if let Some(outcome) = slot.take_outcome() {
+            return outcome;
+        }
+        let group = std::mem::take(
+            &mut *self
+                .shared
+                .queue
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+        self.commit_group(&group);
+        slot.take_outcome()
+            .expect("a queued write is committed by the group that takes the queue")
+    }
+
+    fn commit_group(&self, group: &[Arc<SharedSlot>]) {
+        #[cfg(test)]
+        for slot in group {
+            if let SharedWrite::RemoteMarks(completions) = &slot.write {
+                self.wait_if_remote_mark_paused(completions[0].0);
+            }
+        }
+        let outcomes: Vec<Result<()>> = match self.commit_together(group) {
+            Ok(()) => group.iter().map(|_| Ok(())).collect(),
+            // One write's refusal must not fail the writes sharing its
+            // commit. Nothing was committed, so each commits alone.
+            Err(_) if group.len() > 1 => group
+                .iter()
+                .map(|slot| self.commit_together(std::slice::from_ref(slot)))
+                .collect(),
+            Err(error) => vec![Err(error)],
+        };
+        for (slot, outcome) in group.iter().zip(outcomes) {
+            let outcome = outcome.and_then(|()| self.shared_write_committed(&slot.write));
+            *slot
+                .outcome
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(outcome);
+            slot.done.notify_all();
+        }
+    }
+
+    /// Apply every write of `group`, in queue order, in one immediate
+    /// transaction. On any error nothing is committed.
+    fn commit_together(&self, group: &[Arc<SharedSlot>]) -> Result<()> {
         let mut transaction = self
             .database
             .begin_write()
-            .context("failed to commit journal record batch")?;
+            .context("failed to begin journal commit")?;
         transaction
             .set_durability(Durability::Immediate)
             .context("failed to set journal durability")?;
-        {
-            let mut meta = transaction
-                .open_table(META)
-                .context("failed to open journal metadata")?;
-            let current = read_required::<u64>(&meta, LOCAL_SEQ_KEY)?;
-            let mut expected = current.checked_add(1).context("local sequence overflow")?;
-            let mut total_completed =
-                read_optional::<u64>(&meta, LOCAL_BYTES_COMPLETED_KEY)?.unwrap_or_default();
-            let mut table = transaction
-                .open_table(MUTATIONS)
-                .context("failed to open journal mutations")?;
-            for (index, record) in records.iter().enumerate() {
-                if record.sequence != expected {
-                    bail!(
-                        "local sequence must advance contiguously from {current} to {expected}, got {}",
-                        record.sequence
-                    );
+        for slot in group {
+            match &slot.write {
+                SharedWrite::Records { records, payloads } => {
+                    Self::insert_record_batch(&transaction, records, payloads)?;
                 }
-                total_completed = total_completed
-                    .checked_add(record.payload().map_or(0, |(payload_len, _)| payload_len))
-                    .context("local completed byte counter overflow")?;
-                let encoded =
-                    bincode::serialize(record).context("failed to encode journal mutation")?;
-                table
-                    .insert(record.sequence, encoded.as_slice())
-                    .context("failed to store journal mutation")?;
-                if index + 1 < records.len() {
-                    expected = expected.checked_add(1).context("local sequence overflow")?;
+                SharedWrite::RemoteMarks(completions) => {
+                    Self::insert_remote_marks(&transaction, completions)?;
                 }
             }
-            if !payloads.is_empty() {
-                let mut chunks = transaction.open_table(raw_payload::PAYLOADS)?;
-                for (sequence, payload) in payloads {
-                    raw_payload::insert(&mut chunks, *sequence, payload)?;
-                }
-            }
-            drop(table);
-            write_value(&mut meta, LOCAL_SEQ_KEY, &last.sequence)?;
-            write_value(&mut meta, LOCAL_BYTES_COMPLETED_KEY, &total_completed)?;
         }
         transaction
             .commit()
-            .context("failed to commit journal mutation batch")?;
+            .context("failed to commit journal transaction")?;
         #[cfg(test)]
-        if self
-            .local_commit_error_after_durable
-            .swap(false, Ordering::AcqRel)
-        {
-            bail!("injected local commit error after durable state");
+        self.shared_commits.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn shared_write_committed(&self, write: &SharedWrite) -> Result<()> {
+        match write {
+            SharedWrite::Records { .. } => {
+                *self
+                    .shared
+                    .last_records
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(Instant::now());
+                #[cfg(test)]
+                if self
+                    .local_commit_error_after_durable
+                    .swap(false, Ordering::AcqRel)
+                {
+                    bail!("injected local commit error after durable state");
+                }
+            }
+            SharedWrite::RemoteMarks(_) => {
+                #[cfg(test)]
+                self.remote_watermark_commits
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
         Ok(())
     }
@@ -1946,7 +2124,8 @@ impl Journal {
         }
         let (file, path, slice) = self.open_blob_file(&record)?;
         let (mut file, _) = validate_file_payload(file, &path, slice, payload_len)?;
-        collect_verified_payload(&mut file, payload_len, payload_sha256)
+        let bytes = collect_verified_payload(&mut file, payload_len, payload_sha256)?;
+        Ok((bytes, payload_sha256))
     }
 
     pub(crate) fn open_verified_blob(&self, sequence: Sequence) -> Result<VerifiedBlob> {
@@ -1988,7 +2167,7 @@ impl Journal {
             .with_context(|| format!("journal mutation {sequence} does not exist"))?;
         let record: MutationRecord = bincode::deserialize(encoded.value())?;
         let table = read.open_table(raw_payload::PAYLOADS)?;
-        raw_payload::RawPayload::open(table, &record, maximum_bytes)
+        Ok((table, record))
     }
 
     fn blob_record(&self, sequence: Sequence) -> Result<MutationRecord> {
@@ -2040,74 +2219,62 @@ impl Journal {
                 result_etag.as_deref(),
             )?;
         }
-        let _write = self.write_gate.lock();
-        #[cfg(test)]
-        self.wait_if_remote_mark_paused(completions[0].0);
-        let mut transaction = self
-            .database
-            .begin_write()
-            .context("failed to update remote watermark")?;
-        transaction
-            .set_durability(Durability::Immediate)
-            .context("failed to set journal durability")?;
-        {
-            let mut meta = transaction
-                .open_table(META)
-                .context("failed to open journal metadata")?;
-            let remote_seq = read_required::<u64>(&meta, REMOTE_SEQ_KEY)?;
-            let local_seq = read_required::<u64>(&meta, LOCAL_SEQ_KEY)?;
-            let mut mutations = transaction
-                .open_table(MUTATIONS)
-                .context("failed to open journal mutations")?;
-            let mut versions = transaction
-                .open_table(REMOTE_OBJECT_VERSIONS)
-                .context("failed to open remote object versions")?;
-            let mut total_completed =
-                read_optional::<u64>(&meta, REMOTE_BYTES_COMPLETED_KEY)?.unwrap_or_default();
-            let mut expected = remote_seq;
-            for (sequence, result_etag) in completions {
-                let sequence = *sequence;
-                expected = expected
-                    .checked_add(1)
-                    .context("remote sequence overflow")?;
-                if sequence != expected || sequence > local_seq {
-                    bail!(
-                        "remote sequence must advance contiguously from {remote_seq} to {expected}, got {sequence}"
-                    );
-                }
-                // Decoded inside its own scope so the read guard is released
-                // before the re-insert below, without copying the row first.
-                let mut record: MutationRecord = {
-                    let stored = mutations
-                        .get(sequence)
-                        .context("failed to read remote mutation")?
-                        .with_context(|| format!("journal mutation {sequence} does not exist"))?;
-                    bincode::deserialize(stored.value())
-                        .context("failed to decode remote mutation")?
-                };
-                let completed_bytes = record.payload().map_or(0, |(payload_len, _)| payload_len);
-                total_completed = total_completed
-                    .checked_add(completed_bytes)
-                    .context("remote completed byte counter overflow")?;
-                record.remote_result_etag = result_etag.clone();
-                let encoded =
-                    bincode::serialize(&record).context("failed to encode remote mutation")?;
-                mutations
-                    .insert(sequence, encoded.as_slice())
-                    .context("failed to store remote result")?;
-                apply_remote_object_version(&mut versions, &record)?;
+        self.commit_shared(SharedWrite::RemoteMarks(completions.to_vec()))
+    }
+
+    fn insert_remote_marks(
+        transaction: &redb::WriteTransaction,
+        completions: &[(Sequence, Option<String>)],
+    ) -> Result<()> {
+        let mut meta = transaction
+            .open_table(META)
+            .context("failed to open journal metadata")?;
+        let remote_seq = read_required::<u64>(&meta, REMOTE_SEQ_KEY)?;
+        let local_seq = read_required::<u64>(&meta, LOCAL_SEQ_KEY)?;
+        let mut mutations = transaction
+            .open_table(MUTATIONS)
+            .context("failed to open journal mutations")?;
+        let mut versions = transaction
+            .open_table(REMOTE_OBJECT_VERSIONS)
+            .context("failed to open remote object versions")?;
+        let mut total_completed =
+            read_optional::<u64>(&meta, REMOTE_BYTES_COMPLETED_KEY)?.unwrap_or_default();
+        let mut expected = remote_seq;
+        for (sequence, result_etag) in completions {
+            let sequence = *sequence;
+            expected = expected
+                .checked_add(1)
+                .context("remote sequence overflow")?;
+            if sequence != expected || sequence > local_seq {
+                bail!(
+                    "remote sequence must advance contiguously from {remote_seq} to {expected}, got {sequence}"
+                );
             }
-            drop(mutations);
-            drop(versions);
-            write_value(&mut meta, REMOTE_SEQ_KEY, &expected)?;
-            write_value(&mut meta, REMOTE_BYTES_COMPLETED_KEY, &total_completed)?;
+            // Decoded inside its own scope so the read guard is released
+            // before the re-insert below, without copying the row first.
+            let mut record: MutationRecord = {
+                let stored = mutations
+                    .get(sequence)
+                    .context("failed to read remote mutation")?
+                    .with_context(|| format!("journal mutation {sequence} does not exist"))?;
+                bincode::deserialize(stored.value()).context("failed to decode remote mutation")?
+            };
+            let completed_bytes = record.payload().map_or(0, |(payload_len, _)| payload_len);
+            total_completed = total_completed
+                .checked_add(completed_bytes)
+                .context("remote completed byte counter overflow")?;
+            record.remote_result_etag = result_etag.clone();
+            let encoded =
+                bincode::serialize(&record).context("failed to encode remote mutation")?;
+            mutations
+                .insert(sequence, encoded.as_slice())
+                .context("failed to store remote result")?;
+            apply_remote_object_version(&mut versions, &record)?;
         }
-        transaction
-            .commit()
-            .context("failed to commit remote watermark")?;
-        #[cfg(test)]
-        self.remote_watermark_commits
-            .fetch_add(1, Ordering::Relaxed);
+        drop(mutations);
+        drop(versions);
+        write_value(&mut meta, REMOTE_SEQ_KEY, &expected)?;
+        write_value(&mut meta, REMOTE_BYTES_COMPLETED_KEY, &total_completed)?;
         Ok(())
     }
 
@@ -5748,6 +5915,97 @@ mod tests {
             Some("etag-manifest".to_owned()),
             "batched marks must still publish per-object CAS predecessors"
         );
+    }
+
+    fn wait_for_shared_queue(journal: &Journal, len: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while journal.shared.queue.lock().unwrap().len() != len {
+            assert!(Instant::now() < deadline, "shared writes did not queue");
+            thread::yield_now();
+        }
+    }
+
+    /// A remote mark and a record batch queued behind the journal writer
+    /// commit in one durable transaction, and both survive reopening.
+    #[test]
+    fn a_remote_mark_and_a_record_batch_share_one_durable_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(open_temp_journal(&temp, "bucket-a"));
+        journal
+            .commit_put(put_record(1, "segments/1", b"one"), b"one")
+            .unwrap();
+        let commits_before = journal.shared_commits.load(Ordering::Relaxed);
+
+        let held = journal.write_gate.lock();
+        let marking = thread::spawn({
+            let journal = Arc::clone(&journal);
+            move || journal.mark_remote(1, Some("etag-one".to_owned()))
+        });
+        wait_for_shared_queue(&journal, 1);
+        let writing = thread::spawn({
+            let journal = Arc::clone(&journal);
+            move || journal.commit_put(put_record(2, "segments/2", b"two"), b"two")
+        });
+        wait_for_shared_queue(&journal, 2);
+        drop(held);
+        marking.join().unwrap().unwrap();
+        writing.join().unwrap().unwrap();
+        assert_eq!(
+            journal.shared_commits.load(Ordering::Relaxed) - commits_before,
+            1
+        );
+
+        let journal = Arc::into_inner(journal).unwrap();
+        drop(journal);
+        let reopened = open_temp_journal(&temp, "bucket-a");
+        let progress = reopened.progress().unwrap();
+        assert_eq!((progress.local_seq, progress.remote_seq), (2, 1));
+        assert_eq!(reopened.read_blob_bounded(2, 3).unwrap(), b"two");
+    }
+
+    /// A refused write commits nothing and does not fail the write that
+    /// shared its transaction.
+    #[test]
+    fn a_refused_shared_write_does_not_fail_the_write_beside_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(open_temp_journal(&temp, "bucket-a"));
+        journal
+            .commit_put(put_record(1, "segments/1", b"one"), b"one")
+            .unwrap();
+
+        let held = journal.write_gate.lock();
+        let marking = thread::spawn({
+            let journal = Arc::clone(&journal);
+            // Sequence 2 is not local yet when this mark is applied first.
+            move || journal.mark_remote_batch(&[(1, None), (2, None)])
+        });
+        wait_for_shared_queue(&journal, 1);
+        let writing = thread::spawn({
+            let journal = Arc::clone(&journal);
+            move || journal.commit_put(put_record(2, "segments/2", b"two"), b"two")
+        });
+        wait_for_shared_queue(&journal, 2);
+        drop(held);
+        let refused = marking.join().unwrap().unwrap_err();
+        assert!(format!("{refused:#}").contains("must advance contiguously"));
+        writing.join().unwrap().unwrap();
+        let progress = journal.progress().unwrap();
+        assert_eq!((progress.local_seq, progress.remote_seq), (2, 0));
+    }
+
+    /// While record batches commit, a mark waits for one to carry it, but
+    /// only for the ride window: with no batch coming it commits alone.
+    #[test]
+    fn a_remote_mark_commits_alone_when_no_record_batch_arrives() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        journal
+            .commit_put(put_record(1, "segments/1", b"one"), b"one")
+            .unwrap();
+        let started = Instant::now();
+        journal.mark_remote(1, None).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(journal.progress().unwrap().remote_seq, 1);
     }
 
     /// Batched marks keep the fail-closed contiguity contract: a run that
