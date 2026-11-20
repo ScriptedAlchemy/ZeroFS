@@ -1041,6 +1041,32 @@ async fn generations_reach_both_members_at_the_configured_cadence() -> Result<()
     Ok(())
 }
 
+/// The fixture's writeback journal holds 4,000,000 bytes of dirty RAM. A file
+/// larger than that is acknowledged at WRITE, so its flush must succeed and
+/// its bytes must read back, rather than fail with EIO.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_larger_than_the_writeback_journal_flushes_and_reads_back() -> Result<()> {
+    let fixture = Fixture::new().await;
+    let running = fixture.start().await?;
+    let fs = running.fs();
+    let data = payload(17, 9 * MIB as usize);
+    let inode = write_file(fs, 0, "larger-than-journal", (0o644, 0, 0), &data)
+        .await
+        .context("flush of a file larger than the writeback journal")?;
+    let auth = AuthContext::default();
+    let mut read = Vec::with_capacity(data.len());
+    while read.len() < data.len() {
+        let (bytes, _) = fs
+            .read_file(&auth, inode, read.len() as u64, MIB as u32)
+            .await?;
+        ensure!(!bytes.is_empty(), "short read at {}", read.len());
+        read.extend_from_slice(&bytes);
+    }
+    ensure!(read == data, "read-back differs from the written bytes");
+    running.stop().await;
+    Ok(())
+}
+
 /// Settings for a one-member raw pool with this survival table.
 fn raw_survival_settings(root: &std::path::Path, survival: serde_json::Value) -> Result<Settings> {
     let pool = Uuid::new_v4();
