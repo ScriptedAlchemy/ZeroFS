@@ -1279,25 +1279,27 @@ impl PoolObjectStore {
         skip.extend(self.inner.unavailable.iter().cloned());
         let placement = self.inner.segment_placement;
         let ledger = Arc::clone(&self.inner.ledger);
-        let id = self
-            .catalog(move |catalog| {
-                // Held from the check to the claim, so no two claims are
-                // promised the same bytes.
-                let mut ledger = ledger.lock().unwrap();
-                let member = catalog.admit(
-                    bytes,
-                    &members,
-                    None,
-                    &skip,
-                    placement,
-                    &ledger,
-                    prefer.as_deref(),
-                )?;
-                Ok(ledger.insert_claim(admission::Key::Claim, member, bytes))
-            })
-            .await
-            .map_err(|e| storage_full(e, bytes))?;
-        Ok(Claim::new(Arc::clone(&self.inner.ledger), id))
+        self.catalog(move |catalog| {
+            // Held from the check to the claim, so no two claims are
+            // promised the same bytes.
+            let mut promises = ledger.lock().unwrap();
+            let member = catalog.admit(
+                bytes,
+                &members,
+                None,
+                &skip,
+                placement,
+                &promises,
+                prefer.as_deref(),
+            )?;
+            let key = promises.insert_claim(admission::Key::Claim, member, bytes);
+            drop(promises);
+            // The blocking task may finish after its caller is cancelled.
+            // Its result must own the claim so dropping it returns the room.
+            Ok(Claim::new(ledger, key))
+        })
+        .await
+        .map_err(|e| storage_full(e, bytes))
     }
 
     /// PUT a metadata-survival object into `member`'s own store. Its physical
@@ -1316,16 +1318,27 @@ impl PoolObjectStore {
         let store = Arc::clone(&target.store);
         let bytes = payload.content_length() as u64;
         let ledger = Arc::clone(&self.inner.ledger);
-        let key = self
+        let claim = self
             .catalog(move |catalog| {
-                let mut ledger = ledger.lock().unwrap();
-                catalog.admit_survival(&target, bytes, &ledger)?;
-                Ok(ledger.insert_claim(admission::Key::Survival, target.id, bytes))
+                let mut promises = ledger.lock().unwrap();
+                catalog.admit_survival(&target, bytes, &promises)?;
+                let key = promises.insert_claim(admission::Key::Survival, target.id, bytes);
+                drop(promises);
+                Ok(Claim::new(ledger, key))
             })
             .await
             .map_err(|e| storage_full(e, bytes))?;
-        let _claim = Claim::new(Arc::clone(&self.inner.ledger), key);
-        store.put_opts(location, payload, opts).await
+        let location = location.clone();
+        self.inner
+            .tasks
+            .spawn(async move {
+                // Raw-device writes can outlive a cancelled caller. Keep their
+                // capacity claimed until the underlying operation has settled.
+                let _claim = claim;
+                store.put_opts(&location, payload, opts).await
+            })
+            .await
+            .map_err(|issue| error(format!("survival write task failed: {issue}")))?
     }
 
     /// Grow `segment`'s lease to `total` bytes on the member it is already
@@ -1402,18 +1415,21 @@ impl PoolObjectStore {
         if self.visible(location).await?.is_some() {
             return Ok(());
         }
-        let member = match self.admit(size, None).await {
-            Ok(claim) => claim.member(),
-            Err(error) if crate::retrying_object_store::is_no_space(&error) => {
-                self.inner.members[0].id.clone()
-            }
+        let claim = match self.admit(size, None).await {
+            Ok(claim) => Some(claim),
+            Err(error) if crate::retrying_object_store::is_no_space(&error) => None,
             Err(error) => return Err(error),
         };
+        let member = claim
+            .as_ref()
+            .map_or_else(|| self.inner.members[0].id.clone(), Claim::member);
         self.inner
             .ledger
             .lock()
             .unwrap()
             .insert_lease(segment, member, size);
+        // Keep the claim until the lease counts its room.
+        drop(claim);
         Ok(())
     }
 

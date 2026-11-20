@@ -17,6 +17,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Notify;
 
+mod admission_cancellation;
+
 fn segment(counter: u64) -> Path {
     Path::from(format!("db/{}", Segid::new(41, counter).object_key()))
 }
