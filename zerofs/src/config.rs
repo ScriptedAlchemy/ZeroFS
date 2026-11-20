@@ -337,6 +337,37 @@ impl StoreProfile {
     pub(crate) const NAS_JOURNAL_INFLIGHT: usize = 2;
     pub(crate) const RAW_CANDIDATE_SEAL_BYTES: usize = 4 * 1024 * 1024;
     pub(crate) const RAW_CANDIDATE_INFLIGHT: usize = 1;
+    /// Smallest writeback journal entry segments can be sized to. Half of it
+    /// reaches compaction's one-MiB packed-object floor.
+    pub(crate) const MIN_JOURNAL_ENTRY_BYTES: u64 = 2 << 20;
+
+    /// Bound the seal geometry so every segment fits one writeback journal
+    /// entry of `entry_bytes`. A lane seals once its buffer reaches the
+    /// threshold, after at most one more append, so half the entry for the
+    /// threshold and a quarter for one append leave the last quarter for
+    /// frame, directory and footer encoding. Larger writes split across
+    /// segments and wait for journal room instead of failing at flush.
+    fn fit_journal_entry(self, entry_bytes: u64) -> Result<Self> {
+        anyhow::ensure!(
+            entry_bytes >= Self::MIN_JOURNAL_ENTRY_BYTES,
+            "[writeback] memory_size_gb and disk_size_gb must each be at least {} bytes so one sealed segment fits the journal",
+            Self::MIN_JOURNAL_ENTRY_BYTES
+        );
+        let half = usize::try_from(entry_bytes / 2).unwrap_or(usize::MAX);
+        let seal_threshold = self
+            .seal_threshold
+            .unwrap_or(crate::fs::store::extent::SEAL_THRESHOLD)
+            .min(half);
+        let max_segment_append_bytes = self
+            .max_segment_append_bytes
+            .unwrap_or(usize::MAX)
+            .min(half / 2);
+        Ok(Self {
+            seal_threshold: Some(seal_threshold),
+            max_segment_append_bytes: Some(max_segment_append_bytes),
+            ..self
+        })
+    }
 }
 
 impl From<SftpDataProfile> for StoreProfile {
@@ -2431,8 +2462,23 @@ impl Settings {
             == Some(RuntimeProfile::RawDeviceP3NasFit)
     }
 
-    /// Resolve segment tuning from the runtime profile and storage backends.
+    /// Resolve segment tuning from the runtime profile and storage backends,
+    /// bounded so each sealed segment fits one writeback journal entry.
     pub(crate) fn store_profile(&self) -> Result<StoreProfile> {
+        let profile = self.backend_store_profile()?;
+        match self
+            .writeback
+            .as_ref()
+            .map(crate::writeback::config::WritebackConfig::entry_capacity_bytes)
+            .transpose()?
+            .flatten()
+        {
+            Some(entry_bytes) => profile.fit_journal_entry(entry_bytes),
+            None => Ok(profile),
+        }
+    }
+
+    fn backend_store_profile(&self) -> Result<StoreProfile> {
         if self.raw_device_p3_candidate() || self.raw_device_p3_nas_fit() {
             return Ok(StoreProfile {
                 seal_threshold: Some(StoreProfile::RAW_CANDIDATE_SEAL_BYTES),
@@ -3504,6 +3550,25 @@ min_free_gb = 256.0"#,
             writeback.upload_concurrency, 2,
             "a defaulted upload concurrency must follow a lowered SFTP write budget \
              instead of failing validation"
+        );
+    }
+
+    #[test]
+    fn a_writeback_journal_too_small_for_one_segment_is_refused() {
+        let error = write_and_load(&writeback_sftp_config(
+            16.0,
+            r#"[writeback]
+enabled = true
+dir = "/var/cache/zerofs-writeback"
+memory_size_gb = 0.002
+disk_size_gb = 512.0
+min_free_gb = 256.0"#,
+        ))
+        .and_then(|settings| settings.store_profile())
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("one sealed segment fits the journal"),
+            "{error:#}"
         );
     }
 

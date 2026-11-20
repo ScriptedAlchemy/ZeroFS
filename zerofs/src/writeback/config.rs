@@ -179,6 +179,18 @@ impl WritebackConfig {
             shutdown_flush: self.shutdown_flush,
         }))
     }
+
+    /// The largest object one journal entry can hold, or `None` when
+    /// writeback is off. A PUT is admitted whole against both the dirty RAM
+    /// and the dirty SSD budget, so it must fit the smaller of the two.
+    pub(crate) fn entry_capacity_bytes(&self) -> Result<Option<u64>> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let memory_bytes = decimal_gb_to_bytes("memory_size_gb", self.memory_size_gb)?;
+        let disk_bytes = decimal_gb_to_bytes("disk_size_gb", self.disk_size_gb)?;
+        Ok(Some(memory_bytes.min(disk_bytes)))
+    }
 }
 
 const fn default_high_watermark_percent() -> u8 {

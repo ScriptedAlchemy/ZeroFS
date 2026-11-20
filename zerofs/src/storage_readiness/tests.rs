@@ -55,8 +55,8 @@ impl Fixture {
                     ]
                 }
             },
-            "writeback": { "enabled": true, "dir": paths[4], "memory_size_gb": 0.001,
-                "disk_size_gb": 0.002, "min_free_gb": 0.001 },
+            "writeback": { "enabled": true, "dir": paths[4], "memory_size_gb": 0.004,
+                "disk_size_gb": 0.008, "min_free_gb": 0.001 },
             "servers": {}, "telemetry": { "enabled": false }
         });
         let mut facts = BTreeMap::new();
