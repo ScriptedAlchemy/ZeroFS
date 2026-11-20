@@ -269,6 +269,7 @@ impl ZeroFS {
             materialized_request_cache: crate::fs::mutation::request_cache::RequestCache::new(
                 crate::fs::mutation::config::DEFAULT_VOLATILE_MAX_OPERATIONS,
             ),
+            survival_admission: std::sync::Arc::default(),
             lineage_token,
             serving_writer_epoch,
             max_bytes,

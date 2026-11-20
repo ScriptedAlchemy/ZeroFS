@@ -155,6 +155,9 @@ pub(crate) enum WriteAdmissionError {
     FingerprintMismatch,
     /// Raw byte admission or the preparation gate refused the write.
     Mutation(MutationError),
+    /// Metadata-survival admission refused the write (EAGAIN while a commit
+    /// takes its cut, EIO or EROFS while latched).
+    Survival(FsError),
 }
 
 pub(crate) struct IdentifiedWrite<'a> {
@@ -1244,6 +1247,12 @@ impl ZeroFS {
         scope: ConflictScope,
         length: u64,
     ) -> Result<WriteAdmission, WriteAdmissionError> {
+        // Survival admission precedes every other admission step.
+        let _survival = self
+            .survival_admission
+            .admit()
+            .await
+            .map_err(WriteAdmissionError::Survival)?;
         let coordinator = self
             .mutation_coordinator
             .get()

@@ -34,6 +34,11 @@ exclude = ["vendor/foyer-storage", "raw-device"]
 [workspace.package]
 version = "2.2.2"
 
+# Key derivation is deliberately expensive. Unoptimized, one unwrap of the
+# data key takes seconds, and every test that opens a volume pays for it.
+[profile.dev.package.argon2]
+opt-level = 3
+
 [profile.release]
 lto = true
 opt-level = 3

@@ -12,12 +12,30 @@ pub(crate) enum RawKind {
     Physical,
 }
 
+/// Test builds also accept a private regular file in place of a loop device,
+/// so the whole configuration-to-device path runs without privileges. Release
+/// builds never accept one.
+fn is_test_file(scheme: &str) -> bool {
+    cfg!(test) && matches!(scheme, "raw+p3-testfile" | "raw+testfile")
+}
+
 pub(crate) fn is_p3(scheme: &str) -> bool {
     matches!(scheme, "raw+p3-v2" | "raw+p3-fixture" | "raw+p3-disk")
+        || (is_test_file(scheme) && scheme == "raw+p3-testfile")
 }
 
 pub(crate) fn is_payload(scheme: &str) -> bool {
     matches!(scheme, "raw+loop" | "raw+fixture-loop" | "raw+disk")
+        || (is_test_file(scheme) && scheme == "raw+testfile")
+}
+
+/// An exclusively held device: the open descriptor, its exact size and
+/// whatever keeps the claim alive.
+#[cfg(target_os = "linux")]
+pub(crate) struct Held {
+    pub device: std::fs::File,
+    pub size: u64,
+    _claim: Box<dyn std::any::Any + Send + Sync>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -121,8 +139,9 @@ impl RawBinding {
             !is_p3(url.scheme()) || layout.is_some(),
             "missing explicit P3 region lengths"
         );
+        // Only a test file has no backing path: it is its own device node.
         ensure!(
-            kind == RawKind::Physical || backing.is_some(),
+            kind == RawKind::Physical || backing.is_some() || is_test_file(url.scheme()),
             "missing raw backing path"
         );
         Ok(Self {
@@ -140,9 +159,26 @@ impl RawBinding {
     }
 
     #[cfg(target_os = "linux")]
-    fn claim(&self) -> Result<zerofs_raw_device::claim::Claim> {
+    fn claim(&self) -> Result<Held> {
         use zerofs_raw_device::claim::Claim;
-        Ok(match self.kind {
+        if self.kind != RawKind::Physical && self.backing.is_none() {
+            let device = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.node)?;
+            ensure!(
+                fs4::fs_std::FileExt::try_lock_exclusive(&device)?,
+                "test device {} is already claimed",
+                self.node.display()
+            );
+            let size = device.metadata()?.len();
+            return Ok(Held {
+                device,
+                size,
+                _claim: Box::new(()),
+            });
+        }
+        let claim = match self.kind {
             RawKind::Physical => Claim::from_broker(
                 &PathBuf::from(
                     std::env::var_os("ZEROFS_RAW_CLAIM_SOCKET")
@@ -166,6 +202,11 @@ impl RawBinding {
                 self.backing_path()
                     .context("missing tmpfs fixture backing")?,
             )?,
+        };
+        Ok(Held {
+            device: claim.device.try_clone()?,
+            size: claim.size,
+            _claim: Box::new(claim),
         })
     }
 
@@ -323,16 +364,8 @@ pub(super) async fn open_p3(binding: RawBinding, initialize: bool) -> Result<Ope
     use crate::pool_object_store::CatalogSource;
     use crate::raw_member::RawMemberStore;
     use object_store::path::Path;
-    use std::sync::Arc;
-    use zerofs_raw_device::p3::P3Layout;
     tokio::task::spawn_blocking(move || {
-        let claim = Arc::new(binding.claim()?);
-        let layout = P3Layout::new(claim.size, binding.layout.context("missing raw P3 layout")?)?;
-        let roles = layout.open_v2(
-            claim.device.try_clone()?,
-            *binding.pool.as_bytes(),
-            *binding.member.as_bytes(),
-        )?;
+        let (claim, roles) = binding.p3_roles()?;
         if binding.kind != RawKind::SmallLoop {
             if initialize {
                 ensure!(
@@ -380,4 +413,69 @@ pub(super) async fn open_p3(binding: RawBinding, initialize: bool) -> Result<Ope
 #[cfg(not(target_os = "linux"))]
 pub(super) async fn open_p3(_: RawBinding, _: bool) -> Result<OpenP3> {
     bail!("raw+p3-v2 requires Linux")
+}
+
+#[cfg(target_os = "linux")]
+impl RawBinding {
+    fn p3_roles(&self) -> Result<(std::sync::Arc<Held>, zerofs_raw_device::p3::P3v2)> {
+        let claim = std::sync::Arc::new(self.claim()?);
+        let layout = zerofs_raw_device::p3::P3Layout::new(
+            claim.size,
+            self.layout.context("missing raw P3 layout")?,
+        )?;
+        let roles = layout.open_v2(
+            claim.device.try_clone()?,
+            *self.pool.as_bytes(),
+            *self.member.as_bytes(),
+        )?;
+        Ok((claim, roles))
+    }
+}
+
+/// A freshly provisioned P3 held as the target of an explicit metadata
+/// recovery. Every role is empty.
+pub(crate) struct RecoveryP3 {
+    pub authority: std::sync::Arc<dyn object_store::ObjectStore>,
+    pub path: object_store::path::Path,
+    pub catalog: zerofs_raw_device::journal_region::TransactionRegion,
+    pub journal: zerofs_raw_device::journal_region::TransactionRegion,
+}
+
+/// Claim the configured P3 for recovery. It must be labelled for this pool
+/// and hold nothing: recovery never overwrites or merges into existing state.
+#[cfg(target_os = "linux")]
+pub(crate) async fn open_recovery_p3(binding: RawBinding) -> Result<RecoveryP3> {
+    use crate::raw_member::RawMemberStore;
+    tokio::task::spawn_blocking(move || {
+        let (claim, roles) = binding.p3_roles()?;
+        ensure!(
+            roles.journal.is_empty()?
+                && roles.catalog.is_empty()?
+                && roles.metadata.is_empty()
+                && roles.keys.is_empty()
+                && roles.scratch.is_empty()
+                && roles.cache.is_empty(),
+            "the recovery target P3 is not blank; refusing to write over existing state"
+        );
+        let path = object_store::path::Path::from("db");
+        let authority = super::raw_authority::RawAuthority {
+            envelope: path
+                .clone()
+                .join(crate::key_management::WRAPPED_KEY_FILENAME),
+            metadata: RawMemberStore::new(roles.metadata, claim.clone(), 0)?,
+            keys: RawMemberStore::new(roles.keys, claim.clone(), 0)?,
+        };
+        Ok(RecoveryP3 {
+            authority: std::sync::Arc::new(authority),
+            path,
+            catalog: roles.catalog.retain_claim(claim.clone()),
+            journal: roles.journal.retain_claim(claim),
+        })
+    })
+    .await?
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) async fn open_recovery_p3(_: RawBinding) -> Result<RecoveryP3> {
+    bail!("raw P3 recovery requires Linux")
 }

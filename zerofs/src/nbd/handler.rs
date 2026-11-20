@@ -873,6 +873,7 @@ impl NBDHandler {
             Err(WriteAdmissionError::Unavailable) => Err(CommandError::IoError),
             Err(WriteAdmissionError::Backpressured) => Err(CommandError::IoError),
             Err(WriteAdmissionError::Mutation(error)) => Err(mutation_command_error(error)),
+            Err(WriteAdmissionError::Survival(_)) => Err(CommandError::IoError),
         }
     }
 

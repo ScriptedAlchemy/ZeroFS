@@ -1578,6 +1578,10 @@ pub async fn build_slatedb(
 }
 
 pub struct InitResult {
+    /// The metadata-survival commit owner, when configured on a writer.
+    /// Held for the writer lifetime: dropping it stops interval commits and
+    /// releases every replica lock.
+    pub(crate) survival: Option<Arc<crate::metadata_survival::SurvivalManager>>,
     pub(crate) block_transformer: Arc<dyn BlockTransformer>,
     pub fs: Arc<ZeroFS>,
     pub object_store: Arc<dyn object_store::ObjectStore>,
@@ -1703,6 +1707,7 @@ pub async fn run_server(
     let cache_owner = init_result._cache_owner.clone();
     tokio::spawn(init_result.metadata_fault.clone().exit_when_tripped());
     let writeback_for_shutdown = init_result.writeback.clone();
+    let survival = init_result.survival.clone();
     let writeback_for_metrics = init_result.writeback.clone();
     let writeback_for_checkpoints = init_result.writeback.clone();
     let writeback_for_lifecycle = writeback_for_shutdown.clone();
@@ -2131,6 +2136,11 @@ pub async fn run_server(
                 let recovery_result = match recovery { Some(worker) => worker.shutdown().await, None => Ok(()) };
                 monitor_result?;
                 recovery_result?;
+            }
+            // Serving has stopped and reclaims have drained, so this is the
+            // last consistent cut the members can receive before the close.
+            if let Some(survival) = &survival {
+                survival.shutdown_commit().await;
             }
             info!("Performing final flush and closing database...");
             let lifecycle = MutationLifecycle::new(LifecycleOwners::for_process(

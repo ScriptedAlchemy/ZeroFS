@@ -1259,7 +1259,19 @@ impl ReconciledDb {
             );
         }
 
+        let survival = crate::metadata_survival::attach_writer(
+            settings,
+            &fs,
+            pool.as_ref(),
+            &object_store,
+            &actual_db_path,
+            writeback.as_ref(),
+        )
+        .await
+        .context("Failed to attach metadata survival")?;
+
         Ok(InitResult {
+            survival,
             block_transformer,
             fs,
             // Retry-wrapped for the consumers downstream (the GC's checkpoint-gate
@@ -1384,6 +1396,32 @@ pub(super) async fn raw_pool_journal(
     let region = crate::writeback::bootstrap::apply_raw_budget(region, &writeback)?;
     tokio::task::spawn_blocking(move || {
         crate::writeback::journal::Journal::open_raw(region, identity)
+    })
+    .await?
+}
+
+/// Create the empty writeback journal of a P3 rebuilt by metadata recovery.
+///
+/// The lost journal went with its device. The bucket identity and the key are
+/// the originals, already restored to `store`; neither is ever created here.
+pub(crate) async fn recreate_raw_pool_journal(
+    settings: &Settings,
+    store: &Arc<dyn object_store::ObjectStore>,
+    path: &Path,
+    region: zerofs_raw_device::journal_region::TransactionRegion,
+) -> Result<()> {
+    anyhow::ensure!(
+        region.is_empty()?,
+        "refusing to replace an existing journal"
+    );
+    let (bucket, key) = load_existing_bucket_and_key(settings, store, path.as_ref()).await?;
+    let identity = writeback_journal_identity(settings, &bucket, path.as_ref(), &key)?;
+    let writeback = settings
+        .writeback_settings(crate::writeback::config::WritebackAccessMode::ReadWrite)?
+        .context("raw journal settings are required")?;
+    let region = crate::writeback::bootstrap::apply_raw_budget(region, &writeback)?;
+    tokio::task::spawn_blocking(move || {
+        crate::writeback::journal::Journal::open_raw(region, identity).map(drop)
     })
     .await?
 }
@@ -1531,6 +1569,7 @@ mod role_decision_tests {
                     catalog_dir: temp.path().join("catalog"),
                     segment_placement: Default::default(),
                     allow_degraded_start: false,
+                    metadata_survival: None,
                     members: vec![crate::config::StoragePoolMemberConfig {
                         health_device: None,
                         id: "local".to_owned(),

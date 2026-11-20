@@ -12,6 +12,7 @@ mod file_placement;
 mod health;
 mod recovery;
 mod space;
+mod survival;
 pub use health::{MemberHealth, SegmentFault, SmartSample};
 pub(crate) use recovery::PoolRecovery;
 pub use space::{FilesystemSpace, FreeSpace};
@@ -23,6 +24,8 @@ pub(crate) use catalog::CatalogSource;
 #[cfg(test)]
 pub(crate) use catalog::survival_test_support;
 use catalog::{Catalog, Entry, Garbage, Physical, StoredAttribute, Upload};
+pub(crate) use catalog::{CatalogExport, exported_physical_generations};
+pub(crate) use survival::SurvivalMember;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -155,6 +158,9 @@ pub struct PoolStatus {
     pub mapped_objects: u64,
     pub unreadable: Vec<SegmentFault>,
     pub quarantined_leftovers: Vec<PoolPlacement>,
+    /// The metadata copies on the members, while a server maintains them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata_survival: Option<crate::metadata_survival::SurvivalStatus>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -208,6 +214,12 @@ struct PoolInner {
     safety_failure: tokio_util::sync::CancellationToken,
     active_uploads: Arc<StdMutex<BTreeSet<String>>>,
     no_space: space::NoSpaceMarks,
+    /// Physical generations each retained metadata-survival generation needs.
+    /// Garbage cleanup keeps such bytes and their debt until release.
+    survival_retention: StdMutex<std::collections::BTreeMap<u64, BTreeSet<String>>>,
+    /// Set when retention records exist but could not be read at startup.
+    survival_hold_all: std::sync::atomic::AtomicBool,
+    survival_status: StdMutex<Option<crate::metadata_survival::SurvivalStatus>>,
     #[cfg(test)]
     reserve_pause: StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     #[cfg(test)]
@@ -586,6 +598,60 @@ impl PoolObjectStore {
         .await
     }
 
+    /// Build the in-memory pool around an already opened catalog. Performs no
+    /// catalog writes, member probes, marker checks or recovery.
+    fn assemble(
+        authority: Arc<dyn ObjectStore>,
+        authority_prefix: Path,
+        catalog: Catalog,
+        members: Vec<PoolMember>,
+        segment_placement: SegmentPlacement,
+        unavailable: Option<String>,
+    ) -> Self {
+        let member_indices = members
+            .iter()
+            .enumerate()
+            .map(|(i, member)| (member.id.clone(), i))
+            .collect();
+        Self {
+            inner: Arc::new(PoolInner {
+                authority,
+                authority_prefix,
+                catalog: Arc::new(catalog),
+                member_checks: (0..members.len()).map(|_| Mutex::new(false)).collect(),
+                member_activity: (0..members.len())
+                    .map(|_| MemberActivity {
+                        tasks: tokio_util::task::TaskTracker::new(),
+                        started: AtomicU64::new(0),
+                    })
+                    .collect(),
+                members,
+                segment_placement,
+                unavailable,
+                member_indices,
+                migration: Mutex::new(()),
+                evacuating: Arc::new(StdMutex::new(None)),
+                tasks: tokio_util::task::TaskTracker::new(),
+                health_changed: tokio::sync::Notify::new(),
+                safety_failure: tokio_util::sync::CancellationToken::new(),
+                active_uploads: Arc::new(StdMutex::new(BTreeSet::new())),
+                no_space: space::NoSpaceMarks::default(),
+                survival_retention: StdMutex::new(std::collections::BTreeMap::new()),
+                survival_hold_all: std::sync::atomic::AtomicBool::new(false),
+                survival_status: StdMutex::new(None),
+                #[cfg(test)]
+                reserve_pause: StdMutex::new(None),
+                #[cfg(test)]
+                recovery_pause: StdMutex::new(None),
+                #[cfg(test)]
+                verification_pause: StdMutex::new(None),
+                #[cfg(test)]
+                status_pause: StdMutex::new(None),
+                locks: (0..KEY_LOCKS).map(|_| Arc::new(RwLock::new(()))).collect(),
+            }),
+        }
+    }
+
     pub(crate) async fn open_with_preflight(
         authority: Arc<dyn ObjectStore>,
         authority_prefix: Path,
@@ -622,45 +688,14 @@ impl PoolObjectStore {
                 missing,
             } => (true, allow_degraded, missing),
         };
-        let member_indices = members
-            .iter()
-            .enumerate()
-            .map(|(i, member)| (member.id.clone(), i))
-            .collect();
-        let mut pool = Self {
-            inner: Arc::new(PoolInner {
-                authority,
-                authority_prefix,
-                catalog: Arc::new(catalog),
-                member_checks: (0..members.len()).map(|_| Mutex::new(false)).collect(),
-                member_activity: (0..members.len())
-                    .map(|_| MemberActivity {
-                        tasks: tokio_util::task::TaskTracker::new(),
-                        started: AtomicU64::new(0),
-                    })
-                    .collect(),
-                members,
-                segment_placement,
-                unavailable: unavailable.clone(),
-                member_indices,
-                migration: Mutex::new(()),
-                evacuating: Arc::new(StdMutex::new(None)),
-                tasks: tokio_util::task::TaskTracker::new(),
-                health_changed: tokio::sync::Notify::new(),
-                safety_failure: tokio_util::sync::CancellationToken::new(),
-                active_uploads: Arc::new(StdMutex::new(BTreeSet::new())),
-                no_space: space::NoSpaceMarks::default(),
-                #[cfg(test)]
-                reserve_pause: StdMutex::new(None),
-                #[cfg(test)]
-                recovery_pause: StdMutex::new(None),
-                #[cfg(test)]
-                verification_pause: StdMutex::new(None),
-                #[cfg(test)]
-                status_pause: StdMutex::new(None),
-                locks: (0..KEY_LOCKS).map(|_| Arc::new(RwLock::new(()))).collect(),
-            }),
-        };
+        let mut pool = Self::assemble(
+            authority,
+            authority_prefix,
+            catalog,
+            members,
+            segment_placement,
+            unavailable.clone(),
+        );
         let configured = pool.inner.members.clone();
         pool.catalog(move |catalog| {
             catalog.configure_members_except(&configured, unavailable.as_deref())
@@ -1657,6 +1692,12 @@ impl PoolObjectStore {
     }
 
     async fn cleanup_garbage(&self, garbage: &Garbage) -> object_store::Result<()> {
+        if self.survival_retains(&garbage.entry.physical) {
+            // A retained recovery generation still reads these bytes. Keep the
+            // physical generation and its charged debt; a later cleanup pass
+            // after the generation retires reclaims both.
+            return Ok(());
+        }
         self.remove_physical(&garbage.entry.physical, GenerationState::Published)
             .await?;
         #[cfg(test)]
@@ -1667,6 +1708,9 @@ impl PoolObjectStore {
     }
 
     async fn recover_pending(&self) -> object_store::Result<()> {
+        // Retained survival generations pin their payload across restarts,
+        // even before the survival owner reattaches or if its table is gone.
+        self.load_durable_survival_retention().await;
         let (mut uploads, mut garbage) = self.catalog(Catalog::recovery).await?;
         // Recover local debts first, and bound startup work even when a remote
         // member has thousands of interrupted operations. Native deletions
@@ -1899,6 +1943,9 @@ impl PoolObjectStore {
                 member.safe_to_pull_with_known_loss = false;
             }
         }
+        status.metadata_survival = self
+            .survival_status()
+            .map(|status| status.at(crate::metadata_survival::now_seconds()));
         Ok(status)
     }
 
