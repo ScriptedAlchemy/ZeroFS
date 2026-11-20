@@ -257,7 +257,7 @@ impl MetadataSurvivalConfig {
 /// Why survival did not acknowledge, or why recovery refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum SurvivalFailure {
-    #[error("replica deadline expired before record publication")]
+    #[error("a commit deadline expired before record publication; the next attempt retries")]
     Timeout,
     #[error("metadata replica is full")]
     Full,
@@ -833,12 +833,6 @@ impl SurvivalManager {
             }),
             commit_lock: tokio::sync::Mutex::new(()),
         });
-        manager
-            .fs
-            .survival_admission
-            .set_final_pause(Duration::from_millis(
-                manager.config.final_pause_max_milliseconds,
-            ));
         if fresh {
             manager.activate(settings, &envelope).await?;
         } else {
@@ -1332,6 +1326,25 @@ impl SurvivalManager {
         Ok(receipt)
     }
 
+    /// Reopen admission without a cut once the closed phase reaches the final
+    /// pause. Waiting mutations proceed; the next attempt retries the cut.
+    fn defer_cut(
+        &self,
+        reopen: &mut ReopenOnDrop<'_>,
+        closed_at: std::time::Instant,
+        waiting_for: &str,
+    ) -> anyhow::Error {
+        reopen.reopen();
+        let pause = closed_at.elapsed().as_millis() as u64;
+        self.lock_state().last_pause_millis = Some(pause);
+        failure(
+            SurvivalFailure::Timeout,
+            format!(
+                "{waiting_for} did not finish within final_pause_max_milliseconds; the cut was deferred and admission reopened after {pause} ms"
+            ),
+        )
+    }
+
     /// Closed phase: drain, cutoff, checkpoint and catalog export.
     async fn capture(&self, observer: &mut dyn CommitObserver) -> Result<Candidate> {
         let sequence = self.lock_state().last.map_or(1, |(seq, _, _)| seq + 1);
@@ -1381,6 +1394,11 @@ impl SurvivalManager {
         gate.close()
             .map_err(|_| failure(SurvivalFailure::Io, "admission is latched"))?;
         let closed_at = std::time::Instant::now();
+        // Mutations wait at a closed gate instead of failing, so the commit
+        // bounds the pause: admitted work and the backend cutoff get the final
+        // pause, or the cut is deferred to the next attempt.
+        let pause_deadline = tokio::time::Instant::now()
+            + Duration::from_millis(self.config.final_pause_max_milliseconds);
         let mut reopen = ReopenOnDrop(Some(gate));
         self.reach_all(observer, CommitPoint::AdmissionClosed, Side::After, &intent)
             .await;
@@ -1391,12 +1409,9 @@ impl SurvivalManager {
             &intent,
         )
         .await;
-        tokio::time::timeout(
-            Duration::from_secs(self.config.commit_deadline_seconds),
-            gate.drained(),
-        )
-        .await
-        .map_err(|_| failure(SurvivalFailure::Timeout, "admitted work did not drain"))?;
+        tokio::time::timeout_at(pause_deadline, gate.drained())
+            .await
+            .map_err(|_| self.defer_cut(&mut reopen, closed_at, "admitted work"))?;
         self.reach_all(
             observer,
             CommitPoint::AdmittedWorkDrained,
@@ -1406,16 +1421,16 @@ impl SurvivalManager {
         .await;
         self.reach_all(observer, CommitPoint::BackendCutoff, Side::Before, &intent)
             .await;
-        let durable = self
-            .fs
-            .administrative_remote_durability()
-            .await
-            .map_err(|error| {
-                failure(
-                    SurvivalFailure::Io,
-                    format!("backend cutoff failed: {error}"),
-                )
-            })?;
+        let durable =
+            tokio::time::timeout_at(pause_deadline, self.fs.administrative_remote_durability())
+                .await
+                .map_err(|_| self.defer_cut(&mut reopen, closed_at, "the backend cutoff"))?
+                .map_err(|error| {
+                    failure(
+                        SurvivalFailure::Io,
+                        format!("backend cutoff failed: {error}"),
+                    )
+                })?;
         self.reach_all(observer, CommitPoint::BackendCutoff, Side::After, &intent)
             .await;
 

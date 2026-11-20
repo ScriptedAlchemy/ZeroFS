@@ -444,7 +444,14 @@ pub(super) async fn exercise(
                 .clone();
             result.api.push(probe_read(live, &bad).await?);
             result.api.push(probe_read(live, &safe).await?);
-            result.api.push(probe_create(live, b"read-gate").await?);
+            let gated = spawn_create(live, b"read-gate");
+            if row == Row::ReadFaultClosed {
+                tokio::time::sleep(FINAL_PAUSE_MAX + Duration::from_secs(1)).await;
+                ensure!(
+                    !gated.is_finished(),
+                    "the closed gate refused a mutation instead of holding it"
+                );
+            }
             result.after_catalog = Some(survival_test_support::capture(live.pool()).await?);
             if row == Row::ReadFaultClosed {
                 driver.review_action(live, Action::ReopenAdmission).await?;
@@ -454,6 +461,11 @@ pub(super) async fn exercise(
                     "the deferred observation was never flushed"
                 );
             }
+            result.api.push(
+                tokio::time::timeout(FINAL_PAUSE_MAX + Duration::from_secs(1), gated)
+                    .await
+                    .context("the held mutation did not finish once admission reopened")??,
+            );
         }
         Row::IdleAndBounds => {
             let root = live.replica_roots()[1].join(".zerofs-survival/v1");
@@ -690,18 +702,29 @@ pub(super) async fn exercise(
                 )
                 .await
             });
-            let started = std::time::Instant::now();
-            let late_result = tokio::time::timeout(FINAL_PAUSE_MAX + Duration::from_secs(1), late)
-                .await??
-                .map(|_| ());
-            // Late admission must return while the inode remains held. It
-            // therefore cannot hold that inode while waiting at the gate.
-            result.lock_wait = Some(started.elapsed());
-            result.api.push(late_result);
+            tokio::time::sleep(FINAL_PAUSE_MAX + Duration::from_secs(1)).await;
+            ensure!(!late.is_finished(), "the closed gate refused a write");
+            // A write held at the gate must not hold its inode: once the test
+            // releases its own lock, the inode is free at once.
             drop(guard);
+            let started = std::time::Instant::now();
+            drop(
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    live.fs().lock_manager.acquire(inode),
+                )
+                .await
+                .context("a write waiting at the gate held its inode lock")?,
+            );
+            result.lock_wait = Some(started.elapsed());
+            driver.review_action(live, Action::ReopenAdmission).await?;
             let _ = write.release.send(());
             tokio::time::timeout(Duration::from_secs(2), write.task).await???;
-            driver.review_action(live, Action::ReopenAdmission).await?;
+            result.api.push(
+                tokio::time::timeout(Duration::from_secs(2), late)
+                    .await??
+                    .map(|_| ()),
+            );
             result.api.push(probe_create(live, b"lock-progress").await?);
         }
         Row::DataOnlyLoss => {
@@ -982,12 +1005,12 @@ pub(super) fn oracle(row: Row, live: &Live, observed: &Observation) -> Result<()
                 == [
                     Err(FsError::IoError),
                     Ok(()),
-                    // A commit's closed phase is transient. A latch is not.
-                    Err(if row == Row::ReadFaultClosed {
-                        FsError::RetryLater
+                    // A commit's closed phase delays a mutation. A latch refuses it.
+                    if row == Row::ReadFaultClosed {
+                        Ok(())
                     } else {
-                        FsError::ReadOnlyFilesystem
-                    })
+                        Err(FsError::ReadOnlyFilesystem)
+                    }
                 ]
                 && evidence.before_catalog.is_some()
                 && evidence.before_catalog == evidence.after_catalog,
@@ -1053,10 +1076,10 @@ pub(super) fn oracle(row: Row, live: &Live, observed: &Observation) -> Result<()
             "startup left an owned orphan checkpoint"
         ),
         Row::AdmissionLockOrder => ensure!(
-            evidence.api == [Err(FsError::RetryLater), Ok(())]
+            evidence.api == [Ok(()), Ok(())]
                 && evidence
                     .lock_wait
-                    .is_some_and(|wait| wait <= FINAL_PAUSE_MAX + Duration::from_secs(1)),
+                    .is_some_and(|wait| wait <= Duration::from_secs(1)),
             "admission waited while holding an inode lock"
         ),
         Row::DataOnlyLoss => ensure!(
@@ -1158,18 +1181,18 @@ pub(super) fn optimistic(row: Row, live: &Live, receipt: &SurvivalReceipt) -> Re
         result.api = vec![
             Err(FsError::IoError),
             Ok(()),
-            Err(if row == Row::ReadFaultClosed {
-                FsError::RetryLater
+            if row == Row::ReadFaultClosed {
+                Ok(())
             } else {
-                FsError::ReadOnlyFilesystem
-            }),
+                Err(FsError::ReadOnlyFilesystem)
+            },
         ];
     }
     if row == Row::DataOnlyLoss {
         result.api = vec![Err(FsError::IoError), Ok(()), Ok(())];
     }
     if row == Row::AdmissionLockOrder {
-        result.api = vec![Err(FsError::RetryLater), Ok(())];
+        result.api = vec![Ok(()), Ok(())];
     }
     if row == Row::MetadataReplicaLoss {
         let mut closed = status.clone();

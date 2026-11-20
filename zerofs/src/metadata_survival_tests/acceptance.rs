@@ -15,9 +15,9 @@ use tokio::sync::oneshot;
 use crate::metadata_survival as production;
 
 const REPLICA_TIMEOUT: Duration = Duration::from_secs(90);
-// The proposed `final_pause_max_milliseconds` default. A mutation that finds
-// admission closed for a commit waits at most this long, then fails with
-// EAGAIN. Latched closed admission refuses mutations at once.
+// The `final_pause_max_milliseconds` default: how long a commit may keep a
+// mutation waiting at its closed gate. The mutation waits, it is never
+// refused. Latched closed admission refuses mutations at once.
 const FINAL_PAUSE_MAX: Duration = Duration::from_millis(1000);
 const REPLACEMENT_DEVICE_ID: &str = "fixture-replacement-device";
 
@@ -827,7 +827,7 @@ struct Observation {
     reported_lost: Vec<LostRange>,
     admitted_pending_at_loss: bool,
     commit_waited_for_admitted: bool,
-    late_arrival: Option<Result<(), FsError>>,
+    late_arrival_waited: bool,
     cut: Option<Cut>,
     cut_object: Option<PathBuf>,
     journal_absent: bool,
@@ -1416,6 +1416,18 @@ async fn probe_create(live: &Live, name: &[u8]) -> Result<Result<(), FsError>> {
     .map(|_| ()))
 }
 
+/// Start a create that a closed gate must hold rather than refuse.
+fn spawn_create(live: &Live, name: &'static [u8]) -> tokio::task::JoinHandle<Result<(), FsError>> {
+    let fs = Arc::clone(live.fs());
+    tokio::spawn(async move {
+        let auth = AuthContext::default();
+        let creds = Credentials::from_auth_context(&auth);
+        fs.create(&creds, 0, name, &SetAttributes::default())
+            .await
+            .map(|_| ())
+    })
+}
+
 async fn overwrite_first_file(live: &mut Live, seed: u32) -> Result<()> {
     let file = live.reads[0].inode;
     let data = payload(seed).slice(..FINAL_SIZE);
@@ -1738,8 +1750,8 @@ fn oracle(row: Row, live: &Live, observed: &Observation) -> Result<()> {
         Row::AdmittedWriteLoss => ensure!(
             observed.admitted_pending_at_loss
                 && observed.commit_waited_for_admitted
-                && observed.late_arrival == Some(Err(FsError::RetryLater)),
-            "the admitted write must overlap a waiting commit and a bounded rejected late arrival"
+                && observed.late_arrival_waited,
+            "the admitted write must overlap a waiting commit and a late arrival held at the gate"
         ),
         Row::InterruptedCommit => {
             ensure!(
@@ -2332,6 +2344,7 @@ async fn one_case(row: Row, live: &mut Live, driver: &dyn Survival) -> Result<()
             .await?
             .ok_or_else(|| Missing("the admitted-write mid-commit hook is absent".to_owned()))?;
         let mut commit = None;
+        let mut late = None;
         let result = async {
             let prior = driver.commit(live).await?;
             verify_replica_record(live, &prior, RecordCoverage::AllRequired)?;
@@ -2363,8 +2376,9 @@ async fn one_case(row: Row, live: &mut Live, driver: &dyn Survival) -> Result<()
             // prevent the real drain from completing.
             let _ = pause.release.send(());
             commit = Some(pause.task);
-            let late = probe_create(live, b"late-arrival").await?;
+            late = Some(spawn_create(live, b"late-arrival"));
             tokio::time::sleep(Duration::from_millis(25)).await;
+            let late_waited = !late.as_ref().unwrap().is_finished();
             let pending = !write.task.is_finished();
             let drained_wait = waiting && !commit.as_ref().unwrap().is_finished();
             ensure!(
@@ -2372,7 +2386,7 @@ async fn one_case(row: Row, live: &mut Live, driver: &dyn Survival) -> Result<()
                 "commit did not wait for admitted work"
             );
             lose_device(live, Device::Authority)?;
-            Ok((prior, pending, drained_wait, late))
+            Ok((prior, pending, drained_wait, late_waited))
         }
         .await;
         drop(write.release);
@@ -2382,7 +2396,11 @@ async fn one_case(row: Row, live: &mut Live, driver: &dyn Survival) -> Result<()
             task.abort();
             let _ = task.await;
         }
-        let (receipt, pending, waited, late) = result?;
+        if let Some(task) = late {
+            task.abort();
+            let _ = task.await;
+        }
+        let (receipt, pending, waited, late_arrival_waited) = result?;
         driver.crash_writer(live).await?;
         return recover_after_loss(
             row,
@@ -2392,7 +2410,7 @@ async fn one_case(row: Row, live: &mut Live, driver: &dyn Survival) -> Result<()
             Observation {
                 admitted_pending_at_loss: pending,
                 commit_waited_for_admitted: waited,
-                late_arrival: Some(late),
+                late_arrival_waited,
                 ..Default::default()
             },
         )
@@ -2678,7 +2696,7 @@ async fn every_acceptance_oracle_rejects_success_without_survival() -> Result<()
                 .collect(),
             admitted_pending_at_loss: true,
             commit_waited_for_admitted: true,
-            late_arrival: Some(Err(FsError::RetryLater)),
+            late_arrival_waited: true,
             review: row
                 .review_case()
                 .then(|| review_cases::optimistic(row, &live, &receipt)),

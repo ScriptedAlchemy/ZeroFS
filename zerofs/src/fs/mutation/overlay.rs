@@ -146,6 +146,7 @@ pub(crate) enum WriteAdmission {
 
 /// Why a write could not enter shared admission. Each protocol maps these
 /// onto its own error vocabulary; the sequence itself stays protocol-agnostic.
+#[derive(Debug)]
 pub(crate) enum WriteAdmissionError {
     /// The mutation coordinator or its request cache is gone.
     Unavailable,
@@ -155,8 +156,8 @@ pub(crate) enum WriteAdmissionError {
     FingerprintMismatch,
     /// Raw byte admission or the preparation gate refused the write.
     Mutation(MutationError),
-    /// Metadata-survival admission refused the write (EAGAIN while a commit
-    /// takes its cut, EIO or EROFS while latched).
+    /// Latched metadata-survival admission refused the write (EIO or EROFS).
+    /// A commit's cut only delays a write.
     Survival(FsError),
 }
 
@@ -1247,12 +1248,26 @@ impl ZeroFS {
         scope: ConflictScope,
         length: u64,
     ) -> Result<WriteAdmission, WriteAdmissionError> {
-        // Survival admission precedes every other admission step.
+        // Survival admission precedes every other admission step. It logs
+        // its own refusals with the latch reason.
         let _survival = self
             .survival_admission
             .admit()
             .await
             .map_err(WriteAdmissionError::Survival)?;
+        self.admit_surviving_write(identity, fingerprint, lifetime, scope, length)
+            .await
+            .inspect_err(|error| tracing::warn!(?error, length, "refused a client write"))
+    }
+
+    async fn admit_surviving_write(
+        &self,
+        identity: RequestIdentity,
+        fingerprint: RequestFingerprint,
+        lifetime: RequestLifetime,
+        scope: ConflictScope,
+        length: u64,
+    ) -> Result<WriteAdmission, WriteAdmissionError> {
         let coordinator = self
             .mutation_coordinator
             .get()

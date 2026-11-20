@@ -50,7 +50,7 @@ final drain, seal, flush, checkpoint and catalog export, a pause bounded by
 admission before any replica I/O, so replica publication runs with writes
 admitted. Ordinary memory, local SSD and backend receipts keep their current
 meaning. They can wait at this bounded gate, but do not wait for a survival
-receipt of their own. Recovery uses verified immutable copies in owned scratch and never
+receipt of their own. A commit delays a mutation but never fails one. Recovery uses verified immutable copies in owned scratch and never
 opens the surviving sources through today's mutating startup path.
 
 This stage changes design text and executable acceptance contracts only.
@@ -235,7 +235,7 @@ A survival attempt has three phases, and only the middle one closes admission.
 | Phase | Admission | What a new mutation waits for | When the budget runs out |
 | --- | --- | --- | --- |
 | Pre-drain | Open | Nothing that survival adds. Ordinary writeback backpressure is unchanged. | After `predrain_max_seconds` the owner skips the attempt with admission still open, returns `Timeout` to an explicit request and reports lag. Writers see nothing. |
-| Final pause | Closed | The admission gate, for at most `final_pause_max_milliseconds` from the mutation's arrival. | The owner aborts before any record, settles its own I/O and reopens admission. A mutation still waiting when its own bound expires fails without effect with EAGAIN. |
+| Final pause | Closed | The admission gate, until the owner reopens it. Admitted work and the backend cutoff get `final_pause_max_milliseconds` from the close. | The owner defers the cut before any record, reopens admission and returns `Timeout`. Waiting mutations then proceed. None fails because of a cut. |
 | Replica publication | Open | Nothing. Replica I/O, including HDD fsync and spin-up, runs after admission reopens. | A replica timeout ends the attempt with `Timeout` and admission stays open. A full, stale, corrupt or failing replica latches admission closed. |
 
 Latched states do not make a mutation wait. While a replica fault holds
@@ -243,17 +243,19 @@ admission closed, a mutation fails at once with EIO. After the authority or a
 metadata replica device is lost, and in offline recovery, a mutation fails at
 once with EROFS until offline promotion or verified replacement.
 
-These errors reach programs unchanged through both client paths.
-`FsError::RetryLater` maps to errno 11, EAGAIN, at `zerofs/src/fs/errors.rs:141`.
-`FsError::ReadOnlyFilesystem` maps to errno 30, EROFS, at line 148, and
-`FsError::IoError` to errno 5, EIO. The 9P server returns that errno in its
+The N5 E6 production copy showed why a cut must not refuse a mutation. An
+earlier design failed a mutation that waited longer than the final pause with
+EAGAIN. One WRITE met a slow cut, the file kept a 512 KiB hole, and the NFS
+client saw EIO only at fsync. Every latched refusal is logged with its
+reason.
+
+Latched errors reach programs unchanged through both client paths.
+`FsError::ReadOnlyFilesystem` maps to errno 30, EROFS, at
+`zerofs/src/fs/errors.rs:148`, and `FsError::IoError` to errno 5, EIO. The 9P server returns that errno in its
 `Rlerror` reply, and the Linux v9fs client returns it from the system call,
 such as write(2). The FUSE client `zerofs mount` speaks 9P to the server and
 answers the kernel with the same errno at `zerofs/src/mount.rs:255`, so a
-program on a FUSE mount sees the same value. ZeroFS already returns EAGAIN this
-way when writeback admission is backpressured, at
-`zerofs/src/fs/mutation/overlay_helpers.rs:61`. Returning EAGAIN rather than
-EROFS reserves the read-only error for states that need an operator.
+program on a FUSE mount sees the same value.
 
 | Key | Proposed default | Needs measuring on HDD-backed replicas or members |
 | --- | --- | --- |
@@ -266,10 +268,11 @@ EROFS reserves the read-only error for states that need an operator.
 | `checkpoint_lifetime_seconds` | 600 | Only through the commit deadline it must exceed. |
 
 The 16 MiB residual is a guess sized to leave most of the 1,000 ms pause for
-seal, flush, checkpoint and export. The acceptance probes bound one mutation by
-the final pause plus one second, through `FINAL_PAUSE_MAX` in
-`zerofs/src/metadata_survival_tests/acceptance.rs`. The closed-phase rows
-expect EAGAIN, and the latched read-only and device-loss rows expect EROFS.
+seal, flush, checkpoint and export. The closed-phase acceptance rows expect a
+mutation to be still waiting after the final pause plus one second, through
+`FINAL_PAUSE_MAX` in `zerofs/src/metadata_survival_tests/acceptance.rs`, and
+to succeed once admission reopens. The latched read-only and device-loss rows
+expect EROFS.
 
 Before closing admission, pre-drain the accepted writeback cutoff with writes
 still admitted. Close admission only when the remaining lag is at most
@@ -778,9 +781,6 @@ does not reference, so their presence proves nothing.
 - Not verified: Reopening admission before replica publication is safe in every
   mutator path. It depends on the ledger protecting the candidate from the
   writes that follow the pause.
-- Not verified: The Linux v9fs client and the FUSE kernel module pass EAGAIN to
-  the program unchanged. This follows from the ZeroFS sources cited above. No
-  mounted test checked it.
 
 The coordinator selected a fixed all-replica single-host commit. HA, password
 changes, automatic membership changes, payload redundancy, ACLs, extended

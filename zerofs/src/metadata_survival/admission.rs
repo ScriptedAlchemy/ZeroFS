@@ -3,14 +3,14 @@
 //! Every top-level filesystem mutation takes one token before its conflict
 //! fence or inode lock. A survival commit closes the gate, waits for admitted
 //! tokens, takes its consistent cut and reopens the gate before any replica
-//! I/O. A mutation that arrives while the gate is closed waits at most the
-//! configured final pause and then fails without effect with EAGAIN. A replica
-//! fault or device loss latches the gate: mutations then fail at once with EIO
-//! or EROFS until an operator repairs the replica set.
+//! I/O. A mutation that arrives while the gate is closed waits until it
+//! reopens. The commit bounds how long it keeps the gate closed, so a commit
+//! delays client mutations but never fails one. A replica fault or device loss
+//! latches the gate: mutations then fail at once with EIO or EROFS, each one
+//! logged with the latch reason, until an operator repairs the replica set.
 
 use crate::fs::errors::FsError;
 use std::sync::Mutex;
-use std::time::Duration;
 use tokio::sync::Notify;
 
 #[derive(Debug)]
@@ -24,7 +24,6 @@ struct State {
 pub(crate) struct SurvivalAdmission {
     state: Mutex<State>,
     changed: Notify,
-    final_pause: Mutex<Duration>,
 }
 
 impl Default for SurvivalAdmission {
@@ -36,7 +35,6 @@ impl Default for SurvivalAdmission {
                 latched: None,
             }),
             changed: Notify::new(),
-            final_pause: Mutex::new(Duration::from_millis(1000)),
         }
     }
 }
@@ -77,23 +75,14 @@ impl SurvivalAdmission {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    pub(crate) fn set_final_pause(&self, pause: Duration) {
-        *self
-            .final_pause
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner()) = pause;
-    }
-
-    fn final_pause(&self) -> Duration {
-        *self
-            .final_pause
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-    }
-
     fn try_enter(&self) -> Result<bool, FsError> {
         let mut state = self.lock();
-        if let Some((error, _)) = &state.latched {
+        if let Some((error, reason)) = &state.latched {
+            tracing::warn!(
+                ?error,
+                reason = reason.as_str(),
+                "refused a mutation: metadata survival admission is latched"
+            );
             return Err(*error);
         }
         if state.closed {
@@ -104,7 +93,6 @@ impl SurvivalAdmission {
     }
 
     async fn enter(&self) -> Result<(), FsError> {
-        let deadline = tokio::time::Instant::now() + self.final_pause();
         loop {
             let notified = self.changed.notified();
             tokio::pin!(notified);
@@ -112,14 +100,7 @@ impl SurvivalAdmission {
             if self.try_enter()? {
                 return Ok(());
             }
-            if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                // One last check so a reopen racing the deadline still admits.
-                return if self.try_enter()? {
-                    Ok(())
-                } else {
-                    Err(FsError::RetryLater)
-                };
-            }
+            notified.await;
         }
     }
 
@@ -210,25 +191,28 @@ impl SurvivalAdmission {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::time::Duration;
 
     #[tokio::test]
-    async fn closed_gate_waits_then_returns_eagain_and_latch_refuses_at_once() {
+    async fn closed_gate_holds_a_mutation_until_reopen_and_latch_refuses_at_once() {
         let gate = Arc::new(SurvivalAdmission::default());
-        gate.set_final_pause(Duration::from_millis(50));
         let held = gate.admit_owned().await.unwrap();
         gate.close().unwrap();
         let drained = tokio::spawn({
             let gate = Arc::clone(&gate);
             async move { gate.drained().await }
         });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        let late = tokio::spawn({
+            let gate = Arc::clone(&gate);
+            async move { gate.admit_owned().await.map(drop) }
+        });
+        tokio::time::sleep(Duration::from_millis(1500)).await;
         assert!(!drained.is_finished(), "drain must wait for admitted work");
-        let started = std::time::Instant::now();
-        assert_eq!(gate.admit().await.unwrap_err(), FsError::RetryLater);
-        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert!(!late.is_finished(), "a closed gate must hold, not refuse");
         drop(held);
         drained.await.unwrap();
         gate.reopen();
+        late.await.unwrap().unwrap();
         drop(gate.admit().await.unwrap());
         gate.latch(FsError::IoError, "replica full");
         let started = std::time::Instant::now();

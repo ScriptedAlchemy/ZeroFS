@@ -67,11 +67,11 @@ dir = "/mnt/disk-a/metadata-replica"
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `commit_interval_seconds` | 60 | Seconds between generations. |
-| `final_pause_max_milliseconds` | 1000 | How long a mutation waits for a cut before it fails with EAGAIN. |
+| `final_pause_max_milliseconds` | 1000 | How long a cut may keep mutations waiting for admitted work and the backend cutoff. Past it the cut is deferred to the next attempt and admission reopens. A cut never fails a mutation. |
 | `final_residual_max_bytes` | 16777216 | Undrained journal bytes above which a cut is postponed. |
 | `predrain_max_seconds` | 120 | How long a cut waits for the journal to drain before it is postponed. |
 | `replica_timeout_seconds` | 90 | Deadline for copying a generation to the replicas. |
-| `commit_deadline_seconds` | 180 | Deadline for admitted mutations to finish before a cut. |
+| `commit_deadline_seconds` | 180 | Deadline for the final shutdown commit after its pre-drain. At least `replica_timeout_seconds`. |
 | `checkpoint_lifetime_seconds` | 600 | Lifetime of the database checkpoint a generation pins. |
 | `headroom_bytes` | 4294967296 | Raw devices only. Room on each member above its reserve that only generations may use. |
 

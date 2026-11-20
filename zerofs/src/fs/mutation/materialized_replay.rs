@@ -65,7 +65,10 @@ impl ZeroFS {
                 return receipt(result);
             }
             RequestLookup::FingerprintMismatch => return Err(FsError::InvalidArgument),
-            RequestLookup::Backpressured => return Err(FsError::RetryLater),
+            RequestLookup::Backpressured => {
+                tracing::warn!("refused a client write: the materialized request cache is full");
+                return Err(FsError::RetryLater);
+            }
         };
         let retained = pending.retained();
         let accepted = pending.accept();
