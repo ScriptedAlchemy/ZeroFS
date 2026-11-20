@@ -18,8 +18,8 @@ format, the backend contract, the admission gate and recovery.
 
 **Raw devices.** The authority is a raw P3 (`raw+p3-*` `[storage].url`): its
 journal, catalog region, authority log and key-envelope region. Every pool
-member is a raw `RawStore` object log. Each member holds the generations in
-its own log, under the reserved key namespace `.zerofs-survival/v1/`. Payload
+member is a raw `RawStore` object store. Each member holds the generations in
+its own store, under the reserved key namespace `.zerofs-survival/v1/`. Payload
 keys all start with `.zerofs-pool/`, so the two never collide. The replica
 set is every pool member and is not configurable.
 
@@ -32,13 +32,14 @@ Survival code reaches a replica only through the `ReplicaBackend` contract in
 member's object store. `LocalDirectoryBackend` implements it over a directory
 with temporary files, rename, directory fsync and flock.
 
-On a raw member, one PUT publishes an object: `RawMemberStore` appends the
-record and flushes both label slots before it returns. The pool's exclusive
-device claim keeps every other process out. The region has no size of its
-own. It shares the member's log. Every PUT is admitted through the pool's
-space ledger first, so it never takes room promised to segment data or the
-member's reserve. A PUT that does not fit is refused as `Full` and writes
-nothing. See "When a member fills" in [storage pools](storage-pools.md).
+On a raw member, one PUT publishes an object: `RawMemberStore` writes a new
+allocation, syncs the payload and index, then updates and syncs both label
+slots before it returns. The pool's exclusive device claim keeps every other
+process out. The region has no size of its own. It shares the member's object
+store. Every PUT is admitted through the pool's space ledger first, so it
+never takes room promised to segment data or the member's reserve. A PUT that
+does not fit is refused as `Full` and writes nothing. See "When a member fills"
+in [storage pools](storage-pools.md).
 
 ## Configuration
 
@@ -67,7 +68,7 @@ dir = "/mnt/disk-a/metadata-replica"
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `commit_interval_seconds` | 60 | Seconds between generations. |
-| `final_pause_max_milliseconds` | 1000 | How long a cut may keep mutations waiting for admitted work and the backend cutoff. Past it the cut is deferred to the next attempt and admission reopens. A cut never fails a mutation. |
+| `final_pause_max_milliseconds` | 1000 | Maximum time a cut keeps mutation admission closed; if exceeded, defer the cut and reopen admission. |
 | `final_residual_max_bytes` | 16777216 | Undrained journal bytes above which a cut is postponed. |
 | `predrain_max_seconds` | 120 | How long a cut waits for the journal to drain before it is postponed. |
 | `replica_timeout_seconds` | 90 | Deadline for copying a generation to the replicas. |
@@ -250,17 +251,20 @@ mechanism. Its rows run on the directory backend.
 
 - **No hardware evidence.** No test here runs on a physical device, an HDD or
   across a real power cut.
-- **Log space.** A raw member's log is append-only. Every commit appends a
-  dependency list, a retention record and a commit record, and deleting a
-  retired object appends a tombstone. The space returns only when the engine
-  reclaims log space.
+- **Reclamation timing.** Raw v2 reuses overwritten and deleted objects'
+  blocks after both labels durably publish the change and open readers
+  release them. A replacement still needs room for its new allocation until
+  publication. Retained generations keep their referenced objects live.
 - **Orphaned payload.** Payload written after the recovered generation stays
   on the members after a rebuild, unreferenced.
 - **No online repair.** A commit skips an object a replica already holds at
   the right length. A damaged copy is found at recovery, which then reads the
   other replica. Nothing repairs it online.
-- **Degraded start after a rebuild.** A pool rebuilt without a member cannot
-  start: `allow_degraded_start` covers directory members only.
+- **Degraded start after a rebuild.** `allow_degraded_start` supports one
+  confirmed absent raw HDD, but a survival-enabled writer still requires
+  every metadata replica at startup. Rebuilding with `--allow-missing-member`
+  reports the loss; it does not repair the missing replica or permit that
+  writer to start.
 - **Dependency enumeration.** SlateDB exposes no way to list a checkpoint's
   files. A commit copies every authority object, deduplicated by digest.
 - **Deferred design items.** Idle-commit skipping, terminal offline disable,
