@@ -68,6 +68,11 @@ jobs:
       fail-fast: false
       matrix:
         test: [9p, fuse, zfs-on-zerofs, nfs-kernel-compile]
+        allow_zfs_pool:
+          - ${{ github.repository != 'ScriptedAlchemy/ZeroFS' }}
+        exclude:
+          - test: zfs-on-zerofs
+            allow_zfs_pool: false
 
     steps:
       - uses: actions/checkout@v4

@@ -1328,6 +1328,25 @@ class RunScenarioTests(HarnessCase):
         for field in REQUIRED_RECEIPT_FIELDS:
             self.assertIn(field, receipt, field)
 
+    def test_zfs_pool_creation_is_plan_only_locally_and_on_the_n5_fork(self) -> None:
+        for repository in ("", "ScriptedAlchemy/ZeroFS", "scriptedalchemy/zerofs"):
+            with self.subTest(repository=repository), mock.patch.dict(
+                os.environ, {"GITHUB_REPOSITORY": repository, "GITHUB_ACTIONS": "true" if repository else ""}
+            ):
+                config = self.make_config(run_uuid=str(uuid.uuid4()))
+                lifecycle, runner, _, ledger = self.setup_run(config)
+                args = {"zerofs_binary": self.binary, "zerofs_config": self.zerofs_config}
+                planned = lifecycle.run_scenario(
+                    ledger, "zfs-over-nbd-restart", **args, plan_only=True
+                )
+                self.assertEqual(planned["terminal_state"], "planned")
+                lifecycle, runner, _, ledger = self.setup_run(
+                    self.make_config(run_uuid=str(uuid.uuid4()))
+                )
+                with self.assertRaisesRegex(LifecycleError, "ZFS pool creation is disabled"):
+                    lifecycle.run_scenario(ledger, "zfs-over-nbd-restart", **args)
+                self.assertFalse(any(call[0][:2] == ("zpool", "create") for call in runner.calls))
+
     def test_c3_refuses_to_convert_ack_flags_into_observed_frontiers(self) -> None:
         config = self.make_config(filesystem="volatile_memory", object_="memory")
         lifecycle, runner, _, ledger = self.setup_run(config)

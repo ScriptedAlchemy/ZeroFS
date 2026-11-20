@@ -32,6 +32,16 @@ class ReleasePGOWorkflowTests(unittest.TestCase):
         self.assertIn("test: [9p, fuse, zfs-on-zerofs, nfs-kernel-compile]", strategy)
         self.assertIn("needs: collect-pgo-profile", self.source)
 
+    def test_n5_fork_excludes_pool_creation_from_ci_and_pgo(self):
+        self.assertIn("allow_zfs_pool:\n          - ${{ github.repository != 'ScriptedAlchemy/ZeroFS' }}",
+                      self.profile)
+        self.assertIn("exclude:\n          - test: zfs-on-zerofs\n            allow_zfs_pool: false",
+                      self.profile)
+        zfs_workflow = WORKFLOW.with_name("zfs-test.yml").read_text()
+        for job in ("zfs-test", "zfs-test-tiered"):
+            self.assertIn(f"  {job}:\n    if: github.repository != 'ScriptedAlchemy/ZeroFS'\n",
+                          zfs_workflow)
+
     def test_zfs_profiles_load_nbd_module_before_attaching_device(self):
         install = self.profile.split("      - name: Install dependencies", 1)[1].split(
             "      - uses: actions/setup-go", 1

@@ -306,6 +306,12 @@ def _zfs_over_nbd_restart(context: ScenarioContext) -> ScenarioPlan:
     )
     return ScenarioPlan(
         name="zfs-over-nbd-restart",
+        acceptance_gaps=(
+            ("ZFS pool creation is disabled in local runs and TrueNAS prototype CI",)
+            if os.environ.get("GITHUB_ACTIONS") != "true"
+            or os.environ.get("GITHUB_REPOSITORY", "").casefold() in ("", "scriptedalchemy/zerofs")
+            else ()
+        ),
         legs=("nbd", "zfs"),
         steps=steps,
         durability_floors=floors_for(config.ack, ("nbd-flush",)),
