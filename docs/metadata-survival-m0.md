@@ -223,7 +223,7 @@ The normal library suite passed with **2,194 passed, 0 failed and 20 ignored** i
 ignored tests. No ignored benchmarks ran. Run it from `zerofs/`.
 
 ```sh
-m0_tmp_parent=$(mktemp -d /private/tmp/zfsm0.XXXXXX)
+m0_tmp_parent=$(mktemp -d /private/tmp/zerofs-m0.XXXXXX)
 TMPDIR="$m0_tmp_parent" CARGO_TARGET_DIR="$PWD/target/m0-metadata-survival" \
   /Users/zackjackson/.cargo/bin/cargo +1.100.0 test --locked -p zerofs --lib \
   -- --test-threads=4

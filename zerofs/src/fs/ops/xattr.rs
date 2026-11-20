@@ -2,7 +2,7 @@ use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId};
 use crate::fs::mutation::types::{ConflictKey, ConflictScope};
 use crate::fs::permissions::acl::PosixAcl;
-use crate::fs::permissions::acl::{NFS4_ACL_XDR, POSIX_ACL_ACCESS, POSIX_ACL_DEFAULT};
+use crate::fs::permissions::acl::{POSIX_ACL_ACCESS, POSIX_ACL_DEFAULT};
 use crate::fs::permissions::{AccessMode, Credentials, check_access_with_acl, check_ownership};
 use crate::fs::{ZeroFS, get_current_time};
 use bytes::Bytes;
@@ -23,8 +23,6 @@ pub(crate) enum XattrKind {
     PosixAccess,
     /// `system.posix_acl_default`: stored, served and inherited on create.
     PosixDefault,
-    /// `system.nfs4_acl_xdr`: translated to POSIX ACLs on write, or refused.
-    Nfs4Xdr,
 }
 
 impl XattrName {
@@ -58,7 +56,6 @@ impl XattrName {
             b"system" => match self.as_bytes() {
                 POSIX_ACL_ACCESS => Ok(XattrKind::PosixAccess),
                 POSIX_ACL_DEFAULT => Ok(XattrKind::PosixDefault),
-                NFS4_ACL_XDR => Ok(XattrKind::Nfs4Xdr),
                 _ => Err(FsError::NotSupported),
             },
             _ => Err(FsError::NotSupported),
@@ -69,7 +66,7 @@ impl XattrName {
     pub(crate) fn is_acl(&self) -> bool {
         matches!(
             self.kind(),
-            Ok(XattrKind::PosixAccess | XattrKind::PosixDefault | XattrKind::Nfs4Xdr)
+            Ok(XattrKind::PosixAccess | XattrKind::PosixDefault)
         )
     }
 
@@ -133,14 +130,14 @@ impl XattrName {
             XattrKind::Trusted if creds.uid != 0 => Err(FsError::OperationNotPermitted),
             XattrKind::Security if write && creds.uid != 0 => Err(FsError::OperationNotPermitted),
             // Linux has no ACL operations on symlinks.
-            XattrKind::PosixAccess | XattrKind::PosixDefault | XattrKind::Nfs4Xdr
+            XattrKind::PosixAccess | XattrKind::PosixDefault
                 if matches!(inode, Inode::Symlink(_)) =>
             {
                 Err(FsError::NotSupported)
             }
             // Any caller may read an ACL; only the owner or root may change it
             // (Linux `inode_owner_or_capable`).
-            XattrKind::PosixAccess | XattrKind::PosixDefault | XattrKind::Nfs4Xdr if write => {
+            XattrKind::PosixAccess | XattrKind::PosixDefault if write => {
                 check_ownership(inode, creds)
             }
             _ => Ok(()),

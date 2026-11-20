@@ -36,7 +36,7 @@ pub enum Commands {
     /// Inventory source metadata as JSON Lines without a server or configuration
     ///
     /// Reads may update atime; only a read-only mount prevents this. Exit 3 means
-    /// the inventory is incomplete. The name rule uses the OpenZFS insensitive fold.
+    /// the inventory is incomplete. The name rule uses the ZeroFS insensitive fold.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     Inventory {
         root: PathBuf,

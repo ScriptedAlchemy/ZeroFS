@@ -205,25 +205,6 @@ pub(crate) struct RawAcl {
     pub format: &'static str,
     pub raw: Field<Option<RawBytes>>,
     pub decoded: Field<()>,
-    /// For an observed NFSv4 ACL, whether ZeroFS would enforce it as POSIX
-    /// ACLs. See `docs/permissions-and-acl-contract.md`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub posix_translation: Option<PosixTranslation>,
-}
-
-/// The ZeroFS engine's translation of one NFSv4 ACL, computed by the same
-/// code the server runs when the ACL is written.
-#[derive(Clone, Debug, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub(crate) enum PosixTranslation {
-    Accepted {
-        access: String,
-        default: Option<String>,
-        narrowed: Vec<&'static str>,
-    },
-    Refused {
-        rule: String,
-    },
 }
 
 #[derive(Debug, Serialize)]
@@ -309,9 +290,6 @@ pub(crate) struct Summary {
     pub non_utf8_names: u64,
     /// Entries carrying each ACL format, by inventory format name.
     pub acl_formats: std::collections::BTreeMap<String, u64>,
-    /// NFSv4 ACLs ZeroFS would translate to POSIX ACLs, and would refuse.
-    pub nfs4_acl_translations_accepted: u64,
-    pub nfs4_acl_translations_refused: u64,
     pub unavailable_by_reason: std::collections::BTreeMap<String, u64>,
     pub complete: bool,
 }

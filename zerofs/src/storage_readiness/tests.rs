@@ -5,6 +5,8 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 
 const FAST_UUID: &str = "47166772-65c1-4ecf-8066-935452891add";
+const DURABLE_UUID: &str = "9d4c1a52-3c0e-4f43-9a8b-1f3d2b6c7e10";
+const OTHER_UUID: &str = "c3a8e9f1-6b2d-4e7a-8c5f-0d9b1e2a3f4c";
 
 pub(crate) struct Fixture {
     _temp: tempfile::TempDir,
@@ -47,7 +49,7 @@ impl Fixture {
                     "reserves": [{"filesystem": "durable", "bytes": 1_000_000}, {"filesystem": "fast", "bytes": 1_000_000}],
                     "filesystems": [
                         { "id": "durable", "profile": "hdd-cmr", "mountpoint": durable,
-                            "identity": { "kind": "zfs", "pool_guid": "101", "dataset_guid": "201" } },
+                            "identity": { "kind": "uuid", "uuid": DURABLE_UUID } },
                         { "id": "fast", "profile": "nvme", "mountpoint": fast,
                             "identity": { "kind": "uuid", "uuid": FAST_UUID } }
                     ]
@@ -69,15 +71,8 @@ impl Fixture {
                         durable.clone()
                     },
                     filesystem_root: "/".into(),
-                    identity: if is_fast {
-                        FilesystemIdentity::Uuid {
-                            uuid: FAST_UUID.into(),
-                        }
-                    } else {
-                        FilesystemIdentity::Zfs {
-                            pool_guid: "101".into(),
-                            dataset_guid: "201".into(),
-                        }
+                    identity: FilesystemIdentity::Uuid {
+                        uuid: if is_fast { FAST_UUID } else { DURABLE_UUID }.into(),
                     },
                     writable: true,
                     unlocked: true,
@@ -205,26 +200,31 @@ fn declarations_survive_file_load_and_settings_serialization() {
 }
 
 #[test]
-fn documented_config_preserves_full_unsigned_zfs_guids() {
+fn documented_config_round_trips_and_rejects_noncanonical_uuids() {
     let source = include_str!("../../../docs/examples/storage-readiness.toml");
     let settings: Settings = toml::from_str(source).unwrap();
     settings.validate().unwrap();
     let serialized = toml::to_string(&settings).unwrap();
     let roundtrip: Settings = toml::from_str(&serialized).unwrap();
     roundtrip.validate().unwrap();
+    let uuid = "0f5e7c2a-8b1d-4c3e-9a6f-2b4d6e8f0a1c";
     let declaration = &roundtrip.storage.readiness.as_ref().unwrap().filesystems[0];
     assert_eq!(
         declaration.identity,
-        FilesystemIdentity::Zfs {
-            pool_guid: (u64::MAX - 1).to_string(),
-            dataset_guid: u64::MAX.to_string(),
-        }
+        FilesystemIdentity::Uuid { uuid: uuid.into() }
     );
-    for invalid in ["0", "01", "+1", "18446744073709551616", "guessed"] {
-        let text = source.replace("18446744073709551614", invalid);
+    for invalid in [
+        "00000000-0000-0000-0000-000000000000",
+        "0F5E7C2A-8B1D-4C3E-9A6F-2B4D6E8F0A1C",
+        "0f5e7c2a8b1d4c3e9a6f2b4d6e8f0a1c",
+        "guessed",
+    ] {
+        let text = source.replace(uuid, invalid);
         let parsed: Settings = toml::from_str(&text).unwrap();
-        assert!(parsed.validate().is_err(), "accepted GUID {invalid}");
+        assert!(parsed.validate().is_err(), "accepted UUID {invalid}");
     }
+    let foreign = source.replace(r#"kind = "uuid""#, r#"kind = "foreign""#);
+    assert!(toml::from_str::<Settings>(&foreign).is_err());
 }
 
 #[test]
@@ -232,8 +232,7 @@ fn missing_wrong_locked_readonly_or_unknown_identity_fails_for_each_role() {
     for role in ["authority", "catalog", "member data", "journal", "cache"] {
         for failure in [
             "missing",
-            "wrong-pool",
-            "wrong-dataset",
+            "wrong-identity",
             "unmounted",
             "locked",
             "readonly",
@@ -249,16 +248,9 @@ fn missing_wrong_locked_readonly_or_unknown_identity_fails_for_each_role() {
                 _ => {
                     let fact = fixture.facts.get_mut(&path).unwrap();
                     match failure {
-                        "wrong-pool" => {
-                            fact.identity = FilesystemIdentity::Zfs {
-                                pool_guid: "999".into(),
-                                dataset_guid: "201".into(),
-                            }
-                        }
-                        "wrong-dataset" => {
-                            fact.identity = FilesystemIdentity::Zfs {
-                                pool_guid: "101".into(),
-                                dataset_guid: "999".into(),
+                        "wrong-identity" => {
+                            fact.identity = FilesystemIdentity::Uuid {
+                                uuid: OTHER_UUID.into(),
                             }
                         }
                         "unmounted" => fact.mountpoint = "/".into(),
@@ -349,41 +341,22 @@ fn remote_roles_separate_wal_and_nvme_durable_roles_are_rejected() {
 }
 
 #[test]
-fn duplicate_member_capacity_is_rejected_even_across_zfs_datasets() {
-    for same_dataset in [true, false] {
-        let mut fixture = Fixture::new();
-        let data = fixture.path("member data");
-        let mut member = fixture.document["storage"]["pool"]["members"][0].clone();
-        member["id"] = json!("other");
-        member["url"] = json!(
-            url::Url::from_directory_path(data.with_file_name("other-data"))
-                .unwrap()
-                .as_str()
-        );
-        fixture.document["storage"]["pool"]["members"]
-            .as_array_mut()
+fn duplicate_member_capacity_is_rejected() {
+    let mut fixture = Fixture::new();
+    let data = fixture.path("member data");
+    let mut member = fixture.document["storage"]["pool"]["members"][0].clone();
+    member["id"] = json!("other");
+    member["url"] = json!(
+        url::Url::from_directory_path(data.with_file_name("other-data"))
             .unwrap()
-            .push(member);
-        fixture.document["storage"]["readiness"]["members"]["other"] =
-            json!(if same_dataset { "durable" } else { "other" });
-        if !same_dataset {
-            let mut declaration =
-                fixture.document["storage"]["readiness"]["filesystems"][0].clone();
-            declaration["id"] = json!("other");
-            declaration["mountpoint"] = json!(data.parent().unwrap().join("nested-dataset"));
-            declaration["identity"]["dataset_guid"] = json!("202");
-            fixture.document["storage"]["readiness"]["filesystems"]
-                .as_array_mut()
-                .unwrap()
-                .push(declaration);
-            fixture.document["storage"]["pool"]["members"][1]["url"] = json!(
-                url::Url::from_directory_path(data.parent().unwrap().join("nested-dataset/data"))
-                    .unwrap()
-                    .as_str()
-            );
-        }
-        error_contains(fixture.parse().map(|_| ()), "capacity domain");
-    }
+            .as_str()
+    );
+    fixture.document["storage"]["pool"]["members"]
+        .as_array_mut()
+        .unwrap()
+        .push(member);
+    fixture.document["storage"]["readiness"]["members"]["other"] = json!("durable");
+    error_contains(fixture.parse().map(|_| ()), "capacity domain");
 }
 
 #[test]
@@ -405,7 +378,7 @@ fn independent_hdd_member_is_accepted() {
         .unwrap()
         .push(json!({
             "id": "other", "profile": "hdd-smr", "mountpoint": mountpoint,
-            "identity": { "kind": "zfs", "pool_guid": "102", "dataset_guid": "202" }
+            "identity": { "kind": "uuid", "uuid": OTHER_UUID }
         }));
     fixture.document["storage"]["readiness"]["reserves"]
         .as_array_mut()
@@ -416,9 +389,8 @@ fn independent_hdd_member_is_accepted() {
         MountedFilesystem {
             mountpoint,
             filesystem_root: "/".into(),
-            identity: FilesystemIdentity::Zfs {
-                pool_guid: "102".into(),
-                dataset_guid: "202".into(),
+            identity: FilesystemIdentity::Uuid {
+                uuid: OTHER_UUID.into(),
             },
             writable: true,
             unlocked: true,
@@ -433,12 +405,8 @@ fn invalid_and_aliased_declarations_fail_without_host_probes() {
     for (pointer, value) in [
         ("/storage/readiness/authority", json!("unknown")),
         (
-            "/storage/readiness/filesystems/0/identity/pool_guid",
-            json!(0),
-        ),
-        (
-            "/storage/readiness/filesystems/0/identity/dataset_guid",
-            json!(0),
+            "/storage/readiness/filesystems/0/identity/uuid",
+            json!("guessed"),
         ),
         (
             "/storage/readiness/filesystems/1/identity/uuid",
@@ -467,15 +435,6 @@ fn invalid_and_aliased_declarations_fail_without_host_probes() {
     fixture.document["storage"]["readiness"]["filesystems"][1]["identity"] =
         fixture.document["storage"]["readiness"]["filesystems"][0]["identity"].clone();
     error_contains(fixture.parse().map(|_| ()), "aliases");
-}
-
-#[test]
-fn different_profiles_cannot_describe_the_same_zfs_capacity() {
-    let mut fixture = Fixture::new();
-    fixture.document["storage"]["readiness"]["filesystems"][1]["identity"] = json!({
-        "kind": "zfs", "pool_guid": "101", "dataset_guid": "202"
-    });
-    error_contains(fixture.parse().map(|_| ()), "conflicting profiles");
 }
 
 #[test]
@@ -904,9 +863,8 @@ fn degraded_readiness_keeps_authority_and_catalog_identity_checks() {
     let member = fixture.path("member data");
     let authority = fixture.path("authority");
     let catalog = fixture.path("catalog");
-    fixture.facts.get_mut(&member).unwrap().identity = FilesystemIdentity::Zfs {
-        pool_guid: "102".into(),
-        dataset_guid: "202".into(),
+    fixture.facts.get_mut(&member).unwrap().identity = FilesystemIdentity::Uuid {
+        uuid: OTHER_UUID.into(),
     };
 
     assert!(verify_with(&settings, &fixture).is_err());

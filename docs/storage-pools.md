@@ -154,8 +154,8 @@ local reservations. Each reservation reads `statvfs` inside the catalog
 transaction that records it. Nothing caches the reading.
 
 The filesystem can still fill between that check and the write, because of
-another writer on the same dataset or because ZFS refuses writes before its
-reported free space reaches zero. If a member write then returns ENOSPC or
+another writer on the same filesystem or because some filesystems refuse writes
+before their reported free space reaches zero. If a member write then returns ENOSPC or
 EDQUOT, the pool marks the member full and writes the same segment to the next
 member with room. This happens within the same flush and needs no operator
 action. Full is not a media fault, so the member stays readable and is not

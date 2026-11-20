@@ -14,51 +14,6 @@ pub(super) fn parse_serial(input: &str) -> Result<Serial> {
     Serial::try_from(value.to_owned()).map_err(anyhow::Error::msg)
 }
 
-pub(super) fn zpool_device_paths(input: &str, pool: &str) -> Result<Vec<PathBuf>> {
-    let mut rows = false;
-    let mut saw_pool = false;
-    let mut paths = Vec::new();
-    for line in input.lines() {
-        let fields = line.split_whitespace().collect::<Vec<_>>();
-        if fields.starts_with(&["NAME", "STATE"]) {
-            if rows {
-                bail!("ambiguous ZFS device evidence");
-            }
-            rows = true;
-            continue;
-        }
-        if !rows || fields.is_empty() {
-            continue;
-        }
-        let name = fields[0];
-        if name == "errors:" {
-            break;
-        }
-        if name == pool && !saw_pool {
-            saw_pool = true;
-        } else if name.starts_with('/') {
-            if fields.len() < 2 || fields[1] != "ONLINE" {
-                bail!("ZFS backing device is not online");
-            }
-            paths.push(PathBuf::from(name));
-        } else if !matches!(name, "logs" | "cache" | "spares" | "special" | "dedup")
-            && !["mirror-", "raidz1-", "raidz2-", "raidz3-"]
-                .iter()
-                .any(|prefix| {
-                    name.strip_prefix(prefix).is_some_and(|suffix| {
-                        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
-                    })
-                })
-        {
-            bail!("ZFS backing device evidence unavailable for {name}");
-        }
-    }
-    if !saw_pool || paths.is_empty() {
-        bail!("ZFS backing device set unavailable");
-    }
-    Ok(paths)
-}
-
 #[cfg(target_os = "linux")]
 fn block_serial(path: &Path, allow_partition: bool) -> Result<Serial> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -107,25 +62,21 @@ pub(in crate::storage_readiness) fn observe_device(by_id: &Path) -> Result<Seria
 pub(in crate::storage_readiness) fn backing_serials(
     root: &Path,
 ) -> Result<std::collections::HashSet<Serial>> {
-    use super::Probe;
     super::with_stable_mount(
         root,
         "storage root device changed before backing observation",
         "mount namespace changed during backing device observation",
         |mount| {
-            let paths = match mount.filesystem.as_str() {
-                "ext4" | "xfs" => {
-                    vec![PathBuf::from(super::block_device_path(mount.device))]
-                }
-                "zfs" => {
-                    let pool = super::zfs_pool(&mount)
-                        .map_err(|_| anyhow::anyhow!("ZFS pool unavailable"))?;
-                    let output = super::HostProbe.output("zpool", &["status", "-P", pool])?;
-                    zpool_device_paths(&output, pool)?
-                }
-                other => bail!("backing serials unavailable for filesystem {other}"),
-            };
-            paths.iter().map(|path| block_serial(path, true)).collect()
+            if !matches!(mount.filesystem.as_str(), "ext4" | "xfs") {
+                bail!(
+                    "backing serials unavailable for filesystem {}",
+                    mount.filesystem
+                );
+            }
+            let path = PathBuf::from(super::block_device_path(mount.device));
+            Ok(std::collections::HashSet::from([block_serial(
+                &path, true,
+            )?]))
         },
     )
 }

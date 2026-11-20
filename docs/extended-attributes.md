@@ -44,7 +44,6 @@ bounded by the count cap.
 | `security.capability` | Reads return `ENODATA` and listings omit the name, including for pre-existing values. | Sets return `EOPNOTSUPP`. The caller must have uid 0 to remove a stored value. |
 | Other `security.*` | Any caller may read or list these attributes. | The caller must have uid 0. |
 | `system.posix_acl_access`, `system.posix_acl_default` | Any caller may read or list these. Reads of the access ACL take the owner, mask and other entries from the current mode. | The caller must be the owner or uid 0. The value is validated and enforced. |
-| `system.nfs4_acl_xdr` | Reads return `ENODATA`; ZeroFS does not store the value. | The caller must be the owner or uid 0. ZeroFS translates the value to POSIX ACLs or returns `EOPNOTSUPP`. |
 | Other `system.*` | ZeroFS returns `EOPNOTSUPP`. | ZeroFS returns `EOPNOTSUPP`. |
 
 Only regular files and directories may carry `user.*` attributes. Access to that

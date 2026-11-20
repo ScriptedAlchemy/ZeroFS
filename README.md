@@ -22,7 +22,7 @@ ZeroFS differentiates itself from other "filesystem on S3" projects by:
 - Reaching near-raw-S3 throughput on large files, and scaling to workloads of hundreds of millions of small files
 - Handling tens of thousands of requests per second
 - Requiring no external database service (everything is stored on S3)
-- Being well tested (in CI we run [pjdfstest](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [xfstests](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [kernel builds](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [stress-ng](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [ZFS](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [Jepsen local-fs](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [Jepsen HA](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), and more)
+- Being well tested (in CI we run [pjdfstest](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [xfstests](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [kernel builds](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [stress-ng](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [Jepsen local-fs](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [Jepsen HA](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), and more)
 
 
 
@@ -229,7 +229,6 @@ supports x86-64 and little-endian arm64. See the
 - **[xfstests](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: the standard filesystem regression suite, over NFS, 9P, and FUSE.
 - **[Kernel build](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: the Linux kernel compiles with `make -j$(nproc)` on NFS, 9P, and FUSE mounts.
 - **[stress-ng](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: file-handling stressors run concurrently against live mounts.
-- **[ZFS](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: a ZFS pool on ZeroFS block devices; kernel source extraction, then a scrub.
 - **[Jepsen local-fs](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: random operation histories against a 9P mount, checked against a reference model ([local-fs](https://github.com/jepsen-io/local-fs)). A crash mode kills the server mid-run and verifies recovery matches the last fsync.
 - **[Jepsen HA](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: a Connected leader/standby pair over MinIO under a nemesis that kills or pauses nodes; no acknowledged write may be lost, resurrected, or corrupted across the tested failovers. The local-fs model checker also runs with failovers injected.
 - **[Deterministic simulation](https://github.com/Barre/ZeroFS/actions/workflows/rust.yml)**: data, namespace, segment-GC, and compaction paths run in a simulated world ([`zerofs/tests/dst`](https://github.com/Barre/ZeroFS/tree/main/zerofs/tests/dst)): virtual time, seeded storage latencies and transient faults, and crashes at arbitrary await points or narrow failpoint windows. Recovery is checked against byte-level and namespace reference models, a full metadata consistency scan, segment-accounting reconciliation, and an authoritative footprint scan. One seed is one exact schedule, so a failure reproduces identically.
@@ -478,8 +477,6 @@ nbd-client 127.0.0.1 10809 /dev/nbd0 -N device1 -persist -timeout 600 -connectio
 nbd-client -unix /tmp/zerofs.nbd.sock /dev/nbd1 -N device1 -persist -timeout 600 -connections 4
 
 mkfs.ext4 /dev/nbd0
-# or
-zpool create mypool /dev/nbd0
 ```
 
 The handshake advertises FLUSH, FUA, and multi-connection support. FLUSH and FUA on WRITE/TRIM wait for the configured ZeroFS client-flush barrier, and a FLUSH on any connection covers completed writes from every connection. With persistent writeback enabled, this is a local-journal barrier and does not imply that remote publication has completed. Details: [NBD devices](https://www.zerofs.net/nbd-devices).
@@ -491,7 +488,6 @@ New device files are picked up at runtime. Sizes are fixed at creation: to resiz
 ```bash
 fstrim /mnt/block                    # Manual
 mount -o discard /dev/nbd0 /mnt/block  # Automatic (filesystems)
-zpool set autotrim=on mypool         # Automatic (ZFS)
 ```
 
 TRIM deletes extent pointers and debits each segment's live-byte counter; a GC pass every 60 seconds deletes dead segments and repacks fragmented ones, reclaiming the space in S3.

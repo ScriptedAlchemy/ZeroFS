@@ -3,7 +3,6 @@ pub(super) mod devices;
 
 use super::{FilesystemIdentity, MountedFilesystem};
 use anyhow::{Context, Result, bail};
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
@@ -12,7 +11,6 @@ pub(super) struct Mount {
     root: PathBuf,
     mountpoint: PathBuf,
     filesystem: String,
-    source: String,
     writable: bool,
 }
 
@@ -81,7 +79,6 @@ pub(super) fn containing_mount(input: &str, path: &Path) -> Result<Mount> {
             root: PathBuf::from(unescape(fields[3])?),
             mountpoint,
             filesystem: tail[0].to_owned(),
-            source: unescape(tail[1])?,
             writable: writable(fields[5]) && writable(tail[2]),
         });
     }
@@ -125,104 +122,29 @@ fn block_device_path(device: (u32, u32)) -> String {
     format!("/dev/block/{}:{}", device.0, device.1)
 }
 
-fn zfs_pool(mount: &Mount) -> Result<&str> {
-    let pool = mount
-        .source
-        .split('/')
-        .next()
-        .context("missing ZFS pool name")?;
-    if pool.is_empty() || mount.source.starts_with('-') || mount.source.contains('@') {
-        bail!("invalid mounted ZFS dataset name");
-    }
-    Ok(pool)
-}
-
 pub(super) fn identify(mount: Mount, probe: &dyn Probe) -> Result<MountedFilesystem> {
-    let (identity, unlocked, writable) = match mount.filesystem.as_str() {
-        "ext4" | "xfs" => {
-            // Probe the actual mounted device, not an operator-supplied UUID
-            // symlink or a possibly stale blkid cache.
-            let device = block_device_path(mount.device);
-            let output = probe.output("blkid", &["-p", "-s", "UUID", "-o", "value", &device])?;
-            let uuid = uuid::Uuid::parse_str(scalar(&output)?)?;
-            if uuid.is_nil() {
-                bail!("mounted filesystem has no stable UUID")
-            }
-            (
-                FilesystemIdentity::Uuid {
-                    uuid: uuid.hyphenated().to_string(),
-                },
-                true,
-                mount.writable,
-            )
-        }
-        "zfs" => {
-            let pool = zfs_pool(&mount)?;
-            let output = probe.output(
-                "zfs",
-                &[
-                    "get",
-                    "-H",
-                    "-p",
-                    "-o",
-                    "property,value",
-                    "guid,mounted,mountpoint,keystatus,readonly",
-                    &mount.source,
-                ],
-            )?;
-            let mut properties = BTreeMap::new();
-            for line in output.lines() {
-                let (key, value) = line.split_once('\t').context("invalid ZFS property row")?;
-                if properties.insert(key, value).is_some() {
-                    bail!("duplicate ZFS property")
-                }
-            }
-            let get = |key| {
-                properties
-                    .get(key)
-                    .copied()
-                    .with_context(|| format!("missing ZFS {key} evidence"))
-            };
-            if properties.len() != 5
-                || get("mounted")? != "yes"
-                || Path::new(get("mountpoint")?) != mount.mountpoint
-            {
-                bail!("ZFS dataset is not mounted at the observed root")
-            }
-            let unlocked = match get("keystatus")? {
-                "available" | "none" => true,
-                "unavailable" => false,
-                _ => bail!("unknown ZFS unlock state"),
-            };
-            let writable = match get("readonly")? {
-                "off" => mount.writable,
-                "on" => false,
-                _ => bail!("unknown ZFS readonly state"),
-            };
-            let dataset_guid = get("guid")?.parse::<u64>()?;
-            let pool_output =
-                probe.output("zpool", &["get", "-H", "-p", "-o", "value", "guid", pool])?;
-            let pool_guid = scalar(&pool_output)?.parse::<u64>()?;
-            if dataset_guid == 0 || pool_guid == 0 {
-                bail!("missing stable ZFS GUID")
-            }
-            (
-                FilesystemIdentity::Zfs {
-                    pool_guid: pool_guid.to_string(),
-                    dataset_guid: dataset_guid.to_string(),
-                },
-                unlocked,
-                writable,
-            )
-        }
-        other => bail!("strict storage readiness has no identity adapter for filesystem {other}"),
-    };
+    if !matches!(mount.filesystem.as_str(), "ext4" | "xfs") {
+        bail!(
+            "strict storage readiness has no identity adapter for filesystem {}",
+            mount.filesystem
+        );
+    }
+    // Probe the actual mounted device, not an operator-supplied UUID symlink
+    // or a possibly stale blkid cache.
+    let device = block_device_path(mount.device);
+    let output = probe.output("blkid", &["-p", "-s", "UUID", "-o", "value", &device])?;
+    let uuid = uuid::Uuid::parse_str(scalar(&output)?)?;
+    if uuid.is_nil() {
+        bail!("mounted filesystem has no stable UUID")
+    }
     Ok(MountedFilesystem {
         mountpoint: mount.mountpoint,
         filesystem_root: mount.root,
-        identity,
-        writable,
-        unlocked,
+        identity: FilesystemIdentity::Uuid {
+            uuid: uuid.hyphenated().to_string(),
+        },
+        writable: mount.writable,
+        unlocked: true,
     })
 }
 

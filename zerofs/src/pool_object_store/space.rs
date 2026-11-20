@@ -10,7 +10,7 @@
 //! once per request. Nothing caches it, so it is never older than one catalog
 //! transaction. It can still be wrong by the time the bytes land, because
 //! something outside the pool may fill the filesystem between the check and the
-//! write, and some filesystems (ZFS, for one) refuse writes before `f_bavail`
+//! write, and some filesystems refuse writes before `f_bavail`
 //! reaches zero. That race is handled after the fact: a member write that
 //! returns ENOSPC marks the member full and the write moves to another member.
 use super::PoolMember;

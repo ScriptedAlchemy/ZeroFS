@@ -88,7 +88,6 @@ CONTRACT_SCENARIOS = frozenset(
         "kernel-compile-nfs",
         "kernel-compile-ninep",
         "xfs-over-nbd-restart",
-        "zfs-over-nbd-restart",
         "crash-boundary-matrix",
         "local-receipt-restart",
         "remote-receipt-clean-cache-restart",
@@ -214,7 +213,6 @@ class FakeProbes:
         self.listening_ports: set[int] = set()
         self.active_mounts: set[str] = set()
         self.attached_devices: set[str] = set()
-        self.pools: set[str] = set()
         self.socket_probe_results: list[bool] = []
 
     def process_alive(self, pid: int) -> bool:
@@ -234,9 +232,6 @@ class FakeProbes:
 
     def device_attached(self, device: str) -> bool:
         return device in self.attached_devices
-
-    def pool_exists(self, name: str) -> bool:
-        return name in self.pools
 
     def unix_socket_ready(self, path: str) -> bool:
         _ = path
@@ -482,12 +477,9 @@ class ResourceLedgerTests(HarnessCase):
         with self.assertRaises(UnownedResourceError):
             ledger.record_resource("listener", 22)
         with self.assertRaises(UnownedResourceError):
-            ledger.record_resource("pool", "tank")
-        with self.assertRaises(UnownedResourceError):
             ledger.record_resource("prefix", "someone-elses/prefix")
         with self.assertRaises(UnownedResourceError):
             ledger.record_resource("path", "/var/tmp/other")
-        ledger.record_resource("pool", f"zerofs-tiered-{RUN_UUID}")
         with self.assertRaises(UnownedResourceError):
             ledger.record_resource("process", 4321)
         _ = config
@@ -678,26 +670,22 @@ class CleanupTests(HarnessCase):
         self.assertFalse(config.resource_root.exists())
         lifecycle.cleanup(ResourceLedger.load(config.ledger_path))
 
-    def test_cleanup_tears_down_recorded_processes_mounts_devices_pools(self) -> None:
+    def test_cleanup_tears_down_recorded_processes_mounts_and_devices(self) -> None:
         config = self.make_config()
         lifecycle, runner, probes, ledger = self.setup_run(config)
         mountpoint = config.resource_root / "mnt" / "nfs"
-        pool = f"zerofs-tiered-{RUN_UUID}"
         ledger.record_resource("unit", config.unit_name)
         ledger.record_resource("process", 4242, unit=config.unit_name)
         ledger.record_resource("listener", 12049)
         ledger.record_resource("mount", str(mountpoint))
         ledger.record_resource("device", "/dev/nbd7")
-        ledger.record_resource("pool", pool)
         probes.alive_pids.add(4242)  # PID was reused by an unrelated process.
         probes.active_units.add(config.unit_name)
         probes.unit_pids[config.unit_name] = 99999
         probes.active_mounts.add(str(mountpoint))
         probes.attached_devices.add("/dev/nbd7")
-        probes.pools.add(pool)
         lifecycle.cleanup(ledger)
         commands = [args for args, _ in runner.calls]
-        self.assertIn(("zpool", "destroy", pool), commands)
         self.assertIn((NBD_CLIENT, "-d", "/dev/nbd7"), commands)
         self.assertIn(("umount", str(mountpoint)), commands)
         self.assertNotIn(("kill", "-9", "4242"), commands)
@@ -976,21 +964,13 @@ class ScenarioPlanTests(HarnessCase):
                         {(resource.kind, resource.value) for resource in step.acquires},
                     )
 
-    def test_crash_plans_ledger_mount_pool_device_and_listener_lifecycles(self) -> None:
+    def test_crash_plans_ledger_mount_device_and_listener_lifecycles(self) -> None:
         xfs = SCENARIOS["xfs-over-nbd-restart"](self.context())
-        zfs = SCENARIOS["zfs-over-nbd-restart"](self.context())
         matrix = SCENARIOS["crash-boundary-matrix"](self.context())
         self.assertTrue(
             any(
                 resource.kind == "mount"
                 for step in xfs.steps
-                for resource in step.acquires
-            )
-        )
-        self.assertTrue(
-            any(
-                resource.kind == "pool"
-                for step in zfs.steps
                 for resource in step.acquires
             )
         )
@@ -1328,25 +1308,6 @@ class RunScenarioTests(HarnessCase):
         for field in REQUIRED_RECEIPT_FIELDS:
             self.assertIn(field, receipt, field)
 
-    def test_zfs_pool_creation_is_plan_only_locally_and_on_the_n5_fork(self) -> None:
-        for repository in ("", "ScriptedAlchemy/ZeroFS", "scriptedalchemy/zerofs"):
-            with self.subTest(repository=repository), mock.patch.dict(
-                os.environ, {"GITHUB_REPOSITORY": repository, "GITHUB_ACTIONS": "true" if repository else ""}
-            ):
-                config = self.make_config(run_uuid=str(uuid.uuid4()))
-                lifecycle, runner, _, ledger = self.setup_run(config)
-                args = {"zerofs_binary": self.binary, "zerofs_config": self.zerofs_config}
-                planned = lifecycle.run_scenario(
-                    ledger, "zfs-over-nbd-restart", **args, plan_only=True
-                )
-                self.assertEqual(planned["terminal_state"], "planned")
-                lifecycle, runner, _, ledger = self.setup_run(
-                    self.make_config(run_uuid=str(uuid.uuid4()))
-                )
-                with self.assertRaisesRegex(LifecycleError, "ZFS pool creation is disabled"):
-                    lifecycle.run_scenario(ledger, "zfs-over-nbd-restart", **args)
-                self.assertFalse(any(call[0][:2] == ("zpool", "create") for call in runner.calls))
-
     def test_c3_refuses_to_convert_ack_flags_into_observed_frontiers(self) -> None:
         config = self.make_config(filesystem="volatile_memory", object_="memory")
         lifecycle, runner, _, ledger = self.setup_run(config)
@@ -1501,7 +1462,6 @@ class RunScenarioTests(HarnessCase):
     def test_every_crash_plan_balances_its_runtime_resources(self) -> None:
         for scenario in (
             "xfs-over-nbd-restart",
-            "zfs-over-nbd-restart",
             "crash-boundary-matrix",
             "local-receipt-restart",
             "remote-receipt-clean-cache-restart",
@@ -1881,7 +1841,6 @@ TIERED_WORKFLOW_LEGS = {
         "stress-ng-nfs-ninep",
         False,
     ),
-    "zfs-test.yml": ("zfs-test", "zfs-test-tiered", "zfs-over-nbd-restart", True),
     "xfs-nbd.yml": ("xfs-nbd", "xfs-nbd-tiered", "xfs-over-nbd-restart", True),
 }
 

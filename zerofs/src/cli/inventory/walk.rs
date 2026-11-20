@@ -195,7 +195,6 @@ pub(super) fn inventory_with_options(
             walker.skip_boundary(entry, reason)?;
         } else {
             walker.collect_fd(&mut entry, root_fd.as_fd(), EntryKind::Directory);
-            translate_nfs4_acls(&mut entry);
             walker.output.emit(&Record::Entry(Box::new(entry)))?;
             walker.directory(root_fd.as_fd(), &[], &before)?;
         }
@@ -487,7 +486,6 @@ impl<W: Write> Walker<'_, W> {
             self.links.push(link_row(&link)?)?;
             self.output.emit(&Record::HardlinkObservation(link))?;
         }
-        translate_nfs4_acls(&mut entry);
         self.output.emit(&Record::Entry(Box::new(entry)))?;
         if stable
             && entry_kind == EntryKind::Directory
@@ -894,44 +892,6 @@ fn failed_entry(path: &[u8], error: Errno, trusted_namespace: Field<()>) -> Entr
     }
 }
 
-/// Run the engine's NFSv4-to-POSIX translation on each observed NFSv4 ACL,
-/// so the inventory says per entry whether ZeroFS would enforce it.
-pub(super) fn translate_nfs4_acls(entry: &mut Entry) {
-    let (Field::Observed(kind), Field::Observed(owner), Field::Observed(acls)) =
-        (&entry.kind, &entry.owner, &mut entry.acl)
-    else {
-        return;
-    };
-    for acl in acls {
-        if acl.format != "nfs4-xdr-xattr" {
-            continue;
-        }
-        let Field::Observed(Some(raw)) = &acl.raw else {
-            continue;
-        };
-        let Ok(bytes) = resume::decode_hex(&raw.hex) else {
-            continue;
-        };
-        acl.posix_translation = Some(
-            match crate::fs::permissions::nfs4::map_nfs4_acl(
-                &bytes,
-                *kind == EntryKind::Directory,
-                owner.uid,
-                owner.gid,
-            ) {
-                Ok(mapped) => PosixTranslation::Accepted {
-                    access: mapped.access.to_text(),
-                    default: mapped.default.as_ref().map(|d| d.to_text()),
-                    narrowed: mapped.reports.into_iter().collect(),
-                },
-                Err(refusal) => PosixTranslation::Refused {
-                    rule: refusal.to_string(),
-                },
-            },
-        );
-    }
-}
-
 fn invalidate_reads(entry: &mut Entry, reason: Reason) {
     #[cfg(target_os = "linux")]
     if matches!(
@@ -1208,97 +1168,5 @@ mod tests {
         let mut contents = String::new();
         file.read_to_string(&mut contents).unwrap();
         assert_eq!(contents, "original contents");
-    }
-}
-
-#[cfg(test)]
-mod nfs4_translation_tests {
-    use super::*;
-    use crate::fs::permissions::nfs4::encode::{self, Who};
-
-    fn entry_with_nfs4(kind: EntryKind, raw: Option<Vec<u8>>) -> Entry {
-        let mut entry = failed_entry(b"share", Errno::INVAL, Field::Observed(()));
-        entry.kind = Field::Observed(kind);
-        entry.owner = Field::Observed(Owner {
-            uid: 1000,
-            gid: 100,
-        });
-        entry.acl = Field::Observed(vec![
-            RawAcl {
-                format: "linux-posix-access-xattr",
-                raw: Field::Observed(None),
-                decoded: Field::unavailable(Reason::NotDecoded),
-                posix_translation: None,
-            },
-            RawAcl {
-                format: "nfs4-xdr-xattr",
-                raw: Field::Observed(raw.as_deref().map(RawBytes::new)),
-                decoded: Field::unavailable(Reason::NotDecoded),
-                posix_translation: None,
-            },
-        ]);
-        entry
-    }
-
-    #[test]
-    fn entries_report_the_engine_translation_and_summary_counts_formats() {
-        let restricted = encode::acl(&[
-            (encode::ALLOW, encode::FD, encode::FULL_CONTROL, Who::Owner),
-            (
-                encode::ALLOW,
-                encode::FD,
-                encode::MODIFY | encode::DELETE_CHILD,
-                Who::Group,
-            ),
-        ]);
-        let refused = encode::acl(&[(
-            encode::ALLOW,
-            encode::FILE_INHERIT,
-            encode::FULL_CONTROL,
-            Who::Owner,
-        )]);
-        let mut accepted = entry_with_nfs4(EntryKind::Directory, Some(restricted));
-        translate_nfs4_acls(&mut accepted);
-        let mut rejected = entry_with_nfs4(EntryKind::Directory, Some(refused));
-        translate_nfs4_acls(&mut rejected);
-        let mut absent = entry_with_nfs4(EntryKind::File, None);
-        translate_nfs4_acls(&mut absent);
-
-        let a = serde_json::to_value(&accepted).unwrap();
-        let t = &a["acl"]["value"][1]["posix_translation"];
-        assert_eq!(t["status"], "accepted");
-        assert_eq!(t["access"], "u::rwx,g::rwx,o::---");
-        assert_eq!(t["default"], "u::rwx,g::rwx,o::---");
-        assert_eq!(
-            t["narrowed"],
-            serde_json::json!(["delete_follows_parent_directory_write"])
-        );
-        assert!(a["acl"]["value"][0].get("posix_translation").is_none());
-        let r = serde_json::to_value(&rejected).unwrap();
-        assert_eq!(
-            r["acl"]["value"][1]["posix_translation"],
-            serde_json::json!({"status": "refused", "rule": "file_or_directory_only_inheritance"})
-        );
-        let n = serde_json::to_value(&absent).unwrap();
-        assert!(n["acl"]["value"][1].get("posix_translation").is_none());
-
-        let mut out = Vec::new();
-        let mut manifest = Manifest::new(&mut out);
-        for entry in [accepted, rejected, absent] {
-            manifest.emit(&Record::Entry(Box::new(entry))).unwrap();
-        }
-        manifest.finish().unwrap();
-        let summary = String::from_utf8(out)
-            .unwrap()
-            .lines()
-            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
-            .find(|r| r["record"] == "summary")
-            .unwrap();
-        assert_eq!(
-            summary["acl_formats"],
-            serde_json::json!({"nfs4-xdr-xattr": 2})
-        );
-        assert_eq!(summary["nfs4_acl_translations_accepted"], 1);
-        assert_eq!(summary["nfs4_acl_translations_refused"], 1);
     }
 }

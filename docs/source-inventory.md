@@ -82,8 +82,8 @@ An unsupported extent query remains unavailable.
 
 macOS ACL observations contain the raw bytes returned by `acl_to_text`, or null
 when the descriptor ACL API reports an absent ACL or no entries. Linux probes
-`system.posix_acl_access`,
-`system.posix_acl_default`, and `system.nfs4_acl_xdr` explicitly, including when
+`system.posix_acl_access` and
+`system.posix_acl_default` explicitly, including when
 the name does not appear in the xattr listing. Each raw ACL probe retains its
 own status. Linux `ENODATA` means no ACL was reported. `EOPNOTSUPP` means that
 the filesystem cannot contain that ACL format. This is a definite answer and
@@ -132,11 +132,11 @@ and digest. Links outside the tree equal the observed link count minus the paths
 found only when traversal completed and all link observations agree. Otherwise,
 the outside count remains unavailable.
 
-The `openzfs-insensitive-unicode-5.0.0` collision rule uses the same `fold_name`
-function as filesystem lookup. It applies the OpenZFS Unicode 5.0.0 simple
-uppercase table without normalization. It keeps `ß` distinct from `SS` and
-composed accents distinct from decomposed accents. It matches `ı` with `I`.
-Invalid UTF-8 spans follow the shared OpenZFS byte rule. They participate in
+The `zerofs-insensitive-lookup` collision rule uses the same `fold_name`
+function as filesystem lookup: single-character Unicode uppercase without
+normalization. It keeps `ß` distinct from `SS` and composed accents distinct
+from decomposed accents. It matches `ı` with `I`. Invalid UTF-8 spans follow the
+same byte rule as lookup. They participate in
 collision detection, and each non-UTF-8 basename increments `non_utf8_names`.
 This rule does not establish Samba's matching behavior.
 
@@ -145,8 +145,8 @@ compares NFC forms with `icu_normalizer`. `unicode-case-fold` compares the full
 Unicode case fold of the NFC forms with `unicase` 2.10 or later. Version 2.9
 reordered three-character folds and failed the ligature regression test.
 Those two Unicode rules are advisory and do not establish a collision under the
-source dataset's rule or Samba's matching behavior. Non-UTF-8 names retain their
-exact bytes, participate in the OpenZFS rule only, and increment
+lookup rule or Samba's matching behavior. Non-UTF-8 names retain their
+exact bytes, participate in the lookup rule only, and increment
 `non_utf8_names`. Use the rule field, not the presence of any collision record,
 when assessing a transfer to an insensitive ZeroFS filesystem.
 
@@ -246,8 +246,8 @@ running the test is an error, not a successful no-op.
 The dedicated source-inventory workflow also runs the ordinary inventory suite
 and this exact ignored fixture in a private mount namespace.
 
-- Not verified: TrueNAS and ZFS collection and ACL exposure require runs on those
-  platforms. Local fixtures do not establish which ACLs or xattrs a NAS carries,
+- Not verified: TrueNAS collection and ACL exposure require runs on that
+  platform. Local fixtures do not establish which ACLs or xattrs a NAS carries,
   its space usage, or Samba's name matching behavior.
 
 - Not verified: The macOS collector's tests last ran on macOS before this

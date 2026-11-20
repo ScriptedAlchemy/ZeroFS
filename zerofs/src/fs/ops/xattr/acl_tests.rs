@@ -1,9 +1,7 @@
-//! Engine tests for POSIX ACL storage, enforcement and inheritance, and for
-//! NFSv4 ACL translation.
+//! Engine tests for POSIX ACL storage, enforcement and inheritance.
 
 use super::*;
 use crate::fs::permissions::acl::PosixAcl;
-use crate::fs::permissions::nfs4::encode::{self, Who};
 use crate::fs::test_util::test_creds;
 use crate::fs::types::{AuthContext, SetAttributes, SetMode};
 use std::sync::Arc;
@@ -453,103 +451,6 @@ async fn invalid_acl_values_are_rejected_without_change() {
 }
 
 #[tokio::test]
-async fn nfs4_acls_are_translated_or_refused() {
-    let fs = ZeroFS::new_in_memory().await.unwrap();
-    let dir = scratch(&fs).await;
-    let share = mkdir(&fs, dir, b"share", 0o700).await;
-    let restricted = encode::acl(&[
-        (encode::ALLOW, encode::FD, encode::FULL_CONTROL, Who::Owner),
-        (
-            encode::ALLOW,
-            encode::FD,
-            encode::MODIFY | encode::DELETE_CHILD,
-            Who::Group,
-        ),
-        (
-            encode::ALLOW,
-            encode::FD,
-            encode::MODIFY | encode::DELETE_CHILD,
-            Who::GroupId(TEAM),
-        ),
-    ]);
-    fs.set_xattr(
-        &test_creds(),
-        share,
-        &acl_name(NFS4_ACL_XDR),
-        XattrValue::new(Bytes::from(restricted)).unwrap(),
-        XattrSetMode::Either,
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        get_text(&fs, share, POSIX_ACL_ACCESS).await.unwrap(),
-        "u::rwx,g::rwx,g:300:rwx,m::rwx,o::---"
-    );
-    assert_eq!(
-        get_text(&fs, share, POSIX_ACL_DEFAULT).await.unwrap(),
-        "u::rwx,g::rwx,g:300:rwx,m::rwx,o::---"
-    );
-    assert_eq!(mode_of(&fs, share).await, 0o770);
-    // The blob itself is not stored or served.
-    assert_eq!(
-        fs.get_xattr(&test_creds(), share, &acl_name(NFS4_ACL_XDR))
-            .await,
-        Err(FsError::NoData)
-    );
-    let file = create(&fs, share, b"f", 0o666).await;
-    assert!(write_ok(&fs, STRANGER, &[TEAM], file).await);
-    assert!(!read_ok(&fs, STRANGER, &[], file).await);
-
-    // A refused ACL changes nothing.
-    let before = (
-        get_text(&fs, share, POSIX_ACL_ACCESS).await,
-        mode_of(&fs, share).await,
-    );
-    let refused = encode::acl(&[(
-        encode::ALLOW,
-        encode::FILE_INHERIT,
-        encode::FULL_CONTROL,
-        Who::Owner,
-    )]);
-    assert_eq!(
-        fs.set_xattr(
-            &test_creds(),
-            share,
-            &acl_name(NFS4_ACL_XDR),
-            XattrValue::new(Bytes::from(refused)).unwrap(),
-            XattrSetMode::Either,
-        )
-        .await,
-        Err(FsError::NotSupported)
-    );
-    assert_eq!(
-        before,
-        (
-            get_text(&fs, share, POSIX_ACL_ACCESS).await,
-            mode_of(&fs, share).await
-        )
-    );
-    // Only the owner may translate an ACL onto an inode.
-    assert_eq!(
-        fs.set_xattr(
-            &who(STRANGER, &[TEAM]),
-            share,
-            &acl_name(NFS4_ACL_XDR),
-            XattrValue::new(Bytes::from(encode::acl(&[(
-                encode::ALLOW,
-                0,
-                encode::FULL_CONTROL,
-                Who::Everyone
-            )])))
-            .unwrap(),
-            XattrSetMode::Either,
-        )
-        .await,
-        Err(FsError::OperationNotPermitted)
-    );
-}
-
-#[tokio::test]
 async fn access_checks_never_combine_an_old_mode_with_new_acl_entries() {
     let fs = ZeroFS::new_in_memory().await.unwrap();
     let dir = scratch(&fs).await;
@@ -590,98 +491,6 @@ async fn access_checks_never_combine_an_old_mode_with_new_acl_entries() {
             Err(FsError::PermissionDenied)
         );
     }
-}
-
-#[tokio::test]
-async fn translating_acl_counts_rows_removed_in_the_same_transaction() {
-    use crate::fs::store::xattr::XATTR_COUNT_MAX;
-
-    let fs = ZeroFS::new_in_memory().await.unwrap();
-    let dir = scratch(&fs).await;
-    let share = mkdir(&fs, dir, b"full", 0o700).await;
-    set_text(
-        &fs,
-        share,
-        POSIX_ACL_ACCESS,
-        "u::rwx,u:2000:r--,g::---,m::r--,o::---",
-    )
-    .await
-    .unwrap();
-    let mut txn = fs.db.new_transaction().unwrap();
-    for index in 0..XATTR_COUNT_MAX - 1 {
-        fs.xattr_store.put(
-            &mut txn,
-            share,
-            format!("user.full.{index:04}").as_bytes(),
-            Bytes::from_static(b"retained"),
-        );
-    }
-    fs.write_coordinator.commit(txn).await.unwrap();
-    assert_eq!(
-        fs.xattr_store.list(share).await.unwrap().len(),
-        XATTR_COUNT_MAX
-    );
-    // An actual extra row still fails, without changing the existing ACL.
-    assert_eq!(
-        set_text(&fs, share, POSIX_ACL_DEFAULT, "u::rwx,g::---,o::---").await,
-        Err(FsError::NoSpace)
-    );
-    let translated = encode::acl(&[
-        (encode::ALLOW, 0, encode::FULL_CONTROL, Who::Owner),
-        (
-            encode::ALLOW,
-            encode::FD | encode::INHERIT_ONLY,
-            encode::FULL_CONTROL,
-            Who::Owner,
-        ),
-        (
-            encode::ALLOW,
-            encode::FD | encode::INHERIT_ONLY,
-            encode::READ,
-            Who::User(NAMED),
-        ),
-    ]);
-    fs.set_xattr(
-        &test_creds(),
-        share,
-        &acl_name(NFS4_ACL_XDR),
-        XattrValue::new(Bytes::from(translated)).unwrap(),
-        XattrSetMode::Either,
-    )
-    .await
-    .unwrap();
-    // The access ACL becomes mode-only and frees the default ACL's row.
-    assert_eq!(
-        get_text(&fs, share, POSIX_ACL_ACCESS).await,
-        Err(FsError::NoData)
-    );
-    assert_eq!(mode_of(&fs, share).await, 0o700);
-    assert_eq!(
-        get_text(&fs, share, POSIX_ACL_DEFAULT).await.unwrap(),
-        "u::rwx,u:2000:r-x,g::---,m::r-x,o::---"
-    );
-    assert_eq!(
-        fs.xattr_store.list(share).await.unwrap().len(),
-        XATTR_COUNT_MAX
-    );
-    assert_eq!(
-        fs.xattr_store
-            .get(share, b"user.full.0000")
-            .await
-            .unwrap()
-            .as_ref(),
-        b"retained"
-    );
-    assert_eq!(
-        set_text(
-            &fs,
-            share,
-            POSIX_ACL_ACCESS,
-            "u::rwx,u:2000:r--,g::---,m::r--,o::---",
-        )
-        .await,
-        Err(FsError::NoSpace)
-    );
 }
 
 #[tokio::test]

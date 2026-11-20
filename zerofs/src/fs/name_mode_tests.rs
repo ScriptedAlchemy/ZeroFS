@@ -138,8 +138,8 @@ async fn insensitive_opaque_names_and_normalization_forms_round_trip() {
         "é".as_bytes(),
         "e\u{301}".as_bytes(),
         b"a\xffb",
-        "\u{a7d1}".as_bytes(),
-        "\u{a7d0}".as_bytes(),
+        "ß".as_bytes(),
+        b"ss",
     ] {
         let (id, _) = fs.create(&creds, 0, name, &attrs).await.unwrap();
         assert_preserved(&fs, 0, name, id).await;

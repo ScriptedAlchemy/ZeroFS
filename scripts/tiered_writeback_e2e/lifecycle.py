@@ -99,7 +99,6 @@ REQUIRED_RECEIPT_FIELDS = (
     "ports",
     "devices",
     "mounts",
-    "pools",
     "tool_revisions",
     "manifest",
     "durability_floors",
@@ -220,7 +219,6 @@ class HarnessReceipt:
             "ports": [],
             "devices": [],
             "mounts": [],
-            "pools": [],
             "tool_revisions": dict(PINNED_REVISIONS),
             "manifest": {},
             "durability_floors": [],
@@ -244,7 +242,6 @@ class HarnessReceipt:
             "listener": "ports",
             "device": "devices",
             "mount": "mounts",
-            "pool": "pools",
         }
         collected: dict[str, list[Any]] = {name: [] for name in buckets.values()}
         for kind, value, _ in ledger.resources():
@@ -308,9 +305,6 @@ class Probes:
 
     def unix_socket_ready(self, path: str) -> bool:
         return self._succeeds(["test", "-S", path])
-
-    def pool_exists(self, name: str) -> bool:
-        return self._succeeds(["zpool", "list", "-H", "-o", "name", name])
 
 
 def assert_source_idle(
@@ -436,9 +430,6 @@ class HarnessLifecycle:
         elif kind == "device":
             if self.probes.device_attached(str(value)):
                 self.runner.run([NBD_CLIENT, "-d", str(value)], sudo=True)
-        elif kind == "pool":
-            if self.probes.pool_exists(str(value)):
-                self.runner.run(["zpool", "destroy", str(value)], sudo=True)
         elif kind == "path":
             target = validate_owned_path(Path(str(value)), scope)
             if target.is_dir() and not target.is_symlink():
@@ -494,8 +485,6 @@ class HarnessLifecycle:
             return self.probes.mount_active(str(value))
         if kind == "device":
             return self.probes.device_attached(str(value))
-        if kind == "pool":
-            return self.probes.pool_exists(str(value))
         if kind == "path":
             return Path(str(value)).exists()
         return False  # backend prefixes are covered by the outstanding check.

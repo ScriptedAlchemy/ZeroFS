@@ -5,15 +5,13 @@ const UUID: &str = "47166772-65c1-4ecf-8066-935452891add";
 
 fn mount(filesystem: &str) -> Mount {
     containing_mount(
-        &format!("25 1 8:17 / /fixture/storage rw - {filesystem} tank/data rw\n"),
+        &format!("25 1 8:17 / /fixture/storage rw - {filesystem} /dev/sdb1 rw\n"),
         Path::new("/fixture/storage/data"),
     )
     .unwrap()
 }
 
 struct FakeProbe {
-    zfs: String,
-    pool: String,
     blkid: String,
     fail: bool,
     calls: RefCell<Vec<String>>,
@@ -22,8 +20,9 @@ struct FakeProbe {
 impl Default for FakeProbe {
     fn default() -> Self {
         Self {
-            zfs: "guid\t201\nmounted\tyes\nmountpoint\t/fixture/storage\nkeystatus\tavailable\nreadonly\toff\n".into(),
-            pool: "101\n".into(), blkid: format!("{UUID}\n"), fail: false, calls: RefCell::new(Vec::new()),
+            blkid: format!("{UUID}\n"),
+            fail: false,
+            calls: RefCell::new(Vec::new()),
         }
     }
 }
@@ -35,88 +34,12 @@ impl Probe for FakeProbe {
             bail!("synthetic probe failure")
         }
         match program {
-            "zfs" => {
-                assert_eq!(
-                    args,
-                    [
-                        "get",
-                        "-H",
-                        "-p",
-                        "-o",
-                        "property,value",
-                        "guid,mounted,mountpoint,keystatus,readonly",
-                        "tank/data"
-                    ]
-                );
-                Ok(self.zfs.clone())
-            }
-            "zpool" => {
-                assert_eq!(args, ["get", "-H", "-p", "-o", "value", "guid", "tank"]);
-                Ok(self.pool.clone())
-            }
             "blkid" => {
                 assert_eq!(args, ["-p", "-s", "UUID", "-o", "value", "/dev/block/8:17"]);
                 Ok(self.blkid.clone())
             }
             _ => panic!("unexpected probe {program}"),
         }
-    }
-}
-
-#[test]
-fn zfs_observations_require_pool_and_dataset_guids_mount_and_key_state() {
-    let probe = FakeProbe::default();
-    let facts = identify(mount("zfs"), &probe).unwrap();
-    assert_eq!(
-        facts.identity,
-        FilesystemIdentity::Zfs {
-            pool_guid: "101".into(),
-            dataset_guid: "201".into()
-        }
-    );
-    assert!(facts.unlocked && facts.writable);
-    assert_eq!(*probe.calls.borrow(), ["zfs", "zpool"]);
-}
-
-#[test]
-fn locked_and_readonly_zfs_are_facts_never_ready_defaults() {
-    for (from, to, writable, unlocked) in [
-        ("available", "unavailable", true, false),
-        ("available", "none", true, true),
-        ("readonly\toff", "readonly\ton", false, true),
-    ] {
-        let mut probe = FakeProbe::default();
-        probe.zfs = probe.zfs.replace(from, to);
-        let facts = identify(mount("zfs"), &probe).unwrap();
-        assert_eq!((facts.writable, facts.unlocked), (writable, unlocked));
-    }
-}
-
-#[test]
-fn zfs_missing_unknown_duplicate_and_unmounted_evidence_is_rejected() {
-    for (from, to) in [
-        ("guid\t201\n", ""),
-        ("guid\t201", "guid\t0"),
-        ("mounted\tyes", "mounted\tno"),
-        ("mountpoint\t/fixture/storage", "mountpoint\t/other"),
-        ("keystatus\tavailable", "keystatus\tunknown"),
-        ("keystatus\tavailable\n", ""),
-        ("readonly\toff", "readonly\tunknown"),
-        ("readonly\toff", "readonly\toff\nreadonly\toff"),
-    ] {
-        let mut probe = FakeProbe::default();
-        probe.zfs = probe.zfs.replace(from, to);
-        assert!(
-            identify(mount("zfs"), &probe).is_err(),
-            "accepted {from:?} -> {to:?}"
-        );
-    }
-    for pool in ["", "0", "unknown", "101\n102\n"] {
-        let probe = FakeProbe {
-            pool: pool.into(),
-            ..Default::default()
-        };
-        assert!(identify(mount("zfs"), &probe).is_err());
     }
 }
 
@@ -152,7 +75,7 @@ fn unsupported_filesystems_and_failed_probes_do_not_fall_back() {
         assert!(identify(mount(filesystem), &probe).is_err());
         assert!(probe.calls.borrow().is_empty());
     }
-    for filesystem in ["zfs", "ext4", "xfs"] {
+    for filesystem in ["ext4", "xfs"] {
         let probe = FakeProbe {
             fail: true,
             ..Default::default()
@@ -165,7 +88,7 @@ fn unsupported_filesystems_and_failed_probes_do_not_fall_back() {
 fn nearest_mount_and_mountinfo_escapes_are_resolved_without_prefix_confusion() {
     let input = "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n\
         2 1 8:17 / /fixture/storage rw,nosuid shared:2 - xfs /dev/sdb1 rw\n\
-        3 2 0:35 / /fixture/storage/nested\\040dataset rw - zfs tank/data rw\n";
+        3 2 0:35 / /fixture/storage/nested\\040dataset rw - xfs /dev/sdc1 rw\n";
     let mount = containing_mount(input, Path::new("/fixture/storage/nested dataset/data")).unwrap();
     assert_eq!(
         mount.mountpoint,

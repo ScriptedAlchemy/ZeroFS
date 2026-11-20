@@ -5,8 +5,8 @@ use anyhow::Result;
 use icu_normalizer::ComposingNormalizer;
 use std::io::Write;
 
-const OPENZFS_RULE: &str = "openzfs-insensitive-unicode-5.0.0";
-pub(super) const RULES: [&str; 3] = [OPENZFS_RULE, "unicode-canonical", "unicode-case-fold"];
+const LOOKUP_RULE: &str = "zerofs-insensitive-lookup";
+pub(super) const RULES: [&str; 3] = [LOOKUP_RULE, "unicode-canonical", "unicode-case-fold"];
 
 fn key(rule: usize, name: &[u8]) -> Option<Vec<u8>> {
     if rule == 0 {
@@ -148,15 +148,15 @@ mod tests {
     }
 
     #[test]
-    fn non_utf8_participates_only_in_the_openzfs_rule() {
+    fn non_utf8_participates_only_in_the_lookup_rule() {
         assert_eq!(
             detect(&[b"\xffA", b"\xffa", "�a".as_bytes()]),
-            vec![(OPENZFS_RULE, vec![b"\xffA".to_vec(), b"\xffa".to_vec()])]
+            vec![(LOOKUP_RULE, vec![b"\xffA".to_vec(), b"\xffa".to_vec()])]
         );
     }
 
     #[test]
-    fn openzfs_equivalence_has_no_normalization_or_full_fold_expansion() {
+    fn lookup_equivalence_has_no_normalization_or_full_fold_expansion() {
         for (a, b, collide) in [
             (b"File".as_slice(), b"file".as_slice(), true),
             ("ı".as_bytes(), b"I".as_slice(), true),
@@ -168,7 +168,7 @@ mod tests {
         ] {
             let result = detect(&[a, b]);
             assert_eq!(
-                result.iter().any(|(rule, _)| *rule == OPENZFS_RULE),
+                result.iter().any(|(rule, _)| *rule == LOOKUP_RULE),
                 collide,
                 "{a:02x?} / {b:02x?}"
             );

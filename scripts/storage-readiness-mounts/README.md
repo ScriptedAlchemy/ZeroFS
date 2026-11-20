@@ -33,7 +33,6 @@ The fixture unmounts each owned mount and detaches its own loop device. Remove
 the test container and any image pulled for the run afterward. Do not detach
 unrelated loop devices or prune shared Docker state.
 
-- Not verified: This harness does not establish OpenZFS lifecycle behavior,
-  same-name dataset recreation, or the full server's CLI dispatch. The tmpfs
+- Not verified: This harness does not establish the full server's CLI dispatch. The tmpfs
   case exercises the mount-table refusal, because tmpfs has no supported storage
   identity. Bind-mount coverage is limited to the container's mount namespace.
