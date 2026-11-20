@@ -126,30 +126,36 @@ pub(super) fn validate(
     let wb = settings
         .writeback_settings(WritebackAccessMode::ReadWrite)?
         .context("requires enabled raw writeback")?;
-    let (disk_bytes, reserve, disk_label) = if nas_fit {
+    // Journal RAM bounds what one durable P3 commit can cover: about half of
+    // it accumulates while the other half commits. The NAS fit takes up to
+    // 96 MiB so one flush covers tens of MiB; startup admission charges
+    // whatever is configured.
+    let (memory_bytes, disk_bytes, reserve, disk_label) = if nas_fit {
         (
+            16 * MIB..=96 * MIB,
             10 * GIB,
             4 * GIB..=4 * GIB,
-            "10 GiB disk and 4 GiB free reserve",
+            "16 to 96 MiB journal RAM, 10 GiB disk and 4 GiB free reserve",
         )
     } else {
         (
+            16 * MIB..=16 * MIB,
             16 * MIB,
             1..=8 * MIB,
-            "16 MiB disk and up to 8 MiB free reserve",
+            "16 MiB journal RAM, 16 MiB disk and up to 8 MiB free reserve",
         )
     };
     ensure!(
         wb.ack_mode == AckMode::Memory
             && wb.shutdown_flush == ShutdownFlush::Local
-            && wb.memory_bytes == 16 * MIB
+            && memory_bytes.contains(&wb.memory_bytes)
             && wb.disk_bytes == disk_bytes
             && reserve.contains(&wb.min_free_bytes)
             && wb.local_concurrency == 1
             && wb.upload_concurrency == 2
             && wb.high_watermark_percent == 95
             && wb.resume_percent == 85,
-        "requires memory ack, local shutdown, 16 MiB journal RAM, {disk_label}, one local and two upload workers, and 95/85 watermarks"
+        "requires memory ack, local shutdown, {disk_label}, one local and two upload workers, and 95/85 watermarks"
     );
     ensure!(
         write_ack.mode == FilesystemWriteAckMode::VolatileMemory

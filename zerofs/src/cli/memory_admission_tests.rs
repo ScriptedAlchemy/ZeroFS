@@ -649,7 +649,7 @@ mod raw_candidate {
             .replace("/fixture/", &format!("{}/", root.display()));
         let receipt = validate(root, &config, Some(8 * GIB), "0").unwrap();
         assert_eq!(receipt.included_companion_bytes, 3 * GIB / 2);
-        assert_eq!(receipt.required_bytes, 8_088 * MIB);
+        assert_eq!(receipt.required_bytes, 8_168 * MIB);
         assert!(receipt.stored_state_qualification.is_none());
         assert!(
             receipt
@@ -677,11 +677,15 @@ mod raw_candidate {
         let read = |toml: &str| validate(temp.path(), toml, Some(8 * GIB), "0");
         let receipt = read(config).unwrap();
         assert_eq!(receipt.included_companion_bytes, 1536 * MIB);
-        assert_eq!(receipt.required_bytes, 8_088 * MIB);
+        assert_eq!(receipt.required_bytes, 8_168 * MIB);
         for (old, new) in [
             (
-                "memory_size_gb = 0.016777216",
+                "memory_size_gb = 0.100663296",
                 "memory_size_gb = 0.008388608",
+            ),
+            (
+                "memory_size_gb = 0.100663296",
+                "memory_size_gb = 0.201326592",
             ),
             ("/hdd6?", "/hdd18?"),
             ("/hdd6?", "/dev/sda?"),
