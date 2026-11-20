@@ -46,6 +46,9 @@ pub(crate) struct RawBinding {
     pub pool: Uuid,
     pub member: Uuid,
     pub layout: Option<[u64; 6]>,
+    /// Test files only: pace every member PUT, as a slow disk would.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    put_delay_ms: Option<u64>,
 }
 
 fn path(value: &str) -> Result<PathBuf> {
@@ -89,6 +92,7 @@ impl RawBinding {
         let mut layout = None;
         let mut pool = None;
         let mut member = None;
+        let mut put_delay_ms = None;
         for (key, value) in url.query_pairs() {
             match key.as_ref() {
                 "backing" if kind != RawKind::Physical && backing.is_none() => {
@@ -96,6 +100,9 @@ impl RawBinding {
                 }
                 "pool" if pool.is_none() => pool = Some(Uuid::parse_str(&value)?),
                 "member" if member.is_none() => member = Some(Uuid::parse_str(&value)?),
+                "put_delay_ms" if is_test_file(url.scheme()) && put_delay_ms.is_none() => {
+                    put_delay_ms = Some(value.parse()?)
+                }
                 field
                     if is_p3(url.scheme())
                         && layout.is_none()
@@ -151,6 +158,7 @@ impl RawBinding {
             backing,
             pool,
             member,
+            put_delay_ms,
         })
     }
 
@@ -300,6 +308,9 @@ pub(super) async fn open_member(
         {
             let ms: u64 = value.to_str().context("invalid fixture pacing")?.parse()?;
             ensure!(ms <= 5000, "fixture PUT delay exceeds five seconds");
+            store.fixture_put_delay = std::time::Duration::from_millis(ms);
+        }
+        if let Some(ms) = binding.put_delay_ms {
             store.fixture_put_delay = std::time::Duration::from_millis(ms);
         }
         let min_free_bytes = store.capacity()?.reserve_bytes;

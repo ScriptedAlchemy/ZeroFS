@@ -50,6 +50,8 @@ struct Fixture {
     p3_count: u32,
     interval_seconds: u64,
     final_pause_milliseconds: u64,
+    /// Milliseconds every HDD member PUT takes, as a slow disk would.
+    member_put_delay_ms: u64,
     settings: Settings,
 }
 
@@ -94,6 +96,7 @@ impl Fixture {
             hdds,
             interval_seconds,
             final_pause_milliseconds,
+            member_put_delay_ms: 0,
         };
         fixture.provision_blank_p3();
         drop(
@@ -133,6 +136,12 @@ impl Fixture {
         self.settings = self.build_settings();
     }
 
+    /// Pace every HDD member PUT from the next start on.
+    fn slow_members(&mut self, put_delay_ms: u64) {
+        self.member_put_delay_ms = put_delay_ms;
+        self.settings = self.build_settings();
+    }
+
     /// Lose the authority device entirely and fit a blank replacement.
     fn replace_lost_p3(&mut self) {
         std::fs::remove_file(&self.p3).unwrap();
@@ -149,9 +158,10 @@ impl Fixture {
                 serde_json::json!({
                     "id": id,
                     "url": format!(
-                        "raw+testfile://{}?pool={}&member={member}",
+                        "raw+testfile://{}?pool={}&member={member}&put_delay_ms={}",
                         self.hdd_path(id).display(),
-                        self.pool
+                        self.pool,
+                        self.member_put_delay_ms
                     ),
                     "capacity_gb": 0.064,
                     "reserve_free_gb": 0.0,
@@ -1064,6 +1074,142 @@ async fn a_file_larger_than_the_writeback_journal_flushes_and_reads_back() -> Re
     }
     ensure!(read == data, "read-back differs from the written bytes");
     running.stop().await;
+    Ok(())
+}
+
+/// The N5 E6 copy lost one 512 KiB NFS WRITE to a metadata commit whose
+/// closed phase outlasted the final pause. Slow HDD members stretch every cut
+/// past that pause here while 9P WRITEs, the FUSE mount's own path, are in
+/// flight. A commit must never fail a client write: every WRITE and the
+/// fsync succeed and the file reads back byte for byte.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_commit_that_pauses_past_the_final_pause_never_fails_a_9p_write() -> Result<()> {
+    use ninep_client::{NOFID, NinePClient};
+    const ROOT: u32 = 0;
+    const CHUNK: usize = 256 * 1024;
+    const WRITERS: usize = 8;
+    let mut fixture = Fixture::new().await;
+    fixture.slow_members(1200);
+    let running = fixture.start().await?;
+    let socket_dir = tempfile::tempdir()?;
+    let socket = socket_dir.path().join("9p.sock");
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let server = tokio::spawn({
+        let server = crate::ninep::NinePServer::new_unix(Arc::clone(running.fs()), socket.clone());
+        let shutdown = shutdown.clone();
+        async move { server.start(shutdown).await }
+    });
+    let mut client = None;
+    for _ in 0..100 {
+        if let Ok(connected) = NinePClient::connect_unix(&socket, 256 * 1024).await {
+            client = Some(connected);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let client = client.context("9P server did not accept a connection")?;
+    client.attach(ROOT, NOFID, "root", "", 0).await?;
+    let fid = client.alloc_fid();
+    client.walk(ROOT, fid, &[]).await?;
+    client
+        .lcreate(
+            fid,
+            b"written-across-commits",
+            (libc::O_RDWR | libc::O_CREAT) as u32,
+            libc::S_IFREG | 0o644,
+            0,
+        )
+        .await?;
+
+    let data = payload(29, 24 * MIB as usize);
+    let chunks: Vec<(u64, Bytes)> = (0..data.len())
+        .step_by(CHUNK)
+        .map(|offset| {
+            (
+                offset as u64,
+                data.slice(offset..data.len().min(offset + CHUNK)),
+            )
+        })
+        .collect();
+    let acknowledged = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut writers = tokio::task::JoinSet::new();
+    for lane in 0..WRITERS {
+        let client = Arc::clone(&client);
+        let acknowledged = Arc::clone(&acknowledged);
+        let lane: Vec<_> = chunks.iter().skip(lane).step_by(WRITERS).cloned().collect();
+        writers.spawn(async move {
+            let mut refused = Vec::new();
+            for (offset, chunk) in lane {
+                let length = chunk.len() as u64;
+                match client.write_bytes(fid, offset, chunk).await {
+                    Ok(written) if written == length => {}
+                    outcome => refused.push(format!("WRITE at {offset}: {outcome:?}")),
+                }
+                acknowledged.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            refused
+        });
+    }
+
+    // Once the writers have filled the writeback journal, commits run back
+    // to back for as long as they write, so every cut drains slow members.
+    let writing = tokio_util::sync::CancellationToken::new();
+    let commits = tokio::spawn({
+        let survival = Arc::clone(running.survival());
+        let writing = writing.clone();
+        async move {
+            while acknowledged.load(std::sync::atomic::Ordering::Relaxed) < 32 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let mut longest_pause = 0;
+            while !writing.is_cancelled() {
+                let _ = survival.commit_and_report().await;
+                longest_pause = longest_pause.max(
+                    survival
+                        .status()
+                        .await
+                        .last_pause_millis
+                        .unwrap_or_default(),
+                );
+            }
+            longest_pause
+        }
+    });
+
+    let mut refused = Vec::new();
+    while let Some(lane) = writers.join_next().await {
+        refused.extend(lane?);
+    }
+    let fsync = client.fsync(fid, 0).await;
+    writing.cancel();
+    let longest_pause = commits.await?;
+
+    let mut read = Vec::with_capacity(data.len());
+    while read.len() < data.len() {
+        let bytes = client.read(fid, read.len() as u64, CHUNK as u32).await?;
+        if bytes.is_empty() {
+            break;
+        }
+        read.extend_from_slice(&bytes);
+    }
+    client.clunk(fid).await?;
+    shutdown.cancel();
+    let _ = server.await;
+    running.stop().await;
+
+    ensure!(
+        longest_pause >= 1000,
+        "no commit kept admission closed past the 1000 ms final pause (longest {longest_pause} ms)"
+    );
+    ensure!(refused.is_empty(), "client writes failed: {refused:#?}");
+    ensure!(fsync.is_ok(), "fsync failed: {fsync:?}");
+    let first_difference = read.iter().zip(data.iter()).position(|(a, b)| a != b);
+    ensure!(
+        read.len() == data.len() && first_difference.is_none(),
+        "read back {} of {} bytes, first difference at {first_difference:?}",
+        read.len(),
+        data.len()
+    );
     Ok(())
 }
 
