@@ -180,6 +180,14 @@ pub struct ExtentStore {
     /// Why generations in `sealing` are still unpublished, so a writer that
     /// needs residency answers at once instead of waiting on full storage.
     seal_failures: Arc<write::SealFailures>,
+    /// Notified when a generation enters `sealing`. The flush barrier owns
+    /// every upload permit while it waits for an append gate, so it listens
+    /// here and publishes what a writer rotates in meanwhile.
+    seal_rotated: Arc<tokio::sync::Notify>,
+    /// Test observation point: times the flush barrier has published what was
+    /// resident and gone on to wait for an append gate.
+    #[cfg(test)]
+    flush_gate_waits: Arc<std::sync::atomic::AtomicUsize>,
     /// Deadline after which each currently-dead segment may be deleted:
     /// recorded the first pass it's seen dead, from the latest expiry of the
     /// checkpoints active then, so reclamation outlasts anything that could
@@ -349,6 +357,9 @@ impl ExtentStore {
             seal_upload_sem: Arc::new(Semaphore::new(max_inflight_seals)),
             seal_residency_sem: Arc::new(Semaphore::new(max_inflight_seals)),
             seal_failures: Arc::new(write::SealFailures::default()),
+            seal_rotated: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            flush_gate_waits: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             delete_at: Arc::new(Mutex::new(HashMap::new())),
             nominations: Arc::new(Mutex::new(NominationSet::default())),
             nominations_enabled: Arc::new(AtomicBool::new(false)),

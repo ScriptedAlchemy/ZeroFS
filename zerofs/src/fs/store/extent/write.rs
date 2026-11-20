@@ -1334,7 +1334,46 @@ impl ExtentStore {
             },
         );
         debug_assert!(replaced.is_none(), "sealing generation ids must be unique");
+        self.seal_rotated.notify_waiters();
         Ok(Some((segid, bytes)))
+    }
+
+    /// Take `lane`'s append gate for the flush barrier, which holds every
+    /// upload permit.
+    ///
+    /// The gate's holder may need a residency permit before it lets go, and a
+    /// generation can only give its permit back through a PUT that this
+    /// barrier alone can run. So the barrier publishes what is resident, and
+    /// keeps publishing what any lane rotates in until the gate is granted.
+    /// Publishing once before the wait is not enough: a writer on another
+    /// lane can rotate a generation after that pass, and with it take the
+    /// permit the gate's holder is about to wait for.
+    async fn lock_lane_for_flush<'a>(
+        &self,
+        lane: &'a OpenLane,
+    ) -> Result<LaneAppendGuard<'a>, FsError> {
+        // One lock future for the whole wait keeps the barrier's place in the
+        // gate's FIFO queue across publishing passes.
+        let gate = LaneAppendGuard::lock(lane);
+        tokio::pin!(gate);
+        loop {
+            // Armed before the pass below reads `sealing`, so a generation
+            // rotated in after that read still wakes this wait.
+            let rotated = self.seal_rotated.notified();
+            tokio::pin!(rotated);
+            rotated.as_mut().enable();
+            if let Some(failure) = self.publish_pending_seals().await {
+                return Err(failure);
+            }
+            #[cfg(test)]
+            self.flush_gate_waits
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::select! {
+                biased;
+                guard = &mut gate => return Ok(guard),
+                () = &mut rotated => {}
+            }
+        }
     }
 
     /// The durability barrier (called by the flush path before the manifest is
@@ -1351,15 +1390,12 @@ impl ExtentStore {
             .await
             .map_err(|_| FsError::IoError)?;
 
-        // Freeze the append lanes one at a time. Re-publishing before each wait
-        // releases residency for a writer already blocked inside that lane, then
-        // the semaphore's FIFO lock hands the gate to this barrier next.
+        // Freeze the append lanes one at a time. Publishing during each wait
+        // releases residency for a writer blocked inside that lane, then the
+        // gate's FIFO lock hands it to this barrier next.
         let mut append_guards = Vec::with_capacity(OPEN_SEGMENT_LANES);
         for lane in self.open_lanes.iter() {
-            if let Some(failure) = self.publish_pending_seals().await {
-                return Err(failure);
-            }
-            append_guards.push(LaneAppendGuard::lock(lane).await);
+            append_guards.push(self.lock_lane_for_flush(lane).await?);
         }
         if let Some(failure) = self.publish_pending_seals().await {
             return Err(failure);
@@ -4025,6 +4061,106 @@ mod tests {
                 .await
                 .unwrap(),
             stalled
+        );
+    }
+
+    // The flush barrier takes every upload permit, then waits for each lane's
+    // append gate. While it waits for lane 0's gate, a writer on lane 1 rotates
+    // a generation. That generation takes the only residency permit, and its
+    // PUT queues behind the barrier's upload permit. Lane 0's writer then needs
+    // a residency permit to rotate before it lets go of the gate. Unless the
+    // barrier publishes the generation rotated during its wait, the barrier,
+    // the writer and the queued PUT wait on each other and nothing finishes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn flush_waiting_for_an_append_gate_publishes_what_other_lanes_rotate() {
+        let (store, db) = make().await;
+        // Every append owes a rotation. One residency permit and one upload
+        // permit, as the raw NAS-fit profile has.
+        let mut store = store.with_seal_threshold(1);
+        store.max_inflight_seals = 1;
+        store.seal_upload_sem = Arc::new(Semaphore::new(1));
+        store.seal_residency_sem = Arc::new(Semaphore::new(1));
+
+        let latch = Arc::new(Latch::new());
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        store.before_batch_seal = Some({
+            let latch = Arc::clone(&latch);
+            let armed = Arc::clone(&armed);
+            Arc::new(move || {
+                if armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    latch.block();
+                }
+            })
+        });
+
+        let (gated, other): (InodeId, InodeId) = (100, 101);
+        assert!(std::ptr::eq(store.open_lane(gated), &store.open_lanes[0]));
+        assert!(std::ptr::eq(store.open_lane(other), &store.open_lanes[1]));
+        let gated_data = Bytes::from(incompressible(1, EXTENT_SIZE));
+        let other_data = Bytes::from(incompressible(2, EXTENT_SIZE));
+
+        // Lane 0's writer stops inside its append gate, owing a rotation.
+        let gated_writer = crate::task::spawn_named("gated-writer", {
+            let (store, db, data) = (store.clone(), db.clone(), gated_data.clone());
+            async move { write_committed(&store, &db, gated, 0, &data, 0).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !latch.entered() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("lane 0's writer never reached its AEAD window");
+
+        // The barrier takes the upload permit, finds nothing to publish, and
+        // waits for lane 0's gate.
+        let flush = crate::task::spawn_named("flush", {
+            let store = store.clone();
+            async move { store.seal_open().await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while store
+                .flush_gate_waits
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the flush barrier never waited for lane 0's gate");
+        assert_eq!(store.seal_upload_sem.available_permits(), 0);
+
+        // Lane 1's writer rotates a generation into the only residency
+        // permit. The barrier holds the upload permit its PUT needs.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            write_committed(&store, &db, other, 0, &other_data, 0),
+        )
+        .await
+        .expect("lane 1's writer did not rotate while the barrier waited");
+
+        // Lane 0's writer now asks for a residency permit, still in its gate.
+        latch.release();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            gated_writer.await.unwrap();
+            flush.await.unwrap().unwrap();
+        })
+        .await
+        .expect(
+            "the flush barrier waited for an append gate whose holder waited for \
+             the residency permit of a generation only the barrier could publish",
+        );
+
+        assert!(store.sealing.lock().unwrap().is_empty());
+        assert_eq!(store.seal_residency_sem.available_permits(), 1);
+        assert_eq!(
+            store.read(gated, 0, EXTENT_SIZE as u64).await.unwrap(),
+            gated_data
+        );
+        assert_eq!(
+            store.read(other, 0, EXTENT_SIZE as u64).await.unwrap(),
+            other_data
         );
     }
 
