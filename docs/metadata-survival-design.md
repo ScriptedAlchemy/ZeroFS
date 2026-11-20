@@ -1,5 +1,17 @@
 # Consistent metadata recovery after one device is lost
 
+> **Implementation status.** Plan row M1 implements this mechanism. See
+> [metadata-survival.md](metadata-survival.md) for what is delivered, how to
+> configure and recover it, and the design items still deferred. The text
+> below is the accepted design as written before implementation.
+>
+> **Raw-device target (2026-11-18).** ZeroFS controls the authority NVMe and
+> the HDD members directly as raw block devices. On that topology every pool
+> member holds the recovery generations in its own object log, and the
+> ZFS-specific guidance below does not apply: pool-GUID and vdev bindings,
+> `sync`, SLOG and `recordsize` assumptions, and the TrueNAS HDD measurement
+> recipe.
+
 This is the first design stage of the metadata survival implementation. It is
 verified against ZeroFS commit `9b67f82eddedb30d268ac31fccaa0e3d49d9f2c3`.
 The metadata survival gate, which requires the namespace, placement catalog and

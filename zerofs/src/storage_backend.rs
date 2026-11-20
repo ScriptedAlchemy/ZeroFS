@@ -317,6 +317,27 @@ pub(crate) async fn open_pool_storage(
     }
 }
 
+/// Open one raw pool member on its own, without the authority or the pool.
+/// Offline survival status and recovery read member regions this way, so they
+/// work when the authority device is gone.
+pub(crate) async fn open_raw_member(
+    settings: &Settings,
+    member: &crate::config::StoragePoolMemberConfig,
+) -> Result<PoolMember> {
+    let url: url::Url = member.url.parse()?;
+    anyhow::ensure!(
+        raw::is_payload(url.scheme()),
+        "pool member {} is not a raw device",
+        member.id
+    );
+    raw::open_member(
+        member,
+        raw::RawBinding::parse(&url)?,
+        settings.raw_device_p3_candidate(),
+    )
+    .await
+}
+
 fn bind_readiness_root(
     settings: &Settings,
     url: &url::Url,

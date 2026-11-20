@@ -1540,6 +1540,7 @@ impl Catalog {
             mapped_objects,
             unreadable,
             quarantined_leftovers,
+            metadata_survival: None,
         })
     }
 }
@@ -2229,5 +2230,230 @@ mod empty_quarantine_tests {
         assert_eq!(scans, 4);
         catalog.require_automatic_evacuation(None).unwrap();
         assert_eq!(catalog.empty_ownership_scans.load(Ordering::Relaxed), scans);
+    }
+}
+
+/// A complete logical catalog image for metadata survival: every row of all
+/// nine tables, read in one redb snapshot. It is not a copy of `pool.redb`.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct CatalogExport {
+    pub format: u32,
+    pub tables: BTreeMap<String, BTreeMap<String, Vec<u8>>>,
+}
+
+const BYTE_TABLES: [TableDefinition<'static, &'static str, &'static [u8]>; 7] =
+    [META, MEMBERS, OBJECTS, UPLOADS, GARBAGE, HEALTH, FAULTS];
+
+impl CatalogExport {
+    fn table(&self, name: &str) -> Result<&BTreeMap<String, Vec<u8>>> {
+        self.tables
+            .get(name)
+            .with_context(|| format!("catalog export has no {name} table"))
+    }
+
+    /// Write every exported row into an empty database in one transaction.
+    /// `rebind` replaces the catalog binding of the identity row; without it
+    /// the identity is preserved byte for byte.
+    fn write_into(&self, database: &Database, rebind: Option<&str>) -> Result<Identity> {
+        use redb::TableHandle;
+        if self.format != 1 {
+            bail!("unsupported catalog export format {}", self.format);
+        }
+        let mut expected: BTreeSet<String> = BYTE_TABLES
+            .iter()
+            .map(|definition| definition.name().to_owned())
+            .collect();
+        expected.insert(HIDDEN_LEGACY.name().to_owned());
+        expected.insert(SEGMENT_TARGETS.name().to_owned());
+        if self.tables.keys().cloned().collect::<BTreeSet<_>>() != expected {
+            bail!("catalog export does not contain exactly the nine catalog tables");
+        }
+        let mut identity: Identity = bincode::deserialize(
+            self.table(META.name())?
+                .get("identity")
+                .context("catalog export has no identity")?,
+        )?;
+        if let Some(directory) = rebind {
+            identity.catalog_directory = directory.to_owned();
+        }
+        let mut tx = database.begin_write()?;
+        tx.set_durability(Durability::Immediate)?;
+        for definition in BYTE_TABLES {
+            let mut table = tx.open_table(definition)?;
+            for (key, value) in self.table(definition.name())? {
+                if definition.name() == META.name() && key == "identity" && rebind.is_some() {
+                    table.insert(key.as_str(), bincode::serialize(&identity)?.as_slice())?;
+                } else {
+                    table.insert(key.as_str(), value.as_slice())?;
+                }
+            }
+        }
+        {
+            let mut table = tx.open_table(HIDDEN_LEGACY)?;
+            for (key, value) in self.table(HIDDEN_LEGACY.name())? {
+                let [byte] = value.as_slice() else {
+                    bail!("hidden legacy row {key} is not one byte");
+                };
+                table.insert(key.as_str(), *byte)?;
+            }
+        }
+        {
+            let mut table = tx.open_table(SEGMENT_TARGETS)?;
+            for (key, value) in self.table(SEGMENT_TARGETS.name())? {
+                let member =
+                    std::str::from_utf8(value).context("segment target row is not UTF-8")?;
+                table.insert(key.as_str(), member)?;
+            }
+        }
+        tx.commit()?;
+        Ok(identity)
+    }
+}
+
+impl Catalog {
+    /// Export every table in one read transaction.
+    pub fn export_logical(&self) -> Result<CatalogExport> {
+        use redb::TableHandle;
+        let tx = self.database.begin_read()?;
+        let mut tables = BTreeMap::new();
+        for definition in BYTE_TABLES {
+            let table = tx.open_table(definition)?;
+            let mut rows = BTreeMap::new();
+            for row in table.iter()? {
+                let (key, value) = row?;
+                rows.insert(key.value().to_owned(), value.value().to_vec());
+            }
+            tables.insert(definition.name().to_owned(), rows);
+        }
+        let table = tx.open_table(HIDDEN_LEGACY)?;
+        let mut rows = BTreeMap::new();
+        for row in table.iter()? {
+            let (key, value) = row?;
+            rows.insert(key.value().to_owned(), vec![value.value()]);
+        }
+        tables.insert(HIDDEN_LEGACY.name().to_owned(), rows);
+        let table = tx.open_table(SEGMENT_TARGETS)?;
+        let mut rows = BTreeMap::new();
+        for row in table.iter()? {
+            let (key, value) = row?;
+            rows.insert(key.value().to_owned(), value.value().as_bytes().to_vec());
+        }
+        tables.insert(SEGMENT_TARGETS.name().to_owned(), rows);
+        Ok(CatalogExport { format: 1, tables })
+    }
+
+    fn recovered(
+        database: Database,
+        identity: Identity,
+        directory: Option<(AnchoredDir, CatalogLock)>,
+    ) -> Self {
+        Self {
+            database,
+            identity,
+            verified_empty_quarantined: Mutex::new(BTreeSet::new()),
+            #[cfg(test)]
+            empty_ownership_scans: std::sync::atomic::AtomicUsize::new(0),
+            _directory: directory,
+        }
+    }
+
+    /// Build a fresh catalog in owned recovery scratch from an exact export.
+    ///
+    /// The imported rows, including the original identity and its catalog
+    /// directory binding, are preserved byte for byte. The scratch directory
+    /// is a recovery binding override: this catalog is never opened through
+    /// the ordinary bound startup path, which would refuse the moved directory.
+    pub fn import_recovered(root: &FilePath, export: &CatalogExport) -> Result<Self> {
+        if root.join(CATALOG_FILE_NAME).try_exists()? {
+            bail!(
+                "recovery catalog scratch {} already contains a catalog",
+                root.display()
+            );
+        }
+        let anchored = AnchoredDir::open_or_create_absolute(root, 0o700)?;
+        let (lock, _) = anchored.open_owner_file("pool.lock".as_ref(), true)?;
+        if !FileExt::try_lock_exclusive(&lock)? {
+            bail!("recovery catalog scratch is already locked");
+        }
+        let lock = CatalogLock(lock);
+        let (file, existed) = anchored.open_owner_file(CATALOG_FILE_NAME.as_ref(), true)?;
+        if existed {
+            bail!("recovery catalog appeared while importing it");
+        }
+        let database = Builder::new()
+            .create_file(file)
+            .context("create recovered pool catalog")?;
+        let identity = export.write_into(&database, None)?;
+        anchored.sync()?;
+        Ok(Self::recovered(database, identity, Some((anchored, lock))))
+    }
+
+    /// Rebuild the catalog on an empty raw catalog region from an export.
+    ///
+    /// The export must belong to the pool the region is labelled for. Its
+    /// identity is rebound to this region, so the rebuilt authority marker
+    /// (`identity.marker()`) names the replacement device. A region that
+    /// already holds a catalog is refused untouched.
+    pub fn restore_raw(
+        region: zerofs_raw_device::journal_region::TransactionRegion,
+        export: &CatalogExport,
+    ) -> Result<Self> {
+        let binding = region.identity();
+        anyhow::ensure!(
+            binding.role == zerofs_raw_device::Role::Catalog,
+            "expected raw catalog role"
+        );
+        anyhow::ensure!(
+            region.is_empty()?,
+            "recovery target already holds a raw placement catalog"
+        );
+        use redb::TableHandle;
+        let pool = Uuid::from_bytes(binding.pool_uuid).to_string();
+        let exported: Identity = bincode::deserialize(
+            export
+                .table(META.name())?
+                .get("identity")
+                .context("catalog export has no identity")?,
+        )?;
+        if exported.format != 1 || !exported.initialized || exported.pool_id != pool {
+            return Err(operator_required(anyhow!(
+                "the recovered catalog belongs to pool {}, but the target device is labelled for pool {pool}",
+                exported.pool_id
+            )));
+        }
+        let locator = format!(
+            "raw:v2:{pool}:{}:catalog",
+            Uuid::from_bytes(binding.member_uuid)
+        );
+        let cache_bytes = region.capacity().min(32 << 20) as usize;
+        let database = Builder::new()
+            .set_cache_size(cache_bytes)
+            .create_with_backend(crate::raw_database::RawDatabase(region))?;
+        let identity = export.write_into(&database, Some(&locator))?;
+        Ok(Self::recovered(database, identity, None))
+    }
+}
+
+/// Physical generations an export maps, as `member/<id>/<key>` or
+/// `legacy/<key>`. Survival retention pins exactly these.
+pub(crate) fn exported_physical_generations(export: &CatalogExport) -> Result<BTreeSet<String>> {
+    use redb::TableHandle;
+    let mut keys = BTreeSet::new();
+    for bytes in export
+        .tables
+        .get(OBJECTS.name())
+        .context("catalog export has no object table")?
+        .values()
+    {
+        let entry: Entry = bincode::deserialize(bytes)?;
+        keys.insert(physical_generation(&entry.physical));
+    }
+    Ok(keys)
+}
+
+pub(crate) fn physical_generation(physical: &Physical) -> String {
+    match physical {
+        Physical::Member { member_id, key, .. } => format!("member/{member_id}/{key}"),
+        Physical::Legacy { key, .. } => format!("legacy/{key}"),
     }
 }

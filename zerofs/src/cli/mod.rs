@@ -10,17 +10,21 @@ pub mod debug;
 pub mod fatrace;
 pub mod flush;
 mod init;
+pub(crate) use init::recreate_raw_pool_journal;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) mod inventory;
 pub(crate) mod memory_budget;
 #[cfg(test)]
 mod metadata_fault_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod metadata_survival_raw_tests;
 pub mod monitor;
 pub mod nbd;
 pub mod otrace;
 pub mod password;
 pub mod pool;
 pub mod server;
+pub mod survival;
 pub(crate) mod transfer;
 
 #[derive(Parser)]
@@ -125,6 +129,11 @@ pub enum Commands {
     Pool {
         #[command(subcommand)]
         subcommand: PoolCommands,
+    },
+    /// Metadata survival: per-replica generation status and offline recovery
+    Survival {
+        #[command(subcommand)]
+        subcommand: SurvivalCommands,
     },
     /// Debug commands for inspecting the database
     Debug {
@@ -240,6 +249,52 @@ fn parse_transfer_jobs(value: &str) -> std::result::Result<usize, String> {
     } else {
         Ok(jobs)
     }
+}
+
+#[derive(Subcommand)]
+pub enum SurvivalCommands {
+    /// Report the last metadata generation on every replica
+    ///
+    /// Reads the replicas named by the configuration and authenticates their
+    /// records with the configured password. It never writes. On a raw-device
+    /// pool it claims the member devices, so the server must be stopped; a
+    /// running server reports the same state in `zerofs pool status`. It
+    /// does not need the authority device.
+    Status {
+        #[arg(short, long)]
+        config: PathBuf,
+    },
+    /// Recover the newest complete metadata generation after the authority device is lost
+    ///
+    /// Runs only when asked: ordinary startup never recovers. Sources are
+    /// never modified, every digest is verified before anything is written,
+    /// and the original key envelope is used. Prints a JSON report with the
+    /// selected generation, unavailable members and every lost file range.
+    ///
+    /// With --config, rebuilds a raw-device pool's authority onto the P3 the
+    /// configuration names, which must be freshly provisioned and blank. The
+    /// configuration must name the surviving members and carry the password.
+    ///
+    /// With --replica and --scratch, materializes a directory pool's
+    /// generation read-only into owned scratch and reads the password from
+    /// stdin.
+    Recover {
+        /// Configuration naming the raw members and the blank replacement P3
+        #[arg(short, long, conflicts_with_all = ["replicas", "scratch", "keep"])]
+        config: Option<PathBuf>,
+        /// A member that is also lost; its files are reported as unreadable (repeatable)
+        #[arg(long = "allow-missing-member", requires = "config")]
+        allow_missing: Vec<String>,
+        /// A surviving metadata replica directory (repeatable)
+        #[arg(long = "replica", requires = "scratch")]
+        replicas: Vec<PathBuf>,
+        /// A healthy directory for recovery scratch
+        #[arg(long, requires = "replicas")]
+        scratch: Option<PathBuf>,
+        /// Keep the materialized scratch for inspection instead of removing it
+        #[arg(long, requires = "scratch")]
+        keep: bool,
+    },
 }
 
 #[derive(Subcommand)]

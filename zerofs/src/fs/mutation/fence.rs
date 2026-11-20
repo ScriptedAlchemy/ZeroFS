@@ -137,6 +137,8 @@ impl Drop for MaterializationFence {
 /// grow a second wait beside the fence.
 pub(crate) struct MetadataFence {
     _materialization: Option<MaterializationFence>,
+    // Declared last so the conflict fence reopens before admission releases.
+    _survival: Option<crate::metadata_survival::admission::OwnedAdmissionToken>,
 }
 
 fn mutation_fs_error(error: MutationError) -> FsError {
@@ -155,6 +157,13 @@ impl ZeroFS {
         &self,
         scope: ConflictScope,
     ) -> Result<MetadataFence, FsError> {
+        // One survival admission token per top-level mutation, taken before
+        // any conflict fence or inode lock and held until the fence drops.
+        let survival = if self.db.is_read_only() {
+            None
+        } else {
+            Some(self.survival_admission.admit_owned().await?)
+        };
         let materialization = if let Some(coordinator) = self.mutation_coordinator.get() {
             Some(
                 coordinator
@@ -176,6 +185,7 @@ impl ZeroFS {
         }
         Ok(MetadataFence {
             _materialization: materialization,
+            _survival: survival,
         })
     }
 }

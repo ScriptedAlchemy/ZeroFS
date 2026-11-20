@@ -1,4 +1,6 @@
-//! Executable acceptance contracts. No survival implementation lives here.
+//! Executable acceptance contracts. The production mechanism lives in
+//! `crate::metadata_survival`; `CurrentImplementation` below only binds the
+//! contracts to it.
 
 use super::*;
 use crate::fs::key_codec::KeyCodec;
@@ -9,6 +11,8 @@ use futures::{StreamExt, TryStreamExt};
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
 use tokio::sync::oneshot;
+
+use crate::metadata_survival as production;
 
 const REPLICA_TIMEOUT: Duration = Duration::from_secs(90);
 // The proposed `final_pause_max_milliseconds` default. A mutation that finds
@@ -69,6 +73,13 @@ macro_rules! acceptance_rows {
                 matches!(self, $(Self::$review)|+)
             }
 
+            /// Core rows are bound to the production mechanism. They are
+            /// long-running and stay ignored by default, but no longer fail
+            /// at a missing prerequisite.
+            fn implemented(self) -> bool {
+                matches!(self, $(Self::$core)|+)
+            }
+
             /// The missing prerequisite this row fails with today, verbatim.
             /// It is also the row's `#[ignore]` reason.
             fn stated_reason(self) -> &'static str {
@@ -87,33 +98,33 @@ macro_rules! acceptance_rows {
 acceptance_rows! {
     core {
         AuthorityLoss => authority_device_loss_preserves_committed_namespace,
-            "the metadata_survival configuration table is unsupported";
+            "long-running production survival acceptance; run explicitly with --ignored";
         JournalBeforeBackend => journal_device_loss_before_backend_cutoff_preserves_committed_prefix,
-            "the metadata_survival configuration table is unsupported";
+            "long-running production survival acceptance; run explicitly with --ignored";
         JournalAfterBackend => journal_device_loss_after_backend_cutoff_preserves_committed_prefix,
-            "the metadata_survival configuration table is unsupported";
+            "long-running production survival acceptance; run explicitly with --ignored";
         DataAndReplicaLoss => data_member_with_metadata_replica_loss_preserves_namespace_and_reports_ranges,
-            "the metadata_survival configuration table is unsupported";
+            "long-running production survival acceptance; run explicitly with --ignored";
         PayloadRetention => reclaim_preserves_payload_referenced_by_the_last_survival_commit,
-            "the metadata_survival configuration table is unsupported";
+            "long-running production survival acceptance; run explicitly with --ignored";
         AdmittedWriteLoss => writes_in_flight_during_loss_preserve_last_survival_commit,
-            "the admitted-write mid-commit hook is absent";
+            "long-running production survival acceptance; run explicitly with --ignored";
         InterruptedCommit => interrupted_commit_at_every_step_preserves_a_consistent_generation,
-            "the production commit cut hook is absent";
+            "long-running production survival acceptance; run explicitly with --ignored";
         ExactRecovery => recovery_preserves_exact_catalog_identity_cleanup_debts_and_key_epoch,
-            "the metadata_survival configuration table is unsupported";
+            "long-running production survival acceptance; run explicitly with --ignored";
         SlowReplica => slow_replica_past_timeout_stops_survival_acknowledgements,
-            "the production Slow replica fault hook is absent";
+            "long-running production survival acceptance; run explicitly with --ignored";
         FullReplica => full_replica_stops_survival_acknowledgements,
-            "the production Full replica fault hook is absent";
+            "long-running production survival acceptance; run explicitly with --ignored";
         StaleReplica => stale_replica_stops_survival_acknowledgements,
-            "the production Stale replica fault hook is absent";
+            "long-running production survival acceptance; run explicitly with --ignored";
         ErroringReplica => erroring_replica_stops_survival_acknowledgements,
-            "the production Io replica fault hook is absent";
+            "long-running production survival acceptance; run explicitly with --ignored";
         CompetingWriter => competing_writer_is_refused_by_every_replica_lock,
-            "the production SecondWriter replica fault hook is absent";
+            "long-running production survival acceptance; run explicitly with --ignored";
         ReplacementCatchUp => replaced_replica_requires_verified_offline_catch_up,
-            "the production Replacement replica fault hook is absent";
+            "long-running production survival acceptance; run explicitly with --ignored";
     }
     review {
         DurableEnablement => durable_enablement_survives_missing_or_mismatched_configuration,
@@ -441,13 +452,17 @@ impl State {
         let envelope = std::fs::read(authority.join("zerofs.key"))?;
         let wrapped: crate::key_management::WrappedDataKey =
             bincode::deserialize(&envelope).context("decode the production key envelope")?;
-        let key = serde_json::to_value(&wrapped)?;
+        // The merged envelope schema records the name mode in the envelope
+        // format itself (legacy bincode is implicitly case-sensitive), not as
+        // a field of `WrappedDataKey`. Decode it with the production decoder.
+        let (_, name_mode) = crate::key_management::describe_envelope(&envelope)
+            .context("decode the production key envelope name mode")?;
         Ok(Self {
             namespace: fs.db.scan(..).await?.try_collect().await?,
             catalog: survival_test_support::capture(pool).await?,
             envelope_digest: Sha256::digest(envelope).into(),
             envelope_version: u64::from(wrapped.version),
-            name_mode: key.get("name_mode").cloned(),
+            name_mode: Some(serde_json::Value::String(name_mode.to_owned())),
         })
     }
 
@@ -492,6 +507,7 @@ struct Live {
     reads: Vec<ReadRange>,
     writeback: Option<WritebackObjectStore>,
     replica_override: Option<[PathBuf; 2]>,
+    survival: std::sync::Mutex<Option<Arc<production::SurvivalManager>>>,
 }
 
 impl Live {
@@ -503,6 +519,10 @@ impl Live {
     }
 
     async fn close_writer(&mut self) {
+        // The survival owner releases every replica lock with its writer.
+        if let Some(manager) = self.survival.lock().unwrap().take() {
+            manager.release_locks();
+        }
         if let Some(fs) = self.fs.take() {
             close(fs, self.pool.take().expect("writer pool")).await;
         }
@@ -671,6 +691,7 @@ impl Live {
             reads,
             writeback: None,
             replica_override: None,
+            survival: std::sync::Mutex::new(None),
         })
     }
 
@@ -858,26 +879,457 @@ trait Survival: Sync {
 
 struct CurrentImplementation;
 
+fn production_failure(error: anyhow::Error) -> anyhow::Error {
+    let Some(kind) = error.downcast_ref::<production::SurvivalFailure>().copied() else {
+        return error;
+    };
+    let mapped = match kind {
+        // A changed authority object ends the attempt without latching, like
+        // a pre-record timeout; the next attempt retries.
+        production::SurvivalFailure::Timeout | production::SurvivalFailure::Changed => {
+            SurvivalFailure::Timeout
+        }
+        production::SurvivalFailure::Full => SurvivalFailure::Full,
+        production::SurvivalFailure::Stale => SurvivalFailure::Stale,
+        production::SurvivalFailure::Io | production::SurvivalFailure::Locked => {
+            SurvivalFailure::Io
+        }
+        production::SurvivalFailure::Configuration => SurvivalFailure::Configuration,
+        production::SurvivalFailure::Disabled => SurvivalFailure::Disabled,
+        production::SurvivalFailure::Corrupt => SurvivalFailure::Corrupt,
+        production::SurvivalFailure::Fork => SurvivalFailure::Fork,
+        production::SurvivalFailure::Lost => SurvivalFailure::Lost,
+    };
+    anyhow::Error::new(mapped).context(format!("{error:#}"))
+}
+
+fn test_receipt(receipt: production::SurvivalReceipt) -> SurvivalReceipt {
+    SurvivalReceipt {
+        relative_record: receipt.relative_record,
+        digest: receipt.digest,
+        mutation_cutoff: receipt.mutation_cutoff,
+        envelope_epoch: receipt.envelope_epoch,
+        sequence: receipt.sequence,
+    }
+}
+
+fn authority_db_path(settings: &Settings) -> Result<object_store::path::Path> {
+    // A local store is rooted at `/` and the database path names the
+    // authority directory, exactly as `open_pool_storage` binds it.
+    let dir = url::Url::parse(&settings.storage.url)?
+        .to_file_path()
+        .map_err(|()| anyhow::anyhow!("authority URL is not a local path"))?;
+    Ok(object_store::path::Path::from_absolute_path(dir)?)
+}
+
+/// The survival owner bound to the live writer, opened on first use.
+async fn attach(live: &Live) -> Result<Arc<production::SurvivalManager>> {
+    if let Some(manager) = live.survival.lock().unwrap().clone() {
+        return Ok(manager);
+    }
+    let settings = live.proposed_settings()?;
+    let pool = live.pool().clone();
+    let db_path = authority_db_path(&settings)?;
+    // The store the namespace database was opened with: the writeback overlay
+    // when the fixture attached one, else the pool itself.
+    let db_store: Arc<dyn ObjectStore> = match &live.writeback {
+        Some(writeback) => Arc::new(writeback.clone()),
+        None => Arc::new(pool.clone()),
+    };
+    let dek =
+        load_existing_encryption_key_with_mode(&db_store, &db_path, PASSWORD, NameMode::Sensitive)
+            .await?;
+    let manager = production::SurvivalManager::open(
+        &settings,
+        production::WriterHandles {
+            fs: Arc::clone(live.fs()),
+            pool,
+            db_store,
+            db_path,
+            dek,
+            writeback: live.writeback.clone(),
+        },
+    )
+    .await
+    .map_err(production_failure)?;
+    *live.survival.lock().unwrap() = Some(Arc::clone(&manager));
+    Ok(manager)
+}
+
+/// Adapts the production commit observer to the contract's cut hook.
+struct CutAdapter {
+    hook: CommitCutHook,
+    /// The fixture's writeback, stopped when the cut is reached so the
+    /// simulated crash freezes the whole writer, not only the commit task.
+    writeback: Option<WritebackObjectStore>,
+    crashed: bool,
+    candidate: Arc<std::sync::Mutex<Option<SurvivalReceipt>>>,
+    returned: Option<oneshot::Sender<Result<SurvivalReceipt>>>,
+}
+
+fn test_point(point: production::CommitPoint) -> CommitPoint {
+    use production::CommitPoint as P;
+    match point {
+        P::AdmissionClosed => CommitPoint::AdmissionClosed,
+        P::AdmittedWorkDrained => CommitPoint::AdmittedWorkDrained,
+        P::BackendCutoff => CommitPoint::BackendCutoff,
+        P::CheckpointIntentSynced => CommitPoint::CheckpointIntentSynced,
+        P::CheckpointPublished => CommitPoint::CheckpointPublished,
+        P::CheckpointSynced => CommitPoint::CheckpointSynced,
+        P::CatalogPublished => CommitPoint::CatalogPublished,
+        P::CatalogSynced => CommitPoint::CatalogSynced,
+        P::DependencyPublished => CommitPoint::DependencyPublished,
+        P::DependencyFileSynced => CommitPoint::DependencyFileSynced,
+        P::DependencyDirectorySynced => CommitPoint::DependencyDirectorySynced,
+        P::RetentionInstalled => CommitPoint::RetentionInstalled,
+        P::CommitPublished => CommitPoint::CommitPublished,
+        P::CommitFileSynced => CommitPoint::CommitFileSynced,
+        P::CommitDirectorySynced => CommitPoint::CommitDirectorySynced,
+        P::RetirementLogged => CommitPoint::RetirementLogged,
+        P::CheckpointReleased => CommitPoint::CheckpointReleased,
+        P::DependencyDeleted => CommitPoint::DependencyDeleted,
+        P::DebtCompletionCommitted => CommitPoint::DebtCompletionCommitted,
+    }
+}
+
+#[async_trait]
+impl production::CommitObserver for CutAdapter {
+    async fn reach(
+        &mut self,
+        point: production::CommitPoint,
+        side: production::Side,
+        replica: &str,
+        object: &Path,
+    ) {
+        if self.crashed {
+            // The writer crashed at an earlier cut: it never runs again.
+            return std::future::pending().await;
+        }
+        let side = match side {
+            production::Side::Before => Side::Before,
+            production::Side::After => Side::After,
+        };
+        let point = test_point(point);
+        let cut = self.hook.cut;
+        if (point, side, replica) == (cut.point, cut.side, cut.replica)
+            && valid_object_path(object)
+            && let Some(entered) = self.hook.entered.take()
+        {
+            // Stop background journal replay before the test can remove a
+            // device, so nothing of this writer touches storage afterwards.
+            if let Some(writeback) = self.writeback.take() {
+                let _ = writeback.shutdown().await;
+            }
+            let _ = entered.send(CutEvent {
+                cut,
+                object: object.to_owned(),
+            });
+            // A sent release resumes the real commit. A dropped release is a
+            // crash at this boundary: the writer never runs again.
+            let resumed = match self.hook.release.take() {
+                Some(release) => release.await.is_ok(),
+                None => true,
+            };
+            // Record durable-record progress exactly as the hook does.
+            self.hook.reach(point, side, replica, object).await;
+            if !resumed {
+                self.crashed = true;
+                return std::future::pending().await;
+            }
+            return;
+        }
+        self.hook.reach(point, side, replica, object).await;
+    }
+
+    fn candidate(&mut self, receipt: &production::SurvivalReceipt) {
+        *self.candidate.lock().unwrap() = Some(test_receipt(receipt.clone()));
+    }
+
+    fn returned(&mut self, receipt: &production::SurvivalReceipt) {
+        if let Some(sender) = self.returned.take() {
+            let _ = sender.send(Ok(test_receipt(receipt.clone())));
+        }
+    }
+}
+
+fn status_from(status: production::SurvivalStatus) -> SurvivalStatus {
+    SurvivalStatus {
+        last_sequence: status.last_sequence,
+        last_digest: status
+            .last_digest
+            .as_deref()
+            .and_then(|hex| production::format::parse_hash(hex).ok()),
+        completed_at: status.completed_at,
+        lag: status.lag,
+        failed_replicas: status.failed_replicas,
+        admission_open: status.admission_open,
+        owned_checkpoints: status.owned_checkpoints,
+    }
+}
+
 #[async_trait]
 impl Survival for CurrentImplementation {
-    async fn commit(&self, live: &Live) -> Result<SurvivalReceipt> {
-        // The future production binding must return the owner's real receipt.
-        // Accepting the configuration alone supplies no such receipt. Today the
-        // parser refuses the table first, because config.rs denies unknown pool
-        // fields. Only that exact refusal is the missing prerequisite. Any other
-        // parse error is a fixture fault and stays one.
-        match live.proposed_settings() {
-            Ok(_settings) => missing("the production survival receipt hook is absent"),
-            Err(error) if format!("{error:#}").contains("unknown field `metadata_survival`") => {
-                missing("the metadata_survival configuration table is unsupported")
-            }
-            Err(error) => Err(error),
+    async fn crash_writer(&self, live: &mut Live) -> Result<()> {
+        // Stop the writer without a graceful seal or flush: the devices it
+        // used may be gone. Replica locks are released with the owner.
+        if let Some(manager) = live.survival.lock().unwrap().take() {
+            manager.release_locks();
         }
+        if let Some(fs) = live.fs.take() {
+            // No seal, flush or close: a crashed writer issues no more I/O
+            // to devices that are already gone.
+            fs.stop_new_mutation_admission();
+            let _ = fs.flush_coordinator.stop_worker().await;
+            fs.write_coordinator.take_worker_for_tests().abort();
+            drop(fs);
+        }
+        drop(live.pool.take());
+        drop(live.writeback.take());
+        Ok(())
+    }
+
+    async fn commit(&self, live: &Live) -> Result<SurvivalReceipt> {
+        let manager = attach(live).await?;
+        manager
+            .commit()
+            .await
+            .map(test_receipt)
+            .map_err(production_failure)
     }
 
     async fn recover(&self, sources: &RecoverySources) -> Result<Option<Recovered>> {
-        let _bootstrap_inputs = (&sources.replicas, sources.password, &sources.scratch_parent);
-        missing("the production offline recovery hook is absent")
+        let recovered = production::recover::recover(production::recover::RecoverySources {
+            replicas: sources.replicas.clone(),
+            password: sources.password.to_owned(),
+            scratch_parent: sources.scratch_parent.clone(),
+        })
+        .await
+        .map_err(production_failure)?;
+        let production::recover::Recovered {
+            fs,
+            pool,
+            scratch,
+            authority,
+            commit_digest,
+            report,
+            ..
+        } = recovered;
+        Ok(Some(Recovered {
+            fs,
+            pool,
+            scratch,
+            authority,
+            commit_digest,
+            envelope_epoch: report.key_epoch,
+            lost_ranges: report
+                .lost_ranges
+                .into_iter()
+                .map(|range| LostRange {
+                    names: range.names,
+                    inode: range.inode,
+                    offset: range.offset,
+                    length: range.length,
+                    member: range.member,
+                })
+                .collect(),
+            local_only_suffix: Some(JournalLossReport {
+                last_survival_commit: commit_digest,
+                mutation_cutoff: report.mutation_cutoff,
+                local_only_suffix_lost: report.writes_after_generation_not_recovered,
+            }),
+        }))
+    }
+
+    async fn status(&self, live: &Live) -> Result<SurvivalStatus> {
+        Ok(status_from(attach(live).await?.status().await))
+    }
+
+    async fn clear_fault(&self, live: &Live) -> Result<()> {
+        let manager = attach(live).await?;
+        manager.inject_fault("disk-a-metadata", None);
+        manager
+            .clear_transient_fault()
+            .await
+            .map_err(production_failure)
+    }
+
+    async fn owned_checkpoints(&self, live: &Live) -> Result<Vec<slatedb::Checkpoint>> {
+        attach(live).await?.owned_checkpoints().await
+    }
+
+    async fn pause_commit(&self, live: &Live, cut: Cut) -> Result<Option<PausedCommit>> {
+        let manager = attach(live).await?;
+        let (hook, entered, release) = CommitCutHook::channel(cut);
+        let progress = Arc::clone(&hook.progress);
+        let candidate = Arc::new(std::sync::Mutex::new(None));
+        let (returned, receipt_returned) = oneshot::channel();
+        let (start, started) = oneshot::channel::<()>();
+        let mut adapter = CutAdapter {
+            writeback: live.writeback.clone(),
+            crashed: false,
+            hook,
+            candidate: Arc::clone(&candidate),
+            returned: Some(returned),
+        };
+        let task = tokio::spawn(async move {
+            started
+                .await
+                .map_err(|_| anyhow::anyhow!("commit start barrier dropped"))?;
+            manager
+                .commit_observed(&mut adapter)
+                .await
+                .map(test_receipt)
+                .map_err(production_failure)
+        });
+        Ok(Some(PausedCommit {
+            start,
+            candidate,
+            entered,
+            release,
+            receipt_returned,
+            progress,
+            task,
+        }))
+    }
+
+    async fn pause_write(&self, live: &Live) -> Result<Option<PausedWrite>> {
+        let fs = Arc::clone(live.fs());
+        let inode = live.reads[0].inode;
+        let (start, started) = oneshot::channel::<()>();
+        let (admitted_tx, admitted) = oneshot::channel();
+        let (release, released) = oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            started
+                .await
+                .map_err(|_| anyhow::anyhow!("write start barrier dropped"))?;
+            // A real admitted mutation: it holds survival admission while it
+            // is blocked, exactly as a protocol write does across its work.
+            let token = fs
+                .survival_admission
+                .admit_owned()
+                .await
+                .map_err(|error| anyhow::anyhow!("admission refused: {error:?}"))?;
+            let _ = admitted_tx.send(());
+            if released.await.is_err() {
+                // Released by device loss: the write never proceeds.
+                return Ok(());
+            }
+            let result = fs
+                .write(
+                    &AuthContext::default(),
+                    inode,
+                    0,
+                    &payload(61).slice(..4096),
+                )
+                .await;
+            drop(token);
+            result
+                .map(|_| ())
+                .map_err(|error| anyhow::anyhow!("{error:?}"))
+        });
+        Ok(Some(PausedWrite {
+            start,
+            admitted,
+            release,
+            task,
+        }))
+    }
+
+    async fn fault(&self, live: &Live, fault: ReplicaFault) -> Result<FaultObservation> {
+        let manager = attach(live).await?;
+        let mut observed = FaultObservation::default();
+        match fault {
+            ReplicaFault::Stale => {
+                // The replica misses the post-commit state of the acknowledged
+                // generation: its anchor is rolled back to the previous one,
+                // as on a replica restored from an older copy.
+                self.commit(live).await?;
+                let anchor = live.replica_roots()[1].join(".zerofs-survival/v1/anchor.json");
+                let earlier = std::fs::read(&anchor)?;
+                observed.prior_receipt = Some(self.commit(live).await?);
+                std::fs::write(&anchor, earlier)?;
+            }
+            _ => observed.prior_receipt = Some(self.commit(live).await?),
+        }
+        match fault {
+            ReplicaFault::Slow => manager.inject_fault(
+                "disk-a-metadata",
+                Some(production::replica::InjectedFault::Slow(
+                    REPLICA_TIMEOUT + Duration::from_secs(60),
+                )),
+            ),
+            ReplicaFault::Full => manager.inject_fault(
+                "disk-a-metadata",
+                Some(production::replica::InjectedFault::Full),
+            ),
+            ReplicaFault::Io => manager.inject_fault(
+                "disk-a-metadata",
+                Some(production::replica::InjectedFault::Io),
+            ),
+            ReplicaFault::Stale => {}
+            ReplicaFault::SecondWriter => {
+                let settings = live.proposed_settings()?;
+                let db_path = authority_db_path(&settings)?;
+                let db_store: Arc<dyn ObjectStore> = Arc::new(live.pool().clone());
+                let dek = load_existing_encryption_key_with_mode(
+                    &db_store,
+                    &db_path,
+                    PASSWORD,
+                    NameMode::Sensitive,
+                )
+                .await?;
+                let second = production::SurvivalManager::open(
+                    &settings,
+                    production::WriterHandles {
+                        fs: Arc::clone(live.fs()),
+                        pool: live.pool().clone(),
+                        db_store,
+                        db_path,
+                        dek,
+                        writeback: live.writeback.clone(),
+                    },
+                )
+                .await;
+                observed.second_writer_refused = matches!(
+                    second
+                        .as_ref()
+                        .err()
+                        .and_then(|e| e.downcast_ref::<production::SurvivalFailure>()),
+                    Some(production::SurvivalFailure::Locked)
+                );
+                observed.first_writer_still_owns_lock = manager.holds_every_lock();
+            }
+            ReplicaFault::Replacement => {
+                observed.online_catch_up_refused =
+                    manager.replace_replica_online("disk-a-metadata").is_err();
+                // Offline: stop the survival owner, catch up, then resume.
+                if let Some(manager) = live.survival.lock().unwrap().take() {
+                    manager.release_locks();
+                }
+                drop(manager);
+                let device = live.fixture.root.path().join("replacement-device");
+                let directory = device.join("metadata-replica");
+                std::fs::create_dir_all(&directory)?;
+                let source = production::replica::LocalDirectoryBackend::from_root(
+                    &live.replica_roots()[0].join(".zerofs-survival/v1"),
+                );
+                let destination =
+                    production::replica::LocalDirectoryBackend::new(directory.clone());
+                production::offline_catch_up(
+                    &source,
+                    &destination,
+                    "disk-a-metadata",
+                    REPLACEMENT_DEVICE_ID,
+                    PASSWORD,
+                )
+                .await?;
+                let root = directory.join(".zerofs-survival/v1");
+                observed.offline_verified = true;
+                observed.replacement_root = Some(root);
+            }
+        }
+        observed.injected = Some(fault);
+        Ok(observed)
     }
 }
 
@@ -2294,16 +2746,18 @@ async fn every_acceptance_oracle_rejects_success_without_survival() -> Result<()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_acceptance_row_fails_for_its_stated_reason() -> Result<()> {
     const ROW_BUDGET: Duration = Duration::from_secs(120);
-    let outcomes: Vec<_> = futures::stream::iter(Row::ALL.iter().copied())
-        .map(|row| async move {
-            let started = std::time::Instant::now();
-            let outcome = tokio::spawn(tokio::time::timeout(ROW_BUDGET, acceptance(row))).await;
-            (row, started.elapsed(), outcome)
-        })
-        .buffer_unordered(4)
-        .collect()
-        .await;
-    ensure!(outcomes.len() == Row::ALL.len(), "a row was not run");
+    let outcomes: Vec<_> =
+        futures::stream::iter(Row::ALL.iter().copied().filter(|row| !row.implemented()))
+            .map(|row| async move {
+                let started = std::time::Instant::now();
+                let outcome = tokio::spawn(tokio::time::timeout(ROW_BUDGET, acceptance(row))).await;
+                (row, started.elapsed(), outcome)
+            })
+            .buffer_unordered(4)
+            .collect()
+            .await;
+    let unimplemented = Row::ALL.iter().filter(|row| !row.implemented()).count();
+    ensure!(outcomes.len() == unimplemented, "a row was not run");
     let mut wrong = Vec::new();
     for (row, elapsed, outcome) in outcomes {
         let verdict = match outcome {
@@ -2328,9 +2782,9 @@ async fn every_acceptance_row_fails_for_its_stated_reason() -> Result<()> {
     }
     ensure!(
         wrong.is_empty(),
-        "{} of {} rows did not fail for their stated reason:\n{}",
+        "{} of {} unimplemented rows did not fail for their stated reason:\n{}",
         wrong.len(),
-        Row::ALL.len(),
+        unimplemented,
         wrong.join("\n")
     );
     Ok(())

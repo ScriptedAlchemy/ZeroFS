@@ -23,6 +23,7 @@ mod local_object_store;
 pub mod memory;
 pub(crate) mod metadata_digest;
 mod metadata_fault;
+pub(crate) mod metadata_survival;
 #[cfg(test)]
 mod metadata_survival_tests;
 #[cfg(target_os = "linux")]
@@ -172,6 +173,9 @@ pub async fn run_cli() -> Result<(), operator_required::CliFailure> {
         }
         cli::Commands::Pool { subcommand } => {
             cli::pool::run(subcommand).await?;
+        }
+        cli::Commands::Survival { subcommand } => {
+            cli::survival::run(subcommand).await?;
         }
         cli::Commands::Debug { subcommand } => match subcommand {
             cli::DebugCommands::ListKeys { config } => {

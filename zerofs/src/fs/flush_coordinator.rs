@@ -156,16 +156,21 @@ impl FlushCoordinator {
                 // A close keeps the barrier through db.close(), leaving no gap
                 // in which a FrameLoc can commit after the final seal.
                 let barrier = worker_db.flush_barrier().write_owned().await;
-                let sealed = match hook.get() {
-                    Some(seal) => match seal().await {
-                        Ok(()) => {
-                            #[cfg(feature = "failpoints")]
-                            fail_point!(fp::FLUSH_AFTER_SEAL_BEFORE_MANIFEST);
-                            worker_db.flush().await.map_err(|_| FsError::IoError)
-                        }
-                        Err(e) => Err(e),
-                    },
-                    None => worker_db.flush().await.map_err(|_| FsError::IoError),
+                let sealed = if closer.is_some() && worker_db.is_read_only() {
+                    // A reader has nothing to seal or flush; close it.
+                    Ok(())
+                } else {
+                    match hook.get() {
+                        Some(seal) => match seal().await {
+                            Ok(()) => {
+                                #[cfg(feature = "failpoints")]
+                                fail_point!(fp::FLUSH_AFTER_SEAL_BEFORE_MANIFEST);
+                                worker_db.flush().await.map_err(|_| FsError::IoError)
+                            }
+                            Err(e) => Err(e),
+                        },
+                        None => worker_db.flush().await.map_err(|_| FsError::IoError),
+                    }
                 };
                 let close_result = if closer.is_some() && sealed.is_ok() {
                     worker_db.mark_closing();

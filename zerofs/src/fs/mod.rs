@@ -172,6 +172,10 @@ pub struct ZeroFS {
     /// Bounded replay/collision cache for identified writes when volatile
     /// acknowledgement is disabled and no mutation coordinator exists.
     materialized_request_cache: crate::fs::mutation::request_cache::RequestCache,
+    /// Metadata-survival admission. Open unless a survival commit is taking
+    /// its consistent cut or a replica fault latched it.
+    pub(crate) survival_admission:
+        std::sync::Arc<crate::metadata_survival::admission::SurvivalAdmission>,
     /// Durability lineage token (see `client_fsync_verified`). Identifies the current
     /// unbroken durable lineage; set once at bring-up, constant for this process's life.
     /// A ZeroFS client carries it, and a verified fsync succeeds only while it is

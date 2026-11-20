@@ -598,6 +598,15 @@ impl Db {
         false
     }
 
+    /// The underlying SlateDB writer, for checkpoint creation by the
+    /// metadata-survival owner. `None` for a read-only reader.
+    pub(crate) fn raw_writer(&self) -> Option<Arc<slatedb::Db>> {
+        match &self.inner {
+            SlateDbHandle::ReadWrite(db) => Some(Arc::clone(db)),
+            SlateDbHandle::ReadOnly(_) => None,
+        }
+    }
+
     pub(crate) fn is_read_only(&self) -> bool {
         self.inner.is_read_only()
     }

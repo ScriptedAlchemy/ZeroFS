@@ -203,6 +203,11 @@ impl ZeroFS {
         request: PrepareWriteRequest,
         pending_write_request: Option<crate::dedup::PendingWriteRequest>,
     ) -> Result<FileAttributes, FsError> {
+        let _survival = if self.db.is_read_only() {
+            None
+        } else {
+            Some(self.survival_admission.admit().await?)
+        };
         let mut batch = prepare_write(&self.write_prepare_context(), request).await?;
         batch.commit_ownership = pending_write_request
             .map(crate::fs::write_coordinator::CommitOwnership::Dedup)

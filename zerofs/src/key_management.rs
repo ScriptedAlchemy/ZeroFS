@@ -237,6 +237,36 @@ impl KeyManager {
     }
 }
 
+/// The envelope format version and name mode recorded by envelope bytes,
+/// without unwrapping the data key.
+pub(crate) fn describe_envelope(data: &[u8]) -> Result<(u8, &'static str)> {
+    let envelope = KeyEnvelope::decode(data)?;
+    Ok((
+        envelope.version,
+        match envelope.name_mode {
+            NameMode::Sensitive => "sensitive",
+            NameMode::Insensitive => "insensitive",
+        },
+    ))
+}
+
+/// Unwrap an existing envelope found at `db_path`, honoring the name mode the
+/// envelope itself records. This never creates or replaces a key: a missing
+/// envelope is an error. Offline survival recovery uses it because the
+/// original configuration may be lost with the authority device.
+pub(crate) async fn load_existing_encryption_key_recorded_mode(
+    object_store: &Arc<dyn ObjectStore>,
+    db_path: &Path,
+    password: &str,
+) -> Result<([u8; 32], NameMode)> {
+    let wrapped_key = load_wrapped_key_from_object_store(object_store, db_path)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("missing existing encryption key at {db_path}"))?;
+    let mode = wrapped_key.name_mode;
+    let key = unwrap_key_blocking(password, wrapped_key.wrapped_key).await?;
+    Ok((key, mode))
+}
+
 /// Get the path for the wrapped key file in object store
 fn wrapped_key_path(db_path: &Path) -> Path {
     let mut path = db_path.clone();

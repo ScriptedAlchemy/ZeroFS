@@ -729,6 +729,10 @@ pub struct StoragePoolConfig {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) allow_degraded_start: bool,
     pub(crate) members: Vec<StoragePoolMemberConfig>,
+    /// Redundant recovery generations for the namespace, catalog and key
+    /// envelope. See `docs/metadata-survival-design.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) metadata_survival: Option<crate::metadata_survival::MetadataSurvivalConfig>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -836,6 +840,11 @@ fn path_is_empty(path: &std::path::Path) -> bool {
 
 impl StoragePoolConfig {
     fn validate(&self, settings: &Settings) -> Result<()> {
+        if let Some(survival) = &self.metadata_survival {
+            survival
+                .validate(settings, self)
+                .context("Invalid [storage.pool.metadata_survival] configuration")?;
+        }
         let authority = url::Url::parse(&settings.storage.url)?;
         let p3 = if crate::storage_backend::raw::is_p3(authority.scheme()) {
             anyhow::ensure!(

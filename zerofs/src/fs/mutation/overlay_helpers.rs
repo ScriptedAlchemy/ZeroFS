@@ -62,6 +62,7 @@ pub(super) fn write_admission_fs_error(error: super::overlay::WriteAdmissionErro
         WriteAdmissionError::Backpressured => FsError::RetryLater,
         WriteAdmissionError::FingerprintMismatch => FsError::InvalidArgument,
         WriteAdmissionError::Mutation(error) => mutation_fs_error(error),
+        WriteAdmissionError::Survival(error) => error,
     }
 }
 
