@@ -213,31 +213,6 @@ fn absent_lifetime_rating_is_unavailable_with_a_reason() {
 }
 
 #[test]
-fn reserve_is_declared_once_across_datasets_of_one_pool() {
-    for strict in [true, false] {
-        let mut fixture = Fixture::new();
-        hardware(&mut fixture);
-        let mountpoint = fixture._temp.path().canonicalize().unwrap().join("control");
-        fixture.document["storage"]["readiness"]["strict"] = json!(strict);
-        fixture.document["storage"]["readiness"]["catalog"] = json!("control");
-        fixture.document["storage"]["pool"]["catalog_dir"] = json!(mountpoint.join("catalog"));
-        fixture.document["storage"]["readiness"]["filesystems"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({
-                "id": "control", "profile": "hdd-cmr", "mountpoint": mountpoint,
-                "identity": {"kind": "zfs", "pool_guid": "101", "dataset_guid": "202"}
-            }));
-        fixture.parse().unwrap();
-        fixture.document["storage"]["readiness"]["reserves"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({"filesystem": "control", "bytes": 1_000_000}));
-        error_contains(fixture.parse().map(|_| ()), "one reserve");
-    }
-}
-
-#[test]
 fn declared_reserve_compares_against_the_existing_pool_default() {
     for strict in [true, false] {
         let mut fixture = Fixture::new();

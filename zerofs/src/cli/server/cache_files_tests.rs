@@ -20,7 +20,7 @@ use std::alloc::{Layout, alloc, dealloc};
 use std::sync::Arc;
 
 /// Synthetic stand-in for secret heap contents. Never a real key.
-const MARKER: &[u8; 16] = b"ZFS-PLANTED-SEC!";
+const MARKER: &[u8; 16] = b"ZEROFS-PLANTED-S";
 const PAGE: usize = 4096;
 const MIB: usize = 1024 * 1024;
 

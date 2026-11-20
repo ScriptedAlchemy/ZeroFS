@@ -245,7 +245,7 @@ DST_SEEDS=16039913183294875603 RUSTFLAGS="$DST_RUSTFLAGS" \
 
 ## Continuous Integration Testing
 
-In addition to crash simulation, CI runs pjdfstest, stress-ng, Linux kernel builds, Jepsen's local-fs suite, and a ZFS integration test on every commit.
+In addition to crash simulation, CI runs pjdfstest, stress-ng, Linux kernel builds, and Jepsen's local-fs suite on every commit.
 
 <Row>
   <Col>
@@ -270,19 +270,6 @@ In addition to crash simulation, CI runs pjdfstest, stress-ng, Linux kernel buil
 
 **Jepsen (local-fs)**: Generates random sequences of filesystem operations and checks each result against a reference model, shrinking any divergence to a minimal failing case. It runs over a 9P mount. A crash mode injects the loss of un-fsynced writes: it kills the server mid-run, dropping the in-memory open segment buffer and memtable, then recovers from the object store and verifies the surviving state is consistent with the last fsync.
 
-### Layered Filesystem Testing
-
-The CI suite includes a test that creates a ZFS pool on a ZeroFS NBD block device:
-
-1. Create a 3GB block device file via 9P
-2. Connect via NBD and create a ZFS pool
-3. Extract the Linux kernel source (~80,000 files)
-4. Compute checksums of all files
-5. Export the ZFS pool and restart ZeroFS
-6. Reimport the pool and verify all checksums match
-
-This test validates data integrity through multiple filesystem layers and across process restarts.
-
 ### Test Matrix
 
 | Test Suite | Protocol | Coverage |
@@ -294,7 +281,6 @@ This test validates data integrity through multiple filesystem layers and across
 | pjdfstest | NFS, 9P, FUSE | POSIX compliance |
 | stress-ng | NFS, 9P, FUSE | Concurrent operations under load |
 | Kernel compilation | NFS, 9P, FUSE | Parallel build workload |
-| ZFS integration | NBD + 9P | Block device integrity across restarts |
 
 All tests run on every pull request and merge to the main branch.
 

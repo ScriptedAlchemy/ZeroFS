@@ -6,7 +6,7 @@ export const metadata = {
 
 # NBD Block Devices
 
-ZeroFS exposes files under `.nbd/` as Network Block Device exports. A Linux NBD client can attach an export as `/dev/nbd*`, where it can hold a filesystem or serve as a ZFS vdev. {{ className: 'lead' }}
+ZeroFS exposes files under `.nbd/` as Network Block Device exports. A Linux NBD client can attach an export as `/dev/nbd*`, where it can hold a filesystem. {{ className: 'lead' }}
 
 <Warning>
   The NBD server does not authenticate clients or encrypt traffic. Keep it on
@@ -189,14 +189,10 @@ With the default `sync_writes = false`, ordinary writes may remain buffered unti
 
 ## Discard and Zeroing
 
-ZeroFS accepts TRIM requests from filesystems and ZFS:
+ZeroFS accepts TRIM requests from filesystems:
 
 ```bash
 sudo fstrim /mnt/database
-
-# For a ZFS pool
-sudo zpool set autotrim=on mypool
-sudo zpool trim mypool
 ```
 
 TRIM deletes extent pointers for fully covered extents and debits the affected segments' live-byte counters. Segment garbage collection later deletes empty segments or repacks fragmented ones; object-store usage does not necessarily decrease immediately. See [Garbage collection](/garbage-collection).

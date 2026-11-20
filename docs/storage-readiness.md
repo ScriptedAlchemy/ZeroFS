@@ -81,21 +81,18 @@ mountpoints must themselves be canonical paths.
 
 Authority, catalog, and one member may share a filesystem through disjoint
 directories. Journal and cache may likewise share the NVMe filesystem. Multiple
-data members cannot use the same capacity domain. For ext4/XFS, that domain is
-the filesystem UUID; for ZFS, it is the pool GUID, even across distinct dataset
-GUIDs. This rule rejects member quotas in a shared ZFS pool, which could
-otherwise count the pool's free space twice. Aliased declarations and conflicting
-profiles in one capacity domain are rejected. Config loading sums configured
+data members cannot use the same capacity domain, which is the ext4/XFS
+filesystem UUID. Aliased declarations and conflicting profiles in one capacity
+domain are rejected. Config loading sums configured
 member capacities per domain to reject impossible reserves. Storage readiness
 adds no new admission accounting. Space that control metadata and data share
 still needs the existing reserves.
 
-ZFS GUIDs are canonical nonzero decimal strings, preserving the full unsigned
-64-bit range through TOML. UUIDs are nonzero lowercase hyphenated UUID strings.
-Dataset names alone and directory existence alone cannot establish readiness.
+UUIDs are nonzero lowercase hyphenated UUID strings. Any other identity kind is
+rejected. Directory existence alone cannot establish readiness.
 
 A parser test loads the complete
-[synthetic configuration](examples/storage-readiness.toml). Its paths, IDs, GUIDs, UUID, and serials are fixtures, not discovered operator values
+[synthetic configuration](examples/storage-readiness.toml). Its paths, IDs, UUIDs, and serials are fixtures, not discovered operator values
 or evidence of an installed disk. Use independently obtained real identities for
 an actual deployment; do not substitute those fixture values.
 
@@ -123,14 +120,11 @@ failure date, a workload budget, or measured activity.
 
 `[[storage.readiness.reserves]]` is required once per capacity domain. Each entry
 names a declared `filesystem` ID and a `bytes` quantity parsed as `u64`. There is
-no default. Multiple datasets in one ZFS pool require one entry for that pool,
-referencing any one of its filesystem IDs. A second entry for the same domain is
-invalid. Config loading rejects a quantity below any enforced `reserve_free_gb`
+no default. A second entry for the same domain is invalid. Config loading rejects a quantity below any enforced `reserve_free_gb`
 on that domain or below the journal's enforced `min_free_gb`. It also rejects a
 reserve larger than the summed configured member capacity on that domain. Domains
 without members have no configured capacity bound. Strict Linux verification
-compares the domain reserve with the observed `statvfs` size at each role root,
-including each bound ZFS dataset. A missing, zero, or overflowing size is
+compares the domain reserve with the observed `statvfs` size at each role root. A missing, zero, or overflowing size is
 unavailable and refuses the open. The existing pool reserve default remains
 1.0 GB. These existing settings remain the enforced
 values. The new quantity is a declaration and does not reserve additional space.
@@ -157,21 +151,19 @@ The native adapter currently targets Linux:
 | Filesystem | Required read-only evidence |
 | --- | --- |
 | ext4 / XFS | Containing mount from `/proc/self/mountinfo`, mounted filesystem root `/`, matching path `st_dev`, matching available block-device `st_rdev`, and UUID from uncached `blkid -p` on that mounted device. |
-| ZFS | Containing mount and path device agreement, mounted filesystem root `/`, pool GUID from `zpool get`, and dataset GUID, `mounted=yes`, exact mountpoint, `readonly=off`, and known `keystatus` from `zfs get`. Key status must be `available` or `none`. |
 
 When device entries are present, strict verification also requires every by-id
 path to resolve to a whole block device with the declared serial. The Linux
 adapter reads serials through `/sys/dev/block` and `device/serial`. It resolves
 partition backing to the whole device. It uses the mounted device for ext4/XFS
-and the pool's device paths from `zpool status -P` for ZFS. It compares each role's
+and refuses every other filesystem. It compares each role's
 observed serial set with its declared set and rejects any declared boot serial
 behind a role. It does not probe `/` to infer the operating system's boot device.
 A declaration of `boot = false` is not an observation of boot identity.
 
 Missing serials, inaccessible by-id paths, unresolved backing, mapped or stacked
-block devices, and unsupported ZFS topologies make the device evidence
-unavailable and fail strict verification. The adapter includes the ZFS pool's
-listed device classes conservatively and requires online device paths.
+block devices, and unsupported filesystems make the device evidence
+unavailable and fail strict verification.
 
 Both mount and superblock options must say writable. Mount-table or path-device
 changes during an observation reject it. Probe errors, missing tools or devices,
@@ -216,7 +208,7 @@ identity or capacity evidence.
 With `strict = false`, no host identity or size probes run. The skipped checks
 are required role-root existence, canonical mountpoints, resolved root overlap,
 containing mounts and mounted filesystem roots, descendant mounts, filesystem
-UUIDs or ZFS GUIDs, writable and unlocked state, observed filesystem size versus
+UUIDs, writable and unlocked state, observed filesystem size versus
 the reserve, device serial and whole-block-device identity, backing device sets,
 and declared boot-device exclusion. The open-path identity recheck is also
 skipped. Config validation and the symlink checks still run. Existing backend
@@ -329,23 +321,20 @@ Passing this startup check is not a runtime loss-of-mount guarantee, a
 durability receipt, or a migration gate.
 
 Local tests inject missing, wrong, locked, read-only, and unknown identities for
-every role. They also cover ordinary fallback directories, aliases, shared ZFS
+every role. They also cover ordinary fallback directories, aliases, shared
 capacity, independent members, config round-trips, and Mac rejection before
 mutation.
 Device fixtures exercise both strict modes, missing ratings, reserve minimums,
 activation refusal, serial and block-device failures, mismatched backing sets,
-and declared boot-device exclusion. Parser fixtures exercise sysfs serial text
-and ZFS device lists.
-Mount-table and command-output tests verify parsing and rejection behavior. They
-do not establish OpenZFS runtime behavior. An ignored Linux integration test
+and declared boot-device exclusion. Parser fixtures exercise sysfs serial text.
+Mount-table and command-output tests verify parsing and rejection behavior. An ignored Linux integration test
 checks tmpfs and bind descendants for all five roles in an isolated Docker
 container. A separate privileged test checks a loop-mounted ext4 UUID through
 real `blkid -p`. It also demonstrates that a mount change after a completed
 check reaches the replacement filesystem during a later path-based write.
 A fresh check rejects that mount.
 
-- Not verified: OpenZFS lifecycle and same-name dataset recreation, XFS block
-  devices, and host bind mounts outside the container were not exercised. The
+- Not verified: XFS block devices, and host bind mounts outside the container were not exercised. The
   completed preflight holds no handle and cannot detect later mount changes.
 
 - Not verified: This change claims no acceptance of TrueNAS app or container
@@ -365,7 +354,7 @@ reproduction budget, not a NAS sizing recommendation. The existing unit test
 that floor. A passing filesystem preflight cannot make this runtime model fit
 the N5 Air's reported 29.16 GiB of OS-visible RAM.
 
-A future bounded runtime must leave headroom for TrueNAS, ZFS ARC, Plex, and
+A future bounded runtime must leave headroom for TrueNAS, its ARC, Plex, and
 other apps, and pass real cgroup-limit, backpressure, OOM-recovery, and dirty-data
 tests. An unlimited local run does not establish deployment readiness. Disposable
 build scratch is a separate volatile use; it changes no persistent fsync promise.
@@ -374,6 +363,5 @@ Independent full-copy capacity is currently insufficient. A proposed external
 18 TB drive is not empty or installed and contributes no available capacity.
 Recalculate after the operations-owned transfer, whole-drive final audit, and
 physical installation, using final inventory, engine overhead, other datasets,
-and reserves. Drive labels use decimal TB;
-`zpool list` and `zfs list` values with a `T` suffix use TiB. Capacity verification
+and reserves. Drive labels use decimal TB; TrueNAS values with a `T` suffix use TiB. Capacity verification
 and all migration safety gates remain required.

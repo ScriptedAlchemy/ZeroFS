@@ -785,7 +785,7 @@ mod tests {
             ],
             "filesystems": [
                 {"id": "durable", "profile": "hdd-cmr", "mountpoint": base,
-                    "identity": {"kind": "zfs", "pool_guid": "101", "dataset_guid": "201"}},
+                    "identity": {"kind": "uuid", "uuid": "9d4c1a52-3c0e-4f43-9a8b-1f3d2b6c7e10"}},
                 {"id": "fast", "profile": "nvme", "mountpoint": fast,
                     "identity": {"kind": "uuid", "uuid": "47166772-65c1-4ecf-8066-935452891add"}}
             ]

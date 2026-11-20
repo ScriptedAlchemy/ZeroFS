@@ -46,7 +46,7 @@ jobs:
 
       # One instrumented binary feeds every profiling workload below. The
       # profile output path is chosen at runtime via LLVM_PROFILE_FILE, so the
-      # same binary profiles 9p/fuse/zfs/nfs without a rebuild per matrix leg.
+      # same binary profiles 9p/fuse/nfs without a rebuild per matrix leg.
       - name: Upload instrumented binary
         uses: actions/upload-artifact@v4
         with:
@@ -59,15 +59,12 @@ jobs:
     needs: build-instrumented
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      # Dedicated disposable CI minor; never reuse an attached export.
-      ZEROFS_CI_NBD_DEVICE: /dev/nbd7
     strategy:
       # A failed profile must not cancel the other independent expensive profiles.
       # All profiles are still required by merge-pgo-data.
       fail-fast: false
       matrix:
-        test: [9p, fuse, zfs-on-zerofs, nfs-kernel-compile]
+        test: [9p, fuse, nfs-kernel-compile]
 
     steps:
       - uses: actions/checkout@v4
@@ -100,15 +97,6 @@ jobs:
             sudo modprobe 9pnet_virtio
           elif [ "${{ matrix.test }}" = "fuse" ]; then
             sudo apt-get install -y fuse3
-          elif [ "${{ matrix.test }}" = "zfs-on-zerofs" ]; then
-            sudo apt-get install -y nbd-client zfsutils-linux pigz pixz parallel
-            # The runner's NBD module is not guaranteed to be loaded already.
-            sudo modprobe nbd
-            test -b "$ZEROFS_CI_NBD_DEVICE"
-            if sudo nbd-client -c "$ZEROFS_CI_NBD_DEVICE" >/dev/null 2>&1; then
-              echo "$ZEROFS_CI_NBD_DEVICE already has an NBD export; refusing to reuse it" >&2
-              exit 1
-            fi
           elif [ "${{ matrix.test }}" = "nfs-kernel-compile" ]; then
             sudo apt-get install -y nfs-common
           fi
@@ -145,8 +133,6 @@ jobs:
             mc mb myminio/pgo-profile
           elif [ "${{ matrix.test }}" = "fuse" ]; then
             mc mb myminio/pgo-fuse-test
-          elif [ "${{ matrix.test }}" = "zfs-on-zerofs" ]; then
-            mc mb myminio/pgo-zfs-test
           elif [ "${{ matrix.test }}" = "nfs-kernel-compile" ]; then
             mc mb myminio/pgo-nfs-test
           fi
@@ -274,65 +260,6 @@ jobs:
             cd /
             sudo fusermount3 -u /mnt/zerofs || sudo umount /mnt/zerofs || true
             sudo pkill -TERM -f "zerofs mount" || true
-            kill -TERM $ZEROFS_PID || true
-            wait $ZEROFS_PID || true
-
-          elif [ "${{ matrix.test }}" = "zfs-on-zerofs" ]; then
-            cat > zerofs-pgo.toml << EOF
-          [cache]
-          dir = "/tmp/zerofs-cache"
-          disk_size_gb = 5.0
-          memory_size_gb = 2.0
-
-          [storage]
-          url = "s3://pgo-zfs-test/zfs-test"
-          encryption_password = "test-password-123"
-
-          [servers.ninep]
-          addresses = ["127.0.0.1:5564"]
-
-          [servers.nbd]
-          addresses = ["127.0.0.1:10809"]
-
-          [aws]
-          access_key_id = "minioadmin"
-          secret_access_key = "minioadmin"
-          endpoint = "http://localhost:9000"
-          allow_http = "true"
-
-          [telemetry]
-          enabled = false
-          EOF
-            ./zerofs/target/x86_64-unknown-linux-musl/release/zerofs run -c zerofs-pgo.toml &
-            ZEROFS_PID=$!
-            echo "Waiting for ZeroFS NBD server to start..."
-            for i in {1..30}; do
-              if nc -z 127.0.0.1 10809; then
-                echo "ZeroFS NBD server is ready"
-                break
-              fi
-              sleep 1
-            done
-
-            sudo mkdir -p /mnt/zerofs
-            sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L 127.0.0.1 /mnt/zerofs
-            sudo mkdir -p /mnt/zerofs/.nbd
-            sudo truncate -s 3G /mnt/zerofs/.nbd/test-device
-            sudo umount /mnt/zerofs
-            if ! sudo nbd-client 127.0.0.1 10809 "$ZEROFS_CI_NBD_DEVICE" -N test-device; then
-              # nbd-client reports an ioctl failure but otherwise loses kernel context.
-              sudo dmesg | tail -80 || true
-              cat /sys/block/nbd7/pid 2>/dev/null || true
-              cat /sys/block/nbd7/size 2>/dev/null || true
-              exit 1
-            fi
-            sudo zpool create testpool "$ZEROFS_CI_NBD_DEVICE"
-            sudo zfs create testpool/data
-            sudo zfs set mountpoint=/mnt/zfsdata testpool/data
-            cd /mnt/zfsdata
-            sudo cp "$RUNNER_TEMP/linux-7.2-rc1.tar.gz" .
-            sudo tar -xf linux-7.2-rc1.tar.gz
-            sudo zfs snapshot testpool/data@snapshot1
             kill -TERM $ZEROFS_PID || true
             wait $ZEROFS_PID || true
 

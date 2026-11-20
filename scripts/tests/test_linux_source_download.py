@@ -1,4 +1,4 @@
-"""Exercise fixture transport, validation, and the ZFS setup failure boundary."""
+"""Exercise fixture transport and validation."""
 
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import gzip
@@ -7,13 +7,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import io
 import lzma
-import os
 from pathlib import Path
-import re
-import subprocess
 import tarfile
 import tempfile
-import textwrap
 import threading
 import time
 import unittest
@@ -209,42 +205,6 @@ class LinuxSourceDownloadTests(unittest.TestCase):
             ]))
             with self.assertRaisesRegex(ValueError, "unexpected archive member type"):
                 FETCH.validate_archive(archive, VERSION)
-
-    def test_zfs_setup_keeps_archive_and_extraction_and_stops_on_download_failure(self):
-        workflow = (ROOT / ".github/workflows/zfs-test.yml").read_text()
-        blocks = re.findall(r"      - name: Download and extract Linux kernel\n"
-                            r"        run: \|\n((?:          [^\n]*\n|\n)+)", workflow)
-        self.assertEqual(len(blocks), 1)
-        for failure in (False, True):
-            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                mount = root / "zfsdata"
-                mount.mkdir()
-                source = root / "fixture.tar.gz"
-                source.write_bytes(archive_bytes())
-                for name, script in {
-                    "sudo": 'exec "$@"',
-                    "pigz": 'exec gzip "$@"',
-                    "python3": '[[ "$FAIL_DOWNLOAD" == 0 ]] || exit 22\ncp "$SOURCE_ARCHIVE" "${@: -1}"',
-                }.items():
-                    tool = root / name
-                    tool.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + script + "\n")
-                    tool.chmod(0o755)
-                script = textwrap.dedent(blocks[0]).replace("/mnt/zfsdata", str(mount))
-                result = subprocess.run(
-                    ["bash", "-e", "-o", "pipefail", "-c", script],
-                    env=dict(os.environ, PATH=f"{root}:{os.environ['PATH']}",
-                             RUNNER_TEMP=str(root), GITHUB_WORKSPACE=str(ROOT),
-                             SOURCE_ARCHIVE=str(source), FAIL_DOWNLOAD=str(int(failure))),
-                    capture_output=True, text=True, timeout=10, check=False,
-                )
-                self.assertEqual(result.returncode, 22 if failure else 0, result.stderr)
-                if failure:
-                    self.assertEqual(list(mount.iterdir()), [])
-                else:
-                    self.assertEqual((mount / "linux-7.2-rc1.tar.gz").read_bytes(), source.read_bytes())
-                    self.assertEqual((mount / "linux-7.2-rc1/init/main.c").read_text(), "fixture init/main.c\n")
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -240,78 +240,6 @@ def _xfs_over_nbd_restart(context: ScenarioContext) -> ScenarioPlan:
     )
 
 
-def _zfs_over_nbd_restart(context: ScenarioContext) -> ScenarioPlan:
-    config = context.config
-    pool = f"zerofs-tiered-{config.run_uuid}"
-    proof = f"/{pool}/zfs-restart-proof.bin"
-    listeners = (ResourceOwnership("listener", NBD_PORT),)
-    steps = (
-        server_steps(context, listeners)
-        + nbd_connect_steps(config)
-        + (
-            Step(
-                "create the disposable run-scoped zpool",
-                ("zpool", "create", "-f", pool, NBD_DEVICE),
-                sudo=True,
-                acquires=(ResourceOwnership("pool", pool),),
-            ),
-            Step(
-                "write and sync a durability proof onto ZFS",
-                (
-                    "dd",
-                    "if=/dev/urandom",
-                    f"of={proof}",
-                    "bs=1M",
-                    "count=8",
-                    "conv=fsync",
-                ),
-                sudo=True,
-            ),
-            Step(
-                "export the pool before the crash", ("zpool", "export", pool), sudo=True
-            ),
-        )
-        + _restart_cycle(context, listeners)
-        + (
-            Step(
-                "reattach the device after restart",
-                (
-                    NBD_CLIENT,
-                    "127.0.0.1",
-                    str(NBD_PORT),
-                    NBD_DEVICE,
-                    "-name",
-                    config.unit_name,
-                ),
-                sudo=True,
-                requires=(ResourceOwnership("device", NBD_DEVICE),),
-            ),
-            Step(
-                "import the pool after crash",
-                ("zpool", "import", pool),
-                sudo=True,
-                requires=(ResourceOwnership("pool", pool),),
-            ),
-            Step("scrub the pool", ("zpool", "scrub", "-w", pool), sudo=True),
-            _verify_step("verify the durability proof survived", proof),
-            Step(
-                "destroy the disposable pool",
-                ("zpool", "destroy", pool),
-                sudo=True,
-                releases=(ResourceOwnership("pool", pool),),
-            ),
-        )
-        + nbd_disconnect_steps(config)
-        + server_stop_steps(context, listeners)
-    )
-    return ScenarioPlan(
-        name="zfs-over-nbd-restart",
-        legs=("nbd", "zfs"),
-        steps=steps,
-        durability_floors=floors_for(config.ack, ("nbd-flush",)),
-    )
-
-
 def _crash_boundary_matrix(context: ScenarioContext) -> ScenarioPlan:
     config = context.config
     unit = config.unit_name
@@ -465,7 +393,6 @@ def _terminal_fanout_and_shutdown_timeout(context: ScenarioContext) -> ScenarioP
 
 CRASH_SCENARIOS: dict[str, ScenarioBuilder] = {
     "xfs-over-nbd-restart": _xfs_over_nbd_restart,
-    "zfs-over-nbd-restart": _zfs_over_nbd_restart,
     "crash-boundary-matrix": _crash_boundary_matrix,
     "local-receipt-restart": _local_receipt_restart,
     "remote-receipt-clean-cache-restart": _remote_receipt_clean_cache_restart,

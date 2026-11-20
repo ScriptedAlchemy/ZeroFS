@@ -107,26 +107,10 @@ impl ReadinessConfig {
                 bail!("readiness filesystem IDs must be distinct nonempty ASCII labels");
             }
             absolute_path(&filesystem.mountpoint)?;
-            match &filesystem.identity {
-                FilesystemIdentity::Uuid { uuid } => {
-                    let parsed = uuid::Uuid::parse_str(uuid).context("invalid filesystem UUID")?;
-                    if parsed.is_nil() || parsed.hyphenated().to_string() != *uuid {
-                        bail!("filesystem UUID must be nonzero, lowercase and hyphenated");
-                    }
-                }
-                FilesystemIdentity::Zfs {
-                    pool_guid,
-                    dataset_guid,
-                } => {
-                    for guid in [pool_guid, dataset_guid] {
-                        let value = guid.parse::<u64>().context("invalid ZFS GUID")?;
-                        if value == 0 || value.to_string() != *guid {
-                            bail!(
-                                "ZFS pool and dataset GUIDs must be canonical nonzero decimal strings"
-                            );
-                        }
-                    }
-                }
+            let FilesystemIdentity::Uuid { uuid } = &filesystem.identity;
+            let parsed = uuid::Uuid::parse_str(uuid).context("invalid filesystem UUID")?;
+            if parsed.is_nil() || parsed.hyphenated().to_string() != *uuid {
+                bail!("filesystem UUID must be nonzero, lowercase and hyphenated");
             }
         }
         let resolve = |id: &str| {
@@ -188,7 +172,7 @@ impl ReadinessConfig {
             }
             if !member_domains.insert(filesystem.identity.capacity_domain()) {
                 bail!(
-                    "readiness members must not alias one capacity domain (including a shared ZFS pool)"
+                    "readiness members must not alias one capacity domain"
                 );
             }
             roots.push(StorageRoot {

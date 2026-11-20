@@ -28,7 +28,6 @@ RESOURCE_KINDS = (
     "listener",
     "mount",
     "device",
-    "pool",
     "prefix",
     "path",
 )
@@ -226,12 +225,6 @@ class ResourceLedger:
             if not _NBD_DEVICE.fullmatch(str(value)):
                 raise UnownedResourceError(
                     f"unowned device {value!r}: only /dev/nbdN devices are disposable"
-                )
-            return str(value)
-        if kind == "pool":
-            if not str(value).startswith(f"zerofs-tiered-{self.run_uuid}"):
-                raise UnownedResourceError(
-                    f"unowned pool {value!r}: not scoped to run {self.run_uuid}"
                 )
             return str(value)
         if kind == "prefix":

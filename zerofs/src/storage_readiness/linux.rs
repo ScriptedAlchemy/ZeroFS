@@ -3,7 +3,6 @@ pub(super) mod devices;
 
 use super::{FilesystemIdentity, MountedFilesystem};
 use anyhow::{Context, Result, bail};
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
@@ -125,18 +124,6 @@ fn block_device_path(device: (u32, u32)) -> String {
     format!("/dev/block/{}:{}", device.0, device.1)
 }
 
-fn zfs_pool(mount: &Mount) -> Result<&str> {
-    let pool = mount
-        .source
-        .split('/')
-        .next()
-        .context("missing ZFS pool name")?;
-    if pool.is_empty() || mount.source.starts_with('-') || mount.source.contains('@') {
-        bail!("invalid mounted ZFS dataset name");
-    }
-    Ok(pool)
-}
-
 pub(super) fn identify(mount: Mount, probe: &dyn Probe) -> Result<MountedFilesystem> {
     let (identity, unlocked, writable) = match mount.filesystem.as_str() {
         "ext4" | "xfs" => {
@@ -154,65 +141,6 @@ pub(super) fn identify(mount: Mount, probe: &dyn Probe) -> Result<MountedFilesys
                 },
                 true,
                 mount.writable,
-            )
-        }
-        "zfs" => {
-            let pool = zfs_pool(&mount)?;
-            let output = probe.output(
-                "zfs",
-                &[
-                    "get",
-                    "-H",
-                    "-p",
-                    "-o",
-                    "property,value",
-                    "guid,mounted,mountpoint,keystatus,readonly",
-                    &mount.source,
-                ],
-            )?;
-            let mut properties = BTreeMap::new();
-            for line in output.lines() {
-                let (key, value) = line.split_once('\t').context("invalid ZFS property row")?;
-                if properties.insert(key, value).is_some() {
-                    bail!("duplicate ZFS property")
-                }
-            }
-            let get = |key| {
-                properties
-                    .get(key)
-                    .copied()
-                    .with_context(|| format!("missing ZFS {key} evidence"))
-            };
-            if properties.len() != 5
-                || get("mounted")? != "yes"
-                || Path::new(get("mountpoint")?) != mount.mountpoint
-            {
-                bail!("ZFS dataset is not mounted at the observed root")
-            }
-            let unlocked = match get("keystatus")? {
-                "available" | "none" => true,
-                "unavailable" => false,
-                _ => bail!("unknown ZFS unlock state"),
-            };
-            let writable = match get("readonly")? {
-                "off" => mount.writable,
-                "on" => false,
-                _ => bail!("unknown ZFS readonly state"),
-            };
-            let dataset_guid = get("guid")?.parse::<u64>()?;
-            let pool_output =
-                probe.output("zpool", &["get", "-H", "-p", "-o", "value", "guid", pool])?;
-            let pool_guid = scalar(&pool_output)?.parse::<u64>()?;
-            if dataset_guid == 0 || pool_guid == 0 {
-                bail!("missing stable ZFS GUID")
-            }
-            (
-                FilesystemIdentity::Zfs {
-                    pool_guid: pool_guid.to_string(),
-                    dataset_guid: dataset_guid.to_string(),
-                },
-                unlocked,
-                writable,
             )
         }
         other => bail!("strict storage readiness has no identity adapter for filesystem {other}"),

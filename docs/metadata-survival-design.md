@@ -120,9 +120,8 @@ dir = "/mnt/disk-a/metadata-replica"
 
 The authority counts as one replica. Require at least two independent devices.
 Directories on data members must be disjoint siblings of payload roots.
-Bind devices to disk serials or a ZFS pool GUID and its leaf-vdev identities.
-Reject aliases, overlapping vdev sets and replicas in the authority's ZFS pool,
-even if datasets have different `st_dev` values. Operator labels alone and local
+Bind devices to disk serials. Reject aliases and replicas on the authority's
+device. Operator labels alone and local
 directory fixtures cannot establish independence. Share physical capacity
 accounting between payload and metadata roots on the same device.
 
@@ -282,8 +281,7 @@ publication does not need admission closed.
 The HDD-dependent defaults above are unverified. This measurement settles them.
 Run it on the NAS that will run survival, against the HDD that would hold a
 metadata replica and separately against one HDD payload member. Keep the
-production filesystem, ZFS `sync` setting, record size and any SLOG device
-unchanged. An SSD, a virtual disk or ubuntu-main does not count.
+production filesystem and its sync and record-size settings unchanged. An SSD, a virtual disk or ubuntu-main does not count.
 
 The probe writes each file, fsyncs it and then fsyncs its directory. That is
 the `2 * N` sync pattern of one replica publication. Save it as

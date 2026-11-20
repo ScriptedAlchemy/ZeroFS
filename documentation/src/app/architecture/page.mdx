@@ -115,7 +115,7 @@ Because the servers share one filesystem layer, protocols mix on a single instan
 | [Native kernel client](/kernel-client) | Exact-kernel `zerofs` module; speaks private 9P directly through VFS and netfslib | Fast Linux mounts with reconnect and HA failover |
 | [Stock 9P](/9p-access) | Linux v9fs module | No ZeroFS client installation; fsync-dependent workloads |
 | [`zerofs mount`](/9p-access#mounting-with-zerofs-mount) | FUSE client bundled in the `zerofs` binary; speaks private 9P | Linux mounts without root; reconnect and HA failover across a wider kernel range |
-| [NBD](/nbd-devices) | `nbd-client` | Raw block devices for ext4, XFS, ZFS pools, and VM disks |
+| [NBD](/nbd-devices) | `nbd-client` | Raw block devices for ext4, XFS, and VM disks |
 
 The fsync difference is the deciding factor for databases. NFS COMMIT semantics allow fsync to return before data reaches stable storage. Over 9P, fsync returns only after data is durable.
 

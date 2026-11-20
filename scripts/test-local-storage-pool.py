@@ -1024,7 +1024,7 @@ def run_smoke() -> int:
         binary = arguments.binary.resolve(strict=True)
         require(binary.is_file() and os.access(binary, os.X_OK), f"binary is not executable: {binary}")
         provenance["binary_sha256"] = file_sha256(binary)
-        with tempfile.TemporaryDirectory(prefix="zpool-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="pool-") as temporary:
             root = Path(temporary).resolve()
             try:
                 if arguments.health_recovery:

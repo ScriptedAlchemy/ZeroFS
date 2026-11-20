@@ -30,7 +30,7 @@ data = "durable"
 id = "durable"
 profile = "hdd-smr"
 mountpoint = "/fixture/durable"
-identity = { kind = "zfs", pool_guid = "18446744073709551614", dataset_guid = "18446744073709551615" }
+identity = { kind = "uuid", uuid = "0f5e7c2a-8b1d-4c3e-9a6f-2b4d6e8f0a1c" }
 
 [[storage.readiness.filesystems]]
 id = "fast"

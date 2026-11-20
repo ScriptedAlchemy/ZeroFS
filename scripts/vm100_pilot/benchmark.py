@@ -676,7 +676,7 @@ class BenchmarkRunner:
         # per request -- and each journal commit issues a flush, ZeroFS's full
         # durability barrier -- so an extending pass measures barrier latency
         # (measured 30x slower), not the service ACK this tier is named for.
-        # Production block consumers (ZFS vdevs, VM images, databases)
+        # Production block consumers (VM images, databases)
         # overwrite pre-sized files in place.
         self._run_fio(
             name="zerofs_nbd_odirect_write_layout",
