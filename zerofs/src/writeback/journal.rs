@@ -1132,17 +1132,19 @@ impl Journal {
 
     pub(crate) fn raw_available_space(&self) -> Result<u64> {
         let region = self.raw_region.as_ref().context("expected raw writeback")?;
+        let reserve = region.capacity() - region.resize_ceiling();
+        // A large virgin region can fund the configured dirty budget without
+        // counting any reusable pages. Its length alone is a valid sample, so
+        // skip the redb writer, which waits out any commit's device flush.
+        let unallocated = region.resize_ceiling().saturating_sub(region.len()?);
+        if region.capacity() > 256 << 20 && unallocated >= region.resize_ceiling() / 4 {
+            return Ok(unallocated + reserve);
+        }
         // Match the allocator counts to one on-disk layout. A write
         // transaction excludes writers while we inspect these read-only stats.
         let transaction = self.database.begin_write()?;
         let len = region.len()?;
         let unallocated = region.resize_ceiling().saturating_sub(len);
-        let reserve = region.capacity() - region.resize_ceiling();
-        // A large virgin region can fund the configured dirty budget without
-        // counting any reusable pages. Avoid a redb tree walk on every PUT.
-        if region.capacity() > 256 << 20 && unallocated >= region.resize_ceiling() / 4 {
-            return Ok(unallocated + reserve);
-        }
         let stats = transaction.stats()?;
         let mut bytes = [0; RedbHeader::LEN];
         region.read(0, &mut bytes)?;
@@ -2359,7 +2361,10 @@ impl Journal {
         if self.is_raw() {
             let _write = self.write_gate.lock();
             let mut transaction = self.database.begin_write()?;
-            transaction.set_durability(Durability::Immediate)?;
+            // Rows at or below the durable remote watermark are garbage, and
+            // open_raw retires them again. The next durable commit persists
+            // this one, so it needs no device flush of its own.
+            transaction.set_durability(Durability::None)?;
             transaction
                 .open_table(MUTATIONS)?
                 .retain_in(..=through, |_, _| false)?;
@@ -7118,5 +7123,104 @@ mod tests {
             delete.ssd_reservation_bytes().unwrap()
         );
         assert_eq!(pending[1].operations, 1);
+    }
+
+    fn power_cut_copy(file: &fs::File) -> fs::File {
+        // The bytes the journal has handed the device so far, without any
+        // clean-close checkpoint: what a power cut leaves on the P3.
+        use std::os::unix::fs::FileExt;
+        let len = file.metadata().unwrap().len();
+        let copy = tempfile::tempfile().unwrap();
+        copy.set_len(len).unwrap();
+        let mut buffer = vec![0; 1 << 20];
+        for offset in (0..len).step_by(buffer.len()) {
+            let count = (len - offset).min(buffer.len() as u64) as usize;
+            file.read_exact_at(&mut buffer[..count], offset).unwrap();
+            copy.write_all_at(&buffer[..count], offset).unwrap();
+        }
+        copy
+    }
+
+    #[test]
+    fn raw_prefix_retirement_needs_no_flush_and_a_power_cut_keeps_every_acknowledged_put() {
+        use crate::raw_database::RawDatabase;
+        use zerofs_raw_device::{Identity, Role, journal_region::TransactionRegion};
+
+        const CAPACITY: u64 = 64 << 20;
+        const ID: Identity = Identity {
+            pool_uuid: [5; 16],
+            member_uuid: [6; 16],
+            role: Role::Journal,
+        };
+        let open_region = |file: &fs::File| {
+            let region =
+                TransactionRegion::open(file.try_clone().unwrap(), CAPACITY, 0, CAPACITY, ID)
+                    .unwrap();
+            let ceiling = region.capacity() - (2 << 20);
+            region.with_resize_ceiling(ceiling).unwrap()
+        };
+        let raw_identity = JournalIdentity {
+            backend_kind: "raw".to_owned(),
+            ..identity("raw-bucket")
+        };
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(CAPACITY).unwrap();
+        TransactionRegion::provision(file.try_clone().unwrap(), CAPACITY, 0, CAPACITY, ID).unwrap();
+        let journal = Journal::open_raw(open_region(&file), raw_identity.clone()).unwrap();
+        let payloads = (1..=5_u8)
+            .map(|byte| vec![byte; 200 << 10])
+            .collect::<Vec<_>>();
+        let prepare = |sequence: u64| {
+            let bytes = &payloads[sequence as usize - 1];
+            journal
+                .prepare_verified_put(
+                    put_record(sequence, &format!("segments/{sequence}"), bytes),
+                    &VerifiedPayload::new(Bytes::copy_from_slice(bytes)),
+                )
+                .unwrap()
+        };
+
+        // One group commit acknowledges four puts.
+        journal
+            .publish_batch((1..=4).map(prepare).collect())
+            .unwrap();
+        journal.mark_remote_batch(&[(1, None), (2, None)]).unwrap();
+        journal.remove_remote_prefix(2).unwrap();
+        let before_next_commit = power_cut_copy(&file);
+        journal.publish_batch(vec![prepare(5)]).unwrap();
+        let after_next_commit = power_cut_copy(&file);
+        assert!(journal.mutation(2).unwrap().is_none());
+        drop(journal);
+
+        let durable_rows = |media: &fs::File| {
+            let database = redb::Builder::new()
+                .create_with_backend(RawDatabase(open_region(media)))
+                .unwrap();
+            let read = database.begin_read().unwrap();
+            let table = read.open_table(MUTATIONS).unwrap();
+            table
+                .iter()
+                .unwrap()
+                .map(|row| row.unwrap().0.value())
+                .collect::<Vec<_>>()
+        };
+        // The retirement wrote no barrier: a cut before the next commit
+        // still holds the retired rows, and that commit made it durable.
+        assert_eq!(
+            durable_rows(&power_cut_copy(&before_next_commit)),
+            [1, 2, 3, 4]
+        );
+        assert_eq!(durable_rows(&power_cut_copy(&after_next_commit)), [3, 4, 5]);
+
+        for (media, local_seq) in [(before_next_commit, 4), (after_next_commit, 5)] {
+            let journal = Journal::open_raw(open_region(&media), raw_identity.clone()).unwrap();
+            let progress = journal.progress().unwrap();
+            assert_eq!((progress.remote_seq, progress.local_seq), (2, local_seq));
+            assert!(journal.mutation(1).unwrap().is_none());
+            assert!(journal.mutation(2).unwrap().is_none());
+            for sequence in 3..=local_seq {
+                assert_journal_payload(&journal, sequence, &payloads[sequence as usize - 1]);
+            }
+        }
     }
 }
