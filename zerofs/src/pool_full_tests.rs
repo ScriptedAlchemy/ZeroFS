@@ -38,10 +38,15 @@ const GIB: u64 = 1024 * MIB;
 const DECLARED_A: u64 = 6_001_000_000_000;
 const DECLARED_B: u64 = 18_000_000_000_000;
 const RESERVE: u64 = MIB;
-/// The promise under test: a write or fsync on a full pool answers within
-/// this bound. Measured answers are milliseconds; the bound leaves room for a
-/// loaded CI host.
-const BOUND: Duration = Duration::from_secs(5);
+/// The promise under test: a write or fsync on a full pool answers instead of
+/// waiting without limit. This is a liveness bound, not a speed target:
+/// `bounded` returns as soon as the step answers, and the hang it guards
+/// against never answers. An fsync behind the volatile overlay first
+/// materializes every acknowledged byte, up to the 16 MiB budget, so its time
+/// grows with that work. In an unoptimized build on four loaded CPUs that
+/// took up to 4.8 s, and hosted CI ran past 5 s. The mounted fixtures keep the
+/// client-facing latency contract on the release package.
+const BOUND: Duration = Duration::from_secs(30);
 /// Every test body runs under this, so a hang fails the test.
 const TEST_DEADLINE: Duration = Duration::from_secs(120);
 
