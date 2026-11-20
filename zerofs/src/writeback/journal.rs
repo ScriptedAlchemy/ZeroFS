@@ -121,9 +121,40 @@
 //! Staging cannot read the watermark to check contiguity, precisely because
 //! it runs ahead of it; it takes the expected first sequence from its caller
 //! as an early check and leaves the authoritative one to the commit.
+//!
+//! # Raw P3 journals
+//!
+//! A journal on a raw P3 region has no directory and no containers. The
+//! region's data bytes are split at their midpoint:
+//!
+//! ```text
+//! [ redb file: records only | payload log: a ring of payload bytes ]
+//! ```
+//!
+//! A batch's payloads are written once, back to back, after the batch
+//! before it in the payload log (see `raw_log`). Each record names its
+//! payload as
+//! `raw_payload_log_v1#{position}+{len}`. One redb commit then stores the
+//! records, the new log head and the local watermark, and its single device
+//! flush covers the payload bytes too, because both are writes to one
+//! device. A record is ACKable only after that flush returns.
+//!
+//! A power cut during the flush can leave the commit readable in redb while
+//! some of its payload bytes never reached the device. Each commit stores
+//! the watermark the flush before it covered, so the records above that
+//! watermark are exactly the last commit's. On open, if one of them fails
+//! its digest, all of them are dropped: none was acknowledged, and replay
+//! ends at the commit before. A digest failure at or below that watermark is
+//! damage to acknowledged data and needs an operator.
+//!
+//! The drain retires records at or below the remote watermark, and the log's
+//! tail follows the oldest record left. Journals written before the log keep
+//! their payloads as `raw_payload_chunks_v1` rows in redb. Those still
+//! replay and drain. Nothing writes new ones.
 
 #[cfg(test)]
 mod raw_backend;
+mod raw_log;
 mod raw_payload;
 
 use crate::operator_required::operator_required;
@@ -169,6 +200,12 @@ const REMOTE_SEQ_KEY: &str = "remote_seq";
 const REMOTE_BYTES_COMPLETED_KEY: &str = "remote_bytes_completed";
 const REMOTE_RETRIES_KEY: &str = "remote_retries";
 const FENCE_CLASSIFICATION_VERSION_KEY: &str = "fence_classification_version";
+/// Raw journals: the payload log position after the last recorded batch.
+const PAYLOAD_LOG_HEAD_KEY: &str = "payload_log_head";
+/// Raw journals: every record at or below this sequence was covered by a
+/// device flush that completed. A later commit records it, so the records of
+/// the last commit before a power cut sit above it.
+const PAYLOAD_LOG_FLUSHED_SEQ_KEY: &str = "payload_log_flushed_seq";
 const FENCE_CLASSIFICATION_VERSION: u32 = 2;
 
 /// The large raw disk budget may hold many metadata-only mutations. Keep
@@ -187,6 +224,7 @@ pub struct Journal {
     root: PathBuf,
     root_dir: Option<AnchoredDir>,
     raw_region: Option<Arc<zerofs_raw_device::journal_region::TransactionRegion>>,
+    raw_log: Option<Arc<raw_log::PayloadLog>>,
     // Fields drop in declaration order: close the database before releasing
     // the journal's exclusive ownership below.
     database: Database,
@@ -550,7 +588,8 @@ const REMOTE_MARK_RIDE_WINDOW: Duration = Duration::from_millis(100);
 enum SharedWrite {
     Records {
         records: Vec<MutationRecord>,
-        payloads: Vec<(Sequence, VerifiedPayload)>,
+        /// The payload log head once these records are committed.
+        log_head: Option<u64>,
     },
     RemoteMarks(Vec<(Sequence, Option<String>)>),
 }
@@ -641,15 +680,22 @@ pub(crate) enum StagedBatch {
         records: Vec<MutationRecord>,
         container: Option<AnchoredFileLocation>,
     },
-    /// Raw journals commit payloads and records together. Test sinks may also
-    /// carry prepared mutations directly to the commit half.
+    /// A raw journal's batch: payload bytes written to the payload log, not
+    /// flushed, and named by `records`. The commit's one flush covers both.
+    Logged {
+        records: Vec<MutationRecord>,
+        extent: std::ops::Range<u64>,
+    },
+    /// Test sinks carry prepared mutations directly to the commit half.
     Unstaged(Vec<PreparedMutation>),
 }
 
 impl StagedBatch {
     pub(crate) fn sequences(&self) -> Vec<Sequence> {
         match self {
-            Self::Durable { records, .. } => records.iter().map(|record| record.sequence).collect(),
+            Self::Durable { records, .. } | Self::Logged { records, .. } => {
+                records.iter().map(|record| record.sequence).collect()
+            }
             Self::Unstaged(prepared) => prepared.iter().map(PreparedMutation::sequence).collect(),
         }
     }
@@ -780,6 +826,9 @@ pub(crate) struct RawJournalAllocation {
     fragmented_bytes: u64,
     dirty_blob_bytes: u64,
     dirty_metadata_reserved_bytes: u64,
+    /// Payload log bytes from the oldest undrained payload to the head. The
+    /// log's capacity is `physical_reserve_bytes`.
+    payload_log_held_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1055,6 +1104,7 @@ impl Journal {
             root,
             root_dir: Some(root_dir),
             raw_region: None,
+            raw_log: None,
             database,
             write_gate: JournalWriteGate::default(),
             shared: SharedCommits::default(),
@@ -1101,7 +1151,19 @@ impl Journal {
             header.ensure_openable(len, &root)?;
         }
         let cache_bytes = region.resize_ceiling().min(64 << 20) as usize;
-        let region = Arc::new(region);
+        let ceiling = raw_log::file_ceiling(region.capacity());
+        let region = if len > ceiling {
+            compact_raw_database(region, &root, cache_bytes, &expected_identity)?
+        } else {
+            region
+        };
+        let len = region.len()?;
+        let region = Arc::new(region.with_payload_reserve(ceiling).map_err(|error| {
+            operator_required(anyhow!(
+                "raw journal database is {len} bytes and the payload log leaves it {ceiling}: \
+                 {error}. Start the previous engine, let the journal drain, and stop it cleanly"
+            ))
+        })?);
         let database = open_journal_database(&root, || {
             Builder::new()
                 .set_cache_size(cache_bytes)
@@ -1119,10 +1181,21 @@ impl Journal {
             }
         }
         normalize_mutation_fences(&database, &expected_identity)?;
+        let raw_log = {
+            let read = database.begin_read()?;
+            let meta = read.open_table(META)?;
+            let head = read_optional::<u64>(&meta, PAYLOAD_LOG_HEAD_KEY)?.unwrap_or_default();
+            let remote_seq = read_required::<u64>(&meta, REMOTE_SEQ_KEY)?;
+            let first_held =
+                first_log_position(read.open_table(MUTATIONS)?.range(remote_seq + 1..)?)?;
+            raw_log::PayloadLog::open(Arc::clone(&region), head, first_held)
+                .map_err(operator_required)?
+        };
         let journal = Self {
             root,
             root_dir: None,
             raw_region: Some(region),
+            raw_log: Some(Arc::new(raw_log)),
             database,
             write_gate: JournalWriteGate::default(),
             shared: SharedCommits::default(),
@@ -1139,12 +1212,84 @@ impl Journal {
             #[cfg(test)]
             remote_mark_pause: Mutex::new(None),
         };
+        journal.discard_torn_raw_tail()?;
         let remote_seq = journal.progress()?.remote_seq;
         if remote_seq > 0 {
             journal.remove_remote_prefix(remote_seq)?;
         }
         journal.validate_recovery_state()?;
         Ok(journal)
+    }
+
+    /// Drop the records of a commit that a power cut interrupted.
+    ///
+    /// A commit flushes the device once, for its payload bytes in the log and
+    /// for the redb pages that record them. A cut during that flush can leave
+    /// the redb commit readable and the payload bytes missing. No such commit
+    /// was acknowledged. Every commit records the sequence the flush before it
+    /// covered, so only the last commit's records sit above that sequence.
+    /// When one of them fails its digest, none of them were acknowledged and
+    /// replay ends at the commit before. A read error is not a torn write and
+    /// is returned.
+    fn discard_torn_raw_tail(&self) -> Result<()> {
+        let (flushed, local_seq) = {
+            let read = self.database.begin_read()?;
+            let meta = read.open_table(META)?;
+            let Some(flushed) = read_optional::<u64>(&meta, PAYLOAD_LOG_FLUSHED_SEQ_KEY)? else {
+                return Ok(());
+            };
+            (flushed, read_required::<u64>(&meta, LOCAL_SEQ_KEY)?)
+        };
+        let mut torn = None;
+        for sequence in flushed.saturating_add(1)..=local_seq {
+            let record = self.blob_record(sequence).map_err(operator_required)?;
+            if record.blob_path().is_none() {
+                continue;
+            }
+            match self.open_raw_payload(sequence, u64::MAX) {
+                Ok(_) => {}
+                Err(error) if error.is::<JournalBlobIntegrityError>() => {
+                    torn = Some(sequence);
+                    break;
+                }
+                Err(error) => return Err(operator_required(error)),
+            }
+        }
+        let Some(torn) = torn else {
+            return Ok(());
+        };
+        let _write = self.write_gate.lock();
+        let mut transaction = self.database.begin_write()?;
+        transaction.set_durability(Durability::Immediate)?;
+        {
+            let mut meta = transaction.open_table(META)?;
+            let mut mutations = transaction.open_table(MUTATIONS)?;
+            let mut dropped_bytes = 0_u64;
+            for entry in mutations.extract_from_if(flushed.saturating_add(1).., |_, _| true)? {
+                let record: MutationRecord = bincode::deserialize(entry?.1.value())?;
+                dropped_bytes += record.payload().map_or(0, |(len, _)| len);
+            }
+            let completed = read_required::<u64>(&meta, LOCAL_BYTES_COMPLETED_KEY)?
+                .checked_sub(dropped_bytes)
+                .context("local completed byte counter is below the torn commit")?;
+            write_value(&mut meta, LOCAL_SEQ_KEY, &flushed)?;
+            write_value(&mut meta, LOCAL_BYTES_COMPLETED_KEY, &completed)?;
+        }
+        transaction.commit()?;
+        tracing::warn!(
+            first_torn_sequence = torn,
+            replay_ends_at = flushed,
+            dropped_through = local_seq,
+            "dropped the unacknowledged records of a commit that power loss interrupted"
+        );
+        Ok(())
+    }
+
+    /// Bytes of `region` a raw journal gives its payload log.
+    pub(crate) fn raw_payload_log_bytes(
+        region: &zerofs_raw_device::journal_region::TransactionRegion,
+    ) -> u64 {
+        region.capacity() - raw_log::file_ceiling(region.capacity())
     }
 
     pub(crate) fn max_pending_operations(&self) -> u64 {
@@ -1174,45 +1319,18 @@ impl Journal {
             fragmented_bytes: stats.fragmented_bytes(),
             dirty_blob_bytes: pending.dirty_blob_bytes,
             dirty_metadata_reserved_bytes: pending.dirty_metadata_reserved_bytes,
+            payload_log_held_bytes: self.raw_log()?.held_bytes(),
         })
     }
 
-    pub(crate) fn raw_available_space(&self) -> Result<u64> {
-        let region = self.raw_region.as_ref().context("expected raw writeback")?;
-        let reserve = region.capacity() - region.resize_ceiling();
-        // A large virgin region can fund the configured dirty budget without
-        // counting any reusable pages. Its length alone is a valid sample, so
-        // skip the redb writer, which waits out any commit's device flush.
-        let unallocated = region.resize_ceiling().saturating_sub(region.len()?);
-        if region.capacity() > 256 << 20 && unallocated >= region.resize_ceiling() / 4 {
-            return Ok(unallocated + reserve);
-        }
-        // Match the allocator counts to one on-disk layout. A write
-        // transaction excludes writers while we inspect these read-only stats.
-        let transaction = self.database.begin_write()?;
-        let len = region.len()?;
-        let unallocated = region.resize_ceiling().saturating_sub(len);
-        let stats = transaction.stats()?;
-        let mut bytes = [0; RedbHeader::LEN];
-        region.read(0, &mut bytes)?;
-        let header = RedbHeader::parse(&bytes).context("invalid raw writeback redb header")?;
-        header.ensure_openable(len, self.root())?;
-        anyhow::ensure!(
-            header.page_size == stats.page_size() as u64,
-            "raw allocator page size mismatch"
-        );
+    fn raw_log(&self) -> Result<&Arc<raw_log::PayloadLog>> {
+        self.raw_log.as_ref().context("expected raw writeback")
+    }
 
-        // Free allocator pages exclude live and snapshot-pinned pages. Use
-        // half of the free arena as an estimate to allow for buddy fragmentation
-        // and copy-on-write work. The resize ceiling is the physical limit.
-        let reusable = header
-            .usable_pages
-            .saturating_sub(stats.allocated_pages())
-            .saturating_mul(header.page_size)
-            / 2;
-        // SSD admission subtracts its configured min_free_bytes from the
-        // sample. Add the fenced reserve so that it is deducted exactly once.
-        Ok(unallocated + reusable + reserve)
+    /// Payload log bytes a new batch may take. SSD admission keeps its
+    /// configured `min_free_bytes` of them free.
+    pub(crate) fn raw_available_space(&self) -> Result<u64> {
+        Ok(self.raw_log()?.available_bytes())
     }
 
     pub(crate) fn root(&self) -> &Path {
@@ -1591,7 +1709,7 @@ impl Journal {
         self.require_contiguous_local_batch(&prepared, expected_first)?;
         self.require_unique_local_batch_identities(&prepared)?;
         if self.is_raw() {
-            return Ok(StagedBatch::Unstaged(prepared));
+            return self.stage_raw_batch(prepared);
         }
         if prepared.is_empty() {
             return Ok(StagedBatch::Durable {
@@ -1693,6 +1811,39 @@ impl Journal {
         })
     }
 
+    /// A raw journal's staging half: write the batch's payloads to the
+    /// payload log and name them in its records. Nothing is flushed, so the
+    /// write overlaps the commit of the batch before.
+    fn stage_raw_batch(&self, prepared: Vec<PreparedMutation>) -> Result<StagedBatch> {
+        let write_started = Instant::now();
+        let mut records = Vec::with_capacity(prepared.len());
+        let mut payloads = Vec::with_capacity(prepared.len());
+        for PreparedMutation { record, payload } in prepared {
+            anyhow::ensure!(
+                record.payload() == payload.as_ref().map(|p| (p.byte_len(), p.sha256())),
+                "prepared raw payload and mutation record disagree"
+            );
+            if let Some(payload) = payload {
+                payloads.push((records.len(), payload));
+            }
+            records.push(record);
+        }
+        let staged = self
+            .raw_log()?
+            .stage(payloads.iter().map(|(_, payload)| payload))?;
+        for ((index, payload), position) in payloads.iter().zip(&staged.positions) {
+            *records[*index]
+                .blob_path_mut()
+                .context("missing raw blob reference")? =
+                raw_log::format_reference(*position, payload.byte_len());
+        }
+        record_local_publish_phase("payload_log_write", write_started.elapsed());
+        Ok(StagedBatch::Logged {
+            records,
+            extent: staged.extent,
+        })
+    }
+
     /// The committing half of publication: make the metadata that names an
     /// already-durable container durable too, and only then advance the local
     /// watermark. This is the point at which the batch's records become
@@ -1702,31 +1853,13 @@ impl Journal {
         let records = match staged {
             StagedBatch::Durable { records, .. } if !self.is_raw() => {
                 // Keep the container if the durable header swap may have succeeded.
-                self.commit_record_batch(&records, &[])?;
+                self.commit_record_batch(&records, None)?;
                 records
             }
-            StagedBatch::Unstaged(prepared) if self.is_raw() => {
-                let mut records = Vec::with_capacity(prepared.len());
-                let mut payloads = Vec::with_capacity(prepared.len());
-                for PreparedMutation {
-                    mut record,
-                    payload,
-                } in prepared
-                {
-                    anyhow::ensure!(
-                        record.payload() == payload.as_ref().map(|p| (p.byte_len(), p.sha256())),
-                        "prepared raw payload and mutation record disagree"
-                    );
-                    if let Some(payload) = payload {
-                        *record
-                            .blob_path_mut()
-                            .context("missing raw blob reference")? =
-                            raw_payload::RAW_REFERENCE.to_owned();
-                        payloads.push((record.sequence, payload));
-                    }
-                    records.push(record);
-                }
-                self.commit_record_batch(&records, &payloads)?;
+            StagedBatch::Logged { records, extent } if self.is_raw() => {
+                // A failed commit may still be durable, so the staged bytes
+                // stay where they are.
+                self.commit_record_batch(&records, Some(extent.end))?;
                 records
             }
             _ => bail!("staged batch does not match journal storage"),
@@ -1753,6 +1886,10 @@ impl Journal {
                 container: Some(container),
                 ..
             } => self.discard_container(&container),
+            StagedBatch::Logged { extent, .. } => {
+                self.raw_log()?.abandon(extent.start);
+                Ok(())
+            }
             StagedBatch::Durable {
                 container: None, ..
             }
@@ -1873,24 +2010,20 @@ impl Journal {
     /// advancing `LOCAL_SEQ_KEY` in one immediate transaction is what makes a
     /// batch atomic, and what makes `last <= LOCAL_SEQ` a sound test for
     /// "this container committed".
-    fn commit_record_batch(
-        &self,
-        records: &[MutationRecord],
-        payloads: &[(Sequence, VerifiedPayload)],
-    ) -> Result<()> {
+    fn commit_record_batch(&self, records: &[MutationRecord], log_head: Option<u64>) -> Result<()> {
         if records.is_empty() {
             return Ok(());
         }
         self.commit_shared(SharedWrite::Records {
             records: records.to_vec(),
-            payloads: payloads.to_vec(),
+            log_head,
         })
     }
 
     fn insert_record_batch(
         transaction: &redb::WriteTransaction,
         records: &[MutationRecord],
-        payloads: &[(Sequence, VerifiedPayload)],
+        log_head: Option<u64>,
     ) -> Result<()> {
         let last = records.last().context("record batch must not be empty")?;
         let mut meta = transaction
@@ -1922,13 +2055,10 @@ impl Journal {
                 expected = expected.checked_add(1).context("local sequence overflow")?;
             }
         }
-        if !payloads.is_empty() {
-            let mut chunks = transaction.open_table(raw_payload::PAYLOADS)?;
-            for (sequence, payload) in payloads {
-                raw_payload::insert(&mut chunks, *sequence, payload)?;
-            }
-        }
         drop(table);
+        if let Some(head) = log_head {
+            write_value(&mut meta, PAYLOAD_LOG_HEAD_KEY, &head)?;
+        }
         write_value(&mut meta, LOCAL_SEQ_KEY, &last.sequence)?;
         write_value(&mut meta, LOCAL_BYTES_COMPLETED_KEY, &total_completed)?;
         Ok(())
@@ -2030,10 +2160,21 @@ impl Journal {
         transaction
             .set_durability(Durability::Immediate)
             .context("failed to set journal durability")?;
+        if self.is_raw() {
+            // The flush of every earlier commit has returned.
+            let mut meta = transaction.open_table(META)?;
+            let flushed = read_required::<u64>(&meta, LOCAL_SEQ_KEY)?;
+            write_value(&mut meta, PAYLOAD_LOG_FLUSHED_SEQ_KEY, &flushed)?;
+        }
+        let mut log_head = None;
         for slot in group {
             match &slot.write {
-                SharedWrite::Records { records, payloads } => {
-                    Self::insert_record_batch(&transaction, records, payloads)?;
+                SharedWrite::Records {
+                    records,
+                    log_head: head,
+                } => {
+                    Self::insert_record_batch(&transaction, records, *head)?;
+                    log_head = head.or(log_head);
                 }
                 SharedWrite::RemoteMarks(completions) => {
                     Self::insert_remote_marks(&transaction, completions)?;
@@ -2043,6 +2184,9 @@ impl Journal {
         transaction
             .commit()
             .context("failed to commit journal transaction")?;
+        if let Some(head) = log_head {
+            self.raw_log()?.recorded(head);
+        }
         #[cfg(test)]
         self.shared_commits.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -2110,9 +2254,9 @@ impl Journal {
         maximum_bytes: u64,
     ) -> Result<(Vec<u8>, [u8; 32])> {
         if self.is_raw() {
-            let (table, record) = self.raw_payload_rows(sequence)?;
+            let (held, record) = self.raw_payload_rows(sequence)?;
             let (_, sha256) = record.payload().context("mutation has no payload")?;
-            let bytes = raw_payload::RawPayload::read(table, &record, maximum_bytes)?;
+            let bytes = raw_payload::RawPayload::read(held, &record, maximum_bytes)?;
             return Ok((bytes, sha256));
         }
         let record = self.blob_record(sequence)?;
@@ -2148,15 +2292,15 @@ impl Journal {
         sequence: Sequence,
         maximum_bytes: u64,
     ) -> Result<raw_payload::RawPayload> {
-        let (table, record) = self.raw_payload_rows(sequence)?;
-        raw_payload::RawPayload::open(table, &record, maximum_bytes)
+        let (held, record) = self.raw_payload_rows(sequence)?;
+        raw_payload::RawPayload::open(held, &record, maximum_bytes)
     }
 
-    /// One snapshot's payload chunks and the record that describes them.
-    fn raw_payload_rows(
-        &self,
-        sequence: Sequence,
-    ) -> Result<(raw_payload::PayloadChunks, MutationRecord)> {
+    /// The record of `sequence` and a hold on wherever its payload is. The
+    /// log is pinned before the snapshot, so the extent of a row the snapshot
+    /// still holds has not been reclaimed.
+    fn raw_payload_rows(&self, sequence: Sequence) -> Result<(raw_payload::Held, MutationRecord)> {
+        let pin = self.raw_log()?.pin();
         let read = self.database.begin_read()?;
         let mutations = read.open_table(MUTATIONS)?;
         let encoded = mutations
@@ -2164,7 +2308,7 @@ impl Journal {
             .with_context(|| format!("journal mutation {sequence} does not exist"))?;
         let record: MutationRecord = bincode::deserialize(encoded.value())?;
         let table = read.open_table(raw_payload::PAYLOADS)?;
-        Ok((table, record))
+        Ok((raw_payload::Held::new(pin, table), record))
     }
 
     fn blob_record(&self, sequence: Sequence) -> Result<MutationRecord> {
@@ -2555,15 +2699,23 @@ impl Journal {
             // open_raw retires them again. The next durable commit persists
             // this one, so it needs no device flush of its own.
             transaction.set_durability(Durability::None)?;
-            transaction
-                .open_table(MUTATIONS)?
-                .retain_in(..=through, |_, _| false)?;
+            let first_held = {
+                let mut mutations = transaction.open_table(MUTATIONS)?;
+                mutations.retain_in(..=through, |_, _| false)?;
+                first_log_position(mutations.iter()?)?
+            };
             transaction
                 .open_table(raw_payload::PAYLOADS)?
                 .retain_in(..=(through, u64::MAX), |_, _| false)?;
-            return transaction
+            transaction
                 .commit()
-                .context("failed to retire raw journal prefix");
+                .context("failed to retire raw journal prefix")?;
+            // The rows are gone from every later snapshot, so their log
+            // bytes may be written over. A power cut can bring the rows back,
+            // still at or below the durable remote watermark, and open_raw
+            // retires them before it reads anything.
+            self.raw_log()?.retire_to(first_held);
+            return Ok(());
         }
         let read = self
             .database
@@ -2937,6 +3089,64 @@ impl Journal {
         })?;
         Ok(())
     }
+}
+
+/// The payload log position of the first of `rows` whose payload is in the
+/// log. Positions rise with sequence, so this is the oldest held log byte.
+fn first_log_position<'a>(
+    rows: impl Iterator<
+        Item = std::result::Result<
+            (
+                redb::AccessGuard<'a, u64>,
+                redb::AccessGuard<'a, &'static [u8]>,
+            ),
+            redb::StorageError,
+        >,
+    >,
+) -> Result<Option<u64>> {
+    for row in rows {
+        let record: MutationRecord =
+            bincode::deserialize(row?.1.value()).context("failed to decode journal mutation")?;
+        if let (Some(reference), Some((len, _))) = (record.blob_path(), record.payload())
+            && let Some(position) = raw_log::parse_reference(reference, len)?
+        {
+            return Ok(Some(position));
+        }
+    }
+    Ok(None)
+}
+
+/// Shrink a database an earlier engine grew past where the payload log now
+/// begins. That engine kept payloads in redb, and its file keeps their length
+/// until redb moves the surviving pages down.
+fn compact_raw_database(
+    region: zerofs_raw_device::journal_region::TransactionRegion,
+    root: &Path,
+    cache_bytes: usize,
+    expected: &JournalIdentity,
+) -> Result<zerofs_raw_device::journal_region::TransactionRegion> {
+    let region = Arc::new(region);
+    let mut database = open_journal_database(root, || {
+        Builder::new()
+            .set_cache_size(cache_bytes)
+            .create_with_backend(crate::raw_database::RawDatabase(Arc::clone(&region)))
+    })?;
+    // Another journal's pages are not ours to move.
+    {
+        let read = database.begin_read()?;
+        let meta = read.open_table(META).map_err(operator_required)?;
+        if read_optional::<JournalIdentity>(&meta, IDENTITY_KEY)?.as_ref() != Some(expected) {
+            return Err(operator_required(anyhow!(
+                "writeback journal identity mismatch"
+            )));
+        }
+    }
+    while database
+        .compact()
+        .context("failed to compact the raw journal database")?
+    {}
+    drop(database);
+    Arc::try_unwrap(region).map_err(|_| anyhow!("raw journal region is still in use"))
 }
 
 /// Report a publication failure together with the outcome of unlinking the
@@ -3777,18 +3987,19 @@ fn validate_owner_only(
 mod tests {
     use super::{
         AnchoredDir, FENCE_CLASSIFICATION_VERSION, FENCE_CLASSIFICATION_VERSION_KEY, IDENTITY_KEY,
-        Journal, JournalSnapshot, JournalWriteGate, LOCAL_SEQ_KEY, META, MUTATIONS, PENDING_BLOBS,
-        PublicationFilesystem, REMOTE_OBJECT_VERSIONS, REMOTE_SEQ_KEY, blob_relative_path,
-        read_optional, write_value,
+        Journal, JournalSnapshot, JournalWriteGate, LOCAL_BYTES_COMPLETED_KEY, LOCAL_SEQ_KEY, META,
+        MUTATIONS, PENDING_BLOBS, PreparedMutation, PublicationFilesystem, REMOTE_OBJECT_VERSIONS,
+        REMOTE_SEQ_KEY, blob_relative_path, read_optional, read_required, write_value,
     };
     use crate::writeback::model::{
         FenceClass, JournalIdentity, LocalEtag, MutationKind, MutationMode, MutationRecord,
     };
     use crate::writeback::payload::VerifiedPayload;
     use crate::writeback::test_util::assert_journal_payload;
+    use anyhow::Result;
     use bytes::Bytes;
     use futures::StreamExt;
-    use redb::{Database, ReadableDatabase, ReadableTable};
+    use redb::{Builder, Database, ReadableDatabase, ReadableTable, ReadableTableMetadata};
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
     use std::fs;
@@ -7422,104 +7633,575 @@ mod tests {
         copy
     }
 
-    /// The drain reads a raw payload and its digest in one verified pass, and
-    /// a chunk that no longer matches the record's digest is refused.
-    #[test]
-    fn a_raw_payload_read_returns_the_digest_it_verified() {
-        use redb::ReadableDatabase;
-        use zerofs_raw_device::{Identity, Role, journal_region::TransactionRegion};
+    /// A raw P3 Journal region on a file, as the device holds it.
+    struct RawMedia {
+        file: fs::File,
+        capacity: u64,
+    }
 
-        const CAPACITY: u64 = 64 << 20;
-        const ID: Identity = Identity {
+    impl RawMedia {
+        const ID: zerofs_raw_device::Identity = zerofs_raw_device::Identity {
             pool_uuid: [7; 16],
             member_uuid: [8; 16],
-            role: Role::Journal,
+            role: zerofs_raw_device::Role::Journal,
         };
-        let file = tempfile::tempfile().unwrap();
-        file.set_len(CAPACITY).unwrap();
-        let region =
-            TransactionRegion::provision(file.try_clone().unwrap(), CAPACITY, 0, CAPACITY, ID)
-                .unwrap();
-        let journal = Journal::open_raw(
-            region,
+        fn provision(capacity: u64) -> Self {
+            let file = tempfile::tempfile().unwrap();
+            file.set_len(capacity).unwrap();
+            zerofs_raw_device::journal_region::TransactionRegion::provision(
+                file.try_clone().unwrap(),
+                capacity,
+                0,
+                capacity,
+                Self::ID,
+            )
+            .unwrap();
+            Self { file, capacity }
+        }
+
+        fn region(&self) -> zerofs_raw_device::journal_region::TransactionRegion {
+            zerofs_raw_device::journal_region::TransactionRegion::open(
+                self.file.try_clone().unwrap(),
+                self.capacity,
+                0,
+                self.capacity,
+                Self::ID,
+            )
+            .unwrap()
+        }
+
+        fn identity() -> JournalIdentity {
             JournalIdentity {
                 backend_kind: "raw".to_owned(),
                 ..identity("raw-bucket")
-            },
-        )
-        .unwrap();
-        // Spans three payload chunks.
-        let body = (0..150_000_u32).map(|n| n as u8).collect::<Vec<_>>();
-        let prepared = journal
+            }
+        }
+
+        fn open(&self) -> Result<Journal> {
+            Journal::open_raw(self.region(), Self::identity())
+        }
+
+        /// What a power cut leaves: every byte handed to the device so far.
+        fn power_cut(&self) -> Self {
+            Self {
+                file: power_cut_copy(&self.file),
+                capacity: self.capacity,
+            }
+        }
+
+        fn log_bytes(&self) -> u64 {
+            Journal::raw_payload_log_bytes(&self.region())
+        }
+
+        /// Overwrite one byte of the payload log, as a write that never
+        /// reached the device leaves it.
+        fn tear_log_byte(&self, position: u64) {
+            use std::os::unix::fs::FileExt;
+            let log_bytes = self.log_bytes();
+            let offset = self.capacity - log_bytes + position % log_bytes;
+            let mut byte = [0];
+            self.file.read_exact_at(&mut byte, offset).unwrap();
+            self.file.write_all_at(&[!byte[0]], offset).unwrap();
+        }
+
+        /// The redb file an engine without the payload log would open.
+        fn legacy_database(&self) -> Database {
+            Builder::new()
+                .create_with_backend(crate::raw_database::RawDatabase(self.region()))
+                .unwrap()
+        }
+    }
+
+    fn raw_payload(sequence: u64, len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|index| (index as u64 * 31 + sequence * 7) as u8)
+            .collect()
+    }
+
+    fn raw_put(journal: &Journal, sequence: u64, payload: &[u8]) -> PreparedMutation {
+        journal
             .prepare_verified_put(
-                put_record(1, "segments/1", &body),
-                &VerifiedPayload::new(Bytes::copy_from_slice(&body)),
+                put_record(sequence, &format!("segments/{sequence}"), payload),
+                &VerifiedPayload::new(Bytes::copy_from_slice(payload)),
+            )
+            .unwrap()
+    }
+
+    fn log_position(journal: &Journal, sequence: u64) -> u64 {
+        let record = journal.mutation(sequence).unwrap().unwrap();
+        let (len, _) = record.payload().unwrap();
+        super::raw_log::parse_reference(record.blob_path().unwrap(), len)
+            .unwrap()
+            .expect("payload is in the log")
+    }
+
+    /// Store `payload` the way an engine without the payload log did: as
+    /// chunk rows in redb beside the record.
+    fn legacy_raw_put(database: &Database, sequence: u64, payload: &[u8]) {
+        let mut record = put_record(sequence, &format!("segments/{sequence}"), payload);
+        *record.blob_path_mut().unwrap() = super::raw_payload::RAW_REFERENCE.to_owned();
+        let write = database.begin_write().unwrap();
+        {
+            let mut meta = write.open_table(META).unwrap();
+            let completed = read_required::<u64>(&meta, LOCAL_BYTES_COMPLETED_KEY).unwrap();
+            write_value(&mut meta, LOCAL_SEQ_KEY, &sequence).unwrap();
+            write_value(
+                &mut meta,
+                LOCAL_BYTES_COMPLETED_KEY,
+                &(completed + payload.len() as u64),
             )
             .unwrap();
-        journal.publish_batch(vec![prepared]).unwrap();
+            write
+                .open_table(MUTATIONS)
+                .unwrap()
+                .insert(sequence, bincode::serialize(&record).unwrap().as_slice())
+                .unwrap();
+            super::raw_payload::insert_chunks(
+                &mut write.open_table(super::raw_payload::PAYLOADS).unwrap(),
+                sequence,
+                payload,
+            )
+            .unwrap();
+        }
+        write.commit().unwrap();
+    }
+
+    fn chunk_rows(journal: &Journal) -> u64 {
+        let read = journal.database.begin_read().unwrap();
+        read.open_table(super::raw_payload::PAYLOADS)
+            .unwrap()
+            .len()
+            .unwrap()
+    }
+
+    /// The payload goes to the log, not into redb, and the drain reads it
+    /// and its digest in one verified pass.
+    #[test]
+    fn a_raw_payload_is_in_the_log_and_a_read_returns_the_digest_it_verified() {
+        let media = RawMedia::provision(64 << 20);
+        let journal = media.open().unwrap();
+        let body = raw_payload(1, 150_000);
+        journal
+            .publish_batch(vec![raw_put(&journal, 1, &body)])
+            .unwrap();
 
         let (read, digest) = journal.read_blob_digested(1, body.len() as u64).unwrap();
         assert_eq!(read, body);
         assert_eq!(digest, <[u8; 32]>::from(Sha256::digest(&body)));
+        assert_eq!(chunk_rows(&journal), 0);
 
-        let tampered = {
-            let read = journal.database.begin_read().unwrap();
-            let chunks = read.open_table(super::raw_payload::PAYLOADS).unwrap();
-            let mut chunk = chunks.get((1, 1)).unwrap().unwrap().value().to_vec();
-            chunk[0] ^= 1;
-            chunk
-        };
-        let write = journal.database.begin_write().unwrap();
-        write
-            .open_table(super::raw_payload::PAYLOADS)
-            .unwrap()
-            .insert((1, 1), tampered.as_slice())
-            .unwrap();
-        write.commit().unwrap();
+        media.tear_log_byte(log_position(&journal, 1) + 70_000);
         let error = journal
             .read_blob_digested(1, body.len() as u64)
             .unwrap_err();
         assert!(format!("{error:#}").contains("hash mismatch"), "{error:#}");
     }
 
+    /// A power cut during a commit's flush can leave the redb commit readable
+    /// and its payload bytes missing. Nothing in that commit was acknowledged,
+    /// so replay ends at the commit before it and the journal keeps working.
+    #[test]
+    fn a_torn_payload_tail_is_never_replayed_and_replay_stops_at_the_last_durable_batch() {
+        let media = RawMedia::provision(64 << 20);
+        let journal = media.open().unwrap();
+        let payloads = (1..=4)
+            .map(|sequence| raw_payload(sequence, 300_000))
+            .collect::<Vec<_>>();
+        let put = |sequence: u64| raw_put(&journal, sequence, &payloads[sequence as usize - 1]);
+        journal.publish_batch(vec![put(1), put(2)]).unwrap();
+        journal.publish_batch(vec![put(3), put(4)]).unwrap();
+
+        // The second commit's last block never reached the device.
+        let cut = media.power_cut();
+        cut.tear_log_byte(log_position(&journal, 4) + 299_999);
+        drop(journal);
+
+        let journal = cut.open().unwrap();
+        let progress = journal.progress().unwrap();
+        assert_eq!(progress.local_seq, 2);
+        assert_eq!(progress.local_bytes_completed, 600_000);
+        assert!(journal.mutation(3).unwrap().is_none());
+        assert!(journal.mutation(4).unwrap().is_none());
+        for sequence in 1..=2 {
+            assert_journal_payload(&journal, sequence, &payloads[sequence as usize - 1]);
+        }
+
+        let replacement = raw_payload(9, 200_000);
+        journal
+            .publish_batch(vec![raw_put(&journal, 3, &replacement)])
+            .unwrap();
+        drop(journal);
+        let journal = cut.open().unwrap();
+        assert_eq!(journal.progress().unwrap().local_seq, 3);
+        assert_journal_payload(&journal, 3, &replacement);
+        assert_journal_payload(&journal, 1, &payloads[0]);
+    }
+
+    /// The same cut with every byte on the device keeps the whole commit.
+    #[test]
+    fn a_power_cut_after_the_flush_keeps_the_whole_last_batch() {
+        let media = RawMedia::provision(64 << 20);
+        let journal = media.open().unwrap();
+        let payloads = (1..=3)
+            .map(|sequence| raw_payload(sequence, 300_000))
+            .collect::<Vec<_>>();
+        journal
+            .publish_batch(vec![raw_put(&journal, 1, &payloads[0])])
+            .unwrap();
+        journal
+            .publish_batch(vec![
+                raw_put(&journal, 2, &payloads[1]),
+                raw_put(&journal, 3, &payloads[2]),
+            ])
+            .unwrap();
+        let cut = media.power_cut();
+        drop(journal);
+
+        let journal = cut.open().unwrap();
+        assert_eq!(journal.progress().unwrap().local_seq, 3);
+        for sequence in 1..=3 {
+            assert_journal_payload(&journal, sequence, &payloads[sequence as usize - 1]);
+        }
+    }
+
+    /// Damage below the last commit is not a torn tail: those payloads were
+    /// acknowledged, so the journal refuses to open and drops nothing.
+    #[test]
+    fn a_damaged_payload_below_the_last_commit_needs_an_operator_and_drops_nothing() {
+        let media = RawMedia::provision(64 << 20);
+        let journal = media.open().unwrap();
+        for sequence in 1..=3 {
+            let payload = raw_payload(sequence, 300_000);
+            journal
+                .publish_batch(vec![raw_put(&journal, sequence, &payload)])
+                .unwrap();
+        }
+        let cut = media.power_cut();
+        cut.tear_log_byte(log_position(&journal, 1) + 5);
+        drop(journal);
+
+        let error = cut.open().map(drop).unwrap_err();
+        assert!(
+            crate::operator_required::requires_operator(error.as_ref()),
+            "{error:#}"
+        );
+        let read = cut.legacy_database().begin_read().unwrap();
+        assert_eq!(
+            read_required::<u64>(&read.open_table(META).unwrap(), LOCAL_SEQ_KEY).unwrap(),
+            3
+        );
+        assert_eq!(read.open_table(MUTATIONS).unwrap().len().unwrap(), 3);
+    }
+
+    /// Payload bytes written before a cut, with no commit recording them,
+    /// are free space: nothing replays them and the next batch reuses them.
+    #[test]
+    fn payload_bytes_without_their_commit_are_not_replayed() {
+        let media = RawMedia::provision(64 << 20);
+        let journal = media.open().unwrap();
+        let first = raw_payload(1, 300_000);
+        journal
+            .publish_batch(vec![raw_put(&journal, 1, &first)])
+            .unwrap();
+        let lost = VerifiedPayload::new(Bytes::from(raw_payload(2, 300_000)));
+        journal.raw_log().unwrap().stage([&lost]).unwrap();
+        let cut = media.power_cut();
+        drop(journal);
+
+        let journal = cut.open().unwrap();
+        assert_eq!(journal.progress().unwrap().local_seq, 1);
+        assert!(journal.mutation(2).unwrap().is_none());
+        let second = raw_payload(3, 100_000);
+        journal
+            .publish_batch(vec![raw_put(&journal, 2, &second)])
+            .unwrap();
+        assert_journal_payload(&journal, 1, &first);
+        assert_journal_payload(&journal, 2, &second);
+    }
+
+    /// A batch's payload is written while the batch before it commits. Only
+    /// its own commit acknowledges it, whatever a power cut finds in the log.
+    #[test]
+    fn a_staged_raw_batch_is_replayed_only_after_its_own_commit() {
+        let media = RawMedia::provision(64 << 20);
+        let journal = media.open().unwrap();
+        let payloads = [raw_payload(1, 300_000), raw_payload(2, 300_000)];
+        let first = journal
+            .stage_batch(vec![raw_put(&journal, 1, &payloads[0])], 1)
+            .unwrap();
+        let second = journal
+            .stage_batch(vec![raw_put(&journal, 2, &payloads[1])], 2)
+            .unwrap();
+        assert_eq!(
+            media
+                .power_cut()
+                .open()
+                .unwrap()
+                .progress()
+                .unwrap()
+                .local_seq,
+            0
+        );
+
+        journal.commit_staged(first).unwrap();
+        let cut = media.power_cut().open().unwrap();
+        assert_eq!(cut.progress().unwrap().local_seq, 1);
+        assert_journal_payload(&cut, 1, &payloads[0]);
+        assert!(cut.mutation(2).unwrap().is_none());
+
+        journal.commit_staged(second).unwrap();
+        let cut = media.power_cut().open().unwrap();
+        assert_eq!(cut.progress().unwrap().local_seq, 2);
+        for sequence in 1..=2 {
+            assert_journal_payload(&cut, sequence, &payloads[sequence as usize - 1]);
+        }
+    }
+
+    /// A staged batch that will never commit gives its log bytes back.
+    #[test]
+    fn a_discarded_raw_batch_frees_its_log_bytes() {
+        let media = RawMedia::provision(16 << 20);
+        let journal = media.open().unwrap();
+        let free = journal.raw_available_space().unwrap();
+        let abandoned = journal
+            .stage_batch(vec![raw_put(&journal, 1, &raw_payload(1, 3 << 20))], 1)
+            .unwrap();
+        assert!(journal.raw_available_space().unwrap() <= free - (3 << 20));
+        journal.discard_staged(abandoned).unwrap();
+        assert_eq!(journal.raw_available_space().unwrap(), free);
+
+        let kept = raw_payload(2, 3 << 20);
+        journal
+            .publish_batch(vec![raw_put(&journal, 1, &kept)])
+            .unwrap();
+        assert_eq!(log_position(&journal, 1), 0);
+        assert_journal_payload(&journal, 1, &kept);
+    }
+
+    /// Draining frees log space from the tail. The log wraps over it many
+    /// times and every payload still pending reads back, also after a cut.
+    #[test]
+    fn drained_log_space_is_reused_across_wraps_and_survives_a_power_cut() {
+        const PAYLOAD: usize = 1 << 20;
+        const ROUNDS: u64 = 40;
+        let media = RawMedia::provision(16 << 20);
+        assert!(ROUNDS * PAYLOAD as u64 > 4 * media.log_bytes());
+        let journal = media.open().unwrap();
+        for sequence in 1..=ROUNDS {
+            let payload = raw_payload(sequence, PAYLOAD);
+            journal
+                .publish_batch(vec![raw_put(&journal, sequence, &payload)])
+                .unwrap();
+            // Two payloads stay pending behind the head.
+            if sequence > 2 {
+                journal.mark_remote(sequence - 2, None).unwrap();
+                journal.remove_remote_prefix(sequence - 2).unwrap();
+            }
+            for pending in sequence.saturating_sub(1).max(1)..=sequence {
+                assert_journal_payload(&journal, pending, &raw_payload(pending, PAYLOAD));
+            }
+        }
+        assert!(log_position(&journal, ROUNDS) > 4 * media.log_bytes());
+        let cut = media.power_cut();
+        drop(journal);
+
+        let journal = cut.open().unwrap();
+        let progress = journal.progress().unwrap();
+        assert_eq!(
+            (progress.remote_seq, progress.local_seq),
+            (ROUNDS - 2, ROUNDS)
+        );
+        for pending in ROUNDS - 1..=ROUNDS {
+            assert_journal_payload(&journal, pending, &raw_payload(pending, PAYLOAD));
+        }
+    }
+
+    /// A full log refuses the batch and damages nothing it holds. Draining
+    /// makes room again.
+    #[test]
+    fn a_full_payload_log_refuses_the_batch_and_keeps_what_it_holds() {
+        const PAYLOAD: usize = 1 << 20;
+        let media = RawMedia::provision(16 << 20);
+        let journal = media.open().unwrap();
+        let fits = media.log_bytes() / PAYLOAD as u64;
+        for sequence in 1..=fits {
+            journal
+                .publish_batch(vec![raw_put(
+                    &journal,
+                    sequence,
+                    &raw_payload(sequence, PAYLOAD),
+                )])
+                .unwrap();
+        }
+        assert!(journal.raw_available_space().unwrap() < PAYLOAD as u64);
+        let refused = raw_payload(fits + 1, PAYLOAD);
+        let error = journal
+            .publish_batch(vec![raw_put(&journal, fits + 1, &refused)])
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().map(|e| e.kind()),
+            Some(std::io::ErrorKind::StorageFull),
+            "{error:#}"
+        );
+        assert_eq!(journal.progress().unwrap().local_seq, fits);
+        for sequence in 1..=fits {
+            assert_journal_payload(&journal, sequence, &raw_payload(sequence, PAYLOAD));
+        }
+
+        journal.mark_remote(1, None).unwrap();
+        journal.remove_remote_prefix(1).unwrap();
+        journal
+            .publish_batch(vec![raw_put(&journal, fits + 1, &refused)])
+            .unwrap();
+        assert_journal_payload(&journal, fits + 1, &refused);
+        drop(journal);
+        let journal = media.open().unwrap();
+        assert_eq!(journal.progress().unwrap().local_seq, fits + 1);
+        assert_journal_payload(&journal, 2, &raw_payload(2, PAYLOAD));
+    }
+
+    /// A reader holds its payload's log space after the drain retires the
+    /// record. New batches cannot write over it until the reader is done.
+    #[tokio::test]
+    async fn a_reader_keeps_its_payload_while_the_log_reclaims_around_it() {
+        const PAYLOAD: usize = 1 << 20;
+        let media = RawMedia::provision(16 << 20);
+        let journal = media.open().unwrap();
+        let held = raw_payload(1, PAYLOAD);
+        journal
+            .publish_batch(vec![raw_put(&journal, 1, &held)])
+            .unwrap();
+        let blob = journal.open_verified_blob(1).unwrap();
+        journal.mark_remote(1, None).unwrap();
+        journal.remove_remote_prefix(1).unwrap();
+
+        let mut sequence = 1;
+        let error = loop {
+            sequence += 1;
+            let payload = raw_payload(sequence, PAYLOAD);
+            match journal.publish_batch(vec![raw_put(&journal, sequence, &payload)]) {
+                Ok(_) => {
+                    journal.mark_remote(sequence, None).unwrap();
+                    journal.remove_remote_prefix(sequence).unwrap();
+                }
+                Err(error) => break error,
+            }
+            assert!(sequence < 64, "the pinned payload never held the log back");
+        };
+        assert!(format!("{error:#}").contains("log is full"), "{error:#}");
+        let read = blob
+            .range_stream(0..PAYLOAD as u64, 256 << 10)
+            .unwrap()
+            .map(|chunk| chunk.unwrap())
+            .collect::<Vec<_>>()
+            .await
+            .concat();
+        assert_eq!(read, held);
+
+        drop(blob);
+        let payload = raw_payload(sequence, PAYLOAD);
+        journal
+            .publish_batch(vec![raw_put(&journal, sequence, &payload)])
+            .unwrap();
+        assert_journal_payload(&journal, sequence, &payload);
+    }
+
+    /// Payloads an earlier engine left as redb chunk rows still replay, beside
+    /// new ones in the log, and draining deletes their rows.
+    #[test]
+    fn payloads_left_in_redb_by_an_earlier_engine_replay_and_drain() {
+        let media = RawMedia::provision(64 << 20);
+        drop(media.open().unwrap());
+        let old = raw_payload(1, 150_000);
+        let database = media.legacy_database();
+        legacy_raw_put(&database, 1, &old);
+        drop(database);
+
+        let journal = media.open().unwrap();
+        assert_journal_payload(&journal, 1, &old);
+        assert_eq!(chunk_rows(&journal), 3);
+        let new = raw_payload(2, 150_000);
+        journal
+            .publish_batch(vec![raw_put(&journal, 2, &new)])
+            .unwrap();
+        assert_eq!(chunk_rows(&journal), 3);
+        drop(journal);
+
+        let journal = media.open().unwrap();
+        assert_journal_payload(&journal, 1, &old);
+        assert_journal_payload(&journal, 2, &new);
+        journal.mark_remote(1, None).unwrap();
+        journal.remove_remote_prefix(1).unwrap();
+        assert_eq!(chunk_rows(&journal), 0);
+        assert_journal_payload(&journal, 2, &new);
+    }
+
+    /// An earlier engine's redb file can end above where the payload log now
+    /// begins. Opening moves its pages down first and keeps its payloads.
+    #[test]
+    fn a_database_an_earlier_engine_grew_into_the_log_is_compacted_on_open() {
+        const PAYLOAD: usize = 1 << 20;
+        const ROWS: u64 = 26;
+        // redb doubles its file, here to 32 MiB of a 48 MiB region, and the
+        // last payload lands above the 24 MiB the file now has.
+        let media = RawMedia::provision(48 << 20);
+        drop(media.open().unwrap());
+        let database = media.legacy_database();
+        for sequence in 1..=ROWS {
+            legacy_raw_put(&database, sequence, &raw_payload(sequence, PAYLOAD));
+        }
+        let write = database.begin_write().unwrap();
+        {
+            let mut meta = write.open_table(META).unwrap();
+            write_value(&mut meta, REMOTE_SEQ_KEY, &(ROWS - 1)).unwrap();
+            write
+                .open_table(MUTATIONS)
+                .unwrap()
+                .retain_in(..ROWS, |_, _| false)
+                .unwrap();
+            write
+                .open_table(super::raw_payload::PAYLOADS)
+                .unwrap()
+                .retain_in(..(ROWS, 0), |_, _| false)
+                .unwrap();
+        }
+        write.commit().unwrap();
+        drop(database);
+        let ceiling = media.region().capacity() - media.log_bytes();
+        let grown = media.region().len().unwrap();
+        assert!(grown > ceiling, "{grown} is not above {ceiling}");
+
+        let foreign = JournalIdentity {
+            backend_kind: "raw".to_owned(),
+            ..identity("another-bucket")
+        };
+        let error = Journal::open_raw(media.region(), foreign)
+            .map(drop)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("identity mismatch"),
+            "{error:#}"
+        );
+        assert_eq!(media.region().len().unwrap(), grown);
+
+        let journal = media.open().unwrap();
+        assert!(media.region().len().unwrap() <= ceiling);
+        assert_journal_payload(&journal, ROWS, &raw_payload(ROWS, PAYLOAD));
+        let new = raw_payload(ROWS + 1, PAYLOAD);
+        journal
+            .publish_batch(vec![raw_put(&journal, ROWS + 1, &new)])
+            .unwrap();
+        assert_journal_payload(&journal, ROWS + 1, &new);
+    }
+
     #[test]
     fn raw_prefix_retirement_needs_no_flush_and_a_power_cut_keeps_every_acknowledged_put() {
-        use crate::raw_database::RawDatabase;
-        use zerofs_raw_device::{Identity, Role, journal_region::TransactionRegion};
-
-        const CAPACITY: u64 = 64 << 20;
-        const ID: Identity = Identity {
-            pool_uuid: [5; 16],
-            member_uuid: [6; 16],
-            role: Role::Journal,
-        };
-        let open_region = |file: &fs::File| {
-            let region =
-                TransactionRegion::open(file.try_clone().unwrap(), CAPACITY, 0, CAPACITY, ID)
-                    .unwrap();
-            let ceiling = region.capacity() - (2 << 20);
-            region.with_resize_ceiling(ceiling).unwrap()
-        };
-        let raw_identity = JournalIdentity {
-            backend_kind: "raw".to_owned(),
-            ..identity("raw-bucket")
-        };
-        let file = tempfile::tempfile().unwrap();
-        file.set_len(CAPACITY).unwrap();
-        TransactionRegion::provision(file.try_clone().unwrap(), CAPACITY, 0, CAPACITY, ID).unwrap();
-        let journal = Journal::open_raw(open_region(&file), raw_identity.clone()).unwrap();
+        let media = RawMedia::provision(64 << 20);
+        let journal = media.open().unwrap();
         let payloads = (1..=5_u8)
             .map(|byte| vec![byte; 200 << 10])
             .collect::<Vec<_>>();
-        let prepare = |sequence: u64| {
-            let bytes = &payloads[sequence as usize - 1];
-            journal
-                .prepare_verified_put(
-                    put_record(sequence, &format!("segments/{sequence}"), bytes),
-                    &VerifiedPayload::new(Bytes::copy_from_slice(bytes)),
-                )
-                .unwrap()
-        };
+        let prepare = |sequence: u64| raw_put(&journal, sequence, &payloads[sequence as usize - 1]);
 
         // One group commit acknowledges four puts.
         journal
@@ -7527,16 +8209,14 @@ mod tests {
             .unwrap();
         journal.mark_remote_batch(&[(1, None), (2, None)]).unwrap();
         journal.remove_remote_prefix(2).unwrap();
-        let before_next_commit = power_cut_copy(&file);
+        let before_next_commit = media.power_cut();
         journal.publish_batch(vec![prepare(5)]).unwrap();
-        let after_next_commit = power_cut_copy(&file);
+        let after_next_commit = media.power_cut();
         assert!(journal.mutation(2).unwrap().is_none());
         drop(journal);
 
-        let durable_rows = |media: &fs::File| {
-            let database = redb::Builder::new()
-                .create_with_backend(RawDatabase(open_region(media)))
-                .unwrap();
+        let durable_rows = |media: &RawMedia| {
+            let database = media.power_cut().legacy_database();
             let read = database.begin_read().unwrap();
             let table = read.open_table(MUTATIONS).unwrap();
             table
@@ -7547,14 +8227,11 @@ mod tests {
         };
         // The retirement wrote no barrier: a cut before the next commit
         // still holds the retired rows, and that commit made it durable.
-        assert_eq!(
-            durable_rows(&power_cut_copy(&before_next_commit)),
-            [1, 2, 3, 4]
-        );
-        assert_eq!(durable_rows(&power_cut_copy(&after_next_commit)), [3, 4, 5]);
+        assert_eq!(durable_rows(&before_next_commit), [1, 2, 3, 4]);
+        assert_eq!(durable_rows(&after_next_commit), [3, 4, 5]);
 
         for (media, local_seq) in [(before_next_commit, 4), (after_next_commit, 5)] {
-            let journal = Journal::open_raw(open_region(&media), raw_identity.clone()).unwrap();
+            let journal = media.open().unwrap();
             let progress = journal.progress().unwrap();
             assert_eq!((progress.remote_seq, progress.local_seq), (2, local_seq));
             assert!(journal.mutation(1).unwrap().is_none());

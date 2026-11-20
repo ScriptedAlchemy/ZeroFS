@@ -38,8 +38,11 @@ PUT_DELAY_MS = 200
 P3_LAYOUT = "61440,128,3072,16,32,848"
 JOURNAL_BUDGET = 10 * GIB
 JOURNAL_HEADERS = 2 * RAW_BLOCK
-JOURNAL_PHYSICAL_RESERVE = 4 * GIB
-JOURNAL_RESIZE_CEILING = int(P3_LAYOUT.split(',')[0]) * MIB - JOURNAL_HEADERS - JOURNAL_PHYSICAL_RESERVE
+JOURNAL_MIN_FREE = 4 * GIB
+JOURNAL_CAPACITY = int(P3_LAYOUT.split(',')[0]) * MIB - JOURNAL_HEADERS
+# The redb file holds the records in the lower half. The upper half is the payload log.
+JOURNAL_RESIZE_CEILING = JOURNAL_CAPACITY // 2 // RAW_BLOCK * RAW_BLOCK
+JOURNAL_PAYLOAD_LOG = JOURNAL_CAPACITY - JOURNAL_RESIZE_CEILING
 SIZES = {"p3": 64 * GIB, "small": 12 * GIB, "large": 16 * GIB}
 RESERVE = 256 * MIB
 WRITEBACK = "zerofs_writeback_"
@@ -210,7 +213,7 @@ def config(root, template, devices, *, held=False):
     root.mkdir()
     (root / "mount").mkdir()
     parsed = tomllib.loads(template)
-    assert int(parsed["writeback"]["min_free_gb"] * 1e9) == JOURNAL_PHYSICAL_RESERVE
+    assert int(parsed["writeback"]["min_free_gb"] * 1e9) == JOURNAL_MIN_FREE
     replacements = {
         parsed["cache"]["dir"]: str(root / "unused-clean-cache"),
         parsed["writeback"]["dir"]: str(root / "unused-directory-journal"),
@@ -429,14 +432,17 @@ def check_readiness(configuration, pool, phase, *, minimum_remote_sequence=0, he
     assert result["memory"]["included_companion_bytes"] == COMPANION, result
     assert result["memory"]["hard_limit_bytes"] == MEMORY_LIMIT, result
     allocation = result["journal_allocation"]
-    assert allocation["region_data_capacity_bytes"] == JOURNAL_RESIZE_CEILING + JOURNAL_PHYSICAL_RESERVE
+    assert allocation["region_data_capacity_bytes"] == JOURNAL_CAPACITY
     assert allocation["resize_ceiling_bytes"] == JOURNAL_RESIZE_CEILING
-    assert allocation["physical_reserve_bytes"] == JOURNAL_PHYSICAL_RESERVE
+    assert allocation["physical_reserve_bytes"] == JOURNAL_PAYLOAD_LOG
+    assert JOURNAL_BUDGET + JOURNAL_MIN_FREE <= JOURNAL_PAYLOAD_LOG
     allocated_pages_bytes = allocation["allocated_pages"] * allocation["page_size_bytes"]
     assert 0 < allocated_pages_bytes <= allocation["database_length_bytes"] <= JOURNAL_RESIZE_CEILING
     if held:
         assert 0 < result["remote_seq"] < result["local_seq"], result
-        assert PAYLOAD <= allocation["dirty_blob_bytes"] <= allocation["stored_key_value_bytes"]
+        assert PAYLOAD <= allocation["dirty_blob_bytes"] <= allocation["payload_log_held_bytes"]
+        # The payload is in the log once. redb holds only the records.
+        assert allocation["stored_key_value_bytes"] < PAYLOAD // 64
         assert allocation["dirty_blob_bytes"] + allocation["dirty_metadata_reserved_bytes"] <= JOURNAL_BUDGET
     assert minimum_remote_sequence <= result["remote_seq"] <= result["local_seq"], result
     record("offline_readiness", phase=phase, allocated_pages_bytes=allocated_pages_bytes, **result)
@@ -529,7 +535,7 @@ def qualify(root, devices, source, empty_headers):
         copy_file(source, path, crash=server)
         sample_cgroup("held_copy_killed")
     held = inspect_p3(devices["p3"], "after_held_crash")
-    assert PAYLOAD <= held["journal_bytes"], held
+    assert 0 < held["journal_bytes"], held
     post_crash, after_entries = snapshot(configs["held_replay"], "after_held_crash")
     assert not after_entries and all(post_crash[m]["space"] == baseline[m]["space"] for m in baseline)
 

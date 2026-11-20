@@ -100,13 +100,15 @@ trait LocalJournalSink: Send + Sync + 'static {
             .collect()
     }
 
-    /// Whether `stage_batch` writes payload bytes ahead of the commit.
+    /// How many batches `stage_batch` may write payload bytes for at once,
+    /// ahead of their commits.
     ///
-    /// A sink that stages nothing gains no overlap from assembling a batch
-    /// early. The drain then waits for the commit half to go idle and hands
-    /// it every ready record at once, so one durable commit covers them all.
-    fn stages_payloads(&self) -> bool {
-        false
+    /// A sink that stages nothing returns 0 and gains no overlap from
+    /// assembling a batch early. The drain then waits for the commit half to
+    /// go idle and hands it every ready record at once, so one durable commit
+    /// covers them all.
+    fn staging_writers(&self) -> usize {
+        0
     }
 
     /// Make a batch's payload bytes durable without publishing anything.
@@ -125,8 +127,8 @@ trait LocalJournalSink: Send + Sync + 'static {
     fn commit_staged(&self, staged: StagedBatch) -> AnyResult<Vec<MutationRecord>> {
         match staged {
             StagedBatch::Unstaged(prepared) => self.publish_batch(prepared),
-            StagedBatch::Durable { .. } => {
-                anyhow::bail!("sink cannot commit a durably staged batch")
+            StagedBatch::Durable { .. } | StagedBatch::Logged { .. } => {
+                anyhow::bail!("sink cannot commit a staged batch")
             }
         }
     }
@@ -139,8 +141,8 @@ trait LocalJournalSink: Send + Sync + 'static {
                 }
                 Ok(())
             }
-            StagedBatch::Durable { .. } => {
-                anyhow::bail!("sink cannot discard a durably staged batch")
+            StagedBatch::Durable { .. } | StagedBatch::Logged { .. } => {
+                anyhow::bail!("sink cannot discard a staged batch")
             }
         }
     }
@@ -180,8 +182,14 @@ impl LocalJournalSink for Journal {
         Journal::publish_batch(self, prepared)
     }
 
-    fn stages_payloads(&self) -> bool {
-        !self.is_raw()
+    fn staging_writers(&self) -> usize {
+        if self.is_raw() {
+            // The payload log is one sequential stream, written in commit
+            // order: one batch stages while the batch before it commits.
+            1
+        } else {
+            MAX_CONCURRENT_CONTAINER_WRITES
+        }
     }
 
     fn stage_batch(
@@ -238,13 +246,6 @@ const MAX_LOCAL_PUBLISH_BATCH_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 // to four is worth roughly another 8% at the cost of holding four containers'
 // payloads (256 MiB at the current batch cap) inside the admission budget.
 const MAX_CONCURRENT_CONTAINER_WRITES: usize = 2;
-// Total batches between assembly and commit. Without this the drain would
-// assemble as fast as records arrive and publish them one or two at a time;
-// letting only one batch queue behind the writers is what makes the backlog
-// accumulate into large containers under load, which is where the container's
-// amortization comes from.
-const MAX_IN_FLIGHT_PUBLICATION_BATCHES: usize = MAX_CONCURRENT_CONTAINER_WRITES + 1;
-
 #[derive(Clone)]
 pub struct LocalJournaler {
     inner: Arc<LocalJournalerInner>,
@@ -1013,12 +1014,11 @@ async fn run_journaler(
     } = ownership;
     let prepare_concurrency = prepare_concurrency.max(1);
     // A sink that stages nothing assembles only into an idle pipeline, so
-    // records arriving during a commit join the next one.
-    let in_flight_limit = if sink.stages_payloads() {
-        MAX_IN_FLIGHT_PUBLICATION_BATCHES
-    } else {
-        1
-    };
+    // records arriving during a commit join the next one. Otherwise only one
+    // batch queues behind the writers: that is what lets a backlog collect
+    // into large batches under load.
+    let staging_writers = sink.staging_writers();
+    let in_flight_limit = staging_writers + 1;
     let mut next_admitted = local_sequence.saturating_add(1);
     let mut next_received = local_sequence.checked_add(1);
     let mut preparations: FuturesUnordered<JoinHandle<Preparation>> = FuturesUnordered::new();
@@ -1082,7 +1082,7 @@ async fn run_journaler(
         // sequence ranges, so the writes are independent; only the commits are
         // ordered.
         while terminal.is_none()
-            && staging.len() < MAX_CONCURRENT_CONTAINER_WRITES
+            && staging.len() < staging_writers.max(1)
             && staging.len() + ready.len() + usize::from(committing.is_some()) < in_flight_limit
         {
             match assemble_batch(&mut prepared, next_admitted) {
@@ -1565,8 +1565,8 @@ mod tests {
             self.journal.publish_prepared(prepared)
         }
 
-        fn stages_payloads(&self) -> bool {
-            self.journal.stages_payloads()
+        fn staging_writers(&self) -> usize {
+            self.journal.staging_writers()
         }
 
         fn stage_batch(
@@ -2976,7 +2976,7 @@ mod tests {
             publish_release: Mutex::new(Some(release_rx)),
             published_batches: Mutex::new(Vec::new()),
         });
-        assert!(!sink.stages_payloads());
+        assert_eq!(sink.staging_writers(), 0);
         let journaler = LocalJournaler::start_with_sink_and_observer(
             sink.clone(),
             admission.clone(),

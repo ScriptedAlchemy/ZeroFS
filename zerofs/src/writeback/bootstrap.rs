@@ -5,7 +5,6 @@ use crate::writeback::model::JournalIdentity;
 use crate::writeback::reservation::SsdAdmission;
 use crate::writeback::space_sample::PhysicalSpaceSampler;
 use crate::writeback::store::WritebackObjectStore;
-use anyhow::Context;
 use object_store::ObjectStore;
 use std::sync::Arc;
 
@@ -49,7 +48,7 @@ pub(crate) async fn attach_raw(
 ) -> anyhow::Result<AttachedWriteback> {
     validate_raw_namespace(&settings, namespace)?;
 
-    let region = apply_raw_budget(region, &settings)?;
+    validate_raw_budget(&region, &settings)?;
     let journal = Arc::new(Journal::open_raw(region, identity)?);
     let space = Arc::new(PhysicalSpaceSampler::new_raw(Arc::clone(&journal)));
     tracing::info!("using raw P3 Journal for writeback metadata and payloads");
@@ -74,21 +73,21 @@ pub(crate) fn validate_raw_namespace(
     }
 }
 
-pub(crate) fn apply_raw_budget(
-    region: zerofs_raw_device::journal_region::TransactionRegion,
+/// Check that the payload log holds the whole dirty budget and the free
+/// space SSD admission keeps beside it.
+pub(crate) fn validate_raw_budget(
+    region: &zerofs_raw_device::journal_region::TransactionRegion,
     settings: &WritebackSettings,
-) -> anyhow::Result<zerofs_raw_device::journal_region::TransactionRegion> {
-    let capacity = region.capacity();
-    let ceiling = capacity
-        .checked_sub(settings.min_free_bytes)
-        .context("raw writeback free-space reserve exceeds P3 Journal capacity")?;
-    // Leave room below the hard ceiling for geometric allocator growth,
-    // copy-on-write metadata, and pages pinned by older replay readers.
+) -> anyhow::Result<()> {
+    let log_bytes = Journal::raw_payload_log_bytes(region);
     anyhow::ensure!(
-        settings.disk_bytes <= ceiling / 4,
-        "raw writeback disk budget exceeds one quarter of the usable P3 Journal bytes ({ceiling})"
+        settings
+            .disk_bytes
+            .checked_add(settings.min_free_bytes)
+            .is_some_and(|needed| needed <= log_bytes),
+        "raw writeback disk budget and free-space reserve exceed the {log_bytes}-byte P3 Journal payload log"
     );
-    Ok(region.with_resize_ceiling(ceiling)?)
+    Ok(())
 }
 
 async fn attach_journal(
@@ -268,9 +267,6 @@ mod tests {
         );
 
         let region = TransactionRegion::open(file, CAPACITY, 0, CAPACITY, ID).unwrap();
-        let ceiling = region.capacity() - settings.min_free_bytes;
-        assert!(region.len().unwrap() <= ceiling);
-        let region = region.with_resize_ceiling(ceiling).unwrap();
         let journal = super::Journal::open_raw(region, identity).unwrap();
         assert_eq!(journal.progress().unwrap().remote_seq, 1);
         assert!(journal.mutation(1).unwrap().is_none());
