@@ -142,6 +142,9 @@ pub(crate) struct SurvivalMember {
     /// The label binding `RawStore::open` verified: pool and member UUID.
     pub identity: String,
     pub store: Arc<dyn ObjectStore>,
+    /// The pool whose admission ledger every survival PUT goes through.
+    /// `None` offline, where no pool is open to have promised room.
+    pub pool: Option<PoolObjectStore>,
     /// False when the device did not answer at startup.
     pub available: bool,
 }
@@ -162,6 +165,7 @@ impl PoolObjectStore {
                 id: member.id.clone(),
                 identity: member.identity.clone(),
                 store: Arc::clone(&member.store),
+                pool: Some(self.clone()),
                 available: self.inner.unavailable.as_deref() != Some(member.id.as_str()),
             })
             .collect()

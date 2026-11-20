@@ -17,6 +17,10 @@ use crate::fault_store::native_errno::{self, Armed, Operation};
 use crate::frame_codec::FrameCodec;
 use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
+use crate::fs::mutation::config::{
+    ClientDurabilityTarget, FilesystemWriteAckMode, FilesystemWriteAckSettings,
+    FilesystemWriteAckSource,
+};
 use crate::fs::permissions::Credentials;
 use crate::fs::types::{AuthContext, SetAttributes};
 use crate::pool_object_store::{FilesystemSpace, FreeSpace, PoolMember, PoolObjectStore};
@@ -111,6 +115,7 @@ struct Fixture {
     _root: tempfile::TempDir,
     fs: Arc<ZeroFS>,
     pool: PoolObjectStore,
+    writeback: Option<crate::writeback::store::WritebackObjectStore>,
     a: Member,
     b: Member,
     profile: StoreProfile,
@@ -185,7 +190,26 @@ fn small_segments() -> StoreProfile {
     }
 }
 
+/// How the filesystem above the pool acknowledges and publishes writes.
+#[derive(Clone, Copy, Default)]
+struct Setup {
+    /// `None` keeps the default materialized acknowledgement.
+    write_ack: Option<FilesystemWriteAckSettings>,
+    /// Put a writeback journal between the filesystem and the pool, as the
+    /// NAS package does.
+    writeback: bool,
+}
+
 async fn fixture(a: (u64, Kind), b: (u64, Kind), profile: StoreProfile) -> Fixture {
+    fixture_with(a, b, profile, Setup::default()).await
+}
+
+async fn fixture_with(
+    a: (u64, Kind),
+    b: (u64, Kind),
+    profile: StoreProfile,
+    setup: Setup,
+) -> Fixture {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("authority")).unwrap();
     let authority: Arc<dyn ObjectStore> = Arc::new(object_store::prefix::PrefixStore::new(
@@ -203,9 +227,38 @@ async fn fixture(a: (u64, Kind), b: (u64, Kind), profile: StoreProfile) -> Fixtu
     .await
     .unwrap();
     // The production stack: the retry layer sits above the pool.
-    let store: Arc<dyn ObjectStore> = Arc::new(
+    let mut store: Arc<dyn ObjectStore> = Arc::new(
         crate::retrying_object_store::RetryingObjectStore::new(Arc::new(pool.clone())),
     );
+    let mut writeback = None;
+    if setup.writeback {
+        let settings = crate::writeback::config::WritebackSettings {
+            dir: root.path().canonicalize().unwrap().join("journal"),
+            ack_mode: crate::writeback::config::AckMode::Memory,
+            memory_bytes: 64 * MIB,
+            disk_bytes: 512 * MIB,
+            min_free_bytes: 1,
+            high_watermark_percent: 95,
+            resume_percent: 85,
+            upload_concurrency: 2,
+            local_concurrency: 1,
+            shutdown_flush: crate::writeback::config::ShutdownFlush::Local,
+        };
+        let identity = crate::writeback::model::JournalIdentity {
+            format_version: 1,
+            bucket_id: "full-pool".into(),
+            backend_endpoint: "pool://full-pool".into(),
+            database_prefix: "db".into(),
+            backend_kind: "pool".into(),
+            encryption_key_identity_sha256: [0x52; 32],
+        };
+        let attached = crate::writeback::bootstrap::attach(store, settings, identity, "full-pool")
+            .await
+            .unwrap();
+        attached.lifecycle.set_pool(pool.clone()).await.unwrap();
+        store = attached.store;
+        writeback = Some(attached.lifecycle);
+    }
     let key = [0x52; 32];
     let transformer: Arc<dyn BlockTransformer> =
         ZeroFsBlockTransformer::new_arc(&key, CompressionConfig::default());
@@ -222,7 +275,7 @@ async fn fixture(a: (u64, Kind), b: (u64, Kind), profile: StoreProfile) -> Fixtu
         store,
         Path::from("db"),
     ));
-    let fs = ZeroFS::new_with_slatedb_and_lease(
+    let mut fs = ZeroFS::new_with_slatedb_and_lease(
         SlateDbHandle::ReadWrite(db),
         u64::MAX,
         None,
@@ -245,13 +298,22 @@ async fn fixture(a: (u64, Kind), b: (u64, Kind), profile: StoreProfile) -> Fixtu
     )
     .await
     .unwrap();
+    if let Some(write_ack) = setup.write_ack {
+        fs.write_ack = write_ack;
+    }
+    // As the server wires it: every WRITE claims room in the pool.
+    fs.extent_store.set_admission(pool.clone());
     let fs = Arc::new(fs);
     fs.install_volatile_overlay();
     fs.start_materializer();
+    if let Some(writeback) = &writeback {
+        writeback.activate_remote().unwrap();
+    }
     Fixture {
         _root: root,
         fs,
         pool,
+        writeback,
         a,
         b,
         profile,
@@ -435,33 +497,25 @@ async fn a_member_whose_write_returns_enospc_is_skipped_within_the_same_flush() 
     .await;
 }
 
-/// What [`run_out_of_room`] left behind.
+/// What [`refuse_admitted_writes`] left behind.
 struct Filled {
     /// A file written while the pool was full, and the bytes it should hold.
     after: u64,
     after_data: Bytes,
-    /// Member write attempts when the pool filled.
-    attempts: (usize, usize),
 }
 
-/// Fill the pool so no member has room, then write and fsync again and again.
-async fn run_out_of_room(test: &str, f: &Fixture, how: Fill) -> Filled {
+/// Every member still reports room but refuses writes with a native ENOSPC,
+/// as another writer on the same filesystem can make it. Writes admitted
+/// before the refusal stay in memory: each fsync answers ENOSPC, the retained
+/// bytes stay bounded, and the next WRITE is refused.
+async fn refuse_admitted_writes(test: &str, f: &Fixture) -> Filled {
     let before = create(&f.fs, "before.bin").await;
     let before_data = payload(10, 3 * MIB);
     write(test, &f.fs, before, &before_data).await.unwrap();
     fsync(test, &f.fs, before).await.unwrap();
 
-    match how {
-        Fill::NativeEnospc => {
-            f.a.fill();
-            f.b.fill();
-        }
-        Fill::BelowReserve => {
-            f.a.set_available(RESERVE / 2);
-            f.b.set_available(RESERVE / 2);
-        }
-    }
-    let attempts = (f.a.attempts(), f.b.attempts());
+    f.a.fill();
+    f.b.fill();
     let after = create(&f.fs, "after.bin").await;
     let after_data = payload(11, 32 * MIB);
     match write(test, &f.fs, after, &after_data).await {
@@ -492,20 +546,14 @@ async fn run_out_of_room(test: &str, f: &Fixture, how: Fill) -> Filled {
         read(&f.fs, before, before_data.len() as u64).await,
         before_data
     );
-    Filled {
-        after,
-        after_data,
-        attempts,
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Fill {
-    /// Writes return ENOSPC while the filesystem still claims room.
-    NativeEnospc,
-    /// The filesystem reports free space below the member's reserve, as an
-    /// 8 MiB dataset behind a 6,001 GB declaration does.
-    BelowReserve,
+    // Both members are now marked full, so a new WRITE is refused at once.
+    let refused = create(&f.fs, "refused.bin").await;
+    assert_eq!(
+        write(test, &f.fs, refused, &payload(12, MIB)).await,
+        Err(FsError::NoSpace),
+        "{test}: a WRITE after both members refused writes"
+    );
+    Filled { after, after_data }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -518,7 +566,7 @@ async fn when_writes_return_enospc_everywhere_fsync_reports_enospc_within_the_bo
             small_segments(),
         )
         .await;
-        run_out_of_room(test, &f, Fill::NativeEnospc).await;
+        refuse_admitted_writes(test, &f).await;
         let report = status(&f.pool).await;
         for member in report["members"].as_array().unwrap() {
             assert_eq!(member["space"]["full"]["reason"], "write_returned_no_space");
@@ -528,8 +576,11 @@ async fn when_writes_return_enospc_everywhere_fsync_reports_enospc_within_the_bo
     .await;
 }
 
+/// The field report: every member's filesystem is below its reserve, as an
+/// 8 MiB dataset behind a 6,001 GB declaration is. The WRITE itself answers
+/// ENOSPC, nothing waits in memory, and the next fsync succeeds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn when_real_free_space_is_below_every_reserve_fsync_reports_enospc_within_the_bound() {
+async fn when_real_free_space_is_below_every_reserve_the_write_reports_enospc() {
     deadline(async {
         let test = "all-below-reserve";
         let f = fixture(
@@ -538,10 +589,29 @@ async fn when_real_free_space_is_below_every_reserve_fsync_reports_enospc_within
             small_segments(),
         )
         .await;
-        let filled = run_out_of_room(test, &f, Fill::BelowReserve).await;
-        // Once the pool filled, placement refused both members without
-        // sending either another write.
-        assert_eq!((f.a.attempts(), f.b.attempts()), filled.attempts);
+        let before = create(&f.fs, "before.bin").await;
+        let before_data = payload(10, 3 * MIB);
+        write(test, &f.fs, before, &before_data).await.unwrap();
+        fsync(test, &f.fs, before).await.unwrap();
+
+        f.a.set_available(RESERVE / 2);
+        f.b.set_available(RESERVE / 2);
+        let attempts = (f.a.attempts(), f.b.attempts());
+        let after = create(&f.fs, "after.bin").await;
+        assert_eq!(
+            write(test, &f.fs, after, &payload(11, MIB)).await,
+            Err(FsError::NoSpace)
+        );
+        fsync(test, &f.fs, after).await.unwrap();
+        fsync(test, &f.fs, before).await.unwrap();
+        assert_eq!(f.fs.extent_store.retained_seals(), (0, 0));
+        assert_eq!(read(&f.fs, after, MIB).await, Bytes::new());
+        assert_eq!(
+            read(&f.fs, before, before_data.len() as u64).await,
+            before_data
+        );
+        // Placement refused both members without sending either a write.
+        assert_eq!((f.a.attempts(), f.b.attempts()), attempts);
         let report = status(&f.pool).await;
         for member in report["members"].as_array().unwrap() {
             assert_eq!(
@@ -565,13 +635,15 @@ async fn writes_resume_without_a_restart_when_space_returns() {
             small_segments(),
         )
         .await;
-        let Filled {
-            after, after_data, ..
-        } = run_out_of_room(test, &f, Fill::NativeEnospc).await;
-        // Space returns: the filesystem reports more free bytes than when the
-        // writes failed, and writes succeed again.
+        let Filled { after, after_data } = refuse_admitted_writes(test, &f).await;
+        // Space returns: writes stop failing, and once every write already in
+        // flight has settled, the filesystem reports more free bytes than when
+        // the writes failed. The members stay marked full until then, so this
+        // fsync answers ENOSPC; it waits out any seal still uploading, which
+        // would otherwise record the new free figure in its mark.
         f.a.make_room();
         f.b.make_room();
+        assert_eq!(fsync(test, &f.fs, after).await, Err(FsError::NoSpace));
         f.a.set_available(65 * GIB);
         f.b.set_available(65 * GIB);
         write(test, &f.fs, after, &after_data).await.unwrap();
@@ -721,7 +793,7 @@ async fn a_remote_member_without_a_free_space_source_keeps_working() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ninep_fsync_on_a_full_pool_returns_enospc_not_eio() {
+async fn ninep_write_on_a_full_pool_returns_enospc_not_eio() {
     use ninep_client::{ClientError, NOFID, NinePClient};
     deadline(async {
         let test = "ninep";
@@ -778,30 +850,444 @@ async fn ninep_fsync_on_a_full_pool_returns_enospc_not_eio() {
         f.a.set_available(RESERVE / 2);
         f.b.set_available(RESERVE / 2);
         let after = open("after.bin").await;
-        for chunk in 0..32 {
+        for chunk in 0..3 {
             let data = payload(8 + chunk, MIB);
-            bounded(
+            match bounded(
                 test,
-                "9P write 1 MiB",
+                "9P write on a full pool",
                 client.write_bytes(after, chunk * MIB, data),
             )
             .await
-            .unwrap();
-        }
-        for _ in 0..3 {
-            match bounded(test, "9P fsync on a full pool", client.fsync(after, 0)).await {
+            {
                 Err(ClientError::Errno(errno)) => {
                     assert_eq!(errno, libc::ENOSPC as u32, "full must not look broken")
                 }
-                other => panic!("9P fsync on a full pool returned {other:?}"),
+                other => panic!("9P write on a full pool returned {other:?}"),
             }
         }
+        // Nothing was accepted, so nothing waits to be flushed.
+        bounded(
+            test,
+            "9P fsync after refused writes",
+            client.fsync(after, 0),
+        )
+        .await
+        .unwrap();
         let read = client.alloc_fid();
         client.walk(attach, read, &[b"before.bin"]).await.unwrap();
         client.lopen(read, 0).await.unwrap();
         assert_eq!(
             client.read(read, 0, 2 * MIB as u32).await.unwrap(),
             before_data
+        );
+        shutdown.cancel();
+    })
+    .await;
+}
+
+/// Each member's declared capacity in the delete-and-flush tests, as in the
+/// mounted fixtures: a 24 MiB body and a 32 MiB body do not fit together.
+const QUOTA: u64 = 50_000_000;
+
+/// A pool where member-a's quota is the only room, and member-b's
+/// filesystem is below its reserve.
+async fn full_pool(setup: Setup) -> Fixture {
+    fixture_with(
+        (QUOTA, plenty()),
+        (QUOTA, local(RESERVE / 2)),
+        StoreProfile::default(),
+        setup,
+    )
+    .await
+}
+
+/// Wait until the writeback journal has placed everything it accepted.
+async fn drain(test: &str, f: &Fixture) {
+    if let Some(writeback) = &f.writeback {
+        bounded(
+            test,
+            "writeback drain",
+            writeback.wait_remote(writeback.accepted_sequence()),
+        )
+        .await
+        .unwrap();
+    }
+}
+
+fn volatile_ack() -> FilesystemWriteAckSettings {
+    FilesystemWriteAckSettings {
+        mode: FilesystemWriteAckMode::VolatileMemory,
+        volatile_memory_bytes: 16 * MIB,
+        volatile_max_operations: 128,
+        source: FilesystemWriteAckSource::Filesystem,
+        client_durability_target: ClientDurabilityTarget::LocalSsd,
+    }
+}
+
+fn used_bytes(report: &serde_json::Value, member: usize) -> u64 {
+    report["members"][member]["used_bytes"].as_u64().unwrap()
+}
+
+async fn collect_garbage(f: &Fixture, protect_before: Option<chrono::DateTime<chrono::Utc>>) {
+    crate::fs::gc::GarbageCollector::new(
+        Arc::clone(&f.fs.db),
+        f.fs.tombstone_store.clone(),
+        f.fs.extent_store.clone(),
+        Arc::clone(&f.fs.stats),
+        None,
+        Default::default(),
+    )
+    .run()
+    .await
+    .unwrap();
+    f.fs.extent_store
+        .reclaim_segments(chrono::Utc::now(), protect_before)
+        .await
+        .unwrap();
+}
+
+/// Write `data` in 1 MiB requests until one answers. Returns how many bytes
+/// were acknowledged and the answer that stopped the loop, if any.
+async fn write_until_refused(
+    test: &str,
+    fs: &ZeroFS,
+    inode: u64,
+    data: &Bytes,
+    volatile: bool,
+) -> (usize, Option<FsError>) {
+    let mut offset = 0;
+    while offset < data.len() {
+        let end = (offset + MIB as usize).min(data.len());
+        let chunk = data.slice(offset..end);
+        let result = if volatile {
+            bounded(
+                test,
+                "write 1 MiB",
+                fs.write_ack(&auth(), inode, offset as u64, &chunk),
+            )
+            .await
+        } else {
+            bounded(
+                test,
+                "write 1 MiB",
+                fs.write(&auth(), inode, offset as u64, &chunk),
+            )
+            .await
+        };
+        if let Err(error) = result {
+            return (offset, Some(error));
+        }
+        offset = end;
+    }
+    (offset, None)
+}
+
+/// The contract the mounted fixtures check. On a full pool the WRITE that
+/// cannot be placed answers ENOSPC, and the bytes acknowledged before it
+/// flush. Deleting a file then frees its room without a restart: the rest of
+/// the write is accepted and flushes.
+async fn an_unlink_makes_room_for_a_refused_write(test: &str, setup: Setup) {
+    let volatile = setup.write_ack.is_some();
+    let f = full_pool(setup).await;
+    let previous = create(&f.fs, "previous").await;
+    let previous_data = payload(30, 20);
+    write(test, &f.fs, previous, &previous_data).await.unwrap();
+    fsync(test, &f.fs, previous).await.unwrap();
+    let deleted = create(&f.fs, "delete-me").await;
+    write(test, &f.fs, deleted, &payload(31, 24 * MIB))
+        .await
+        .unwrap();
+    fsync(test, &f.fs, deleted).await.unwrap();
+
+    let replacement = create(&f.fs, "replacement").await;
+    let replacement_data = payload(32, 32 * MIB);
+    let (acknowledged, refusal) =
+        write_until_refused(test, &f.fs, replacement, &replacement_data, volatile).await;
+    assert_eq!(
+        refusal,
+        Some(FsError::NoSpace),
+        "{test}: no WRITE was refused"
+    );
+    assert!(
+        acknowledged > 0,
+        "{test}: the first WRITE was already refused"
+    );
+    // The acknowledged prefix flushes; nothing refused waits in memory, and
+    // every admitted segment is placed.
+    fsync(test, &f.fs, replacement).await.unwrap();
+    drain(test, &f).await;
+    assert_eq!(f.fs.extent_store.retained_seals(), (0, 0));
+    assert_eq!(status(&f.pool).await["members"][0]["admitted_bytes"], 0);
+    assert_eq!(
+        read(&f.fs, replacement, replacement_data.len() as u64).await,
+        replacement_data.slice(..acknowledged)
+    );
+    // The pool is still full: a retry without a deletion is refused again.
+    let (_, still) = write_until_refused(
+        test,
+        &f.fs,
+        replacement,
+        &replacement_data.slice(acknowledged..acknowledged + MIB as usize),
+        volatile,
+    )
+    .await;
+    assert_eq!(still, Some(FsError::NoSpace));
+
+    let started = Instant::now();
+    f.fs.remove(&auth(), 0, b"delete-me").await.unwrap();
+    let before = used_bytes(&status(&f.pool).await, 0);
+    collect_garbage(&f, None).await;
+    drain(test, &f).await;
+    let after = used_bytes(&status(&f.pool).await, 0);
+    assert!(
+        before - after >= 24 * MIB,
+        "{test}: the deleted body stayed charged to member-a: {before} -> {after}"
+    );
+    let mut offset = acknowledged;
+    while offset < replacement_data.len() {
+        let end = (offset + MIB as usize).min(replacement_data.len());
+        let chunk = replacement_data.slice(offset..end);
+        if volatile {
+            bounded(
+                test,
+                "write 1 MiB",
+                f.fs.write_ack(&auth(), replacement, offset as u64, &chunk),
+            )
+            .await
+            .unwrap();
+        } else {
+            bounded(
+                test,
+                "write 1 MiB",
+                f.fs.write(&auth(), replacement, offset as u64, &chunk),
+            )
+            .await
+            .unwrap();
+        }
+        offset = end;
+    }
+    fsync(test, &f.fs, replacement).await.unwrap();
+    drain(test, &f).await;
+    timing(test, "unlink to flushed rewrite", started.elapsed());
+    assert_eq!(f.fs.extent_store.retained_seals(), (0, 0));
+    assert_eq!(
+        read(&f.fs, replacement, replacement_data.len() as u64).await,
+        replacement_data
+    );
+    assert_eq!(read(&f.fs, previous, 20).await, previous_data);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unlink_makes_room_for_a_write_refused_with_enospc() {
+    deadline(an_unlink_makes_room_for_a_refused_write(
+        "unlink-room",
+        Setup::default(),
+    ))
+    .await;
+}
+
+/// The NAS package acknowledges WRITE from memory before materializing it.
+/// Admission happens before that reply, so a full pool answers ENOSPC there
+/// instead of failing the materializer for every later request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn volatile_acknowledgement_refuses_the_write_and_recovers_after_an_unlink() {
+    deadline(an_unlink_makes_room_for_a_refused_write(
+        "volatile-unlink-room",
+        Setup {
+            write_ack: Some(volatile_ack()),
+            writeback: false,
+        },
+    ))
+    .await;
+}
+
+/// With the writeback journal, segments are acknowledged before the pool
+/// places them. Each keeps its lease until it is placed, so the drain never
+/// waits on room another write took, and the deletions reclaim queues behind
+/// it reach the pool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_writeback_journal_places_admitted_segments_and_drains_deletions() {
+    deadline(an_unlink_makes_room_for_a_refused_write(
+        "writeback-unlink-room",
+        Setup {
+            write_ack: None,
+            writeback: true,
+        },
+    ))
+    .await;
+}
+
+/// The NAS package: volatile acknowledgement over the writeback journal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_nas_package_stack_refuses_at_write_and_recovers_after_an_unlink() {
+    deadline(an_unlink_makes_room_for_a_refused_write(
+        "package-unlink-room",
+        Setup {
+            write_ack: Some(volatile_ack()),
+            writeback: true,
+        },
+    ))
+    .await;
+}
+
+/// The same refusal with the old bytes pinned: an open 9P reader across the
+/// unlink, then a persistent checkpoint. Each keeps the deleted body readable
+/// and charged, so WRITE stays refused; the body is freed and the WRITE
+/// accepted only once the last pin is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pinned_bytes_stay_charged_until_the_last_pin_is_released() {
+    use ninep_client::{ClientError, NOFID, NinePClient};
+    deadline(async {
+        let test = "pinned-unlink";
+        let f = full_pool(Setup::default()).await;
+        f.fs.start_reclaim_drainer();
+        let socket = f._root.path().join("9p.sock");
+        let server = crate::ninep::NinePServer::new_unix(Arc::clone(&f.fs), socket.clone());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let _ = server.start(server_shutdown).await;
+        });
+        let mut client = None;
+        for _ in 0..100 {
+            if let Ok(connected) = NinePClient::connect_unix(&socket, 1024 * 1024).await {
+                client = Some(connected);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let client = client.expect("9P server did not start");
+        let root = client.alloc_fid();
+        client.attach(root, NOFID, "", "", 0).await.unwrap();
+        let create = |name: &'static str| {
+            let client = Arc::clone(&client);
+            async move {
+                let fid = client.alloc_fid();
+                client.walk(root, fid, &[]).await.unwrap();
+                client
+                    .lcreate(fid, name.as_bytes(), 2, 0o644, 0)
+                    .await
+                    .unwrap();
+                fid
+            }
+        };
+        // Writes from `offset` in 1 MiB requests until one is refused.
+        let write_from = |fid: u32, data: Bytes, offset: usize| {
+            let client = Arc::clone(&client);
+            async move {
+                let mut offset = offset;
+                while offset < data.len() {
+                    let end = (offset + MIB as usize).min(data.len());
+                    match client
+                        .write_bytes(fid, offset as u64, data.slice(offset..end))
+                        .await
+                    {
+                        Ok(_) => offset = end,
+                        Err(ClientError::Errno(errno)) => {
+                            assert_eq!(errno, libc::ENOSPC as u32, "full must not look broken");
+                            return (offset, true);
+                        }
+                        Err(other) => panic!("9P write returned {other:?}"),
+                    }
+                }
+                (offset, false)
+            }
+        };
+        let read_all = |fid: u32, length: u64| {
+            let client = Arc::clone(&client);
+            async move {
+                let mut out = Vec::new();
+                while (out.len() as u64) < length {
+                    let chunk = client
+                        .read(fid, out.len() as u64, 512 * 1024)
+                        .await
+                        .unwrap();
+                    assert!(!chunk.is_empty(), "short read at {}", out.len());
+                    out.extend_from_slice(&chunk);
+                }
+                Bytes::from(out)
+            }
+        };
+
+        let deleted = create("delete-me").await;
+        let deleted_data = payload(40, 24 * MIB);
+        assert_eq!(
+            write_from(deleted, deleted_data.clone(), 0).await,
+            (deleted_data.len(), false)
+        );
+        bounded(test, "9P fsync", client.fsync(deleted, 0))
+            .await
+            .unwrap();
+        let reader = client.alloc_fid();
+        client.walk(root, reader, &[b"delete-me"]).await.unwrap();
+        client.lopen(reader, 0).await.unwrap();
+        client.clunk(deleted).await.unwrap();
+
+        let replacement = create("replacement").await;
+        let replacement_data = payload(41, 32 * MIB);
+        let (acknowledged, refused) = write_from(replacement, replacement_data.clone(), 0).await;
+        assert!(refused && acknowledged > 0, "{acknowledged} {refused}");
+        bounded(test, "9P fsync", client.fsync(replacement, 0))
+            .await
+            .unwrap();
+        client.unlinkat(root, b"delete-me", 0).await.unwrap();
+        let charged = used_bytes(&status(&f.pool).await, 0);
+
+        // The open reader pins the unlinked inode.
+        collect_garbage(&f, None).await;
+        assert_eq!(
+            read_all(reader, deleted_data.len() as u64).await,
+            deleted_data
+        );
+        assert_eq!(used_bytes(&status(&f.pool).await, 0), charged);
+        assert_eq!(
+            write_from(replacement, replacement_data.clone(), acknowledged).await,
+            (acknowledged, true),
+            "a WRITE was accepted while the reader pinned the deleted body"
+        );
+
+        // Once the reader is gone, a persistent checkpoint's reclaim gate
+        // still pins it. The mounted fixture reads a real checkpoint view.
+        let deleted_files = f.fs.stats.files_deleted.load(Ordering::Relaxed);
+        client.clunk(reader).await.unwrap();
+        for _ in 0..250 {
+            if f.fs.stats.files_deleted.load(Ordering::Relaxed) > deleted_files {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            f.fs.stats.files_deleted.load(Ordering::Relaxed) > deleted_files,
+            "the last clunk did not release the unlinked inode"
+        );
+        collect_garbage(&f, Some(chrono::Utc::now())).await;
+        assert_eq!(used_bytes(&status(&f.pool).await, 0), charged);
+        assert_eq!(
+            write_from(replacement, replacement_data.clone(), acknowledged).await,
+            (acknowledged, true),
+            "a WRITE was accepted while the checkpoint pinned the deleted body"
+        );
+
+        collect_garbage(&f, None).await;
+        let after = used_bytes(&status(&f.pool).await, 0);
+        assert!(
+            charged - after >= 24 * MIB,
+            "the unpinned body stayed charged to member-a: {charged} -> {after}"
+        );
+        assert_eq!(
+            write_from(replacement, replacement_data.clone(), acknowledged).await,
+            (replacement_data.len(), false)
+        );
+        bounded(test, "9P fsync", client.fsync(replacement, 0))
+            .await
+            .unwrap();
+        let replacement =
+            f.fs.lookup(&root_credentials(), 0, b"replacement")
+                .await
+                .unwrap();
+        assert_eq!(
+            read(&f.fs, replacement, replacement_data.len() as u64).await,
+            replacement_data
         );
         shutdown.cancel();
     })

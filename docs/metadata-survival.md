@@ -35,8 +35,10 @@ with temporary files, rename, directory fsync and flock.
 On a raw member, one PUT publishes an object: `RawMemberStore` appends the
 record and flushes both label slots before it returns. The pool's exclusive
 device claim keeps every other process out. The region has no size of its
-own. It shares the member's log, and a full member refuses the PUT without
-writing anything.
+own. It shares the member's log. Every PUT is admitted through the pool's
+space ledger first, so it never takes room promised to segment data or the
+member's reserve. A PUT that does not fit is refused as `Full` and writes
+nothing. See "When a member fills" in [storage pools](storage-pools.md).
 
 ## Configuration
 
@@ -233,6 +235,9 @@ mechanism. Its rows run on the directory backend.
 
 ## Known limits
 
+- **No room kept for generations.** Segment data may fill a raw member up to
+  its reserve. The next generation is then refused as `Full`, which latches
+  EIO for every mutation, although WRITE alone would have answered ENOSPC.
 - **No hardware evidence.** No test here runs on a physical device, an HDD or
   across a real power cut.
 - **Log space.** A raw member's log is append-only. Every commit appends a

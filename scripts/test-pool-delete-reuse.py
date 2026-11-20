@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """Exercise full-pool reuse and crash integrity on disposable local storage.
 
-This acceptance test currently fails the immediate-reuse assertion. It still
-checks surviving data after SIGKILL before reporting that failure. Run on Linux
-in an isolated mount namespace with /dev/fuse and CAP_SYS_ADMIN.
+Member A's quota is the only room. A replacement is written on one descriptor
+until a WRITE answers ENOSPC; the bytes acknowledged before it must fsync.
+Deleting a file must then free its room without a restart: member A's used
+bytes drop within RECLAIM_BOUND_SECONDS, and the rest of the replacement is
+written and fsynced on the same descriptor. An open reader or a checkpoint
+keeps the deleted bytes readable and charged for at least that long, and WRITE
+stays refused, until the pin is released. SIGKILL and restart then check
+every hash. Run on Linux in an isolated mount namespace with CAP_SYS_ADMIN,
+and /dev/fuse for the FUSE client.
 """
 
 import argparse
@@ -19,6 +25,16 @@ import time
 
 
 MIB = 1024**2
+RESERVE = 1_000_000
+# A refused WRITE, and a WRITE or fsync with room, answer within this.
+ANSWER_SECONDS = 5
+# Unlink to freed room. Segment GC deletes a dead segment once the newest
+# ephemeral checkpoint it saw first has expired, plus 30 s of clock skew, and
+# never sooner than its 60 s in-flight read floor. Every metadata compaction
+# writes such a checkpoint with a 15-minute lifetime. Add the tombstone GC's
+# 10 s cadence and passes at the configured 5 s interval.
+RECLAIM_BOUND_SECONDS = 900 + 30 + 60 + 10 + 5 * 5 + 55
+KERNEL_9P = "trans=unix,version=9p2000.L,msize=1048576,cache=none,access=user,nodev,nosuid"
 
 
 def command(*args):
@@ -67,18 +83,55 @@ def digest(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
-def run(binary, scratch, evidence, distinct_payload, protection):
+def unmount(path, client_kind):
+    if client_kind == "kernel-9p":
+        # A kernel 9P mount whose server was killed can only be detached.
+        command("umount", "-l", str(path))
+    else:
+        command("fusermount3", "-u", str(path))
+
+
+def free_bytes(path):
+    usage = os.statvfs(path)
+    return usage.f_bavail * usage.f_frsize
+
+
+def pool_used(binary, root, member=0):
+    report = json.loads(
+        command(str(binary), "pool", "status", "--endpoint", f"unix:{root / 'rpc.sock'}")
+    )
+    return report["members"][member]["used_bytes"]
+
+
+def write_until_refused(descriptor, data, offset):
+    """Write `data` from `offset` in 1 MiB requests. Returns the offset reached
+    and the seconds the refused WRITE took, or None when every byte was taken."""
+    while offset < len(data):
+        started = time.monotonic()
+        try:
+            written = os.write(descriptor, data[offset : offset + MIB])
+        except OSError as error:
+            assert error.errno == errno.ENOSPC, error
+            return offset, time.monotonic() - started
+        assert written > 0
+        assert time.monotonic() - started < ANSWER_SECONDS
+        offset += written
+    return offset, None
+
+
+def run(binary, scratch, evidence, protection, client_kind):
     root = Path(tempfile.mkdtemp(prefix="zerofs-delete-reuse-", dir=scratch))
     mounted = []
     server = client = None
     pending = None
     reader = None
-    log = (evidence / "processes.log").open("wb")
+    log_path = evidence / "processes.log"
+    log = log_path.open("wb")
     result = {
         "kernel": os.uname().release,
         "binary_sha256": digest(binary),
         "protection": protection,
-        "distinct_payload": distinct_payload,
+        "client": client_kind,
     }
     try:
         for name in ("member-a", "member-b", "metadata", "catalog", "cache", "mount"):
@@ -95,10 +148,9 @@ def run(binary, scratch, evidence, distinct_payload, protection):
                 str(path),
             )
             mounted.append(path)
-        space = os.statvfs(root / "member-b")
-        (root / "member-b/ballast").write_bytes(
-            bytes(space.f_bavail * space.f_frsize - 900_000)
-        )
+        # Member B's filesystem stays below its reserve for the whole case.
+        (root / "member-b/ballast").write_bytes(bytes(free_bytes(root / "member-b") - 900_000))
+        assert free_bytes(root / "member-b") < RESERVE
         config = root / "zerofs.toml"
         config.write_text(f'''[cache]
 dir = "{root / "cache"}"
@@ -120,17 +172,18 @@ id = "member-b"
 url = "file://{root / "member-b"}"
 capacity_gb = 0.05
 reserve_free_gb = 0.001
+[gc]
+interval_secs = 5
+idle_interval_secs = 1
 [servers.ninep]
 addresses = []
 unix_socket = "{root / "9p.sock"}"
+[servers.rpc]
+addresses = []
+unix_socket = "{root / "rpc.sock"}"
 [telemetry]
 enabled = false
 ''')
-        if protection == "checkpoint":
-            with config.open("a") as stream:
-                stream.write(
-                    f'\n[servers.rpc]\naddresses = []\nunix_socket = "{root / "rpc.sock"}"\n'
-                )
         command(str(binary), "pool", "init", "-c", str(config))
 
         def start(*options):
@@ -141,10 +194,17 @@ enabled = false
                 stdout=log,
                 stderr=log,
             )
-            wait_for((root / "9p.sock").exists, process, "server readiness")
+            wait_for(
+                lambda: (root / "9p.sock").exists() and (root / "rpc.sock").exists(),
+                process,
+                "server readiness",
+            )
             return process
 
         def mount():
+            if client_kind == "kernel-9p":
+                command("mount", "-t", "9p", "-o", KERNEL_9P, str(root / "9p.sock"), str(root / "mount"))
+                return None
             process = subprocess.Popen(
                 [
                     str(binary),
@@ -164,119 +224,123 @@ enabled = false
             wait_for(lambda: is_mounted(root / "mount"), process, "FUSE readiness")
             return process
 
+        def restart(*options):
+            nonlocal server, client
+            stop(client)
+            if is_mounted(root / "mount"):
+                unmount(root / "mount", client_kind)
+            stop(server)
+            server = start(*options)
+            client = mount()
+
         server = start()
         client = mount()
         previous = b"earlier flushed data"
         data = hashlib.shake_256(b"delete-space").digest(32 * MIB)
-        replacement = (
-            hashlib.shake_256(b"replacement").digest(len(data))
-            if distinct_payload
-            else data
-        )
+        replacement = hashlib.shake_256(b"replacement").digest(len(data))
         result["deleted_sha256"] = hashlib.sha256(data).hexdigest()
         result["expected_replacement_sha256"] = hashlib.sha256(replacement).hexdigest()
         for name, payload in (("previous", previous), ("delete-me", data)):
             with (root / "mount" / name).open("wb", buffering=0) as target:
-                for offset in range(0, len(payload), MIB):
-                    assert target.write(payload[offset : offset + MIB]) == len(
-                        payload[offset : offset + MIB]
-                    )
+                assert write_until_refused(target.fileno(), payload, 0) == (len(payload), None)
                 os.fsync(target.fileno())
         if protection == "open-reader":
             reader = (root / "mount/delete-me").open("rb", buffering=0)
         elif protection == "checkpoint":
-            command(
-                str(binary), "checkpoint", "create", "-c", str(config), "before-unlink"
-            )
-        pending = os.open(
-            root / "mount/replacement", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
-        )
-        for offset in range(0, len(replacement), MIB):
-            assert os.write(pending, replacement[offset : offset + MIB]) == MIB
-        try:
-            os.fsync(pending)
-        except OSError as error:
-            assert error.errno == errno.ENOSPC, error
-        else:
-            raise AssertionError("fixture did not fill the pool")
+            command(str(binary), "checkpoint", "create", "-c", str(config), "before-unlink")
+
+        pending = os.open(root / "mount/replacement", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        acknowledged, refused = write_until_refused(pending, replacement, 0)
+        assert refused is not None, "fixture did not fill the pool"
+        assert 0 < acknowledged < len(replacement), acknowledged
+        assert refused < ANSWER_SECONDS, refused
+        result["write_errno"] = "ENOSPC"
+        result["acknowledged_bytes"] = acknowledged
+        result["refused_write_seconds"] = refused
+        # The acknowledged prefix flushes: nothing refused waits in memory.
+        started = time.monotonic()
+        os.fsync(pending)
+        result["fsync_after_refusal_seconds"] = time.monotonic() - started
+        assert result["fsync_after_refusal_seconds"] < ANSWER_SECONDS
+        with (root / "mount/replacement").open("rb") as source:
+            assert source.read() == replacement[:acknowledged]
         result["earlier_sha256"] = digest(root / "mount/previous")
         assert result["earlier_sha256"] == hashlib.sha256(previous).hexdigest()
-        started = time.monotonic()
+        charged = pool_used(binary, root)
+        result["member_a_used_before_unlink"] = charged
+
         (root / "mount/delete-me").unlink()
-        # One retry on the same pending descriptor; no sleep, polling, or restart.
-        try:
-            os.fsync(pending)
-        except OSError as error:
-            result["reuse_errno"] = error.errno
-        else:
-            result["reuse_errno"] = None
-        result["delete_and_flush_seconds"] = time.monotonic() - started
+        unlinked = time.monotonic()
+        if protection != "none":
+            # As long as an unpinned deletion may take to be freed.
+            time.sleep(RECLAIM_BOUND_SECONDS)
+            assert pool_used(binary, root) == charged, "a pin did not keep the deleted bytes"
+            assert write_until_refused(pending, replacement, acknowledged)[1] is not None
+            result["pinned_seconds"] = time.monotonic() - unlinked
+            if reader is not None:
+                result["unlinked_reader_sha256"] = hashlib.file_digest(reader, "sha256").hexdigest()
+                assert result["unlinked_reader_sha256"] == result["deleted_sha256"]
+                reader.close()
+                reader = None
+            else:
+                os.close(pending)
+                pending = None
+                restart("--checkpoint", "before-unlink")
+                result["checkpoint_view_sha256"] = digest(root / "mount/delete-me")
+                assert result["checkpoint_view_sha256"] == result["deleted_sha256"]
+                restart()
+                command(str(binary), "checkpoint", "delete", "-c", str(config), "before-unlink")
+                pending = os.open(root / "mount/replacement", os.O_WRONLY)
+                os.lseek(pending, acknowledged, os.SEEK_SET)
+            unlinked = time.monotonic()
+
+        deadline = unlinked + RECLAIM_BOUND_SECONDS
+        while pool_used(binary, root) > charged - len(data):
+            assert time.monotonic() < deadline, "the deleted bytes were not freed in time"
+            time.sleep(1)
+        result["release_to_freed_seconds"] = time.monotonic() - unlinked
+        result["member_a_used_after_reclaim"] = pool_used(binary, root)
+        # One attempt per WRITE: every remaining byte must be taken.
+        assert write_until_refused(pending, replacement, acknowledged) == (len(replacement), None)
+        started = time.monotonic()
+        os.fsync(pending)
+        result["rewrite_fsync_seconds"] = time.monotonic() - started
+        assert result["rewrite_fsync_seconds"] < ANSWER_SECONDS
+        result["release_to_flushed_seconds"] = time.monotonic() - unlinked
         assert digest(root / "mount/previous") == result["earlier_sha256"]
-        if reader is not None:
-            result["unlinked_reader_sha256"] = hashlib.file_digest(
-                reader, "sha256"
-            ).hexdigest()
-            assert result["unlinked_reader_sha256"] == result["deleted_sha256"]
 
         # Kill before any graceful final seal/flush can change the evidence.
         stop(server, kill=True)
         stop(client, kill=True)
-        if reader is not None:
-            reader.close()
-            reader = None
         try:
             os.close(pending)
         except OSError as error:
             assert error.errno in (errno.EIO, errno.ENOTCONN), error
         pending = None
-        command("fusermount3", "-u", str(root / "mount"))
+        unmount(root / "mount", client_kind)
         server = start()
         client = mount()
         assert digest(root / "mount/previous") == result["earlier_sha256"]
         result["earlier_hash_after_sigkill"] = result["earlier_sha256"]
-        if result["reuse_errno"] is None:
-            assert (
-                digest(root / "mount/replacement")
-                == result["expected_replacement_sha256"]
-            )
-            result["replacement_hash_after_sigkill"] = result[
-                "expected_replacement_sha256"
-            ]
-        else:
-            # The deletion was not fsynced: its old durable name may return.
-            if (root / "mount/delete-me").exists():
-                assert (
-                    digest(root / "mount/delete-me") == hashlib.sha256(data).hexdigest()
-                )
-                result["old_target_hash_after_sigkill"] = hashlib.sha256(
-                    data
-                ).hexdigest()
-        if protection == "checkpoint":
-            stop(client)
-            if is_mounted(root / "mount"):
-                command("fusermount3", "-u", str(root / "mount"))
-            stop(server)
-            server = start("--checkpoint", "before-unlink")
-            client = mount()
-            result["checkpoint_after_restart_sha256"] = digest(root / "mount/delete-me")
-            assert result["checkpoint_after_restart_sha256"] == result["deleted_sha256"]
-            assert digest(root / "mount/previous") == result["earlier_sha256"]
+        assert digest(root / "mount/replacement") == result["expected_replacement_sha256"]
+        result["replacement_hash_after_sigkill"] = result["expected_replacement_sha256"]
+        assert not (root / "mount/delete-me").exists()
         print(json.dumps(result, sort_keys=True), flush=True)
         (evidence / "receipt.json").write_text(json.dumps(result, indent=2) + "\n")
-        expected_errno = None if protection == "none" else errno.ENOSPC
-        assert result["reuse_errno"] == expected_errno, result
-        assert result["delete_and_flush_seconds"] < 5, result
     finally:
         stop(client, kill=True)
         if reader is not None:
-            reader.close()
+            try:
+                reader.close()
+            except OSError:
+                pass
         if pending is not None:
             try:
                 os.close(pending)
             except OSError:
                 pass
         if is_mounted(root / "mount"):
-            command("fusermount3", "-u", str(root / "mount"))
+            unmount(root / "mount", client_kind)
         stop(server)
         for path in reversed(mounted):
             command("umount", str(path))
@@ -292,27 +356,17 @@ def main():
     parser.add_argument("--scratch", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument(
-        "--distinct-payload",
-        action="store_true",
-        help="stage different bytes from the file being deleted",
-    )
-    parser.add_argument(
         "--protection",
         choices=("none", "open-reader", "checkpoint"),
         default="none",
-        help="protect old bytes on the same quota-limited fixture and require ENOSPC",
+        help="pin the deleted bytes with an open reader or a checkpoint",
     )
+    parser.add_argument("--client", choices=("fuse", "kernel-9p"), default="fuse")
     args = parser.parse_args()
     args.evidence.mkdir(parents=True, exist_ok=True)
     if not __debug__:
         parser.error("acceptance assertions require Python without -O")
-    run(
-        args.binary.resolve(),
-        args.scratch,
-        args.evidence,
-        args.distinct_payload or args.protection != "none",
-        args.protection,
-    )
+    run(args.binary.resolve(), args.scratch, args.evidence, args.protection, args.client)
 
 
 if __name__ == "__main__":

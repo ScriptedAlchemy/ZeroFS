@@ -100,7 +100,8 @@ fn assess_with(
         let quota = member
             .capacity_bytes
             .saturating_sub(member.used_bytes)
-            .saturating_sub(member.reserved_bytes);
+            .saturating_sub(member.reserved_bytes)
+            .saturating_sub(member.admitted_bytes);
         let observed = match observed {
             None => {
                 member.available_bytes = quota;
@@ -214,6 +215,7 @@ mod tests {
                 capacity_bytes: quota,
                 used_bytes: used,
                 reserved_bytes: reserved,
+                admitted_bytes: 0,
                 objects: 0,
                 health: MemberHealth::default(),
                 unavailable_at_startup: false,

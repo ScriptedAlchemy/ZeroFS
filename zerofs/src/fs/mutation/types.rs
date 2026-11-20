@@ -45,6 +45,8 @@ pub(crate) struct PreparedWriteMember {
     pub(crate) parent_name_for_update: Option<(InodeId, Vec<u8>)>,
     pub(crate) span: Option<(u64, u64)>,
     pub(crate) quota: Option<crate::fs::quota::ProvisionalQuotaReservation>,
+    /// Pool room for this member's frames, held from WRITE until apply.
+    pub(crate) capacity: Option<crate::pool_object_store::Claim>,
 }
 
 /// Outcome of [`prepare_write`](crate::fs::ops::write::prepare_write).

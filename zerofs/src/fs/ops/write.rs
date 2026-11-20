@@ -343,6 +343,7 @@ pub(crate) async fn prepare_write_with_append(
                 parent_name_for_update: None,
                 span,
                 quota: None,
+                capacity: None,
             });
             continue;
         }
@@ -366,6 +367,12 @@ pub(crate) async fn prepare_write_with_append(
             let size_increase = new_size - old_size;
             quota = Some(fs.quota.reserve(size_increase)?);
         }
+        // Room for the frames before the reply: a WRITE the pool cannot
+        // place answers ENOSPC here instead of failing a later flush.
+        let capacity = fs
+            .extent_store
+            .claim_write(member.id, member.offset, member.data.len() as u64)
+            .await?;
 
         let (now_sec, now_nsec) = get_current_time();
         let mode = mode_after_content_change(file.mode, &creds);
@@ -403,6 +410,7 @@ pub(crate) async fn prepare_write_with_append(
             parent_name_for_update,
             span,
             quota,
+            capacity,
         });
     }
 
@@ -460,18 +468,21 @@ pub(crate) async fn apply_prepared_batch(
     let mut txn = fs.db.new_transaction()?;
     let mut tail_updates = Vec::new();
 
-    for member in &batch.members {
+    for member in &mut batch.members {
         if member.data.is_empty() {
             continue;
         }
+        // What the segment leases did not take goes back once this returns.
+        let claim = member.capacity.take();
         let tail_update = fs
             .extent_store
-            .write(
+            .write_claimed(
                 &mut txn,
                 member.id,
                 member.offset,
                 &member.data,
                 member.old_size,
+                claim.as_ref(),
             )
             .await?;
         tail_updates.push((member.id, tail_update));

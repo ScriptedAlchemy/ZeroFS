@@ -246,6 +246,101 @@ async fn a_full_raw_member_reuses_space_after_pool_segment_retirement() {
     );
 }
 
+/// A metadata-survival write into a raw member never takes room promised to
+/// segment data, even while the member itself still has those bytes free. A
+/// refused survival write leaves nothing behind, and the promised segment is
+/// placed afterwards.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn survival_writes_never_take_room_promised_to_segments() {
+    use crate::raw_member::RawMemberStore;
+    use crate::retrying_object_store::is_no_space;
+    use crate::storage_backend::raw::RawSpace;
+    use zerofs_raw_device::{Identity, RawStore, Role};
+
+    const SIZE: u64 = 1 << 20;
+    const RESERVE: u64 = 8192;
+    let fixture = Fixture::new(SIZE);
+    let backing = fixture.catalog.path().join("raw");
+    std::fs::File::create(&backing)
+        .unwrap()
+        .set_len(SIZE)
+        .unwrap();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&backing)
+        .unwrap();
+    let identity = Identity {
+        pool_uuid: [1; 16],
+        member_uuid: [2; 16],
+        role: Role::Data,
+    };
+    let raw = RawMemberStore::new(
+        RawStore::provision(file, SIZE, identity).unwrap(),
+        (),
+        RESERVE,
+    )
+    .unwrap();
+    let mut member = fixture.member(true);
+    member.store = Arc::new(raw.clone());
+    member.min_free_bytes = RESERVE;
+    member.free_space = Some(Arc::new(RawSpace::new(1, raw.clone())));
+    let id = member.id.clone();
+    let pool = fixture.open_balanced(vec![member], true).await;
+
+    // Promise all but one survival object's room to one segment.
+    let object = RawStore::put_cost(1).unwrap();
+    let room = pool.status().await.unwrap().members[0].available_bytes;
+    let leased = (1..=room - object)
+        .rev()
+        .find(|bytes| RawStore::put_cost(*bytes).unwrap() <= room - object)
+        .unwrap();
+    assert!(room - object - RawStore::put_cost(leased).unwrap() < object);
+    let claim = pool.admit(leased, None).await.unwrap();
+    // Nothing is written for the claim yet, so the member alone would take
+    // two more objects.
+    assert!(raw.capacity().unwrap().admissible_bytes >= 2 * object);
+
+    let survival = |name: &str| Path::from(format!(".zerofs-survival/v1/{name}"));
+    let put = |name: &'static str| {
+        let pool = pool.clone();
+        let id = id.clone();
+        async move {
+            pool.put_survival(
+                &id,
+                &survival(name),
+                Bytes::from_static(b"m").into(),
+                PutOptions::default(),
+            )
+            .await
+        }
+    };
+    put("first").await.unwrap();
+    assert!(is_no_space(&put("second").await.unwrap_err()));
+    assert!(matches!(
+        raw.head(&survival("second")).await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+
+    claim.fund(Segid::new(41, 950), leased).unwrap();
+    drop(claim);
+    let body = Bytes::from(vec![5; leased as usize]);
+    pool.put_opts(&segment(950), body.clone().into(), create_options())
+        .await
+        .unwrap();
+    assert_eq!(read(&pool, &segment(950)).await, body);
+    assert_eq!(
+        raw.get(&survival("first"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+        Bytes::from_static(b"m")
+    );
+}
+
 #[derive(Debug, Default)]
 struct FaultControl {
     offline: AtomicBool,
@@ -3322,7 +3417,7 @@ async fn writeback_replays_segment_to_persisted_member_before_any_pool_put() {
     )
     .await
     .unwrap();
-    attached.lifecycle.set_pool(pool.clone());
+    attached.lifecycle.set_pool(pool.clone()).await.unwrap();
     let segid = Segid::new(41, 706);
     let key = segment(segid.counter);
     let body = Bytes::from_static(b"durable before the first pool put");
@@ -3642,7 +3737,7 @@ async fn check_writeback_target_reconciliation(body_len: usize, already_remote: 
     )
     .await
     .unwrap();
-    attached.lifecycle.set_pool(pool.clone());
+    attached.lifecycle.set_pool(pool.clone()).await.unwrap();
     let publisher = crate::segment_store::SegmentStore::new(
         Arc::new(object_store::prefix::PrefixStore::new(
             Arc::clone(&attached.store),
@@ -3762,7 +3857,7 @@ async fn writeback_segment_retry_waits_for_original_remote_ack() {
     )
     .await
     .unwrap();
-    attached.lifecycle.set_pool(pool.clone());
+    attached.lifecycle.set_pool(pool.clone()).await.unwrap();
     let key = segment(712);
     let body = Bytes::from_static(b"same pending segment");
     let mut options = create_options();
@@ -3851,7 +3946,7 @@ async fn check_writeback_retry_with_full_ssd(queue_ram_owner: bool) {
     )
     .await
     .unwrap();
-    attached.lifecycle.set_pool(pool.clone());
+    attached.lifecycle.set_pool(pool.clone()).await.unwrap();
     let mut options = create_options();
     options.extensions.insert(GeneratedSegmentCreate);
     options.extensions.insert(SegmentTarget("hdd-a".into()));
@@ -3972,4 +4067,147 @@ async fn bound_segment_refusal_does_not_stop_other_automatic_evacuation() {
     assert!(pool.faults().await.unwrap().is_empty());
     assert!(!pool.status().await.unwrap().members[0].safe_to_remove);
     assert!(!pool.inner.safety_failure.is_cancelled());
+}
+
+fn admitted(status: &super::PoolStatus, id: &str) -> u64 {
+    status
+        .members
+        .iter()
+        .find(|member| member.id == id)
+        .unwrap()
+        .admitted_bytes
+}
+
+/// A claim holds room until it is dropped. Claims, leases and reservations
+/// never promise the same bytes, and a leased segment's own reservation does
+/// not count its lease a second time.
+#[tokio::test]
+async fn claims_and_leases_share_room_with_reservations_exactly() {
+    let fixture = Fixture::new(1024);
+    let pool = fixture.initialize().await;
+    let first = pool.admit(600, None).await.unwrap();
+    let second = pool.admit(600, None).await.unwrap();
+    assert_ne!(first.member(), second.member());
+    let refused = pool.admit(600, None).await.unwrap_err();
+    assert!(crate::retrying_object_store::is_no_space(&refused));
+    // A plain PUT may not take the claimed room either.
+    let location = segment(901);
+    let error = pool
+        .put_opts(
+            &location,
+            Bytes::from(vec![7; 600]).into(),
+            create_options(),
+        )
+        .await
+        .unwrap_err();
+    assert!(crate::retrying_object_store::is_no_space(&error));
+    drop(second);
+    pool.admit(600, None).await.unwrap();
+
+    // `first` funds a 600-byte lease. Placing that segment needs no room
+    // beyond its own lease, and placement releases the lease.
+    let leased = Segid::new(41, 902);
+    first.fund(leased, 600).unwrap();
+    assert_eq!(pool.lease_member(leased), Some(first.member()));
+    drop(first);
+    let member = pool.lease_member(leased).unwrap();
+    assert_eq!(admitted(&pool.status().await.unwrap(), &member), 600);
+    pool.put_opts(
+        &segment(902),
+        Bytes::from(vec![9; 600]).into(),
+        create_options(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(placement(&pool, &segment(902)).await, member);
+    assert_eq!(pool.lease_member(leased), None);
+    let status = pool.status().await.unwrap();
+    assert_eq!(admitted(&status, &member), 0);
+    assert_eq!(usage(&pool, &member).await.0, 600);
+}
+
+/// A journaled segment the pool has not placed keeps its room across a
+/// restart: attaching the writeback store leases it again, and placing it
+/// releases the lease.
+#[tokio::test]
+async fn a_restart_leases_segments_the_journal_has_not_placed() {
+    use crate::writeback::config::{AckMode, ShutdownFlush, WritebackSettings};
+    use crate::writeback::model::JournalIdentity;
+
+    let fixture = Fixture::new(1024);
+    let pool = fixture.initialize().await;
+    let settings = WritebackSettings {
+        dir: fixture.catalog.path().canonicalize().unwrap().join("dirty"),
+        ack_mode: AckMode::Memory,
+        memory_bytes: 1_000_000,
+        disk_bytes: 10_000_000,
+        min_free_bytes: 1,
+        high_watermark_percent: 95,
+        resume_percent: 85,
+        upload_concurrency: 1,
+        local_concurrency: 1,
+        shutdown_flush: ShutdownFlush::Local,
+    };
+    let identity = JournalIdentity {
+        format_version: 1,
+        bucket_id: "lease-fixture".into(),
+        backend_endpoint: "memory://lease-fixture".into(),
+        database_prefix: "db".into(),
+        backend_kind: "pool".into(),
+        encryption_key_identity_sha256: [0x87; 32],
+    };
+    let attached = crate::writeback::bootstrap::attach(
+        Arc::new(pool.clone()),
+        settings.clone(),
+        identity.clone(),
+        "lease-fixture",
+    )
+    .await
+    .unwrap();
+    attached.lifecycle.set_pool(pool.clone()).await.unwrap();
+    let key = segment(903);
+    let body = Bytes::from(vec![3; 600]);
+    attached
+        .store
+        .put_opts(&key, body.clone().into(), create_options())
+        .await
+        .unwrap();
+    attached
+        .lifecycle
+        .wait_local_through_accepted()
+        .await
+        .unwrap();
+    attached.lifecycle.shutdown().await.unwrap();
+    drop(attached);
+    pool.settle().await;
+    drop(pool);
+
+    let pool = fixture.reopen().await.unwrap();
+    let replay = crate::writeback::bootstrap::attach(
+        Arc::new(pool.clone()),
+        settings,
+        identity,
+        "lease-fixture",
+    )
+    .await
+    .unwrap();
+    replay.lifecycle.set_pool(pool.clone()).await.unwrap();
+    let leased = pool.lease_member(Segid::new(41, 903)).unwrap();
+    assert_eq!(admitted(&pool.status().await.unwrap(), &leased), 600);
+    // The other member still has room; the leased one does not.
+    let other = pool.admit(600, None).await.unwrap();
+    assert_ne!(other.member(), leased);
+    assert!(pool.admit(600, None).await.is_err());
+    drop(other);
+
+    replay.lifecycle.activate_remote().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), replay.lifecycle.wait_remote(1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(placement(&pool, &key).await, leased);
+    assert_eq!(read(&pool, &key).await, body);
+    assert_eq!(admitted(&pool.status().await.unwrap(), &leased), 0);
+    assert_eq!(usage(&pool, &leased).await.0, 600);
+    replay.lifecycle.shutdown().await.unwrap();
 }

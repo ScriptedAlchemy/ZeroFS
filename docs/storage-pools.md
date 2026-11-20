@@ -164,17 +164,77 @@ bytes than it had when the write failed. A remote member has no free-space
 figure, so a no-space answer keeps it out of placement for 30 seconds, after
 which one write may try it again.
 
-When no member has room, a write or fsync answers ENOSPC, not EIO, over 9P.
-The FUSE client forwards that errno, and NFS maps it to `NFS3ERR_NOSPC`. NBD
-still reports EIO for every filesystem error. A test harness on a tmp
-directory measured the ENOSPC answer in milliseconds. An fsync that returns ENOSPC has made nothing durable past
-the previous successful fsync. Files flushed before the pool filled keep
-reading back correctly. Data written since then stays in memory, readable by
-the server, but is not durable. A later fsync publishes it once space returns,
-and no restart is needed. While storage stays full, the retained data is
-bounded. It is at most `max_inflight_seals` sealed segments plus one open
-segment per write lane, each no larger than the seal threshold plus one
-write. A write that would need more answers ENOSPC instead of waiting.
+A WRITE is admitted before its reply. It claims room on one member for an
+upper bound of what it can add to open segments: one full frame per touched
+extent at the compressor's worst case, a directory entry each, and a footer
+for every segment it can open. The claim funds a lease on the open segment it
+lands in, and the lease holds that room until the segment's placement commits.
+With the writeback journal that is when the drain places the segment, not when
+the journal acknowledges it. Every claim, lease and reservation counts the
+others, so a seal always has the room its WRITE was promised. Truncates and
+other writes outside a WRITE claim exactly what they stage.
+
+When no member has room, the WRITE answers ENOSPC, not EIO, over 9P. The FUSE
+client forwards that errno, and NFS maps it to `NFS3ERR_NOSPC`. NBD still
+reports EIO for every filesystem error. Volatile acknowledgement claims before
+it replies too, so a full pool refuses the request instead of failing the
+materializer. Bytes acknowledged before the refusal are in segments that have
+their room, and the next fsync makes them durable. A refused WRITE changed
+nothing, so nothing waits in memory and later flushes keep succeeding. A claim
+is an upper bound and must fit on one member, so a WRITE can be refused while
+a little less than its claim is still free, or while the members together have
+room that none has alone.
+
+Deleting a file frees its room without a restart, once nothing can read the
+deleted bytes. The unlink and the next flush succeed, and the tombstone
+collector removes the extents within about 10 seconds. Segment reclamation then
+deletes a dead segment once the newest ephemeral checkpoint it saw when the
+segment first died has expired, plus 30 seconds of clock skew, and never
+sooner than its 60-second in-flight read floor. Every SlateDB metadata
+compaction writes an unnamed checkpoint with a 15-minute lifetime, so on a
+busy filesystem the room comes back about 16 minutes after the unlink, plus
+one segment GC interval. The mounted fixture sets a 5-second interval and
+requires the room back within 1,080 seconds. Open readers and checkpoints keep
+the deleted bytes readable and charged for as long as they exist, so WRITE
+stays refused until the last of them is gone.
+
+One case still keeps acknowledged data in memory. If a member's filesystem
+refuses a write it reported room for, because another writer filled it or it
+stops short of its reported free space, the pool marks the member full and
+tries the next member. When every member refuses, fsync answers ENOSPC and the
+retained data stays bounded. It is at most `max_inflight_seals` sealed
+segments plus one open segment per write lane, each no larger than the seal
+threshold plus one write. New WRITEs are refused while the marks last, and a
+later fsync publishes the retained data once a member reports more room.
+Deleting files through ZeroFS does not help then, because the deletion can
+become durable only after the retained segments are published, and with the
+writeback journal a deletion is never sent to the pool ahead of an earlier
+unplaced segment. Room has to come from outside: the filesystem freeing bytes,
+a grown quota, or another member. A raw member reports its exact free space,
+so it does not reach this case.
+
+Claims and leases live in memory. A restart forgets them with the unflushed
+data they covered. When the writeback store attaches to the pool it leases
+every segment its journal holds but has not placed, so new writes cannot take
+that room after a restart. `pool status` reports each member's outstanding
+claims and leases as `admitted_bytes`, and `available_bytes` excludes them.
+
+On raw members the same ledger covers two more costs. Each claim, lease and
+reservation counts its exact raw allocation, record and alignment included,
+not just its payload bytes. Metadata survival writes its generations into the
+members' own logs. Each of those PUTs first claims its allocation on that
+member and holds the claim until the PUT returns. It must fit above the
+member's reserve beside every other promise, like any other write, but it
+counts against no quota. When it does not fit, it is refused and writes
+nothing. So a survival write never takes the room an admitted WRITE was
+promised. The payload that retained survival generations pin stays charged as
+cleanup debt. With survival enabled, a deleted file's room therefore returns
+only after the generations that map it retire.
+
+Nothing keeps room back for survival. Segment data can fill a raw pool up to
+its reserve, and the next generation is then refused as full, which latches
+mutations with EIO until an operator repairs the replica set. See
+[metadata survival](metadata-survival.md).
 
 `zerofs pool status` and the admin JSON report each member's
 `space.filesystem_free_bytes`, `space.filesystem_total_bytes` and

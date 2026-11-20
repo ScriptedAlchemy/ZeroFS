@@ -24,15 +24,18 @@
 //! - **identity** is the member's label binding (pool UUID and member UUID),
 //!   which `RawStore::open` verified against the device.
 //! - **bounded region**: the region shares the member's log, so it has no
-//!   size of its own. Exhaustion is the member's exact space admission
-//!   refusing the PUT, reported as `Full`. Nothing is written in that case.
+//!   size of its own. Every PUT goes through the pool's admission ledger,
+//!   which refuses it when it would take room promised to segment data or
+//!   the member's reserve. A refusal, or the member's exact space admission
+//!   refusing the PUT, is reported as `Full`. Nothing is written in that
+//!   case.
 
 use super::backend::{Fence, Presence, ReplicaBackend, ReplicaError, Staged};
 use super::format::ROOT;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -59,17 +62,25 @@ pub(crate) struct MemberRegion {
     member_id: String,
     identity: String,
     store: Arc<dyn ObjectStore>,
+    /// Admits every PUT against the pool's promises; `None` offline.
+    pool: Option<crate::pool_object_store::PoolObjectStore>,
     presence: Presence,
     staged: Mutex<Option<(String, Bytes)>>,
 }
 
 impl MemberRegion {
     /// A region on an opened member. `identity` is the member's label binding.
-    pub(crate) fn new(member_id: &str, identity: &str, store: Arc<dyn ObjectStore>) -> Self {
+    pub(crate) fn new(
+        member_id: &str,
+        identity: &str,
+        store: Arc<dyn ObjectStore>,
+        pool: Option<crate::pool_object_store::PoolObjectStore>,
+    ) -> Self {
         Self {
             member_id: member_id.to_owned(),
             identity: identity.to_owned(),
             store,
+            pool,
             presence: Presence::Present,
             staged: Mutex::default(),
         }
@@ -80,7 +91,7 @@ impl MemberRegion {
     pub(crate) fn absent(member_id: &str, identity: &str, store: Arc<dyn ObjectStore>) -> Self {
         Self {
             presence: Presence::Absent,
-            ..Self::new(member_id, identity, store)
+            ..Self::new(member_id, identity, store, None)
         }
     }
 
@@ -92,6 +103,22 @@ impl MemberRegion {
             path = path.join(part.as_os_str().to_string_lossy().as_ref());
         }
         Ok(path)
+    }
+
+    async fn put(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<()> {
+        match &self.pool {
+            Some(pool) => {
+                pool.put_survival(&self.member_id, location, payload, opts)
+                    .await
+            }
+            None => self.store.put_opts(location, payload, opts).await,
+        }
+        .map(|_| ())
     }
 
     fn require_present(&self) -> Result<(), ReplicaError> {
@@ -144,8 +171,7 @@ impl ReplicaBackend for MemberRegion {
             ));
         }
         match self
-            .store
-            .put_opts(
+            .put(
                 &self.path(MARKER)?,
                 Bytes::from_static(b"zerofs-survival-region-v1").into(),
                 PutMode::Create.into(),
@@ -234,11 +260,13 @@ impl ReplicaBackend for MemberRegion {
             .filter(|(token, _)| *token == staged.token)
             .map(|(_, bytes)| bytes)
             .ok_or_else(|| ReplicaError::Io("staged object is unknown".into()))?;
-        self.store
-            .put(&self.path(&staged.key)?, bytes.into())
-            .await
-            .map(|_| ())
-            .map_err(io)
+        self.put(
+            &self.path(&staged.key)?,
+            bytes.into(),
+            PutOptions::default(),
+        )
+        .await
+        .map_err(io)
     }
 
     async fn flush(&self, _key_hint: &str) -> Result<(), ReplicaError> {

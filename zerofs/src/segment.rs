@@ -36,7 +36,7 @@ pub const SEGMENT_INFO: &[u8] = b"zerofs-v1-segment";
 pub(crate) const FOOTER_LEN: usize = 64;
 const MAGIC: &[u8; 4] = b"ZSEG";
 const VERSION: u32 = 1;
-const DIR_ENTRY_LEN: usize = 28; // byte_offset(8) + len(4) + inode(8) + extent(8)
+pub(crate) const DIR_ENTRY_LEN: usize = 28; // byte_offset(8) + len(4) + inode(8) + extent(8)
 pub(crate) const LEN_PREFIX: usize = 4;
 
 // Footer field offsets within the trailing 64 bytes.

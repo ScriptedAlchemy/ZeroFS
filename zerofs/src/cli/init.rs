@@ -314,7 +314,11 @@ impl StartupContext {
                     }
                     .context("Failed to attach persistent writeback")?;
                     if let Some(pool) = &pool {
-                        attached.lifecycle.set_pool(pool.clone());
+                        attached
+                            .lifecycle
+                            .set_pool(pool.clone())
+                            .await
+                            .context("Failed to lease journaled pool segments")?;
                     }
                     (attached.store, Some(attached.lifecycle))
                 }
@@ -1191,6 +1195,11 @@ impl ReconciledDb {
         .await
         .context("Failed to initialize filesystem")?;
         fs.write_ack = write_ack;
+        if let Some(pool) = &pool
+            && !db_mode.is_read_only()
+        {
+            fs.extent_store.set_admission(pool.clone());
+        }
 
         if let Some(writeback) = writeback.clone() {
             let barrier_store = writeback.clone();

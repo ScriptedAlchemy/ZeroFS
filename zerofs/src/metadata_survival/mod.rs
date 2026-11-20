@@ -472,7 +472,7 @@ pub(crate) fn authority_dir(settings: &Settings) -> Result<PathBuf> {
 /// A raw pool member as a replica: its region lives in the member's log.
 fn member_replica(member: crate::pool_object_store::SurvivalMember) -> Replica {
     let region = if member.available {
-        member_region::MemberRegion::new(&member.id, &member.identity, member.store)
+        member_region::MemberRegion::new(&member.id, &member.identity, member.store, member.pool)
     } else {
         member_region::MemberRegion::absent(&member.id, &member.identity, member.store)
     };
@@ -2342,6 +2342,7 @@ pub(crate) async fn offline_member_replicas(settings: &Settings) -> Result<Offli
                     id: member.id.clone(),
                     identity,
                     store: Arc::clone(&opened.store),
+                    pool: None,
                     available: true,
                 };
                 offline.opened.push(opened);
@@ -2355,6 +2356,7 @@ pub(crate) async fn offline_member_replicas(settings: &Settings) -> Result<Offli
                     id: member.id.clone(),
                     identity,
                     store: Arc::new(object_store::memory::InMemory::new()),
+                    pool: None,
                     available: false,
                 }
             }

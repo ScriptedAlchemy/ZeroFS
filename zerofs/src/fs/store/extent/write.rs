@@ -105,6 +105,7 @@ use crate::db::Transaction;
 use crate::frame_codec::Compressed;
 use crate::fs::inode::InodeId;
 use crate::fs::{EXTENT_SIZE, FsError};
+use crate::pool_object_store::Claim;
 use crate::replication::ReplOp;
 use crate::segment::{DirEntry, FrameLoc, Segid, SegmentFormatLimits};
 use crate::segment_store::SegmentStoreError;
@@ -171,6 +172,19 @@ pub(crate) const OPEN_SEGMENT_LANES: usize = 4;
 /// (`SegmentStore::put_segment`), so its fsync-path latency stays bounded
 /// despite the size.
 pub(crate) const SEAL_THRESHOLD: usize = 256 * 1024 * 1024;
+
+/// Room each new segment needs beyond its frames and directory entries in a
+/// WRITE's claim: a footer, the sealed directory's fixed part, and a raw
+/// member's record header and block rounding.
+const NEW_SEGMENT_SLACK: u64 = crate::segment::FOOTER_LEN as u64 + 8 * 1024;
+
+/// Bytes `frames` occupy in a segment, length prefixes included.
+fn stored_len(frames: &[Compressed]) -> usize {
+    frames
+        .iter()
+        .map(|frame| crate::segment::LEN_PREFIX + frame.sealed_len())
+        .sum()
+}
 
 /// The error a flush reports for its failed segment PUTs: ENOSPC only when
 /// every failure was a full backend, so a client can tell full from broken.
@@ -765,6 +779,7 @@ impl ExtentStore {
         id: InodeId,
         edits: &[(u64, Option<Bytes>)],
         old_extent_end: u64,
+        claim: Option<&Claim>,
     ) -> Result<(), FsError> {
         // Extent indices must be unique within one batch (order is free): the
         // point-lookup path below emits one debit per `edits` entry, so a
@@ -924,6 +939,17 @@ impl ExtentStore {
         #[cfg(test)]
         StagePhaseNanos::add(&phase.compress, t_compress);
         let has_frames = !compressed.is_empty();
+        // Frames staged outside a WRITE, such as a truncate's partial last
+        // extent, claim exactly what they add.
+        let own_claim = match (has_frames, claim) {
+            (true, None) => {
+                let frames = stored_len(&compressed) as u64;
+                self.claim(id, self.growth_bound(frames, compressed.len() as u64, 1))
+                    .await?
+            }
+            _ => None,
+        };
+        let claim = claim.or(own_claim.as_ref());
         #[cfg(test)]
         if has_frames {
             phase
@@ -949,6 +975,9 @@ impl ExtentStore {
         // grows past the threshold plus one write while storage stays full.
         if has_frames && lane.open.lock().unwrap().buf.len() >= self.seal_threshold() {
             self.spawn_seal(&append_guard).await?;
+        }
+        if has_frames && let Some(claim) = claim {
+            self.fund_lease(&append_guard, claim, &compressed).await?;
         }
         #[cfg(test)]
         let t_gate_hold = std::time::Instant::now();
@@ -1093,6 +1122,89 @@ impl ExtentStore {
             StagePhaseNanos::add(&phase.spawn_seal, t_spawn_seal);
         }
         Ok(())
+    }
+
+    /// Claim room for a WRITE of `len` bytes at `offset` before it is
+    /// acknowledged. `Ok(None)` when segments are not pooled.
+    pub(crate) async fn claim_write(
+        &self,
+        id: InodeId,
+        offset: u64,
+        len: u64,
+    ) -> Result<Option<Claim>, FsError> {
+        let Some((start, end)) = Self::extent_span(offset, len) else {
+            return Ok(None);
+        };
+        let extents = end - start + 1;
+        // Every touched extent becomes one full frame, whatever it held.
+        let frame = (crate::segment::LEN_PREFIX + self.codec.sealed_bound(EXTENT_SIZE)) as u64;
+        let frames = extents.saturating_mul(frame);
+        // Crossing the seal threshold opens segments, and a lease on another
+        // member opens one more.
+        let segments = (frames / self.seal_threshold() as u64).saturating_add(2);
+        self.claim(id, self.growth_bound(frames, extents, segments))
+            .await
+    }
+
+    /// Upper bound on what `frames` bytes of `entries` frames add to open
+    /// segments, opening at most `segments` new ones.
+    fn growth_bound(&self, frames: u64, entries: u64, segments: u64) -> u64 {
+        let directory = usize::try_from(entries)
+            .ok()
+            .and_then(|entries| entries.checked_mul(crate::segment::DIR_ENTRY_LEN))
+            .map_or(u64::MAX, |plain| self.codec.sealed_bound(plain) as u64);
+        frames
+            .saturating_add(directory)
+            .saturating_add(segments.saturating_mul(NEW_SEGMENT_SLACK))
+    }
+
+    async fn claim(&self, id: InodeId, bytes: u64) -> Result<Option<Claim>, FsError> {
+        let Some(pool) = self.admission.get() else {
+            return Ok(None);
+        };
+        // Prefer the member the inode's lane is filling, so its segment grows
+        // instead of rotating early.
+        let prefer = pool.lease_member(self.open_lane(id).open.lock().unwrap().segid);
+        match pool.admit(bytes, prefer).await {
+            Ok(claim) => Ok(Some(claim)),
+            Err(error) if crate::retrying_object_store::is_no_space(&error) => {
+                Err(FsError::NoSpace)
+            }
+            Err(error) => {
+                error!("pool admission failed for inode {id}: {error}");
+                Err(FsError::IoError)
+            }
+        }
+    }
+
+    /// Grow the open segment's lease to cover `frames` from `claim`. A
+    /// segment leased on another member is sealed first, so these frames
+    /// start a new segment on the claim's member.
+    async fn fund_lease(
+        &self,
+        appended: &LaneAppendGuard<'_>,
+        claim: &Claim,
+        frames: &[Compressed],
+    ) -> Result<(), FsError> {
+        let projected = || {
+            let open = appended.lane().open.lock().unwrap();
+            let frame_bytes = stored_len(frames);
+            let directory = self
+                .codec
+                .sealed_bound((open.dir.len() + frames.len()) * crate::segment::DIR_ENTRY_LEN);
+            let total = open.buf.len() + frame_bytes + directory + crate::segment::FOOTER_LEN;
+            (open.segid, total as u64)
+        };
+        let (segid, total) = projected();
+        if claim.fund(segid, total).is_ok() {
+            return Ok(());
+        }
+        self.spawn_seal(appended).await?;
+        let (segid, total) = projected();
+        claim.fund(segid, total).map_err(|_| {
+            error!("open segment {segid:?} stayed leased on another member after rotation");
+            FsError::IoError
+        })
     }
 
     /// Sealed generations still waiting for a successful PUT, and their bytes.
@@ -1442,6 +1554,21 @@ impl ExtentStore {
         data: &Bytes,
         old_size: u64,
     ) -> Result<TailUpdate, FsError> {
+        self.write_claimed(txn, id, offset, data, old_size, None)
+            .await
+    }
+
+    /// [`Self::write`] with the room its WRITE claimed. Without a claim, and
+    /// with a pool, each staged batch claims its own room.
+    pub(crate) async fn write_claimed(
+        &self,
+        txn: &mut Transaction,
+        id: InodeId,
+        offset: u64,
+        data: &Bytes,
+        old_size: u64,
+        claim: Option<&Claim>,
+    ) -> Result<TailUpdate, FsError> {
         if data.is_empty() {
             return Ok(TailUpdate::Keep);
         }
@@ -1525,7 +1652,7 @@ impl ExtentStore {
         // All frame locations and the inode update still publish in one
         // transaction, even when the data spans several sealed objects.
         for batch in edits.chunks(self.max_append_extents) {
-            self.stage_edits(txn, id, batch, old_size.div_ceil(EXTENT_SIZE as u64))
+            self.stage_edits(txn, id, batch, old_size.div_ceil(EXTENT_SIZE as u64), claim)
                 .await?;
         }
 
@@ -1568,8 +1695,14 @@ impl ExtentStore {
                 } else {
                     (last_extent_idx, Some(extent.freeze()))
                 };
-                self.stage_edits(txn, id, &[edit], old_size.div_ceil(EXTENT_SIZE as u64))
-                    .await?;
+                self.stage_edits(
+                    txn,
+                    id,
+                    &[edit],
+                    old_size.div_ceil(EXTENT_SIZE as u64),
+                    None,
+                )
+                .await?;
             }
         }
         Ok(())
@@ -1617,8 +1750,14 @@ impl ExtentStore {
                 }
             }
         }
-        self.stage_edits(txn, id, &edits, file_size.div_ceil(EXTENT_SIZE as u64))
-            .await
+        self.stage_edits(
+            txn,
+            id,
+            &edits,
+            file_size.div_ceil(EXTENT_SIZE as u64),
+            None,
+        )
+        .await
     }
 
     /// Delete an extent range under the inode's write lock, in its own transaction.
@@ -2814,7 +2953,13 @@ mod tests {
         let seed = Bytes::from(vec![0x77; EXTENT_SIZE]);
         let mut seed_txn = db.new_transaction().unwrap();
         store
-            .stage_edits(&mut seed_txn, seed_inode, &[(2, Some(seed.clone()))], 0)
+            .stage_edits(
+                &mut seed_txn,
+                seed_inode,
+                &[(2, Some(seed.clone()))],
+                0,
+                None,
+            )
             .await
             .unwrap();
         commit(&store, seed_txn).await;
@@ -2843,7 +2988,10 @@ mod tests {
             (12, Some(plains[2].clone())),
         ];
         let mut txn = db.new_transaction().unwrap();
-        store.stage_edits(&mut txn, inode, &edits, 0).await.unwrap();
+        store
+            .stage_edits(&mut txn, inode, &edits, 0, None)
+            .await
+            .unwrap();
 
         assert!(
             observed_unlocked.load(std::sync::atomic::Ordering::SeqCst),
@@ -2922,6 +3070,7 @@ mod tests {
                                 Some(Bytes::from(incompressible(inode as usize, EXTENT_SIZE))),
                             )],
                             0,
+                            None,
                         )
                         .await
                         .unwrap();
@@ -3742,7 +3891,7 @@ mod tests {
                     let mut txn = db.new_transaction().unwrap();
                     let payload = Bytes::from(incompressible(inode as usize, EXTENT_SIZE));
                     store
-                        .stage_edits(&mut txn, inode, &[(0, Some(payload))], 0)
+                        .stage_edits(&mut txn, inode, &[(0, Some(payload))], 0, None)
                         .await
                         .unwrap();
                     commit(&store, txn).await;
