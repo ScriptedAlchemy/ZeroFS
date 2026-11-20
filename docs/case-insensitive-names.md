@@ -21,19 +21,18 @@ prevent startup. Older binaries read the magic as an impossible string length
 and refuse to open the filesystem. Their key loader propagates that parse
 error and never initializes a replacement key.
 
-Insensitive lookup uses Unicode 5.0.0 simple uppercase without normalization.
-The byte-span rules match OpenZFS 2.3.4 `u8_textprep_str` with
-`U8_TEXTPREP_IGNORE_INVALID`. A recognized UTF-8 lead byte consumes its full
+Insensitive lookup uses single-character Unicode uppercase, from the Rust
+standard library, without normalization. A character whose uppercase form
+expands to several characters, such as `ß`, keeps its spelling. A recognized
+UTF-8 lead byte consumes its full
 2, 3, or 4-byte span, even when later bytes are invalid. A truncated span copies
 through the end of the name. Other invalid bytes consume one byte. Invalid
-spans retain every byte, so `c3 61` and `c3 41` remain distinct. Valid spans fold
-with the pinned uppercase table. The exported `fs::name_mode::fold_name`
+spans retain every byte, so `c3 61` and `c3 41` remain distinct. The exported `fs::name_mode::fold_name`
 function supplies this rule for lookup and inventory.
 
 NFC and NFD spellings can coexist. The 255-byte filename limit applies to the
-supplied name, even when its lookup key grows after folding. The offline
-reference generator reads the OpenZFS tables as data and compares every one-
-and two-byte string plus 200,000 seeded strings of three to eight bytes.
+supplied name, even when its lookup key grows after folding. A unit test checks
+that folding every Unicode scalar value is idempotent.
 
 Creating a file, directory, symlink, hardlink or special node at a fold-equal
 name returns `EEXIST`. A rename onto a different entry replaces that entry.
@@ -114,4 +113,4 @@ admits it.
 - Not verified: a stock Linux v9fs mount and Samba with `standard_lookup =
   "exact"`. The tests drive the 9P handler through plain `9P2000.L` sessions
   without a kernel mount.
-- Not verified: Samba end to end, Linux v9fs client caching, native kernel mount refusal, and equivalence with a running ZFS filesystem require separate acceptance tests.
+- Not verified: Samba end to end, Linux v9fs client caching, and native kernel mount refusal require separate acceptance tests.

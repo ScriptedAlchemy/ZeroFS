@@ -1,34 +1,9 @@
 # Permissions and ACL contract
 
-This document states what ZeroFS enforces, what it translates, and what it
-refuses when it stores ownership, mode bits and access control lists. A
-migration tool or operator should check a source tree against it before copying
-data in. The rule throughout is that ZeroFS never makes access looser than the
-source without saying so per file. When it cannot express a source ACL, it
-refuses the write.
-
-## Decision for an NFSv4 source
-
-The legacy TrueNAS share uses NFSv4 ACLs. Another lane read the dataset
-properties at 2026-11-19T02:52:50Z: `storage/Storage` has `acltype=nfsv4`,
-`aclmode=restricted` and `casesensitivity=insensitive`. This lane made no NAS
-reads. Three options exist for such a source.
-
-| Option | Status in ZeroFS |
-| --- | --- |
-| Enforce NFSv4 ACLs natively | Not implemented. ZeroFS has no NFSv4 ACL evaluator. |
-| Translate NFSv4 ACLs to enforced POSIX ACLs, refusing every case that would change a read, write or execute decision | Implemented. Described below. |
-| Keep NFSv4 ACLs as inert bytes | Not offered. ZeroFS never stores an NFSv4 ACL it does not enforce. Copying without ACLs needs an explicit operator waiver, which the copy tool must record. |
-
-The copy tool must write ACLs, including `system.nfs4_acl_xdr`, through the
-ZeroFS FUSE client. The kernel 9P mount refuses ACL writes (see "Client-side
-checks").
-
-The operator must decide, per source tree, between translation and a waiver.
-`zerofs inventory`, run where the source's NFSv4 ACLs are visible, reports the
-translation result for every entry (see "Checking a source tree" below). A tree
-with no refused entries can migrate under translation. Each refused entry needs
-a decision: change its ACL at the source, or waive ACL migration for it.
+This document states what ZeroFS enforces and what it refuses when it stores
+ownership, mode bits and POSIX access control lists. ZeroFS never makes access
+looser than a stored ACL says. When it cannot express an ACL, it refuses the
+write.
 
 ## What is enforced
 
@@ -110,8 +85,7 @@ effective decision is the stricter of the client's and the server's.
   `access=client,posixacl`, which the app rejected for other reasons, and the
   kernel's ACL calls require that flag. `setfacl` and a read of
   `system.posix_acl_access` fail with `EOPNOTSUPP`, and `getfacl` shows an ACL
-  built from the mode. A write of `system.nfs4_acl_xdr` also fails with
-  `EOPNOTSUPP`. The caller always gets that error, so an ACL is never
+  built from the mode. The caller always gets that error, so an ACL is never
   silently dropped. The kernel checks only mode bits locally, so a named user
   or named group receives no more than the mode's group or other bits on that
   mount. The server still enforces every stored ACL for requests from that
@@ -123,128 +97,17 @@ effective decision is the stricter of the client's and the server's.
   mapping applies before the check. Returned attributes retain acknowledged
   RAM-write size and timestamps without forcing materialization.
 
-## Translation of NFSv4 ACLs
-
-A write of `system.nfs4_acl_xdr`, in the OpenZFS layout that TrueNAS emits,
-asks ZeroFS to translate an NFSv4 ACL. The caller must own the inode or be
-root. ZeroFS translates the ACL into a POSIX access ACL and, for a directory
-with inheritable entries, a POSIX default ACL. It stores only the POSIX ACLs.
-It does not store or serve the NFSv4 bytes: a read of `system.nfs4_acl_xdr`
-returns `ENODATA`, and listings omit it. A refused ACL returns `EOPNOTSUPP` and
-changes nothing. The server log records each translation with the resulting
-ACLs and any narrowed rights, and each refusal with its rule.
-
-### The acceptance rule
-
-Translation is accepted only when the POSIX ACL makes the same decision as the
-NFSv4 ACL for every request of read, write and execute, alone or combined, for
-every class of caller. ZeroFS checks this by enumeration, not by pattern
-matching. The caller classes are the owner, each named user, an unnamed user,
-and every combination of membership in the owning group and the named groups.
-For inheritable entries, ZeroFS repeats the check with the future child's owner
-set to each named user and to an unnamed user, the child's group set to each
-named group and to an unnamed group, and the child being a file and a
-directory. NFSv4 evaluation follows RFC 8881 order: for each right, the first
-matching entry that mentions it decides it, and an undecided right is denied.
-
-NFSv4 rights map to POSIX bits as follows.
-
-| POSIX | NFSv4 rights it stands for |
-| --- | --- |
-| `r` | `READ_DATA` (list directory). Requires `READ_NAMED_ATTRS`, because POSIX read also allows reading `user.*` attributes. |
-| `w` on a file | `WRITE_DATA` and `APPEND_DATA` together. Requires `WRITE_NAMED_ATTRS` and `WRITE_ATTRIBUTES`, because POSIX write also allows writing `user.*` attributes and setting times to now. |
-| `w` on a directory | `ADD_FILE` and `ADD_SUBDIRECTORY` together, with the requirements above, plus `DELETE_CHILD` for the same caller. Inheritable `DELETE` alone cannot authorize deleting every existing or future child. |
-| `x` | `EXECUTE` (traverse directory). |
-
-### Patterns that translate
-
-These TrueNAS patterns translate. The tests in
-`zerofs/src/fs/permissions/nfs4/tests.rs` cover each one.
-
-- `owner@`, `group@` and `everyone@` allow entries with the TrueNAS basic sets
-  `FULL_CONTROL`, `READ` and `TRAVERSE`. `MODIFY` also translates on files;
-  directory grants need explicit `DELETE_CHILD` in addition to `MODIFY`.
-  `NFS4_RESTRICTED`, `NFS4_OPEN` and `NFS4_HOME` presets containing directory
-  `MODIFY` without that right are refused.
-- Named group entries, such as the SMB `BUILTIN\Users` (gid 545) and
-  `BUILTIN\Administrators` (gid 544) groups, and named user entries. A POSIX
-  mask is added equal to the union of the named and group-class permissions.
-- File-and-directory inheritance (`FILE_INHERIT` with `DIRECTORY_INHERIT`),
-  inherit-only entries, and the informational `INHERITED` flag. Inherit-only
-  entries feed only the default ACL.
-- Deny entries whose effect POSIX can express, such as a named user denied
-  write ahead of an `everyone@` grant, an `owner@` deny ahead of an
-  `everyone@` grant, or an `everyone@` deny after the grants.
-
-### Patterns that are refused
-
-Each refusal names one rule. The inventory and the server log print the rule.
-
-| Rule | Cause |
-| --- | --- |
-| `decision_mismatch` | Some caller class would get a different decision for `r`, `w`, `x` or a combined request. Typical causes: a deny for one group ahead of an allow for another, rights split across group entries that no single POSIX group entry can grant together, owner rights that depend on the owner's group membership, or a deny for a named user who could own a future child. |
-| `file_or_directory_only_inheritance` | An entry inherits to files only or to directories only. POSIX defaults apply to both. |
-| `no_propagate_inheritance` | `NO_PROPAGATE_INHERIT`. POSIX defaults always propagate. |
-| `partial_write_rights` | `WRITE_DATA` without `APPEND_DATA`, or the reverse; on a directory, `ADD_FILE` without `ADD_SUBDIRECTORY`. |
-| `data_right_without_named_attribute_right` | Read data without `READ_NAMED_ATTRS`, or write data without `WRITE_NAMED_ATTRS`. |
-| `write_without_write_attributes` | Write data without `WRITE_ATTRIBUTES`. |
-| `directory_write_without_delete_child` | Directory write without `DELETE_CHILD`, including inheritable grants. A child's owning group or ACL may differ from the parent's, and an existing/protected child may grant no `DELETE`; the parent ACL alone cannot prove that POSIX deletion would preserve access. |
-| `unsupported_ace_type` | Audit or alarm entries. |
-| `unknown_ace_flags`, `unknown_access_bits`, `malformed_xdr` | Bits or layout outside OpenZFS's NFSv4.1 encoding. |
-| `too_many_entries`, `too_many_named_principals` | More than 128 entries, 8 named users or 6 named groups. These bound the enumeration. |
-
-### Narrowings that are reported
-
-Some NFSv4 rights have no per-file POSIX equivalent. Translation drops them
-and reports each one per file in the `narrowed` list.
-
-- `acl_or_owner_change_limited_to_owner`: `WRITE_ACL` or `WRITE_OWNER` granted
-  to someone other than the owner. In POSIX only the owner or root may change
-  an ACL or mode, and only root may change the owner.
-- `attribute_write_without_data_write_dropped`: `WRITE_NAMED_ATTRS` or
-  `WRITE_ATTRIBUTES` without data write. POSIX ties both to `w`.
-- `delete_follows_parent_directory_write`: `DELETE` on the object. POSIX
-  decides deletion from the parent directory's `w` and `x` and the sticky bit.
-
-### What translation does not keep
-
-- The NFSv4 bytes, the ACL flags (`auto-inherit`, `protected`, `defaulted`)
-  and per-entry `INHERITED` flags. These steer Windows-side propagation, not
-  access.
-- `aclmode=restricted`. On ZFS a `chmod` of a file with a non-trivial ACL fails.
-  On ZeroFS the owner may `chmod`, which rewrites the mask and other entry.
-- `aclinherit=passthrough`. ZFS ignores the creating mode for inherited entries.
-  POSIX limits an inherited ACL by the creating mode, so new files can be
-  narrower than on the source. Clients that mask the creating mode also
-  narrow the inherited ACL.
-- `READ_ATTRIBUTES`, `READ_ACL` and `SYNCHRONIZE`. Any caller who can reach an
-  inode can `stat` it and read its ACL, as on Linux. Samba enforces these rights
-  for SMB clients on the source, so SMB access through ZeroFS is looser here.
-
 ## What is refused outside ACLs
 
-`system.*` names other than `system.posix_acl_access`,
-`system.posix_acl_default` and `system.nfs4_acl_xdr` return `EOPNOTSUPP`, as do
+`system.*` names other than `system.posix_acl_access` and
+`system.posix_acl_default` return `EOPNOTSUPP`, as do
 unknown namespaces. `docs/extended-attributes.md` covers the other namespaces.
 
 ## Checking a source tree
 
-`zerofs inventory` probes `system.posix_acl_access`, `system.posix_acl_default`
-and `system.nfs4_acl_xdr` on each entry. For every observed NFSv4 ACL the
-entry's ACL record gains a `posix_translation` object, produced by the same
-code the server runs:
-
-```json
-{"status": "accepted", "access": "u::rwx,g::rwx,o::---", "default": "u::rwx,g::rwx,o::---", "narrowed": ["delete_follows_parent_directory_write"]}
-{"status": "refused", "rule": "file_or_directory_only_inheritance"}
-```
-
-The summary record counts entries per ACL format in `acl_formats` and reports
-`nfs4_acl_translations_accepted` and `nfs4_acl_translations_refused`. When any
-entry is refused, the command also prints a warning to standard error. Linux
-exposes `system.nfs4_acl_xdr` only on the ZFS host itself, so a run over an SMB
-or NFS client mount reports no NFSv4 ACLs even when the dataset has them. An
-inventory of the production share needs the parent's authorization.
+`zerofs inventory` probes `system.posix_acl_access` and
+`system.posix_acl_default` on each entry. The summary record counts entries per
+ACL format in `acl_formats`.
 
 ## Storage and compatibility
 
@@ -267,8 +130,8 @@ permission states. Owner, root, symlink and no-ACL fast paths use the original
 inode alone.
 
 The evidence under `docs/evidence/acl-xattr-20261119/` describes its recorded
-source revision. Changes to combined permission checks, coherent ACL reads and
-NFSv4 deletion-policy refusal require fresh mounted qualification; those
+source revision. Changes to combined permission checks and coherent ACL reads
+require fresh mounted qualification; those
 historical receipts do not qualify the updated implementation.
 
 A ZeroFS binary from before this change ignores ACL rows and checks mode bits

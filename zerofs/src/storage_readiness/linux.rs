@@ -11,7 +11,6 @@ pub(super) struct Mount {
     root: PathBuf,
     mountpoint: PathBuf,
     filesystem: String,
-    source: String,
     writable: bool,
 }
 
@@ -80,7 +79,6 @@ pub(super) fn containing_mount(input: &str, path: &Path) -> Result<Mount> {
             root: PathBuf::from(unescape(fields[3])?),
             mountpoint,
             filesystem: tail[0].to_owned(),
-            source: unescape(tail[1])?,
             writable: writable(fields[5]) && writable(tail[2]),
         });
     }
@@ -125,32 +123,28 @@ fn block_device_path(device: (u32, u32)) -> String {
 }
 
 pub(super) fn identify(mount: Mount, probe: &dyn Probe) -> Result<MountedFilesystem> {
-    let (identity, unlocked, writable) = match mount.filesystem.as_str() {
-        "ext4" | "xfs" => {
-            // Probe the actual mounted device, not an operator-supplied UUID
-            // symlink or a possibly stale blkid cache.
-            let device = block_device_path(mount.device);
-            let output = probe.output("blkid", &["-p", "-s", "UUID", "-o", "value", &device])?;
-            let uuid = uuid::Uuid::parse_str(scalar(&output)?)?;
-            if uuid.is_nil() {
-                bail!("mounted filesystem has no stable UUID")
-            }
-            (
-                FilesystemIdentity::Uuid {
-                    uuid: uuid.hyphenated().to_string(),
-                },
-                true,
-                mount.writable,
-            )
-        }
-        other => bail!("strict storage readiness has no identity adapter for filesystem {other}"),
-    };
+    if !matches!(mount.filesystem.as_str(), "ext4" | "xfs") {
+        bail!(
+            "strict storage readiness has no identity adapter for filesystem {}",
+            mount.filesystem
+        );
+    }
+    // Probe the actual mounted device, not an operator-supplied UUID symlink
+    // or a possibly stale blkid cache.
+    let device = block_device_path(mount.device);
+    let output = probe.output("blkid", &["-p", "-s", "UUID", "-o", "value", &device])?;
+    let uuid = uuid::Uuid::parse_str(scalar(&output)?)?;
+    if uuid.is_nil() {
+        bail!("mounted filesystem has no stable UUID")
+    }
     Ok(MountedFilesystem {
         mountpoint: mount.mountpoint,
         filesystem_root: mount.root,
-        identity,
-        writable,
-        unlocked,
+        identity: FilesystemIdentity::Uuid {
+            uuid: uuid.hyphenated().to_string(),
+        },
+        writable: mount.writable,
+        unlocked: true,
     })
 }
 

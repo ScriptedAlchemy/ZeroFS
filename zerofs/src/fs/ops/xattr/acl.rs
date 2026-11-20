@@ -1,19 +1,17 @@
-//! Storage, inheritance and enforcement of POSIX ACLs, and translation of
-//! written NFSv4 ACLs. The contract is `docs/permissions-and-acl-contract.md`.
+//! Storage, inheritance and enforcement of POSIX ACLs. The contract is `docs/permissions-and-acl-contract.md`.
 
 use super::{XattrKind, XattrName};
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId};
 use crate::fs::mutation::types::{ConflictKey, ConflictScope};
 use crate::fs::permissions::acl::{POSIX_ACL_ACCESS, POSIX_ACL_DEFAULT, PosixAcl};
-use crate::fs::permissions::nfs4::map_nfs4_acl;
 use crate::fs::permissions::{AccessMode, Credentials, check_access_with_acl};
 use crate::fs::store::xattr::XATTR_COUNT_MAX;
 use crate::fs::{ZeroFS, get_current_time};
 use bytes::Bytes;
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 /// Inode ids are allocated upward from zero and never reach this value, so
 /// its attribute rows cannot belong to a file. Older binaries ignore them.
@@ -215,8 +213,7 @@ impl ZeroFS {
         })
     }
 
-    /// Set or remove `system.posix_acl_access`, `system.posix_acl_default`,
-    /// or translate a written `system.nfs4_acl_xdr`.
+    /// Set or remove `system.posix_acl_access` or `system.posix_acl_default`.
     pub(super) async fn mutate_acl(
         &self,
         creds: &Credentials,
@@ -233,7 +230,7 @@ impl ZeroFS {
             }
             _ => None,
         };
-        let removal = value.is_none() || (kind != XattrKind::Nfs4Xdr && decoded.is_none());
+        let removal = value.is_none() || decoded.is_none();
 
         let fence = self
             .fence_metadata(ConflictScope::single(ConflictKey::Inode(id)))
@@ -256,35 +253,6 @@ impl ZeroFS {
                 };
             }
             XattrKind::PosixDefault => (None, Some(decoded)),
-            XattrKind::Nfs4Xdr => {
-                // The blob is never stored, so there is nothing to remove.
-                let Some(value) = value else {
-                    return Err(FsError::NoData);
-                };
-                match map_nfs4_acl(&value, is_directory, inode.uid(), inode.gid()) {
-                    Ok(mapped) => {
-                        info!(
-                            inode = id,
-                            access = %mapped.access.to_text(),
-                            default = %mapped.default.as_ref().map(PosixAcl::to_text).unwrap_or_default(),
-                            narrowed = ?mapped.reports,
-                            "translated NFSv4 ACL to POSIX ACLs"
-                        );
-                        (
-                            Some(Some(mapped.access)),
-                            is_directory.then_some(mapped.default),
-                        )
-                    }
-                    Err(refusal) => {
-                        warn!(
-                            inode = id,
-                            reason = %refusal,
-                            "refused NFSv4 ACL that POSIX ACLs cannot enforce without loosening"
-                        );
-                        return Err(FsError::NotSupported);
-                    }
-                }
-            }
             _ => return Err(FsError::NotSupported),
         };
 

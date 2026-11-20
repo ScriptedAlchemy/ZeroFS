@@ -17,10 +17,6 @@ use bytes::Bytes;
 pub(crate) const POSIX_ACL_ACCESS: &[u8] = b"system.posix_acl_access";
 pub(crate) const POSIX_ACL_DEFAULT: &[u8] = b"system.posix_acl_default";
 
-/// The TrueNAS/OpenZFS NFSv4 ACL attribute. ZeroFS translates a value written
-/// here into POSIX ACLs (see `nfs4.rs`) and never stores the blob itself.
-pub(crate) const NFS4_ACL_XDR: &[u8] = b"system.nfs4_acl_xdr";
-
 const ACL_EA_VERSION: u32 = 2;
 const HEADER_LEN: usize = 4;
 const ENTRY_LEN: usize = 8;
@@ -34,8 +30,11 @@ const TAG_GROUP: u16 = 0x08;
 const TAG_MASK: u16 = 0x10;
 const TAG_OTHER: u16 = 0x20;
 
+#[cfg(test)]
 const PERM_READ: u16 = 4;
+#[cfg(test)]
 const PERM_WRITE: u16 = 2;
+#[cfg(test)]
 const PERM_EXECUTE: u16 = 1;
 const PERM_ALL: u16 = 7;
 
@@ -332,6 +331,7 @@ impl PosixAcl {
     /// Build a canonical ACL from owner, named-user, owning-group,
     /// named-group and other permissions. A mask is added when named entries
     /// exist. Named ids must be distinct within each list.
+    #[cfg(test)]
     pub(crate) fn from_parts(
         user_obj: u16,
         users: &[(u32, u16)],
@@ -379,7 +379,8 @@ impl PosixAcl {
         Self { entries }
     }
 
-    /// `getfacl`-style short text, for logs and reports.
+    /// `getfacl`-style short text for test assertions.
+    #[cfg(test)]
     pub(crate) fn to_text(&self) -> String {
         self.entries
             .iter()

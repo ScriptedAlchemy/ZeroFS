@@ -68,10 +68,15 @@ pub(in crate::storage_readiness) fn backing_serials(
         "mount namespace changed during backing device observation",
         |mount| {
             if !matches!(mount.filesystem.as_str(), "ext4" | "xfs") {
-                bail!("backing serials unavailable for filesystem {}", mount.filesystem);
+                bail!(
+                    "backing serials unavailable for filesystem {}",
+                    mount.filesystem
+                );
             }
             let path = PathBuf::from(super::block_device_path(mount.device));
-            Ok(std::collections::HashSet::from([block_serial(&path, true)?]))
+            Ok(std::collections::HashSet::from([block_serial(
+                &path, true,
+            )?]))
         },
     )
 }

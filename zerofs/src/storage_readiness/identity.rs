@@ -4,16 +4,13 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub(crate) enum FilesystemIdentity {
-    Uuid {
-        uuid: String,
-    },
+    Uuid { uuid: String },
 }
 
 impl FilesystemIdentity {
     pub(super) fn capacity_domain(&self) -> String {
-        match self {
-            Self::Uuid { uuid } => format!("uuid:{uuid}"),
-        }
+        let Self::Uuid { uuid } = self;
+        format!("uuid:{uuid}")
     }
 }
 

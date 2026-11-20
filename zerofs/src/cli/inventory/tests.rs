@@ -580,16 +580,10 @@ fn linux_non_utf8_names_and_symlink_metadata() {
         assert!(attrs.is_empty(), "{attrs:#?}");
     }
     let probes = link["acl"]["value"].as_array().unwrap();
-    for probe in &probes[..2] {
+    assert_eq!(probes.len(), 2);
+    for probe in probes {
         assert_eq!(probe["raw"]["reason"], "not_applicable_on_platform");
     }
-    assert_eq!(
-        probes[2]["raw"],
-        serde_json::json!({
-            "status": "unavailable", "reason": "format_not_supported_by_filesystem",
-            "errno": rustix::io::Errno::OPNOTSUPP.raw_os_error()
-        })
-    );
 }
 
 #[cfg(target_os = "linux")]
@@ -624,20 +618,10 @@ fn linux_raw_acl_probes() {
         rustix::fs::open(&path, rustix::fs::OFlags::RDONLY, rustix::fs::Mode::empty()).unwrap();
     let observed = serde_json::to_value(platform::acl(fd.as_fd())).unwrap();
     let probes = observed["value"].as_array().unwrap();
-    assert_eq!(probes.len(), 3);
+    assert_eq!(probes.len(), 2);
     assert_eq!(probes[0]["raw"]["value"]["hex"], hex(&acl));
     assert_eq!(probes[1]["raw"]["status"], "observed");
     assert_eq!(probes[1]["raw"]["value"], Value::Null);
-    assert_eq!(probes[2]["format"], "nfs4-xdr-xattr");
-    assert_eq!(
-        probes[2]["raw"],
-        serde_json::to_value(record::Field::<Option<record::RawBytes>>::Unavailable {
-            reason: record::Reason::FormatNotSupportedByFilesystem,
-            errno: Some(rustix::io::Errno::OPNOTSUPP.raw_os_error()),
-        })
-        .unwrap()
-    );
-    assert_eq!(probes[2]["decoded"]["reason"], "not_decoded");
 }
 
 #[cfg(target_os = "linux")]
@@ -712,7 +696,7 @@ fn review_special_node_metadata() {
         {
             assert_eq!(node["xattrs"]["status"], "observed", "{node:#}");
             let probes = node["acl"]["value"].as_array().unwrap();
-            assert_eq!(probes.len(), 3);
+            assert_eq!(probes.len(), 2);
             assert_eq!(probes[0]["raw"]["status"], "observed");
         }
         #[cfg(target_os = "macos")]

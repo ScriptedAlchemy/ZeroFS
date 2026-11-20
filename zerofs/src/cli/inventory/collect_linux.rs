@@ -140,14 +140,12 @@ fn acl_probes(mut probe: impl FnMut(&str) -> Field<Option<RawBytes>>) -> Field<V
         [
             ("linux-posix-access-xattr", "system.posix_acl_access"),
             ("linux-posix-default-xattr", "system.posix_acl_default"),
-            ("nfs4-xdr-xattr", "system.nfs4_acl_xdr"),
         ]
         .into_iter()
         .map(|(format, name)| RawAcl {
             format,
             raw: probe(name).format_probe(),
             decoded: Field::unavailable(Reason::NotDecoded),
-            posix_translation: None,
         })
         .collect(),
     )
@@ -200,7 +198,7 @@ fn path_metadata_at(
         get,
     );
     let acl = acl_probes(|name| {
-        if kind != EntryKind::Symlink || name == "system.nfs4_acl_xdr" {
+        if kind != EntryKind::Symlink {
             get(OsStr::new(name))
         } else {
             Field::unavailable(Reason::NotApplicableOnPlatform)
@@ -259,7 +257,6 @@ pub(super) fn filesystem(stat: &StatFs) -> Filesystem {
         0x01021997 => Some("9p"),
         0x65735546 => Some("fuse"),
         0xef53 => Some("ext"),
-        0x2fc12fc1 => Some("zfs"),
         0x9123683e => Some("btrfs"),
         0x58465342 => Some("xfs"),
         _ => None,

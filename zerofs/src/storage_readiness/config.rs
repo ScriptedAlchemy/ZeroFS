@@ -171,9 +171,7 @@ impl ReadinessConfig {
                 );
             }
             if !member_domains.insert(filesystem.identity.capacity_domain()) {
-                bail!(
-                    "readiness members must not alias one capacity domain"
-                );
+                bail!("readiness members must not alias one capacity domain");
             }
             roots.push(StorageRoot {
                 role: RoleName::Member(member.id.clone()),

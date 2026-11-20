@@ -1,5 +1,4 @@
 pub(crate) mod acl;
-pub(crate) mod nfs4;
 
 use super::errors::FsError;
 use super::inode::{DirectoryInode, Inode, InodeAttrs};

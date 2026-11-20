@@ -281,81 +281,6 @@ def kernel_9p_acl_refusal(root, config_has_acl):
           got=getfacl(f))
 
 
-def nfs4_write(client, root, accepts_translation, observe_root=None):
-    """Refuse unsafe directory MODIFY, then test the explicit DELETE_CHILD
-    variant. Observe kernel-9P writes through FUSE because access=user refuses
-    ACL reads too, so a kernel read cannot prove the server stayed unchanged."""
-    import struct
-    full, modify, delete_child = 0x1F01FF, 0x1301BF, 0x40
-    ace = lambda kind, flags, iflag, mask, who: struct.pack(">5I", kind, flags, iflag, mask, who)
-
-    def encoded(group_rights):
-        return struct.pack(">2I", 0, 2) + ace(0, 0x3, 1, full, 1) + ace(0, 0x3 | 0x40, 1, group_rights, 2)
-
-    def write(value):
-        r = as_user(OWNER, [OWNER], ["python3", "-c", """
-import json, os, sys
-try:
-    os.setxattr(sys.argv[1], 'system.nfs4_acl_xdr', bytes.fromhex(sys.argv[2]))
-    result = 0
-except OSError as error:
-    result = error.errno
-print(json.dumps({'errno': result}))
-""", d, value.hex()])
-        try:
-            result = json.loads(r.stdout)["errno"] if r.returncode == 0 else None
-        except (ValueError, KeyError, TypeError):
-            result = None
-        emit("nfs4_write", client=client, errno=result, exit=r.returncode, stderr=r.stderr.strip())
-        return result
-
-    def permission_state():
-        return (os.stat(observed).st_mode & 0o7777, getfacl(observed), getfacl(observed, default=True))
-
-    def no_inert_value():
-        try:
-            os.getxattr(observed, "system.nfs4_acl_xdr")
-            got = 0
-        except OSError as error:
-            got = error.errno
-        check(f"{client}: NFSv4 bytes are not stored or served", got == errno.ENODATA,
-              errno=got)
-        check(f"{client}: NFSv4 bytes are not listed",
-              "system.nfs4_acl_xdr" not in os.listxattr(observed))
-
-    d = os.path.join(root, f"nfs4-{client}")
-    os.mkdir(d, 0o700)
-    os.chown(d, OWNER, OWNER)
-    observed = os.path.join(observe_root or root, os.path.basename(d))
-    before = permission_state()
-    # TrueNAS NFS4_RESTRICTED uses MODIFY without DELETE_CHILD. Inherited
-    # DELETE cannot authorize every existing/protected child, so fail closed.
-    got = write(encoded(modify))
-    check(f"{client}: NFSv4 directory MODIFY without DELETE_CHILD refused",
-          got == errno.EOPNOTSUPP, errno=got)
-    after = permission_state()
-    check(f"{client}: refused ACL leaves mode, access and default unchanged",
-          after == before, before=before, after=after)
-    no_inert_value()
-
-    got = write(encoded(modify | delete_child))
-    if accepts_translation:
-        check(f"{client}: NFSv4 preset with explicit DELETE_CHILD translated", got == 0,
-              errno=got)
-        check(f"{client}: translated access ACL", getfacl(observed) == "user::rwx,group::rwx,other::---", got=getfacl(observed))
-        check(f"{client}: translated default ACL",
-              getfacl(observed, default=True) == "user::rwx,group::rwx,other::---", got=getfacl(observed, default=True))
-        check(f"{client}: owning group member creates", can(STRANGER, [OWNER], "create", os.path.join(d, "g")))
-        check(f"{client}: other cannot list", not can(STRANGER, [], "list", d))
-    else:
-        check(f"{client}: representable NFSv4 write refused by access=user",
-              got == errno.EOPNOTSUPP, errno=got)
-        after = permission_state()
-        check(f"{client}: client refusal leaves mode, access and default unchanged",
-              after == before, before=before, after=after)
-    no_inert_value()
-
-
 def cross_client(kroot, froot, f_rel):
     """ACLs set through FUSE, used through the kernel 9P client. The kernel
     9P client with access=user checks mode bits locally, so a named entry
@@ -493,8 +418,6 @@ def main():
             kernel_9p_acl_refusal(fixture.kmnt, support)
         saved = {client: acl_suite(client, mnt) for client, mnt in acl_clients}
         fuse_create_and_sgid(fixture.fmnt)
-        nfs4_write("fuse", fixture.fmnt, accepts_translation=True)
-        nfs4_write("kernel-9p", fixture.kmnt, accepts_translation=False, observe_root=fixture.fmnt)
         cross_client(fixture.kmnt, fixture.fmnt, os.path.relpath(saved["fuse"][0], fixture.fmnt))
         fixture.stop()
         fixture.start()

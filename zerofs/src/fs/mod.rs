@@ -8,7 +8,6 @@ pub mod key_codec;
 pub mod lock_manager;
 pub mod metrics;
 pub mod name_mode;
-mod name_uppercase;
 pub mod permissions;
 pub mod stats;
 pub mod store;
@@ -192,7 +191,7 @@ pub struct ZeroFS {
     /// connections (a retry may arrive on a new one); on a standby it is also fed
     /// by the replication stream.
     pub(crate) dedup: Arc<crate::dedup::DedupCache>,
-    /// Whether this volume stores POSIX or NFSv4 ACLs. See `fs/ops/xattr/acl.rs`.
+    /// Whether this volume stores POSIX ACLs. See `fs/ops/xattr/acl.rs`.
     pub(crate) acl_state: Arc<ops::AclState>,
 }
 
