@@ -1800,6 +1800,11 @@ async fn verify_existing(
     let mut local_stream = blob
         .range_stream(0..blob.len(), REMOTE_STREAM_CHUNK_BYTES)
         .map_err(|error| journal_blob_error("journal range failed", error))?;
+    // The local stream's items carry no size contract: a raw P3 journal yields
+    // its 60 KiB payload chunks whatever chunk size is requested. Compare byte
+    // for byte across item boundaries, so only different bytes are reported as
+    // divergence and never a different chunking of the same bytes.
+    let mut local = bytes::Bytes::new();
     let mut offset = 0u64;
     while offset < blob.len() {
         let end = offset
@@ -1811,21 +1816,39 @@ async fn verify_existing(
             range: Some(GetRange::Bounded(offset..end)),
             ..GetOptions::default()
         };
-        let remote_range = bounded_remote_step(record, "reconciliation range read", async {
+        let mut remote_range = bounded_remote_step(record, "reconciliation range read", async {
             remote.get_opts(target, options).await?.bytes().await
         })
         .await?;
-        let local_range = local_stream
-            .next()
-            .await
-            .transpose()
-            .map_err(|error| journal_blob_error("journal range read failed", error))?
-            .unwrap_or_default();
-        if local_range.len() as u64 != end - offset || remote_range != local_range {
+        if remote_range.len() as u64 != end - offset {
             return Err(object_store::Error::AlreadyExists {
                 path: target.to_string(),
                 source: Box::new(RemoteContentDivergence),
             });
+        }
+        while !remote_range.is_empty() {
+            if local.is_empty() {
+                // The verified stream fails instead of ending short, so a
+                // missing item here is local corruption, not remote divergence.
+                local = local_stream
+                    .next()
+                    .await
+                    .transpose()
+                    .map_err(|error| journal_blob_error("journal range read failed", error))?
+                    .ok_or_else(|| {
+                        journal_blob_error(
+                            "journal range read failed",
+                            JournalBlobIntegrityError::LengthMismatch.into(),
+                        )
+                    })?;
+            }
+            let count = local.len().min(remote_range.len());
+            if local.split_to(count) != remote_range.split_to(count) {
+                return Err(object_store::Error::AlreadyExists {
+                    path: target.to_string(),
+                    source: Box::new(RemoteContentDivergence),
+                });
+            }
         }
         offset = end;
     }
@@ -2070,6 +2093,107 @@ mod tests {
             2,
             "reconciliation performs one bounded HEAD and one bounded range GET"
         );
+    }
+
+    fn raw_journal(capacity: u64) -> Journal {
+        use zerofs_raw_device::{Identity, Role, journal_region::TransactionRegion};
+
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(capacity).unwrap();
+        let region = TransactionRegion::provision(
+            file,
+            capacity,
+            0,
+            capacity,
+            Identity {
+                pool_uuid: [9; 16],
+                member_uuid: [10; 16],
+                role: Role::Journal,
+            },
+        )
+        .unwrap();
+        Journal::open_raw(
+            region,
+            JournalIdentity {
+                format_version: 1,
+                bucket_id: "raw-bucket".to_owned(),
+                backend_endpoint: "raw-pool".to_owned(),
+                database_prefix: "db".to_owned(),
+                backend_kind: "raw".to_owned(),
+                encryption_key_identity_sha256: [0x77; 32],
+            },
+        )
+        .unwrap()
+    }
+
+    /// A raw P3 journal streams a payload in its own 60 KiB chunks, not in the
+    /// 16 MiB ranges reconciliation reads from the remote. Identical bytes must
+    /// reconcile whatever the chunking, across a remote range boundary too.
+    #[tokio::test]
+    async fn verify_existing_reconciles_a_raw_journal_payload_across_its_payload_chunks() {
+        // One byte past a raw payload chunk; a few chunks; and more than one
+        // 16 MiB remote range, ending off both chunk grids.
+        for len in [
+            60 * 1024 + 1,
+            200 << 10,
+            super::REMOTE_STREAM_CHUNK_BYTES + 60 * 1024 + 1,
+        ] {
+            let journal = Arc::new(raw_journal(128 << 20));
+            let target = Path::from("db/segments/64/0000000000000003/0000000000000b64");
+            let expected = Bytes::from((0..len).map(|n| (n % 251) as u8).collect::<Vec<_>>());
+            let record = put_record(1, target.as_ref(), &expected);
+            journal.commit_put(record.clone(), &expected).unwrap();
+            let remote = InMemory::new();
+            let created = remote
+                .put(&target, PutPayload::from(expected.clone()))
+                .await
+                .unwrap();
+
+            let reconciled = verify_existing(&remote, &journal, &record, &target)
+                .await
+                .unwrap_or_else(|error| panic!("{len} identical bytes must reconcile: {error}"));
+            assert_eq!(reconciled.e_tag, created.e_tag);
+        }
+    }
+
+    /// Reconciliation still fails closed on a raw journal: a remote object of
+    /// the same length that differs in any payload chunk is a permanent
+    /// divergence, and so is one of another length.
+    #[tokio::test]
+    async fn verify_existing_rejects_different_bytes_under_a_raw_journal() {
+        let len = super::REMOTE_STREAM_CHUNK_BYTES + 60 * 1024 + 1;
+        let journal = Arc::new(raw_journal(128 << 20));
+        let target = Path::from("db/segments/64/0000000000000003/0000000000000b64");
+        let expected = (0..len).map(|n| (n % 251) as u8).collect::<Vec<_>>();
+        let record = put_record(1, target.as_ref(), &expected);
+        journal.commit_put(record.clone(), &expected).unwrap();
+
+        let mut candidates = Vec::new();
+        // First byte, a byte inside a later payload chunk of the first remote
+        // range, the first byte of the second remote range, and the last byte.
+        for flipped in [0, 60 * 1024 + 7, super::REMOTE_STREAM_CHUNK_BYTES, len - 1] {
+            let mut different = expected.clone();
+            different[flipped] ^= 1;
+            candidates.push(different);
+        }
+        candidates.push(expected[..len - 1].to_vec());
+        candidates.push([expected.as_slice(), &[0]].concat());
+        for different in candidates {
+            let remote = InMemory::new();
+            remote
+                .put(&target, PutPayload::from(Bytes::from(different)))
+                .await
+                .unwrap();
+            let error = verify_existing(&remote, &journal, &record, &target)
+                .await
+                .expect_err("different remote bytes must never reconcile");
+            assert!(
+                matches!(&error, object_store::Error::AlreadyExists { source, .. }
+                    if source.is::<super::RemoteContentDivergence>()),
+                "{error}"
+            );
+            assert!(is_terminal_remote_error(&error));
+        }
     }
 
     #[tokio::test]

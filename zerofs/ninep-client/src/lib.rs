@@ -526,6 +526,20 @@ struct RequestAdmission {
     _permit: OwnedSemaphorePermit,
     outage_generation: u64,
     retirement_generation: u64,
+    /// Fids the caller names on the wire. Retiring one of them ends the
+    /// request; retiring any other fid does not.
+    fids: FencedFids,
+}
+
+/// The fids of one request, padded with [`NOFID`]. No 9P request names more
+/// than two.
+type FencedFids = [u32; 2];
+
+fn fenced_fids(fids: impl IntoIterator<Item = u32>) -> FencedFids {
+    let mut fids = fids.into_iter();
+    let fenced = [fids.next().unwrap_or(NOFID), fids.next().unwrap_or(NOFID)];
+    debug_assert!(fids.next().is_none(), "a request names at most two fids");
+    fenced
 }
 
 type AdmissionPermit = Arc<RequestAdmission>;
@@ -735,10 +749,27 @@ impl SessionState {
 #[derive(Default)]
 struct StatefulRequests {
     next_id: u64,
-    /// Failed/stale fid retirements invalidate callers still waiting for
-    /// admission, before they have a bounded registration in `pending`.
+    /// Counts failed/stale fid retirements. A caller records it on arrival,
+    /// before it has a bounded registration in `pending`.
     retirement_generation: u64,
+    /// The generation each fid number was last retired at. A caller that
+    /// arrived earlier and names that fid must not resume: the number may
+    /// already belong to another file. Fid numbers are recycled, so this holds
+    /// at most one entry per number the session has ever allocated.
+    retired_fids: HashMap<u32, u64>,
     pending: HashMap<u64, PendingStatefulRequest>,
+}
+
+impl StatefulRequests {
+    /// Whether one of `fids` was retired after `generation` was recorded.
+    fn retired_since(&self, generation: u64, fids: impl IntoIterator<Item = u32>) -> bool {
+        self.retirement_generation != generation
+            && fids.into_iter().any(|fid| {
+                self.retired_fids
+                    .get(&fid)
+                    .is_some_and(|&retired_at| retired_at > generation)
+            })
+    }
 }
 
 struct PendingStatefulRequest {
@@ -1895,10 +1926,7 @@ impl NinePClient {
                     if let Some((_, request)) = stateful {
                         self.check_stateful_request(request)?;
                     } else {
-                        self.validate_admission_generation(
-                            admission,
-                            registry.retirement_generation,
-                        )?;
+                        self.validate_admission(admission, &registry)?;
                     }
                     let (frame, send) = OutboundFrame::new(bytes, &conn.send_progress);
                     pending.mark_dispatched();
@@ -1956,7 +1984,7 @@ impl NinePClient {
             if let Some((_, request)) = stateful {
                 self.check_stateful_request(request)?;
             } else {
-                self.validate_admission_generation(admission, registry.retirement_generation)?;
+                self.validate_admission(admission, &registry)?;
             }
             // Successful mutations create per-fid durability obligations.
             if !matches!(msg.body, Message::Rlerror(_)) {
@@ -1971,20 +1999,23 @@ impl NinePClient {
 
     fn check_admitted_request(&self, admission: &RequestAdmission) -> ClientResult<()> {
         let registry = self.stateful_requests.lock().unwrap();
-        self.validate_admission_generation(admission, registry.retirement_generation)
+        self.validate_admission(admission, &registry)
     }
 
-    fn validate_admission_generation(
+    /// Fails a request whose outage bound expired or whose own fid was retired
+    /// since it arrived. The caller holds the registry, so the result stays
+    /// true until it enqueues or publishes under the same lock.
+    fn validate_admission(
         &self,
         admission: &RequestAdmission,
-        retirement_generation: u64,
+        registry: &StatefulRequests,
     ) -> ClientResult<()> {
         let terminal_errno = self.terminal_errno.load(Ordering::Acquire);
         if terminal_errno != 0 {
             return Err(ClientError::Errno(terminal_errno));
         }
         if self.outage_generation.load(Ordering::Acquire) != admission.outage_generation
-            || retirement_generation != admission.retirement_generation
+            || registry.retired_since(admission.retirement_generation, admission.fids)
         {
             return Err(ClientError::Disconnected);
         }
@@ -1996,11 +2027,17 @@ impl NinePClient {
     /// connection that carries it is torn down. Outage and terminal failures
     /// must also release callers still waiting for admission: an earlier
     /// caller can retain its permit without polling its completed response.
-    async fn acquire_request_admission(&self) -> ClientResult<AdmissionPermit> {
+    async fn acquire_request_admission(&self, fids: FencedFids) -> ClientResult<AdmissionPermit> {
         let outage_generation = self.outage_generation.load(Ordering::Acquire);
         // Include stateless RPCs such as Twrite: a caller waiting for its
         // permit must not resume against a fid retired during this wait.
         let retirement_generation = self.stateful_requests.lock().unwrap().retirement_generation;
+        let retired = || {
+            self.stateful_requests
+                .lock()
+                .unwrap()
+                .retired_since(retirement_generation, fids)
+        };
         // Requests arriving after the outage was declared retain the same
         // bounded fresh-attempt policy as already-admitted requests.
         if self.unavailable.load(Ordering::Acquire) {
@@ -2018,8 +2055,7 @@ impl NinePClient {
             }
             if self.unavailable.load(Ordering::Acquire)
                 || self.outage_generation.load(Ordering::Acquire) != outage_generation
-                || self.stateful_requests.lock().unwrap().retirement_generation
-                    != retirement_generation
+                || retired()
             {
                 return Err(ClientError::Disconnected);
             }
@@ -2028,8 +2064,7 @@ impl NinePClient {
                     // The semaphore may have reserved this permit while its
                     // caller stopped polling across an entire outage.
                     if self.outage_generation.load(Ordering::Acquire) != outage_generation
-                        || self.stateful_requests.lock().unwrap().retirement_generation
-                            != retirement_generation
+                        || retired()
                     {
                         return Err(ClientError::Disconnected);
                     }
@@ -2038,6 +2073,7 @@ impl NinePClient {
                             _permit: permit,
                             outage_generation,
                             retirement_generation,
+                            fids,
                         }))
                         .map_err(|_| ClientError::Disconnected);
                 }
@@ -2131,8 +2167,10 @@ impl NinePClient {
 
     async fn begin_stateful_request(&self, body: &Message) -> ClientResult<StatefulRequest> {
         let retirement_generation = self.stateful_requests.lock().unwrap().retirement_generation;
-        let admission = self.acquire_request_admission().await?;
         let fids = body.request_fids().collect::<Vec<_>>();
+        let admission = self
+            .acquire_request_admission(fenced_fids(fids.iter().copied()))
+            .await?;
         // Each stateful RPC changes exactly one fid. A source used to create
         // another fid is shared, so independent child walks/opens stay parallel.
         let changed_fid = match body {
@@ -2156,7 +2194,7 @@ impl NinePClient {
             // an older admission waiter can never target a reused fid. This
             // includes callers that arrived during an already-declared outage
             // and were waiting for a fresh reconnect attempt.
-            if registry.retirement_generation != retirement_generation {
+            if registry.retired_since(retirement_generation, fids.iter().copied()) {
                 return Err(ClientError::Disconnected);
             }
             let waiters = registry
@@ -2454,10 +2492,7 @@ impl NinePClient {
             let registry =
                 admission_context.map(|(client, _)| client.stateful_requests.lock().unwrap());
             if let Some((client, admission)) = admission_context {
-                client.validate_admission_generation(
-                    admission,
-                    registry.as_ref().unwrap().retirement_generation,
-                )?;
+                client.validate_admission(admission, registry.as_ref().unwrap())?;
             }
             let (frame, send) = OutboundFrame::new(bytes, &conn.send_progress);
             pending.mark_dispatched();
@@ -2509,7 +2544,9 @@ impl NinePClient {
 
     /// Issue a request, turning a returned `Rlerror` into [`ClientError::Errno`].
     async fn rpc(&self, body: Message) -> ClientResult<Message> {
-        let admission = self.acquire_request_admission().await?;
+        let admission = self
+            .acquire_request_admission(fenced_fids(body.request_fids()))
+            .await?;
         self.rpc_with_admission(body, &admission).await
     }
 
@@ -2890,7 +2927,9 @@ impl NinePClient {
     /// retained callers from resending or publishing state for a reused fid.
     fn invalidate_fid_requests(&self, fid: u32, retiring_request: Option<u64>) {
         let mut registry = self.stateful_requests.lock().unwrap();
-        registry.retirement_generation = registry.retirement_generation.wrapping_add(1);
+        registry.retirement_generation += 1;
+        let retired_at = registry.retirement_generation;
+        registry.retired_fids.insert(fid, retired_at);
         registry
             .pending
             .retain(|id, pending| Some(*id) == retiring_request || !pending.fids.contains(&fid));
@@ -3241,7 +3280,7 @@ impl NinePClient {
         while written < len {
             // Bound the internal staging copy as well as the response slot and
             // serialized frame. Waiters retain only their caller-owned input.
-            let admission = self.acquire_request_admission().await?;
+            let admission = self.acquire_request_admission(fenced_fids([fid])).await?;
             let end = written + (len - written).min(max);
             let data = chunk(written, end);
             debug_assert_eq!(data.len(), end - written);
@@ -3541,6 +3580,9 @@ impl NinePClient {
     /// `Tfsyncdur`; the oldest recorded lineage token determines the result.
     pub async fn fsync_inode(&self, fids: &[u32], primary: u32, datasync: u32) -> ClientResult<()> {
         self.validate_fids(fids.iter().copied())?;
+        // Only `primary` travels on the wire. A sibling retired while the
+        // flush runs may have a new owner by the time the reply arrives.
+        let arrived = self.stateful_requests.lock().unwrap().retirement_generation;
         // Generations prevent the result from clearing writes concurrent with fsync.
         let mut token: Option<u64> = None;
         let mut snaps: Vec<(u32, u64)> = Vec::with_capacity(fids.len());
@@ -3560,16 +3602,22 @@ impl NinePClient {
             .await
         {
             Ok(Message::Rfsync(_)) => {
+                let registry = self.stateful_requests.lock().unwrap();
                 for (fid, generation) in snaps {
-                    self.clear_unsynced_if_unchanged(fid, generation);
+                    if !registry.retired_since(arrived, [fid]) {
+                        self.clear_unsynced_if_unchanged(fid, generation);
+                    }
                 }
                 Ok(())
             }
             Ok(_) => Err(ClientError::Unexpected("fsync")),
             Err(ClientError::Errno(e)) if e == linux::ESTALE => {
                 // Preserve stale obligations until replacement writes arrive.
+                let registry = self.stateful_requests.lock().unwrap();
                 for (fid, generation) in snaps {
-                    self.report_unsynced_if_unchanged(fid, generation);
+                    if !registry.retired_since(arrived, [fid]) {
+                        self.report_unsynced_if_unchanged(fid, generation);
+                    }
                 }
                 Err(ClientError::Errno(e))
             }
@@ -4793,7 +4841,10 @@ mod session_transition_tests {
             let client = test_client(Arc::clone(&conn));
             for (index, body) in bodies.iter().enumerate() {
                 let original = body_bytes(body);
-                let admission = client.acquire_request_admission().await.unwrap();
+                let admission = client
+                    .acquire_request_admission(fenced_fids(body.request_fids()))
+                    .await
+                    .unwrap();
                 let mut attempt = OpAttemptState::default();
                 let (_, response_conn) = client
                     .send_request_on_current(
@@ -6499,7 +6550,9 @@ mod session_transition_tests {
 
         let request_client = Arc::clone(&client);
         let request = tokio::spawn(async move {
-            let admission = request_client.acquire_request_admission().await?;
+            let admission = request_client
+                .acquire_request_admission(fenced_fids([7]))
+                .await?;
             request_client
                 .write_chunk(7, 0, Bytes::from_static(b"x"), &admission)
                 .await
@@ -8115,6 +8168,174 @@ mod session_transition_tests {
                 "a retired caller dispatched against the reused fid"
             );
             assert!(!returned.dead.load(Ordering::Acquire));
+        }
+
+        /// A takeover that loses an unflushed create leaves its creator's open
+        /// handle stale. Closing that handle retires only that fid.
+        async fn retire_stale_handle(client: &Arc<NinePClient>, fid: u32) {
+            client
+                .state
+                .lock()
+                .unwrap()
+                .fids
+                .insert(fid, inode_fid(u64::from(fid) * 10, 0, 0, Some(0)));
+            client.stale_fids.insert(fid);
+            // A stale fid has no server copy, so this settles without a reply.
+            tokio::time::timeout(Duration::from_secs(1), client.clunk(fid))
+                .await
+                .expect("retiring a stale fid waited for the server")
+                .unwrap();
+            assert!(!client.state.lock().unwrap().fids.contains_key(&fid));
+        }
+
+        fn directory_fid(client: &NinePClient, fid: u32, inode_id: u64) {
+            client
+                .state
+                .lock()
+                .unwrap()
+                .fids
+                .insert(fid, inode_fid(inode_id, 0, 0, None));
+        }
+
+        #[tokio::test]
+        async fn retiring_a_stale_fid_spares_a_reply_in_flight_on_another_fid() {
+            let (conn, mut requests) = test_conn_with_receiver();
+            let client = test_client(Arc::clone(&conn));
+            directory_fid(&client, 1, 10);
+            let mut getattr = Box::pin(client.getattr(1, 0));
+            assert!(futures::poll!(getattr.as_mut()).is_pending());
+            let sent = recv_op_request(&mut requests, "the directory getattr").await;
+            assert!(matches!(
+                sent.body,
+                Message::Tgetattr(Tgetattr { fid: 1, .. })
+            ));
+
+            retire_stale_handle(&client, 7).await;
+
+            reply(
+                &conn,
+                sent.tag,
+                Message::Rgetattr(Rgetattr {
+                    valid: 0,
+                    stat: Stat {
+                        qid: qid(10),
+                        ..Default::default()
+                    },
+                }),
+            );
+            let stat = getattr
+                .await
+                .expect("closing another file's stale handle failed this getattr");
+            assert_eq!(stat.qid.path, 10);
+        }
+
+        #[tokio::test]
+        async fn retiring_a_stale_fid_spares_a_mutation_in_flight_on_another_fid() {
+            let (conn, mut requests) = test_conn_with_receiver();
+            let client = test_client(Arc::clone(&conn));
+            directory_fid(&client, 1, 10);
+            conn.lineage_token.store(41, Ordering::Relaxed);
+            let mut unlink = Box::pin(client.unlinkat(1, b"victim", 0));
+            assert!(futures::poll!(unlink.as_mut()).is_pending());
+            let sent = recv_op_request(&mut requests, "the unlink").await;
+            assert!(matches!(sent.body, Message::Tunlinkat(_)));
+
+            retire_stale_handle(&client, 7).await;
+
+            // The server applied the unlink. Reporting EIO here would leave
+            // the caller unable to tell, and would drop the obligation that
+            // makes a later fsync of the directory answer for it.
+            reply(&conn, sent.tag, Message::Runlinkat(Runlinkat));
+            unlink
+                .await
+                .expect("closing another file's stale handle failed this unlink");
+            assert_eq!(client.unsynced.get(&1).and_then(|u| u.oldest), Some(41));
+        }
+
+        #[tokio::test]
+        async fn retiring_a_fid_spares_a_caller_waiting_for_admission_on_another_fid() {
+            let (conn, mut requests) = test_conn_with_receiver();
+            let client = test_client_with_limit(Arc::clone(&conn), 1);
+            directory_fid(&client, 1, 10);
+            directory_fid(&client, 3, 30);
+            // An unpolled reply holds the only permit.
+            let mut held = Box::pin(client.lopen(3, 0));
+            assert!(futures::poll!(held.as_mut()).is_pending());
+            let sent = recv_op_request(&mut requests, "the open holding the permit").await;
+            reply(
+                &conn,
+                sent.tag,
+                Message::Rlopen(Rlopen {
+                    qid: qid(30),
+                    iounit: 0,
+                }),
+            );
+            let names: &[&[u8]] = &[b"child"];
+            let mut walk = Box::pin(client.walk(1, 2, names));
+            assert!(futures::poll!(walk.as_mut()).is_pending());
+            assert!(requests.try_recv().is_err());
+
+            {
+                let _transition = client.session_transition.try_lock().unwrap();
+                client.invalidate_fid_requests(7, None);
+            }
+
+            held.await.unwrap();
+            assert!(futures::poll!(walk.as_mut()).is_pending());
+            let sent = recv_op_request(&mut requests, "the walk after admission").await;
+            assert!(matches!(
+                sent.body,
+                Message::Twalk(Twalk {
+                    fid: 1,
+                    newfid: 2,
+                    ..
+                })
+            ));
+            reply(
+                &conn,
+                sent.tag,
+                Message::Rwalk(Rwalk {
+                    nwqid: 1,
+                    wqids: vec![qid(70)],
+                }),
+            );
+            walk.await
+                .expect("retiring another fid failed a walk waiting for admission");
+            assert_eq!(client.state.lock().unwrap().fids[&2].inode_id, 70);
+        }
+
+        #[tokio::test]
+        async fn an_fsync_reply_cannot_discharge_a_sibling_fid_retired_during_the_flush() {
+            let (conn, mut requests) = test_conn_with_receiver();
+            let client = test_client(Arc::clone(&conn));
+            directory_fid(&client, 5, 50);
+            client.note_unsynced(7, 41);
+            let mut fsync = Box::pin(client.fsync_inode(&[5, 7], 5, 0));
+            assert!(futures::poll!(fsync.as_mut()).is_pending());
+            let sent = recv_op_request(&mut requests, "the fsync").await;
+            assert!(matches!(
+                sent.body,
+                Message::Tfsyncdur(Tfsyncdur {
+                    fid: 5,
+                    token: 41,
+                    ..
+                })
+            ));
+
+            // The sibling handle is closed and its number goes to another
+            // file, whose first write the flush in flight does not cover.
+            retire_stale_handle(&client, 7).await;
+            client.free_fid(7);
+            assert_eq!(client.alloc_fid(), 7);
+            client.note_unsynced(7, 42);
+
+            reply(&conn, sent.tag, Message::Rfsync(Rfsync));
+            fsync.await.expect("the fsynced fid itself was not retired");
+            assert_eq!(
+                client.unsynced.get(&7).and_then(|u| u.oldest),
+                Some(42),
+                "an fsync discharged a write made by the fid's next owner"
+            );
         }
 
         #[tokio::test(start_paused = true)]

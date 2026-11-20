@@ -391,6 +391,18 @@
   [dir v]
   (java.nio.file.Files/deleteIfExists (.toPath (io/file (subdir dir v) (str v)))))
 
+(defn removed-here?
+  "Whether a fresh open of f finds no such file. Only ENOENT shows the value is
+  gone. Any other failure to open leaves the outcome unknown and is thrown, as
+  when the mount fails the probe with EIO or ESTALE around a failover.
+  `java.io.FileInputStream` reports every failure to open as
+  FileNotFoundException, so it cannot make this distinction."
+  [^java.io.File f]
+  (try (.close (java.nio.file.Files/newInputStream
+                (.toPath f) (make-array java.nio.file.OpenOption 0)))
+       false
+       (catch java.nio.file.NoSuchFileException _ true)))
+
 (defn fsync-sentinel!
   "Fsync the sentinel file. A ZeroFS fsync is a GLOBAL flush, so calling it after a
   rename/delete makes that mutation durable on the shared store, so an :ok add or
@@ -584,13 +596,12 @@
                         (when fsync? (fsync-sentinel! dir))
                         ;; Re-verify absence on the CURRENT node (a reroute can split
                         ;; the delete and the fsync): :ok must mean v is really gone
-                        ;; here. If a fresh open still finds it, the delete's durability
-                        ;; is indeterminate -> :info, not a false :ok-removed.
-                        (let [present? (try (.close (java.io.FileInputStream. f)) true
-                                            (catch java.io.FileNotFoundException _ false))]
-                          (if present?
-                            (assoc op :type :info :value v :error :still-present-here)
-                            (assoc op :type :ok :value v)))
+                        ;; here. If a fresh open still finds it, or fails for any
+                        ;; reason but ENOENT, the delete's durability is
+                        ;; indeterminate -> :info, not a false :ok-removed.
+                        (if (removed-here? f)
+                          (assoc op :type :ok :value v)
+                          (assoc op :type :info :value v :error :still-present-here))
                         (catch java.io.IOException e
                           (assoc op :type :info :value v :error (.getMessage e))))))
                   (assoc op :type :fail :error :nothing-to-remove))

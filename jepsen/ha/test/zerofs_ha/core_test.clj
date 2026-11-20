@@ -389,6 +389,63 @@
     (is (= :info (:type (core/classify-add-error
                          (java.io.IOException. "Input/output error")))))))
 
+(defn- set-client-with-live-value
+  "A set client over a fresh directory whose worker 0 still owns value v."
+  [v]
+  (let [dir (.toFile (Files/createTempDirectory
+                      "zerofs-ha-remove" (make-array FileAttribute 0)))]
+    {:dir dir
+     :client (core/->SetClient (.getPath dir) true (atom v) (atom {0 #{v}}) (atom nil))}))
+
+(defn- delete-tree! [dir]
+  (run! #(.delete %) (reverse (file-seq dir))))
+
+(deftest remove-is-ok-when-the-value-is-observed-absent
+  (let [v 7
+        {:keys [dir client]} (set-client-with-live-value v)]
+    (try
+      (.mkdirs (core/subdir dir v))
+      (spit (io/file (core/subdir dir v) (str v)) (str v "\n"))
+      (is (= {:type :ok :value v}
+             (select-keys (client/invoke! client {} {:f :remove :process 0})
+                          [:type :value :error])))
+      (finally (delete-tree! dir)))))
+
+(deftest remove-is-indeterminate-when-the-absence-probe-fails
+  ;; A leader acknowledges the unlink and dies before the fsync. The fsync then
+  ;; succeeds on its successor, which never saw the unlink, and the mount fails
+  ;; the probe with an errno other than ENOENT. The value is still there.
+  (let [v 7
+        {:keys [dir client]} (set-client-with-live-value v)]
+    (try
+      ;; A regular file where the subdirectory belongs makes the probe fail
+      ;; with ENOTDIR, standing in for the mount's EIO.
+      (spit (core/subdir dir v) "")
+      (with-redefs [core/remove-file! (fn [_ _] true)]
+        (let [op (client/invoke! client {} {:f :remove :process 0})]
+          (is (= :info (:type op)))
+          (is (= v (:value op)))
+          (is (re-find #"Not a directory" (str (:error op))))
+          (is (:valid? (check [{:type :ok :f :add :value v}
+                               op
+                               {:type :ok :f :read :value #{v}}])))))
+      (finally (delete-tree! dir)))))
+
+(deftest removed-here-distinguishes-absence-from-a-failed-open
+  (let [dir (.toFile (Files/createTempDirectory
+                      "zerofs-ha-probe" (make-array FileAttribute 0)))
+        file (io/file dir "present")]
+    (try
+      (spit file "x")
+      (is (false? (core/removed-here? file)))
+      (is (true? (core/removed-here? (io/file dir "absent"))))
+      (is (thrown? java.nio.file.FileSystemException
+                   (core/removed-here? (io/file file "child"))))
+      (is (not (instance? java.nio.file.NoSuchFileException
+                          (try (core/removed-here? (io/file file "child"))
+                               (catch java.io.IOException e e)))))
+      (finally (delete-tree! dir)))))
+
 (deftest inode-accounting-waits-for-replay-protected-orphans
   (let [samples (atom [20 19])
         options (atom nil)]
