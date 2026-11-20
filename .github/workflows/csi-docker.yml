@@ -4,6 +4,8 @@ on:
   push:
     tags: ["v*"]
   pull_request:
+    # Lane PRs into the integration branch are gated locally and by its own PR; run the matrix once there.
+    branches: ["main", "develop"]
   # Releases are immutable, so a failed tag run can't be re-triggered by
   # re-pushing the tag. Dispatch with a tag input rebuilds that release's
   # image from the current workflow definition.

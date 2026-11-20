@@ -1468,13 +1468,16 @@ impl SurvivalManager {
                     &intent,
                 )
                 .await;
-            let deadline = Duration::from_secs(self.config.replica_timeout_seconds);
-            let published = tokio::time::timeout(
+            let deadline = pause_deadline.min(
+                tokio::time::Instant::now()
+                    + Duration::from_secs(self.config.replica_timeout_seconds),
+            );
+            let published = tokio::time::timeout_at(
                 deadline,
                 self.publish(replica, &intent, intent_bytes.clone()),
             )
             .await
-            .unwrap_or(Err(SurvivalFailure::Timeout));
+            .map_err(|_| self.defer_cut(&mut reopen, closed_at, "the checkpoint intent"))?;
             if let Err(kind) = published {
                 let replica = &self.replicas[index];
                 reopen.reopen();
@@ -1498,7 +1501,9 @@ impl SurvivalManager {
         // No namespace batch may commit between the checkpoint and the
         // catalog export, so every namespace segment reference has its mapping.
         let barrier = self.fs.db.flush_barrier();
-        let guard = barrier.write().await;
+        let guard = tokio::time::timeout_at(pause_deadline, barrier.write())
+            .await
+            .map_err(|_| self.defer_cut(&mut reopen, closed_at, "the checkpoint barrier"))?;
         self.reach_all(
             observer,
             CommitPoint::CheckpointPublished,
@@ -1506,17 +1511,20 @@ impl SurvivalManager {
             &intent,
         )
         .await;
-        let checkpoint = raw
-            .create_checkpoint(
+        let checkpoint = tokio::time::timeout_at(
+            pause_deadline,
+            raw.create_checkpoint(
                 slatedb::config::CheckpointScope::Durable,
                 &slatedb::config::CheckpointOptions {
                     lifetime: Some(lifetime),
                     source: None,
                     name: Some(checkpoint_name.clone()),
                 },
-            )
-            .await
-            .map_err(|error| failure(SurvivalFailure::Io, format!("create checkpoint: {error}")))?;
+            ),
+        )
+        .await
+        .map_err(|_| self.defer_cut(&mut reopen, closed_at, "checkpoint creation"))?
+        .map_err(|error| failure(SurvivalFailure::Io, format!("create checkpoint: {error}")))?;
         self.reach_all(
             observer,
             CommitPoint::CheckpointPublished,
@@ -1524,10 +1532,10 @@ impl SurvivalManager {
             &intent,
         )
         .await;
-        let export =
-            self.pool.export_catalog().await.map_err(|error| {
-                failure(SurvivalFailure::Io, format!("export catalog: {error}"))
-            })?;
+        let export = tokio::time::timeout_at(pause_deadline, self.pool.export_catalog())
+            .await
+            .map_err(|_| self.defer_cut(&mut reopen, closed_at, "the catalog export"))?
+            .map_err(|error| failure(SurvivalFailure::Io, format!("export catalog: {error}")))?;
         drop(guard);
         // The checkpoint's manifest update must reach the authority before it
         // is copied.
@@ -1538,11 +1546,13 @@ impl SurvivalManager {
             &intent,
         )
         .await;
-        let _drained = self
-            .fs
-            .administrative_remote_durability()
-            .await
-            .map_err(|error| failure(SurvivalFailure::Io, format!("checkpoint drain: {error}")))?;
+        let _drained =
+            tokio::time::timeout_at(pause_deadline, self.fs.administrative_remote_durability())
+                .await
+                .map_err(|_| self.defer_cut(&mut reopen, closed_at, "the checkpoint drain"))?
+                .map_err(|error| {
+                    failure(SurvivalFailure::Io, format!("checkpoint drain: {error}"))
+                })?;
         self.reach_all(
             observer,
             CommitPoint::CheckpointSynced,

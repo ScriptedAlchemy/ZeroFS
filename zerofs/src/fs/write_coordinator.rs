@@ -335,7 +335,7 @@ impl WriteCoordinator {
     /// Awaiting `commit` after releasing the lock would give neither
     /// guarantee: two writers could reach the send in either order.
     pub(crate) fn submit(&self, txn: Transaction) -> Result<PendingCommit, FsError> {
-        self.submit_owned(txn, CommitOwnership::None, CommitSettlement::None)
+        self.submit_owned(txn, CommitOwnership::None, CommitSettlement::None, ())
     }
 
     pub(crate) fn submit_owned(
@@ -343,8 +343,9 @@ impl WriteCoordinator {
         txn: Transaction,
         ownership: CommitOwnership,
         settlement: CommitSettlement,
+        held: impl Send + 'static,
     ) -> Result<PendingCommit, FsError> {
-        self.queue(txn, ownership, settlement, Box::new(()))
+        self.queue(txn, ownership, settlement, Box::new(held))
     }
 
     fn queue(

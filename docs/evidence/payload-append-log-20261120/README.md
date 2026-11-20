@@ -52,6 +52,10 @@ The base binary ran with the base copy of `raw-device/large_mounted.py`,
 because that file asserts the journal layout. The rest of the harness is this
 branch's.
 
+Every run predates the merge of `integration/all-open-prs` at `913b6e18` into
+this branch. The required checks ran again on the merged tree. The benchmarks
+did not.
+
 **The 20 ms flush is a model, not a NAS measurement.**
 
 ## Before and after

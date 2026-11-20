@@ -14,6 +14,8 @@ on:
   push:
     branches: ["main", "develop"]
   pull_request:
+    # Lane PRs into the integration branch are gated locally and by its own PR; run the matrix once there.
+    branches: ["main", "develop"]
   workflow_dispatch:
 
 permissions:
@@ -42,6 +44,7 @@ jobs:
           scripts.tests.test_small_nas_memory
           scripts.tests.test_local_storage_pool_diagnostics
           scripts.tests.test_case_insensitive_fuse_cleanup
+          scripts.tests.test_raw_journal_bench_cleanup
       - name: Run Proxmox deployment regressions
         run: python3 -m unittest discover -s proxmox/tests -p 'test_*.py'
 

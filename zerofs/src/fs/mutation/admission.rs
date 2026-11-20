@@ -438,6 +438,7 @@ pub(crate) struct PreparationGuard {
     raw_permit: Option<RawMutationPermit>,
     request: Option<PendingRequest>,
     state: PreparationState,
+    survival: Option<crate::metadata_survival::admission::OwnedAdmissionToken>,
 }
 
 impl PreparationGuard {
@@ -454,6 +455,7 @@ impl PreparationGuard {
                 raw_permit: Some(raw_permit),
                 request: Some(request),
                 state: PreparationState::Open,
+                survival: None,
             }),
             Err(error) => {
                 request.cancel();
@@ -461,6 +463,16 @@ impl PreparationGuard {
                 Err(error)
             }
         }
+    }
+
+    /// Keep the survival cut behind preparation until publication gives the
+    /// write a cutoff, or cancellation removes it from the gate.
+    pub(crate) fn with_survival(
+        mut self,
+        token: crate::metadata_survival::admission::OwnedAdmissionToken,
+    ) -> Self {
+        self.survival = Some(token);
+        self
     }
 
     pub(crate) fn publish(

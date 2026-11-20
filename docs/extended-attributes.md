@@ -51,7 +51,7 @@ namespace on symlinks, FIFOs, sockets, or device nodes returns `EPERM`, includin
 for uid 0. On a directory with the sticky bit, only the owner or uid 0 may set or
 remove `user.*` attributes. Unknown namespace prefixes return `EOPNOTSUPP`.
 [permissions-and-acl-contract.md](permissions-and-acl-contract.md) describes
-ACL storage, enforcement, inheritance and NFSv4 translation. ACL writes ignore
+POSIX ACL storage, enforcement and inheritance. ACL writes ignore
 `XATTR_CREATE` and `XATTR_REPLACE`, as Linux does.
 
 A set with flags zero creates or replaces an attribute. `XATTR_CREATE` requires the

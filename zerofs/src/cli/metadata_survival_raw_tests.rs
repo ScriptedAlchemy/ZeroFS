@@ -58,7 +58,8 @@ struct Fixture {
 impl Fixture {
     /// A pool whose generations are cut only when a test asks.
     async fn new() -> Self {
-        Self::with_cadence(3600, 1000).await
+        // Recovery tests must reach their faults; deadline tests set their own budget.
+        Self::with_cadence(3600, 30_000).await
     }
 
     /// Three provisioned devices and an initialized, empty pool.
@@ -281,6 +282,76 @@ fn payload(seed: u8, length: usize) -> Bytes {
     }
     bytes.truncate(length);
     bytes.into()
+}
+
+/// A checkpoint can wait for the database barrier after the backend cutoff
+/// has already completed. That wait must share the final-pause deadline.
+#[tokio::test]
+async fn checkpoint_barrier_timeout_reopens_survival_admission() -> Result<()> {
+    use crate::metadata_survival::{CommitObserver, CommitPoint, Side};
+
+    struct HoldCheckpointBarrier {
+        barrier: Arc<tokio::sync::RwLock<()>>,
+        held: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CommitObserver for HoldCheckpointBarrier {
+        async fn reach(&mut self, point: CommitPoint, side: Side, _: &str, _: &std::path::Path) {
+            if point == CommitPoint::BackendCutoff && side == Side::After && self.held.is_none() {
+                self.held = Some(Arc::clone(&self.barrier).read_owned().await);
+            }
+        }
+    }
+
+    let fixture = Fixture::with_cadence(3600, 1000).await;
+    let running = fixture.start().await?;
+    let mut observer = HoldCheckpointBarrier {
+        barrier: running.fs().db.flush_barrier(),
+        held: None,
+    };
+    let attempt = tokio::time::timeout(
+        Duration::from_secs(5),
+        running.survival().commit_observed(&mut observer),
+    )
+    .await;
+    let held_barrier = observer.held.is_some();
+    let reopened = running.fs().survival_admission.is_open();
+    drop(observer);
+    let next_write = tokio::time::timeout(
+        Duration::from_secs(5),
+        running
+            .fs()
+            .create_exclusive(&AuthContext::default(), 0, b"after-deferred-cut"),
+    )
+    .await;
+    let retry = tokio::time::timeout(Duration::from_secs(10), running.survival().commit()).await;
+    running.stop().await;
+
+    ensure!(
+        held_barrier,
+        "the test never reached the checkpoint barrier"
+    );
+    let error = attempt
+        .context("checkpoint barrier outlasted the final pause")?
+        .expect_err("the blocked checkpoint must defer its cut");
+    ensure!(
+        error.downcast_ref::<SurvivalFailure>() == Some(&SurvivalFailure::Timeout),
+        "expected a final-pause timeout, got {error:#}"
+    );
+    ensure!(
+        reopened,
+        "a deferred checkpoint must reopen mutation admission"
+    );
+    next_write.context("the next mutation stayed blocked after the deferred cut")??;
+    ensure!(
+        retry
+            .context("the deferred cut could not be retried")??
+            .sequence
+            == 1,
+        "the deferred cut must not publish a generation"
+    );
+    Ok(())
 }
 
 async fn write_file(
@@ -1088,7 +1159,7 @@ async fn a_commit_that_pauses_past_the_final_pause_never_fails_a_9p_write() -> R
     const ROOT: u32 = 0;
     const CHUNK: usize = 256 * 1024;
     const WRITERS: usize = 8;
-    let mut fixture = Fixture::new().await;
+    let mut fixture = Fixture::with_cadence(3600, 1000).await;
     fixture.slow_members(1200);
     let running = fixture.start().await?;
     let socket_dir = tempfile::tempdir()?;

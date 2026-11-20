@@ -1121,7 +1121,7 @@ impl ZeroFS {
             check_permissions: true,
         };
         if self.volatile_overlay.get().is_none() {
-            let mut batch = prepare_write(&self.write_prepare_context(), request).await?;
+            let mut batch = self.prepare_materialized_write(request).await?;
             let result = apply_prepared_batch(&self.write_apply_context(), &mut batch).await?;
             return Ok(result.primary_attrs());
         }
@@ -1250,13 +1250,19 @@ impl ZeroFS {
     ) -> Result<WriteAdmission, WriteAdmissionError> {
         // Survival admission precedes every other admission step. It logs
         // its own refusals with the latch reason.
-        let _survival = self
+        let survival = self
             .survival_admission
-            .admit()
+            .admit_owned()
             .await
             .map_err(WriteAdmissionError::Survival)?;
         self.admit_surviving_write(identity, fingerprint, lifetime, scope, length)
             .await
+            .map(|admission| match admission {
+                WriteAdmission::Prepared(guard) => {
+                    WriteAdmission::Prepared(guard.with_survival(survival))
+                }
+                WriteAdmission::Joined(retained) => WriteAdmission::Joined(retained),
+            })
             .inspect_err(|error| tracing::warn!(?error, length, "refused a client write"))
     }
 

@@ -32,7 +32,8 @@ cleanup() {
        [[ $actual == "$owner" ]]; then
         docker volume rm "$name" >/dev/null || clean=false
     fi
-    if docker container inspect "$name" >/dev/null 2>&1 || docker volume inspect "$name" >/dev/null 2>&1; then
+    if ! docker info --format '{{.Name}}' >/dev/null ||
+       docker container inspect "$name" >/dev/null 2>&1 || docker volume inspect "$name" >/dev/null 2>&1; then
         clean=false
     fi
     printf '{"case":"docker_cleanup","name":"%s","verified_absent":%s}\n' "$name" "$clean"
