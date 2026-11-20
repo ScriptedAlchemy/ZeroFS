@@ -3448,6 +3448,8 @@ impl VerifiedBlob {
         self.len
     }
 
+    /// Stream `range` in items of at most `chunk_bytes`. An item may be
+    /// shorter: a raw journal yields one stored payload chunk at a time.
     pub(crate) fn range_stream(
         &self,
         range: std::ops::Range<u64>,
