@@ -8,7 +8,6 @@ permissions:
 
 jobs:
   zfs-test:
-    if: github.repository != 'ScriptedAlchemy/ZeroFS'
     name: Run ZFS on top of ZeroFS
     runs-on: ubuntu-latest
     env:
@@ -455,7 +454,6 @@ jobs:
           docker stop minio || true
 
   zfs-test-tiered:
-    if: github.repository != 'ScriptedAlchemy/ZeroFS'
     name: Run ZFS on top of ZeroFS (tiered volatile_memory+ssd)
     runs-on: ubuntu-latest
 
