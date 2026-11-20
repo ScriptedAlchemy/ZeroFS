@@ -2,6 +2,8 @@
 # Count P3 journal writes and flushes per acknowledged MiB on block-backed loops.
 # Usage: bench-raw-journal-flush.sh LINUX_EXECUTABLE_AND_MANIFEST_DIRECTORY
 # Env: BENCH_PAYLOAD_MIB (default 2048), BENCH_RUNS (default 3), BENCH_CPUS (default 3),
+# BENCH_WRITERS (default 1; files of BENCH_PAYLOAD_MIB written at once),
+# BENCH_CRASH_REPLAY=1 (no timing: SIGKILL the engine after fsync, then replay the copy),
 # BENCH_FLUSH_DELAY_US (preload flush_shim.c on the P3 loop, adding this delay per sync),
 # BENCH_PERF=1 (sample the engine and FUSE client during the first copy; needs an image with perf),
 # BENCH_MEMBER_PUT_DELAY_MS (pace member PUTs so read-back finds the copy in the P3 journal).
@@ -54,6 +56,8 @@ docker run --rm --name "$name" --label "$label=$owner" --pull never \
     -e PYTHONDONTWRITEBYTECODE=1 -e TMPDIR=/dev/shm \
     -e "BENCH_PAYLOAD_MIB=${BENCH_PAYLOAD_MIB:-2048}" -e "BENCH_RUNS=${BENCH_RUNS:-3}" \
     ${BENCH_FLUSH_DELAY_US:+-e "BENCH_FLUSH_DELAY_US=$BENCH_FLUSH_DELAY_US"} \
+    ${BENCH_WRITERS:+-e "BENCH_WRITERS=$BENCH_WRITERS"} \
+    ${BENCH_CRASH_REPLAY:+-e "BENCH_CRASH_REPLAY=$BENCH_CRASH_REPLAY"} \
     ${BENCH_PERF:+-e "BENCH_PERF=$BENCH_PERF" --cap-add PERFMON} \
     ${BENCH_MEMBER_PUT_DELAY_MS:+-e "BENCH_MEMBER_PUT_DELAY_MS=$BENCH_MEMBER_PUT_DELAY_MS"} \
     "$image" timeout --kill-after=30s 90m python3 -u /h/journal_flush_bench.py
