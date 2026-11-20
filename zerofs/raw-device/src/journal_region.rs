@@ -311,7 +311,7 @@ impl TransactionRegion {
         }
         let result = self.region.sync_data();
         if result.is_err() {
-            // Poison even when another thread poisoned the region first.
+            // Record the failure even if a panicking thread poisoned the lock.
             self.state
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())

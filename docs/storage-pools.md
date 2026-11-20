@@ -174,6 +174,13 @@ the journal acknowledges it. Every claim, lease and reservation counts the
 others, so a seal always has the room its WRITE was promised. Truncates and
 other writes outside a WRITE claim exactly what they stage.
 
+Admission reads the catalog's committed rows and the in-memory promises. It
+never waits for a placement commit, so a slow catalog flush delays the drain
+and not the client. A reservation counts in memory from the moment its member
+is chosen until its upload row is committed. When placement moves between two
+writes of one file, the open segment's lease grows on its own member while
+that member has room, and the segment is sealed early only when it has none.
+
 When no member has room, the WRITE answers ENOSPC, not EIO, over 9P. The FUSE
 client forwards that errno, and NFS maps it to `NFS3ERR_NOSPC`. NBD still
 reports EIO for every filesystem error. Volatile acknowledgement claims before
