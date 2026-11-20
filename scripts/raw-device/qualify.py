@@ -201,13 +201,13 @@ def run():
             assert invoke("get", a, disks[0], identities[0], key) == data[0]
         with pool(1, size) as (dirty, dirty_nodes):
             with dirty[0].open("r+b", buffering=0) as backing:
-                backing.seek(-1, 2)
+                backing.seek(3 * 4096 - 1)
                 backing.write(b"X")
             before = digest(dirty[0].read_bytes())
             with device(dirty[0], dirty_nodes) as node:
                 invoke("init-blank", node, dirty[0], identities[0], expect="not blank")
             assert digest(dirty[0].read_bytes()) == before
-            record("nonzero last sector refused, bytes preserved")
+            record("nonzero first log block refused, bytes preserved")
         # A recognized foreign filesystem is a negative control only.
         with pool(1, size) as (foreign, foreign_nodes):
             with device(foreign[0], foreign_nodes) as node:

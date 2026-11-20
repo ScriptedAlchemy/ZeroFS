@@ -374,52 +374,94 @@ fn open_reports_blank_device_as_not_provisioned() {
     assert!(matches!(open_err(&scratch), Error::NotProvisioned));
 }
 
-// --- provisioning refuses anything but a blank device ---------------------
-
 #[test]
 fn provision_refuses_an_existing_label_without_writing() {
-    let scratch = two_acknowledged_flushes();
-    let before = scratch.all();
-    match RawStore::provision(scratch.file(), SIZE, id()) {
-        Err(Error::AlreadyProvisioned { found }) => assert_eq!(found, id()),
-        other => panic!("expected AlreadyProvisioned, got {other:?}"),
+    for damaged_slot in 0..LABEL_SLOTS {
+        let scratch = two_acknowledged_flushes();
+        Damage::Torn.apply(&scratch, damaged_slot);
+        let before = scratch.all();
+        match RawStore::provision(scratch.file(), SIZE, id()) {
+            Err(Error::AlreadyProvisioned { found }) => assert_eq!(found, id()),
+            other => panic!("expected AlreadyProvisioned, got {other:?}"),
+        }
+        assert_eq!(scratch.all(), before);
     }
-    assert_eq!(scratch.all(), before);
 }
 
 #[test]
-fn provision_refuses_nonzero_bytes_anywhere_and_leaves_them_unchanged() {
-    let sector = value(7, 512);
-    let cases = [
-        (0, b"\x55\xaa".to_vec()),                // boot signature bytes
-        (512, b"EFI PART".to_vec()),              // GPT header
-        (1024, b"ext4-like superblock".to_vec()), // inside a label slot
-        (SIZE / 2 + 1536, sector.clone()),        // a middle sector
-        (SIZE - 512, sector.clone()),             // final sector
-        (SIZE - 1, vec![1]),                      // final byte
-    ];
-    for (offset, bytes) in cases {
+fn provision_refuses_nonzero_bytes_in_labels_or_first_log_block_without_writing() {
+    for first_nonzero in [BLOCK_SIZE - 1, LOG_START - 1, LOG_START + BLOCK_SIZE - 1] {
         let scratch = Scratch::new(SIZE);
-        scratch.write_at(offset, &bytes);
+        scratch.write_at(first_nonzero, &[1]);
         let before = scratch.all();
-        let first_nonzero = offset + bytes.iter().position(|&b| b != 0).unwrap() as u64;
         match RawStore::provision(scratch.file(), SIZE, id()) {
             Err(Error::NotBlank { offset }) => assert_eq!(offset, first_nonzero),
-            other => panic!("offset {offset}: expected NotBlank, got {other:?}"),
+            other => panic!("offset {first_nonzero}: expected NotBlank, got {other:?}"),
         }
         assert_eq!(scratch.all(), before, "provision modified the device");
-        assert_eq!(scratch.read_at(offset, bytes.len()), bytes);
     }
+}
+
+#[test]
+fn provision_and_reopen_ignore_random_bytes_after_first_log_block() {
+    let scratch = Scratch::new(SIZE);
+    let suffix = LOG_START + BLOCK_SIZE;
+    let garbage = value(7, (SIZE - suffix) as usize);
+    scratch.write_at(suffix, &garbage);
+    drop(provision(&scratch));
+    assert_eq!(scratch.read_at(suffix, garbage.len()), garbage);
+    let mut store = reopen(&scratch);
+    assert!(contents(&store).is_empty());
+
+    store.put(b"first", b"first value").unwrap();
+    store.put(b"second", b"second value").unwrap();
+    store.flush().unwrap();
+    drop(store);
+    assert_eq!(
+        contents(&reopen(&scratch)),
+        BTreeMap::from([
+            (b"first".to_vec(), b"first value".to_vec()),
+            (b"second".to_vec(), b"second value".to_vec()),
+        ])
+    );
+}
+
+#[test]
+fn reopen_ignores_a_foreign_record_at_the_durable_tail() {
+    let donor = Scratch::new(SIZE);
+    let mut foreign = provision(&donor);
+    foreign.put(b"current", b"value").unwrap();
+    let tail = foreign.geometry().tail;
+    foreign.put(b"stale", b"old value").unwrap();
+    foreign.flush().unwrap();
+
+    let scratch = Scratch::new(SIZE);
+    let record = donor.read_at(tail, (foreign.geometry().durable_tail - tail) as usize);
+    scratch.write_at(tail, &record);
+    let mut store = provision(&scratch);
+    store.put(b"current", b"value").unwrap();
+    store.flush().unwrap();
+    assert_eq!(store.geometry().durable_tail, tail);
+    drop(store);
+    assert_eq!(scratch.read_at(tail, record.len()), record);
+
+    let reopened = reopen(&scratch);
+    assert_eq!(
+        contents(&reopened),
+        BTreeMap::from([(b"current".to_vec(), b"value".to_vec())])
+    );
 }
 
 #[test]
 fn a_device_with_only_its_label_erased_is_still_refused() {
     let scratch = two_acknowledged_flushes();
     scratch.write_at(0, &[0u8; 2 * BLOCK]);
+    let before = scratch.all();
     assert!(matches!(
         RawStore::provision(scratch.file(), SIZE, id()),
         Err(Error::NotBlank { offset: LOG_START })
     ));
+    assert_eq!(scratch.all(), before);
 }
 
 #[test]

@@ -136,14 +136,14 @@ impl fmt::Debug for RawStore {
 }
 
 impl RawStore {
-    /// Bind a blank device to `identity` and return an empty store. The label
-    /// is durable in both slots when this returns.
+    /// Bind a device to `identity` and return an empty store with both label
+    /// slots durable.
     ///
-    /// Reads the entire device first and refuses it if any byte is nonzero:
-    /// [`Error::AlreadyProvisioned`] when a ZeroFS label is present, otherwise
-    /// [`Error::NotBlank`] with the first nonzero offset. Nothing is written
-    /// unless the whole device is zero. The scan costs one full sequential
-    /// read of the device.
+    /// Returns [`Error::AlreadyProvisioned`] if either slot has a valid label.
+    /// Both label slots and the first log block must be zero. A nonzero byte
+    /// in that range returns [`Error::NotBlank`] with its offset. Provisioning
+    /// checks this range before any writes. The rest of the device can contain
+    /// old data.
     pub fn provision(file: File, device_size: u64, identity: Identity) -> Result<Self> {
         Self::provision_region(Region::whole(file, device_size)?, identity)
     }
@@ -159,7 +159,9 @@ impl RawStore {
                 });
             }
         }
-        require_blank(&file)?;
+        if let Some(offset) = first_nonzero(&file, LOG_START + BLOCK_SIZE)? {
+            return Err(Error::NotBlank { offset });
+        }
 
         let label = Label {
             generation: 1,
@@ -669,12 +671,11 @@ fn describe(state: &SlotState) -> String {
     }
 }
 
-/// Offset of the first nonzero byte anywhere on the device.
-fn first_nonzero(file: &Region, device_size: u64) -> Result<Option<u64>> {
-    let mut buf = vec![0u8; SCAN_CHUNK];
+fn first_nonzero(file: &Region, end: u64) -> Result<Option<u64>> {
+    let mut buf = vec![0u8; end.min(SCAN_CHUNK as u64) as usize];
     let mut offset = 0;
-    while offset < device_size {
-        let len = (device_size - offset).min(SCAN_CHUNK as u64) as usize;
+    while offset < end {
+        let len = (end - offset).min(buf.len() as u64) as usize;
         file.read_exact_at(&mut buf[..len], offset)?;
         if let Some(at) = buf[..len].iter().position(|&b| b != 0) {
             return Ok(Some(offset + at as u64));

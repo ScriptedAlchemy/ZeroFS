@@ -47,13 +47,13 @@ These are engine interface specifications. Physical initialization writes media 
 | Command | Contract |
 | --- | --- |
 | `zerofs-raw-device physical check-claim DESIGNATION` | Temporarily acquires the exclusive claim, issues the identity and signature checks and reports the held byte length. Performs no media writes. Exit releases the descriptor. |
-| `zerofs-raw-device physical init-blank DESIGNATION POOL_UUID MEMBER_UUID payload` | Explicitly provisions the respective HDD after a full zero-content scan. |
-| `zerofs-raw-device physical p3-v2-init-blank nvme POOL_UUID MEMBER_UUID p3 LAYOUT_BYTES` | Requires six exact comma-separated byte lengths. Checks the entire P3 for zero before its first label write. Each role also checks its own range. |
+| `zerofs-raw-device physical init-blank DESIGNATION POOL_UUID MEMBER_UUID payload` | Checks for foreign signatures, refuses an existing ZeroFS label, and requires both label slots and the first log block to be zero before provisioning the HDD. |
+| `zerofs-raw-device physical p3-v2-init-blank nvme POOL_UUID MEMBER_UUID p3 LAYOUT_BYTES` | Requires six exact comma-separated byte lengths. Checks the entire P3 for zero before its first label write. Transactional regions also check their own ranges for zero bytes. |
 | `zerofs pool init -c CONFIG` | Initializes the namespace on explicitly provisioned devices. Existing journal, catalog, authority, key, scratch or cache contents on the P3 block initialization. An interrupted partial setup requires inspection. |
 | `zerofs pool verify-raw -c CONFIG` | Stopped-engine check. Acquires the claims and checks the original catalog, authority bucket, key envelope and journal identity. Emits schema version 1 JSON, including verification booleans, member status, local/remote sequence and the typed `memory.included_companion_bytes`. The `journal_allocation` object reports redb length, allocated pages, stored key/value bytes, metadata, fragmentation and pending payload charges. Opening a transactional database can run normal recovery and retirement of an already-drained prefix. |
 | `zerofs run -c CONFIG` | Independently claims and checks the devices. An empty original journal, missing label, mismatched pool/member/role or missing required member prevents ordinary startup. |
 
-Whole-media zero verification on successful provisioning reads at least 6,001,175,126,016 B and 18,000,207,937,536 B on the two HDDs, plus two passes over the 1,000,204,886,016 B P3. QUICK wipes do not establish zero content throughout those ranges. A missing label does not authorize initialization. The earlier extended WD SMART check was waived for the disposable trial.
+A TrueNAS QUICK wipe can prepare an HDD for provisioning if the physical claim finds no foreign signatures and the first 12 KiB are zero. The rest of the HDD can contain old bytes. Provisioning starts with an empty log checkpoint, and replay checks the provisioning nonce and sequence of each record up to the durable tail. Verify that the disk is expendable and that evacuation is complete before wiping it. The P3 requires whole-device zero verification. The earlier extended WD SMART check was waived for the disposable trial.
 
 ## Geometry and finite admission
 
