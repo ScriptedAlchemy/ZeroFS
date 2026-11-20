@@ -1032,10 +1032,12 @@ impl Catalog {
     /// The member a new `size`-byte segment would be placed on now, by the
     /// same rule as [`Self::reserve`], without recording anything. It reads
     /// committed rows, so it never waits for a placement commit.
+    #[allow(clippy::too_many_arguments)]
     pub fn admit(
         &self,
         size: u64,
         members: &[PoolMember],
+        target: Option<&str>,
         skip: &BTreeSet<String>,
         placement: SegmentPlacement,
         ledger: &Ledger,
@@ -1048,7 +1050,7 @@ impl Catalog {
             Request {
                 size,
                 members,
-                target: None,
+                target,
                 skip,
                 placement,
                 admitted: &admitted,
@@ -2072,6 +2074,7 @@ mod reservation_in_flight_tests {
             .admit(
                 size,
                 members,
+                None,
                 &BTreeSet::new(),
                 SegmentPlacement::FirstFit,
                 &ledger.lock().unwrap(),

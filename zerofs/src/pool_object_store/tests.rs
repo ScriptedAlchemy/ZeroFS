@@ -4256,6 +4256,32 @@ async fn claims_and_leases_share_room_with_reservations_exactly() {
     assert_eq!(usage(&pool, &member).await.0, 600);
 }
 
+/// A WRITE that claimed room on one member can keep filling a segment
+/// leased on another while that member has room, and not past it.
+#[tokio::test]
+async fn a_lease_grows_on_its_own_member_while_that_member_has_room() {
+    let fixture = Fixture::new(1024);
+    let pool = fixture.initialize().await;
+    let leased = Segid::new(41, 920);
+    assert!(!pool.extend_lease(leased, 300).await.unwrap());
+
+    let first = pool.admit(300, Some("hdd-a".into())).await.unwrap();
+    first.fund(leased, 300).unwrap();
+    drop(first);
+    let other = pool.admit(300, Some("hdd-b".into())).await.unwrap();
+    assert_eq!(other.member(), "hdd-b");
+    assert!(other.fund(leased, 600).is_err());
+
+    assert!(pool.extend_lease(leased, 600).await.unwrap());
+    assert_eq!(pool.lease_member(leased).as_deref(), Some("hdd-a"));
+    assert_eq!(admitted(&pool.status().await.unwrap(), "hdd-a"), 600);
+    // The member holds 1024 bytes: the lease cannot grow past them, and a
+    // refused growth leaves it as it was.
+    assert!(!pool.extend_lease(leased, 1025).await.unwrap());
+    assert_eq!(admitted(&pool.status().await.unwrap(), "hdd-a"), 600);
+    assert!(!pool.inner.safety_failure.is_cancelled());
+}
+
 /// A WRITE is admitted while a placement holds, or waits for, the catalog
 /// writer: admission reads committed rows and the ledger only.
 #[tokio::test]

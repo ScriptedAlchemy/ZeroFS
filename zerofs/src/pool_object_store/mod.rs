@@ -1287,6 +1287,7 @@ impl PoolObjectStore {
                 let member = catalog.admit(
                     bytes,
                     &members,
+                    None,
                     &skip,
                     placement,
                     &ledger,
@@ -1325,6 +1326,50 @@ impl PoolObjectStore {
             .map_err(|e| storage_full(e, bytes))?;
         let _claim = Claim::new(Arc::clone(&self.inner.ledger), key);
         store.put_opts(location, payload, opts).await
+    }
+
+    /// Grow `segment`'s lease to `total` bytes on the member it is already
+    /// leased on, for a WRITE that claimed its room on another member.
+    /// `false` means the lease's member has no room for the growth, or the
+    /// segment has no lease.
+    pub(crate) async fn extend_lease(&self, segment: Segid, total: u64) -> object_store::Result<bool> {
+        let members = self.inner.members.clone();
+        let mut skip: BTreeSet<String> =
+            self.inner.no_space.current(&members).into_keys().collect();
+        skip.extend(self.inner.unavailable.iter().cloned());
+        let ledger = Arc::clone(&self.inner.ledger);
+        self.catalog(move |catalog| {
+            let mut ledger = ledger.lock().unwrap();
+            let Some((member, leased)) = ledger.lease(segment) else {
+                return Ok(false);
+            };
+            let member = member.to_owned();
+            let growth = total.saturating_sub(leased);
+            let fits = growth == 0
+                || match catalog.admit(
+                    growth,
+                    &members,
+                    Some(&member),
+                    &skip,
+                    SegmentPlacement::FirstFit,
+                    &ledger,
+                    None,
+                ) {
+                    Ok(_) => true,
+                    Err(issue)
+                        if issue.is::<catalog::NoCapacity>()
+                            || issue.is::<catalog::NoAvailableMember>() =>
+                    {
+                        false
+                    }
+                    Err(issue) => return Err(issue),
+                };
+            if fits {
+                ledger.grow_lease(segment, total);
+            }
+            Ok(fits)
+        })
+        .await
     }
 
     /// The member `segment` is leased on, while it is unplaced.

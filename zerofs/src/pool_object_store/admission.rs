@@ -126,6 +126,20 @@ impl Ledger {
         self.entries.get(&key).map(|entry| entry.member.as_str())
     }
 
+    /// The member `segment` is leased on and the bytes it holds there.
+    pub(super) fn lease(&self, segment: Segid) -> Option<(&str, u64)> {
+        self.entries
+            .get(&Key::Segment(segment))
+            .map(|entry| (entry.member.as_str(), entry.bytes))
+    }
+
+    /// Grow `segment`'s lease to `total` bytes on its own member.
+    pub(super) fn grow_lease(&mut self, segment: Segid, total: u64) {
+        if let Some(entry) = self.entries.get_mut(&Key::Segment(segment)) {
+            entry.bytes = entry.bytes.max(total);
+        }
+    }
+
     /// Record a claim of `kind`: [`Key::Claim`] or [`Key::Survival`].
     pub(super) fn insert_claim(&mut self, kind: fn(u64) -> Key, member: String, bytes: u64) -> Key {
         let key = kind(self.next_claim);

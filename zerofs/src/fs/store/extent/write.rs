@@ -1178,8 +1178,9 @@ impl ExtentStore {
     }
 
     /// Grow the open segment's lease to cover `frames` from `claim`. A
-    /// segment leased on another member is sealed first, so these frames
-    /// start a new segment on the claim's member.
+    /// segment leased on another member grows there while that member has
+    /// room. Otherwise it is sealed first, so these frames start a new
+    /// segment on the claim's member.
     async fn fund_lease(
         &self,
         appended: &LaneAppendGuard<'_>,
@@ -1198,6 +1199,19 @@ impl ExtentStore {
         let (segid, total) = projected();
         if claim.fund(segid, total).is_ok() {
             return Ok(());
+        }
+        // Placement can move between two writes of one file. Keep filling the
+        // segment where it is leased while that member has room, so segments
+        // are not cut short each time it does.
+        if let Some(pool) = self.admission.get() {
+            match pool.extend_lease(segid, total).await {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) => {
+                    error!("pool admission failed for segment {segid:?}: {error}");
+                    return Err(FsError::IoError);
+                }
+            }
         }
         self.spawn_seal(appended).await?;
         let (segid, total) = projected();
