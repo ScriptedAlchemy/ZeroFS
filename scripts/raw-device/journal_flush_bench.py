@@ -56,6 +56,13 @@ def disk_delta(after, before):
                    for key in STAT_FIELDS if key != "in_flight"} for name in after}
 
 
+def peak_resident_bytes(pid):
+    for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+        if line.startswith("VmHWM:"):
+            return int(line.split()[1]) * 1024
+    raise RuntimeError("engine VmHWM not found")
+
+
 def cpu_seconds(pid):
     fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
     return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
@@ -239,6 +246,7 @@ def run_once(index, bindings, configuration, path, server, address, shim):
     record("write_fsync", run=index, bytes=PAYLOAD, seconds=seconds,
            mb_per_s=rate, fsync_seconds=(synced - written) / 1e9,
            engine_cpu_seconds=write_cpu, client_cpu_seconds=client_cpu,
+           engine_peak_resident_bytes=peak_resident_bytes(server.pid),
            p3_writes_per_mib=p3["writes"] / mib, p3_flushes_per_mib=p3["flushes"] / mib,
            p3_write_amplification=p3["write_sectors"] * 512 / PAYLOAD,
            p3_mean_write_kib=p3["write_sectors"] / 2 / max(p3["writes"], 1),
