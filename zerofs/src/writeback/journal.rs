@@ -194,6 +194,8 @@ pub struct Journal {
     shared: SharedCommits,
     #[cfg(test)]
     shared_commits: AtomicU64,
+    #[cfg(test)]
+    shared_commit_attempts: AtomicU64,
     _lock: Option<JournalLock>,
     format_version: u32,
     #[cfg(test)]
@@ -553,6 +555,11 @@ enum SharedWrite {
         payloads: Vec<(Sequence, VerifiedPayload)>,
     },
     RemoteMarks(Vec<(Sequence, Option<String>)>),
+}
+
+enum SharedCommitFailure {
+    Rejected(anyhow::Error),
+    Commit(Arc<redb::CommitError>),
 }
 
 /// One queued [`SharedWrite`] and where its caller reads the outcome.
@@ -1060,6 +1067,8 @@ impl Journal {
             shared: SharedCommits::default(),
             #[cfg(test)]
             shared_commits: AtomicU64::new(0),
+            #[cfg(test)]
+            shared_commit_attempts: AtomicU64::new(0),
             _lock: Some(lock),
             format_version: expected_identity.format_version,
             #[cfg(test)]
@@ -1128,6 +1137,8 @@ impl Journal {
             shared: SharedCommits::default(),
             #[cfg(test)]
             shared_commits: AtomicU64::new(0),
+            #[cfg(test)]
+            shared_commit_attempts: AtomicU64::new(0),
             _lock: None,
             format_version: expected_identity.format_version,
             #[cfg(test)]
@@ -2000,55 +2011,109 @@ impl Journal {
                 self.wait_if_remote_mark_paused(completions[0].0);
             }
         }
-        let outcomes: Vec<Result<()>> = match self.commit_together(group) {
-            Ok(()) => group.iter().map(|_| Ok(())).collect(),
-            // One write's refusal must not fail the writes sharing its
-            // commit. Nothing was committed, so each commits alone.
-            Err(_) if group.len() > 1 => group
-                .iter()
-                .map(|slot| self.commit_together(std::slice::from_ref(slot)))
-                .collect(),
-            Err(error) => vec![Err(error)],
-        };
-        for (slot, outcome) in group.iter().zip(outcomes) {
-            let outcome = outcome.and_then(|()| self.shared_write_committed(&slot.write));
-            *slot
-                .outcome
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) = Some(outcome);
-            slot.done.notify_all();
+        match self.commit_together(group) {
+            Ok(()) => {
+                for slot in group {
+                    self.complete_shared_write(slot, Ok(()));
+                }
+            }
+            // A refusal before commit aborts the transaction. Isolate it so
+            // valid writes can still commit, but stop at any commit error:
+            // its durable outcome is unknown until recovery.
+            Err(SharedCommitFailure::Rejected(_)) if group.len() > 1 => {
+                for (index, slot) in group.iter().enumerate() {
+                    match self.commit_together(std::slice::from_ref(slot)) {
+                        Ok(()) => self.complete_shared_write(slot, Ok(())),
+                        Err(SharedCommitFailure::Rejected(error)) => {
+                            self.complete_shared_write(slot, Err(error));
+                        }
+                        Err(SharedCommitFailure::Commit(error)) => {
+                            self.fail_shared_commit(&group[index..], error);
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(SharedCommitFailure::Rejected(error)) => {
+                self.complete_shared_write(&group[0], Err(error));
+            }
+            Err(SharedCommitFailure::Commit(error)) => self.fail_shared_commit(group, error),
         }
+    }
+
+    fn fail_shared_commit(&self, group: &[Arc<SharedSlot>], error: Arc<redb::CommitError>) {
+        for slot in group {
+            self.complete_shared_write(
+                slot,
+                Err(anyhow!(Arc::clone(&error)).context("failed to commit journal transaction")),
+            );
+        }
+    }
+
+    fn complete_shared_write(&self, slot: &SharedSlot, outcome: Result<()>) {
+        if outcome.is_ok() {
+            self.shared_write_committed(&slot.write);
+        }
+        *slot
+            .outcome
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(outcome);
+        slot.done.notify_all();
     }
 
     /// Apply every write of `group`, in queue order, in one immediate
-    /// transaction. On any error nothing is committed.
-    fn commit_together(&self, group: &[Arc<SharedSlot>]) -> Result<()> {
-        let mut transaction = self
-            .database
-            .begin_write()
-            .context("failed to begin journal commit")?;
-        transaction
-            .set_durability(Durability::Immediate)
-            .context("failed to set journal durability")?;
-        for slot in group {
-            match &slot.write {
-                SharedWrite::Records { records, payloads } => {
-                    Self::insert_record_batch(&transaction, records, payloads)?;
-                }
-                SharedWrite::RemoteMarks(completions) => {
-                    Self::insert_remote_marks(&transaction, completions)?;
+    /// transaction. Only a rejection before commit guarantees no publication.
+    fn commit_together(
+        &self,
+        group: &[Arc<SharedSlot>],
+    ) -> std::result::Result<(), SharedCommitFailure> {
+        #[cfg(test)]
+        self.shared_commit_attempts.fetch_add(1, Ordering::Relaxed);
+        let transaction = (|| -> Result<_> {
+            let mut transaction = self
+                .database
+                .begin_write()
+                .context("failed to begin journal commit")?;
+            transaction
+                .set_durability(Durability::Immediate)
+                .context("failed to set journal durability")?;
+            for slot in group {
+                match &slot.write {
+                    SharedWrite::Records { records, payloads } => {
+                        Self::insert_record_batch(&transaction, records, payloads)?;
+                    }
+                    SharedWrite::RemoteMarks(completions) => {
+                        Self::insert_remote_marks(&transaction, completions)?;
+                    }
                 }
             }
-        }
+            Ok(transaction)
+        })()
+        .map_err(SharedCommitFailure::Rejected)?;
         transaction
             .commit()
-            .context("failed to commit journal transaction")?;
+            .map_err(|error| SharedCommitFailure::Commit(Arc::new(error)))?;
         #[cfg(test)]
-        self.shared_commits.fetch_add(1, Ordering::Relaxed);
+        {
+            self.shared_commits.fetch_add(1, Ordering::Relaxed);
+            if group
+                .iter()
+                .any(|slot| matches!(slot.write, SharedWrite::Records { .. }))
+                && self
+                    .local_commit_error_after_durable
+                    .swap(false, Ordering::AcqRel)
+            {
+                return Err(SharedCommitFailure::Commit(Arc::new(
+                    redb::CommitError::Storage(redb::StorageError::Io(std::io::Error::other(
+                        "injected local commit error after durable state",
+                    ))),
+                )));
+            }
+        }
         Ok(())
     }
 
-    fn shared_write_committed(&self, write: &SharedWrite) -> Result<()> {
+    fn shared_write_committed(&self, write: &SharedWrite) {
         match write {
             SharedWrite::Records { .. } => {
                 *self
@@ -2056,13 +2121,6 @@ impl Journal {
                     .last_records
                     .lock()
                     .unwrap_or_else(|error| error.into_inner()) = Some(Instant::now());
-                #[cfg(test)]
-                if self
-                    .local_commit_error_after_durable
-                    .swap(false, Ordering::AcqRel)
-                {
-                    bail!("injected local commit error after durable state");
-                }
             }
             SharedWrite::RemoteMarks(_) => {
                 #[cfg(test)]
@@ -2070,7 +2128,6 @@ impl Journal {
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
-        Ok(())
     }
 
     fn discard_container(&self, location: &AnchoredFileLocation) -> Result<()> {
@@ -5958,6 +6015,105 @@ mod tests {
         let progress = reopened.progress().unwrap();
         assert_eq!((progress.local_seq, progress.remote_seq), (2, 1));
         assert_eq!(reopened.read_blob_bounded(2, 3).unwrap(), b"two");
+    }
+
+    #[test]
+    fn an_ambiguous_shared_commit_is_not_retried_and_preserves_its_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(open_temp_journal(&temp, "bucket-a"));
+        journal
+            .commit_put(put_record(1, "segments/1", b"one"), b"one")
+            .unwrap();
+        let attempts = journal.shared_commit_attempts.load(Ordering::Relaxed);
+
+        let held = journal.write_gate.lock();
+        let marking = thread::spawn({
+            let journal = Arc::clone(&journal);
+            move || journal.mark_remote(1, Some("etag-one".to_owned()))
+        });
+        wait_for_shared_queue(&journal, 1);
+        let writing = thread::spawn({
+            let journal = Arc::clone(&journal);
+            move || journal.commit_put(put_record(2, "segments/2", b"two"), b"two")
+        });
+        wait_for_shared_queue(&journal, 2);
+        journal
+            .local_commit_error_after_durable
+            .store(true, Ordering::Release);
+        drop(held);
+
+        for error in [
+            marking.join().unwrap().unwrap_err(),
+            writing.join().unwrap().unwrap_err(),
+        ] {
+            assert!(
+                format!("{error:#}").contains("injected local commit error after durable state"),
+                "the uncertain commit's original error was lost: {error:#}"
+            );
+        }
+        assert_eq!(
+            journal.shared_commit_attempts.load(Ordering::Relaxed) - attempts,
+            1,
+            "an ambiguous commit must not be split and retried"
+        );
+        let progress = journal.progress().unwrap();
+        assert_eq!((progress.local_seq, progress.remote_seq), (2, 1));
+        assert_journal_payload(&journal, 2, b"two");
+        drop(journal);
+
+        let recovered = open_temp_journal(&temp, "bucket-a");
+        let progress = recovered.progress().unwrap();
+        assert_eq!((progress.local_seq, progress.remote_seq), (2, 1));
+        assert_journal_payload(&recovered, 2, b"two");
+    }
+
+    #[test]
+    fn an_ambiguous_fallback_commit_stops_the_remaining_shared_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_temp_journal(&temp, "bucket-a");
+        journal.commit_metadata(delete_record(1, "old-1")).unwrap();
+        let slot = |write| {
+            Arc::new(super::SharedSlot {
+                write,
+                outcome: Mutex::new(None),
+                done: std::sync::Condvar::new(),
+            })
+        };
+        let group = [
+            // Refuse the group before commit, forcing per-write isolation.
+            slot(super::SharedWrite::RemoteMarks(vec![(1, None), (2, None)])),
+            slot(super::SharedWrite::Records {
+                records: vec![delete_record(2, "old-2")],
+                payloads: Vec::new(),
+            }),
+            slot(super::SharedWrite::Records {
+                records: vec![delete_record(3, "old-3")],
+                payloads: Vec::new(),
+            }),
+        ];
+        let attempts = journal.shared_commit_attempts.load(Ordering::Relaxed);
+        journal
+            .local_commit_error_after_durable
+            .store(true, Ordering::Release);
+
+        journal.commit_group(&group);
+
+        let refused = group[0].take_outcome().unwrap().unwrap_err();
+        assert!(format!("{refused:#}").contains("must advance contiguously"));
+        for slot in &group[1..] {
+            let error = slot.take_outcome().unwrap().unwrap_err();
+            assert!(
+                format!("{error:#}").contains("injected local commit error after durable state"),
+                "{error:#}"
+            );
+        }
+        assert_eq!(
+            journal.shared_commit_attempts.load(Ordering::Relaxed) - attempts,
+            3,
+            "the write after the ambiguous fallback must not be attempted"
+        );
+        assert_eq!(journal.progress().unwrap().local_seq, 2);
+        assert!(journal.mutation(3).unwrap().is_none());
     }
 
     /// A refused write commits nothing and does not fail the write that
