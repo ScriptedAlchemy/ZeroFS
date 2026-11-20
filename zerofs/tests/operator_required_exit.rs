@@ -265,6 +265,73 @@ disk_size_gb = 0.1
 min_free_gb = 0.001
 "#;
 
+/// Offline recovery must acquire the stopped journal's owner lock and match
+/// its persisted identity before updating its predecessor record.
+#[test]
+fn offline_recovery_checks_the_journal_lock_and_identity() {
+    let volume = Volume::new();
+    let writeback = WRITEBACK.replace("{dir}", &volume.path("writeback").display().to_string());
+    let config = volume.create(&writeback);
+    let journals = files_named(&volume.path("writeback"), "journal.redb");
+    assert_eq!(journals.len(), 1);
+    let db = &journals[0];
+    let journal = db.parent().unwrap();
+    let object = volume.path("data/predecessor");
+    std::fs::write(&object, b"predecessor").unwrap();
+    let recover = |config: &Path| {
+        Command::new(zerofs_binary())
+            .args(["debug", "reseed-writeback-predecessor", "--config"])
+            .arg(config)
+            .arg("--journal")
+            .arg(journal)
+            .arg("--path")
+            .arg(object.strip_prefix("/").unwrap())
+            .args(["--sequence", "0"])
+            .output()
+            .unwrap()
+    };
+
+    let original = std::fs::read(db).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(journal.join("LOCK"))
+        .unwrap();
+    lock.try_lock().unwrap();
+    let busy = recover(&config);
+    let diagnostic = String::from_utf8_lossy(&busy.stderr);
+    assert!(
+        !busy.status.success() && diagnostic.contains("already locked"),
+        "{diagnostic}"
+    );
+    assert!(
+        std::fs::read(db).unwrap() == original,
+        "refusal modified the journal"
+    );
+    drop(lock);
+
+    let other = Volume::new();
+    let other_writeback =
+        WRITEBACK.replace("{dir}", &other.path("writeback").display().to_string());
+    let mismatch = recover(&other.create(&other_writeback));
+    let diagnostic = String::from_utf8_lossy(&mismatch.stderr);
+    assert!(
+        !mismatch.status.success() && diagnostic.contains("identity mismatch"),
+        "{diagnostic}"
+    );
+    assert!(
+        std::fs::read(db).unwrap() == original,
+        "refusal modified the journal"
+    );
+
+    let matching = recover(&config);
+    assert!(
+        matching.status.success(),
+        "{}",
+        String::from_utf8_lossy(&matching.stderr)
+    );
+}
+
 /// The journal device lost acknowledged writes: the database ends before the
 /// end its last durable commit describes.
 #[test]
