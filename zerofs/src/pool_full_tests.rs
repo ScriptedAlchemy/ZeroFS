@@ -807,3 +807,241 @@ async fn ninep_fsync_on_a_full_pool_returns_enospc_not_eio() {
     })
     .await;
 }
+
+/// Each member's declared capacity in the delete-and-flush tests, as in the
+/// mounted fixtures: a 24 MiB body and a 32 MiB body do not fit together.
+const QUOTA: u64 = 50_000_000;
+
+/// A pool where member-a holds a flushed 24 MiB file within its quota, and
+/// member-b's filesystem is below its reserve.
+async fn full_pool() -> Fixture {
+    fixture(
+        (QUOTA, plenty()),
+        (QUOTA, local(RESERVE / 2)),
+        StoreProfile::default(),
+    )
+    .await
+}
+
+fn used_bytes(report: &serde_json::Value, member: usize) -> u64 {
+    report["members"][member]["used_bytes"].as_u64().unwrap()
+}
+
+async fn collect_garbage(f: &Fixture, protect_before: Option<chrono::DateTime<chrono::Utc>>) {
+    crate::fs::gc::GarbageCollector::new(
+        Arc::clone(&f.fs.db),
+        f.fs.tombstone_store.clone(),
+        f.fs.extent_store.clone(),
+        Arc::clone(&f.fs.stats),
+        None,
+        Default::default(),
+    )
+    .run()
+    .await
+    .unwrap();
+    f.fs.extent_store
+        .reclaim_segments(chrono::Utc::now(), protect_before)
+        .await
+        .unwrap();
+}
+
+/// The contract the mounted fixtures check: after an unlink on a full pool,
+/// the staged write's next fsync succeeds once a member has room for its
+/// whole seal, without a restart, and the deleted body is then reclaimed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fsync_after_unlink_succeeds_once_a_member_has_room() {
+    deadline(async {
+        let test = "unlink-then-room";
+        let f = full_pool().await;
+        let previous = create(&f.fs, "previous").await;
+        let previous_data = payload(30, 20);
+        write(test, &f.fs, previous, &previous_data).await.unwrap();
+        fsync(test, &f.fs, previous).await.unwrap();
+        let deleted = create(&f.fs, "delete-me").await;
+        write(test, &f.fs, deleted, &payload(31, 24 * MIB))
+            .await
+            .unwrap();
+        fsync(test, &f.fs, deleted).await.unwrap();
+        let replacement = create(&f.fs, "replacement").await;
+        let replacement_data = payload(32, 32 * MIB);
+        write(test, &f.fs, replacement, &replacement_data)
+            .await
+            .unwrap();
+        assert_eq!(fsync(test, &f.fs, replacement).await, Err(FsError::NoSpace));
+
+        f.fs.remove(&auth(), 0, b"delete-me").await.unwrap();
+        assert_eq!(
+            fsync(test, &f.fs, replacement).await,
+            Err(FsError::NoSpace),
+            "the unlink alone gave no member room for the seal"
+        );
+
+        f.b.set_available(64 * GIB);
+        fsync(test, &f.fs, replacement).await.unwrap();
+        assert_eq!(f.fs.extent_store.retained_seals(), (0, 0));
+        assert_eq!(
+            read(&f.fs, replacement, replacement_data.len() as u64).await,
+            replacement_data
+        );
+        assert_eq!(read(&f.fs, previous, 20).await, previous_data);
+
+        let before = used_bytes(&status(&f.pool).await, 0);
+        collect_garbage(&f, None).await;
+        let after = used_bytes(&status(&f.pool).await, 0);
+        assert!(
+            before - after >= 24 * MIB,
+            "the deleted body stayed charged to member-a: {before} -> {after}"
+        );
+        assert_eq!(read(&f.fs, previous, 20).await, previous_data);
+        assert_eq!(
+            read(&f.fs, replacement, replacement_data.len() as u64).await,
+            replacement_data
+        );
+    })
+    .await;
+}
+
+/// The same progress with the old bytes pinned: an open 9P reader across the
+/// unlink, then a persistent checkpoint. Each keeps the deleted body readable
+/// and charged after the staged fsync succeeds. The body goes only once the
+/// last pin is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pinned_bytes_survive_the_fsync_that_follows_an_unlink() {
+    use ninep_client::{ClientError, NOFID, NinePClient};
+    deadline(async {
+        let test = "pinned-unlink";
+        let f = full_pool().await;
+        f.fs.start_reclaim_drainer();
+        let socket = f._root.path().join("9p.sock");
+        let server = crate::ninep::NinePServer::new_unix(Arc::clone(&f.fs), socket.clone());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let _ = server.start(server_shutdown).await;
+        });
+        let mut client = None;
+        for _ in 0..100 {
+            if let Ok(connected) = NinePClient::connect_unix(&socket, 1024 * 1024).await {
+                client = Some(connected);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let client = client.expect("9P server did not start");
+        let root = client.alloc_fid();
+        client.attach(root, NOFID, "", "", 0).await.unwrap();
+        let create = |name: &'static str| {
+            let client = Arc::clone(&client);
+            async move {
+                let fid = client.alloc_fid();
+                client.walk(root, fid, &[]).await.unwrap();
+                client
+                    .lcreate(fid, name.as_bytes(), 2, 0o644, 0)
+                    .await
+                    .unwrap();
+                fid
+            }
+        };
+        let write_all = |fid: u32, data: Bytes| {
+            let client = Arc::clone(&client);
+            async move {
+                for offset in (0..data.len()).step_by(MIB as usize) {
+                    let end = (offset + MIB as usize).min(data.len());
+                    client
+                        .write_bytes(fid, offset as u64, data.slice(offset..end))
+                        .await
+                        .unwrap();
+                }
+            }
+        };
+        let read_all = |fid: u32, length: u64| {
+            let client = Arc::clone(&client);
+            async move {
+                let mut out = Vec::new();
+                while (out.len() as u64) < length {
+                    let chunk = client
+                        .read(fid, out.len() as u64, 512 * 1024)
+                        .await
+                        .unwrap();
+                    assert!(!chunk.is_empty(), "short read at {}", out.len());
+                    out.extend_from_slice(&chunk);
+                }
+                Bytes::from(out)
+            }
+        };
+        let enospc = |result: Result<(), ClientError>| match result {
+            Err(ClientError::Errno(errno)) => assert_eq!(errno, libc::ENOSPC as u32),
+            other => panic!("9P fsync on a full pool returned {other:?}"),
+        };
+
+        let deleted = create("delete-me").await;
+        let deleted_data = payload(40, 24 * MIB);
+        write_all(deleted, deleted_data.clone()).await;
+        bounded(test, "9P fsync", client.fsync(deleted, 0))
+            .await
+            .unwrap();
+        let reader = client.alloc_fid();
+        client.walk(root, reader, &[b"delete-me"]).await.unwrap();
+        client.lopen(reader, 0).await.unwrap();
+        client.clunk(deleted).await.unwrap();
+
+        let replacement = create("replacement").await;
+        let replacement_data = payload(41, 32 * MIB);
+        write_all(replacement, replacement_data.clone()).await;
+        enospc(bounded(test, "9P fsync", client.fsync(replacement, 0)).await);
+        client.unlinkat(root, b"delete-me", 0).await.unwrap();
+        enospc(bounded(test, "9P fsync", client.fsync(replacement, 0)).await);
+
+        f.b.set_available(64 * GIB);
+        bounded(
+            test,
+            "9P fsync once member-b has room",
+            client.fsync(replacement, 0),
+        )
+        .await
+        .unwrap();
+        let charged = used_bytes(&status(&f.pool).await, 0);
+
+        // The open reader pins the unlinked inode.
+        collect_garbage(&f, None).await;
+        assert_eq!(
+            read_all(reader, deleted_data.len() as u64).await,
+            deleted_data
+        );
+        assert_eq!(used_bytes(&status(&f.pool).await, 0), charged);
+
+        // Once the reader is gone, a persistent checkpoint's reclaim gate
+        // still pins it. The mounted fixture reads a real checkpoint view.
+        let deleted_files = f.fs.stats.files_deleted.load(Ordering::Relaxed);
+        client.clunk(reader).await.unwrap();
+        for _ in 0..250 {
+            if f.fs.stats.files_deleted.load(Ordering::Relaxed) > deleted_files {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            f.fs.stats.files_deleted.load(Ordering::Relaxed) > deleted_files,
+            "the last clunk did not release the unlinked inode"
+        );
+        collect_garbage(&f, Some(chrono::Utc::now())).await;
+        assert_eq!(used_bytes(&status(&f.pool).await, 0), charged);
+
+        collect_garbage(&f, None).await;
+        let after = used_bytes(&status(&f.pool).await, 0);
+        assert!(
+            charged - after >= 24 * MIB,
+            "the unpinned body stayed charged to member-a: {charged} -> {after}"
+        );
+        let replacement =
+            f.fs.lookup(&root_credentials(), 0, b"replacement")
+                .await
+                .unwrap();
+        assert_eq!(
+            read(&f.fs, replacement, replacement_data.len() as u64).await,
+            replacement_data
+        );
+        shutdown.cancel();
+    })
+    .await;
+}

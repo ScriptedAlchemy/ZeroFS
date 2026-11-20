@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """Exercise full-pool reuse and crash integrity on disposable local storage.
 
-This acceptance test currently fails the immediate-reuse assertion. It still
-checks surviving data after SIGKILL before reporting that failure. Run on Linux
-in an isolated mount namespace with /dev/fuse and CAP_SYS_ADMIN.
+With `--room-from unlink`, the unprotected case requires the unlink alone to
+make room. It fails that assertion today, after checking the surviving data
+after SIGKILL. With `--room-from member-b`, the same pending descriptor must
+still get ENOSPC after the unlink. Releasing ballast on member-b then makes
+room for the whole refused seal, and the next fsync must succeed within five
+seconds of that release, with every protection still holding the old bytes.
+Run on Linux in an isolated mount namespace with CAP_SYS_ADMIN, and /dev/fuse
+for the FUSE client.
 """
 
 import argparse
@@ -12,6 +17,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -19,6 +25,10 @@ import time
 
 
 MIB = 1024**2
+RESERVE = 1_000_000
+QUOTA = 50_000_000
+FLUSH_DEADLINE_SECONDS = 5
+KERNEL_9P = "trans=unix,version=9p2000.L,msize=1048576,cache=none,access=user,nodev,nosuid"
 
 
 def command(*args):
@@ -67,23 +77,49 @@ def digest(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
-def run(binary, scratch, evidence, distinct_payload, protection):
+def unmount(path, client_kind):
+    if client_kind == "kernel-9p":
+        # A kernel 9P mount whose server was killed can only be detached.
+        command("umount", "-l", str(path))
+    else:
+        command("fusermount3", "-u", str(path))
+
+
+def free_bytes(path):
+    usage = os.statvfs(path)
+    return usage.f_bavail * usage.f_frsize
+
+
+def refused_seal_bytes(log_path, offset):
+    with log_path.open("rb") as source:
+        source.seek(offset)
+        sizes = set(re.findall(rb"no pool member has room for a (\d+)-byte object", source.read()))
+    assert len(sizes) == 1, sizes
+    return int(sizes.pop())
+
+
+def run(binary, scratch, evidence, distinct_payload, protection, client_kind, room_from):
     root = Path(tempfile.mkdtemp(prefix="zerofs-delete-reuse-", dir=scratch))
     mounted = []
     server = client = None
     pending = None
     reader = None
-    log = (evidence / "processes.log").open("wb")
+    log_path = evidence / "processes.log"
+    log = log_path.open("wb")
     result = {
         "kernel": os.uname().release,
         "binary_sha256": digest(binary),
         "protection": protection,
         "distinct_payload": distinct_payload,
+        "client": client_kind,
+        "room_from": room_from,
     }
+    ballast = None
     try:
         for name in ("member-a", "member-b", "metadata", "catalog", "cache", "mount"):
             (root / name).mkdir(mode=0o700)
-        for name, size in (("member-a", "3g"), ("member-b", "8m")):
+        member_b_size = "8m" if room_from == "unlink" else "64m"
+        for name, size in (("member-a", "3g"), ("member-b", member_b_size)):
             path = root / name
             command(
                 "mount",
@@ -95,10 +131,9 @@ def run(binary, scratch, evidence, distinct_payload, protection):
                 str(path),
             )
             mounted.append(path)
-        space = os.statvfs(root / "member-b")
-        (root / "member-b/ballast").write_bytes(
-            bytes(space.f_bavail * space.f_frsize - 900_000)
-        )
+        ballast = root / "member-b/ballast"
+        ballast.write_bytes(bytes(free_bytes(root / "member-b") - 900_000))
+        assert free_bytes(root / "member-b") < RESERVE
         config = root / "zerofs.toml"
         config.write_text(f'''[cache]
 dir = "{root / "cache"}"
@@ -145,6 +180,9 @@ enabled = false
             return process
 
         def mount():
+            if client_kind == "kernel-9p":
+                command("mount", "-t", "9p", "-o", KERNEL_9P, str(root / "9p.sock"), str(root / "mount"))
+                return None
             process = subprocess.Popen(
                 [
                     str(binary),
@@ -193,16 +231,36 @@ enabled = false
         )
         for offset in range(0, len(replacement), MIB):
             assert os.write(pending, replacement[offset : offset + MIB]) == MIB
+        log.flush()
+        offset = log_path.stat().st_size
         try:
             os.fsync(pending)
         except OSError as error:
             assert error.errno == errno.ENOSPC, error
         else:
             raise AssertionError("fixture did not fill the pool")
+        seal = refused_seal_bytes(log_path, offset)
+        assert seal >= len(replacement), seal
+        result["refused_seal_bytes"] = seal
         result["earlier_sha256"] = digest(root / "mount/previous")
         assert result["earlier_sha256"] == hashlib.sha256(previous).hexdigest()
         started = time.monotonic()
         (root / "mount/delete-me").unlink()
+        if room_from == "member-b":
+            # The unlink alone leaves no member room for the refused seal.
+            try:
+                os.fsync(pending)
+            except OSError as error:
+                assert error.errno == errno.ENOSPC, error
+            else:
+                raise AssertionError("fsync succeeded before any member had room")
+            # The deadline starts before the operation that makes room.
+            started = time.monotonic()
+            ballast.unlink()
+            ballast = None
+            room = free_bytes(root / "member-b") - RESERVE
+            result["member_b_room_bytes"] = room
+            assert min(room, QUOTA) >= seal, (room, seal)
         # One retry on the same pending descriptor; no sleep, polling, or restart.
         try:
             os.fsync(pending)
@@ -222,14 +280,18 @@ enabled = false
         stop(server, kill=True)
         stop(client, kill=True)
         if reader is not None:
-            reader.close()
+            # The reader's bytes were verified above; its client is gone.
+            try:
+                reader.close()
+            except OSError as error:
+                assert error.errno in (errno.EIO, errno.ENOTCONN), error
             reader = None
         try:
             os.close(pending)
         except OSError as error:
             assert error.errno in (errno.EIO, errno.ENOTCONN), error
         pending = None
-        command("fusermount3", "-u", str(root / "mount"))
+        unmount(root / "mount", client_kind)
         server = start()
         client = mount()
         assert digest(root / "mount/previous") == result["earlier_sha256"]
@@ -242,6 +304,8 @@ enabled = false
             result["replacement_hash_after_sigkill"] = result[
                 "expected_replacement_sha256"
             ]
+            # The acknowledged fsync also made the earlier unlink durable.
+            assert not (root / "mount/delete-me").exists()
         else:
             # The deletion was not fsynced: its old durable name may return.
             if (root / "mount/delete-me").exists():
@@ -254,7 +318,7 @@ enabled = false
         if protection == "checkpoint":
             stop(client)
             if is_mounted(root / "mount"):
-                command("fusermount3", "-u", str(root / "mount"))
+                unmount(root / "mount", client_kind)
             stop(server)
             server = start("--checkpoint", "before-unlink")
             client = mount()
@@ -263,9 +327,11 @@ enabled = false
             assert digest(root / "mount/previous") == result["earlier_sha256"]
         print(json.dumps(result, sort_keys=True), flush=True)
         (evidence / "receipt.json").write_text(json.dumps(result, indent=2) + "\n")
-        expected_errno = None if protection == "none" else errno.ENOSPC
+        expected_errno = (
+            None if protection == "none" or room_from == "member-b" else errno.ENOSPC
+        )
         assert result["reuse_errno"] == expected_errno, result
-        assert result["delete_and_flush_seconds"] < 5, result
+        assert result["delete_and_flush_seconds"] < FLUSH_DEADLINE_SECONDS, result
     finally:
         stop(client, kill=True)
         if reader is not None:
@@ -276,7 +342,7 @@ enabled = false
             except OSError:
                 pass
         if is_mounted(root / "mount"):
-            command("fusermount3", "-u", str(root / "mount"))
+            unmount(root / "mount", client_kind)
         stop(server)
         for path in reversed(mounted):
             command("umount", str(path))
@@ -300,7 +366,16 @@ def main():
         "--protection",
         choices=("none", "open-reader", "checkpoint"),
         default="none",
-        help="protect old bytes on the same quota-limited fixture and require ENOSPC",
+        help="protect old bytes on the same quota-limited fixture; with room only "
+        "from the unlink, require ENOSPC",
+    )
+    parser.add_argument("--client", choices=("fuse", "kernel-9p"), default="fuse")
+    parser.add_argument(
+        "--room-from",
+        choices=("unlink", "member-b"),
+        default="unlink",
+        help="what makes room for the refused seal: the unlink alone, or "
+        "releasing ballast on member-b after the unlink",
     )
     args = parser.parse_args()
     args.evidence.mkdir(parents=True, exist_ok=True)
@@ -310,8 +385,10 @@ def main():
         args.binary.resolve(),
         args.scratch,
         args.evidence,
-        args.distinct_payload or args.protection != "none",
+        args.distinct_payload or args.protection != "none" or args.room_from != "unlink",
         args.protection,
+        args.client,
+        args.room_from,
     )
 
 
