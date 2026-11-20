@@ -233,6 +233,9 @@ pub struct ExtentStore {
     /// unset in the extent unit tests, where `commit_via_coordinator` is the sole
     /// segcount writer and commits directly.
     coordinator: Arc<std::sync::OnceLock<crate::fs::write_coordinator::WeakWriteCoordinator>>,
+    /// The pool whose room every WRITE claims before its reply. Unset when
+    /// segments are not pooled, and then nothing is claimed.
+    admission: Arc<std::sync::OnceLock<crate::pool_object_store::PoolObjectStore>>,
     /// Reclaim/compaction counters and footprint gauges, bridged to Prometheus.
     /// Written only by the segment-GC task (see `reclaim_segments_gated`).
     segment_gc_stats: Arc<SegmentGcStats>,
@@ -362,6 +365,7 @@ impl ExtentStore {
             max_append_extents: usize::MAX,
             max_inflight_seals,
             coordinator: Arc::new(std::sync::OnceLock::new()),
+            admission: Arc::new(std::sync::OnceLock::new()),
             segment_gc_stats: Arc::new(SegmentGcStats::default()),
             #[cfg(test)]
             old_extent_scan_ranges: Arc::new(Mutex::new(Vec::new())),
@@ -493,6 +497,11 @@ impl ExtentStore {
         coord: crate::fs::write_coordinator::WeakWriteCoordinator,
     ) {
         let _ = self.coordinator.set(coord);
+    }
+
+    /// Claim room in `pool` for every WRITE and lease each open segment.
+    pub(crate) fn set_admission(&self, pool: crate::pool_object_store::PoolObjectStore) {
+        let _ = self.admission.set(pool);
     }
 
     /// Enable read-path compaction nominations.

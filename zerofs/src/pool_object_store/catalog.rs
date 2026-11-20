@@ -4,6 +4,7 @@
 //! transaction. An unpublished upload remains reserved until its unique object
 //! has been deleted. Superseded objects remain charged until cleanup succeeds.
 
+use super::admission::Admitted;
 use super::health::{MemberHealth, SegmentFault, SmartSample};
 use super::{EvacuationCapacity, PoolMember, PoolMemberStatus, PoolPlacement, PoolStatus};
 use crate::config::SegmentPlacement;
@@ -50,6 +51,24 @@ pub(super) struct AllocationBlocked {
 }
 
 pub const CATALOG_FILE_NAME: &str = "pool.redb";
+
+/// One placement question for [`Catalog::choose`].
+struct Request<'a> {
+    size: u64,
+    members: &'a [PoolMember],
+    target: Option<&'a str>,
+    skip: &'a BTreeSet<String>,
+    placement: SegmentPlacement,
+    admitted: &'a Admitted,
+    /// Tried first when it is a candidate at all.
+    prefer: Option<&'a str>,
+}
+
+struct Choice {
+    member: String,
+    /// Round-robin placement chose this local member.
+    rotated: bool,
+}
 const HEALTH: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_member_health_v1");
 const FAULTS: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_segment_faults_v1");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("pool_meta");
@@ -789,6 +808,7 @@ impl Catalog {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn reserve(
         &self,
         location: &str,
@@ -797,156 +817,227 @@ impl Catalog {
         target: Option<&str>,
         skip: &BTreeSet<String>,
         placement: SegmentPlacement,
+        admitted: &Admitted,
+        prefer: Option<&str>,
     ) -> Result<Upload> {
         let mut tx = self.database.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
-        let targets = tx.open_table(SEGMENT_TARGETS)?;
-        let bound = targets.get(location)?;
+        let bound = tx
+            .open_table(SEGMENT_TARGETS)?
+            .get(location)?
+            .map(|bound| bound.value().to_owned());
         if let (Some(bound), Some(target)) = (&bound, target) {
-            require_segment_target(bound.value(), target)?;
+            require_segment_target(bound, target)?;
         }
-        let target = bound.as_ref().map(|bound| bound.value()).or(target);
-        let upload = {
-            let mut table = tx.open_table(MEMBERS)?;
-            // Conservatively share the reservation budget across all local
-            // paths. In particular, two directories on the same filesystem
-            // must not both promise the same currently-free physical bytes.
-            let mut local_reserved = 0_u64;
-            for member in members.iter().filter(|member| member.is_local()) {
-                let record: MemberRecord = bincode::deserialize(
-                    table
-                        .get(member.id.as_str())?
-                        .context("unregistered pool member")?
-                        .value(),
-                )?;
-                local_reserved = local_reserved
-                    .checked_add(record.reserved)
-                    .context("local pool reservation overflow")?;
-            }
-            let costed_members: BTreeMap<_, _> = members
-                .iter()
-                .filter(|member| member.free_space.is_some())
-                .map(|member| (member.id.as_str(), member))
-                .collect();
-            if !costed_members.is_empty() {
-                // Raw uploads own record/padding bytes and future deletion
-                // space in addition to their logical quota. UPLOADS is keyed
-                // by upload id, so derive this from the outstanding rows only
-                // for custom space sources; directory/SFTP admission never
-                // scans uploads. Keep the durable logical counters unchanged.
-                for row in tx.open_table(UPLOADS)?.iter()? {
-                    let upload: Upload = bincode::deserialize(row?.1.value())?;
-                    if let Some(member) = costed_members.get(upload.member_id.as_str()) {
-                        local_reserved = local_reserved
-                            .checked_add(member.put_cost(upload.size).saturating_sub(upload.size))
-                            .context("local pool physical reservation overflow")?;
-                    }
-                }
-            }
-            let rotate = target.is_none() && placement == SegmentPlacement::RoundRobinLocal;
-            let (locals, start) = if rotate {
-                let meta = tx.open_table(META)?;
-                let last = meta.get(LAST_LOCAL_RESERVATION)?.and_then(|last| {
-                    members
-                        .iter()
-                        .position(|member| member.id.as_bytes() == last.value())
-                });
-                (members, last.map_or(0, |index| index + 1))
-            } else {
-                (&[][..], 0)
-            };
-            let candidates = locals[start..]
-                .iter()
-                .chain(&locals[..start])
-                .filter(|member| member.is_local())
-                .chain(members.iter().filter(|member| {
-                    target.is_none_or(|id| id == member.id) && (!rotate || !member.is_local())
-                }));
-            let mut chosen = None;
-            let mut unavailable = None;
-            let mut capacity_limited = false;
-            for member in candidates {
-                let health = health_in(&tx, &member.id)?;
-                if let Some(reason) = health.quarantine.or(health.monitoring_error) {
-                    unavailable = Some(NoAvailableMember {
-                        member: member.id.clone(),
-                        reason,
-                    });
-                    continue;
-                }
-                if skip.contains(&member.id) {
-                    capacity_limited = true;
-                    continue;
-                }
-                let mut record: MemberRecord = bincode::deserialize(
-                    table
-                        .get(member.id.as_str())?
-                        .context("unregistered pool member")?
-                        .value(),
-                )?;
-                let occupied = record
-                    .used
-                    .checked_add(record.reserved)
-                    .context("pool usage overflow")?;
-                // Outstanding reservations may not have reached the device
-                // yet. Counting all of them is deliberately conservative.
-                let physical = match member.filesystem_space() {
-                    None => None,
-                    Some(Ok(space)) => Some(super::space::physical_room(
-                        space,
-                        member.min_free_bytes,
-                        local_reserved,
-                    )),
-                    Some(Err(error)) => {
-                        unavailable = Some(NoAvailableMember {
-                            member: member.id.clone(),
-                            reason: format!("could not read filesystem space: {error}"),
-                        });
-                        continue;
-                    }
-                };
-                let declared = record.capacity.saturating_sub(occupied);
-                if declared < size
-                    || physical
-                        .is_some_and(|room| room.is_none_or(|bytes| bytes < member.put_cost(size)))
-                {
-                    capacity_limited = true;
-                    continue;
-                }
-                record.reserved = record
-                    .reserved
-                    .checked_add(size)
-                    .context("pool reservation overflow")?;
-                table.insert(member.id.as_str(), bincode::serialize(&record)?.as_slice())?;
-                if rotate && member.is_local() {
-                    // Advance only for a local reservation, in the same transaction
-                    // as the capacity charge and upload record.
-                    tx.open_table(META)?
-                        .insert(LAST_LOCAL_RESERVATION, member.id.as_bytes())?;
-                }
-                chosen = Some(member.id.clone());
-                break;
-            }
-            let member_id = chosen.ok_or_else(|| match unavailable {
-                Some(failure) if !capacity_limited => anyhow!(failure),
-                _ => anyhow!(NoCapacity),
-            })?;
-            let id = Uuid::new_v4().to_string();
-            Upload {
-                physical_key: format!(".zerofs-pool/{}/objects/{id}", self.identity.pool_id),
-                id,
-                location: location.to_owned(),
-                member_id,
+        let target = bound.as_deref().or(target);
+        let choice = Self::choose(
+            &tx,
+            Request {
                 size,
-                started: false,
-            }
+                members,
+                target,
+                skip,
+                placement,
+                admitted,
+                prefer,
+            },
+        )?;
+        {
+            let mut table = tx.open_table(MEMBERS)?;
+            let mut record: MemberRecord = bincode::deserialize(
+                table
+                    .get(choice.member.as_str())?
+                    .context("unregistered pool member")?
+                    .value(),
+            )?;
+            record.reserved = record
+                .reserved
+                .checked_add(size)
+                .context("pool reservation overflow")?;
+            table.insert(
+                choice.member.as_str(),
+                bincode::serialize(&record)?.as_slice(),
+            )?;
+        }
+        if choice.rotated {
+            // Advance only for a local reservation, in the same transaction
+            // as the capacity charge and upload record.
+            tx.open_table(META)?
+                .insert(LAST_LOCAL_RESERVATION, choice.member.as_bytes())?;
+        }
+        let id = Uuid::new_v4().to_string();
+        let upload = Upload {
+            physical_key: format!(".zerofs-pool/{}/objects/{id}", self.identity.pool_id),
+            id,
+            location: location.to_owned(),
+            member_id: choice.member,
+            size,
+            started: false,
         };
         tx.open_table(UPLOADS)?
             .insert(upload.id.as_str(), bincode::serialize(&upload)?.as_slice())?;
-        drop(bound);
-        drop(targets);
         tx.commit()?;
         Ok(upload)
+    }
+
+    /// The member a new `size`-byte segment would be placed on now, by the
+    /// same rule as [`Self::reserve`], without recording anything.
+    pub fn admit(
+        &self,
+        size: u64,
+        members: &[PoolMember],
+        skip: &BTreeSet<String>,
+        placement: SegmentPlacement,
+        admitted: &Admitted,
+        prefer: Option<&str>,
+    ) -> Result<String> {
+        let tx = self.database.begin_write()?;
+        let choice = Self::choose(
+            &tx,
+            Request {
+                size,
+                members,
+                target: None,
+                skip,
+                placement,
+                admitted,
+                prefer,
+            },
+        )?;
+        tx.abort()?;
+        Ok(choice.member)
+    }
+
+    fn choose(tx: &redb::WriteTransaction, request: Request<'_>) -> Result<Choice> {
+        let Request {
+            size,
+            members,
+            target,
+            skip,
+            placement,
+            admitted,
+            prefer,
+        } = request;
+        let table = tx.open_table(MEMBERS)?;
+        // Conservatively share the reservation budget across all local
+        // paths. In particular, two directories on the same filesystem
+        // must not both promise the same currently-free physical bytes.
+        let mut local_reserved = admitted.local_physical(members);
+        for member in members.iter().filter(|member| member.is_local()) {
+            let record: MemberRecord = bincode::deserialize(
+                table
+                    .get(member.id.as_str())?
+                    .context("unregistered pool member")?
+                    .value(),
+            )?;
+            local_reserved = local_reserved
+                .checked_add(record.reserved)
+                .context("local pool reservation overflow")?;
+        }
+        let costed_members: BTreeMap<_, _> = members
+            .iter()
+            .filter(|member| member.free_space.is_some())
+            .map(|member| (member.id.as_str(), member))
+            .collect();
+        if !costed_members.is_empty() {
+            // Raw uploads own record/padding bytes and future deletion
+            // space in addition to their logical quota. UPLOADS is keyed
+            // by upload id, so derive this from the outstanding rows only
+            // for custom space sources; directory/SFTP admission never
+            // scans uploads. Keep the durable logical counters unchanged.
+            for row in tx.open_table(UPLOADS)?.iter()? {
+                let upload: Upload = bincode::deserialize(row?.1.value())?;
+                if let Some(member) = costed_members.get(upload.member_id.as_str()) {
+                    local_reserved = local_reserved
+                        .checked_add(member.put_cost(upload.size).saturating_sub(upload.size))
+                        .context("local pool physical reservation overflow")?;
+                }
+            }
+        }
+        let rotate = target.is_none() && placement == SegmentPlacement::RoundRobinLocal;
+        let (locals, start) = if rotate {
+            let meta = tx.open_table(META)?;
+            let last = meta.get(LAST_LOCAL_RESERVATION)?.and_then(|last| {
+                members
+                    .iter()
+                    .position(|member| member.id.as_bytes() == last.value())
+            });
+            (members, last.map_or(0, |index| index + 1))
+        } else {
+            (&[][..], 0)
+        };
+        let mut candidates: Vec<&PoolMember> = locals[start..]
+            .iter()
+            .chain(&locals[..start])
+            .filter(|member| member.is_local())
+            .chain(members.iter().filter(|member| {
+                target.is_none_or(|id| id == member.id) && (!rotate || !member.is_local())
+            }))
+            .collect();
+        if let Some(index) = prefer.and_then(|id| candidates.iter().position(|m| m.id == id)) {
+            let preferred = candidates.remove(index);
+            candidates.insert(0, preferred);
+        }
+        let mut unavailable = None;
+        let mut capacity_limited = false;
+        for member in candidates {
+            let health = health_in(tx, &member.id)?;
+            if let Some(reason) = health.quarantine.or(health.monitoring_error) {
+                unavailable = Some(NoAvailableMember {
+                    member: member.id.clone(),
+                    reason,
+                });
+                continue;
+            }
+            if skip.contains(&member.id) {
+                capacity_limited = true;
+                continue;
+            }
+            let record: MemberRecord = bincode::deserialize(
+                table
+                    .get(member.id.as_str())?
+                    .context("unregistered pool member")?
+                    .value(),
+            )?;
+            let occupied = record
+                .used
+                .checked_add(record.reserved)
+                .and_then(|occupied| occupied.checked_add(admitted.on(&member.id).logical))
+                .context("pool usage overflow")?;
+            // Outstanding reservations may not have reached the device
+            // yet. Counting all of them is deliberately conservative.
+            let physical = match member.filesystem_space() {
+                None => None,
+                Some(Ok(space)) => Some(super::space::physical_room(
+                    space,
+                    member.min_free_bytes,
+                    local_reserved,
+                )),
+                Some(Err(error)) => {
+                    unavailable = Some(NoAvailableMember {
+                        member: member.id.clone(),
+                        reason: format!("could not read filesystem space: {error}"),
+                    });
+                    continue;
+                }
+            };
+            let declared = record.capacity.saturating_sub(occupied);
+            if declared < size
+                || physical
+                    .is_some_and(|room| room.is_none_or(|bytes| bytes < member.put_cost(size)))
+            {
+                capacity_limited = true;
+                continue;
+            }
+            return Ok(Choice {
+                member: member.id.clone(),
+                rotated: rotate && member.is_local(),
+            });
+        }
+        Err(match unavailable {
+            Some(failure) if !capacity_limited => anyhow!(failure),
+            _ => anyhow!(NoCapacity),
+        })
     }
 
     pub fn require_automatic_evacuation(&self, unavailable: Option<&str>) -> Result<()> {
@@ -1284,6 +1375,7 @@ impl Catalog {
         active: Option<&super::EvacuationProgress>,
         full: &BTreeMap<String, i64>,
         unavailable: Option<&str>,
+        admitted: &Admitted,
     ) -> Result<PoolStatus> {
         let tx = self.database.begin_read()?;
         // Read the clock after the snapshot opens, so no observation in it is later.
@@ -1465,6 +1557,7 @@ impl Catalog {
                 capacity_bytes: record.capacity,
                 used_bytes: record.used,
                 reserved_bytes: record.reserved,
+                admitted_bytes: admitted.on(&record.id).logical,
                 objects,
                 evacuation_capacity: EvacuationCapacity {
                     required_bytes: if health.quarantine.is_some() {
@@ -1497,7 +1590,7 @@ impl Catalog {
             &mut members,
             &evacuation_segments,
             full,
-            reservation_overhead_bytes,
+            reservation_overhead_bytes.saturating_add(admitted.local_physical(order)),
         );
         let multiple_failures = members
             .iter()
@@ -1715,6 +1808,8 @@ mod raw_reservation_tests {
             Some(target),
             &BTreeSet::new(),
             SegmentPlacement::FirstFit,
+            &Admitted::default(),
+            None,
         )
     }
 
@@ -1740,7 +1835,7 @@ mod raw_reservation_tests {
 
             let catalog = Catalog::open(&path, "db", false, Some(&marker)).unwrap();
             let status = catalog
-                .status(&members, None, &BTreeMap::new(), None)
+                .status(&members, None, &BTreeMap::new(), None, &Admitted::default())
                 .unwrap();
             assert_eq!(status.members[0].reserved_bytes, size);
             assert_eq!(status.members[0].pending_uploads, 1);
@@ -1783,7 +1878,7 @@ mod raw_reservation_tests {
             .unwrap();
         assert!(
             catalog
-                .status(&members, None, &BTreeMap::new(), None)
+                .status(&members, None, &BTreeMap::new(), None, &Admitted::default())
                 .unwrap()
                 .members[0]
                 .evacuation_capacity
@@ -1792,7 +1887,7 @@ mod raw_reservation_tests {
 
         let pending = reserve(&catalog, &members, "unpublished", 1, "raw").unwrap();
         let status = catalog
-            .status(&members, None, &BTreeMap::new(), None)
+            .status(&members, None, &BTreeMap::new(), None, &Admitted::default())
             .unwrap();
         assert_eq!(status.members[1].reserved_bytes, 1);
         assert_eq!(status.members[1].available_bytes, 4 << 10);
@@ -1805,7 +1900,7 @@ mod raw_reservation_tests {
         catalog.forget_upload(&pending.id).unwrap();
         assert!(
             catalog
-                .status(&members, None, &BTreeMap::new(), None)
+                .status(&members, None, &BTreeMap::new(), None, &Admitted::default())
                 .unwrap()
                 .members[0]
                 .evacuation_capacity
@@ -2012,7 +2107,13 @@ mod legacy_health_compatibility {
             free_space: None,
         };
         let status = catalog
-            .status(&[config], None, &BTreeMap::new(), None)
+            .status(
+                &[config],
+                None,
+                &BTreeMap::new(),
+                None,
+                &Admitted::default(),
+            )
             .unwrap();
         assert_eq!(status.mapped_objects, 1);
         assert_eq!(status.members[0].used_bytes, 7);
@@ -2093,6 +2194,8 @@ mod empty_quarantine_tests {
                 Some(member),
                 &BTreeSet::new(),
                 SegmentPlacement::FirstFit,
+                &Admitted::default(),
+                None,
             )
             .unwrap();
         let entry = Entry {
@@ -2150,7 +2253,9 @@ mod empty_quarantine_tests {
                     &members,
                     Some("old"),
                     &BTreeSet::new(),
-                    SegmentPlacement::FirstFit
+                    SegmentPlacement::FirstFit,
+                    &Admitted::default(),
+                    None
                 )
                 .is_err()
         );
@@ -2184,6 +2289,8 @@ mod empty_quarantine_tests {
                 Some("old"),
                 &BTreeSet::new(),
                 SegmentPlacement::FirstFit,
+                &Admitted::default(),
+                None,
             )
             .unwrap();
         insert(&catalog, &members, "current-data", "current", 8);

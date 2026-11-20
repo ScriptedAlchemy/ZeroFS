@@ -169,6 +169,16 @@ impl FrameCodec {
         Ok(Compressed(out))
     }
 
+    /// Largest [`Compressed::sealed_len`] a `plain_len`-byte input can produce:
+    /// the length prefix, the compressor's worst case, nonce and tag.
+    pub(crate) fn sealed_bound(&self, plain_len: usize) -> usize {
+        let payload_bound = match self.compression {
+            CompressionConfig::Lz4 => lz4_flex::block::get_maximum_output_size(plain_len),
+            CompressionConfig::Zstd(_) => zstd::zstd_safe::compress_bound(plain_len),
+        };
+        4 + payload_bound + SEALED_FRAME_OVERHEAD
+    }
+
     /// Compress `data` with the configured codec. Pure: the output depends only
     /// on the bytes and the configured level, never on shared state, so it can
     /// run on any thread, outside any lock, and feed [`Self::seal_compressed`].
@@ -271,6 +281,33 @@ mod tests {
 
     fn codec() -> FrameCodec {
         FrameCodec::new(&[7u8; 32], b"frame-codec-test", CompressionConfig::Lz4)
+    }
+
+    /// Pool admission claims `sealed_bound` before compressing, so no input
+    /// may seal larger, whatever it holds and whichever codec seals it.
+    #[test]
+    fn sealed_bound_covers_every_sealed_frame() {
+        for compression in [CompressionConfig::Lz4, CompressionConfig::Zstd(3)] {
+            let codec = FrameCodec::new(&[7u8; 32], b"frame-codec-test", compression);
+            for plain in [
+                Vec::new(),
+                vec![0; 32 * 1024],
+                noise(32 * 1024),
+                noise(28 * 4096),
+            ] {
+                let sealed = codec.compress(&plain).unwrap().sealed_len();
+                assert!(
+                    sealed <= codec.sealed_bound(plain.len()),
+                    "{compression:?}: {sealed} > {}",
+                    codec.sealed_bound(plain.len())
+                );
+                assert_eq!(
+                    codec.seal(&plain, b"aad").unwrap().len(),
+                    sealed,
+                    "a sealed frame is as long as its compressed payload promised"
+                );
+            }
+        }
     }
 
     fn noise(size: usize) -> Vec<u8> {

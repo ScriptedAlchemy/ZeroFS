@@ -6,12 +6,14 @@
 //! Replacement and migration publish the new location before removing the old
 //! body, and failed cleanup remains charged and recoverable.
 
+mod admission;
 mod capacity;
 mod catalog;
 mod file_placement;
 mod health;
 mod recovery;
 mod space;
+pub(crate) use admission::Claim;
 pub use health::{MemberHealth, SegmentFault, SmartSample};
 pub(crate) use recovery::PoolRecovery;
 pub use space::{FilesystemSpace, FreeSpace};
@@ -97,6 +99,8 @@ pub struct PoolMemberStatus {
     pub used_bytes: u64,
     /// Includes interrupted/unpublished uploads until their cleanup succeeds.
     pub reserved_bytes: u64,
+    /// Admitted writes and open or journaled segments not placed yet.
+    pub admitted_bytes: u64,
     pub objects: u64,
     pub health: MemberHealth,
     pub unavailable_at_startup: bool,
@@ -208,6 +212,8 @@ struct PoolInner {
     safety_failure: tokio_util::sync::CancellationToken,
     active_uploads: Arc<StdMutex<BTreeSet<String>>>,
     no_space: space::NoSpaceMarks,
+    /// Room promised to WRITE claims and unplaced segments; see [`admission`].
+    ledger: Arc<StdMutex<admission::Ledger>>,
     #[cfg(test)]
     reserve_pause: StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     #[cfg(test)]
@@ -648,6 +654,7 @@ impl PoolObjectStore {
                 safety_failure: tokio_util::sync::CancellationToken::new(),
                 active_uploads: Arc::new(StdMutex::new(BTreeSet::new())),
                 no_space: space::NoSpaceMarks::default(),
+                ledger: Arc::default(),
                 #[cfg(test)]
                 reserve_pause: StdMutex::new(None),
                 #[cfg(test)]
@@ -1047,9 +1054,30 @@ impl PoolObjectStore {
         skip.extend(refused.iter().cloned());
         skip.extend(self.inner.unavailable.iter().cloned());
         let key = location.to_string();
+        let lease = self.segment_id(location);
+        let ledger = Arc::clone(&self.inner.ledger);
         let upload = self
             .catalog(move |catalog| {
-                catalog.reserve(&key, size, &members, target.as_deref(), &skip, placement)
+                // Held across the catalog transaction, so a concurrent claim
+                // cannot promise the bytes this reservation takes.
+                let mut ledger = ledger.lock().unwrap();
+                let own = lease.map(admission::Key::Segment);
+                let admitted = ledger.admitted(&members, own);
+                let prefer = own.and_then(|key| ledger.member_of(key)).map(str::to_owned);
+                let upload = catalog.reserve(
+                    &key,
+                    size,
+                    &members,
+                    target.as_deref(),
+                    &skip,
+                    placement,
+                    &admitted,
+                    prefer.as_deref(),
+                )?;
+                if let Some(segment) = lease {
+                    ledger.set_placing(segment, true);
+                }
+                Ok(upload)
             })
             .await?;
         #[cfg(test)]
@@ -1165,6 +1193,9 @@ impl PoolObjectStore {
             let garbage = self.catalog(move |catalog| catalog.publish_for_migration(&id, &entry, previous.as_ref(), automatic, unavailable.as_deref())).await?;
             #[cfg(test)] crash_cutpoint("after_remap");
             #[cfg(test)] if garbage.is_some() { crash_cutpoint("before_source_delete"); }
+            if let Some(segment) = self.segment_id(&location) {
+                self.inner.ledger.lock().unwrap().remove(admission::Key::Segment(segment));
+            }
             if let Some(garbage) = garbage
                 && let Err(error) = self.cleanup_garbage(&garbage).await {
                     tracing::warn!(%error, location = %location, "pool placement committed; old object cleanup remains pending");
@@ -1192,6 +1223,79 @@ impl PoolObjectStore {
                 target.0
             )));
         }
+        Ok(())
+    }
+
+    /// Admit `bytes` of new segment data on one member, trying `prefer`
+    /// first. Fails with the typed no-space error when no member has room.
+    pub(crate) async fn admit(
+        &self,
+        bytes: u64,
+        prefer: Option<String>,
+    ) -> object_store::Result<Claim> {
+        let members = self.inner.members.clone();
+        let mut skip: BTreeSet<String> =
+            self.inner.no_space.current(&members).into_keys().collect();
+        skip.extend(self.inner.unavailable.iter().cloned());
+        let placement = self.inner.segment_placement;
+        let ledger = Arc::clone(&self.inner.ledger);
+        let id = self
+            .catalog(move |catalog| {
+                let mut ledger = ledger.lock().unwrap();
+                let admitted = ledger.admitted(&members, None);
+                let member = catalog.admit(
+                    bytes,
+                    &members,
+                    &skip,
+                    placement,
+                    &admitted,
+                    prefer.as_deref(),
+                )?;
+                Ok(ledger.insert_claim(member, bytes))
+            })
+            .await
+            .map_err(|e| storage_full(e, bytes))?;
+        Ok(Claim::new(Arc::clone(&self.inner.ledger), id))
+    }
+
+    /// The member `segment` is leased on, while it is unplaced.
+    pub(crate) fn lease_member(&self, segment: Segid) -> Option<String> {
+        self.inner
+            .ledger
+            .lock()
+            .unwrap()
+            .member_of(admission::Key::Segment(segment))
+            .map(str::to_owned)
+    }
+
+    /// Lease room for a segment that is acknowledged but not placed yet, such
+    /// as one the writeback journal still holds after a restart. Its bytes
+    /// count even when no member has room for them, so new writes are refused
+    /// until they are placed.
+    pub(crate) async fn lease_unplaced(
+        &self,
+        location: &Path,
+        size: u64,
+    ) -> object_store::Result<()> {
+        let Some(segment) = self.segment_id(location) else {
+            return Ok(());
+        };
+        let _guard = self.key_lock(location).write_owned().await;
+        if self.visible(location).await?.is_some() {
+            return Ok(());
+        }
+        let member = match self.admit(size, None).await {
+            Ok(claim) => claim.member(),
+            Err(error) if crate::retrying_object_store::is_no_space(&error) => {
+                self.inner.members[0].id.clone()
+            }
+            Err(error) => return Err(error),
+        };
+        self.inner
+            .ledger
+            .lock()
+            .unwrap()
+            .insert_lease(segment, member, size);
         Ok(())
     }
 
@@ -1621,6 +1725,17 @@ impl PoolObjectStore {
     }
 
     async fn cleanup_upload(&self, upload: &Upload) -> object_store::Result<()> {
+        // The lease counts the segment again from here; while cleanup is
+        // pending the reservation counts it too, which only over-promises less.
+        if let Ok(location) = catalog_path(&upload.location)
+            && let Some(segment) = self.segment_id(&location)
+        {
+            self.inner
+                .ledger
+                .lock()
+                .unwrap()
+                .set_placing(segment, false);
+        }
         // Consult the durable state; a caller may have been cancelled just
         // after the started flag was committed by a blocking catalog task.
         let id = upload.id.clone();
@@ -1854,9 +1969,16 @@ impl PoolObjectStore {
         let evacuating = self.inner.evacuating.lock().unwrap().clone();
         let snapshot = evacuating.clone();
         let unavailable = self.inner.unavailable.clone();
+        let admitted = self.inner.ledger.lock().unwrap().admitted(&members, None);
         let mut status = self
             .catalog(move |catalog| {
-                catalog.status(&members, snapshot.as_ref(), &full, unavailable.as_deref())
+                catalog.status(
+                    &members,
+                    snapshot.as_ref(),
+                    &full,
+                    unavailable.as_deref(),
+                    &admitted,
+                )
             })
             .await?;
         #[cfg(test)]
@@ -2212,6 +2334,14 @@ impl PoolObjectStore {
 
     async fn delete_owned(&self, location: Path) -> object_store::Result<Path> {
         let _guard = self.key_lock(&location).write_owned().await;
+        if let Some(segment) = self.segment_id(&location) {
+            // A segment deleted before its placement needs no room any more.
+            self.inner
+                .ledger
+                .lock()
+                .unwrap()
+                .remove(admission::Key::Segment(segment));
+        }
         let Some(previous) = self.visible(&location).await? else {
             return Ok(location);
         };

@@ -439,11 +439,36 @@ impl WritebackObjectStore {
         .await
     }
 
-    pub(crate) fn set_pool(&self, pool: PoolObjectStore) {
+    /// Attach the pool behind this journal. Segments the journal holds but
+    /// has not placed in it are leased, so after a restart new writes cannot
+    /// be admitted into the room they still need.
+    pub(crate) async fn set_pool(&self, pool: PoolObjectStore) -> object_store::Result<()> {
+        let snapshot =
+            self.inner.journal.snapshot().map_err(|error| {
+                generic_error(format!("writeback journal read failed: {error}"))
+            })?;
+        for record in snapshot
+            .records
+            .iter()
+            .filter(|record| record.sequence > snapshot.remote_seq)
+        {
+            if let MutationKind::Put {
+                mode: MutationMode::Create,
+                payload_len,
+                ..
+            } = &record.kind
+            {
+                let location = Path::parse(&record.path).map_err(|error| {
+                    generic_error(format!("journal path {} is invalid: {error}", record.path))
+                })?;
+                pool.lease_unplaced(&location, *payload_len).await?;
+            }
+        }
         self.inner
             .pool
             .set(pool)
             .expect("writeback pool already configured");
+        Ok(())
     }
 
     /// Start remote writeback after callers have finished opening over the

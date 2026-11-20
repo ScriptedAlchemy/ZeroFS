@@ -223,3 +223,150 @@ async fn full_pool_drain_keeps_queued_payload_and_recovers_without_restart() {
     scheduler.shutdown().await.unwrap();
     journaler.shutdown().await.unwrap();
 }
+
+/// The drain deadlock that write-time admission avoids. While the pool
+/// refuses an earlier segment create, a later deletion stays behind it, even
+/// when that deletion is what would make room: the remote copy must remain a
+/// prefix of the journal, whose metadata may still reference the deleted
+/// object. The pool must therefore never refuse an admitted segment for room
+/// it promised elsewhere. Only room arriving from outside releases this state.
+#[tokio::test]
+async fn a_deletion_stays_behind_an_earlier_create_the_pool_refuses() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("journal");
+    let journal = Arc::new(
+        Journal::open(
+            &root,
+            JournalIdentity {
+                format_version: 1,
+                bucket_id: "capacity-order".into(),
+                backend_endpoint: "memory://capacity-order".into(),
+                database_prefix: "root".into(),
+                backend_kind: "memory".into(),
+                encryption_key_identity_sha256: [0x43; 32],
+            },
+        )
+        .unwrap(),
+    );
+    let backend = Arc::new(FullUntilReleased {
+        inner: object_store::memory::InMemory::new(),
+        full: AtomicBool::new(true),
+        attempts: AtomicUsize::new(0),
+    });
+    let deleted = Path::from("root/segments/02/0000000000000001/0000000000000002");
+    let deleted_body = Bytes::from_static(b"a deleted file's segment holding the room");
+    backend
+        .inner
+        .put(&deleted, deleted_body.clone().into())
+        .await
+        .unwrap();
+    let created = Path::from("root/segments/03/0000000000000001/0000000000000003");
+    let created_body = Bytes::from_static(b"an unleased segment the full pool refuses");
+    let record = crate::writeback::test_util::put_record(
+        1,
+        created.as_ref(),
+        &created_body,
+        MutationMode::Create,
+        FenceClass::ImmutableCreate,
+        0,
+        0,
+    );
+    journal.commit_put(record, &created_body).unwrap();
+    journal
+        .publish_prepared(
+            journal
+                .prepare_metadata(crate::writeback::test_util::delete_record(
+                    2,
+                    deleted.as_ref(),
+                    FenceClass::Fence,
+                    0,
+                    0,
+                ))
+                .unwrap(),
+        )
+        .unwrap();
+
+    let remote: Arc<dyn ObjectStore> = Arc::new(RetryingObjectStore::new(backend.clone()));
+    let admission = Admission::new(1024 * 1024);
+    let ssd = Arc::new(
+        SsdAdmission::recover(
+            1024 * 1024,
+            100,
+            90,
+            70,
+            2,
+            journal.pending_ssd_reservations().unwrap(),
+            None,
+        )
+        .unwrap(),
+    );
+    let space = Arc::new(PhysicalSpaceSampler::new(root));
+    let overlay = OverlayIndex::recover(remote.clone(), journal.clone())
+        .await
+        .unwrap();
+    let journaler = LocalJournaler::start_with_observer_and_space(
+        journal.clone(),
+        admission.clone(),
+        4,
+        1,
+        None,
+        space.clone(),
+    )
+    .unwrap();
+    let scheduler = RemoteScheduler::start(
+        remote,
+        journal.clone(),
+        overlay,
+        admission,
+        ssd,
+        space,
+        journaler.barrier(),
+        2,
+    )
+    .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while backend.attempts.load(Ordering::SeqCst) < 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the journal must keep retrying the refused create");
+    assert!(scheduler.terminal_error().is_none());
+    assert_eq!(journal.progress().unwrap().remote_seq, 0);
+    assert_eq!(
+        backend
+            .inner
+            .get(&deleted)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+        deleted_body,
+        "the deletion reached the pool ahead of the create before it"
+    );
+
+    backend.full.store(false, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(3), scheduler.barrier().wait_remote(2))
+        .await
+        .expect("both records must drain once room arrives from outside")
+        .unwrap();
+    assert!(matches!(
+        backend.inner.head(&deleted).await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+    assert_eq!(
+        backend
+            .inner
+            .get(&created)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+        created_body
+    );
+    scheduler.shutdown().await.unwrap();
+    journaler.shutdown().await.unwrap();
+}
