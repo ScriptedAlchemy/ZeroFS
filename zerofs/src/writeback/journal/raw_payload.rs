@@ -8,6 +8,8 @@ use std::io::{self, Write};
 
 pub(super) const PAYLOADS: TableDefinition<(Sequence, u64), &[u8]> =
     TableDefinition::new("raw_payload_chunks_v1");
+/// One read snapshot of the payload chunks.
+pub(super) type PayloadChunks = ReadOnlyTable<(Sequence, u64), &'static [u8]>;
 pub(super) const RAW_REFERENCE: &str = "raw_payload_chunks_v1";
 // Leave room for redb's leaf metadata within a 64 KiB buddy allocation.
 const CHUNK_BYTES: usize = 60 * 1024;
@@ -59,7 +61,7 @@ impl Write for ChunkWriter<'_, '_> {
 
 pub(super) struct RawPayload {
     // The read-only table pins its redb snapshot even after remote cleanup.
-    table: ReadOnlyTable<(Sequence, u64), &'static [u8]>,
+    table: PayloadChunks,
     sequence: Sequence,
     len: u64,
     sha256: [u8; 32],
@@ -68,7 +70,7 @@ pub(super) struct RawPayload {
 impl RawPayload {
     /// Open `record`'s payload and verify every chunk against its digest.
     pub(super) fn open(
-        table: ReadOnlyTable<(Sequence, u64), &'static [u8]>,
+        table: PayloadChunks,
         record: &MutationRecord,
         maximum_bytes: u64,
     ) -> Result<Self> {
@@ -80,7 +82,7 @@ impl RawPayload {
     /// Read `record`'s payload, verified against its digest in the same
     /// pass: the digest is of exactly the bytes returned.
     pub(super) fn read(
-        table: ReadOnlyTable<(Sequence, u64), &'static [u8]>,
+        table: PayloadChunks,
         record: &MutationRecord,
         maximum_bytes: u64,
     ) -> Result<Vec<u8>> {
@@ -91,11 +93,7 @@ impl RawPayload {
         Ok(bytes)
     }
 
-    fn bind(
-        table: ReadOnlyTable<(Sequence, u64), &'static [u8]>,
-        record: &MutationRecord,
-        maximum_bytes: u64,
-    ) -> Result<Self> {
+    fn bind(table: PayloadChunks, record: &MutationRecord, maximum_bytes: u64) -> Result<Self> {
         ensure!(
             record.blob_path() == Some(RAW_REFERENCE),
             "invalid raw payload reference"

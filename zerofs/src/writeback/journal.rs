@@ -2156,10 +2156,7 @@ impl Journal {
     fn raw_payload_rows(
         &self,
         sequence: Sequence,
-    ) -> Result<(
-        redb::ReadOnlyTable<(Sequence, u64), &'static [u8]>,
-        MutationRecord,
-    )> {
+    ) -> Result<(raw_payload::PayloadChunks, MutationRecord)> {
         let read = self.database.begin_read()?;
         let mutations = read.open_table(MUTATIONS)?;
         let encoded = mutations
