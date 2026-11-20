@@ -865,6 +865,8 @@ pub struct NinePClient {
     request_admission: Arc<Semaphore>,
     /// Per-fid durability obligations carried across reconnects.
     unsynced: DashMap<u32, Unsynced>,
+    /// Numbers each [`Unsynced`] record. Fid numbers are recycled; these are not.
+    unsynced_incarnations: AtomicU64,
     counters: Arc<TrafficCounters>,
 }
 
@@ -872,9 +874,20 @@ pub struct NinePClient {
 /// a concurrent write. `reported` keeps `ESTALE` visible until a replacement write.
 #[derive(Default)]
 struct Unsynced {
+    /// Which record this is. Closing a fid drops its record, and the next owner
+    /// of the number starts a new one whose `generation` counts from zero again.
+    incarnation: u64,
     oldest: Option<u64>,
     generation: u64,
     reported: bool,
+}
+
+/// What a verified fsync saw of one fid's obligation when it was sent. The
+/// reply settles that record only, and only if no write has followed.
+#[derive(Clone, Copy)]
+struct UnsyncedSnapshot {
+    incarnation: u64,
+    generation: u64,
 }
 
 impl Unsynced {
@@ -1013,6 +1026,7 @@ impl NinePClient {
             frame_encoded_hook: Mutex::new(None),
             request_admission: Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS)),
             unsynced: DashMap::new(),
+            unsynced_incarnations: AtomicU64::new(0),
             counters,
         });
         client.spawn_supervisor();
@@ -1643,27 +1657,46 @@ impl NinePClient {
 
     /// Records an acknowledged mutation under its connection lineage.
     fn note_unsynced(&self, fid: u32, token: u64) {
-        self.unsynced.entry(fid).or_default().note(token);
+        self.unsynced
+            .entry(fid)
+            .or_insert_with(|| Unsynced {
+                incarnation: self.unsynced_incarnations.fetch_add(1, Ordering::Relaxed),
+                ..Unsynced::default()
+            })
+            .note(token);
     }
 
-    /// Snapshot `(oldest token, generation)` of `fid` for a verified fsync.
-    fn snapshot_unsynced(&self, fid: u32) -> (Option<u64>, u64) {
-        self.unsynced.get(&fid).map_or((None, 0), |u| u.snapshot())
+    /// The oldest token `fid` owes a verified fsync, and the state the reply
+    /// may settle. `None` when the fid owes nothing: a record created while the
+    /// flush runs is not the reply's to settle.
+    fn snapshot_unsynced(&self, fid: u32) -> Option<(Option<u64>, UnsyncedSnapshot)> {
+        self.unsynced.get(&fid).map(|u| {
+            let (oldest, generation) = u.snapshot();
+            let snapshot = UnsyncedSnapshot {
+                incarnation: u.incarnation,
+                generation,
+            };
+            (oldest, snapshot)
+        })
     }
 
     /// Clears an unchanged obligation after verified fsync. `remove_if` rechecks
     /// under the shard lock before deleting the empty entry.
-    fn clear_unsynced_if_unchanged(&self, fid: u32, generation: u64) {
-        if let Some(mut u) = self.unsynced.get_mut(&fid) {
-            u.clear_if_unchanged(generation);
+    fn clear_unsynced_if_unchanged(&self, fid: u32, snapshot: UnsyncedSnapshot) {
+        if let Some(mut u) = self.unsynced.get_mut(&fid)
+            && u.incarnation == snapshot.incarnation
+        {
+            u.clear_if_unchanged(snapshot.generation);
         }
         self.unsynced.remove_if(&fid, |_, u| u.oldest.is_none());
     }
 
     /// Marks an unchanged obligation reported after `ESTALE`.
-    fn report_unsynced_if_unchanged(&self, fid: u32, generation: u64) {
-        if let Some(mut u) = self.unsynced.get_mut(&fid) {
-            u.report_if_unchanged(generation);
+    fn report_unsynced_if_unchanged(&self, fid: u32, snapshot: UnsyncedSnapshot) {
+        if let Some(mut u) = self.unsynced.get_mut(&fid)
+            && u.incarnation == snapshot.incarnation
+        {
+            u.report_if_unchanged(snapshot.generation);
         }
     }
 
@@ -3583,15 +3616,20 @@ impl NinePClient {
         // Only `primary` travels on the wire. A sibling retired while the
         // flush runs may have a new owner by the time the reply arrives.
         let arrived = self.stateful_requests.lock().unwrap().retirement_generation;
-        // Generations prevent the result from clearing writes concurrent with fsync.
+        // A sibling closed normally is not retired, and its number can be
+        // reused just the same. Each snapshot names the record it saw, so the
+        // result cannot settle the next owner's writes or any write concurrent
+        // with the fsync.
         let mut token: Option<u64> = None;
-        let mut snaps: Vec<(u32, u64)> = Vec::with_capacity(fids.len());
+        let mut snaps: Vec<(u32, UnsyncedSnapshot)> = Vec::with_capacity(fids.len());
         for &fid in fids {
-            let (oldest, generation) = self.snapshot_unsynced(fid);
+            let Some((oldest, snapshot)) = self.snapshot_unsynced(fid) else {
+                continue;
+            };
             if let Some(t) = oldest {
                 token = Some(token.map_or(t, |w| w.min(t)));
             }
-            snaps.push((fid, generation));
+            snaps.push((fid, snapshot));
         }
         match self
             .rpc(Message::Tfsyncdur(Tfsyncdur {
@@ -3603,9 +3641,9 @@ impl NinePClient {
         {
             Ok(Message::Rfsync(_)) => {
                 let registry = self.stateful_requests.lock().unwrap();
-                for (fid, generation) in snaps {
+                for (fid, snapshot) in snaps {
                     if !registry.retired_since(arrived, [fid]) {
-                        self.clear_unsynced_if_unchanged(fid, generation);
+                        self.clear_unsynced_if_unchanged(fid, snapshot);
                     }
                 }
                 Ok(())
@@ -3614,9 +3652,9 @@ impl NinePClient {
             Err(ClientError::Errno(e)) if e == linux::ESTALE => {
                 // Preserve stale obligations until replacement writes arrive.
                 let registry = self.stateful_requests.lock().unwrap();
-                for (fid, generation) in snaps {
+                for (fid, snapshot) in snaps {
                     if !registry.retired_since(arrived, [fid]) {
-                        self.report_unsynced_if_unchanged(fid, generation);
+                        self.report_unsynced_if_unchanged(fid, snapshot);
                     }
                 }
                 Err(ClientError::Errno(e))
@@ -4565,6 +4603,7 @@ mod session_transition_tests {
             frame_encoded_hook: Mutex::new(None),
             request_admission: Arc::new(Semaphore::new(max_inflight_requests)),
             unsynced: DashMap::new(),
+            unsynced_incarnations: AtomicU64::new(0),
             counters: Arc::new(TrafficCounters::default()),
         })
     }
@@ -8335,6 +8374,121 @@ mod session_transition_tests {
                 client.unsynced.get(&7).and_then(|u| u.oldest),
                 Some(42),
                 "an fsync discharged a write made by the fid's next owner"
+            );
+        }
+
+        async fn acknowledged_write(
+            client: &Arc<NinePClient>,
+            conn: &Conn,
+            requests: &mut TestRequests,
+            fid: u32,
+        ) {
+            let write_client = Arc::clone(client);
+            let write = tokio::spawn(async move { write_client.write(fid, 0, b"a").await });
+            let sent = recv_op_request(requests, "a write").await;
+            assert!(matches!(sent.body, Message::Twrite(_)));
+            answer(conn, &sent);
+            assert_eq!(write.await.unwrap().unwrap(), 1);
+        }
+
+        /// Puts a flush of fid 5 on the wire that also covers one write made
+        /// through sibling handle 7 under `sibling_lineage`. Before the reply,
+        /// that handle is closed normally and its number is handed to another
+        /// file, which is written once under lineage 41. Both owners of the
+        /// number have then made exactly one write. Returns the flush and its
+        /// tag.
+        async fn recycle_sibling_during_flush(
+            client: &Arc<NinePClient>,
+            conn: &Conn,
+            requests: &mut TestRequests,
+            sibling_lineage: u64,
+        ) -> (tokio::task::JoinHandle<ClientResult<()>>, u16) {
+            directory_fid(client, 5, 50);
+            conn.lineage_token.store(sibling_lineage, Ordering::Relaxed);
+            acknowledged_write(client, conn, requests, 7).await;
+            conn.lineage_token.store(41, Ordering::Relaxed);
+
+            let fsync_client = Arc::clone(client);
+            let fsync = tokio::spawn(async move { fsync_client.fsync_inode(&[5, 7], 5, 0).await });
+            let sent = recv_op_request(requests, "the flush").await;
+            match &sent.body {
+                Message::Tfsyncdur(f) => assert_eq!((f.fid, f.token), (5, sibling_lineage)),
+                other => panic!("expected Tfsyncdur, got {other:?}"),
+            }
+
+            let clunk_client = Arc::clone(client);
+            let clunk = tokio::spawn(async move { clunk_client.clunk(7).await });
+            let closing = recv_op_request(requests, "the sibling's clunk").await;
+            assert!(matches!(closing.body, Message::Tclunk(Tclunk { fid: 7 })));
+            answer(conn, &closing);
+            clunk.await.unwrap().unwrap();
+            client.free_fid(7);
+            assert_eq!(client.alloc_fid(), 7);
+            acknowledged_write(client, conn, requests, 7).await;
+            (fsync, sent.tag)
+        }
+
+        #[tokio::test]
+        async fn an_fsync_reply_cannot_discharge_a_sibling_fid_recycled_during_the_flush() {
+            let (conn, mut requests) = test_conn_with_receiver();
+            let client = test_client(Arc::clone(&conn));
+            let (fsync, tag) =
+                recycle_sibling_during_flush(&client, &conn, &mut requests, 41).await;
+
+            reply(&conn, tag, Message::Rfsync(Rfsync));
+            fsync
+                .await
+                .unwrap()
+                .expect("the fsynced fid itself stayed open");
+
+            // Token zero tells the server there is no write to verify.
+            let fsync_client = Arc::clone(&client);
+            let own = tokio::spawn(async move { fsync_client.fsync(7, 0).await });
+            let sent = recv_op_request(&mut requests, "the new owner's own fsync").await;
+            match &sent.body {
+                Message::Tfsyncdur(f) => assert_eq!(
+                    f.token, 41,
+                    "another file's fsync discharged a write made after it was sent"
+                ),
+                other => panic!("expected Tfsyncdur, got {other:?}"),
+            }
+            reply(&conn, sent.tag, Message::Rfsync(Rfsync));
+            own.await.unwrap().unwrap();
+            assert!(client.unsynced.get(&7).is_none());
+        }
+
+        #[tokio::test]
+        async fn a_stale_fsync_reply_cannot_report_a_sibling_fid_recycled_during_the_flush() {
+            let (conn, mut requests) = test_conn_with_receiver();
+            let client = test_client(Arc::clone(&conn));
+            let (fsync, tag) =
+                recycle_sibling_during_flush(&client, &conn, &mut requests, 40).await;
+
+            reply(
+                &conn,
+                tag,
+                Message::Rlerror(Rlerror {
+                    ecode: linux::ESTALE,
+                }),
+            );
+            let error = fsync
+                .await
+                .unwrap()
+                .expect_err("the old owner's write predates this lineage");
+            assert!(
+                matches!(error, ClientError::Errno(errno) if errno == linux::ESTALE),
+                "{error}"
+            );
+
+            // A reported loss is replaced by the next write. The new owner was
+            // never told of one, so its lineage-41 write must stay the oldest
+            // and fail its own fsync once the lineage moves on.
+            conn.lineage_token.store(42, Ordering::Relaxed);
+            acknowledged_write(&client, &conn, &mut requests, 7).await;
+            assert_eq!(
+                client.unsynced.get(&7).and_then(|u| u.oldest),
+                Some(41),
+                "another file's ESTALE retired the new owner's unverified write"
             );
         }
 
