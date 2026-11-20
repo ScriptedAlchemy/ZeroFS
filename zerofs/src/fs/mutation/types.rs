@@ -63,6 +63,8 @@ pub(crate) struct PreparedWriteBatch {
     /// Protocol replay ownership. Before submission it remains caller-owned;
     /// submission transfers the one typed owner into the canonical worker.
     pub(crate) commit_ownership: crate::fs::write_coordinator::CommitOwnership,
+    /// Materialized writes retain admission through their queued commit.
+    pub(crate) survival: Option<crate::metadata_survival::admission::OwnedAdmissionToken>,
 }
 
 /// The last published single-inode write projection, including its byte-range
@@ -92,6 +94,7 @@ impl PreparedWriteBatch {
             replayed: Some(result),
             guards: None,
             commit_ownership: crate::fs::write_coordinator::CommitOwnership::None,
+            survival: None,
         }
     }
 

@@ -40,6 +40,11 @@ impl ZeroFS {
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_setattr)? {
             return Ok(result);
         }
+        let survival = if self.db.is_read_only() {
+            None
+        } else {
+            Some(self.survival_admission.admit_owned().await?)
+        };
         let guard = self.lock_manager.acquire(id).await;
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_setattr)? {
             return Ok(result);
@@ -74,7 +79,9 @@ impl ZeroFS {
                 attrs: post_attrs.clone(),
             },
         );
-        self.write_coordinator.commit_holding(txn, guard).await?;
+        self.write_coordinator
+            .commit_holding(txn, (survival, guard))
+            .await?;
         self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
         Ok(post_attrs)
     }

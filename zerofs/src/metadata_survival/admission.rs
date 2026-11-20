@@ -39,22 +39,8 @@ impl Default for SurvivalAdmission {
     }
 }
 
-/// One admitted top-level mutation. Dropping it releases admission.
-#[must_use = "admission lasts as long as the token is held"]
-#[derive(Debug)]
-pub(crate) struct AdmissionToken<'a> {
-    gate: Option<&'a SurvivalAdmission>,
-}
-
-impl Drop for AdmissionToken<'_> {
-    fn drop(&mut self) {
-        if let Some(gate) = self.gate.take() {
-            gate.release();
-        }
-    }
-}
-
 /// An owned token for detached work that must outlive its caller's borrow.
+#[must_use = "admission lasts as long as the token is held"]
 #[derive(Debug)]
 pub(crate) struct OwnedAdmissionToken {
     gate: Option<std::sync::Arc<SurvivalAdmission>>,
@@ -106,11 +92,6 @@ impl SurvivalAdmission {
 
     /// Admit one top-level mutation. Never call while holding an inode,
     /// pool, catalog or database lock.
-    pub(crate) async fn admit(&self) -> Result<AdmissionToken<'_>, FsError> {
-        self.enter().await?;
-        Ok(AdmissionToken { gate: Some(self) })
-    }
-
     pub(crate) async fn admit_owned(
         self: &std::sync::Arc<Self>,
     ) -> Result<OwnedAdmissionToken, FsError> {
@@ -213,14 +194,17 @@ mod tests {
         drained.await.unwrap();
         gate.reopen();
         late.await.unwrap().unwrap();
-        drop(gate.admit().await.unwrap());
+        drop(gate.admit_owned().await.unwrap());
         gate.latch(FsError::IoError, "replica full");
         let started = std::time::Instant::now();
-        assert_eq!(gate.admit().await.unwrap_err(), FsError::IoError);
+        assert_eq!(gate.admit_owned().await.unwrap_err(), FsError::IoError);
         assert!(started.elapsed() < Duration::from_millis(20));
         gate.latch(FsError::ReadOnlyFilesystem, "replica lost");
         gate.latch(FsError::IoError, "later fault");
-        assert_eq!(gate.admit().await.unwrap_err(), FsError::ReadOnlyFilesystem);
+        assert_eq!(
+            gate.admit_owned().await.unwrap_err(),
+            FsError::ReadOnlyFilesystem
+        );
         assert!(gate.close().is_err());
     }
 

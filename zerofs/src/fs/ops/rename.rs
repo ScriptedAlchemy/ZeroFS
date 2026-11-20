@@ -695,11 +695,6 @@ impl ZeroFS {
             if let Some(ref target_dir) = to_dir {
                 check_sticky_bit_delete(target_dir, &source_inode, &creds)?;
             }
-            if crate::dedup::has_op_id(&op_id) {
-                let mut txn = self.db.new_transaction()?;
-                txn.set_dedup_result(op_id, DedupResult::Rename);
-                self.write_coordinator.commit(txn).await?;
-            }
             let outcome = if let Some(expected) = verification {
                 let actual = self
                     .hash_file_canonical_locked(auth, source_inode_id)
@@ -707,17 +702,26 @@ impl ZeroFS {
                 #[cfg(test)]
                 self.pause_verified_rename_after_hash_if_requested(source_inode_id)
                     .await;
-                if actual.size != expected.size || expected.sha256 != Some(actual.sha256) {
-                    VerifiedRenameOutcome::Mismatch(actual)
-                } else {
-                    VerifiedRenameOutcome::Published(actual)
-                }
+                Some(
+                    if actual.size != expected.size || expected.sha256 != Some(actual.sha256) {
+                        VerifiedRenameOutcome::Mismatch(actual)
+                    } else {
+                        VerifiedRenameOutcome::Published(actual)
+                    },
+                )
             } else {
-                return Ok(RenameCompletion::default());
+                None
             };
+            if crate::dedup::has_op_id(&op_id) {
+                let mut txn = self.db.new_transaction()?;
+                txn.set_dedup_result(op_id, DedupResult::Rename);
+                self.write_coordinator
+                    .commit_holding(txn, (directory_rename_guard, fence, guards))
+                    .await?;
+            }
             return Ok(RenameCompletion {
                 moved: false,
-                verification: Some(outcome),
+                verification: outcome,
             });
         }
 

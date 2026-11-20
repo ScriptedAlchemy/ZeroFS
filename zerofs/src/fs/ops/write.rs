@@ -203,17 +203,26 @@ impl ZeroFS {
         request: PrepareWriteRequest,
         pending_write_request: Option<crate::dedup::PendingWriteRequest>,
     ) -> Result<FileAttributes, FsError> {
-        let _survival = if self.db.is_read_only() {
-            None
-        } else {
-            Some(self.survival_admission.admit().await?)
-        };
-        let mut batch = prepare_write(&self.write_prepare_context(), request).await?;
+        let mut batch = self.prepare_materialized_write(request).await?;
         batch.commit_ownership = pending_write_request
             .map(crate::fs::write_coordinator::CommitOwnership::Dedup)
             .unwrap_or_default();
         let result = apply_prepared_batch(&self.write_apply_context(), &mut batch).await?;
         Ok(result.primary_attrs())
+    }
+
+    pub(crate) async fn prepare_materialized_write(
+        &self,
+        request: PrepareWriteRequest,
+    ) -> Result<PreparedWriteBatch, FsError> {
+        let survival = if self.db.is_read_only() {
+            None
+        } else {
+            Some(self.survival_admission.admit_owned().await?)
+        };
+        let mut batch = prepare_write(&self.write_prepare_context(), request).await?;
+        batch.survival = survival;
+        Ok(batch)
     }
 }
 
@@ -422,6 +431,7 @@ pub(crate) async fn prepare_write_with_append(
             replayed: None,
             guards: Some(guards),
             commit_ownership: crate::fs::write_coordinator::CommitOwnership::None,
+            survival: None,
         },
         previous_writes + 1,
     ))
@@ -555,6 +565,7 @@ pub(crate) async fn apply_prepared_batch(
         txn,
         std::mem::take(&mut batch.commit_ownership),
         crate::fs::write_coordinator::CommitSettlement::Write(settlement),
+        batch.survival.take(),
     )?;
     batch.guards = None;
     pending.wait().await?;
@@ -599,6 +610,7 @@ async fn empty_batch_result(
             txn,
             std::mem::take(&mut batch.commit_ownership),
             crate::fs::write_coordinator::CommitSettlement::None,
+            batch.survival.take(),
         )?;
         pending.wait().await?;
     }
