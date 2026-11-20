@@ -427,11 +427,14 @@ fn provision_and_reopen_ignore_random_bytes_after_first_log_block() {
 }
 
 #[test]
-fn reopen_ignores_a_foreign_record_at_the_durable_tail() {
+fn reopen_ignores_a_foreign_index_page_at_the_durable_tail() {
+    // Another provisioning's committed index page sits right after this
+    // store's committed prefix. Its nonce differs, so reopen must ignore it.
     let donor = Scratch::new(SIZE);
     let mut foreign = provision(&donor);
     foreign.put(b"current", b"value").unwrap();
-    let tail = foreign.geometry().tail;
+    foreign.flush().unwrap();
+    let tail = foreign.geometry().durable_tail;
     foreign.put(b"stale", b"old value").unwrap();
     foreign.flush().unwrap();
 
