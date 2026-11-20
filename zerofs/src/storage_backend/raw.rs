@@ -175,6 +175,18 @@ impl RawBinding {
 }
 
 #[cfg(target_os = "linux")]
+pub(super) fn member_absent(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(zerofs_raw_device::claim::is_device_absent)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn member_absent(_: &anyhow::Error) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
 pub(super) async fn open_member(
     config: &crate::config::StoragePoolMemberConfig,
     binding: RawBinding,

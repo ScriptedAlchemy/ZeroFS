@@ -47,7 +47,16 @@ impl Claim {
     pub fn physical(role: PhysicalRole) -> io::Result<Self> {
         let host = Machine::host()?;
         let disk = TrialDisk::for_role(role);
-        let before = host.inspect(disk)?;
+        let before = match host.inspect(disk) {
+            Err(error)
+                if role != PhysicalRole::Nvme
+                    && error.kind() == ErrorKind::NotFound
+                    && host.confirm_absent(disk)? =>
+            {
+                return Err(super::device_absent());
+            }
+            result => result?,
+        };
         let device = OpenOptions::new()
             .read(true)
             .write(true)

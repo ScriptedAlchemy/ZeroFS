@@ -516,11 +516,21 @@ impl Catalog {
                     .map(|value| bincode::deserialize(value.value()))
                     .transpose()?;
                 if unavailable == Some(member.id.as_str()) {
-                    if !existing.is_some_and(|record| record.initialized) {
+                    let Some(record) = existing.filter(|record| record.initialized) else {
                         bail!(
                             "unavailable pool member {} was never initialized",
                             member.id
                         );
+                    };
+                    if member.identity != super::UNAVAILABLE_MEMBER_IDENTITY
+                        && record.identity != member.identity
+                    {
+                        return Err(crate::operator_required::operator_required(
+                            anyhow::anyhow!(
+                                "unavailable pool member {} changed backend identity",
+                                member.id
+                            ),
+                        ));
                     }
                     continue;
                 }

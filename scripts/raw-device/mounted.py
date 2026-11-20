@@ -131,12 +131,13 @@ def raw_url(scheme, binding, **extra):
     return f"{scheme}://{node}?{query}"
 
 
-def write_config(root, authority_url, catalog, members):
+def write_config(root, authority_url, catalog, members, *, allow_degraded=False):
     root.mkdir()
     (root / "mount").mkdir()
     config = root / "zerofs.toml"
     catalog_setting = f'catalog_dir = "{catalog}"\n' if catalog is not None else ""
     disk_size = 0 if catalog is None else 0.064
+    degraded_setting = "allow_degraded_start = true\n" if allow_degraded else ""
     content = f"""[cache]
 dir = "{root / 'cache'}"
 disk_size_gb = {disk_size}
@@ -148,7 +149,7 @@ url = "{authority_url}"
 encryption_password = "disposable-raw-mounted-fixture"
 
 [storage.pool]
-{catalog_setting}segment_placement = "round_robin_local"
+{catalog_setting}{degraded_setting}segment_placement = "round_robin_local"
 
 [servers.ninep]
 unix_socket = "{root / 'ninep.sock'}"
@@ -639,6 +640,103 @@ def qualify(root, members, memory_limit, p3):
         check_p3_shadows(root, configs)
 
 
+def qualify_degraded_start(root, members, p3, memory_limit):
+    authority = raw_url("raw+p3-v2", p3, layout_mib=P3_LAYOUT)
+
+    def phase(name, *, allow_degraded=False):
+        return write_config(root / name, authority, None, members, allow_degraded=allow_degraded)
+
+    def refuse_start(config, diagnostic, expected=None):
+        result = subprocess.run([ZEROFS, "run", "-c", config], capture_output=True, timeout=30)
+        error = result.stderr.decode(errors="replace")
+        assert result.returncode and diagnostic in error, (result.returncode, error)
+        if expected is not None:
+            assert result.returncode == expected, (result.returncode, error)
+        assert all(not (config.parent / socket).exists() for socket in ("rpc.sock", "ninep.sock"))
+        record("cold_start_refused", phase=config.parent.name, exit_status=result.returncode)
+
+    initial = phase("initial")
+    check_admission(initial, memory_limit)
+    run(ZEROFS, "pool", "init", "-c", initial)
+    files = {
+        name: random.Random(seed).randbytes(size)
+        for seed, (name, size) in enumerate((("first", 2 * MIB), ("second", 2 * MIB),
+                                             ("spanning", 4 * MIB)))
+    }
+    placements = {}
+    with mounted(initial) as (path, _):
+        for name, body in files.items():
+            with path.with_name(name).open("xb") as file:
+                for offset in range(0, len(body), 2 * MIB):
+                    payload = body[offset:offset + 2 * MIB]
+                    assert file.write(payload) == len(payload)
+                    file.flush()
+                    os.fsync(file.fileno())
+            run(ZEROFS, "flush", "-c", initial)
+            placement = json.loads(run(ZEROFS, "pool", "file-placement", "--endpoint",
+                                       f"unix:{initial.parent / 'rpc.sock'}", f"/{name}"))
+            placements[name] = set(placement["members"])
+            assert sum(row["logical_bytes"] for row in placement["members"].values()) == len(body)
+    assert placements["spanning"] == members.keys(), placements
+    assert {frozenset(placements[name]) for name in ("first", "second")} == {
+        frozenset({"small"}), frozenset({"large"})
+    }, placements
+    affected = {name for name, placement in placements.items() if "small" in placement}
+    [surviving] = files.keys() - affected
+
+    node = members["small"][0]
+    absent = node.with_name("absent-small")
+    default = phase("missing_default")
+    degraded = phase("missing_opt_in", allow_degraded=True)
+    wrong_member = phase("wrong_member_identity", allow_degraded=True)
+    wrong_member.write_text(wrong_member.read_text().replace(members["small"][3], str(uuid4())))
+    refuse_start(wrong_member, "device label binding mismatch (member)")
+    missing_both = phase("missing_both", allow_degraded=True)
+    node.rename(absent)
+    try:
+        refuse_start(default, "designated raw device is absent", expected=10)
+        refuse_start(wrong_member, "unavailable pool member small changed backend identity", expected=10)
+
+        large = members["large"][0]
+        unavailable_large = large.with_name("absent-large")
+        large.rename(unavailable_large)
+        try:
+            refuse_start(missing_both, "designated raw device is absent", expected=10)
+        finally:
+            unavailable_large.rename(large)
+
+        with mounted(degraded) as (path, _):
+            endpoint = f"unix:{degraded.parent / 'rpc.sock'}"
+            status = json.loads(run(ZEROFS, "pool", "status", "--endpoint", endpoint))
+            assert [member["id"] for member in status["members"]
+                    if member["unavailable_at_startup"]] == ["small"], status
+            assert path.with_name(surviving).read_bytes() == files[surviving]
+            for name in sorted(affected):
+                try:
+                    path.with_name(name).read_bytes()
+                except OSError as error:
+                    assert error.errno == errno.EIO, error
+                else:
+                    raise AssertionError(f"{name} did not return EIO")
+            report = json.loads(run(ZEROFS, "pool", "affected", "--endpoint", endpoint,
+                                    "--member", "small"))
+            assert report["complete"] and not report["errors"], report
+            [live] = [view for view in report["views"] if view["view"] == "live"]
+            assert not live["unresolved_segments"], report
+            paths = {bytes(path) for ref in live["references"] for path in ref["paths"]}
+            assert paths == {f"/{name}".encode() for name in affected}, report
+            record("degraded_cold_reads", survivor=surviving, eio=sorted(affected),
+                   reported=sorted(path.decode() for path in paths))
+    finally:
+        absent.rename(node)
+
+    restored = phase("restored")
+    with mounted(restored) as (path, _):
+        for name, body in files.items():
+            assert path.with_name(name).read_bytes() == body, name
+    record("restored_cold_reads", verified=sorted(files))
+
+
 def qualify_evacuation_and_loss(root, members, p3, memory_limit):
     configs = []
 
@@ -703,7 +801,7 @@ def qualify_evacuation_and_loss(root, members, p3, memory_limit):
     config = phase("missing_at_start")
     node.rename(absent)
     try:
-        error = run(ZEROFS, "run", "-c", config, refuse="claim raw member small")
+        error = run(ZEROFS, "run", "-c", config, refuse="designated raw device is absent")
         for socket in ("rpc.sock", "ninep.sock"):
             assert not (config.parent / socket).exists(), socket
         record("cold_start_absent_member", diagnostic=error.split("Error: ")[-1],
@@ -750,7 +848,8 @@ def main():
             raise RuntimeError(f"missing parent-built Linux executable at {executable}")
     record("binaries", sha256=run("sha256sum", ZEROFS, PROBE).decode().splitlines())
     mode = os.environ["RAW_MOUNTED_MODE"]
-    assert mode in {"placement", "p3", "nas-fit", "nas-fit-two-members", "nas-fit-loss"}, mode
+    assert mode in {"placement", "p3", "degraded-start", "nas-fit", "nas-fit-two-members",
+                    "nas-fit-loss"}, mode
     nas_fit = mode.startswith("nas-fit")
     if nas_fit:
         sample_cgroup("start")
@@ -781,7 +880,9 @@ def main():
                        loop_major=os.major(block_id), loop_minor=os.minor(block_id))
             p3 = members.pop("p3", None)
             check_member_bindings(members)
-            if mode == "nas-fit-loss":
+            if mode == "degraded-start":
+                qualify_degraded_start(root, members, p3, expected_memory)
+            elif mode == "nas-fit-loss":
                 qualify_evacuation_and_loss(root, members, p3, expected_memory)
             elif nas_fit:
                 qualify_nas_fit(root, members, expected_memory, p3, two_members=mode == "nas-fit-two-members")

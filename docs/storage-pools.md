@@ -404,7 +404,11 @@ declaration. The authority, its identity marker, the catalog, and the other
 readiness roles are still required. With strict readiness configured, the
 mount and device identity checks apply to every remaining role. A directory
 at the missing mount path without the matching pool member marker cannot
-receive segments. Status sets `unavailable_at_startup` for the excluded member.
+receive segments. For raw disks, the claim broker must confirm that the
+designated HDD is absent. A disk that is present but fails its claim or
+identity checks still stops startup. Without the opt-in, a confirmed missing
+raw HDD causes `zerofs run` to exit with operator-required status 10. The
+raw P3 authority is required in either mode. Status sets `unavailable_at_startup` for the excluded member.
 Its mapped segments return I/O errors on cold reads. Restart after restoring
 the member to have it checked again.
 

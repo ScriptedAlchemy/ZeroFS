@@ -42,6 +42,28 @@ fn checked(rc: i32) -> io::Result<()> {
     }
 }
 
+#[derive(Debug)]
+struct DeviceAbsent;
+
+impl std::fmt::Display for DeviceAbsent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("designated raw device is absent")
+    }
+}
+
+impl std::error::Error for DeviceAbsent {}
+
+fn device_absent() -> io::Error {
+    io::Error::new(ErrorKind::NotFound, DeviceAbsent)
+}
+
+/// True only for an absence confirmed by the raw claim implementation.
+pub fn is_device_absent(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<DeviceAbsent>())
+}
+
 pub struct Claim {
     pub device: File,
     pub size: u64,
@@ -99,7 +121,13 @@ impl Claim {
         // LOCK_EX | LOCK_NB serializes our own callers, including loop aliases.
         checked(unsafe { libc::flock(backing_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) })?;
 
-        let node_meta = fs::symlink_metadata(node)?;
+        let node_meta = fs::symlink_metadata(node).map_err(|error| {
+            if error.kind() == ErrorKind::NotFound {
+                device_absent()
+            } else {
+                error
+            }
+        })?;
         let major = libc::major(node_meta.rdev());
         let minor = libc::minor(node_meta.rdev());
         require(

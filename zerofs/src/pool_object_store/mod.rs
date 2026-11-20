@@ -536,6 +536,8 @@ impl Drop for CancelOnDrop {
     }
 }
 
+pub(crate) const UNAVAILABLE_MEMBER_IDENTITY: &str = "unavailable";
+
 pub(crate) enum MemberPreflight {
     #[cfg(test)]
     Lazy,
@@ -707,6 +709,7 @@ impl PoolObjectStore {
             } else if check_local && let Err(issue) = pool.probe_local_member(member, &record).await
             {
                 if !allow_degraded
+                    || member.local_path.is_none()
                     || unavailable.is_some()
                     || pool.inner.members.len() < 2
                     || pool.inner.safety_failure.is_cancelled()
