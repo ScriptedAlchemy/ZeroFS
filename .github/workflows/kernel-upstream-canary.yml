@@ -2,6 +2,8 @@ name: kernel-upstream-canary
 
 on:
   pull_request:
+    # Lane PRs into the integration branch are gated locally and by its own PR; run the matrix once there.
+    branches: ["main", "develop"]
     paths:
       - "kernel/**"
       - ".github/workflows/kernel-upstream-canary.yml"
@@ -15,7 +17,8 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  # A newer push supersedes a PR canary; scheduled canaries always finish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   resolve:

@@ -4,6 +4,8 @@ on:
   push:
     branches: ["main", "develop"]
   pull_request:
+    # Lane PRs into the integration branch are gated locally and by its own PR; run the matrix once there.
+    branches: ["main", "develop"]
   workflow_dispatch:
     inputs:
       runner:
