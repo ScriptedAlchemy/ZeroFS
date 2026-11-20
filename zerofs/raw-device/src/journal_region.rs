@@ -8,6 +8,10 @@
 //! The database owns transaction ordering and page reclamation. In particular
 //! its durable metadata must stop referencing truncated bytes before it calls
 //! `set_len`. Ordinary writes are durable only once `sync_data` succeeds.
+//!
+//! The bytes above the resize ceiling are the reserve. The file never grows
+//! into them. A caller that takes the reserve with `with_payload_reserve`
+//! addresses it directly, and `sync_data` makes those writes durable too.
 
 use crate::{BLOCK_SIZE, Error, Identity, MIN_DEVICE_SIZE, Result, Role, region::Region};
 use sha2::{Digest, Sha256};
@@ -30,6 +34,7 @@ pub struct TransactionRegion {
     region: Region,
     binding: Binding,
     resize_ceiling: u64,
+    reserve_writable: bool,
     state: Mutex<State>,
     /// Holds a flush open between its two waits.
     #[cfg(test)]
@@ -181,6 +186,7 @@ impl TransactionRegion {
             region,
             binding,
             resize_ceiling: binding.region_len - DATA_START,
+            reserve_writable: false,
             state: Mutex::new(State {
                 length,
                 stale_slot,
@@ -226,6 +232,73 @@ impl TransactionRegion {
 
     pub fn resize_ceiling(&self) -> u64 {
         self.resize_ceiling
+    }
+
+    /// Fence the file below `ceiling` and hand the bytes above it to the
+    /// caller. Reserve writes end the proof that the unexposed suffix is
+    /// blank, so forget it durably first. Later growth zeroes what it exposes.
+    pub fn with_payload_reserve(self, ceiling: u64) -> io::Result<Self> {
+        let mut region = self.with_resize_ceiling(ceiling)?;
+        {
+            let mut state = region.state()?;
+            region.repair(&mut state)?;
+            if state.length.zero_from.is_some() {
+                let next = Length {
+                    generation: state.length.generation.checked_add(1).ok_or_else(|| {
+                        io::Error::other("raw transactional region generation exhausted")
+                    })?,
+                    len: state.length.len,
+                    zero_from: None,
+                };
+                let result = checkpoint(&region.region, region.binding, next);
+                poison_on_error(&mut state, result)?;
+                state.length = next;
+            }
+        }
+        region.reserve_writable = true;
+        Ok(region)
+    }
+
+    pub fn reserve_len(&self) -> u64 {
+        self.capacity() - self.resize_ceiling
+    }
+
+    pub fn read_reserve(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        let start = self.reserve_offset(offset, out.len())?;
+        drop(self.state()?);
+        self.region.read_exact_at(out, start)
+    }
+
+    /// Write into the reserve and start the device write-out, so the next
+    /// `sync_data` has less to wait for. This runs without the state lock, so
+    /// the file's readers and writers never wait for it.
+    pub fn write_reserve(&self, offset: u64, bytes: &[u8]) -> io::Result<()> {
+        let start = self.reserve_offset(offset, bytes.len())?;
+        drop(self.state()?);
+        let result = self.region.write_all_at(bytes, start);
+        if result.is_err() {
+            self.state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .poisoned = true;
+        } else {
+            self.region.start_writeback(start, bytes.len());
+        }
+        result
+    }
+
+    fn reserve_offset(&self, offset: u64, count: usize) -> io::Result<u64> {
+        if !self.reserve_writable
+            || offset
+                .checked_add(count as u64)
+                .is_none_or(|end| end > self.reserve_len())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "I/O outside raw transactional region reserve",
+            ));
+        }
+        Ok(DATA_START + self.resize_ceiling + offset)
     }
 
     pub fn len(&self) -> io::Result<u64> {
@@ -647,6 +720,47 @@ mod tests {
             .read_exact_at(&mut data[1..], START + MIN_DEVICE_SIZE)
             .unwrap();
         assert_eq!(data, [0xba, 0xbe]);
+    }
+
+    #[test]
+    fn the_payload_reserve_is_fenced_from_the_file_and_survives_reopen() {
+        let media = Media::new();
+        let journal = media.provision();
+        let ceiling = journal.capacity() / 2;
+        assert!(journal.write_reserve(0, &[1]).is_err());
+        let journal = journal.with_payload_reserve(ceiling).unwrap();
+        assert_eq!(journal.reserve_len(), journal.capacity() - ceiling);
+        assert_eq!(journal.state().unwrap().length.zero_from, None);
+
+        let last = journal.reserve_len() - 2;
+        journal.write_reserve(0, &[0xa1, 0xa2]).unwrap();
+        journal.write_reserve(last, &[0xb1, 0xb2]).unwrap();
+        assert!(journal.write_reserve(last + 1, &[0, 0]).is_err());
+        assert!(journal.read_reserve(last + 1, &mut [0, 0]).is_err());
+        assert_eq!(
+            journal.set_len(ceiling + 1).unwrap_err().kind(),
+            io::ErrorKind::StorageFull
+        );
+        // The file's last byte sits directly below the reserve's first.
+        journal.set_len(ceiling).unwrap();
+        journal.write(ceiling - 1, &[0xc1]).unwrap();
+        journal.sync_data().unwrap();
+        drop(journal);
+
+        let journal = media.reopen().with_payload_reserve(ceiling).unwrap();
+        let mut bytes = [0; 2];
+        journal.read_reserve(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [0xa1, 0xa2]);
+        journal.read_reserve(last, &mut bytes).unwrap();
+        assert_eq!(bytes, [0xb1, 0xb2]);
+        journal.read(ceiling - 1, &mut bytes[..1]).unwrap();
+        assert_eq!(bytes[0], 0xc1);
+        let mut adjacent = [0];
+        media
+            .file
+            .read_exact_at(&mut adjacent, START + MIN_DEVICE_SIZE)
+            .unwrap();
+        assert_eq!(adjacent, [0]);
     }
 
     #[test]

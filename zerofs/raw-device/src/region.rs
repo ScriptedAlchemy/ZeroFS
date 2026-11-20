@@ -57,6 +57,28 @@ impl Region {
             .write_all_at(input, self.absolute(offset, input.len())?)
     }
 
+    /// Ask the kernel to start writing this range to the device now, without
+    /// waiting. Only `sync_data` makes it durable, and it then has less left
+    /// to write.
+    pub(crate) fn start_writeback(&self, offset: u64, len: usize) {
+        #[cfg(target_os = "linux")]
+        if let Ok(start) = self.absolute(offset, len) {
+            use std::os::fd::AsRawFd;
+            // SAFETY: the descriptor is open and the call takes no pointers.
+            // Its result is not needed: this only moves work ahead of the sync.
+            unsafe {
+                libc::sync_file_range(
+                    self.file.as_raw_fd(),
+                    start as libc::off64_t,
+                    len as libc::off64_t,
+                    libc::SYNC_FILE_RANGE_WRITE,
+                );
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (offset, len);
+    }
+
     pub(crate) fn sync_data(&self) -> io::Result<()> {
         self.file.sync_data()
     }
