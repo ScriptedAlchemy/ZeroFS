@@ -9,10 +9,10 @@ use super::health::{MemberHealth, SegmentFault, SmartSample};
 use super::{EvacuationCapacity, PoolMember, PoolMemberStatus, PoolPlacement, PoolStatus};
 use crate::config::SegmentPlacement;
 use crate::operator_required::operator_required;
+use crate::segment::Segid;
 use anyhow::{Context, Result, anyhow, bail};
 use fs4::fs_std::FileExt;
 use object_store::path::Path;
-use crate::segment::Segid;
 use redb::{
     Builder, Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata,
     TableDefinition,

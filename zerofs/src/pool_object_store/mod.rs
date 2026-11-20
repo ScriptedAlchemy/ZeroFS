@@ -1332,7 +1332,11 @@ impl PoolObjectStore {
     /// leased on, for a WRITE that claimed its room on another member.
     /// `false` means the lease's member has no room for the growth, or the
     /// segment has no lease.
-    pub(crate) async fn extend_lease(&self, segment: Segid, total: u64) -> object_store::Result<bool> {
+    pub(crate) async fn extend_lease(
+        &self,
+        segment: Segid,
+        total: u64,
+    ) -> object_store::Result<bool> {
         let members = self.inner.members.clone();
         let mut skip: BTreeSet<String> =
             self.inner.no_space.current(&members).into_keys().collect();
@@ -2094,12 +2098,12 @@ impl PoolObjectStore {
         let unavailable = self.inner.unavailable.clone();
         // A reservation committing right now may also be in the reserved
         // bytes this report reads next.
-        let admitted =
-            self.inner
-                .ledger
-                .lock()
-                .unwrap()
-                .admitted(&members, None, &BTreeSet::new());
+        let admitted = self
+            .inner
+            .ledger
+            .lock()
+            .unwrap()
+            .admitted(&members, None, &BTreeSet::new());
         let mut status = self
             .catalog(move |catalog| {
                 catalog.status(
