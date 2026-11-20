@@ -138,9 +138,9 @@ From 2 files on, the journal is the limit, at about 346 MB/s here.
 
 - **The fixture's P3 loop device.** The benchmark now times the payload log's
   own pattern on a scratch loop with no engine and no flush model: 32 MiB in
-  4 MiB writes, then one fdatasync. Over 40 runs the median was 497 MB/s on a
-  first write, with a range of 361 to 601, and 540 MB/s on a rewrite, with a
-  range of 393 to 722. **900 MB/s cannot be shown on this fixture.**
+  4 MiB writes, then one fdatasync. Over 68 runs the median was 482 MB/s on a
+  first write, with a range of 293 to 601, and 534 MB/s on a rewrite, with a
+  range of 331 to 722. **900 MB/s cannot be shown on this fixture.**
 - **The journal's commit.** In the 8 GiB copies the journal committed 537
   batches of about 15 MiB. A commit took 52 ms: 20 ms of modelled flush and
   about 32 ms of the device writing the batch out. Staging the payload took
@@ -156,12 +156,14 @@ beside the second row and 194.9 beside the third.
 
 | Journal variant | 8 GiB, 1 file, 3 CPUs | 2 GiB, 1 file, 8 CPUs | 4 files of 1 GiB, 8 CPUs | P3 flushes per MiB at 8 GiB |
 | --- | --- | --- | --- | --- |
-| Payload written inside the commit | 279.5, one run | not run | 339.7, 339.9 | 0.16 |
+| Payload written inside the commit | 279.5, 322.0 | not run | 339.7, 339.9 | 0.16, 0.11 |
 | Payload staged ahead (this branch) | 294.0 (292.6–296.1) | 294.3 (275.9–312.6) | 346.6 (341.2–357.0) | 0.15 |
 | Staged ahead with early write-out | 279.5 (278.3–293.5) | 252.4 (247.5–257.2) | 419.8 (410.4–425.3), 6 runs | 0.23 |
 
 Staging ahead of the commit, without the early write-out, shows no measurable
-gain over writing the payload inside the commit with 4 files.
+gain over writing the payload inside the commit, with 1 file or with 4. The
+first row's two 8 GiB runs are 43 MB/s apart, and its 279.5 MB/s run has no
+receipt because a later run reused its output file.
 
 ## A stall that is not from this change
 
