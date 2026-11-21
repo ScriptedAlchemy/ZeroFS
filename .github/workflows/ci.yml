@@ -45,6 +45,7 @@ jobs:
           scripts.tests.test_local_storage_pool_diagnostics
           scripts.tests.test_case_insensitive_fuse_cleanup
           scripts.tests.test_raw_journal_bench_cleanup
+          scripts.tests.test_raw_journal_flush_bench
       - name: Run Proxmox deployment regressions
         run: python3 -m unittest discover -s proxmox/tests -p 'test_*.py'
 

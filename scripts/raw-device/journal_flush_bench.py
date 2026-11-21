@@ -5,6 +5,7 @@ on a block-backed Docker volume, so every loop flush reaches a real device.
 """
 
 from contextlib import ExitStack
+import errno
 import fcntl
 import hashlib
 import http.client
@@ -193,6 +194,16 @@ def chunks(seed):
         yield index.to_bytes(8, "little") + pool[start + 8:start + IO]
 
 
+def pwrite_all(fd, body, offset):
+    pending = memoryview(body)
+    while pending:
+        count = os.pwrite(fd, pending, offset)
+        if count <= 0:
+            raise OSError(errno.EIO, "flush probe write made no progress")
+        pending = pending[count:]
+        offset += count
+
+
 def sequential_batches(fd):
     """Time the payload log's pattern: 32 MiB in 4 MiB writes, then one sync."""
     batch, piece = 32 * MIB, os.urandom(4 * MIB)
@@ -200,7 +211,7 @@ def sequential_batches(fd):
     for index in range(7):
         start = time.monotonic_ns()
         for offset in range(0, batch, len(piece)):
-            os.pwrite(fd, piece, index * batch + offset)
+            pwrite_all(fd, piece, index * batch + offset)
         os.fdatasync(fd)
         samples.append(time.monotonic_ns() - start)
     median = sorted(samples)[len(samples) // 2]
@@ -236,7 +247,7 @@ def flush_latency(root, nodes):
                 for _ in range(count):
                     offset = generator.randrange(0, 256 * MIB - size, 4096)
                     start = time.monotonic_ns()
-                    os.pwrite(fd, block, offset)
+                    pwrite_all(fd, block, offset)
                     os.fdatasync(fd)
                     samples.append(time.monotonic_ns() - start)
                 samples.sort()
