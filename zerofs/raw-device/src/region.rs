@@ -60,6 +60,32 @@ impl Region {
     pub(crate) fn sync_data(&self) -> io::Result<()> {
         self.file.sync_data()
     }
+
+    /// Ask a Linux block device to deallocate this region. Returns whether
+    /// the device accepted the request. Regular files, and devices that do
+    /// not support discard, are left unchanged. Deallocated blocks may read
+    /// back as anything, so callers must not rely on them being zero.
+    pub(crate) fn discard(&self) -> io::Result<bool> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::{fd::AsRawFd, unix::fs::FileTypeExt};
+
+            if self.file.metadata()?.file_type().is_block_device() {
+                let range = [self.start, self.len];
+                // BLKDISCARD takes a {start, length} pair of byte offsets.
+                let result = unsafe { libc::ioctl(self.file.as_raw_fd(), 0x1277, &range) };
+                if result == 0 {
+                    return Ok(true);
+                }
+                let error = io::Error::last_os_error();
+                return match error.raw_os_error() {
+                    Some(libc::EOPNOTSUPP) => Ok(false),
+                    _ => Err(error),
+                };
+            }
+        }
+        Ok(false)
+    }
 }
 
 fn device_size(file: &File) -> Result<u64> {
