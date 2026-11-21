@@ -141,6 +141,7 @@ impl PayloadLog {
         let mut writer = Writer {
             log: self,
             position: start,
+            remaining: bytes,
             buffer: Vec::with_capacity(WRITE_BYTES.min((end - start) as usize)),
         };
         let mut positions = Vec::with_capacity(payloads.len());
@@ -237,13 +238,24 @@ struct Writer<'a> {
     log: &'a PayloadLog,
     /// Position of the first buffered byte.
     position: u64,
+    /// Payload bytes left in this batch's reserved extent, excluding padding.
+    remaining: u64,
     buffer: Vec<u8>,
 }
 
 impl Write for Writer<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        // Staged files are revalidated after streaming. A file that grew must
+        // not wrap into held payloads before that validation rejects it.
+        if bytes.len() as u64 > self.remaining {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "raw payload exceeds its reserved log extent",
+            ));
+        }
         let count = bytes.len().min(WRITE_BYTES - self.buffer.len());
         self.buffer.extend_from_slice(&bytes[..count]);
+        self.remaining -= count as u64;
         if self.buffer.len() == WRITE_BYTES {
             self.flush()?;
         }
@@ -313,4 +325,62 @@ pub(super) fn parse_reference(reference: &str, len: u64) -> Result<Option<u64>> 
             .parse()
             .context("malformed raw payload log position")?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::writeback::payload::VerifiedPayload;
+    use bytes::Bytes;
+    use zerofs_raw_device::{Identity, Role};
+
+    #[test]
+    fn a_grown_staged_payload_cannot_overwrite_a_pinned_payload() {
+        let capacity = WRITE_BYTES as u64;
+        let region_len = 2 * capacity + 2 * BLOCK;
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(region_len).unwrap();
+        let region = TransactionRegion::provision(
+            file,
+            region_len,
+            0,
+            region_len,
+            Identity {
+                pool_uuid: [1; 16],
+                member_uuid: [2; 16],
+                role: Role::Journal,
+            },
+        )
+        .unwrap()
+        .with_payload_reserve(capacity)
+        .unwrap();
+        let log = Arc::new(PayloadLog::open(Arc::new(region), 0, None).unwrap());
+
+        let held = Bytes::from(vec![0x5a; BLOCK as usize]);
+        let committed = log.stage([&VerifiedPayload::new(held.clone())]).unwrap();
+        log.recorded(committed.extent.end);
+        let pin = log.pin();
+        log.retire_to(None);
+        let available = log.available_bytes();
+
+        let mut source = tempfile::tempfile().unwrap();
+        source.write_all(&vec![0x9b; BLOCK as usize]).unwrap();
+        let changed =
+            VerifiedPayload::from_open_staged_file(source.try_clone().unwrap(), BLOCK).unwrap();
+        // The source originally fits. Growing it to a complete ring would
+        // write its last block over the reader's first block before the
+        // source's final length/digest check reports the change.
+        source.set_len(capacity).unwrap();
+        assert!(log.stage([&changed]).is_err());
+        assert_eq!(log.available_bytes(), available);
+        let mut read = vec![0; held.len()];
+        pin.read(0, &mut read).unwrap();
+        assert_eq!(read, held);
+
+        let replacement = VerifiedPayload::new(Bytes::from_static(b"replacement"));
+        let staged = log.stage([&replacement]).unwrap();
+        assert_eq!(staged.extent.start, committed.extent.end);
+        pin.read(0, &mut read).unwrap();
+        assert_eq!(read, held);
+    }
 }
