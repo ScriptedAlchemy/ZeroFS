@@ -214,7 +214,10 @@ interrupted rebuild therefore leaves a P3 that both startup and a second
 rebuild refuse. Provision it again and rerun.
 
 The rebuilt database opens at exactly the generation's checkpoint. Manifests
-newer than the checkpoint and compactor state are not restored.
+newer than the checkpoint, compactor state and the database collector's
+`gc/*.boundary` marks are not restored. The marks record versions the lost
+device had retired, and the rebuilt database numbers its compactor state from
+1 again.
 
 If a member is also lost, the command fails and names it. To proceed without
 it:

@@ -637,11 +637,22 @@ fn manifest_id(relative: &Path) -> Option<u64> {
 /// the catalog export was cut with. Compactor state describes work against
 /// newer manifests and is rebuilt by the database, and the pool identity
 /// marker is rewritten for the rebound catalog.
+///
+/// SlateDB's collector records the highest manifest and compactions version
+/// it has retired in `gc/<name>.boundary`, and refuses any version at or below
+/// that mark as already existing. The rebuilt database starts its compactor
+/// state again at version 1 and its manifests again after the checkpoint's,
+/// so a restored mark would refuse them. Neither mark is restored. They fence
+/// writers that outlived a collection, and a blank device has none; the
+/// collector writes new marks as it retires versions again.
 fn belongs_on_rebuilt_authority(relative: &Path, checkpoint_manifest: u64) -> bool {
     if let Some(id) = manifest_id(relative) {
         return id <= checkpoint_manifest;
     }
-    !(relative.starts_with("compactions") || relative == Path::new(".zerofs-pool/identity"))
+    !(relative.starts_with("compactions")
+        || relative == Path::new("gc/manifest.boundary")
+        || relative == Path::new("gc/compactions.boundary")
+        || relative == Path::new(".zerofs-pool/identity"))
 }
 
 /// Rebuild a lost authority NVMe onto a blank P3 from the raw pool members.
