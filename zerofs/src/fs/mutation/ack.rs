@@ -69,6 +69,16 @@ impl ZeroFS {
             .map_err(FsError::from)
     }
 
+    /// Admit one top-level mutation: refuse it when the durability tier has
+    /// failed, then take the survival admission token. Never call while
+    /// holding an inode, pool, catalog or database lock.
+    pub(crate) async fn admit_mutation(
+        &self,
+    ) -> Result<crate::metadata_survival::admission::OwnedAdmissionToken, FsError> {
+        self.flush_coordinator.check_admission()?;
+        self.survival_admission.admit_owned().await
+    }
+
     async fn durable_to_configured_target(&self, cutoff: MutationCutoff) -> Result<(), FsError> {
         if self.ignore_fsync {
             return Ok(());

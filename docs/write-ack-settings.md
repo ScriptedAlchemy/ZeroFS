@@ -7,6 +7,8 @@ On the Storage page, **Active** describes the running engine. An administrator c
 | Materialized | The filesystem has applied the write. The bounded object writeback tier can still have journal and destination work pending. | With the bounded journal enabled, fsync waits for the local journal. |
 | Volatile memory | The filesystem has admitted the bytes to bounded RAM and made them visible to other readers. Unflushed bytes can be lost on process or power failure. | fsync waits for the covered writes to materialize and reach the local journal. The packaged NVMe/TCP target also fsyncs its writes, including FUA, and forwards explicit FLUSH. |
 
+Once the writeback tier fails terminally (a poisoned admission tier, or a terminal journaler or remote scheduler), every new mutation, including ordinary writes, fails with EIO instead of being acknowledged from memory.
+
 HDD drain continues asynchronously. A full journal or unavailable destination can delay durability through backpressure. For the bounded journal profile the editor accepts 16–256 whole MiB and 1–2048 operations. Startup memory admission charges two ownership stages. Throughput qualification uses 256 MiB and 2048 operations.
 
 ## What the acknowledgement modes can accelerate

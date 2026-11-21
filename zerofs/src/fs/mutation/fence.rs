@@ -162,7 +162,7 @@ impl ZeroFS {
         let survival = if self.db.is_read_only() {
             None
         } else {
-            Some(self.survival_admission.admit_owned().await?)
+            Some(self.admit_mutation().await?)
         };
         let materialization = if let Some(coordinator) = self.mutation_coordinator.get() {
             Some(

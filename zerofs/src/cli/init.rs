@@ -1201,50 +1201,8 @@ impl ReconciledDb {
             fs.extent_store.set_admission(pool.clone());
         }
 
-        if let Some(writeback) = writeback.clone() {
-            let barrier_store = writeback.clone();
-            fs.flush_coordinator
-                .set_local_durability_barrier(Arc::new(move || {
-                    let writeback = barrier_store.clone();
-                    Box::pin(async move {
-                        writeback
-                            .wait_local_through_accepted()
-                            .await
-                            .map_err(|error| {
-                                tracing::error!(
-                                    "writeback local durability barrier failed: {error}"
-                                );
-                                crate::fs::errors::FsError::IoError
-                            })
-                    })
-                }));
-            let captured = writeback.clone();
-            fs.flush_coordinator
-                .set_object_capture(std::sync::Arc::new(move || captured.object_coverage()));
-            let waited = writeback.clone();
-            fs.flush_coordinator
-                .set_object_wait(std::sync::Arc::new(move |coverage, target| {
-                    let writeback = waited.clone();
-                    Box::pin(async move {
-                        use crate::fs::mutation::durability::{
-                            DurabilityError, DurabilityTarget, ObjectCoverage,
-                        };
-                        match coverage {
-                            ObjectCoverage::DirectRemote => Ok(()),
-                            ObjectCoverage::Writeback {
-                                journal_incarnation,
-                                sequence,
-                            } => writeback
-                                .wait_coverage(
-                                    journal_incarnation.as_uuid(),
-                                    sequence,
-                                    matches!(target, DurabilityTarget::RemoteBackend),
-                                )
-                                .await
-                                .map_err(DurabilityError::Object),
-                        }
-                    })
-                }));
+        if let Some(writeback) = &writeback {
+            fs.flush_coordinator.attach_writeback(writeback);
         }
 
         let fs = Arc::new(fs);
