@@ -146,3 +146,45 @@ async fn an_out_of_range_reconnect_timeout_is_rejected() {
         );
     }
 }
+
+/// `Client::write` closes its handle before it returns, so `Client::sync` is
+/// the only fsync that can answer for it.
+#[tokio::test]
+async fn sync_reports_a_write_lost_after_its_handle_was_closed() {
+    let on_lineage = |lineage| async move {
+        let mut fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.lineage_token = lineage;
+        Arc::new(fs)
+    };
+    // One server before and after it lost its unflushed writes.
+    let (before, after) = (on_lineage(41).await, on_lineage(42).await);
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("closed.9p.sock");
+    let server = start_server(before, sock.clone());
+    let client = connect_opts_with_retry(&sock, ConnectOptions::default()).await;
+
+    client.write("/lost", b"payload").await.unwrap();
+    // The handle is clunked and its number recycled.
+    client.wait_for_cleanup().await;
+
+    server.cancel();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while client.is_connected() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the client never noticed the server leave");
+    let _ = std::fs::remove_file(&sock);
+    let _server = start_server(after, sock.clone());
+
+    let error = tokio::time::timeout(Duration::from_secs(10), client.sync())
+        .await
+        .expect("sync timed out waiting for the reconnect")
+        .expect_err("sync must report the write the server lost after its handle closed");
+    assert!(matches!(error, ZeroFsError::Stale { .. }), "{error}");
+    client
+        .sync()
+        .await
+        .expect("the loss was reported twice with nothing written since");
+}

@@ -11,6 +11,11 @@ use tokio::sync::{mpsc, oneshot};
 /// Maximum `Twalk` components per request.
 const MAX_WELEM: usize = 16;
 
+/// Owner of what closed handles still owe a verified fsync. The session has
+/// no per-file lifetime to keep it under, so one record holds all of it and
+/// `Client::sync` settles it.
+const CLOSED_HANDLES: u64 = 0;
+
 pub(crate) struct Session {
     pub(crate) client: Arc<NinePClient>,
     pub(crate) root_fid: u32,
@@ -36,6 +41,7 @@ impl Session {
                     JanitorCommand::Clunk(fid) => {
                         // Recycle only after clunk settlement prevents aliasing.
                         let _ = janitor_client.clunk(fid).await;
+                        janitor_client.keep_closed_unsynced(fid, CLOSED_HANDLES);
                         janitor_client.free_fid(fid);
                     }
                     JanitorCommand::Barrier(done) => {

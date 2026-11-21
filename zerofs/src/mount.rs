@@ -602,6 +602,35 @@ fn tracked_handle_fid(
         .map(|owner_uid| (fid, owner_uid))
 }
 
+/// Stop tracking an open handle on its inode (on release), so a later fsync
+/// does not present a fid the client may have freed and recycled. The inode
+/// keeps what the handle still owes: `fsync(fd)` answers for writes made
+/// through a descriptor that is already closed. Both happen under the entry
+/// lock, so `forget` cannot run between them and leave the debt behind.
+fn untrack_handle(client: &NinePClient, inodes: &DashMap<u64, InodeEntry>, ino: u64, fid: u32) {
+    if let Some(mut e) = inodes.get_mut(&ino) {
+        e.handles.remove(&fid);
+        client.keep_closed_unsynced(fid, ino);
+    }
+}
+
+/// The fids a verified fsync of `ino` presents, `primary` first. Mutations
+/// for one inode may use its per-user fid or any open handle.
+fn inode_fsync_fids(inodes: &DashMap<u64, InodeEntry>, ino: u64, primary: u32) -> Vec<u32> {
+    let mut fids = vec![primary];
+    if let Some(entry) = inodes.get(&ino) {
+        fids.extend(
+            entry
+                .fids
+                .values()
+                .chain(entry.handles.keys())
+                .copied()
+                .filter(|&fid| fid != primary),
+        );
+    }
+    fids
+}
+
 /// Return an open handle only when it belongs to the current request uid.
 /// File descriptors can be passed between users, while 9P fids retain the
 /// uid that opened them. A primary-gid change does not revoke an open
@@ -780,7 +809,17 @@ impl Filesystem for Fuse9P {
         // Live handles are normally cleared by release/releasedir before the final
         // forget, so `handles` is empty here; clunking it anyway is leak-hygiene if a
         // handle outlived its release.
-        if let Some((_, entry)) = self.inodes.remove_if(&ino, |_, e| e.lookup == 0) {
+        let forgotten = self.inodes.remove_if(&ino, |_, e| {
+            let gone = e.lookup == 0;
+            if gone {
+                // No descriptor can fsync this inode again. Dropping what its
+                // closed handles owed under the entry lock keeps a release
+                // from adding to it afterwards.
+                self.client.forget_closed_unsynced(ino);
+            }
+            gone
+        });
+        if let Some((_, entry)) = forgotten {
             // Drop prefetches before this inode number can be registered again
             // at generation zero.
             for fid in entry.handles.keys() {
@@ -2008,12 +2047,8 @@ impl Fuse9P {
         });
     }
 
-    /// Stop tracking an open handle on its inode (on release), so a later fsync
-    /// does not present a fid the client may have freed and recycled.
     fn drop_handle(&self, ino: u64, fh: FileHandle) {
-        if let Some(mut e) = self.inodes.get_mut(&ino) {
-            e.handles.remove(&(fh.0 as u32));
-        }
+        untrack_handle(&self.client, &self.inodes, ino, fh.0 as u32);
     }
 
     fn release_inner(&self, fh: FileHandle, reply: ReplyEmpty) {
@@ -2033,19 +2068,11 @@ impl Fuse9P {
         let inodes = Arc::clone(&self.inodes);
         let primary = fh.0 as u32;
         self.rt.spawn(async move {
-            // Mutations for one inode may use its per-user fid or any open handle.
-            let mut fids = vec![primary];
-            if let Some(entry) = inodes.get(&ino) {
-                fids.extend(
-                    entry
-                        .fids
-                        .values()
-                        .chain(entry.handles.keys())
-                        .copied()
-                        .filter(|&fid| fid != primary),
-                );
-            }
-            match client.fsync_inode(&fids, primary, datasync as u32).await {
+            let fids = inode_fsync_fids(&inodes, ino, primary);
+            match client
+                .fsync_inode(ino, &fids, primary, datasync as u32)
+                .await
+            {
                 Ok(()) => reply.ok(),
                 Err(e) => reply.error(errno(&e)),
             }
@@ -4048,6 +4075,132 @@ mod client_tests {
         let rf2 = c2.alloc_fid();
         let q = c2.rebind(rf2, vol_qid.path, 0).await.unwrap();
         assert_eq!(q.path, vol_qid.path);
+
+        shutdown.cancel();
+    }
+
+    /// A filesystem holding an empty `/f`, served under durability lineage
+    /// `lineage`, and the file's inode id.
+    async fn file_on_lineage(lineage: u64) -> (Arc<ZeroFS>, u64) {
+        let mut fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.lineage_token = lineage;
+        let fs = Arc::new(fs);
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("create.9p.sock");
+        let shutdown = start_server(Arc::clone(&fs), sock.clone());
+        let client = connect_with_retry(&sock).await;
+        client
+            .attach(ROOT_FID_TEST, NOFID, "root", "", 0)
+            .await
+            .unwrap();
+        let fid = client.alloc_fid();
+        client.walk(ROOT_FID_TEST, fid, &[]).await.unwrap();
+        let (qid, _) = client
+            .lcreate(
+                fid,
+                b"f",
+                (libc::O_RDWR | libc::O_CREAT) as u32,
+                libc::S_IFREG | 0o644,
+                0,
+            )
+            .await
+            .unwrap();
+        client.clunk(fid).await.unwrap();
+        shutdown.cancel();
+        (fs, qid.path)
+    }
+
+    /// `fsync(fd)` answers for every write to the file, including one made
+    /// through a descriptor that has since been closed. Samba and unfsd open
+    /// and close handles constantly, so the write and the fsync often arrive
+    /// on different ones.
+    #[tokio::test]
+    async fn fsync_reports_a_write_lost_after_its_handle_was_released() {
+        use super::{InodeEntry, UserIdentity, ino_of, inode_fsync_fids, untrack_handle};
+        use dashmap::DashMap;
+
+        // One server before and after it lost its unflushed writes: the file
+        // is there, the bytes are not, and the lineage has moved on.
+        let (before, inode) = file_on_lineage(41).await;
+        let (after, inode_after) = file_on_lineage(42).await;
+        assert_eq!(inode, inode_after);
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("release.9p.sock");
+        let shutdown = start_server(before, sock.clone());
+        let client = connect_with_retry(&sock).await;
+        client
+            .attach(ROOT_FID_TEST, NOFID, "root", "", 0)
+            .await
+            .unwrap();
+
+        // What the mount holds for a file open twice.
+        let identity = UserIdentity {
+            uid: 0,
+            gid: 0,
+            groups: None,
+        };
+        let ino = ino_of(inode);
+        let inode_fid = client.alloc_fid();
+        client
+            .walk(ROOT_FID_TEST, inode_fid, &[b"f"])
+            .await
+            .unwrap();
+        let inodes = DashMap::new();
+        let mut entry = InodeEntry {
+            lookup: 1,
+            ..InodeEntry::default()
+        };
+        entry.fids.insert(identity, inode_fid);
+        inodes.insert(ino, entry);
+        let mut open = Vec::new();
+        for _ in 0..2 {
+            let fid = client.alloc_fid();
+            client
+                .open_clone(inode_fid, fid, libc::O_RDWR as u32, None)
+                .await
+                .unwrap();
+            inodes
+                .get_mut(&ino)
+                .unwrap()
+                .handles
+                .insert(fid, identity.uid);
+            open.push(fid);
+        }
+        let (written, kept) = (open[0], open[1]);
+
+        // write(fd1), close(fd1): `release` untracks the handle, clunks it
+        // and returns its number.
+        assert_eq!(client.write(written, 0, b"lost").await.unwrap(), 4);
+        untrack_handle(&client, &inodes, ino, written);
+        client.clunk(written).await.unwrap();
+        client.free_fid(written);
+
+        shutdown.cancel();
+        for _ in 0..200 {
+            if UnixStream::connect(&sock).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let _ = std::fs::remove_file(&sock);
+        let shutdown = start_server(after, sock.clone());
+
+        // fsync(fd2).
+        let fids = inode_fsync_fids(&inodes, ino, kept);
+        let fsync = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.fsync_inode(ino, &fids, kept, 0),
+        )
+        .await
+        .expect("fsync timed out waiting for the reconnect");
+        match fsync {
+            Err(ClientError::Errno(e)) => assert_eq!(e, libc::ESTALE as u32),
+            other => panic!(
+                "fsync must report the write the server lost after its handle closed, got {other:?}"
+            ),
+        }
+        assert_eq!(client.read(kept, 0, 16).await.unwrap(), b"");
 
         shutdown.cancel();
     }

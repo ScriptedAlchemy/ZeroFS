@@ -865,8 +865,11 @@ pub struct NinePClient {
     request_admission: Arc<Semaphore>,
     /// Per-fid durability obligations carried across reconnects.
     unsynced: DashMap<u32, Unsynced>,
-    /// Numbers each [`Unsynced`] record. Fid numbers are recycled; these are not.
+    /// Numbers each [`Unsynced`] record and each revision of a
+    /// [`ClosedUnsynced`] one. Fid numbers are recycled; these are not.
     unsynced_incarnations: AtomicU64,
+    /// What closed fids still owed, under the owner their caller named.
+    closed_unsynced: DashMap<u64, ClosedUnsynced>,
     counters: Arc<TrafficCounters>,
 }
 
@@ -888,6 +891,24 @@ struct Unsynced {
 struct UnsyncedSnapshot {
     incarnation: u64,
     generation: u64,
+}
+
+/// What fids closed under one owner still owe a verified fsync. Their numbers
+/// are free for reuse, so the record is kept under the owner instead.
+struct ClosedUnsynced {
+    /// The oldest lineage with a write that no fsync has answered for.
+    oldest: u64,
+    /// Changes whenever a closed fid is folded in and is never reused, so a
+    /// reply settles only the record its fsync saw.
+    revision: u64,
+}
+
+/// The closed fids whose writes an fsync answers for.
+#[derive(Clone, Copy)]
+enum ClosedScope {
+    None,
+    Owner(u64),
+    All,
 }
 
 impl Unsynced {
@@ -917,6 +938,12 @@ impl Unsynced {
         if self.generation == generation {
             self.reported = true;
         }
+    }
+
+    /// The token a closed fid leaves owing. A loss already reported to the
+    /// caller is not owed again: no write can follow through a closed fid.
+    fn owed_after_close(&self) -> Option<u64> {
+        self.oldest.filter(|_| !self.reported)
     }
 }
 
@@ -1027,6 +1054,7 @@ impl NinePClient {
             request_admission: Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS)),
             unsynced: DashMap::new(),
             unsynced_incarnations: AtomicU64::new(0),
+            closed_unsynced: DashMap::new(),
             counters,
         });
         client.spawn_supervisor();
@@ -1703,6 +1731,70 @@ impl NinePClient {
     /// Removes durability state before a fid number is reused.
     fn forget_unsynced(&self, fid: u32) {
         self.unsynced.remove(&fid);
+    }
+
+    /// Moves what `fid` still owes a verified fsync to `owner`, for a handle
+    /// the caller is closing. [`Self::free_fid`] alone forgets it.
+    ///
+    /// `owner` is the caller's key for whatever outlives the handle. The FUSE
+    /// mount passes the inode, so [`Self::fsync_inode`] through another
+    /// descriptor answers for the closed one's writes. A caller with nothing
+    /// to forget passes one constant and settles with [`Self::fsync_all`].
+    ///
+    /// The record is one token per owner. It goes when an fsync that covers it
+    /// succeeds or reports the loss, or on [`Self::forget_closed_unsynced`].
+    pub fn keep_closed_unsynced(&self, fid: u32, owner: u64) {
+        // The owner holds the debt before the fid lets go of it. An fsync
+        // reads fids first and owners second, so it finds it in one of them.
+        self.unsynced.remove_if(&fid, |_, record| {
+            if let Some(token) = record.owed_after_close() {
+                let revision = self.unsynced_incarnations.fetch_add(1, Ordering::Relaxed);
+                self.closed_unsynced
+                    .entry(owner)
+                    .and_modify(|closed| {
+                        closed.oldest = closed.oldest.min(token);
+                        closed.revision = revision;
+                    })
+                    .or_insert(ClosedUnsynced {
+                        oldest: token,
+                        revision,
+                    });
+            }
+            true
+        });
+    }
+
+    /// Drops what closed handles left owing under `owner`. Call it when the
+    /// owner is gone and no fsync can name it again.
+    pub fn forget_closed_unsynced(&self, owner: u64) {
+        self.closed_unsynced.remove(&owner);
+    }
+
+    /// The closed-fid records in `scope`, as `(owner, oldest, revision)`.
+    fn snapshot_closed_unsynced(&self, scope: ClosedScope) -> Vec<(u64, u64, u64)> {
+        match scope {
+            ClosedScope::None => Vec::new(),
+            ClosedScope::Owner(owner) => self
+                .closed_unsynced
+                .get(&owner)
+                .map(|closed| (owner, closed.oldest, closed.revision))
+                .into_iter()
+                .collect(),
+            ClosedScope::All => self
+                .closed_unsynced
+                .iter()
+                .map(|closed| (*closed.key(), closed.oldest, closed.revision))
+                .collect(),
+        }
+    }
+
+    /// Drops the closed-fid records an fsync answered for, by success or by
+    /// reporting the loss. A record folded into since then stays owed.
+    fn settle_closed_unsynced(&self, closed: Vec<(u64, u64, u64)>) {
+        for (owner, _, revision) in closed {
+            self.closed_unsynced
+                .remove_if(&owner, |_, closed| closed.revision == revision);
+        }
     }
 
     /// Maximum data a single Tread/Treaddir response (Rread/Rreaddir) can carry
@@ -3609,9 +3701,27 @@ impl NinePClient {
         }
     }
 
-    /// Verifies fsync for all fids associated with one inode. `primary` carries
+    /// Verifies fsync for one inode: its open `fids`, and the handles closed
+    /// with [`Self::keep_closed_unsynced`] under `inode`. `primary` carries
     /// `Tfsyncdur`; the oldest recorded lineage token determines the result.
-    pub async fn fsync_inode(&self, fids: &[u32], primary: u32, datasync: u32) -> ClientResult<()> {
+    pub async fn fsync_inode(
+        &self,
+        inode: u64,
+        fids: &[u32],
+        primary: u32,
+        datasync: u32,
+    ) -> ClientResult<()> {
+        self.fsync_covering(fids, ClosedScope::Owner(inode), primary, datasync)
+            .await
+    }
+
+    async fn fsync_covering(
+        &self,
+        fids: &[u32],
+        closed: ClosedScope,
+        primary: u32,
+        datasync: u32,
+    ) -> ClientResult<()> {
         self.validate_fids(fids.iter().copied())?;
         // Only `primary` travels on the wire. A sibling retired while the
         // flush runs may have a new owner by the time the reply arrives.
@@ -3631,6 +3741,10 @@ impl NinePClient {
             }
             snaps.push((fid, snapshot));
         }
+        let closed = self.snapshot_closed_unsynced(closed);
+        for &(_, oldest, _) in &closed {
+            token = Some(token.map_or(oldest, |w| w.min(oldest)));
+        }
         match self
             .rpc(Message::Tfsyncdur(Tfsyncdur {
                 fid: primary,
@@ -3646,6 +3760,7 @@ impl NinePClient {
                         self.clear_unsynced_if_unchanged(fid, snapshot);
                     }
                 }
+                self.settle_closed_unsynced(closed);
                 Ok(())
             }
             Ok(_) => Err(ClientError::Unexpected("fsync")),
@@ -3657,6 +3772,9 @@ impl NinePClient {
                         self.report_unsynced_if_unchanged(fid, snapshot);
                     }
                 }
+                // The server flushed before it compared tokens, so what is
+                // left of this lineage is durable and the rest is reported.
+                self.settle_closed_unsynced(closed);
                 Err(ClientError::Errno(e))
             }
             Err(e) => Err(e),
@@ -3665,10 +3783,12 @@ impl NinePClient {
 
     /// Verified fsync for one fid. Multi-fid inode users call [`Self::fsync_inode`].
     pub async fn fsync(&self, fid: u32, datasync: u32) -> ClientResult<()> {
-        self.fsync_inode(&[fid], fid, datasync).await
+        self.fsync_covering(&[fid], ClosedScope::None, fid, datasync)
+            .await
     }
 
-    /// Filesystem-wide barrier for this client's outstanding durability obligations.
+    /// Filesystem-wide barrier for this client's outstanding durability
+    /// obligations, those of closed handles included.
     pub async fn fsync_all(&self, primary: u32, datasync: u32) -> ClientResult<()> {
         let mut fids = vec![primary];
         for entry in &self.unsynced {
@@ -3677,7 +3797,8 @@ impl NinePClient {
                 fids.push(fid);
             }
         }
-        self.fsync_inode(&fids, primary, datasync).await
+        self.fsync_covering(&fids, ClosedScope::All, primary, datasync)
+            .await
     }
 
     pub async fn statfs(&self, fid: u32) -> ClientResult<Rstatfs> {
@@ -4524,6 +4645,18 @@ mod durability_tracking_tests {
     }
 
     #[test]
+    fn a_closed_fid_owes_its_oldest_write_until_the_loss_is_reported() {
+        let mut u = Unsynced::default();
+        assert_eq!(u.owed_after_close(), None);
+        u.note(5);
+        u.note(9);
+        assert_eq!(u.owed_after_close(), Some(5));
+        let (_, generation) = u.snapshot();
+        u.report_if_unchanged(generation);
+        assert_eq!(u.owed_after_close(), None);
+    }
+
+    #[test]
     fn nothing_tracked_reports_none() {
         let u = Unsynced::default();
         assert_eq!(u.snapshot(), (None, 0));
@@ -4604,6 +4737,7 @@ mod session_transition_tests {
             request_admission: Arc::new(Semaphore::new(max_inflight_requests)),
             unsynced: DashMap::new(),
             unsynced_incarnations: AtomicU64::new(0),
+            closed_unsynced: DashMap::new(),
             counters: Arc::new(TrafficCounters::default()),
         })
     }
@@ -8349,7 +8483,7 @@ mod session_transition_tests {
             let client = test_client(Arc::clone(&conn));
             directory_fid(&client, 5, 50);
             client.note_unsynced(7, 41);
-            let mut fsync = Box::pin(client.fsync_inode(&[5, 7], 5, 0));
+            let mut fsync = Box::pin(client.fsync_inode(50, &[5, 7], 5, 0));
             assert!(futures::poll!(fsync.as_mut()).is_pending());
             let sent = recv_op_request(&mut requests, "the fsync").await;
             assert!(matches!(
@@ -8409,7 +8543,8 @@ mod session_transition_tests {
             conn.lineage_token.store(41, Ordering::Relaxed);
 
             let fsync_client = Arc::clone(client);
-            let fsync = tokio::spawn(async move { fsync_client.fsync_inode(&[5, 7], 5, 0).await });
+            let fsync =
+                tokio::spawn(async move { fsync_client.fsync_inode(50, &[5, 7], 5, 0).await });
             let sent = recv_op_request(requests, "the flush").await;
             match &sent.body {
                 Message::Tfsyncdur(f) => assert_eq!((f.fid, f.token), (5, sibling_lineage)),
@@ -8490,6 +8625,229 @@ mod session_transition_tests {
                 Some(41),
                 "another file's ESTALE retired the new owner's unverified write"
             );
+        }
+
+        /// What FUSE `release` does to a handle open on `inode`.
+        async fn release_handle(
+            client: &Arc<NinePClient>,
+            conn: &Conn,
+            requests: &mut TestRequests,
+            fid: u32,
+            inode: u64,
+        ) {
+            client.keep_closed_unsynced(fid, inode);
+            let clunk_client = Arc::clone(client);
+            let clunk = tokio::spawn(async move { clunk_client.clunk(fid).await });
+            let closing = recv_op_request(requests, "the released handle's clunk").await;
+            assert!(matches!(closing.body, Message::Tclunk(_)));
+            answer(conn, &closing);
+            clunk.await.unwrap().unwrap();
+            client.free_fid(fid);
+        }
+
+        /// Runs a verified fsync of `inode` through `primary` against a server
+        /// on `lineage`, which cannot vouch for a write acknowledged on any
+        /// other. Returns the result and the token the fsync presented.
+        async fn fsync_inode_on_lineage(
+            client: &Arc<NinePClient>,
+            conn: &Conn,
+            requests: &mut TestRequests,
+            lineage: u64,
+            inode: u64,
+            primary: u32,
+        ) -> (ClientResult<()>, u64) {
+            let fsync_client = Arc::clone(client);
+            let fsync = tokio::spawn(async move {
+                fsync_client
+                    .fsync_inode(inode, &[primary], primary, 0)
+                    .await
+            });
+            let token = answer_fsync_on_lineage(conn, requests, lineage).await;
+            (fsync.await.unwrap(), token)
+        }
+
+        async fn answer_fsync_on_lineage(
+            conn: &Conn,
+            requests: &mut TestRequests,
+            lineage: u64,
+        ) -> u64 {
+            let sent = recv_op_request(requests, "the fsync").await;
+            let Message::Tfsyncdur(fsync) = &sent.body else {
+                panic!("expected Tfsyncdur, got {:?}", sent.body);
+            };
+            let body = if fsync.token == 0 || fsync.token == lineage {
+                Message::Rfsync(Rfsync)
+            } else {
+                Message::Rlerror(Rlerror {
+                    ecode: linux::ESTALE,
+                })
+            };
+            reply(conn, sent.tag, body);
+            fsync.token
+        }
+
+        /// Handles 5 and 7 are open on inode 50. One write goes through 7
+        /// under lineage 41, and 7 is released before any fsync. The server
+        /// then restarts on lineage 42, having lost the write.
+        async fn write_lost_after_release() -> (Arc<NinePClient>, Arc<Conn>, TestRequests) {
+            let (conn, mut requests) = test_conn_with_receiver();
+            let client = test_client(Arc::clone(&conn));
+            directory_fid(&client, 5, 50);
+            conn.lineage_token.store(41, Ordering::Relaxed);
+            acknowledged_write(&client, &conn, &mut requests, 7).await;
+            release_handle(&client, &conn, &mut requests, 7, 50).await;
+
+            let (returned, returned_requests) = server_returns(&client);
+            returned.lineage_token.store(42, Ordering::Relaxed);
+            (client, returned, returned_requests)
+        }
+
+        fn assert_estale(result: ClientResult<()>, why: &str) {
+            let error = result.expect_err(why);
+            assert!(
+                matches!(error, ClientError::Errno(errno) if errno == linux::ESTALE),
+                "{error}"
+            );
+        }
+
+        #[tokio::test]
+        async fn fsync_reports_a_write_lost_after_its_handle_was_released() {
+            let (client, conn, mut requests) = write_lost_after_release().await;
+
+            let (result, token) =
+                fsync_inode_on_lineage(&client, &conn, &mut requests, 42, 50, 5).await;
+            assert_estale(
+                result,
+                "fsync reported success for a write the server lost after its handle closed",
+            );
+            assert_eq!(token, 41);
+        }
+
+        #[tokio::test]
+        async fn a_lost_released_write_is_reported_once() {
+            let (client, conn, mut requests) = write_lost_after_release().await;
+            let (result, _) =
+                fsync_inode_on_lineage(&client, &conn, &mut requests, 42, 50, 5).await;
+            assert_estale(result, "the released handle's write was lost");
+            assert!(client.closed_unsynced.is_empty());
+
+            // No write can follow through a closed handle, so a loss that
+            // stayed owed would fail every later fsync of the file.
+            let (result, token) =
+                fsync_inode_on_lineage(&client, &conn, &mut requests, 42, 50, 5).await;
+            result.expect("the loss was reported twice");
+            assert_eq!(token, 0);
+        }
+
+        #[tokio::test]
+        async fn fsync_settles_a_released_handles_write() {
+            let (conn, mut requests) = test_conn_with_receiver();
+            let client = test_client(Arc::clone(&conn));
+            directory_fid(&client, 5, 50);
+            conn.lineage_token.store(41, Ordering::Relaxed);
+            acknowledged_write(&client, &conn, &mut requests, 7).await;
+            release_handle(&client, &conn, &mut requests, 7, 50).await;
+
+            // The number is free and carries nothing to its next owner.
+            assert_eq!(client.alloc_fid(), 7);
+            assert!(client.unsynced.get(&7).is_none());
+            assert_eq!(client.closed_unsynced.get(&50).map(|c| c.oldest), Some(41));
+
+            let (result, token) =
+                fsync_inode_on_lineage(&client, &conn, &mut requests, 41, 50, 5).await;
+            result.expect("the server still holds the released handle's write");
+            assert_eq!(token, 41);
+            assert!(
+                client.closed_unsynced.is_empty(),
+                "a settled write stayed owed"
+            );
+        }
+
+        #[tokio::test]
+        async fn fsync_of_one_inode_does_not_answer_for_another_inodes_released_handle() {
+            let (client, conn, mut requests) = write_lost_after_release().await;
+            directory_fid(&client, 6, 60);
+
+            let (result, token) =
+                fsync_inode_on_lineage(&client, &conn, &mut requests, 42, 60, 6).await;
+            result.expect("inode 60 lost nothing");
+            assert_eq!(token, 0);
+            assert_eq!(client.closed_unsynced.get(&50).map(|c| c.oldest), Some(41));
+
+            // Forgetting the inode is the other way its record goes.
+            client.forget_closed_unsynced(50);
+            assert!(client.closed_unsynced.is_empty());
+        }
+
+        #[tokio::test]
+        async fn fsync_of_one_handle_does_not_answer_for_a_released_one() {
+            let (client, conn, mut requests) = write_lost_after_release().await;
+
+            let fsync_client = Arc::clone(&client);
+            let fsync = tokio::spawn(async move { fsync_client.fsync(5, 0).await });
+            let token = answer_fsync_on_lineage(&conn, &mut requests, 42).await;
+            fsync.await.unwrap().expect("handle 5 lost nothing");
+            assert_eq!(token, 0);
+            assert_eq!(client.closed_unsynced.get(&50).map(|c| c.oldest), Some(41));
+        }
+
+        #[tokio::test]
+        async fn fsync_all_reports_a_write_lost_after_its_handle_was_released() {
+            let (client, conn, mut requests) = write_lost_after_release().await;
+
+            let fsync_client = Arc::clone(&client);
+            let fsync = tokio::spawn(async move { fsync_client.fsync_all(5, 0).await });
+            let token = answer_fsync_on_lineage(&conn, &mut requests, 42).await;
+            assert_estale(
+                fsync.await.unwrap(),
+                "the barrier reported success for a write the server lost after its handle closed",
+            );
+            assert_eq!(token, 41);
+            assert!(client.closed_unsynced.is_empty());
+        }
+
+        #[tokio::test]
+        async fn an_fsync_reply_cannot_settle_a_handle_released_during_the_flush() {
+            let (conn, mut requests) = test_conn_with_receiver();
+            let client = test_client(Arc::clone(&conn));
+            directory_fid(&client, 5, 50);
+            conn.lineage_token.store(41, Ordering::Relaxed);
+            acknowledged_write(&client, &conn, &mut requests, 7).await;
+            release_handle(&client, &conn, &mut requests, 7, 50).await;
+
+            let fsync_client = Arc::clone(&client);
+            let fsync = tokio::spawn(async move { fsync_client.fsync_inode(50, &[5], 5, 0).await });
+            let sent = recv_op_request(&mut requests, "the flush").await;
+            assert!(matches!(sent.body, Message::Tfsyncdur(_)));
+
+            // A second handle writes and is released after the flush was
+            // sent, so the reply says nothing about its write.
+            acknowledged_write(&client, &conn, &mut requests, 9).await;
+            release_handle(&client, &conn, &mut requests, 9, 50).await;
+
+            reply(&conn, sent.tag, Message::Rfsync(Rfsync));
+            fsync.await.unwrap().unwrap();
+            assert_eq!(
+                client.closed_unsynced.get(&50).map(|c| c.oldest),
+                Some(41),
+                "an fsync settled a write released after it was sent"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_released_handle_does_not_owe_a_loss_it_already_reported() {
+            let (conn, mut requests) = test_conn_with_receiver();
+            let client = test_client(Arc::clone(&conn));
+            conn.lineage_token.store(41, Ordering::Relaxed);
+            acknowledged_write(&client, &conn, &mut requests, 7).await;
+
+            let fsync_client = Arc::clone(&client);
+            let fsync = tokio::spawn(async move { fsync_client.fsync(7, 0).await });
+            answer_fsync_on_lineage(&conn, &mut requests, 42).await;
+            assert_estale(fsync.await.unwrap(), "the write predates lineage 42");
+
+            release_handle(&client, &conn, &mut requests, 7, 50).await;
+            assert!(client.closed_unsynced.is_empty());
         }
 
         #[tokio::test(start_paused = true)]
