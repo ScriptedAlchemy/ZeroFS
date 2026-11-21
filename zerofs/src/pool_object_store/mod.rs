@@ -1279,10 +1279,15 @@ impl PoolObjectStore {
         skip.extend(self.inner.unavailable.iter().cloned());
         let placement = self.inner.segment_placement;
         let ledger = Arc::clone(&self.inner.ledger);
+        let queued = std::time::Instant::now();
         self.catalog(move |catalog| {
+            crate::fs::metrics::record_write_stage("claim_blocking_queue", queued);
+            let locking = std::time::Instant::now();
             // Held from the check to the claim, so no two claims are
             // promised the same bytes.
             let mut promises = ledger.lock().unwrap();
+            crate::fs::metrics::record_write_stage("claim_ledger_lock", locking);
+            let admitting = std::time::Instant::now();
             let member = catalog.admit(
                 bytes,
                 &members,
@@ -1292,13 +1297,18 @@ impl PoolObjectStore {
                 &promises,
                 prefer.as_deref(),
             )?;
+            crate::fs::metrics::record_write_stage("claim_catalog_admit", admitting);
             let key = promises.insert_claim(admission::Key::Claim, member, bytes);
             drop(promises);
             // The blocking task may finish after its caller is cancelled.
             // Its result must own the claim so dropping it returns the room.
-            Ok(Claim::new(ledger, key))
+            Ok((Claim::new(ledger, key), std::time::Instant::now()))
         })
         .await
+        .map(|(claim, returned)| {
+            crate::fs::metrics::record_write_stage("claim_blocking_return", returned);
+            claim
+        })
         .map_err(|e| storage_full(e, bytes))
     }
 

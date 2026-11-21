@@ -1290,6 +1290,7 @@ impl ZeroFS {
             }
             RequestLookup::Backpressured => return Err(WriteAdmissionError::Backpressured),
         };
+        let raw_waiting = std::time::Instant::now();
         let raw_permit = match coordinator.raw_budget().acquire(length).await {
             Ok(permit) => permit,
             Err(error) => {
@@ -1297,6 +1298,7 @@ impl ZeroFS {
                 return Err(WriteAdmissionError::Mutation(error));
             }
         };
+        crate::fs::metrics::record_write_stage("ack_admission_raw_budget", raw_waiting);
         PreparationGuard::new(coordinator.gate(), scope, raw_permit, pending)
             .map(WriteAdmission::Prepared)
             .map_err(WriteAdmissionError::Mutation)
@@ -1342,6 +1344,7 @@ impl ZeroFS {
             request_lifetime,
             fingerprint_context,
         } = write;
+        let started = std::time::Instant::now();
         let policy = identity.replay_policy();
         let fingerprint = if policy.fingerprints_request() {
             direct_write_fingerprint(
@@ -1356,6 +1359,7 @@ impl ZeroFS {
         } else {
             RequestFingerprint::from_bytes([0; 32])
         };
+        crate::fs::metrics::record_write_stage("ack_fingerprint", started);
         let replay_count = if policy.tracks_protocol_ledger() {
             Some(u32::try_from(data.len()).map_err(|_| FsError::InvalidArgument)?)
         } else {
@@ -1443,6 +1447,7 @@ impl ZeroFS {
                 cutoff: self.capture_mutation_cutoff(),
             });
         }
+        let admitting = std::time::Instant::now();
         let guard = match self
             .begin_write_admission(
                 identity,
@@ -1463,6 +1468,8 @@ impl ZeroFS {
                 });
             }
         };
+        crate::fs::metrics::record_write_stage("ack_admission", admitting);
+        let reserving = std::time::Instant::now();
         let admission = match overlay.reserve(id, data.len()).await {
             Ok(admission) => admission,
             Err(error) => {
@@ -1491,6 +1498,8 @@ impl ZeroFS {
         // Serialize projection and publication for this one inode. Taking the
         // hint first makes cancellation or failed publication fall back to the
         // canonical lock. Other writers and striped batches acquire it normally.
+        crate::fs::metrics::record_write_stage("ack_volatile_reserve", reserving);
+        let preparing = std::time::Instant::now();
         let mut append = runtime.append.lock().await;
         let (batch, writes) =
             match prepare_write_with_append(&self.write_prepare_context(), request, append.take())
@@ -1529,6 +1538,8 @@ impl ZeroFS {
                     .map(|member| member.post_attrs.clone())
             })
             .expect("prepared batch has attributes");
+        crate::fs::metrics::record_write_stage("ack_prepare", preparing);
+        let accepting = std::time::Instant::now();
         let cutoff = overlay
             .accept(StagedWriteAccept {
                 inode: id,
@@ -1547,6 +1558,8 @@ impl ZeroFS {
             .await
             .map_err(overlay_fs_error)?;
         *append = next_append;
+        crate::fs::metrics::record_write_stage("ack_accept", accepting);
+        crate::fs::metrics::record_write_stage("ack_total", started);
         Ok(WriteAckReceipt { attrs, cutoff })
     }
 

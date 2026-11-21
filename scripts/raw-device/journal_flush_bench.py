@@ -10,6 +10,7 @@ import fcntl
 import hashlib
 import http.client
 import json
+import mmap
 import os
 from pathlib import Path
 import random
@@ -36,6 +37,13 @@ WRITERS = int(os.environ.get("BENCH_WRITERS", "1"))
 IO = MIB
 SHIM_DELAY_US = os.environ.get("BENCH_FLUSH_DELAY_US")
 PERF = os.environ.get("BENCH_PERF") == "1"
+# Do not issue the P3 loop's syncs, only delay them. The P3 bytes then stay in the page cache,
+# so the copy is not held to the fixture disk's rate. Not a durable run.
+P3_NO_SYNC = os.environ.get("BENCH_P3_NO_SYNC") == "1"
+# Write from a page-aligned buffer, as a client that issues aligned direct I/O does.
+ALIGNED = os.environ.get("BENCH_ALIGNED") == "1"
+# Sample each stage's queue depth and each thread's CPU during every copy.
+STAGES = os.environ.get("BENCH_STAGES") == "1"
 # Pace member PUTs so most of the copy is still in the P3 journal when it is read back.
 MEMBER_PUT_DELAY_MS = os.environ.get("BENCH_MEMBER_PUT_DELAY_MS")
 # Instead of timing copies, SIGKILL the engine after fsync and replay the copy from the journal.
@@ -86,7 +94,9 @@ def publish_counters(address):
     wanted = ("zerofs_writeback_local_publish_batches_total",
               "zerofs_writeback_local_publish_records_total",
               "zerofs_writeback_local_publish_phase_seconds_sum",
-              "zerofs_writeback_local_publish_phase_seconds_count")
+              "zerofs_writeback_local_publish_phase_seconds_count",
+              # Each write stage's seconds over the copy: divided by its MiB, its cost per MiB.
+              "zerofs_write_stage_seconds_sum", "zerofs_write_stage_seconds_count")
     return {line.split()[0]: float(line.split()[1]) for line in body.splitlines()
             if line.split(" ", 1)[0].split("{", 1)[0] in wanted}
 
@@ -136,8 +146,9 @@ def install_shim(root, p3_node):
     log.touch()
     os.environ.update(LD_PRELOAD=str(library), FLUSH_SHIM_LOG=str(log),
                       FLUSH_SHIM_DELAY_US=SHIM_DELAY_US,
+                      FLUSH_SHIM_SKIP_SYNC="1" if P3_NO_SYNC else "0",
                       FLUSH_SHIM_MINOR=str(os.minor(p3_node.stat().st_rdev)))
-    record("flush_shim", added_sync_delay_us=int(SHIM_DELAY_US))
+    record("flush_shim", added_sync_delay_us=int(SHIM_DELAY_US), p3_syncs_issued=not P3_NO_SYNC)
     return ShimLog(log)
 
 
@@ -157,10 +168,18 @@ def start_perf(root, pids):
     if not PERF:
         return None
     data = root / "perf.data"
-    process = subprocess.Popen(["perf", "record", "-q", "-N", "-F", "499", "-o", data,
+    # Frame-pointer call graphs: build the engine with -C force-frame-pointers=yes and symbols.
+    process = subprocess.Popen(["perf", "record", "-q", "-N", "-F", "499", "-g", "-o", data,
                                 "-p", ",".join(map(str, pids))])
     time.sleep(1)
     return process, data
+
+
+def perf_report(data, *arguments):
+    report = subprocess.run(["perf", "report", "--stdio", "-q", "-i", data, "-g", "none",
+                             *arguments], capture_output=True, text=True, timeout=900,
+                            check=True).stdout
+    return [line.strip() for line in report.splitlines() if line.strip()]
 
 
 def stop_perf(handle):
@@ -169,11 +188,98 @@ def stop_perf(handle):
     process, data = handle
     process.send_signal(2)
     process.wait(timeout=120)
-    report = subprocess.run(["perf", "report", "--stdio", "-q", "--no-children", "-i", data,
-                             "--sort", "comm,sym", "--percent-limit", "0.7"],
-                            capture_output=True, text=True, timeout=600, check=True).stdout
+    # Self time says which code burns CPU. Inclusive time says which stage called it.
+    record("perf_profile",
+           self_time=perf_report(data, "--no-children", "--sort", "comm,sym",
+                                 "--percent-limit", "0.7")[:80],
+           inclusive=perf_report(data, "--children", "--sort", "sym",
+                                 "--percent-limit", "1.5")[:160],
+           threads=perf_report(data, "--no-children", "--sort", "comm,tid",
+                               "--percent-limit", "0.7")[:60])
     data.unlink()
-    record("perf_profile", top=[line.strip() for line in report.splitlines() if line.strip()][:60])
+
+
+GAUGES = {
+    "volatile_dirty_bytes": "zerofs_nbd_volatile_memory_dirty_bytes",
+    "volatile_capacity_bytes": "zerofs_nbd_volatile_memory_capacity_bytes",
+    "volatile_dirty_operations": "zerofs_nbd_volatile_memory_dirty_operations",
+    "dirty_ram_bytes": "zerofs_writeback_dirty_ram_bytes",
+    "dirty_ram_capacity_bytes": "zerofs_writeback_dirty_ram_capacity_bytes",
+    "ninep_inflight_requests": "zerofs_p9_inflight_requests",
+    "ssd_admission_paced": "zerofs_writeback_ssd_admission_paced",
+}
+
+
+def thread_cpu(pid):
+    """CPU seconds of each thread, keyed by thread id, with its name."""
+    usage = {}
+    for task in Path(f"/proc/{pid}/task").iterdir():
+        try:
+            name, fields = (task / "stat").read_text().rsplit(")", 1)
+        except OSError:
+            continue
+        fields = fields.split()
+        usage[int(task.name)] = (name.split("(", 1)[1],
+                                 (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK"))
+    return usage
+
+
+class StageSampler:
+    """Say which stage holds a copy back: sample each stage's queue and each thread's CPU.
+
+    A queue that sits at its capacity has a slower stage after it. A thread
+    that runs for the whole copy is a serial stage.
+    """
+
+    def __init__(self, address, pids):
+        self.address, self.pids = address, pids
+        self.samples, self.stopped = [], threading.Event()
+        self.before = {name: thread_cpu(pid) for name, pid in pids.items()}
+        self.started = time.monotonic()
+        self.thread = threading.Thread(target=self.run)
+        self.thread.start()
+
+    def run(self):
+        while not self.stopped.wait(0.05):
+            connection = http.client.HTTPConnection(self.address, timeout=4)
+            try:
+                connection.request("GET", "/metrics")
+                body = connection.getresponse().read().decode()
+            except OSError:
+                continue
+            finally:
+                connection.close()
+            values = {line.split()[0]: float(line.split()[1]) for line in body.splitlines()
+                      if line.split(" ", 1)[0] in GAUGES.values()}
+            self.samples.append({key: values.get(name, 0.0) for key, name in GAUGES.items()})
+
+    def finish(self):
+        self.stopped.set()
+        self.thread.join()
+        seconds = time.monotonic() - self.started
+        result = {"samples": len(self.samples)}
+        if self.samples:
+            for key in GAUGES:
+                values = sorted(sample[key] for sample in self.samples)
+                result[key] = {"mean": statistics.fmean(values),
+                               "median": values[len(values) // 2], "max": values[-1]}
+            for queue in ("volatile", "dirty_ram"):
+                full = sum(sample[f"{queue}_dirty_bytes" if queue == "volatile" else "dirty_ram_bytes"]
+                           >= 0.9 * sample[f"{queue}_capacity_bytes"] for sample in self.samples)
+                result[f"{queue}_at_capacity_fraction"] = full / len(self.samples)
+        for name, pid in self.pids.items():
+            after, busy = thread_cpu(pid), {}
+            for tid, (thread, cpu) in after.items():
+                spent = cpu - self.before[name].get(tid, (thread, 0.0))[1]
+                if spent > 0:
+                    entry = busy.setdefault(thread, {"threads": 0, "cpu_seconds": 0.0,
+                                                     "busiest_fraction": 0.0})
+                    entry["threads"] += 1
+                    entry["cpu_seconds"] += spent
+                    entry["busiest_fraction"] = max(entry["busiest_fraction"], spent / seconds)
+            result[f"{name}_threads"] = dict(sorted(
+                busy.items(), key=lambda item: -item[1]["cpu_seconds"])[:12])
+        record("stage_sample", seconds=seconds, **result)
 
 
 def evict(bindings):
@@ -262,8 +368,14 @@ def flush_latency(root, nodes):
 
 
 def write_file(target, seed, done):
+    # FUSE direct I/O cuts a request at 256 pages, so a 1 MiB write from an unaligned buffer
+    # reaches the engine as two writes that share an extent. A mapping is page-aligned.
+    aligned = mmap.mmap(-1, IO) if ALIGNED else None
     with target.open("xb", buffering=0) as file:
         for chunk in chunks(seed):
+            if aligned is not None:
+                aligned[:] = chunk
+                chunk = aligned
             write_all(file.fileno(), chunk)
         written = time.monotonic_ns()
         os.fsync(file.fileno())
@@ -284,7 +396,8 @@ def run_once(index, bindings, configuration, path, server, address, shim):
     before_disk, before_cpu = disk_stats(bindings), cpu_seconds(server.pid)
     before_client = cpu_seconds(client)
     before_publish = publish_counters(address)
-    profile = start_perf(path.parent.parent, (server.pid, client)) if index == 0 else None
+    profile = start_perf(VOLUME, (server.pid, client)) if index == 0 else None
+    sampler = StageSampler(address, {"engine": server.pid, "client": client}) if STAGES else None
     if shim:
         shim.take()
     done = {}
@@ -301,6 +414,8 @@ def run_once(index, bindings, configuration, path, server, address, shim):
     write = disk_delta(disk_stats(bindings), before_disk)
     write_cpu = cpu_seconds(server.pid) - before_cpu
     client_cpu = cpu_seconds(client) - before_client
+    if sampler:
+        sampler.finish()
     stop_perf(profile)
     after_publish = publish_counters(address)
     p3 = write["p3"]
@@ -385,9 +500,10 @@ def crash_replay(bindings, configuration):
 
 def main():
     assert Path("/.dockerenv").exists() and os.path.ismount(VOLUME)
+    assert not P3_NO_SYNC or (SHIM_DELAY_US is not None and not CRASH_REPLAY)
     os.umask(0o077)
     require_fuse()
-    record("bench_setup", payload_bytes=PAYLOAD, runs=RUNS, writers=WRITERS,
+    record("bench_setup", payload_bytes=PAYLOAD, runs=RUNS, writers=WRITERS, aligned=ALIGNED,
            member_put_delay_ms=MEMBER_PUT_DELAY_MS,
            binaries=command("sha256sum", ZEROFS, PROBE).decode().splitlines())
     with tempfile.TemporaryDirectory(dir=VOLUME, prefix="bench-") as scratch, \

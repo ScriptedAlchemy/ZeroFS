@@ -6,6 +6,13 @@ use std::time::Instant;
 
 const MIB_IN_BYTES: f64 = 1024.0 * 1024.0;
 
+/// Time one stage of a client write into `zerofs_write_stage_seconds{stage}`.
+/// A stage's sum over a copy, divided by the MiB copied, is its cost per MiB.
+pub(crate) fn record_write_stage(stage: &'static str, since: Instant) {
+    metrics::histogram!("zerofs_write_stage_seconds", "stage" => stage)
+        .record(since.elapsed().as_secs_f64());
+}
+
 struct PreviousSnapshot {
     total_operations: u64,
     bytes_read: u64,
