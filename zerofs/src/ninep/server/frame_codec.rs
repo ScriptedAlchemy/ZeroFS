@@ -41,10 +41,8 @@ impl FidFootprint {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct ShallowFrameMetadata {
     pub(super) fids: FidFootprint,
-    pub(super) received_op: Option<ReceivedOp>,
+    pub(super) received_op: Option<([u8; P9_OP_ID_LEN], u8, u64)>,
 }
-
-pub(super) type ReceivedOp = ([u8; P9_OP_ID_LEN], u8, u64);
 
 fn read_u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_le_bytes(
@@ -410,11 +408,6 @@ pub(super) struct FrameHeader {
     pub(super) type_byte: u8,
 }
 
-pub(super) enum FramePlan<C, R> {
-    Read(C),
-    Refuse(R),
-}
-
 #[cfg(test)]
 pub(super) async fn read_9p_frame<R>(
     reader: &mut R,
@@ -423,29 +416,23 @@ pub(super) async fn read_9p_frame<R>(
 where
     R: AsyncRead + Unpin,
 {
-    Ok(read_9p_frame_charged(
-        reader,
-        shutdown,
-        || false,
-        async |_, _| Ok(FramePlan::<(), ()>::Read(())),
-    )
-    .await?
-    .map(|(frame, _)| frame))
+    Ok(read_9p_frame_charged(reader, shutdown, async |_| Ok(()))
+        .await?
+        .map(|(frame, ())| frame))
 }
 
 /// Read one frame, calling `charge` with its header before allocating the
 /// body. `charge` decides what memory credit covers the frame; shutdown
 /// during the header, the charge or the body ends the read cleanly.
-pub(super) async fn read_9p_frame_charged<R, C, F>(
+pub(super) async fn read_9p_frame_charged<R, C>(
     reader: &mut R,
     shutdown: &CancellationToken,
-    private: impl Fn() -> bool,
-    charge: impl AsyncFnOnce(FrameHeader, Option<ReceivedOp>) -> anyhow::Result<FramePlan<C, F>>,
-) -> anyhow::Result<Option<(Bytes, FramePlan<C, F>)>>
+    charge: impl AsyncFnOnce(FrameHeader) -> anyhow::Result<C>,
+) -> anyhow::Result<Option<(Bytes, C)>>
 where
     R: AsyncRead + Unpin,
 {
-    let mut header = [0u8; P9_HEADER_SIZE + P9_OP_ENVELOPE_LEN];
+    let mut header = [0u8; P9_HEADER_SIZE];
     let header_result = tokio::select! {
         biased;
         _ = shutdown.cancelled() => return Ok(None),
@@ -470,52 +457,24 @@ where
     tokio::select! {
         biased;
         _ = shutdown.cancelled() => return Ok(None),
-        result = reader.read_exact(&mut header[P9_SIZE_FIELD_LEN..P9_HEADER_SIZE]) => { result?; }
+        result = reader.read_exact(&mut header[P9_SIZE_FIELD_LEN..]) => { result?; }
     }
-    let type_byte = header[P9_SIZE_FIELD_LEN];
-    let prefix_len = if private() && P9Message::carries_op_id(type_byte) {
-        let end = frame_len.min(header.len());
-        tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => return Ok(None),
-            result = reader.read_exact(&mut header[P9_HEADER_SIZE..end]) => { result?; }
-        }
-        end
-    } else {
-        P9_HEADER_SIZE
-    };
-    let prefix = &header[..prefix_len];
     let charged = tokio::select! {
         biased;
         _ = shutdown.cancelled() => return Ok(None),
         charged = charge(FrameHeader {
             len: frame_len,
-            type_byte,
-        }, inspect_frame_metadata(prefix, true).received_op) => charged?,
+            type_byte: header[P9_SIZE_FIELD_LEN],
+        }) => charged?,
     };
 
-    if matches!(charged, FramePlan::Refuse(_)) {
-        // An overload refusal needs only the tag. Consume exactly this body
-        // so the next header, including Tflush, remains reachable.
-        let remaining = (frame_len - prefix_len) as u64;
-        let mut body = reader.take(remaining);
-        let mut sink = tokio::io::sink();
-        tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => return Ok(None),
-            result = tokio::io::copy(&mut body, &mut sink) => {
-                anyhow::ensure!(result? == remaining, "truncated refused 9P request");
-            }
-        }
-        return Ok(Some((Bytes::copy_from_slice(prefix), charged)));
-    }
     let mut frame = BytesMut::with_capacity(frame_len);
-    frame.extend_from_slice(prefix);
+    frame.extend_from_slice(&header);
     // The body is initialized by AsyncRead, rather than zero-filled and then
     // immediately overwritten. Keep the read bounded even if the allocator
     // gives BytesMut more capacity than requested: the next frame must remain
     // available for its own admission decision.
-    let mut body = reader.take((frame_len - prefix_len) as u64);
+    let mut body = reader.take((frame_len - P9_HEADER_SIZE) as u64);
     while frame.len() < frame_len {
         let received = tokio::select! {
             biased;

@@ -89,17 +89,11 @@ async fn fragmented_frames_initialize_the_body_only_as_it_arrives() {
             let mut reader = FragmentedReader::new(expected.clone(), private, chunk);
             let dropped = Arc::new(AtomicUsize::new(0));
             let shutdown = CancellationToken::new();
-            let (actual, charge) = read_9p_frame_charged(
-                &mut reader,
-                &shutdown,
-                || private,
-                async |header, operation| {
-                    assert_eq!(header.len, expected.len());
-                    assert_eq!(header.type_byte, T_WRITE);
-                    assert_eq!(operation, private.then_some(([7; P9_OP_ID_LEN], 0, 3)));
-                    Ok(FramePlan::<Credit, ()>::Read(Credit(Arc::clone(&dropped))))
-                },
-            )
+            let (actual, charge) = read_9p_frame_charged(&mut reader, &shutdown, async |header| {
+                assert_eq!(header.len, expected.len());
+                assert_eq!(header.type_byte, T_WRITE);
+                Ok(Credit(Arc::clone(&dropped)))
+            })
             .await
             .unwrap()
             .unwrap();
@@ -126,15 +120,10 @@ async fn charged_reader_leaves_a_pipelined_frame_unread() {
         let mut reader = FragmentedReader::new(stream, private, usize::MAX);
         let shutdown = CancellationToken::new();
         for expected in [&first, &second] {
-            let (actual, _) = read_9p_frame_charged(
-                &mut reader,
-                &shutdown,
-                || private,
-                async |_, _| Ok(FramePlan::<(), ()>::Read(())),
-            )
-            .await
-            .unwrap()
-            .unwrap();
+            let (actual, ()) = read_9p_frame_charged(&mut reader, &shutdown, async |_| Ok(()))
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(actual.as_ref(), expected.as_slice());
             if expected.len() == first.len() {
                 assert_eq!(reader.position, first.len());
@@ -144,47 +133,14 @@ async fn charged_reader_leaves_a_pipelined_frame_unread() {
 }
 
 #[tokio::test]
-async fn refused_body_is_consumed_without_consuming_the_next_frame() {
-    let first = write_frame(128 * 1024, false);
-    let second = write_frame(97, false);
-    let mut stream = first.clone();
-    stream.extend_from_slice(&second);
-    let mut reader = FragmentedReader::new(stream, false, 17);
-    let shutdown = CancellationToken::new();
-    let (prefix, plan) = read_9p_frame_charged(
-        &mut reader,
-        &shutdown,
-        || false,
-        async |_, _| Ok(FramePlan::<(), _>::Refuse(41)),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(prefix.as_ref(), &first[..P9_HEADER_SIZE]);
-    assert!(matches!(plan, FramePlan::Refuse(41)));
-    assert_eq!(reader.position, first.len());
-    assert_eq!(
-        read_9p_frame(&mut reader, &shutdown)
-            .await
-            .unwrap()
-            .unwrap()
-            .as_ref(),
-        second
-    );
-}
-
-#[tokio::test]
 async fn truncated_body_returns_eof_and_releases_admission() {
     let mut frame = write_frame(128 * 1024, true);
     frame.pop();
     let mut reader = FragmentedReader::new(frame, true, 4096);
     let dropped = Arc::new(AtomicUsize::new(0));
-    let result = read_9p_frame_charged(
-        &mut reader,
-        &CancellationToken::new(),
-        || true,
-        async |_, _| Ok(FramePlan::<Credit, ()>::Read(Credit(Arc::clone(&dropped)))),
-    )
+    let result = read_9p_frame_charged(&mut reader, &CancellationToken::new(), async |_| {
+        Ok(Credit(Arc::clone(&dropped)))
+    })
     .await;
     let error = result.err().expect("truncated body must fail");
     assert_eq!(
@@ -199,12 +155,9 @@ async fn body_read_error_releases_admission() {
     let mut reader = FragmentedReader::new(write_frame(128 * 1024, false), false, 4096);
     reader.fail_at = Some(P9_HEADER_SIZE + 4096);
     let dropped = Arc::new(AtomicUsize::new(0));
-    let result = read_9p_frame_charged(
-        &mut reader,
-        &CancellationToken::new(),
-        || false,
-        async |_, _| Ok(FramePlan::<Credit, ()>::Read(Credit(Arc::clone(&dropped)))),
-    )
+    let result = read_9p_frame_charged(&mut reader, &CancellationToken::new(), async |_| {
+        Ok(Credit(Arc::clone(&dropped)))
+    })
     .await;
     let error = result.err().expect("connection reset must fail the read");
     assert_eq!(
@@ -220,12 +173,9 @@ async fn shutdown_during_partial_body_releases_admission() {
     reader.pending_at = Some(P9_HEADER_SIZE + 4096);
     let dropped = Arc::new(AtomicUsize::new(0));
     let shutdown = CancellationToken::new();
-    let read = read_9p_frame_charged(
-        &mut reader,
-        &shutdown,
-        || false,
-        async |_, _| Ok(FramePlan::<Credit, ()>::Read(Credit(Arc::clone(&dropped)))),
-    );
+    let read = read_9p_frame_charged(&mut reader, &shutdown, async |_| {
+        Ok(Credit(Arc::clone(&dropped)))
+    });
     let mut read = std::pin::pin!(read);
     assert!(futures::poll!(read.as_mut()).is_pending());
     assert_eq!(dropped.load(Ordering::SeqCst), 0);
@@ -238,15 +188,12 @@ async fn shutdown_during_partial_body_releases_admission() {
 async fn admission_failure_does_not_read_the_body() {
     for private in [false, true] {
         let mut reader = FragmentedReader::new(write_frame(128 * 1024, private), private, 4096);
-        let result = read_9p_frame_charged(
-            &mut reader,
-            &CancellationToken::new(),
-            || private,
-            async |_, _| Err::<FramePlan<(), ()>, _>(anyhow::anyhow!("admission closed")),
-        )
+        let result = read_9p_frame_charged(&mut reader, &CancellationToken::new(), async |_| {
+            Err::<(), _>(anyhow::anyhow!("admission closed"))
+        })
         .await;
         assert!(result.is_err());
-        assert_eq!(reader.position, reader.body_start);
+        assert_eq!(reader.position, P9_HEADER_SIZE);
     }
 }
 
