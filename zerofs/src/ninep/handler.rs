@@ -761,18 +761,6 @@ impl NinePHandler {
         self.filesystem.dedup.reserve_initial(op_id)
     }
 
-    /// Publish the refusal through the same replicated transaction as other
-    /// terminal mutation outcomes before allowing the reply onto the wire.
-    pub(super) async fn persist_overload_refusal(&self, id: crate::dedup::OpId) -> P9Result<()> {
-        self.ensure_terminal_dedup_result(
-            id,
-            crate::dedup::DedupResult::Error {
-                errno: crate::linux_errno::EAGAIN,
-            },
-        )
-        .await
-    }
-
     /// Commit terminal no-op and error outcomes to the mutation ledger.
     async fn ensure_terminal_dedup_result(
         &self,

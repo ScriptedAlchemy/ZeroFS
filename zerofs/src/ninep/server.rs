@@ -2503,6 +2503,12 @@ mod tests {
             (tag, decode(&bytes))
         }
 
+        /// The next reply, however long it takes.
+        async fn recv_any(&mut self) -> (u16, P9Message) {
+            let (tag, bytes) = self.rx.recv().await.expect("response channel").into_parts();
+            (tag, decode(&bytes))
+        }
+
         async fn recv_flush(&mut self, context: &str) -> u16 {
             let (tag, response) = self.recv(context).await;
             assert!(matches!(response.body, Message::Rflush(Rflush)));
@@ -4512,13 +4518,19 @@ mod tests {
     }
 
     fn maximum_write(tag: u16, private: bool) -> Bytes {
+        maximum_write_to(1, tag, private)
+    }
+
+    /// One write whose frame is exactly the largest a connection accepts, so
+    /// it alone fills the reader's pending envelope.
+    fn maximum_write_to(fid: u32, tag: u16, private: bool) -> Bytes {
         let header =
             ninep_proto::P9_TWRITE_HDR as usize + if private { P9_OP_ENVELOPE_LEN } else { 0 };
         let size = P9_MAX_MSIZE as usize - header;
         let packet = P9Message::new(
             tag,
             Message::Twrite(Twrite {
-                fid: 1,
+                fid,
                 offset: 0,
                 count: size as u32,
                 data: DekuBytes::from(vec![0; size]),
@@ -4530,8 +4542,48 @@ mod tests {
         Bytes::from(packet)
     }
 
+    /// Create an empty file in the root and leave it open for writing on fid 2.
+    async fn create_file_on_fid_2(handler: &NinePHandler) {
+        let walk = handler.handle_message(2, walk_message(1, 2, &[])).await;
+        assert!(matches!(walk.body, Message::Rwalk(_)));
+        let create = handler
+            .handle_message(
+                3,
+                Message::Tlcreate(ninep_proto::Tlcreate {
+                    fid: 2,
+                    name: P9String::new(b"copied".to_vec()),
+                    flags: libc::O_RDWR as u32,
+                    mode: 0o644,
+                    gid: 0,
+                }),
+            )
+            .await;
+        assert!(matches!(create.body, Message::Rlcreate(_)));
+    }
+
+    /// Far longer than any grace the reader ever gave a full envelope. It is
+    /// only ever slept on a paused clock, where it costs no real time.
+    const STALLED_STORAGE: Duration = Duration::from_secs(60);
+
+    /// Generous bound on a reply that is expected. It only ends a hung test.
+    const EVENTUAL_REPLY: Duration = Duration::from_secs(120);
+
+    fn written_bytes(reply: &P9Message) -> Option<u32> {
+        match &reply.body {
+            Message::Rwrite(written) => Some(written.count),
+            _ => None,
+        }
+    }
+
+    /// A Linux kernel copy of a 274 MB file through the native client failed
+    /// with `cp: failed to close: Resource temporarily unavailable`. The client
+    /// pipelines maximum-size writes. One of them fills the pending envelope
+    /// while the connection's request credit is busy, and after one slow
+    /// second the reader answered the next frame with `EAGAIN`, which
+    /// writeback handed to `close`. Slow storage must delay that frame, never
+    /// fail it.
     #[tokio::test]
-    async fn serial_stream_reaches_flush_behind_a_full_pending_envelope() {
+    async fn serial_frame_behind_a_full_pending_envelope_waits_for_storage() {
         for private in [false, true] {
             let (fs, handler) = in_memory_handler().await;
             if private {
@@ -4539,151 +4591,63 @@ mod tests {
             } else {
                 plain_root_session(&handler).await;
             }
-            let prior_id = [0x92; 16];
-            let applied = if private {
-                let Message::Rmkdir(response) = handler
-                    .handle_message_with_op_id(7, prior_id, plain_mkdir(b"already-applied"))
-                    .await
-                    .body
-                else {
-                    panic!("initial mkdir must succeed");
-                };
-                Some(response.qid)
-            } else {
-                None
-            };
+            create_file_on_fid_2(&handler).await;
             let mut connection = SaturatedConnection::start(Arc::clone(&handler));
+            // Storage is slow: the connection's only request slot stays busy.
             let held = connection.admission.admit_request(1, 0).await.unwrap();
-            connection
-                .client
-                .write_all(&maximum_write(10, private))
-                .await
-                .unwrap();
-            let stall = if private {
-                // A ledger-only result needs no local SlateDB write. Hold a
-                // preceding nonempty commit at its write permit to stall the
-                // same worker that will replicate and publish the refusal.
-                let barrier = fs.db.flush_barrier().write_owned().await;
-                let reached = fs.write_coordinator.probe_next_apply();
-                let marker_handler = Arc::clone(&handler);
-                let commit = tokio::spawn(async move {
-                    marker_handler
-                        .handle_message_with_op_id(8, [0x94; 16], plain_mkdir(b"queued-marker"))
-                        .await
-                });
-                tokio::time::timeout(TEST_TIMEOUT, reached)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                Some((barrier, commit))
-            } else {
-                None
-            };
+            let first = maximum_write_to(2, 10, private);
+            let written = (first.len()
+                - ninep_proto::P9_TWRITE_HDR as usize
+                - if private { P9_OP_ENVELOPE_LEN } else { 0 }) as u32;
+            connection.client.write_all(&first).await.unwrap();
             let id = [0x91; 16];
-            let skipped = if private {
-                mkdir_frame(11, id, 0, b"retried-after-refusal")
+            let queued = if private {
+                mkdir_frame(11, id, 0, b"queued-behind-the-write")
             } else {
-                frame(11, root_getattr())
+                frame(11, plain_mkdir(b"queued-behind-the-write"))
             };
-            connection.client.write_all(&skipped).await.unwrap();
-            if private {
-                connection
-                    .client
-                    .write_all(&mkdir_frame(
-                        13,
-                        prior_id,
-                        P9_OP_FLAG_RETRY,
-                        b"already-applied",
-                    ))
-                    .await
-                    .unwrap();
-            }
-            connection
-                .send(12, Message::Tflush(Tflush { oldtag: 10 }))
-                .await;
-            let bound = Duration::from_secs(3);
-            let mut replies = vec![
-                connection
-                    .recv_within(bound, "flush or overload refusal")
-                    .await,
-            ];
-            if let Some((barrier, commit)) = stall {
-                assert_eq!(
-                    replies[0].0, 12,
-                    "Tflush must pass the stalled refusal commit"
+            connection.client.write_all(&queued).await.unwrap();
+
+            // A paused clock advances only once every task is waiting, so
+            // this sleep returns after the reader has done all it can with
+            // both frames, at any execution speed.
+            tokio::time::pause();
+            tokio::time::sleep(STALLED_STORAGE).await;
+            tokio::time::resume();
+            if let Ok(reply) = connection.rx.try_recv() {
+                let (tag, bytes) = reply.into_parts();
+                panic!(
+                    "slow storage must not answer a queued frame: tag {tag} got {:?}",
+                    decode(&bytes).body
                 );
-                assert!(
-                    fs.dedup.get(&id).is_none(),
-                    "a refusal must not be visible before commit"
-                );
-                drop(barrier);
-                assert!(matches!(commit.await.unwrap().body, Message::Rmkdir(_)));
             }
-            replies.push(
-                connection
-                    .recv_within(TEST_TIMEOUT, "remaining reply")
-                    .await,
+            assert!(
+                fs.dedup.get(&id).is_none(),
+                "a queued mutation must not record an outcome before it runs"
             );
-            replies.sort_by_key(|(tag, _)| *tag);
-            assert_eq!(replies[0].0, 11);
-            assert!(matches!(
-                replies[0].1.body,
-                Message::Rlerror(Rlerror {
-                    ecode: crate::linux_errno::EAGAIN
-                })
-            ));
-            assert_eq!(replies[1].0, 12);
-            assert!(matches!(replies[1].1.body, Message::Rflush(_)));
+
             drop(held);
-            if let Some(first_qid) = applied {
-                let (tag, replay) = connection
-                    .recv_within(TEST_TIMEOUT, "prior success on the same connection")
-                    .await;
-                assert_eq!(tag, 13);
-                assert!(matches!(replay.body, Message::Rmkdir(ref r) if r.qid == first_qid));
-                // A caller that lost the refusal must be able to replay it
-                // on a replacement connection as well.
-                let replacement =
-                    NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
-                establish_session(&replacement, 1, b"root", 0, None).await;
-                let refused = replacement
-                    .handle_message_with_op_envelope_origin(
-                        14,
-                        id,
-                        P9_OP_FLAG_RETRY,
-                        0,
-                        plain_mkdir(b"retried-after-refusal"),
-                    )
-                    .await;
-                assert!(matches!(
-                    refused.body,
-                    Message::Rlerror(Rlerror {
-                        ecode: crate::linux_errno::EAGAIN
-                    })
-                ));
-                connection
-                    .client
-                    .write_all(&mkdir_frame(15, [0x93; 16], 0, b"retried-after-refusal"))
-                    .await
-                    .unwrap();
-                assert!(matches!(
-                    connection
-                        .recv_within(TEST_TIMEOUT, "unrelated FIRST stays on the live connection")
-                        .await
-                        .1
-                        .body,
-                    Message::Rmkdir(_)
-                ));
-            }
+            let (tag, reply) = connection
+                .recv_within(EVENTUAL_REPLY, "the write that filled the envelope")
+                .await;
+            assert_eq!(tag, 10);
+            assert_eq!(written_bytes(&reply), Some(written), "{:?}", reply.body);
+            let (tag, reply) = connection
+                .recv_within(EVENTUAL_REPLY, "the frame queued behind the write")
+                .await;
+            assert_eq!(tag, 11);
+            assert!(matches!(reply.body, Message::Rmkdir(_)), "{:?}", reply.body);
+            assert_eq!(walk_errno(&handler, b"queued-behind-the-write").await, None);
             drop(connection.client);
             connection.reader.await.unwrap().unwrap();
         }
     }
 
     #[tokio::test]
-    async fn websocket_reaches_flush_behind_a_full_pending_envelope() {
+    async fn websocket_frame_behind_a_full_pending_envelope_waits_for_storage() {
         let (_, handler) = in_memory_handler().await;
         plain_root_session(&handler).await;
+        create_file_on_fid_2(&handler).await;
         let mut io = DispatchFixture::new(handler, 8);
         let global = P9GlobalAdmission::for_test(64 * 1024 * 1024, 1);
         io.admission = global.connection_for_test(64 * 1024 * 1024, 1);
@@ -4700,35 +4664,45 @@ mod tests {
             connection_shutdown: &shutdown,
             process_shutdown: &shutdown,
         };
-        pending
-            .dispatch(maximum_write(10, false), &context)
+        let first = maximum_write_to(2, 10, false);
+        let written = (first.len() - ninep_proto::P9_TWRITE_HDR as usize) as u32;
+        pending.dispatch(first, &context).await.unwrap();
+        {
+            let queued = pending.dispatch(frame(11, root_getattr()), &context);
+            tokio::pin!(queued);
+            tokio::time::pause();
+            tokio::select! {
+                biased;
+                result = &mut queued => panic!(
+                    "slow storage must not settle a frame that cannot fit: {result:?}"
+                ),
+                _ = tokio::time::sleep(STALLED_STORAGE) => {}
+            }
+            tokio::time::resume();
+            assert!(
+                io.rx.try_recv().is_err(),
+                "slow storage must not answer a queued frame"
+            );
+            drop(held);
+            tokio::time::timeout(EVENTUAL_REPLY, queued)
+                .await
+                .expect("the queued frame is read once the envelope has room")
+                .unwrap();
+        }
+        let (tag, reply) = tokio::time::timeout(EVENTUAL_REPLY, io.recv_any())
             .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(3), async {
-            pending
-                .dispatch(frame(11, root_getattr()), &context)
-                .await
-                .unwrap();
-            pending
-                .dispatch(frame(12, Message::Tflush(Tflush { oldtag: 10 })), &context)
-                .await
-                .unwrap();
-        })
-        .await
-        .expect("the serial WebSocket must reach Tflush");
-        let (tag, reply) = io.recv("ordinary frame refused").await;
+            .expect("the write that filled the envelope");
+        assert_eq!(tag, 10);
+        assert_eq!(written_bytes(&reply), Some(written), "{:?}", reply.body);
+        let (tag, reply) = tokio::time::timeout(EVENTUAL_REPLY, io.recv_any())
+            .await
+            .expect("the frame queued behind the write");
         assert_eq!(tag, 11);
-        assert!(matches!(
-            reply.body,
-            Message::Rlerror(Rlerror {
-                ecode: crate::linux_errno::EAGAIN
-            })
-        ));
-        assert_eq!(
-            io.recv_flush("flush behind refused ordinary frame").await,
-            12
+        assert!(
+            matches!(reply.body, Message::Rgetattr(_)),
+            "{:?}",
+            reply.body
         );
-        drop(held);
     }
 
     #[tokio::test]

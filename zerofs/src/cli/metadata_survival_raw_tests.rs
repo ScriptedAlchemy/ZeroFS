@@ -284,14 +284,25 @@ fn payload(seed: u8, length: usize) -> Bytes {
     bytes.into()
 }
 
+/// Bounds an await that is expected to finish. It only ends a hung test.
+const HANG_GUARD: Duration = Duration::from_secs(300);
+
 /// A checkpoint can wait for the database barrier after the backend cutoff
 /// has already completed. That wait must share the final-pause deadline.
+///
+/// No step races the final pause. The fixture's pause is far longer than a
+/// closed phase takes, so the first attempt reaches the barrier and the retry
+/// completes at any execution speed. The observer then expires the pause by
+/// moving the Tokio clock while it holds the barrier, so the barrier is the
+/// wait that meets the deadline. Moving the clock needs the current-thread
+/// runtime this test runs on.
 #[tokio::test]
 async fn checkpoint_barrier_timeout_reopens_survival_admission() -> Result<()> {
     use crate::metadata_survival::{CommitObserver, CommitPoint, Side};
 
     struct HoldCheckpointBarrier {
         barrier: Arc<tokio::sync::RwLock<()>>,
+        final_pause: Duration,
         held: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     }
 
@@ -300,18 +311,24 @@ async fn checkpoint_barrier_timeout_reopens_survival_admission() -> Result<()> {
         async fn reach(&mut self, point: CommitPoint, side: Side, _: &str, _: &std::path::Path) {
             if point == CommitPoint::BackendCutoff && side == Side::After && self.held.is_none() {
                 self.held = Some(Arc::clone(&self.barrier).read_owned().await);
+                tokio::time::pause();
+                tokio::time::advance(self.final_pause).await;
+                tokio::time::resume();
             }
         }
     }
 
-    let fixture = Fixture::with_cadence(3600, 1000).await;
+    let fixture = Fixture::new().await;
+    let final_pause = Duration::from_millis(fixture.final_pause_milliseconds);
     let running = fixture.start().await?;
     let mut observer = HoldCheckpointBarrier {
         barrier: running.fs().db.flush_barrier(),
+        final_pause,
         held: None,
     };
+    // The guard outlasts the clock the observer moves.
     let attempt = tokio::time::timeout(
-        Duration::from_secs(5),
+        final_pause + HANG_GUARD,
         running.survival().commit_observed(&mut observer),
     )
     .await;
@@ -319,13 +336,13 @@ async fn checkpoint_barrier_timeout_reopens_survival_admission() -> Result<()> {
     let reopened = running.fs().survival_admission.is_open();
     drop(observer);
     let next_write = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         running
             .fs()
             .create_exclusive(&AuthContext::default(), 0, b"after-deferred-cut"),
     )
     .await;
-    let retry = tokio::time::timeout(Duration::from_secs(10), running.survival().commit()).await;
+    let retry = tokio::time::timeout(HANG_GUARD, running.survival().commit()).await;
     running.stop().await;
 
     ensure!(
@@ -338,6 +355,10 @@ async fn checkpoint_barrier_timeout_reopens_survival_admission() -> Result<()> {
     ensure!(
         error.downcast_ref::<SurvivalFailure>() == Some(&SurvivalFailure::Timeout),
         "expected a final-pause timeout, got {error:#}"
+    );
+    ensure!(
+        format!("{error:#}").contains("the checkpoint barrier did not finish"),
+        "the barrier wait must be what met the final pause, got {error:#}"
     );
     ensure!(
         reopened,

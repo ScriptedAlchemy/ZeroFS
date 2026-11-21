@@ -213,7 +213,7 @@ impl P9GlobalAdmission {
             .await
     }
 
-    pub(super) async fn admit_receive_bytes(
+    async fn admit_receive_bytes(
         self: &Arc<Self>,
         permits: u32,
         shutdown: &CancellationToken,
