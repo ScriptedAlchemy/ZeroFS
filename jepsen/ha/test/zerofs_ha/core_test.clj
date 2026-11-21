@@ -163,6 +163,47 @@
         (.delete child)
         (.delete dir)))))
 
+(deftest directory-durability-read-refuses-a-failed-listing
+  (let [dir (.toFile (Files/createTempDirectory
+                      "zerofs-ha-directory-read" (make-array FileAttribute 0)))
+        child (io/file dir "d")
+        entry (io/file child "kept")
+        handles (atom {"d" {:dirname "d"}})
+        dc (core/->DurabilityClient (.getPath dir) handles (atom 0))]
+    (try
+      (is (.mkdir child))
+      (spit entry "value")
+      (is (= {"d" #{"kept"}}
+             (:value (client/invoke! dc {} {:f :readdir}))))
+      (is (.delete entry))
+      (is (.delete child))
+      ;; A failed lookup or an unusable path must not establish absence.
+      (is (thrown? java.io.IOException
+                   (client/invoke! dc {} {:f :readdir})))
+      (spit child "not a directory")
+      (is (thrown? java.io.IOException
+                   (client/invoke! dc {} {:f :readdir})))
+      (finally
+        (.delete entry)
+        (.delete child)
+        (.delete dir)))))
+
+(deftest directory-durability-checker-requires-a-final-observation
+  (let [history [{:type :ok :f :rename
+                  :dir-facts [{:dir "source" :name "moved" :present false}]}
+                 {:type :invoke :f :fsyncdir :dir "source" :process 0}
+                 {:type :ok :f :fsyncdir :dir "source" :process 0}]
+        observed {:type :ok :f :readdir :value {"source" #{}}}
+        check (fn [ops] (checker/check (core/dirent-honesty-checker) {} ops {}))]
+    (is (true? (:valid? (check (conj history observed)))))
+    (is (false? (:valid? (check (conj history (assoc observed :value {"source" #{"moved"}}))))))
+    (doseq [ops [history
+                 (conj history (assoc observed :type :fail :error "Input/output error"))
+                 (conj history (assoc observed :value {}))
+                 (into [observed] history)
+                 (into [observed] (conj history {:type :fail :f :readdir}))]]
+      (is (= :unknown (:valid? (check ops))) (pr-str ops)))))
+
 (deftest unmount-dispatches-to-the-selected-client
   (let [commands (atom [])
         base     {:mount "/tmp/zerofs-ha/mnt"}]

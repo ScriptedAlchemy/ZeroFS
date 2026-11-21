@@ -764,7 +764,9 @@
                                          [dirname (into (sorted-set)
                                                         (map #(.getName %)
                                                              (or (.listFiles (dc-file dir dirname))
-                                                                 (into-array java.io.File []))))])))))))
+                                                                 (throw (java.io.IOException.
+                                                                         (str "Cannot list durability directory: "
+                                                                              (dc-file dir dirname)))))))])))))))
   (teardown! [_ _test] (close-durability-handles! handles))
   ;; Jepsen closes a worker before replacing a crashed logical process. These
   ;; handles belong to the whole test, not that worker: closing them here erases
@@ -1187,15 +1189,15 @@
   listing: a `:present true` entry must be present, a `:present false` entry absent.
   Catches an fsync of a directory that OKs over a lost entry change. `clean-fsyncdir-ok?`
   guards against a fix that just fails every fsyncdir. The final read is `:readdir`,
-  giving {dir -> #{entry names}}."
+  giving {dir -> #{entry names}}. An absent, failed or incomplete final listing
+  leaves the result unknown; it cannot establish that an entry is absent."
   []
   (reify checker/Checker
     (check [_ _test history _opts]
       (let [indexed (vec (map-indexed (fn [i op] (assoc op ::i i)) history))
-            final   (or (->> indexed
-                             (filter #(and (= :ok (:type %)) (= :readdir (:f %))))
-                             last :value)
-                        {})
+            final-op (last (filter #(= :readdir (:f %)) indexed))
+            final (or (:value final-op) {})
+            last-fsync (last (filter #(= :fsyncdir (:f %)) indexed))
             fsyncdirs (->> indexed
                            (reduce (fn [{:keys [pending done]} op]
                                      (if (= :fsyncdir (:f op))
@@ -1222,13 +1224,19 @@
                          (mapcat (fn [op] (map #(assoc % ::i (::i op)) (:dir-facts op)))))
             required (->> facts
                           (filter (fn [f] (= :ok (:result (first-fsyncdir-after (::i f) (:dir f)))))))
+            observed? (and (= :ok (:type final-op))
+                           (> (::i final-op) (get last-fsync ::i -1))
+                           (every? #(contains? final (:dir %)) required))
             violated (->> required
                           (remove (fn [f]
                                     (= (:present f)
                                        (contains? (get final (:dir f) #{}) (:name f)))))
                           vec)
             clean-fsyncdir-ok? (= :ok (:result (last fsyncdirs)))]
-        {:valid?            (and (empty? violated) clean-fsyncdir-ok?)
+        {:valid?            (if observed?
+                              (and (empty? violated) clean-fsyncdir-ok?)
+                              :unknown)
+         :final-read-complete? observed?
          :required-count    (count required)
          :violated-count    (count violated)
          :violated          (vec (take 50 violated))
