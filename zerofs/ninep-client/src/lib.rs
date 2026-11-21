@@ -917,6 +917,10 @@ impl Unsynced {
         if self.reported || self.oldest.is_none() {
             self.oldest = Some(token);
             self.reported = false;
+        } else {
+            // A reply can stay unpolled across a reconnect and arrive after
+            // a write acknowledged on the newer lineage.
+            self.oldest = self.oldest.map(|oldest| oldest.min(token));
         }
         self.generation = self.generation.wrapping_add(1);
     }
@@ -8213,6 +8217,56 @@ mod session_transition_tests {
             );
             assert_eq!(client.state.lock().unwrap().fids[&7].inode_id, 999);
             assert!(returned_requests.try_recv().is_err());
+        }
+
+        async fn retained_write_reply_after_lineage_change(release: bool) {
+            let (conn, mut requests) = test_conn_with_receiver();
+            let client = test_client(Arc::clone(&conn));
+            directory_fid(&client, 5, 50);
+            conn.lineage_token.store(41, Ordering::Relaxed);
+            let mut old_write = Box::pin(client.write(7, 0, b"a"));
+            assert!(futures::poll!(old_write.as_mut()).is_pending());
+            let sent = recv_op_request(&mut requests, "the old lineage's write").await;
+            answer(&conn, &sent);
+
+            // The reply has arrived, but its caller does not poll it until
+            // after a short reconnect and a new write on the same fid.
+            conn.connection_lost(&client.reconnect_notify);
+            let (returned, mut returned_requests) = server_returns(&client);
+            returned.lineage_token.store(42, Ordering::Relaxed);
+            acknowledged_write(&client, &returned, &mut returned_requests, 7).await;
+            assert_eq!(old_write.await.unwrap(), 1);
+            if release {
+                release_handle(&client, &returned, &mut returned_requests, 7, 50).await;
+            }
+
+            let fsync_client = Arc::clone(&client);
+            let fsync = tokio::spawn(async move {
+                if release {
+                    fsync_client.fsync_inode(50, &[5], 5, 0).await
+                } else {
+                    fsync_client.fsync(7, 0).await
+                }
+            });
+            let token = answer_fsync_on_lineage(&returned, &mut returned_requests, 42).await;
+            assert_eq!(
+                token, 41,
+                "the newer write hid the older acknowledged write's lineage"
+            );
+            assert_estale(
+                fsync.await.unwrap(),
+                "the server cannot vouch for the retained reply's write",
+            );
+        }
+
+        #[tokio::test]
+        async fn an_old_write_reply_after_reconnect_keeps_its_older_lineage() {
+            retained_write_reply_after_lineage_change(false).await;
+        }
+
+        #[tokio::test]
+        async fn a_closed_handle_keeps_the_lineage_of_a_retained_write_reply() {
+            retained_write_reply_after_lineage_change(true).await;
         }
 
         async fn retired_fid_with_admitted_caller(xattr: bool) {
