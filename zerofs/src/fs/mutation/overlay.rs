@@ -156,8 +156,9 @@ pub(crate) enum WriteAdmissionError {
     FingerprintMismatch,
     /// Raw byte admission or the preparation gate refused the write.
     Mutation(MutationError),
-    /// Latched metadata-survival admission refused the write (EIO or EROFS).
-    /// A commit's cut only delays a write.
+    /// Latched metadata-survival admission refused the write (EIO or EROFS),
+    /// or the durability tier failed terminally (EIO). A commit's cut only
+    /// delays a write.
     Survival(FsError),
 }
 
@@ -1251,8 +1252,7 @@ impl ZeroFS {
         // Survival admission precedes every other admission step. It logs
         // its own refusals with the latch reason.
         let survival = self
-            .survival_admission
-            .admit_owned()
+            .admit_mutation()
             .await
             .map_err(WriteAdmissionError::Survival)?;
         self.admit_surviving_write(identity, fingerprint, lifetime, scope, length)

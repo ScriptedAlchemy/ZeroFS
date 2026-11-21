@@ -33,6 +33,8 @@ type ObjectWaitHook = Arc<
         + Send
         + Sync,
 >;
+/// Reports why the durability tier can no longer accept new mutations.
+type AdmissionCheck = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 type Reply = oneshot::Sender<Result<(), FsError>>;
 
 #[derive(Debug, Clone)]
@@ -106,6 +108,7 @@ pub struct FlushCoordinator {
     materialize_hook: Arc<OnceLock<MaterializeHook>>,
     object_capture: Arc<OnceLock<CaptureHook>>,
     object_wait: Arc<OnceLock<ObjectWaitHook>>,
+    admission_check: Arc<OnceLock<AdmissionCheck>>,
     pending_capture: PendingCapture,
     db: Arc<Db>,
     worker: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -226,6 +229,7 @@ impl FlushCoordinator {
             materialize_hook,
             object_capture,
             object_wait,
+            admission_check: Arc::new(OnceLock::new()),
             pending_capture: Arc::new(StdMutex::new(None)),
             db,
             worker: Arc::new(Mutex::new(Some(worker))),
@@ -262,6 +266,74 @@ impl FlushCoordinator {
 
     pub(crate) fn set_object_wait(&self, hook: ObjectWaitHook) {
         let _ = self.object_wait.set(hook);
+    }
+
+    /// Install the check that refuses new mutations once the durability tier
+    /// has failed terminally (first call wins).
+    pub(crate) fn set_admission_check(&self, hook: AdmissionCheck) {
+        let _ = self.admission_check.set(hook);
+    }
+
+    /// Route every durability barrier and mutation admission check through
+    /// the local writeback journal in front of the remote backend.
+    pub(crate) fn attach_writeback(
+        &self,
+        writeback: &crate::writeback::store::WritebackObjectStore,
+    ) {
+        let local = writeback.clone();
+        self.set_local_durability_barrier(Arc::new(move || {
+            let writeback = local.clone();
+            Box::pin(async move {
+                writeback
+                    .wait_local_through_accepted()
+                    .await
+                    .map_err(|error| {
+                        tracing::error!("writeback local durability barrier failed: {error}");
+                        FsError::IoError
+                    })
+            })
+        }));
+        let refusing = writeback.clone();
+        self.set_admission_check(Arc::new(move || {
+            refusing.mutation_refusal().map_or(Ok(()), Err)
+        }));
+        let captured = writeback.clone();
+        self.set_object_capture(Arc::new(move || captured.object_coverage()));
+        let waited = writeback.clone();
+        self.set_object_wait(Arc::new(move |coverage, target| {
+            let writeback = waited.clone();
+            Box::pin(async move {
+                match coverage {
+                    ObjectCoverage::DirectRemote => Ok(()),
+                    ObjectCoverage::Writeback {
+                        journal_incarnation,
+                        sequence,
+                    } => writeback
+                        .wait_coverage(
+                            journal_incarnation.as_uuid(),
+                            sequence,
+                            matches!(target, DurabilityTarget::RemoteBackend),
+                        )
+                        .await
+                        .map_err(DurabilityError::Object),
+                }
+            })
+        }));
+    }
+
+    /// EIO if no new mutation can become durable. A mutation admitted then
+    /// would be acknowledged from memory and lost on the next restart.
+    pub(crate) fn check_admission(&self) -> Result<(), FsError> {
+        match self.admission_check.get().map(|check| check()) {
+            Some(Err(reason)) => {
+                tracing::warn!(
+                    reason = reason.as_str(),
+                    "refused a mutation: the durability tier cannot persist it"
+                );
+                Err(FsError::IoError)
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Materialize `cutoff`, then seal+flush+capture under the database

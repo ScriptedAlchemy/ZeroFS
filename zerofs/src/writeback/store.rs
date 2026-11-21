@@ -685,6 +685,16 @@ impl WritebackObjectStore {
         Ok(())
     }
 
+    /// Why no new filesystem mutation can become durable, if that is so:
+    /// the remote scheduler or journaler is terminal, or an admission tier is
+    /// poisoned or closed. Byte and space pressure is not a refusal here;
+    /// it only delays work.
+    pub(crate) fn mutation_refusal(&self) -> Option<String> {
+        self.check_duplicate_admission()
+            .err()
+            .map(|error| error.to_string())
+    }
+
     fn check_duplicate_admission(&self) -> object_store::Result<()> {
         self.ensure_writable()?;
         self.inner

@@ -215,7 +215,6 @@ async fn open_writeback_fs(
     use crate::block_transformer::ZeroFsBlockTransformer;
     use crate::config::CompressionConfig;
     use crate::db::SlateDbHandle;
-    use crate::fs::mutation::durability::{DurabilityError, DurabilityTarget, ObjectCoverage};
 
     let attached = crate::writeback::bootstrap::attach(remote, settings, identity, namespace)
         .await
@@ -254,41 +253,7 @@ async fn open_writeback_fs(
     .expect("open ZeroFS over SSD writeback");
     fs.write_ack = volatile_local_settings();
 
-    let local = writeback.clone();
-    fs.flush_coordinator
-        .set_local_durability_barrier(Arc::new(move || {
-            let writeback = local.clone();
-            Box::pin(async move {
-                writeback
-                    .wait_local_through_accepted()
-                    .await
-                    .map_err(|_| crate::fs::errors::FsError::IoError)
-            })
-        }));
-    let captured = writeback.clone();
-    fs.flush_coordinator
-        .set_object_capture(Arc::new(move || captured.object_coverage()));
-    let waited = writeback.clone();
-    fs.flush_coordinator
-        .set_object_wait(Arc::new(move |coverage, target| {
-            let writeback = waited.clone();
-            Box::pin(async move {
-                match coverage {
-                    ObjectCoverage::DirectRemote => Ok(()),
-                    ObjectCoverage::Writeback {
-                        journal_incarnation,
-                        sequence,
-                    } => writeback
-                        .wait_coverage(
-                            journal_incarnation.as_uuid(),
-                            sequence,
-                            matches!(target, DurabilityTarget::RemoteBackend),
-                        )
-                        .await
-                        .map_err(DurabilityError::Object),
-                }
-            })
-        }));
+    fs.flush_coordinator.attach_writeback(&writeback);
 
     let fs = Arc::new(fs);
     fs.install_volatile_overlay();
@@ -967,4 +932,60 @@ async fn shipping_nfs_listener_rejects_ignore_fsync() {
 
     let error = result.expect_err("NFS must fail closed when fsync is disabled");
     assert!(format!("{error:#}").contains("ignore_fsync"));
+}
+
+/// Once the writeback tier is terminal, nothing it would have to persist is
+/// acknowledged: mutations fail with EIO and leave the namespace unchanged.
+#[tokio::test]
+async fn poisoned_writeback_refuses_mutations_instead_of_acknowledging_them() {
+    use crate::fs::errors::FsError;
+
+    let temp = tempfile::tempdir().expect("temporary SSD writeback directory");
+    let (fs, writeback) = open_writeback_fs(
+        Arc::new(InMemory::new()),
+        writeback_settings(temp.path().join("writeback")),
+        writeback_identity(),
+        "nfs_poisoned_test",
+    )
+    .await;
+    let auth: AuthContext = (&nfs_auth(1000)).into();
+    let creds = Credentials::from_auth_context(&auth);
+    let (kept, _) = fs
+        .create(&creds, 0, b"kept", &SetAttributes::default())
+        .await
+        .expect("create before the writeback failure");
+
+    // What the remote scheduler publishes when writeback becomes terminal.
+    writeback
+        .ssd_admission()
+        .poison("remote writeback entered terminal state (test)");
+
+    assert_eq!(fs.remove(&auth, 0, b"kept").await, Err(FsError::IoError));
+    assert_eq!(
+        fs.rename(&auth, 0, b"kept", 0, b"moved").await,
+        Err(FsError::IoError)
+    );
+    assert_eq!(
+        fs.create(&creds, 0, b"fresh", &SetAttributes::default())
+            .await
+            .map(|_| ()),
+        Err(FsError::IoError)
+    );
+    assert_eq!(
+        fs.mkdir(&creds, 0, b"made", &SetAttributes::default())
+            .await
+            .map(|_| ()),
+        Err(FsError::IoError)
+    );
+    assert_eq!(
+        fs.write(&auth, kept, 0, &bytes::Bytes::from_static(b"volatile"))
+            .await
+            .map(|_| ()),
+        Err(FsError::IoError)
+    );
+
+    assert_eq!(fs.lookup(&creds, 0, b"kept").await, Ok(kept));
+    for absent in [&b"moved"[..], b"fresh", b"made"] {
+        assert_eq!(fs.lookup(&creds, 0, absent).await, Err(FsError::NotFound));
+    }
 }
