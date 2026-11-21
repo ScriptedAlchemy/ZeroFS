@@ -229,6 +229,11 @@ pub(super) struct OpenLane {
     /// `append_gate`, so no new reservation can start — and therefore never
     /// seals a segment containing an unfilled hole.
     pub(super) fill_barrier: tokio::sync::RwLock<()>,
+    /// A copy of `open.segid` that rotation updates under `open`. A WRITE's
+    /// claim reads it to prefer the member the lane is filling, without
+    /// waiting while an apply copies frames into the open buffer. The claim
+    /// only uses it as a placement hint, so a value one rotation old is fine.
+    pub(super) open_segid: std::sync::Mutex<Segid>,
 }
 
 /// A held append gate, bundled with the lane it belongs to. The two are never
@@ -916,6 +921,7 @@ impl ExtentStore {
         // the AEAD binds (segid, frame_index), assigned under the lock. Large
         // batches fan out on rayon; block_in_place needs the multi-thread
         // runtime (tests run current-thread), and small batches stay inline.
+        let compressing = std::time::Instant::now();
         let payloads: Vec<&Bytes> = edits.iter().filter_map(|(_, e)| e.as_ref()).collect();
         let compressed: Vec<Compressed> = if should_parallel_compress(payloads.len())
             && tokio::runtime::Handle::current().runtime_flavor()
@@ -938,6 +944,7 @@ impl ExtentStore {
         };
         #[cfg(test)]
         StagePhaseNanos::add(&phase.compress, t_compress);
+        crate::fs::metrics::record_write_stage("stage_compress", compressing);
         let has_frames = !compressed.is_empty();
         // Frames staged outside a WRITE, such as a truncate's partial last
         // extent, claim exactly what they add.
@@ -958,15 +965,19 @@ impl ExtentStore {
         }
         #[cfg(test)]
         let t_protect = std::time::Instant::now();
+        let protecting = std::time::Instant::now();
         if has_frames {
             // Must precede FrameLoc assignment under `open`.
             self.protect_extent_ref(txn).await;
         }
+        crate::fs::metrics::record_write_stage("stage_protect_ref", protecting);
         #[cfg(test)]
         StagePhaseNanos::add(&phase.protect_ref, t_protect);
         #[cfg(test)]
         let t_gate_wait = std::time::Instant::now();
+        let gating = std::time::Instant::now();
         let append_guard = self.lock_append_lane(id).await;
+        crate::fs::metrics::record_write_stage("stage_append_gate", gating);
         let lane = append_guard.lane();
         #[cfg(test)]
         StagePhaseNanos::add(&phase.gate_wait, t_gate_wait);
@@ -976,9 +987,12 @@ impl ExtentStore {
         if has_frames && lane.open.lock().unwrap().buf.len() >= self.seal_threshold() {
             self.spawn_seal(&append_guard).await?;
         }
+        let funding = std::time::Instant::now();
         if has_frames && let Some(claim) = claim {
             self.fund_lease(&append_guard, claim, &compressed).await?;
         }
+        crate::fs::metrics::record_write_stage("stage_fund_lease", funding);
+        let reserving = std::time::Instant::now();
         #[cfg(test)]
         let t_gate_hold = std::time::Instant::now();
         // Under the gate, claim only what the AAD binds and the buffer layout
@@ -1018,6 +1032,7 @@ impl ExtentStore {
         };
         #[cfg(test)]
         StagePhaseNanos::add(&phase.gate_hold, t_gate_hold);
+        crate::fs::metrics::record_write_stage("stage_reserve", reserving);
         let mut locs = Vec::new();
         if let Some((reservation, fill_guard)) = reserved {
             #[cfg(test)]
@@ -1039,12 +1054,14 @@ impl ExtentStore {
                     })
                 })
                 .collect();
+            let sealing = std::time::Instant::now();
             let sealed = crate::segment::seal_compressed_batch(
                 &self.codec,
                 reservation.segid,
                 reservation.first_frame,
                 frames,
             );
+            crate::fs::metrics::record_write_stage("stage_aead", sealing);
             #[cfg(feature = "failpoints")]
             let sealed = sealed.and_then(|frames| batch_seal_failpoint().map(|()| frames));
             #[cfg(test)]
@@ -1064,6 +1081,7 @@ impl ExtentStore {
             })?;
             #[cfg(test)]
             let t_open_lock = std::time::Instant::now();
+            let filling = std::time::Instant::now();
             let mut open = lane.open.lock().unwrap();
             #[cfg(test)]
             StagePhaseNanos::add(&phase.open_lock_wait, t_open_lock);
@@ -1074,7 +1092,9 @@ impl ExtentStore {
             StagePhaseNanos::add(&phase.append, t_append);
             drop(open);
             drop(fill_guard);
+            crate::fs::metrics::record_write_stage("stage_fill", filling);
         }
+        let indexing = std::time::Instant::now();
         #[cfg(test)]
         let t_txn_stage = std::time::Instant::now();
         let mut locs = locs.into_iter();
@@ -1109,6 +1129,8 @@ impl ExtentStore {
         }
         #[cfg(test)]
         StagePhaseNanos::add(&phase.txn_stage, t_txn_stage);
+        crate::fs::metrics::record_write_stage("stage_index", indexing);
+        let rotating = std::time::Instant::now();
         if let Some(append_guard) = rotate_guard {
             #[cfg(test)]
             let t_spawn_seal = std::time::Instant::now();
@@ -1121,6 +1143,7 @@ impl ExtentStore {
             #[cfg(test)]
             StagePhaseNanos::add(&phase.spawn_seal, t_spawn_seal);
         }
+        crate::fs::metrics::record_write_stage("stage_rotate", rotating);
         Ok(())
     }
 
@@ -1164,8 +1187,14 @@ impl ExtentStore {
         };
         // Prefer the member the inode's lane is filling, so its segment grows
         // instead of rotating early.
-        let prefer = pool.lease_member(self.open_lane(id).open.lock().unwrap().segid);
-        match pool.admit(bytes, prefer).await {
+        let preferring = std::time::Instant::now();
+        let open_segid = *self.open_lane(id).open_segid.lock().unwrap();
+        let prefer = pool.lease_member(open_segid);
+        crate::fs::metrics::record_write_stage("claim_prefer", preferring);
+        let admitting = std::time::Instant::now();
+        let admitted = pool.admit(bytes, prefer).await;
+        crate::fs::metrics::record_write_stage("claim_pool_admit", admitting);
+        match admitted {
             Ok(claim) => Ok(Some(claim)),
             Err(error) if crate::retrying_object_store::is_no_space(&error) => {
                 Err(FsError::NoSpace)
@@ -1315,6 +1344,7 @@ impl ExtentStore {
         let buf = std::mem::replace(&mut open.buf, replacement);
         open.dir.clear();
         open.segid = self.segments.next_segid();
+        *freeze.lane.open_segid.lock().unwrap() = open.segid;
         debug_assert_ne!(
             open.segid, segid,
             "rotated open segid must differ from the sealed one"
@@ -1470,7 +1500,9 @@ impl ExtentStore {
     /// while this waits for a residency permit and while it drains reservations
     /// already in flight.
     async fn spawn_seal(&self, appended: &LaneAppendGuard<'_>) -> Result<(), FsError> {
+        let waiting = std::time::Instant::now();
         let residency = self.acquire_residency().await?;
+        crate::fs::metrics::record_write_stage("seal_residency_wait", waiting);
         let freeze = LaneFreeze::acquire(appended).await;
         let (segid, _) =
             match self.rotate_sealing_generation(&freeze, residency, SegmentFormatLimits::WIRE) {
@@ -1596,6 +1628,7 @@ impl ExtentStore {
         // partially-overwritten extents, and each edited extent's current
         // FrameLoc -- so it must not run while a queued write owns any of
         // these extents. Disjoint ranges are unaffected.
+        let preparing = std::time::Instant::now();
         self.inflight_writes
             .wait_for_overlap(id, start_extent, end_extent)
             .await;
@@ -1663,6 +1696,7 @@ impl ExtentStore {
             }
         }
 
+        crate::fs::metrics::record_write_stage("stage_split_extents", preparing);
         // All frame locations and the inode update still publish in one
         // transaction, even when the data spans several sealed objects.
         for batch in edits.chunks(self.max_append_extents) {

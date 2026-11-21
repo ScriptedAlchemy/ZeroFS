@@ -5,7 +5,12 @@
 # BENCH_WRITERS (default 1; files of BENCH_PAYLOAD_MIB written at once),
 # BENCH_CRASH_REPLAY=1 (no timing: SIGKILL the engine after fsync, then replay the copy),
 # BENCH_FLUSH_DELAY_US (preload flush_shim.c on the P3 loop, adding this delay per sync),
-# BENCH_PERF=1 (sample the engine and FUSE client during the first copy; needs an image with perf),
+# BENCH_PERF=1 (sample the engine and FUSE client with call graphs during the first copy; needs an
+# image with perf and binaries built with frame pointers and symbols),
+# BENCH_P3_NO_SYNC=1 (with BENCH_FLUSH_DELAY_US: delay the P3 loop's syncs without issuing them, so
+# the fixture disk does not limit the copy; not a durable run),
+# BENCH_ALIGNED=1 (write from a page-aligned buffer, so FUSE direct I/O does not split a write),
+# BENCH_STAGES=1 (report each stage's queue depth and each thread's CPU for every copy),
 # BENCH_MEMBER_PUT_DELAY_MS (pace member PUTs so read-back finds the copy in the P3 journal).
 set -euo pipefail
 
@@ -60,5 +65,8 @@ docker run --rm --name "$name" --label "$label=$owner" --pull never \
     ${BENCH_WRITERS:+-e "BENCH_WRITERS=$BENCH_WRITERS"} \
     ${BENCH_CRASH_REPLAY:+-e "BENCH_CRASH_REPLAY=$BENCH_CRASH_REPLAY"} \
     ${BENCH_PERF:+-e "BENCH_PERF=$BENCH_PERF" --cap-add PERFMON} \
+    ${BENCH_STAGES:+-e "BENCH_STAGES=$BENCH_STAGES"} \
+    ${BENCH_ALIGNED:+-e "BENCH_ALIGNED=$BENCH_ALIGNED"} \
+    ${BENCH_P3_NO_SYNC:+-e "BENCH_P3_NO_SYNC=$BENCH_P3_NO_SYNC"} \
     ${BENCH_MEMBER_PUT_DELAY_MS:+-e "BENCH_MEMBER_PUT_DELAY_MS=$BENCH_MEMBER_PUT_DELAY_MS"} \
     "$image" timeout --kill-after=30s 90m python3 -u /h/journal_flush_bench.py

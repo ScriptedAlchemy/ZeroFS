@@ -1,7 +1,11 @@
 // LD_PRELOAD shim for journal_flush_bench.py. On the one loop device named by
 // FLUSH_SHIM_MINOR it logs every positioned write and data sync with the
 // fd's last written offset, and optionally adds FLUSH_SHIM_DELAY_US after
-// each sync to model a slower device flush. Other descriptors pass through.
+// each sync to model a slower device flush. With FLUSH_SHIM_SKIP_SYNC=1 the
+// sync on that device is not issued at all, only logged and delayed: the
+// bytes stay in the page cache, so the run shows what the engine does above a
+// device that is not the limit, and proves nothing about durability. Other
+// descriptors pass through.
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -16,6 +20,7 @@
 #define MAX_FD 65536
 static int target_minor = -1;
 static long delay_us;
+static int skip_sync;
 static int log_fd = -1;
 static long long last_offset[MAX_FD];
 
@@ -23,6 +28,8 @@ __attribute__((constructor)) static void init(void) {
     const char *minor = getenv("FLUSH_SHIM_MINOR");
     const char *delay = getenv("FLUSH_SHIM_DELAY_US");
     const char *path = getenv("FLUSH_SHIM_LOG");
+    const char *skip = getenv("FLUSH_SHIM_SKIP_SYNC");
+    if (skip) skip_sync = atoi(skip);
     if (minor) target_minor = atoi(minor);
     if (delay) delay_us = atol(delay);
     if (path) log_fd = open(path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
@@ -79,11 +86,11 @@ static int synced(int fd, int result) {
 int fdatasync(int fd) {
     static int (*real)(int);
     if (!real) real = dlsym(RTLD_NEXT, "fdatasync");
-    return synced(fd, real(fd));
+    return synced(fd, skip_sync && on_target(fd) ? 0 : real(fd));
 }
 
 int fsync(int fd) {
     static int (*real)(int);
     if (!real) real = dlsym(RTLD_NEXT, "fsync");
-    return synced(fd, real(fd));
+    return synced(fd, skip_sync && on_target(fd) ? 0 : real(fd));
 }

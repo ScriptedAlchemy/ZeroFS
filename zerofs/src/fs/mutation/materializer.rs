@@ -621,6 +621,7 @@ async fn run_lane_job(materializer: &Materializer, _inode: u64, job: LaneJob) {
             sequence,
         } => {
             let shutdown = runtime.shutdown_token();
+            let started = std::time::Instant::now();
             let lifecycle = AssertUnwindSafe(async {
                 tokio::select! {
                     biased;
@@ -645,6 +646,7 @@ async fn run_lane_job(materializer: &Materializer, _inode: u64, job: LaneJob) {
             })
             .catch_unwind()
             .await;
+            crate::fs::metrics::record_write_stage("materialize_member", started);
             match lifecycle {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => {

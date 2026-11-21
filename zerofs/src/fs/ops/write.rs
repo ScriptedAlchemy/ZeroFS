@@ -287,6 +287,7 @@ pub(crate) async fn prepare_write_with_append(
         let guards = previous.guards.upgrade()?;
         Some((guards, previous.inode, previous.writes))
     });
+    let locking = std::time::Instant::now();
     let (guards, mut projected_inode, previous_writes) = match continuation {
         Some((guards, inode, writes)) => (guards, Some(inode), writes),
         None => {
@@ -295,6 +296,8 @@ pub(crate) async fn prepare_write_with_append(
         }
     };
 
+    crate::fs::metrics::record_write_stage("prepare_inode_lock", locking);
+    let overlapping = std::time::Instant::now();
     for member in &request.members {
         let span = ExtentStore::extent_span(member.offset, member.data.len() as u64);
         if let Some((start_extent, end_extent)) = span {
@@ -303,6 +306,7 @@ pub(crate) async fn prepare_write_with_append(
                 .await;
         }
     }
+    crate::fs::metrics::record_write_stage("prepare_inflight_overlap", overlapping);
 
     if let Some(result) = replayed_batch(fs, &request)? {
         drop(guards);
@@ -378,10 +382,12 @@ pub(crate) async fn prepare_write_with_append(
         }
         // Room for the frames before the reply: a WRITE the pool cannot
         // place answers ENOSPC here instead of failing a later flush.
+        let claiming = std::time::Instant::now();
         let capacity = fs
             .extent_store
             .claim_write(member.id, member.offset, member.data.len() as u64)
             .await?;
+        crate::fs::metrics::record_write_stage("prepare_claim", claiming);
 
         let (now_sec, now_nsec) = get_current_time();
         let mode = mode_after_content_change(file.mode, &creds);
@@ -477,6 +483,7 @@ pub(crate) async fn apply_prepared_batch(
 
     let mut txn = fs.db.new_transaction()?;
     let mut tail_updates = Vec::new();
+    let staging = std::time::Instant::now();
 
     for member in &mut batch.members {
         if member.data.is_empty() {
@@ -525,6 +532,7 @@ pub(crate) async fn apply_prepared_batch(
         );
     }
 
+    crate::fs::metrics::record_write_stage("apply_stage", staging);
     let db_write_start = std::time::Instant::now();
     let mut queued_extents = Vec::new();
     for member in &batch.members {
@@ -569,6 +577,7 @@ pub(crate) async fn apply_prepared_batch(
     )?;
     batch.guards = None;
     pending.wait().await?;
+    crate::fs::metrics::record_write_stage("apply_commit", db_write_start);
     debug!("DB write took: {:?}", db_write_start.elapsed());
 
     #[cfg(feature = "failpoints")]
