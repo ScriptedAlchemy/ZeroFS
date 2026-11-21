@@ -43,6 +43,21 @@ impl ZeroFS {
         attr: &SetAttributes,
         op_id: crate::dedup::OpId,
     ) -> Result<(InodeId, FileAttributes), FsError> {
+        let result = self
+            .symlink_applied(creds, dirid, linkname, target, attr, op_id)
+            .await;
+        self.stable_reply(result).await
+    }
+
+    async fn symlink_applied(
+        &self,
+        creds: &Credentials,
+        dirid: InodeId,
+        linkname: &[u8],
+        target: &[u8],
+        attr: &SetAttributes,
+        op_id: crate::dedup::OpId,
+    ) -> Result<(InodeId, FileAttributes), FsError> {
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_symlink)? {
             return Ok(result);
         }
@@ -211,6 +226,20 @@ impl ZeroFS {
     /// `link` tagged with an idempotency op-id: an applied retry returns success
     /// instead of EEXIST. See [`Self::create_idempotent`].
     pub(crate) async fn link_idempotent(
+        &self,
+        auth: &AuthContext,
+        fileid: InodeId,
+        linkdirid: InodeId,
+        linkname: &[u8],
+        op_id: crate::dedup::OpId,
+    ) -> Result<(InodeId, FileAttributes), FsError> {
+        let result = self
+            .link_applied(auth, fileid, linkdirid, linkname, op_id)
+            .await;
+        self.stable_reply(result).await
+    }
+
+    async fn link_applied(
         &self,
         auth: &AuthContext,
         fileid: InodeId,

@@ -413,8 +413,41 @@ impl ZeroFS {
         .map(|_| ())
     }
 
+    /// A rename is stable before it returns; see
+    /// [`ZeroFS::namespace_replies_are_stable`].
     #[allow(clippy::too_many_arguments)]
     async fn rename_with_options(
+        &self,
+        auth: &AuthContext,
+        from_dirid: u64,
+        from_name: &[u8],
+        source_match: NameMatch,
+        to_dirid: u64,
+        to_name: &[u8],
+        op_id: crate::dedup::OpId,
+        replace_existing: bool,
+        expected_source: Option<InodeId>,
+        verification: Option<VerifiedFileExpectation>,
+    ) -> Result<RenameCompletion, FsError> {
+        let result = self
+            .rename_applied(
+                auth,
+                from_dirid,
+                from_name,
+                source_match,
+                to_dirid,
+                to_name,
+                op_id,
+                replace_existing,
+                expected_source,
+                verification,
+            )
+            .await;
+        self.stable_reply(result).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn rename_applied(
         &self,
         auth: &AuthContext,
         from_dirid: u64,

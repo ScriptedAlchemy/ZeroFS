@@ -133,7 +133,23 @@ impl ZeroFS {
         .await
     }
 
+    /// A client SETATTR is stable before it returns; see
+    /// [`ZeroFS::namespace_replies_are_stable`].
     async fn setattr_idempotent_inner(
+        &self,
+        creds: &Credentials,
+        id: InodeId,
+        setattr: &SetAttributes,
+        op_id: crate::dedup::OpId,
+        size_authorization: SizeAuthorization,
+    ) -> Result<FileAttributes, FsError> {
+        let result = self
+            .setattr_applied(creds, id, setattr, op_id, size_authorization)
+            .await;
+        self.stable_reply(result).await
+    }
+
+    async fn setattr_applied(
         &self,
         creds: &Credentials,
         id: InodeId,

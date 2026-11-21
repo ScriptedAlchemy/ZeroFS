@@ -69,6 +69,38 @@ impl ZeroFS {
             .map_err(FsError::from)
     }
 
+    /// Whether namespace and attribute replies wait for local durability.
+    ///
+    /// NFSv3 (RFC 1813) requires CREATE, MKDIR, SYMLINK, MKNOD, REMOVE,
+    /// RMDIR, RENAME, LINK and SETATTR to reach stable storage before the
+    /// reply, and SMB clients expect the same. UNFS3 and Samba issue plain
+    /// syscalls for these and never fsync the parent directory, so the engine
+    /// is the only place the guarantee can be kept. It applies in front of
+    /// the local writeback journal. Ordinary WRITE data keeps its configured
+    /// acknowledgement and is covered by COMMIT, fsync or FLUSH. Without
+    /// writeback every reply would wait for the remote backend, so the
+    /// direct-remote mode keeps its historical deferred metadata.
+    pub(crate) fn namespace_replies_are_stable(&self) -> bool {
+        !self.ignore_fsync
+            && self.write_ack.client_durability_target
+                == crate::fs::mutation::config::ClientDurabilityTarget::LocalSsd
+    }
+
+    /// Make a successful namespace or attribute mutation durable before its
+    /// reply. Callers have already released their locks and fence, so
+    /// concurrent mutations share one seal, flush and journal wait.
+    pub(crate) async fn stable_reply<T>(&self, result: Result<T, FsError>) -> Result<T, FsError> {
+        let value = result?;
+        if self.namespace_replies_are_stable() {
+            let target = DurabilityTarget::from(self.write_ack.client_durability_target);
+            self.flush_coordinator
+                .durable_applied(target)
+                .await
+                .map_err(FsError::from)?;
+        }
+        Ok(value)
+    }
+
     /// Admit one top-level mutation: refuse it when the durability tier has
     /// failed, then take the survival admission token. Never call while
     /// holding an inode, pool, catalog or database lock.

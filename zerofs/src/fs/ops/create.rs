@@ -58,7 +58,24 @@ impl ZeroFS {
             .await
     }
 
+    /// A create is stable before it returns; see
+    /// [`ZeroFS::namespace_replies_are_stable`].
     pub(crate) async fn create_with_umask(
+        &self,
+        creds: &Credentials,
+        dirid: InodeId,
+        name: &[u8],
+        attr: &SetAttributes,
+        op_id: crate::dedup::OpId,
+        umask: u32,
+    ) -> Result<(InodeId, FileAttributes), FsError> {
+        let result = self
+            .create_applied(creds, dirid, name, attr, op_id, umask)
+            .await;
+        self.stable_reply(result).await
+    }
+
+    async fn create_applied(
         &self,
         creds: &Credentials,
         dirid: InodeId,
@@ -270,6 +287,21 @@ impl ZeroFS {
         op_id: crate::dedup::OpId,
         umask: u32,
     ) -> Result<(InodeId, FileAttributes), FsError> {
+        let result = self
+            .mkdir_applied(creds, dirid, name, attr, op_id, umask)
+            .await;
+        self.stable_reply(result).await
+    }
+
+    async fn mkdir_applied(
+        &self,
+        creds: &Credentials,
+        dirid: InodeId,
+        name: &[u8],
+        attr: &SetAttributes,
+        op_id: crate::dedup::OpId,
+        umask: u32,
+    ) -> Result<(InodeId, FileAttributes), FsError> {
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_mkdir)? {
             return Ok(result);
         }
@@ -461,6 +493,24 @@ impl ZeroFS {
     /// existing node instead of EEXIST. See [`Self::create_idempotent`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn mknod_idempotent(
+        &self,
+        creds: &Credentials,
+        dirid: InodeId,
+        name: &[u8],
+        ftype: FileType,
+        attr: &SetAttributes,
+        rdev: Option<(u32, u32)>,
+        op_id: crate::dedup::OpId,
+        umask: u32,
+    ) -> Result<(InodeId, FileAttributes), FsError> {
+        let result = self
+            .mknod_applied(creds, dirid, name, ftype, attr, rdev, op_id, umask)
+            .await;
+        self.stable_reply(result).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn mknod_applied(
         &self,
         creds: &Credentials,
         dirid: InodeId,

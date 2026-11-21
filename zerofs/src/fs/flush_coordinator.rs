@@ -336,6 +336,18 @@ impl FlushCoordinator {
         }
     }
 
+    /// Seal+flush+capture under the database barrier, then wait the requested
+    /// object target. Unlike [`Self::durable_through`] this materializes no
+    /// volatile writes: it covers what the database already holds, which is
+    /// every applied metadata commit. Concurrent callers share one capture.
+    pub(crate) async fn durable_applied(
+        &self,
+        target: DurabilityTarget,
+    ) -> Result<(), DurabilityError> {
+        let coverage = self.capture_under_barrier().await?;
+        self.wait_object(coverage, target).await
+    }
+
     /// Materialize `cutoff`, then seal+flush+capture under the database
     /// barrier, then wait the requested object target after releasing it.
     pub(crate) async fn durable_through(

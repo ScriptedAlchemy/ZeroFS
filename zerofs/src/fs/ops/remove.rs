@@ -159,8 +159,35 @@ impl ZeroFS {
         .map(|_| ())
     }
 
+    /// A remove is stable before it returns; see
+    /// [`ZeroFS::namespace_replies_are_stable`].
     #[allow(clippy::too_many_arguments)]
     async fn remove_idempotent_inner(
+        &self,
+        auth: &AuthContext,
+        dirid: InodeId,
+        name: &[u8],
+        name_match: NameMatch,
+        op_id: crate::dedup::OpId,
+        expected_directory: Option<bool>,
+        expected_entry: Option<(InodeId, u64)>,
+    ) -> Result<bool, FsError> {
+        let result = self
+            .remove_applied(
+                auth,
+                dirid,
+                name,
+                name_match,
+                op_id,
+                expected_directory,
+                expected_entry,
+            )
+            .await;
+        self.stable_reply(result).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn remove_applied(
         &self,
         auth: &AuthContext,
         dirid: InodeId,

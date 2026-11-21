@@ -934,6 +934,108 @@ async fn shipping_nfs_listener_rejects_ignore_fsync() {
     assert!(format!("{error:#}").contains("ignore_fsync"));
 }
 
+/// RFC 1813 namespace and attribute replies wait for the local durability
+/// barrier; only WRITE data may stay volatile until COMMIT.
+#[tokio::test]
+async fn namespace_replies_wait_for_local_durability() {
+    use crate::fs::types::SetMode;
+
+    let (fs, adapter, file) = volatile_adapter(b"namespace-subject").await;
+    let adapter = Arc::new(adapter);
+    let (entered, release) = blocking_local_barrier(&fs);
+    let auth = nfs_auth(1000);
+
+    async fn waits<T: Send + 'static>(
+        label: &str,
+        entered: &Notify,
+        release: &Notify,
+        operation: tokio::task::JoinHandle<T>,
+    ) -> T {
+        let mut operation = operation;
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap_or_else(|_| panic!("{label} did not reach the local durability barrier"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut operation)
+                .await
+                .is_err(),
+            "{label} replied before local durability completed"
+        );
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), operation)
+            .await
+            .unwrap_or_else(|_| panic!("{label} did not resume"))
+            .unwrap_or_else(|_| panic!("{label} panicked"))
+    }
+
+    let create = tokio::spawn({
+        let (adapter, auth) = (Arc::clone(&adapter), auth.clone());
+        async move {
+            adapter
+                .create(&auth, 0, &filename(b"created"), sattr3::default())
+                .await
+        }
+    });
+    waits("CREATE", &entered, &release, create).await.unwrap();
+
+    let mkdir = tokio::spawn({
+        let (adapter, auth) = (Arc::clone(&adapter), auth.clone());
+        async move {
+            adapter
+                .mkdir(&auth, 0, &filename(b"made"), &sattr3::default())
+                .await
+        }
+    });
+    waits("MKDIR", &entered, &release, mkdir).await.unwrap();
+
+    let rename = tokio::spawn({
+        let (adapter, auth) = (Arc::clone(&adapter), auth.clone());
+        async move {
+            adapter
+                .rename(&auth, 0, &filename(b"created"), 0, &filename(b"renamed"))
+                .await
+        }
+    });
+    waits("RENAME", &entered, &release, rename).await.unwrap();
+
+    let remove = tokio::spawn({
+        let (adapter, auth) = (Arc::clone(&adapter), auth.clone());
+        async move { adapter.remove(&auth, 0, &filename(b"renamed")).await }
+    });
+    waits("REMOVE", &entered, &release, remove).await.unwrap();
+
+    let setattr = tokio::spawn({
+        let fs = Arc::clone(&fs);
+        async move {
+            fs.setattr(
+                &Credentials::from_auth_context(&(&nfs_auth(1000)).into()),
+                file,
+                &SetAttributes {
+                    mode: SetMode::Set(0o600),
+                    ..Default::default()
+                },
+            )
+            .await
+        }
+    });
+    waits("SETATTR", &entered, &release, setattr).await.unwrap();
+
+    // An UNSTABLE WRITE still replies from memory without the barrier.
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        adapter.write_with_context(
+            &write_context(700, 70, stable_how::UNSTABLE),
+            &auth,
+            file,
+            0,
+            b"volatile data",
+        ),
+    )
+    .await
+    .expect("UNSTABLE WRITE waited for local durability")
+    .expect("UNSTABLE WRITE failed");
+}
+
 /// Once the writeback tier is terminal, nothing it would have to persist is
 /// acknowledged: mutations fail with EIO and leave the namespace unchanged.
 #[tokio::test]
