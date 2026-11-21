@@ -1,0 +1,222 @@
+{
+  "schema_version": 1,
+  "baseline_commit": "20fc0f403ead3166cb6a42b4d45c98676858cd75",
+  "incoming_reviewed_commit": "63ad64ce3da264a6046193a03c944d1a993857f1",
+  "incoming_scope": "Two commits add physical NAS benchmark documentation only; production source matches the original review baseline.",
+  "scope": "Local validation of final production-source content, using isolated or extracted-source harnesses to fit the available compiler memory. This is not a full cargo test or NAS acceptance result.",
+  "source_snapshot_files_verified_unchanged": 276,
+  "changed_source_sha256": {
+    "zerofs/src/frame_codec.rs": "084c0d29ac7cd64b3f5f824892588cb692f0592581324fa4cbfeb813cdf76dce",
+    "zerofs/src/fs/mutation/overlay.rs": "91017e459e503d88bbd8b7a4349fb661b8ca8d95a5e952431333361200237558",
+    "zerofs/src/fs/mutation/overlay/sequential_write_tests.rs": "abf0e895cad52652e7c52943ac8cf5ec5e793d4413372036f259400a260b4c72",
+    "zerofs/src/fs/mutation/types.rs": "35f501e80f29e9df48a9c34c3706e69b3ccbf7a8bb096312819cc9ee47beaa6e",
+    "zerofs/src/fs/ops/write.rs": "5b384450640512226f2334eae78b720849534cd624b9ab9e27002cbb797be996",
+    "zerofs/src/fs/store/extent/mod.rs": "d3a2bdf966d24264a296d4ff499238828ae8fc727299ae64af1e6731701942c7",
+    "zerofs/src/fs/store/extent/write.rs": "353b22d1fb1c31474946aa829c496d7a14982b373077d4dfaa5fbabca6c52d12",
+    "zerofs/src/local_object_store.rs": "1db843e2751dd9d7cef5384138e68058fb3cc7397c18d926e9d7b1b24c64c74d",
+    "zerofs/src/local_object_store/worker.rs": "0ef2fb39c3dbac5fb378aff8b6c7d6491c5ce229bfbb96471aad6ecc60ce03aa",
+    "zerofs/src/ninep/handler.rs": "ddb7380245c036916292252400596d14a4327e9eabee4d2f832f0443ba0eccce",
+    "zerofs/src/ninep/handler/io_context_tests.rs": "6120fb95764244c38ca094f7788ff0b1a8282fb33b67c7d1168b921edd79bee8",
+    "zerofs/src/ninep/server/frame_codec.rs": "a4969560d5f4789226c5d2b26408b0246c9559fc825009ac5a85a2a5268e6070",
+    "zerofs/src/ninep/server/frame_codec/reader_tests.rs": "ae9fed6bf5afc6285168ccb52c31024e035ac3266749d7574c04ca077ec73bd8",
+    "zerofs/src/ninep/server/session.rs": "6f721faff61af409acc9384ece327e28da1dc76c9f8bbe97268f5f604e8d5e43",
+    "zerofs/src/writeback/journal.rs": "c6865ea026645b10d8e3a383c0d1753da38eb7b4109272bea7fd93cc66ccab02",
+    "zerofs/src/writeback/remote.rs": "218542edc1eba0e003633dc8d79e570202384d6333fa2826f5c762a1e46749fe",
+    "zerofs/src/writeback/remote_streaming_tests.rs": "da08b7e9545412a9f0eb082273a33945403ceb721998a5c822f1272f5daddf25"
+  },
+  "gates": {
+    "format": {
+      "command": "cargo fmt --all -- --check",
+      "exit_code": 0
+    },
+    "production_clippy": {
+      "command": "cargo clippy --locked --offline --no-default-features --features webui -p zerofs --lib -- -D warnings",
+      "exit_code": 0,
+      "seconds": 67.07070425500206,
+      "note": "An existing Cargo manifest warning about homepage/documentation duplication is outside rustc Clippy; no Rust lint failed."
+    },
+    "selected_test_clippy": {
+      "command": "clippy-driver with the exact combined extracted-source harness arguments, --emit=metadata -D warnings",
+      "exit_code": 0,
+      "seconds": 55.28707851499712,
+      "note": "The source harness allows dead_code and unused_imports for fixture extraction, and excludes the CLI entrypoint. This does not replace all-target hosted Clippy."
+    }
+  },
+  "isolated_suites": [
+    {
+      "suite": "journal module",
+      "passed": 100,
+      "failed": 0,
+      "ignored": 2,
+      "measured": 0,
+      "filtered_out": 58,
+      "log_sha256": "5e95b8a6a8b89820eedb6f7f171a257e55d7f97b3bc373d23164dddff08735fd"
+    },
+    {
+      "suite": "local object-store, pool and worker modules",
+      "passed": 22,
+      "failed": 0,
+      "ignored": 1,
+      "measured": 0,
+      "filtered_out": 0,
+      "log_sha256": "826cfaeaea0db84859b3d52efdbc19e00bced7830c2edf735597430ce7e93c0b"
+    },
+    {
+      "suite": "frame codec module",
+      "passed": 11,
+      "failed": 0,
+      "ignored": 0,
+      "measured": 0,
+      "filtered_out": 0,
+      "log_sha256": "bcb108988b4f12fa917b650d1760860fb104885198ce4b92f06bbfd4184035d8"
+    },
+    {
+      "suite": "9P frame reader and dot-path helper",
+      "passed": 9,
+      "failed": 0,
+      "ignored": 0,
+      "measured": 0,
+      "filtered_out": 0,
+      "log_sha256": "1b2f12033e5994207318e577d4aaf5ab3ee911860dfc2ee769203fd6cd696cf5"
+    }
+  ],
+  "isolated_suite_notes": [
+    "The 9P suite contains eight frame-reader checks plus the dot-path helper also exercised in the integration suite; counts should not be summed as unique tests.",
+    "Two journal throughput benchmarks require a real disk and release build and stayed ignored.",
+    "The local-worker diagnostic benchmark is ignored in the ordinary test invocation; its separate run is recorded in measurements.json."
+  ],
+  "combined_integration": {
+    "build_exit_code": 0,
+    "passed": 25,
+    "failed": 0,
+    "selectors": [
+      {
+        "selector": "cache_retention",
+        "exit_code": 0,
+        "seconds": 0.17377076399861835
+      },
+      {
+        "selector": "cache_budget",
+        "exit_code": 0,
+        "seconds": 0.06685780599946156
+      },
+      {
+        "selector": "cache_shards",
+        "exit_code": 0,
+        "seconds": 0.15118855399850872
+      },
+      {
+        "selector": "extent_edges",
+        "exit_code": 0,
+        "seconds": 0.1145829759989283
+      },
+      {
+        "selector": "extent_read_error",
+        "exit_code": 0,
+        "seconds": 0.06483137299801456
+      },
+      {
+        "selector": "extent_maximum",
+        "exit_code": 0,
+        "seconds": 0.06452370199986035
+      },
+      {
+        "selector": "extent_mixed",
+        "exit_code": 0,
+        "seconds": 0.06464024999877438
+      },
+      {
+        "selector": "extent_append",
+        "exit_code": 0,
+        "seconds": 0.1148921390013129
+      },
+      {
+        "selector": "extent_sparse",
+        "exit_code": 0,
+        "seconds": 0.06445694599824492
+      },
+      {
+        "selector": "extent_zero",
+        "exit_code": 0,
+        "seconds": 0.0643065000003844
+      },
+      {
+        "selector": "ninep_dot_path",
+        "exit_code": 0,
+        "seconds": 0.03244860199993127
+      },
+      {
+        "selector": "ninep_dot_rename",
+        "exit_code": 0,
+        "seconds": 0.06451804300013464
+      },
+      {
+        "selector": "ninep_io_snapshot",
+        "exit_code": 0,
+        "seconds": 0.06432069100264926
+      },
+      {
+        "selector": "ninep_open_inode",
+        "exit_code": 0,
+        "seconds": 0.06730621500173584
+      },
+      {
+        "selector": "remote_small_corruption",
+        "exit_code": 0,
+        "seconds": 0.0645245329978934
+      },
+      {
+        "selector": "remote_atomic_boundary",
+        "exit_code": 0,
+        "seconds": 1.9772055319990613
+      },
+      {
+        "selector": "remote_multipart_boundary",
+        "exit_code": 0,
+        "seconds": 2.2258974729993497
+      },
+      {
+        "selector": "remote_corruption_terminal",
+        "exit_code": 0,
+        "seconds": 0.06477436199929798
+      },
+      {
+        "selector": "remote_corruption_classifier",
+        "exit_code": 0,
+        "seconds": 0.03706882100232178
+      },
+      {
+        "selector": "sequential_overwrites",
+        "exit_code": 0,
+        "seconds": 0.06495583099967916
+      },
+      {
+        "selector": "sequential_fallback",
+        "exit_code": 0,
+        "seconds": 0.11446038199937902
+      },
+      {
+        "selector": "sequential_fairness",
+        "exit_code": 0,
+        "seconds": 0.41967616799956886
+      },
+      {
+        "selector": "append_fairness",
+        "exit_code": 0,
+        "seconds": 0.5731373249982425
+      },
+      {
+        "selector": "ninep_directory_pin",
+        "exit_code": 0,
+        "seconds": 0.06569643699913286
+      },
+      {
+        "selector": "ninep_dot_directory_pin",
+        "exit_code": 0,
+        "seconds": 0.06453840100220987
+      }
+    ],
+    "method": "Production src copied intact, with identical in-memory constructors, existing test fixtures and selected checked-in test bodies exposed. Test-only materializer hold and directory-replacement pause hooks are enabled; operational implementations are unchanged. The CLI entrypoint is excluded."
+  },
+  "remaining_validation": "Full hosted CI on the published PR head and a NAS image rebuilt from that head remain required before claiming deployment readiness or improved end-to-end throughput."
+}

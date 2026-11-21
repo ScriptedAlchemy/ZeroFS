@@ -2476,8 +2476,13 @@ mod tests {
                 self.state
                     .close_started_count
                     .fetch_add(1, Ordering::SeqCst);
+                // Wait for permission before announcing the close, so a test
+                // that releases it right after the announcement is not lost.
+                let allowed = self.state.allow_close.notified();
+                tokio::pin!(allowed);
+                allowed.as_mut().enable();
                 self.state.close_started.notify_one();
-                self.state.allow_close.notified().await;
+                allowed.await;
             }
             if self.state.panic_close.load(Ordering::SeqCst) != 0 {
                 panic!("injected SFTP close owner panic");
@@ -3145,8 +3150,10 @@ mod tests {
             .unwrap();
         caller.block_on(async {
             last.complete().await.unwrap();
+            // Liveness bounds, not speed targets: each wait ends as soon as
+            // its event happens, so a loaded host must not fail them.
             tokio::time::timeout(
-                Duration::from_secs(1),
+                Duration::from_secs(30),
                 factory.state.close_started.notified(),
             )
             .await
@@ -3163,9 +3170,12 @@ mod tests {
             assert_eq!(factory.live(), 1);
             factory.state.block_close.store(0, Ordering::SeqCst);
             factory.state.allow_close.notify_waiters();
-            tokio::time::timeout(Duration::from_secs(1), pool.inner.wait_for_activity_drain())
-                .await
-                .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                pool.inner.wait_for_activity_drain(),
+            )
+            .await
+            .unwrap();
             assert_eq!(factory.live(), 0);
             pool.checkout(OperationKind::Read)
                 .await

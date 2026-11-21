@@ -1,0 +1,65 @@
+{
+  "verified_utc": "2026-11-19T19:13:50.949277+00:00",
+  "scratch": "/var/tmp/zerofs-raw-physical.2KjfLdYV",
+  "containers_removed": [
+    {
+      "name": "zerofs-raw-physical.2KjfLdYV-check",
+      "id": "f5b6641feffe2e31a41ba7a642e528e39bef927ecde6f2681a40cbdefdaa756d",
+      "status": 101
+    },
+    {
+      "name": "zerofs-raw-physical.2KjfLdYV-final-audit",
+      "id": "d40254883874564f7c3d4885c51c75f159592e219fb39ddb3426a70668958f72",
+      "status": 0
+    },
+    {
+      "name": "zerofs-raw-physical.2KjfLdYV-final",
+      "id": "fdba3e2aabd4dcdfc07b22486ca9fb19aabaca207abc2b65d6b23b96bda78ff0",
+      "status": 0
+    },
+    {
+      "name": "zerofs-raw-physical.2KjfLdYV-integration",
+      "id": "83dd06c04b1abdd6f66f3545fced20bda4b34e04cddaf17196d3f6308d555abc",
+      "status": 101
+    },
+    {
+      "name": "zerofs-raw-physical.2KjfLdYV-pin1",
+      "id": "1a754cf8ae20afba5a6463da9726e6749ce1814eabc9885dee3700a55893267d",
+      "status": 0
+    },
+    {
+      "name": "zerofs-raw-physical.2KjfLdYV-pin2",
+      "id": "d7a23ec323c004d0da9cb7a2e838442d2663321ab3ee2a3859bcca1d7bf71ce1",
+      "status": 1
+    },
+    {
+      "name": "zerofs-raw-physical.2KjfLdYV-pin3",
+      "id": "aff50c36f9c87d9959b09ff19932fa34ae1d668298df23e1de28329c9432d22c",
+      "status": 0
+    },
+    {
+      "name": "zerofs-raw-physical.2KjfLdYV-prep",
+      "id": "e9fc8ae9de48b3a682eb3488ac62cb6c6f01751982cb3298c9f0824146f392ea",
+      "status": 0
+    },
+    {
+      "name": "zerofs-raw-physical.2KjfLdYV-probe-opt",
+      "id": "f8d70b80f4aed4971d2ba00ee7625f30ffc721f5cebc3f9924eafc2962149e81",
+      "status": 0
+    },
+    {
+      "name": "zerofs-raw-physical.2KjfLdYV-wasm",
+      "id": "106984956da2daa11f611b28f28d3e3421568d5a700ae54f7836d29da957d316",
+      "status": 0
+    }
+  ],
+  "volumes_removed": [
+    "zerofs-raw-physical.2KjfLdYV-cargo",
+    "zerofs-raw-physical.2KjfLdYV-target"
+  ],
+  "verified_absent": true,
+  "shared_image": "m1-survival-zj7q-rust:local",
+  "shared_seed_volume": "m1-survival-zj7q-cargo",
+  "qualification_target": "Studio Docker",
+  "other_cleanup": "Spark fixture and KVM claim witness receipts record their own host cleanup. The next broker qualification has separate ubuntu-main scratch."
+}

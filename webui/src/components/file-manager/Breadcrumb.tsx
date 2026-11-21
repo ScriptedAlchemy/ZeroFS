@@ -1,11 +1,11 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { ChevronRight, HardDrive, Ellipsis } from "lucide-react";
-import { DRAG_MIME } from "./FileBrowser";
+import { DRAG_MIME, draggedPaths } from "./drag-data";
 
 interface BreadcrumbProps {
   path: string;
   onNavigate: (path: string) => void;
-  onMoveToDir: (entryName: string, targetDir: string) => void;
+  onMoveToDir: (sourcePath: string, targetDir: string) => void;
 }
 
 function BreadcrumbInner({ path, onNavigate, onMoveToDir }: BreadcrumbProps) {
@@ -66,11 +66,8 @@ function BreadcrumbInner({ path, onNavigate, onMoveToDir }: BreadcrumbProps) {
     (e: React.DragEvent, targetPath: string) => {
       e.preventDefault();
       setDropTarget(null);
-      const raw = e.dataTransfer.getData(DRAG_MIME);
-      if (!raw) return;
-      const names: string[] = JSON.parse(raw);
-      for (const name of names) {
-        onMoveToDir(name, targetPath);
+      for (const sourcePath of draggedPaths(e.dataTransfer)) {
+        onMoveToDir(sourcePath, targetPath);
       }
     },
     [onMoveToDir],

@@ -23,8 +23,8 @@ use slatedb::object_store::{
 use std::{sync::Arc, time::Duration};
 use uuid::Uuid;
 
-const LEADER_MARKER: &str = ".zerofs_ha_leader";
-const OWNERSHIP_RECORD: &str = ".zerofs_ha_ownership";
+pub(crate) const LEADER_MARKER: &str = ".zerofs_ha_leader";
+pub(crate) const OWNERSHIP_RECORD: &str = ".zerofs_ha_ownership";
 
 /// Covers the previous owner's cached authority, final validation, and response drain.
 const CLAIM_GRACE: Duration = crate::replication::AUTHORITY_TTL

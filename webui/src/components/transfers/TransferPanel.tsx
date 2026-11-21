@@ -14,7 +14,9 @@ import {
   Clock,
 } from "lucide-react";
 import { formatSize } from "../../lib/format";
-import { TransferContext, type TransferHandle } from "./TransferContext";
+import { formatError } from "../../lib/errors";
+import { toast } from "sonner";
+import { TransferContext, type TransferHandle, type TransferRetry } from "./TransferContext";
 
 export type { TransferHandle } from "./TransferContext";
 
@@ -30,7 +32,7 @@ interface TransferEntry {
   startedAt: number;
   error?: string;
   detail?: string;
-  retry?: () => void;
+  retry?: TransferRetry;
   abort?: AbortController;
 }
 
@@ -64,7 +66,7 @@ export function TransferPanel({ children }: { children: React.ReactNode }) {
   );
 
   const startTransfer = useCallback(
-    (type: TransferEntry["type"], name: string, total: number, retry?: () => void): TransferHandle => {
+    (type: TransferEntry["type"], name: string, total: number, retry?: TransferRetry): TransferHandle => {
       const id = nextId.current++;
       const abort = new AbortController();
       setTransfers((prev) => [
@@ -78,17 +80,17 @@ export function TransferPanel({ children }: { children: React.ReactNode }) {
   );
 
   const startDownload = useCallback(
-    (name: string, retry?: () => void) => startTransfer("download", name, 0, retry),
+    (name: string, retry?: TransferRetry) => startTransfer("download", name, 0, retry),
     [startTransfer],
   );
 
   const startUpload = useCallback(
-    (name: string, total: number, retry?: () => void) => startTransfer("upload", name, total, retry),
+    (name: string, total: number, retry?: TransferRetry) => startTransfer("upload", name, total, retry),
     [startTransfer],
   );
 
   const startDelete = useCallback(
-    (name: string, retry?: () => void) => startTransfer("delete", name, 0, retry),
+    (name: string, retry?: TransferRetry) => startTransfer("delete", name, 0, retry),
     [startTransfer],
   );
 
@@ -181,6 +183,7 @@ function TransferRow({
   onCancel: (id: number) => void;
 }) {
   const [now, setNow] = useState(() => performance.now());
+  const [retrying, setRetrying] = useState(false);
   useEffect(() => {
     if (t.status !== "active") return;
     const id = setInterval(() => setNow(performance.now()), 500);
@@ -221,9 +224,17 @@ function TransferRow({
         )}
         {t.status === "error" && t.retry && (
           <button
-            onClick={() => {
-              onDismiss(t.id);
-              t.retry!();
+            disabled={retrying}
+            aria-busy={retrying}
+            onClick={async () => {
+              setRetrying(true);
+              try {
+                if (await t.retry!() !== false) onDismiss(t.id);
+              } catch (error) {
+                toast.error("Failed to retry transfer", { description: formatError(error) });
+              } finally {
+                setRetrying(false);
+              }
             }}
             className="shrink-0 p-0.5 rounded opacity-0 group-hover:opacity-100 hover:bg-accent text-muted hover:text-foreground transition-all"
             title="Retry"

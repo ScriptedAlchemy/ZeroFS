@@ -1,3 +1,4 @@
+use crate::pool_object_store::{PoolObjectStore, SegmentTarget};
 use crate::segment_store::{
     AuthoritativeSegmentRead, ConditionalMultipartCreate, GeneratedSegmentCreate,
 };
@@ -42,7 +43,7 @@ use std::hash::{Hash, Hasher};
 #[cfg(not(unix))]
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::sync::{Mutex, Notify, OwnedMutexGuard};
 use uuid::Uuid;
 
@@ -72,6 +73,7 @@ struct WritebackStoreInner {
     space_refresher: Arc<SpaceRefresher>,
     journaler: LocalJournaler,
     remote: RemoteScheduler,
+    pool: OnceLock<PoolObjectStore>,
     database_prefix: String,
     incarnation: Uuid,
     next_sequence: AtomicU64,
@@ -172,8 +174,7 @@ impl WritebackObjectStore {
         if settings.memory_bytes == 0 {
             anyhow::bail!("writeback requires a positive independent dirty RAM budget");
         }
-        let snapshot = journal.snapshot()?;
-        let database_prefix = snapshot.identity.database_prefix.clone();
+        let (identity, incarnation, local_seq) = journal.startup_cursor()?;
         let (space, ssd) = match owners {
             Some((space, ssd)) => (space, ssd),
             None => {
@@ -182,7 +183,7 @@ impl WritebackObjectStore {
                 let pending = journal.pending_ssd_reservations()?;
                 let ssd = Arc::new(SsdAdmission::recover(
                     settings.disk_bytes,
-                    1 << 20,
+                    journal.max_pending_operations(),
                     settings.high_watermark_percent,
                     settings.resume_percent,
                     settings.min_free_bytes,
@@ -242,9 +243,10 @@ impl WritebackObjectStore {
                 space_refresher: SpaceRefresher::start(Arc::clone(&ssd), Arc::clone(&space)),
                 journaler,
                 remote,
-                database_prefix,
-                incarnation: snapshot.incarnation,
-                next_sequence: AtomicU64::new(snapshot.local_seq),
+                pool: OnceLock::new(),
+                database_prefix: identity.database_prefix,
+                incarnation,
+                next_sequence: AtomicU64::new(local_seq),
                 key_locks: (0..KEY_LOCK_SHARDS)
                     .map(|_| Arc::new(Mutex::new(())))
                     .collect(),
@@ -437,6 +439,38 @@ impl WritebackObjectStore {
         .await
     }
 
+    /// Attach the pool behind this journal. Segments the journal holds but
+    /// has not placed in it are leased, so after a restart new writes cannot
+    /// be admitted into the room they still need.
+    pub(crate) async fn set_pool(&self, pool: PoolObjectStore) -> object_store::Result<()> {
+        let snapshot =
+            self.inner.journal.snapshot().map_err(|error| {
+                generic_error(format!("writeback journal read failed: {error}"))
+            })?;
+        for record in snapshot
+            .records
+            .iter()
+            .filter(|record| record.sequence > snapshot.remote_seq)
+        {
+            if let MutationKind::Put {
+                mode: MutationMode::Create,
+                payload_len,
+                ..
+            } = &record.kind
+            {
+                let location = Path::parse(&record.path).map_err(|error| {
+                    generic_error(format!("journal path {} is invalid: {error}", record.path))
+                })?;
+                pool.lease_unplaced(&location, *payload_len).await?;
+            }
+        }
+        self.inner
+            .pool
+            .set(pool)
+            .expect("writeback pool already configured");
+        Ok(())
+    }
+
     /// Start remote writeback after callers have finished opening over the
     /// stable recovered overlay. Repeated activation is harmless.
     pub(crate) fn activate_remote(&self) -> Result<(), RemoteBarrierError> {
@@ -627,6 +661,93 @@ impl WritebackObjectStore {
         }
     }
 
+    async fn validate_segment_target(
+        &self,
+        location: &Path,
+        options: &PutOptions,
+    ) -> object_store::Result<()> {
+        if let Some(target) = options.extensions.get::<SegmentTarget>() {
+            if !matches!(options.mode, PutMode::Create)
+                || options.extensions.get::<GeneratedSegmentCreate>().is_none()
+            {
+                return Err(generic_error(
+                    "writeback segment targets require generated conditional create",
+                ));
+            }
+            let pool = self.inner.pool.get().ok_or_else(|| {
+                generic_error("writeback cannot persist a segment target without its pool catalog")
+            })?;
+            // Validate before either idempotent success or AlreadyExists can
+            // reach the publisher's byte-only reconciliation. Replay needs
+            // this binding committed before its journal payload is acknowledged.
+            pool.register_segment_target(location, target).await?;
+        }
+        Ok(())
+    }
+
+    /// Why no new filesystem mutation can become durable, if that is so:
+    /// the remote scheduler or journaler is terminal, or an admission tier is
+    /// poisoned or closed. Byte and space pressure is not a refusal here;
+    /// it only delays work.
+    pub(crate) fn mutation_refusal(&self) -> Option<String> {
+        self.check_duplicate_admission()
+            .err()
+            .map(|error| error.to_string())
+    }
+
+    fn check_duplicate_admission(&self) -> object_store::Result<()> {
+        self.ensure_writable()?;
+        self.inner
+            .admission
+            .check_available()
+            .map_err(|error| generic_error(format!("dirty RAM admission failed: {error}")))?;
+        self.inner
+            .ssd
+            .check_available()
+            .map_err(|error| generic_error(format!("dirty SSD admission failed: {error}")))
+    }
+
+    async fn matching_create_before_admission(
+        &self,
+        location: &Path,
+        payload: &VerifiedPayload,
+        options: &PutOptions,
+    ) -> object_store::Result<Option<(u64, LocalEtag)>> {
+        if !matches!(options.mode, PutMode::Create)
+            || options.extensions.get::<GeneratedSegmentCreate>().is_none()
+        {
+            return Ok(None);
+        }
+        self.check_duplicate_admission()?;
+        let _key_guard = self.key_lock(location).lock_owned().await;
+        let existing = self
+            .inner
+            .overlay
+            .matching_local_create(location, payload)
+            .await;
+        if !matches!(&existing, Ok(None)) {
+            // The ordinary new-object path persists its target after admission.
+            // A duplicate must check its target even if its bytes conflict.
+            self.validate_segment_target(location, options).await?;
+        }
+        existing
+    }
+
+    async fn acknowledge_existing_create(
+        &self,
+        sequence: u64,
+        local_etag: LocalEtag,
+    ) -> object_store::Result<PutResult> {
+        self.check_duplicate_admission()?;
+        self.await_ack(&self.inner.journaler.barrier(), sequence)
+            .await?;
+        Ok(PutResult {
+            e_tag: Some(local_etag.as_str().to_owned()),
+            version: Some(local_etag.as_str().to_owned()),
+            extensions: Extensions::new(),
+        })
+    }
+
     async fn owned_put_verified_inner(
         self,
         location: Path,
@@ -641,6 +762,15 @@ impl WritebackObjectStore {
             .extensions
             .get::<WriteAdmissionTestControl>()
             .cloned();
+        if let Some((sequence, local_etag)) = self
+            .matching_create_before_admission(&location, &payload, &options)
+            .await?
+        {
+            drop(payload);
+            drop(ram);
+            drop(disk);
+            return self.acknowledge_existing_create(sequence, local_etag).await;
+        }
         let disk_charge = MutationRecord::ssd_reservation_estimate(
             location.as_ref(),
             None,
@@ -667,14 +797,23 @@ impl WritebackObjectStore {
         let lock = self.key_lock(&location);
         let key_guard = lock.lock_owned().await;
         let trusted_segment_create = options.extensions.get::<GeneratedSegmentCreate>().is_some();
+        self.validate_segment_target(&location, &options).await?;
         let (mode, expected_visible_version, predecessor) = match &options.mode {
             PutMode::Overwrite => (MutationMode::Overwrite, None, None),
             PutMode::Create if trusted_segment_create => {
-                if self.inner.overlay.has_visible_local_object(&location).await {
-                    return Err(object_store::Error::AlreadyExists {
-                        path: location.to_string(),
-                        source: "overlay-visible object already exists".into(),
-                    });
+                if let Some((sequence, local_etag)) = self
+                    .inner
+                    .overlay
+                    .matching_local_create(&location, &payload)
+                    .await?
+                {
+                    // Recheck after admission waited without the key lock: a
+                    // concurrent writer may have accepted the same create.
+                    drop(key_guard);
+                    drop(payload);
+                    drop(ram);
+                    drop(disk);
+                    return self.acknowledge_existing_create(sequence, local_etag).await;
                 }
                 (MutationMode::Create, None, None)
             }
@@ -955,6 +1094,18 @@ impl ObjectStore for WritebackObjectStore {
     ) -> object_store::Result<PutResult> {
         let bytes_len = u64::try_from(payload.content_length())
             .map_err(|_| generic_error("put payload length exceeds u64"))?;
+        let generated_payload = (matches!(options.mode, PutMode::Create)
+            && options.extensions.get::<GeneratedSegmentCreate>().is_some())
+        .then(|| VerifiedPayload::from_put_payload(payload.clone()));
+        if let Some(verified) = &generated_payload
+            && let Some((sequence, local_etag)) = self
+                .matching_create_before_admission(location, verified, &options)
+                .await?
+        {
+            drop(generated_payload);
+            drop(payload);
+            return self.acknowledge_existing_create(sequence, local_etag).await;
+        }
         let ram = self
             .inner
             .admission
@@ -962,6 +1113,20 @@ impl ObjectStore for WritebackObjectStore {
             .await
             .map_err(|error| generic_error(format!("dirty RAM admission failed: {error}")))?
             .accept();
+        if let Some(verified) = generated_payload {
+            // Hash existing chunks before preflight without concatenating or
+            // copying their bytes. Keep that verified source after admission.
+            drop(payload);
+            let owned = self.clone();
+            let location = location.clone();
+            return tokio::spawn(async move {
+                owned
+                    .owned_put_verified(location, verified, options, Some(ram), None, None)
+                    .await
+            })
+            .await
+            .map_err(|error| generic_error(format!("owned put task failed: {error}")))?;
+        }
         let bytes = Bytes::from(payload);
         let owned = self.clone();
         let location = location.clone();
@@ -998,14 +1163,19 @@ impl ObjectStore for WritebackObjectStore {
                 ));
             }
         }
-        let memory_parts = self.inner.settings.ack_mode == AckMode::Memory;
+        let memory_parts =
+            self.inner.settings.ack_mode == AckMode::Memory || self.inner.journal.is_raw();
         let staging = if memory_parts {
             None
         } else {
             Some(
-                allocate_multipart_staging(&self.inner.journal.anchored_root()).map_err(
-                    |error| generic_error(format!("failed to allocate multipart staging: {error}")),
-                )?,
+                self.inner
+                    .journal
+                    .anchored_root()
+                    .and_then(allocate_multipart_staging)
+                    .map_err(|error| {
+                        generic_error(format!("failed to allocate multipart staging: {error}"))
+                    })?,
             )
         };
         let declared_payload_len =
@@ -2623,7 +2793,7 @@ mod tests {
         );
 
         segments
-            .put_segment(segid, Bytes::from(vec![2u8; size]))
+            .put_segment(segid, Bytes::from(vec![2u8; size]), None)
             .await
             .expect_err("remote immutable-key collision must remain fatal");
         assert_eq!(
@@ -5155,7 +5325,7 @@ mod tests {
             async move {
                 let segid = segments.next_segid();
                 segments
-                    .put_segment(segid, Bytes::from(vec![index; 1024]))
+                    .put_segment(segid, Bytes::from(vec![index; 1024]), None)
                     .await
                     .unwrap();
             }
@@ -5196,7 +5366,7 @@ mod tests {
 
         let accepted = tokio::time::timeout(
             Duration::from_secs(1),
-            segments.put_segment(segments.next_segid(), Bytes::from_static(b"segment")),
+            segments.put_segment(segments.next_segid(), Bytes::from_static(b"segment"), None),
         )
         .await;
         controls.release_heads();
@@ -5207,6 +5377,70 @@ mod tests {
             .expect("local admission waited for a remote HEAD")
             .expect("generated segment create failed");
         assert_eq!(controls.head_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn matching_segment_retry_preserves_terminal_admission_failures() {
+        for terminal in ["ram", "ssd", "remote"] {
+            let temp = tempfile::tempdir().unwrap();
+            let attached = crate::writeback::bootstrap::attach(
+                Arc::new(object_store::memory::InMemory::new()),
+                WritebackSettings {
+                    dir: temp.path().canonicalize().unwrap().join("dirty"),
+                    ack_mode: AckMode::Ssd,
+                    memory_bytes: 1024,
+                    disk_bytes: 1024 * 1024,
+                    min_free_bytes: 1,
+                    high_watermark_percent: 95,
+                    resume_percent: 85,
+                    upload_concurrency: 1,
+                    local_concurrency: 1,
+                    shutdown_flush: ShutdownFlush::Local,
+                },
+                JournalIdentity {
+                    format_version: 1,
+                    bucket_id: "terminal-retry".into(),
+                    backend_endpoint: "memory://terminal-retry".into(),
+                    database_prefix: "db".into(),
+                    backend_kind: "memory".into(),
+                    encryption_key_identity_sha256: [0x74; 32],
+                },
+                "terminal-retry",
+            )
+            .await
+            .unwrap();
+            let key = Path::from("db/segments/01/0000000000000001/0000000000000001");
+            let body = Bytes::from_static(b"accepted");
+            let mut options = PutOptions::from(PutMode::Create);
+            options.extensions.insert(GeneratedSegmentCreate);
+            attached
+                .store
+                .put_opts(&key, body.clone().into(), options.clone())
+                .await
+                .unwrap();
+            match terminal {
+                "ram" => attached
+                    .lifecycle
+                    .inner
+                    .admission
+                    .poison("test RAM terminal"),
+                "ssd" => attached.ssd.poison("test SSD terminal"),
+                "remote" => attached.lifecycle.inner.remote.shutdown().await.unwrap(),
+                _ => unreachable!(),
+            }
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                attached.store.put_opts(&key, body.into(), options),
+            )
+            .await
+            .expect("a terminal admission state must fail without waiting for capacity")
+            .expect_err("matching bytes must not hide a terminal admission failure");
+            let status = attached.lifecycle.status().unwrap();
+            assert_eq!(status.accepted_seq, 1);
+            assert_eq!(status.local_seq, 1);
+            assert_eq!(status.remote_seq, 0);
+            attached.lifecycle.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]

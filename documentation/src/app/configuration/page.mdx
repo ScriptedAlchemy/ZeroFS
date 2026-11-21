@@ -245,7 +245,12 @@ ownership or permissions on existing files.
 [servers.ninep]
 addresses = ["0.0.0.0:5564"]
 unix_socket = "/tmp/zerofs.9p.sock"  # Optional
+# standard_lookup = "exact"           # Optional, default "folded"
 ```
+
+`standard_lookup` sets how a filesystem created with `name_mode = "insensitive"`
+matches names sent by stock `9P2000.L` clients. See
+[Case-insensitive filesystems](/9p-access#case-insensitive-filesystems).
 
 ### NBD Server
 

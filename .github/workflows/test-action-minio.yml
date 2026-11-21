@@ -4,13 +4,23 @@ on:
   push:
     branches: ["main", "develop"]
   pull_request:
+    # Lane PRs into the integration branch are gated locally and by its own PR; run the matrix once there.
     branches: ["main", "develop"]
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Runner for the MinIO test
+        type: choice
+        default: macos-latest
+        options:
+          - macos-latest
+          - ubuntu-latest
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -18,8 +28,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os == 'macos-latest' && 'macos-15-intel' || matrix.os }}
+        os: ["${{ inputs.runner || 'ubuntu-latest' }}"]
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4

@@ -1,0 +1,26 @@
+--- run.py
++++ run.py
+@@ -108,7 +108,9 @@
+         writeback = config["writeback"]
+         if (
+             config["runtime"]["profile"] != "small-nas-journal-v1"
+-            or config["filesystem"]["write_ack_mode"] != "materialized"
++            or config["filesystem"]["write_ack_mode"] != "volatile_memory"
++            or config["filesystem"]["volatile_memory_gb"] != 0.268435456
++            or config["filesystem"]["volatile_max_operations"] != 2048
+             or config["filesystem"]["ignore_fsync"]
+             or config["servers"]["ninep"] != {"addresses": [], "unix_socket": str(self.socket)}
+             or not writeback["enabled"]
+@@ -123,6 +125,12 @@
+             if not marker:
+                 raise RuntimeError("expected a final writeback table in the template")
+             template = before.replace('profile = "small-nas-journal-v1"\n', "")
++            template = template.replace(
++                'write_ack_mode = "volatile_memory"\n'
++                'volatile_memory_gb = 0.268435456\n'
++                'volatile_max_operations = 2048\n',
++                'write_ack_mode = "materialized"\n',
++            )
+             parsed = tomllib.loads(template)
+             if "profile" in parsed["runtime"] or "writeback" in parsed:
+                 raise RuntimeError("verifier must omit the journal profile and table")

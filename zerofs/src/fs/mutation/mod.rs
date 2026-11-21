@@ -29,6 +29,9 @@ pub(crate) mod types;
 #[cfg(test)]
 mod lifecycle_tests;
 
+#[cfg(test)]
+mod survival_tests;
+
 use crate::fs::ZeroFS;
 use crate::fs::mutation::types::MutationCutoff;
 

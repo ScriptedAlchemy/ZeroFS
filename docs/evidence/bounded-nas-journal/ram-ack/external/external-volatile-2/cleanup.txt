@@ -1,0 +1,5 @@
+zerofs-external-4ckSBRLd-client
+container absent zerofs-external-4ckSBRLd-client
+zerofs-external-4ckSBRLd-service
+container absent zerofs-external-4ckSBRLd-service
+scratch absent /var/tmp/zerofs-external.4ckSBRLd

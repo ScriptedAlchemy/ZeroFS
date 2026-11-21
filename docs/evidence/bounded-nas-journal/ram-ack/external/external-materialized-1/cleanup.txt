@@ -1,0 +1,5 @@
+zerofs-external-3ll9T8wn-client
+container absent zerofs-external-3ll9T8wn-client
+zerofs-external-3ll9T8wn-service
+container absent zerofs-external-3ll9T8wn-service
+scratch absent /var/tmp/zerofs-external.3ll9T8wn

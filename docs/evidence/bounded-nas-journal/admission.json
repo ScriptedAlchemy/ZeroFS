@@ -1,0 +1,8 @@
+{
+  "hard_limit_bytes": 6979321856,
+  "required_bytes": 5804916736,
+  "remaining_bytes": 1174405120,
+  "rss_pressure_cap_bytes": 6308233216,
+  "accounting": "memory_policy=small-nas-journal-v1 reason=explicit bounded journal fixture geometry; application-wide qualification required; clean_cache_bytes=100663296 source=resolved cache split with three 32 MiB floors; object_writeback_bytes=134217728 source=resolved writeback RAM or disabled; volatile_write_bytes=0 source=resolved shared write-ack setting times two ownership stages; direct_segment_bytes=201326592 source=selected store geometry (open plus retained segments); unmodeled_residency_reserve_bytes=4697620480 source=baseline plus 1 GiB journal workers/replay allowance; computed from ci+webui package-baseline-ci-limit64g-cache0.001-wb0-jobs8-primary/samples.jsonl; R=ceil64MiB(1.10*3241541632); H=ceil64MiB(0.15*3241541632+1.25*137129984); engine_headroom_bytes=671088640 source=computed from ci+webui package-baseline-ci-limit64g-cache0.001-wb0-jobs8-primary/samples.jsonl; R=ceil64MiB(1.10*3241541632); H=ceil64MiB(0.15*3241541632+1.25*137129984); hard_limit_source=[runtime] memory_limit_gb; external_companions=excluded from measured engine reserves, subtract FUSE/smbd and file cache from container limit before runtime.memory_limit_gb; stored_state_qualification=unavailable for selected policy",
+  "stored_state_qualification": null
+}

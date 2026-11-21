@@ -29,6 +29,7 @@ fn test_creds() -> Credentials {
         groups: [1000; 16],
         groups_count: 1,
         groups_complete: true,
+        groups_truncated: false,
     }
 }
 
@@ -72,6 +73,11 @@ impl CrashTestContext {
 
     /// Create a new filesystem instance
     async fn create_fs(&self) -> Arc<ZeroFS> {
+        self.create_fs_with_name_mode(zerofs::fs::name_mode::NameMode::Sensitive)
+            .await
+    }
+
+    async fn create_fs_with_name_mode(&self, mode: zerofs::fs::name_mode::NameMode) -> Arc<ZeroFS> {
         let db_path = Path::from("slatedb");
         // Mirror the production durability-critical SlateDB config (see
         // cli/server.rs): WAL off + effectively disabled size thresholds mean the
@@ -117,6 +123,7 @@ impl CrashTestContext {
                 ),
                 None,
                 zerofs::config::StoreProfile::default(),
+                mode,
             )
             .await
             .unwrap(),
@@ -3648,4 +3655,249 @@ async fn test_abandoned_batch_reservation_leaves_a_sound_segment() {
         report.is_consistent(),
         "Inconsistent after reclaim:\n{report}"
     );
+}
+
+#[tokio::test]
+async fn insensitive_case_only_rename_is_atomic_when_interrupted() {
+    use zerofs::fs::name_mode::NameMode;
+    let _scenario = fail::FailScenario::setup();
+    for point in [
+        fp::RENAME_AFTER_SOURCE_UNLINK,
+        fp::RENAME_AFTER_NEW_ENTRY,
+        fp::RENAME_AFTER_COMMIT,
+    ] {
+        let ctx = CrashTestContext::new();
+        let fs = ctx.create_fs_with_name_mode(NameMode::Insensitive).await;
+        let creds = test_creds();
+        let auth = AuthContext::from(&creds);
+        let (inode, _) = fs
+            .create(&creds, 0, b"Foo", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.write(&auth, inode, 0, &Bytes::from_static(b"payload"))
+            .await
+            .unwrap();
+        fs.flush_coordinator.flush().await.unwrap();
+        fail::cfg(point, "panic").unwrap();
+        let task_fs = fs.clone();
+        let interrupted =
+            tokio::spawn(async move { task_fs.rename(&auth, 0, b"Foo", 0, b"foo").await }).await;
+        fail::remove(point);
+        assert!(
+            interrupted.is_err_and(|error| error.is_panic()),
+            "{point} did not interrupt the rename"
+        );
+        drop(fs);
+        let reopened = ctx.create_fs_with_name_mode(NameMode::Insensitive).await;
+        let report = verify_consistency(&reopened).await.unwrap();
+        assert!(report.is_consistent(), "{point}: {report}");
+        let entries: Vec<_> = reopened
+            .directory_store
+            .list(0)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1, "{point}");
+        let before = entries[0].name == b"Foo";
+        let after = entries[0].name == b"foo";
+        assert!(before ^ after, "{point}: {:?}", entries[0].name);
+        assert_eq!(reopened.lookup(&creds, 0, b"FOO").await.unwrap(), inode);
+        assert_eq!(
+            reopened
+                .read_file(&AuthContext::from(&creds), inode, 0, 7)
+                .await
+                .unwrap()
+                .0
+                .as_ref(),
+            b"payload"
+        );
+    }
+}
+
+#[tokio::test]
+async fn insensitive_create_is_atomic_when_interrupted() {
+    use zerofs::fs::name_mode::NameMode;
+    let _scenario = fail::FailScenario::setup();
+    for point in [
+        fp::CREATE_AFTER_INODE,
+        fp::CREATE_AFTER_DIR_ENTRY,
+        fp::CREATE_AFTER_COMMIT,
+    ] {
+        let ctx = CrashTestContext::new();
+        let fs = ctx.create_fs_with_name_mode(NameMode::Insensitive).await;
+        let creds = test_creds();
+        fs.flush_coordinator.flush().await.unwrap();
+        fail::cfg(point, "panic").unwrap();
+        let task_fs = fs.clone();
+        let task_creds = creds;
+        let interrupted = tokio::spawn(async move {
+            task_fs
+                .create(&task_creds, 0, b"Foo", &SetAttributes::default())
+                .await
+        })
+        .await;
+        fail::remove(point);
+        assert!(
+            interrupted.is_err_and(|error| error.is_panic()),
+            "{point} did not interrupt the create"
+        );
+        drop(fs);
+        let reopened = ctx.create_fs_with_name_mode(NameMode::Insensitive).await;
+        let report = verify_consistency(&reopened).await.unwrap();
+        assert!(report.is_consistent(), "{point}: {report}");
+        let entries: Vec<_> = reopened
+            .directory_store
+            .list(0)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let before = entries.is_empty();
+        let after = entries.len() == 1 && entries[0].name == b"Foo";
+        assert!(before ^ after, "{point}: {} entries", entries.len());
+        match reopened.lookup(&creds, 0, b"foo").await {
+            Ok(inode) => {
+                assert!(after, "{point}");
+                assert_eq!(entries[0].inode_id, inode);
+                assert!(matches!(
+                    reopened
+                        .create(&creds, 0, b"FOO", &SetAttributes::default())
+                        .await,
+                    Err(zerofs::fs::errors::FsError::Exists)
+                ));
+            }
+            Err(zerofs::fs::errors::FsError::NotFound) => assert!(before, "{point}"),
+            other => panic!("{point}: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn insensitive_names_and_collisions_survive_reopen() {
+    use zerofs::fs::name_mode::NameMode;
+    let _scenario = fail::FailScenario::setup();
+    let ctx = CrashTestContext::new();
+    let fs = ctx.create_fs_with_name_mode(NameMode::Insensitive).await;
+    let creds = test_creds();
+    let auth = AuthContext::from(&creds);
+    let attrs = SetAttributes::default();
+    let (foo, _) = fs.create(&creds, 0, b"Foo", &attrs).await.unwrap();
+    for result in [
+        fs.create(&creds, 0, b"foo", &attrs).await,
+        fs.mkdir(&creds, 0, b"foo", &attrs).await,
+        fs.symlink(&creds, 0, b"foo", b"target", &attrs).await,
+        fs.mknod(&creds, 0, b"foo", FileType::Fifo, &attrs, None)
+            .await,
+    ] {
+        assert!(matches!(result, Err(zerofs::fs::errors::FsError::Exists)));
+    }
+    assert!(matches!(
+        fs.link(&auth, foo, 0, b"foo").await,
+        Err(zerofs::fs::errors::FsError::Exists)
+    ));
+    fs.rename(&auth, 0, b"Foo", 0, b"foo").await.unwrap();
+    fs.write(&auth, foo, 0, &Bytes::from_static(b"payload"))
+        .await
+        .unwrap();
+    fs.setattr(&creds, foo, &attrs).await.unwrap();
+    let (a, _) = fs.create(&creds, 0, b"a", &attrs).await.unwrap();
+    fs.create(&creds, 0, b"b", &attrs).await.unwrap();
+    fs.rename(&auth, 0, b"a", 0, b"B").await.unwrap();
+    fs.rename(&auth, 0, b"B", 0, b"B").await.unwrap();
+    let (x, _) = fs.create(&creds, 0, b"x", &attrs).await.unwrap();
+    fs.link(&auth, x, 0, b"y").await.unwrap();
+    fs.rename(&auth, 0, b"x", 0, b"Y").await.unwrap();
+    for name in [
+        b"a\xffb".as_slice(),
+        b"\xc3a",
+        b"\xc3A",
+        "é".as_bytes(),
+        "e\u{301}".as_bytes(),
+    ] {
+        fs.create(&creds, 0, name, &attrs).await.unwrap();
+    }
+    let mut recased = Vec::new();
+    for (old, new, kind) in [
+        (b"Dir".as_slice(), b"dir".as_slice(), FileType::Directory),
+        (b"Sym", b"sym", FileType::Symlink),
+        (b"Pipe", b"pipe", FileType::Fifo),
+    ] {
+        let (id, _) = match kind {
+            FileType::Directory => fs.mkdir(&creds, 0, old, &attrs).await.unwrap(),
+            FileType::Symlink => fs.symlink(&creds, 0, old, b"foo", &attrs).await.unwrap(),
+            _ => fs.mknod(&creds, 0, old, kind, &attrs, None).await.unwrap(),
+        };
+        fs.rename(&auth, 0, old, 0, new).await.unwrap();
+        recased.push((new, id));
+    }
+    let report = verify_consistency(&fs).await.unwrap();
+    assert!(report.errors.is_empty(), "{report:?}");
+    fs.flush_coordinator.flush().await.unwrap();
+    drop(fs);
+    let fs = ctx.create_fs_with_name_mode(NameMode::Insensitive).await;
+    assert_eq!(fs.lookup(&creds, 0, b"FOO").await.unwrap(), foo);
+    assert_eq!(fs.lookup(&creds, 0, b"b").await.unwrap(), a);
+    assert_eq!(fs.lookup(&creds, 0, b"X").await.unwrap(), x);
+    assert_eq!(fs.lookup(&creds, 0, b"Y").await.unwrap(), x);
+    fs.lookup(&creds, 0, b"A\xffB").await.unwrap();
+    assert!(matches!(
+        fs.create(&creds, 0, b"FOO", &attrs).await,
+        Err(zerofs::fs::errors::FsError::Exists)
+    ));
+    let entries: Vec<_> = fs
+        .directory_store
+        .list(0)
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    for name in [
+        b"foo".as_slice(),
+        b"B",
+        b"x",
+        b"y",
+        b"a\xffb",
+        b"\xc3a",
+        b"\xc3A",
+        "é".as_bytes(),
+        "e\u{301}".as_bytes(),
+    ] {
+        assert!(entries.iter().any(|entry| entry.name == name));
+    }
+    let codec = KeyCodec::with_name_mode(NameMode::Insensitive);
+    for (name, id) in recased
+        .into_iter()
+        .chain([(b"foo".as_slice(), foo), (b"B".as_slice(), a)])
+    {
+        assert_eq!(fs.lookup(&creds, 0, name).await.unwrap(), id);
+        let entry = fs
+            .db
+            .get_bytes(&codec.dir_entry_key(0, name))
+            .await
+            .unwrap()
+            .unwrap();
+        let (_, cookie) = KeyCodec::decode_dir_entry(&entry).unwrap();
+        let row = fs
+            .db
+            .get_bytes(&codec.dir_scan_key(0, cookie))
+            .await
+            .unwrap()
+            .unwrap();
+        let (display, embedded) =
+            zerofs::fs::store::directory::decode_dir_scan_value(&row).unwrap();
+        assert_eq!(display, name);
+        let zerofs::fs::store::directory::DirScanValue::WithInode { inode, .. } = embedded else {
+            panic!("expected embedded inode")
+        };
+        assert_eq!(
+            bincode::serialize(&inode).unwrap(),
+            bincode::serialize(&fs.inode_store.get(id).await.unwrap()).unwrap()
+        );
+    }
+    let report = verify_consistency(&fs).await.unwrap();
+    assert!(report.errors.is_empty(), "{report:?}");
 }

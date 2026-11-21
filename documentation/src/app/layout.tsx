@@ -1,6 +1,6 @@
 import glob from 'fast-glob'
 import { type Metadata } from 'next'
-import { Schibsted_Grotesk, Geist_Mono } from 'next/font/google'
+import localFont from 'next/font/local'
 import { Providers } from '@/app/providers'
 import { Layout } from '@/components/Layout'
 import { type Section } from '@/components/SectionProvider'
@@ -8,15 +8,16 @@ import PlausibleProvider from 'next-plausible'
 import '@/styles/tailwind.css'
 import '@/styles/mermaid.css'
 
-const schibstedGrotesk = Schibsted_Grotesk({
-  subsets: ['latin'],
+const schibstedGrotesk = localFont({
+  src: '../../node_modules/@fontsource-variable/schibsted-grotesk/files/schibsted-grotesk-latin-wght-normal.woff2',
+  weight: '400 900',
   variable: '--font-schibsted',
   display: 'swap',
 })
 
-const geistMono = Geist_Mono({
-  subsets: ['latin'],
-  weight: ['400', '500', '600'],
+const geistMono = localFont({
+  src: '../../node_modules/@fontsource-variable/geist-mono/files/geist-mono-latin-wght-normal.woff2',
+  weight: '400 600',
   variable: '--font-geist-mono',
   display: 'swap',
 })

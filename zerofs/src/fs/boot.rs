@@ -8,7 +8,7 @@ use crate::fs::inode::{DirectoryInode, Inode};
 use crate::fs::key_codec::KeyCodec;
 use crate::fs::lock_manager::KeyedLockManager;
 use crate::fs::metrics::FileSystemStats;
-use crate::fs::stats::{FileSystemGlobalStats, StatsShardData};
+use crate::fs::stats::FileSystemGlobalStats;
 use crate::fs::store::{DirectoryStore, ExtentStore, InodeStore, OrphanStore, TombstoneStore};
 use crate::fs::tracing::AccessTracer;
 use crate::fs::write_coordinator::WriteCoordinator;
@@ -49,6 +49,7 @@ impl ZeroFS {
             segment_codec,
             None,
             crate::config::StoreProfile::default(),
+            crate::fs::name_mode::NameMode::Sensitive,
         )
         .await
     }
@@ -73,11 +74,12 @@ impl ZeroFS {
         segment_warm: Option<crate::segment_store::SegmentWarmHook>,
         // Backend data-plane tuning; `Default` keeps every crate default.
         store_profile: crate::config::StoreProfile,
+        name_mode: crate::fs::name_mode::NameMode,
     ) -> anyhow::Result<Self> {
         // The expiry reaper may already be running from CLI setup.
         dedup.start_expiry_reaper();
         let lock_manager = Arc::new(KeyedLockManager::new());
-        let key_codec = Arc::new(KeyCodec::new());
+        let key_codec = Arc::new(KeyCodec::with_name_mode(name_mode));
         let ha_writer = lease.is_some();
 
         // The data-db `writer_epoch` (monotonic object-store CAS, bumped on every
@@ -151,10 +153,8 @@ impl ZeroFS {
 
         for i in 0..STATS_SHARDS {
             let shard_key = key_codec.stats_shard_key(i);
-            if let Some(data) = db.get_bytes(&shard_key).await?
-                && let Ok(shard_data) = bincode::deserialize::<StatsShardData>(&data)
-            {
-                global_stats.load_shard(i, &shard_data);
+            if let Some(data) = db.get_bytes(&shard_key).await? {
+                global_stats.load_shard_record(i, &data);
             }
         }
 
@@ -180,7 +180,8 @@ impl ZeroFS {
             store_profile
                 .decoded_extent_cache_bytes
                 .unwrap_or(crate::fs::store::extent::DEFAULT_DECODED_EXTENT_CACHE_BYTES),
-        );
+        )
+        .with_max_segment_append_bytes(store_profile.max_segment_append_bytes);
         // Seed the monitor's segment footprint gauges from the existing on-store
         // segments before any write; from here they are maintained incrementally
         // off the commit path, so the panel never scans to stay current.
@@ -197,6 +198,7 @@ impl ZeroFS {
         let directory_store = DirectoryStore::new(db.clone(), key_codec.clone());
         let inode_store = InodeStore::new(db.clone(), key_codec.clone(), next_inode_id);
         let tombstone_store = TombstoneStore::new(db.clone(), key_codec.clone());
+        let xattr_store = super::store::XattrStore::new(db.clone(), key_codec.clone());
         let orphan_store = OrphanStore::new(db.clone(), key_codec.clone());
 
         // Carry the durability lineage only across a coverage-proven, untainted
@@ -237,18 +239,23 @@ impl ZeroFS {
         let (reclaim_tx, reclaim_rx) = tokio::sync::mpsc::unbounded_channel();
         dedup.set_reclaim_sender(&reclaim_tx);
 
-        let committed = global_stats.get_totals().0;
+        let committed = global_stats.known_totals().map(|(bytes, _)| bytes);
         let fs = Self {
+            name_mode,
             db: db.clone(),
             extent_store,
             directory_store,
             inode_store,
             tombstone_store,
             orphan_store,
+            xattr_store,
             open_handles: Arc::new(DashMap::new()),
             reclaim_tx,
             reclaim_rx: Arc::new(Mutex::new(Some(reclaim_rx))),
+            reclaim_shutdown: tokio_util::sync::CancellationToken::new(),
+            reclaim_task: Arc::new(Mutex::new(None)),
             lock_manager,
+            directory_rename_lock: Arc::new(tokio::sync::Mutex::new(())),
             stats,
             global_stats,
             flush_coordinator,
@@ -262,19 +269,22 @@ impl ZeroFS {
             materialized_request_cache: crate::fs::mutation::request_cache::RequestCache::new(
                 crate::fs::mutation::config::DEFAULT_VOLATILE_MAX_OPERATIONS,
             ),
+            survival_admission: std::sync::Arc::default(),
             lineage_token,
             serving_writer_epoch,
             max_bytes,
-            quota: crate::fs::quota::LogicalQuota::new(max_bytes, committed),
+            quota: crate::fs::quota::LogicalQuota::from_known_usage(max_bytes, committed),
             tracer: AccessTracer::new(),
             object_tracer,
             dedup,
+            acl_state: Default::default(),
         };
 
         // Reclaim durable orphans before a writer starts serving.
         if !db.is_read_only() {
             fs.drain_orphans().await?;
         }
+        fs.report_acl_state().await?;
 
         Ok(fs)
     }
@@ -434,6 +444,22 @@ impl ZeroFS {
 
     #[cfg(test)]
     pub(crate) async fn new_in_memory_with_sync_writes(sync_writes: bool) -> anyhow::Result<Self> {
+        Self::new_in_memory_with_options(sync_writes, crate::fs::name_mode::NameMode::Sensitive)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn new_in_memory_with_name_mode(
+        mode: crate::fs::name_mode::NameMode,
+    ) -> anyhow::Result<Self> {
+        Self::new_in_memory_with_options(false, mode).await
+    }
+
+    #[cfg(test)]
+    async fn new_in_memory_with_options(
+        sync_writes: bool,
+        mode: crate::fs::name_mode::NameMode,
+    ) -> anyhow::Result<Self> {
         use crate::block_transformer::ZeroFsBlockTransformer;
         use crate::config::CompressionConfig;
         use slatedb::BlockTransformer;
@@ -462,13 +488,22 @@ impl ZeroFS {
             crate::segment::SEGMENT_INFO,
             CompressionConfig::default(),
         );
-        Self::new_with_slatedb(
+        Self::new_with_slatedb_and_lease(
             SlateDbHandle::ReadWrite(slatedb),
             u64::MAX,
             None,
             sync_writes,
+            false,
+            None,
+            None,
+            Arc::new(crate::dedup::DedupCache::new()),
+            None,
+            ObjectTracer::new(),
             object_store,
             segment_codec,
+            None,
+            crate::config::StoreProfile::default(),
+            mode,
         )
         .await
     }

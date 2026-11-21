@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::io::BufRead;
 
+pub(crate) mod abandonment;
 pub mod alloc_rss;
 pub mod block_transformer;
 mod bucket_identity;
@@ -19,7 +20,12 @@ pub mod length_checked_object_store;
 #[allow(dead_code)]
 mod linux_errno;
 mod local_object_store;
+pub mod memory;
 pub(crate) mod metadata_digest;
+mod metadata_fault;
+pub(crate) mod metadata_survival;
+#[cfg(test)]
+mod metadata_survival_tests;
 #[cfg(target_os = "linux")]
 mod mount;
 mod nbd;
@@ -28,11 +34,17 @@ mod nfs;
 mod ninep;
 pub mod object_store_prefetch;
 pub mod object_trace;
+pub mod operator_required;
 mod parse_object_store;
 #[cfg(test)]
 mod pool_export_tests;
+#[cfg(test)]
+mod pool_full_tests;
 mod pool_object_store;
 mod prometheus;
+mod raw_database;
+#[cfg(target_os = "linux")]
+mod raw_member;
 mod redis_conditional_store;
 pub mod replication;
 pub mod retrying_object_store;
@@ -48,6 +60,7 @@ pub mod sftp_transport;
 mod storage_backend;
 pub mod storage_class_object_store;
 mod storage_compatibility;
+mod storage_readiness;
 pub(crate) mod task;
 mod telemetry;
 #[cfg(feature = "webui")]
@@ -69,10 +82,26 @@ mod posix_tests;
 #[cfg(test)]
 mod zerofs_client_tests;
 
-pub async fn run_cli() -> Result<()> {
+pub async fn run_cli() -> Result<(), operator_required::CliFailure> {
     let cli = cli::Cli::parse_args();
 
     match cli.command {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        cli::Commands::Inventory {
+            root,
+            hash,
+            max_entries_per_second,
+            work_dir,
+            resume_from,
+        } => {
+            cli::inventory::run(
+                &root,
+                hash,
+                max_entries_per_second,
+                work_dir.as_deref(),
+                resume_from.as_deref(),
+            )?;
+        }
         cli::Commands::Upload {
             target,
             source,
@@ -124,7 +153,9 @@ pub async fn run_cli() -> Result<()> {
             eprintln!("New password read successfully.");
 
             eprintln!("Changing encryption password...");
-            cli::password::change_password(&settings, new_password).await?;
+            cli::password::change_password(&settings, new_password)
+                .await
+                .map_err(anyhow::Error::from)?;
             println!("✓ Encryption password changed successfully!");
             println!("ℹ To use the new password, update your config file or environment variable");
         }
@@ -133,14 +164,33 @@ pub async fn run_cli() -> Result<()> {
             read_only,
             checkpoint,
         } => {
-            cli::server::run_server(config, read_only, checkpoint).await?;
+            cli::server::run_server(config, read_only, checkpoint)
+                .await
+                .map_err(operator_required::CliFailure::server)?;
+        }
+        cli::Commands::MemoryStatus { config } => {
+            cli::memory_budget::print_status(&config)?;
         }
         cli::Commands::Pool { subcommand } => {
             cli::pool::run(subcommand).await?;
         }
+        cli::Commands::Survival { subcommand } => {
+            cli::survival::run(subcommand).await?;
+        }
         cli::Commands::Debug { subcommand } => match subcommand {
             cli::DebugCommands::ListKeys { config } => {
                 cli::debug::list_keys(config).await?;
+            }
+            cli::DebugCommands::ScanCacheFiles {
+                path,
+                json,
+                live,
+                legacy,
+            } => {
+                let exit_status = cli::debug::scan_cache_files(&path, json, live, legacy)?;
+                if exit_status != 0 {
+                    std::process::exit(exit_status);
+                }
             }
             cli::DebugCommands::ReseedWritebackPredecessor {
                 config,
@@ -220,6 +270,7 @@ pub async fn run_cli() -> Result<()> {
             writeback,
             relaxed_consistency,
             aname,
+            reconnect_timeout,
         } => {
             let opts = mount::MountOptions {
                 msize,
@@ -228,6 +279,7 @@ pub async fn run_cli() -> Result<()> {
                 writeback,
                 relaxed_consistency,
                 aname: aname.unwrap_or_default(),
+                reconnect_timeout,
             };
             if let Err(e) = mount::run(target, mountpoint, opts).await {
                 eprintln!("✗ Error: {:#}", e);

@@ -391,7 +391,7 @@ async fn upload_queues_a_second_aligned_chunk_while_the_first_is_committing() {
     });
     first_apply_reached.await.unwrap();
 
-    let second_queued = tokio::time::timeout(Duration::from_secs(2), async {
+    let second_queued = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if let Some(Some(crate::fs::inode::Inode::File(file))) =
                 filesystem.inode_store.pending_inode(inode)
@@ -458,7 +458,9 @@ async fn cancellation_settles_issued_chunks_before_returning() {
         .await
     });
     first_apply_reached.await.unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
+    // A liveness bound, not a speed target: the loop exits as soon as the
+    // pipeline fills, so a loaded host must not fail it.
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if let Some(Some(crate::fs::inode::Inode::File(file))) =
                 filesystem.inode_store.pending_inode(inode)

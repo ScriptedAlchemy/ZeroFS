@@ -1244,7 +1244,7 @@ class FreshResetTests(unittest.TestCase):
                 return '[storage]\nurl = "sftp://pilot@example.test:23/old"\n'
 
             def _fast_topology(self) -> str:
-                return "fastpool/fast zfs /fast"
+                return "/dev/fast xfs /fast"
 
             def _stage_fixtures(self) -> Path:
                 events.append("stage")

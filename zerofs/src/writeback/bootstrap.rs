@@ -35,13 +35,73 @@ pub(crate) async fn attach(
     let journal_dir = base.open_or_create_child(namespace.as_ref(), 0o700)?;
     settings.dir = journal_dir.display().to_path_buf();
     let journal = Arc::new(Journal::open_anchored(journal_dir.clone(), identity)?);
-    let recovery = journal.progress()?;
     let space = Arc::new(PhysicalSpaceSampler::new_anchored(journal_dir));
+    attach_journal(remote, settings, journal, space).await
+}
+
+pub(crate) async fn attach_raw(
+    remote: Arc<dyn ObjectStore>,
+    settings: WritebackSettings,
+    identity: JournalIdentity,
+    namespace: &str,
+    region: zerofs_raw_device::journal_region::TransactionRegion,
+) -> anyhow::Result<AttachedWriteback> {
+    validate_raw_namespace(&settings, namespace)?;
+
+    validate_raw_budget(&region, &settings)?;
+    let journal = Arc::new(Journal::open_raw(region, identity)?);
+    let space = Arc::new(PhysicalSpaceSampler::new_raw(Arc::clone(&journal)));
+    tracing::info!("using raw P3 Journal for writeback metadata and payloads");
+    attach_journal(remote, settings, journal, space).await
+}
+
+/// Apply the same directory-journal migration guard to startup and offline
+/// verification before either opens the raw journal database.
+pub(crate) fn validate_raw_namespace(
+    settings: &WritebackSettings,
+    namespace: &str,
+) -> anyhow::Result<()> {
+    validate_namespace(namespace)?;
+    let previous = settings.dir.join(namespace);
+    match std::fs::symlink_metadata(&previous) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+        Ok(_) => anyhow::bail!(
+            "raw P3 writeback refuses an existing directory journal at {}; drain and migrate it first",
+            previous.display()
+        ),
+    }
+}
+
+/// Check that the payload log holds the whole dirty budget and the free
+/// space SSD admission keeps beside it.
+pub(crate) fn validate_raw_budget(
+    region: &zerofs_raw_device::journal_region::TransactionRegion,
+    settings: &WritebackSettings,
+) -> anyhow::Result<()> {
+    let log_bytes = Journal::raw_payload_log_bytes(region);
+    anyhow::ensure!(
+        settings
+            .disk_bytes
+            .checked_add(settings.min_free_bytes)
+            .is_some_and(|needed| needed <= log_bytes),
+        "raw writeback disk budget and free-space reserve exceed the {log_bytes}-byte P3 Journal payload log"
+    );
+    Ok(())
+}
+
+async fn attach_journal(
+    remote: Arc<dyn ObjectStore>,
+    settings: WritebackSettings,
+    journal: Arc<Journal>,
+    space: Arc<PhysicalSpaceSampler>,
+) -> anyhow::Result<AttachedWriteback> {
+    let recovery = journal.progress()?;
     let sample = space.sample().await?;
     let pending = journal.pending_ssd_reservations()?;
     let ssd = Arc::new(SsdAdmission::recover(
         settings.disk_bytes,
-        1 << 20,
+        journal.max_pending_operations(),
         settings.high_watermark_percent,
         settings.resume_percent,
         settings.min_free_bytes,
@@ -98,6 +158,445 @@ mod tests {
 
     fn physical_child(temp: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
         temp.path().canonicalize().unwrap().join(name)
+    }
+
+    #[tokio::test]
+    async fn raw_attachment_fences_replays_and_retires_without_a_directory() {
+        use zerofs_raw_device::{Identity, Role, journal_region::TransactionRegion};
+
+        const CAPACITY: u64 = 64 << 20;
+        const ID: Identity = Identity {
+            pool_uuid: [1; 16],
+            member_uuid: [2; 16],
+            role: Role::Journal,
+        };
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(CAPACITY).unwrap();
+        let region =
+            TransactionRegion::provision(file.try_clone().unwrap(), CAPACITY, 0, CAPACITY, ID)
+                .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let settings = WritebackSettings {
+            dir: physical_child(&temp, "unused-directory"),
+            ack_mode: AckMode::Memory,
+            memory_bytes: 4 << 20,
+            disk_bytes: 8 << 20,
+            min_free_bytes: 1,
+            high_watermark_percent: 95,
+            resume_percent: 85,
+            upload_concurrency: 2,
+            local_concurrency: 2,
+            shutdown_flush: ShutdownFlush::Local,
+        };
+        let identity = JournalIdentity {
+            format_version: 1,
+            bucket_id: "raw-bucket".to_owned(),
+            backend_endpoint: "raw-pool".to_owned(),
+            database_prefix: "db".to_owned(),
+            backend_kind: "raw".to_owned(),
+            encryption_key_identity_sha256: [7; 32],
+        };
+        let remote = Arc::new(InMemory::new());
+        let (partitioned, controls) = FaultStore::new(remote.clone());
+        controls.partition_writes(true);
+        let attached = super::attach_raw(
+            partitioned.clone(),
+            settings.clone(),
+            identity.clone(),
+            "bucket_fixture",
+            region,
+        )
+        .await
+        .unwrap();
+        let sample = attached.space.sample().await.unwrap();
+        assert!(sample.available_bytes < CAPACITY - 2 * zerofs_raw_device::BLOCK_SIZE);
+        let path = Path::from("db/segments/1");
+        let payload = Bytes::from(vec![0x58; 132 << 10]);
+        attached
+            .store
+            .put(&path, payload.clone().into())
+            .await
+            .unwrap();
+        attached
+            .lifecycle
+            .wait_local_through_accepted()
+            .await
+            .unwrap();
+        assert_eq!(attached.lifecycle.status().unwrap().local_seq, 1);
+        assert!(remote.head(&path).await.is_err());
+        attached.lifecycle.shutdown().await.unwrap();
+        drop(attached);
+
+        let region =
+            TransactionRegion::open(file.try_clone().unwrap(), CAPACITY, 0, CAPACITY, ID).unwrap();
+        let attached = super::attach_raw(
+            partitioned,
+            settings.clone(),
+            identity.clone(),
+            "bucket_fixture",
+            region,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            attached
+                .store
+                .get(&path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            payload
+        );
+        assert!(remote.head(&path).await.is_err());
+        controls.partition_writes(false);
+        attached.lifecycle.activate_remote().unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            attached.lifecycle.wait_remote(1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        attached.lifecycle.shutdown().await.unwrap();
+        drop(attached);
+        assert_eq!(
+            remote.get(&path).await.unwrap().bytes().await.unwrap(),
+            payload
+        );
+
+        let region = TransactionRegion::open(file, CAPACITY, 0, CAPACITY, ID).unwrap();
+        let journal = super::Journal::open_raw(region, identity).unwrap();
+        assert_eq!(journal.progress().unwrap().remote_seq, 1);
+        assert!(journal.mutation(1).unwrap().is_none());
+        assert!(!settings.dir.exists());
+    }
+
+    /// What a kill leaves on the P3: the bytes the journal has handed the
+    /// device so far, with no clean close.
+    #[cfg(unix)]
+    fn killed_image(media: &fs::File) -> fs::File {
+        use std::os::unix::fs::FileExt;
+        let len = media.metadata().unwrap().len();
+        let image = tempfile::tempfile().unwrap();
+        image.set_len(len).unwrap();
+        let mut buffer = vec![0; 1 << 20];
+        for offset in (0..len).step_by(buffer.len()) {
+            let count = (len - offset).min(buffer.len() as u64) as usize;
+            media.read_exact_at(&mut buffer[..count], offset).unwrap();
+            image.write_all_at(&buffer[..count], offset).unwrap();
+        }
+        image
+    }
+
+    #[cfg(unix)]
+    mod raw_replay {
+        use super::super::{AttachedWriteback, attach_raw};
+        use super::killed_image;
+        use crate::fault_store::{FaultControls, FaultStore};
+        use crate::segment::Segid;
+        use crate::segment_store::GeneratedSegmentCreate;
+        use crate::writeback::config::{AckMode, ShutdownFlush, WritebackSettings};
+        use crate::writeback::model::JournalIdentity;
+        use bytes::Bytes;
+        use object_store::{
+            ObjectStore, ObjectStoreExt, PutMode, PutOptions, memory::InMemory, path::Path,
+        };
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        use zerofs_raw_device::{Identity, Role, journal_region::TransactionRegion};
+
+        const CAPACITY: u64 = 256 << 20;
+        const ID: Identity = Identity {
+            pool_uuid: [3; 16],
+            member_uuid: [4; 16],
+            role: Role::Journal,
+        };
+        /// The raw journal's payload chunk and the remote reconciliation range.
+        const PAYLOAD_CHUNK: usize = 60 << 10;
+        const REMOTE_RANGE: usize = 16 << 20;
+
+        struct Fixture {
+            remote: Arc<InMemory>,
+            store: Arc<FaultStore>,
+            controls: Arc<FaultControls>,
+            settings: WritebackSettings,
+            identity: JournalIdentity,
+            _temp: tempfile::TempDir,
+        }
+
+        impl Fixture {
+            fn new() -> Self {
+                let temp = tempfile::tempdir().unwrap();
+                let remote = Arc::new(InMemory::new());
+                let (store, controls) = FaultStore::new(remote.clone());
+                Self {
+                    remote,
+                    store,
+                    controls,
+                    settings: WritebackSettings {
+                        dir: super::physical_child(&temp, "unused-directory"),
+                        ack_mode: AckMode::Memory,
+                        memory_bytes: 60 << 20,
+                        disk_bytes: 60 << 20,
+                        min_free_bytes: 1,
+                        high_watermark_percent: 95,
+                        resume_percent: 85,
+                        upload_concurrency: 4,
+                        local_concurrency: 2,
+                        shutdown_flush: ShutdownFlush::Local,
+                    },
+                    identity: JournalIdentity {
+                        format_version: 1,
+                        bucket_id: "raw-bucket".to_owned(),
+                        backend_endpoint: "raw-pool".to_owned(),
+                        database_prefix: "db".to_owned(),
+                        backend_kind: "raw".to_owned(),
+                        encryption_key_identity_sha256: [7; 32],
+                    },
+                    _temp: temp,
+                }
+            }
+
+            /// Start the engine on `media`, as a restart does: the overlay
+            /// recovers and remote replay stays paused until activated.
+            async fn start(&self, media: &std::fs::File) -> AttachedWriteback {
+                let region =
+                    TransactionRegion::open(media.try_clone().unwrap(), CAPACITY, 0, CAPACITY, ID)
+                        .unwrap();
+                attach_raw(
+                    self.store.clone(),
+                    self.settings.clone(),
+                    self.identity.clone(),
+                    "bucket_fixture",
+                    region,
+                )
+                .await
+                .unwrap()
+            }
+
+            async fn published(&self, path: &Path) -> Option<Bytes> {
+                match self.remote.get(path).await {
+                    Ok(result) => Some(result.bytes().await.unwrap()),
+                    Err(object_store::Error::NotFound { .. }) => None,
+                    Err(error) => panic!("remote read of {path} failed: {error}"),
+                }
+            }
+
+            /// Wait for `path` to be published, failing as soon as replay
+            /// stops for good instead of timing out.
+            async fn wait_published(&self, engine: &AttachedWriteback, path: &Path) {
+                let deadline = Instant::now() + Duration::from_secs(60);
+                while self.published(path).await.is_none() {
+                    let status = engine.lifecycle.status().unwrap();
+                    assert_eq!(
+                        status.terminal_error, None,
+                        "replay stopped before publishing {path}"
+                    );
+                    assert!(Instant::now() < deadline, "{path} was never published");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+
+        fn segment(counter: u64) -> Path {
+            Path::from(format!("db/{}", Segid::new(3, counter).object_key()))
+        }
+
+        fn pattern(seed: u32, len: usize) -> Bytes {
+            let mut state = seed;
+            (0..len)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (state >> 24) as u8
+                })
+                .collect::<Vec<_>>()
+                .into()
+        }
+
+        async fn seal(engine: &AttachedWriteback, path: &Path, payload: &Bytes) {
+            let mut options = PutOptions::from(PutMode::Create);
+            options.extensions.insert(GeneratedSegmentCreate);
+            engine
+                .store
+                .put_opts(path, payload.clone().into(), options)
+                .await
+                .unwrap();
+        }
+
+        /// The N5 production wedge of 2026-11-20. Segments are sealed into a
+        /// raw P3 journal faster than the HDDs take them. The engine is
+        /// killed while the frontier upload is still in flight and segments
+        /// behind it are already published, so the journal's remote watermark
+        /// does not cover them. Every later start replays those creates
+        /// against objects that already hold the same bytes. Replay must
+        /// reconcile them and drain; engine 102b0e59 instead reported a
+        /// permanent remote divergence for any such segment larger than one
+        /// 60 KiB journal payload chunk and refused every write from then on.
+        #[tokio::test]
+        async fn restarts_reconcile_segments_published_before_a_kill_and_drain() {
+            let fixture = Fixture::new();
+            let media = tempfile::tempfile().unwrap();
+            media.set_len(CAPACITY).unwrap();
+            TransactionRegion::provision(media.try_clone().unwrap(), CAPACITY, 0, CAPACITY, ID)
+                .unwrap();
+
+            // The backlog: one ordering fence, then five sealed segments.
+            let manifest = Path::from("db/manifest/00000000000000000001.manifest");
+            let manifest_bytes = pattern(1, 4 << 10);
+            let segments = [
+                (segment(0xb60), pattern(2, PAYLOAD_CHUNK + 1)),
+                (segment(0xb61), pattern(3, 4 << 20)),
+                (segment(0xb62), pattern(4, REMOTE_RANGE + PAYLOAD_CHUNK + 1)),
+                (segment(0xb63), pattern(5, 200 << 10)),
+                (segment(0xb64), pattern(6, 4 << 20)),
+            ];
+
+            // First run: the HDDs stall on the fence while two segments
+            // behind it finish publishing.
+            fixture.controls.block_puts();
+            let engine = fixture.start(&media).await;
+            engine
+                .store
+                .put_opts(
+                    &manifest,
+                    manifest_bytes.clone().into(),
+                    PutMode::Create.into(),
+                )
+                .await
+                .unwrap();
+            for (path, payload) in &segments {
+                seal(&engine, path, payload).await;
+            }
+            engine
+                .lifecycle
+                .wait_local_through_accepted()
+                .await
+                .unwrap();
+            engine.lifecycle.activate_remote().unwrap();
+            for (path, _) in &segments[1..3] {
+                fixture.controls.release_put_path(path.as_ref());
+                fixture.wait_published(&engine, path).await;
+            }
+            let status = engine.lifecycle.status().unwrap();
+            assert_eq!((status.remote_seq, status.local_seq), (0, 6));
+
+            // SIGKILL: the P3 keeps what it held at this instant. The dying
+            // process publishes nothing more.
+            let media = killed_image(&media);
+            engine.lifecycle.shutdown().await.unwrap();
+            drop(engine);
+            assert_eq!(fixture.published(&manifest).await, None);
+
+            // Second run: restart with the backlog. Replay meets the two
+            // published segments and must accept them as its own bytes.
+            let engine = fixture.start(&media).await;
+            let status = engine.lifecycle.status().unwrap();
+            assert_eq!((status.remote_seq, status.local_seq), (0, 6));
+            engine.lifecycle.activate_remote().unwrap();
+            for (path, _) in &segments[1..3] {
+                fixture.controls.release_put_path(path.as_ref());
+            }
+            // The lanes those two free carry the next segment, which then
+            // also publishes ahead of the still-stalled fence.
+            fixture.controls.release_put_path(segments[3].0.as_ref());
+            fixture.wait_published(&engine, &segments[3].0).await;
+            let status = engine.lifecycle.status().unwrap();
+            assert_eq!((status.remote_seq, status.terminal_error), (0, None));
+
+            // A graceful stop in the middle of that drain, then a third run
+            // on healthy HDDs.
+            engine.lifecycle.shutdown().await.unwrap();
+            drop(engine);
+            fixture.controls.release_puts();
+            let engine = fixture.start(&media).await;
+            engine.lifecycle.activate_remote().unwrap();
+            tokio::time::timeout(Duration::from_secs(60), engine.lifecycle.wait_remote(6))
+                .await
+                .expect("the backlog drains")
+                .expect("replay reconciles every published segment");
+            let status = engine.lifecycle.status().unwrap();
+            assert_eq!(
+                (status.remote_seq, status.local_seq, status.terminal_error),
+                (6, 6, None)
+            );
+            assert_eq!(fixture.published(&manifest).await, Some(manifest_bytes));
+            for (path, payload) in &segments {
+                assert_eq!(fixture.published(path).await.as_ref(), Some(payload));
+            }
+            engine.lifecycle.shutdown().await.unwrap();
+            drop(engine);
+
+            // Fourth run: nothing is pending and new writes drain.
+            let engine = fixture.start(&media).await;
+            let status = engine.lifecycle.status().unwrap();
+            assert_eq!((status.remote_seq, status.local_seq), (6, 6));
+            engine.lifecycle.activate_remote().unwrap();
+            let (path, payload) = (segment(0xb65), pattern(7, 4 << 20));
+            seal(&engine, &path, &payload).await;
+            tokio::time::timeout(Duration::from_secs(60), engine.lifecycle.wait_remote(7))
+                .await
+                .expect("the new segment drains")
+                .unwrap();
+            assert_eq!(fixture.published(&path).await, Some(payload));
+            engine.lifecycle.shutdown().await.unwrap();
+        }
+
+        /// The same restart still fails closed when the published object is
+        /// not the journal's: replay stops for good and refuses new writes
+        /// instead of accepting or overwriting the other bytes.
+        #[tokio::test]
+        async fn a_restart_still_refuses_a_published_segment_with_other_bytes() {
+            let fixture = Fixture::new();
+            let media = tempfile::tempfile().unwrap();
+            media.set_len(CAPACITY).unwrap();
+            TransactionRegion::provision(media.try_clone().unwrap(), CAPACITY, 0, CAPACITY, ID)
+                .unwrap();
+            let (path, payload) = (segment(0xb64), pattern(8, 4 << 20));
+            // Same length, one different byte in the last payload chunk.
+            let mut other = payload.to_vec();
+            *other.last_mut().unwrap() ^= 1;
+            let other = Bytes::from(other);
+            fixture
+                .remote
+                .put(&path, other.clone().into())
+                .await
+                .unwrap();
+
+            let engine = fixture.start(&media).await;
+            seal(&engine, &path, &payload).await;
+            engine
+                .lifecycle
+                .wait_local_through_accepted()
+                .await
+                .unwrap();
+            let media = killed_image(&media);
+            engine.lifecycle.shutdown().await.unwrap();
+            drop(engine);
+
+            let engine = fixture.start(&media).await;
+            engine.lifecycle.activate_remote().unwrap();
+            let error =
+                tokio::time::timeout(Duration::from_secs(60), engine.lifecycle.wait_remote(1))
+                    .await
+                    .expect("replay reaches a verdict")
+                    .expect_err("other bytes must not reconcile");
+            assert!(
+                error
+                    .to_string()
+                    .contains("permanent remote divergence at sequence 1"),
+                "{error}"
+            );
+            assert_eq!(fixture.published(&path).await, Some(other));
+            let refused = engine
+                .store
+                .put(&segment(0xb65), Bytes::from_static(b"later").into())
+                .await
+                .expect_err("a diverged journal admits no further writes");
+            assert!(refused.to_string().contains("poisoned"), "{refused}");
+            let _ = engine.lifecycle.shutdown().await;
+        }
     }
 
     #[tokio::test]

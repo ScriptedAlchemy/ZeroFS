@@ -873,6 +873,7 @@ impl NBDHandler {
             Err(WriteAdmissionError::Unavailable) => Err(CommandError::IoError),
             Err(WriteAdmissionError::Backpressured) => Err(CommandError::IoError),
             Err(WriteAdmissionError::Mutation(error)) => Err(mutation_command_error(error)),
+            Err(WriteAdmissionError::Survival(_)) => Err(CommandError::IoError),
         }
     }
 
@@ -1204,6 +1205,7 @@ mod tests {
             groups: [0; 16],
             groups_count: 1,
             groups_complete: true,
+            groups_truncated: false,
         }
     }
 

@@ -14,7 +14,7 @@ const MULTIPLE_SICK_MEMBERS: &str = "multiple_sick_members";
 /// single-device failure into a permanent multi-device stop. Count unfinished
 /// zero-byte operations too: their physical ownership still has to settle.
 fn active_failure(member: &PoolMemberStatus) -> bool {
-    member.health.quarantine.is_some()
+    (member.health.quarantine.is_some() || member.unavailable_at_startup)
         && (member.objects != 0
             || member.used_bytes != 0
             || member.reserved_bytes != 0
@@ -171,7 +171,7 @@ impl PoolObjectStore {
         let sick: BTreeSet<_> = status
             .members
             .iter()
-            .filter(|m| m.health.quarantine.is_some())
+            .filter(|m| !m.unavailable_at_startup && m.health.quarantine.is_some())
             .map(|m| m.id.as_str())
             .collect();
         if sick.is_empty() {
@@ -202,7 +202,9 @@ impl PoolObjectStore {
                     continue;
                 }
                 for target in status.members.iter().filter(|m| {
-                    m.health.quarantine.is_none() && m.health.monitoring_error.is_none()
+                    !m.unavailable_at_startup
+                        && m.health.quarantine.is_none()
+                        && m.health.monitoring_error.is_none()
                 }) {
                     if stop.is_cancelled() {
                         break;

@@ -163,6 +163,47 @@
         (.delete child)
         (.delete dir)))))
 
+(deftest directory-durability-read-refuses-a-failed-listing
+  (let [dir (.toFile (Files/createTempDirectory
+                      "zerofs-ha-directory-read" (make-array FileAttribute 0)))
+        child (io/file dir "d")
+        entry (io/file child "kept")
+        handles (atom {"d" {:dirname "d"}})
+        dc (core/->DurabilityClient (.getPath dir) handles (atom 0))]
+    (try
+      (is (.mkdir child))
+      (spit entry "value")
+      (is (= {"d" #{"kept"}}
+             (:value (client/invoke! dc {} {:f :readdir}))))
+      (is (.delete entry))
+      (is (.delete child))
+      ;; A failed lookup or an unusable path must not establish absence.
+      (is (thrown? java.io.IOException
+                   (client/invoke! dc {} {:f :readdir})))
+      (spit child "not a directory")
+      (is (thrown? java.io.IOException
+                   (client/invoke! dc {} {:f :readdir})))
+      (finally
+        (.delete entry)
+        (.delete child)
+        (.delete dir)))))
+
+(deftest directory-durability-checker-requires-a-final-observation
+  (let [history [{:type :ok :f :rename
+                  :dir-facts [{:dir "source" :name "moved" :present false}]}
+                 {:type :invoke :f :fsyncdir :dir "source" :process 0}
+                 {:type :ok :f :fsyncdir :dir "source" :process 0}]
+        observed {:type :ok :f :readdir :value {"source" #{}}}
+        check (fn [ops] (checker/check (core/dirent-honesty-checker) {} ops {}))]
+    (is (true? (:valid? (check (conj history observed)))))
+    (is (false? (:valid? (check (conj history (assoc observed :value {"source" #{"moved"}}))))))
+    (doseq [ops [history
+                 (conj history (assoc observed :type :fail :error "Input/output error"))
+                 (conj history (assoc observed :value {}))
+                 (into [observed] history)
+                 (into [observed] (conj history {:type :fail :f :readdir}))]]
+      (is (= :unknown (:valid? (check ops))) (pr-str ops)))))
+
 (deftest unmount-dispatches-to-the-selected-client
   (let [commands (atom [])
         base     {:mount "/tmp/zerofs-ha/mnt"}]
@@ -388,6 +429,63 @@
                          (java.io.IOException. "Bad file descriptor")))))
     (is (= :info (:type (core/classify-add-error
                          (java.io.IOException. "Input/output error")))))))
+
+(defn- set-client-with-live-value
+  "A set client over a fresh directory whose worker 0 still owns value v."
+  [v]
+  (let [dir (.toFile (Files/createTempDirectory
+                      "zerofs-ha-remove" (make-array FileAttribute 0)))]
+    {:dir dir
+     :client (core/->SetClient (.getPath dir) true (atom v) (atom {0 #{v}}) (atom nil))}))
+
+(defn- delete-tree! [dir]
+  (run! #(.delete %) (reverse (file-seq dir))))
+
+(deftest remove-is-ok-when-the-value-is-observed-absent
+  (let [v 7
+        {:keys [dir client]} (set-client-with-live-value v)]
+    (try
+      (.mkdirs (core/subdir dir v))
+      (spit (io/file (core/subdir dir v) (str v)) (str v "\n"))
+      (is (= {:type :ok :value v}
+             (select-keys (client/invoke! client {} {:f :remove :process 0})
+                          [:type :value :error])))
+      (finally (delete-tree! dir)))))
+
+(deftest remove-is-indeterminate-when-the-absence-probe-fails
+  ;; A leader acknowledges the unlink and dies before the fsync. The fsync then
+  ;; succeeds on its successor, which never saw the unlink, and the mount fails
+  ;; the probe with an errno other than ENOENT. The value is still there.
+  (let [v 7
+        {:keys [dir client]} (set-client-with-live-value v)]
+    (try
+      ;; A regular file where the subdirectory belongs makes the probe fail
+      ;; with ENOTDIR, standing in for the mount's EIO.
+      (spit (core/subdir dir v) "")
+      (with-redefs [core/remove-file! (fn [_ _] true)]
+        (let [op (client/invoke! client {} {:f :remove :process 0})]
+          (is (= :info (:type op)))
+          (is (= v (:value op)))
+          (is (re-find #"Not a directory" (str (:error op))))
+          (is (:valid? (check [{:type :ok :f :add :value v}
+                               op
+                               {:type :ok :f :read :value #{v}}])))))
+      (finally (delete-tree! dir)))))
+
+(deftest removed-here-distinguishes-absence-from-a-failed-open
+  (let [dir (.toFile (Files/createTempDirectory
+                      "zerofs-ha-probe" (make-array FileAttribute 0)))
+        file (io/file dir "present")]
+    (try
+      (spit file "x")
+      (is (false? (core/removed-here? file)))
+      (is (true? (core/removed-here? (io/file dir "absent"))))
+      (is (thrown? java.nio.file.FileSystemException
+                   (core/removed-here? (io/file file "child"))))
+      (is (not (instance? java.nio.file.NoSuchFileException
+                          (try (core/removed-here? (io/file file "child"))
+                               (catch java.io.IOException e e)))))
+      (finally (delete-tree! dir)))))
 
 (deftest inode-accounting-waits-for-replay-protected-orphans
   (let [samples (atom [20 19])

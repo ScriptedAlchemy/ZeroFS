@@ -1,13 +1,13 @@
 import { useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { p9client, type FileEntry, type FileInfo, type TrafficStats } from "../lib/zerofs/client";
+import { p9client, type FileInfo, type TrafficStats } from "../lib/zerofs/client";
 import { useNinePConnection } from "./use-ninep-connection";
 
 export function useDirectory(path: string) {
   const state = useNinePConnection();
-  return useQuery<FileEntry[]>({
+  return useQuery({
     queryKey: ["9p", "ls", path],
-    queryFn: () => p9client.listDirectory(path),
+    queryFn: () => p9client.directoryListing(path),
     enabled: state === "connected",
     retry: false,
   });
@@ -48,7 +48,8 @@ export function useRemove() {
 export function useRename() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ oldPath, newPath }: { oldPath: string; newPath: string }) => p9client.rename(oldPath, newPath),
+    mutationFn: ({ oldPath, newPath, replace }: { oldPath: string; newPath: string; replace?: boolean }) =>
+      p9client.rename(oldPath, newPath, replace),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["9p", "ls"] });
     },
@@ -70,15 +71,17 @@ export function useUpload() {
       onProgress,
       signal,
       batch,
+      replace,
     }: {
       dirPath: string;
       file: File;
+      replace?: boolean;
       onProgress?: (sent: number, total: number) => void;
       signal?: AbortSignal;
       batch?: ReturnType<typeof p9client.beginUploadBatch>;
     }) => {
       const targetPath = dirPath.replace(/\/$/, "") + "/" + file.name;
-      return p9client.uploadBlob(targetPath, file, { onProgress, signal, batch });
+      return p9client.uploadBlob(targetPath, file, { onProgress, signal, batch, replace });
     },
     onSuccess: (_data, { dirPath }) => {
       qc.invalidateQueries({ queryKey: ["9p", "ls", dirPath] });

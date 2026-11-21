@@ -1,0 +1,23 @@
+{
+  "utc": "2026-11-19T19:26:18.344335+00:00",
+  "stage_removed": "/var/tmp/zerofs-raw-broker.JSP06y6m",
+  "guest_removed": "/var/tmp/zerofs-claim-ns.oo8i5as0",
+  "containers_removed": {
+    "zerofs-raw-broker.JSP06y6m-seed": "6be3f46755c6068b46ddac9d361e9840ae0a66b3a07f3edc03c107abd3a8c0f7",
+    "zerofs-raw-broker.JSP06y6m-warm": "7d698f2d1c26eb2f928046d01bb110e69a13782c0d13e40da864e517d0f9e80e",
+    "zerofs-raw-broker.JSP06y6m-candidate": "a8533c4b566329a0c7698c3c9aa0163518c9502dd6fab58062f5a7b7ad14e034",
+    "zerofs-raw-broker.JSP06y6m-ns": "63ec3f20a96a4eac83e17e35421f7a13e59fd45e93bdb4acf3f66651e3a59e7f",
+    "zerofs-raw-broker.JSP06y6m-batch": "6c7a14eaed0b02987fa92de0743aa2ac0ef133fa1ac85417050d03a61aee930c",
+    "zerofs-raw-broker.JSP06y6m-tests": "8b56bd1c025e60f7816ef8b10f9250ffe3384d7895f81efb8dfa2d3c522aae70"
+  },
+  "volumes_removed": [
+    "zerofs-raw-broker.JSP06y6m-cargo",
+    "zerofs-raw-broker.JSP06y6m-target"
+  ],
+  "unrelated_containers_preserved": 10,
+  "unrelated_volumes_preserved": 8,
+  "existing_image_ids_preserved": 25,
+  "shared_builder_cache_volume_preserved": true,
+  "buildbuddy": "running",
+  "owned_resources_remaining": 0
+}

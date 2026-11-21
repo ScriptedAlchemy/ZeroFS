@@ -235,6 +235,114 @@ async fn configured_local_disks_spill_at_capacity_and_reopen_with_the_same_place
     assert_eq!(read(reopened.store.as_ref(), &second).await, "abcd");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn degraded_local_pool_keeps_an_unused_sftp_member_deferred() {
+    use crate::config::SftpConfig;
+    use crate::pool_object_store::SegmentTarget;
+    use russh::keys::ssh_key::{LineEnding, private::Ed25519Keypair};
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    let fixture = Fixture::new(128, 128);
+    let (opened, pool) = open_pool_storage(&fixture.settings, true).await.unwrap();
+    let survivor = segment(&opened.path, 1);
+    let unavailable = segment(&opened.path, 2);
+    create_segment(opened.store.as_ref(), &survivor, b"survivor").await;
+    let mut options = PutOptions::from(PutMode::Create);
+    options.extensions.insert(GeneratedSegmentCreate);
+    options
+        .extensions
+        .insert(SegmentTarget("disk-b".to_owned()));
+    opened
+        .store
+        .put_opts(&unavailable, Bytes::from_static(b"offline").into(), options)
+        .await
+        .unwrap();
+    let pool_id = pool.status().await.unwrap().pool_id;
+    drop(opened);
+    drop(pool);
+
+    // A listening socket without an SSH server lets us prove that neither
+    // construction, local reads, nor unused shutdown attempts a remote dial.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let identity_file = fixture.root.path().join("test-identity");
+    let known_hosts = fixture.root.path().join("test-known-hosts");
+    let identity = russh::keys::PrivateKey::from(Ed25519Keypair::from_seed(&[0x29; 32]));
+    std::fs::write(
+        &identity_file,
+        identity.to_openssh(LineEnding::LF).unwrap().as_bytes(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&identity_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::write(&known_hosts, "").unwrap();
+
+    let mut settings = fixture.settings.clone();
+    let configured = settings.storage.pool.as_mut().unwrap();
+    configured.allow_degraded_start = true;
+    let mut remote = configured.members[0].clone();
+    remote.id = "unused-remote".to_owned();
+    remote.url = format!("sftp://audit@{endpoint}/pool-member");
+    remote.sftp = Some(SftpConfig {
+        identity_file,
+        known_hosts,
+        max_connections: 1,
+        read_concurrency: 1,
+        write_concurrency: 1,
+        ..Default::default()
+    });
+    configured.members.push(remote);
+    let settings = fixture.reload(&settings).unwrap();
+    let offline = fixture.root.path().join("offline-disk-b");
+    std::fs::rename(&fixture.members[1], &offline).unwrap();
+
+    let opened = tokio::time::timeout(Duration::from_secs(5), open_storage(&settings))
+        .await
+        .expect("a deferred remote must not delay degraded local startup")
+        .unwrap();
+    let pool = opened.pool.as_ref().unwrap();
+    let status = pool.status().await.unwrap();
+    assert_eq!(status.pool_id, pool_id);
+    assert!(
+        status
+            .members
+            .iter()
+            .find(|member| member.id == "disk-b")
+            .unwrap()
+            .unavailable_at_startup
+    );
+    assert_eq!(read(opened.store.as_ref(), &survivor).await, "survivor");
+    assert!(opened.store.get(&unavailable).await.is_err());
+    assert_eq!(member_for(pool, &survivor).await, "disk-a");
+    assert_eq!(member_for(pool, &unavailable).await, "disk-b");
+    assert!(!fixture.members[1].exists());
+
+    let metadata = opened.path.clone().join("manifest").join("degraded-start");
+    opened
+        .store
+        .put(&metadata, "metadata".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(fixture.metadata.join("manifest/degraded-start")).unwrap(),
+        b"metadata"
+    );
+    let sessions = opened.sftp_pool.as_ref().unwrap();
+    assert_eq!(sessions.pools.len(), 1);
+    assert!(!sessions.fatal);
+    tokio::time::timeout(Duration::from_secs(5), sessions.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "an unused remote member must never dial during local startup, reads, or shutdown"
+    );
+}
+
 #[tokio::test]
 async fn ordinary_open_requires_initialization_and_never_recreates_a_lost_catalog() {
     let fixture = Fixture::new(8, 16);
@@ -396,4 +504,82 @@ fn unsupported_member_schemes_and_remote_metadata_are_rejected_before_opening_st
     let error = fixture.reload(&settings).unwrap_err();
     assert!(format!("{error:#}").contains("authoritative metadata"));
     assert!(!fixture.catalog().exists());
+}
+
+/// The retry decision for an errno belongs to the backend that produced it.
+/// A remote store (SFTP, S3, GCS, Azure) keeps retrying an EIO-shaped error,
+/// because there it means a broken connection or an unavailable server. Only
+/// the local metadata store treats EIO as final.
+#[tokio::test]
+async fn only_a_local_metadata_store_stops_retrying_an_eio() {
+    use crate::fault_store::native_errno::{self, Operation};
+    use crate::retrying_object_store::RetryingObjectStore;
+    use std::time::Duration;
+
+    let location = Path::from("boundary-metadata/compacted/one.sst");
+    let stack = |url: &str, fault: &crate::metadata_fault::MetadataFault| {
+        let memory: Box<dyn ObjectStore> = Box::new(object_store::memory::InMemory::new());
+        // A file:// URL gets its injection point from guard_local_metadata.
+        let inner = if url.starts_with("file:") {
+            memory
+        } else {
+            native_errno::wrap(memory)
+        };
+        let guarded = super::guard_local_metadata(&url.parse().unwrap(), inner, fault);
+        RetryingObjectStore::new(Arc::from(guarded))
+    };
+
+    for url in ["sftp://storage.example/zerofs", "s3://bucket/zerofs"] {
+        let fault = crate::metadata_fault::MetadataFault::default();
+        let store = stack(url, &fault);
+        store
+            .put(&location, Bytes::from_static(b"sst body").into())
+            .await
+            .unwrap();
+        let _eio = native_errno::arm(
+            "/boundary-metadata",
+            Operation::Read,
+            "one.sst",
+            libc::EIO,
+            Some(2),
+        );
+        let body = tokio::time::timeout(Duration::from_secs(10), store.get_range(&location, 0..3))
+            .await
+            .expect("a remote EIO must be retried to success")
+            .expect("the third attempt succeeds");
+        assert_eq!(body.as_ref(), b"sst");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), fault.tripped())
+                .await
+                .is_err(),
+            "{url}: a remote store must never report a local metadata failure"
+        );
+    }
+
+    let fault = crate::metadata_fault::MetadataFault::default();
+    let store = stack("file:///boundary-metadata/", &fault);
+    store
+        .put(&location, Bytes::from_static(b"sst body").into())
+        .await
+        .unwrap();
+    let _eio = native_errno::arm(
+        "/boundary-metadata",
+        Operation::Read,
+        "one.sst",
+        libc::EIO,
+        Some(2),
+    );
+    let error = tokio::time::timeout(Duration::from_secs(10), store.get_range(&location, 0..3))
+        .await
+        .expect("a local metadata EIO must not be retried")
+        .expect_err("the first EIO is final");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("/boundary-metadata/compacted/one.sst") && message.contains("EIO"),
+        "{message}"
+    );
+    let recorded = tokio::time::timeout(Duration::from_secs(1), fault.tripped())
+        .await
+        .expect("a local metadata EIO must trip the fault");
+    assert!(recorded.to_string().contains("one.sst"), "{recorded:#}");
 }

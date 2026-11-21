@@ -5,6 +5,10 @@ directories and remote object stores into one filesystem. A storage pool holds
 permanent file data. It is independent of the clean read cache and the optional
 writeback journal.
 
+For opt-in, declared disk profiles and filesystem identity checks before opening
+a local pool, see [storage readiness](storage-readiness.md). This startup preflight
+does not enable strict placement.
+
 ## Native local storage
 
 Set `[storage].url` to a local directory:
@@ -94,11 +98,43 @@ configuration. The catalog is also bound to its original resolved directory;
 copying the database into a different directory cannot create a second owner of
 the same member data.
 
-Members are considered in configuration order. Each new immutable segment goes
-to the first member whose configured quota and local free-space reserve allow
-it. The quota counts committed data, pending uploads, and superseded data still
-awaiting deletion. Adding another permanent member adds capacity without
-changing filesystem paths or remapping previously written segments.
+The default setting, `segment_placement = "first_fit"`, considers members in
+configuration order. Each new immutable segment goes to the first eligible
+member whose quota and local free-space reserve allow it. The quota counts
+committed data, pending uploads, and superseded data still awaiting deletion.
+Adding another permanent member adds capacity without changing filesystem paths
+or remapping previously written segments.
+
+Placement currently operates on sealed segments. A file can span segments,
+and a segment can carry extents from several files. Whole-file placement across
+multiple members requires binding an inode before frame packing, carrying the
+binding through upload and recovery, and keeping compaction and reclaim within
+that binding. The allocator has no complete file length or inode ownership at
+admission, so the current placement modes provide segment-level capacity
+admission.
+
+The pool has an internal exact-target contract for new conditional segment
+uploads. A caller that provides a target persists it in the catalog before
+capacity admission. Writeback registers explicit generated-segment targets in
+the same catalog before it can acknowledge the journal entry. Replay uses
+the same logical key and inherits the persisted target even when no earlier
+pool put occurred. Later puts honor the target after reclaim or restart. The
+allocator checks the target's health, quota and filesystem reserve and
+refuses allocations it cannot satisfy. Segment migration cannot move a
+targeted segment to another member. There is currently no filesystem placement
+mode that emits these targets.
+
+Set `segment_placement = "round_robin_local"` in `[storage.pool]` to rotate new
+immutable segment reservations across eligible local members. Rotation follows
+configuration order and resumes after restart from the last local reservation
+recorded in the catalog. Members that are quarantined, unavailable, or out of room
+are skipped. When no local member can accept a segment, remote members are
+considered in configuration order.
+
+Each segment has one backing member. Placement works at segment granularity, so
+a small write can land entirely on one disk and placement does not stripe every
+file. To measure how a workload used the pool, compare its new entries in
+`zerofs pool placements` and sum their `size` by `member_id`.
 
 `capacity_gb` is a physical segment-storage budget in decimal GB. Metadata,
 catalog space, provider overhead, and other files on the same disk need their
@@ -108,11 +144,161 @@ reserve for both metadata and data. `[filesystem].max_size_gb` remains the
 separate logical filesystem quota; `zerofs pool status` reports physical member
 capacity and reservations. Compression means logical and physical usage differ.
 
+### When a member fills
+
+`capacity_gb` is an upper bound that an operator typed. The free space the
+member's filesystem reports is a fact. For a local member, placement and
+`pool status` both allow the smaller of the declared capacity left and the
+filesystem's free bytes minus `reserve_free_gb` and the pool's outstanding
+local reservations. Each reservation reads `statvfs` inside the catalog
+transaction that records it. Nothing caches the reading.
+
+The filesystem can still fill between that check and the write, because of
+another writer on the same filesystem or because some filesystems refuse writes
+before their reported free space reaches zero. If a member write then returns ENOSPC or
+EDQUOT, the pool marks the member full and writes the same segment to the next
+member with room. This happens within the same flush and needs no operator
+action. Full is not a media fault, so the member stays readable and is not
+quarantined. Later placements skip it until its filesystem reports more free
+bytes than it had when the write failed. A remote member has no free-space
+figure, so a no-space answer keeps it out of placement for 30 seconds, after
+which one write may try it again.
+
+A WRITE is admitted before its reply. It claims room on one member for an
+upper bound of what it can add to open segments: one full frame per touched
+extent at the compressor's worst case, a directory entry each, and a footer
+for every segment it can open. The claim funds a lease on the open segment it
+lands in, and the lease holds that room until the segment's placement commits.
+With the writeback journal that is when the drain places the segment, not when
+the journal acknowledges it. Every claim, lease and reservation counts the
+others, so a seal always has the room its WRITE was promised. Truncates and
+other writes outside a WRITE claim exactly what they stage.
+
+Admission reads the catalog's committed rows and the in-memory promises. It
+never waits for a placement commit, so a slow catalog flush delays the drain
+and not the client. A reservation counts in memory from the moment its member
+is chosen until its upload row is committed. When placement moves between two
+writes of one file, the open segment's lease grows on its own member while
+that member has room, and the segment is sealed early only when it has none.
+
+When no member has room, the WRITE answers ENOSPC, not EIO, over 9P. The FUSE
+client forwards that errno, and NFS maps it to `NFS3ERR_NOSPC`. NBD still
+reports EIO for every filesystem error. Volatile acknowledgement claims before
+it replies too, so a full pool refuses the request instead of failing the
+materializer. Bytes acknowledged before the refusal are in segments that have
+their room, and the next fsync makes them durable. A refused WRITE changed
+nothing, so nothing waits in memory and later flushes keep succeeding. A claim
+is an upper bound and must fit on one member, so a WRITE can be refused while
+a little less than its claim is still free, or while the members together have
+room that none has alone.
+
+Deleting a file frees its room without a restart, once nothing can read the
+deleted bytes. The unlink and the next flush succeed, and the tombstone
+collector removes the extents within about 10 seconds. Segment reclamation then
+deletes a dead segment once the newest ephemeral checkpoint it saw when the
+segment first died has expired, plus 30 seconds of clock skew, and never
+sooner than its 60-second in-flight read floor. Every SlateDB metadata
+compaction writes an unnamed checkpoint with a 15-minute lifetime, so on a
+busy filesystem the room comes back about 16 minutes after the unlink, plus
+one segment GC interval. The mounted fixture sets a 5-second interval and
+requires the room back within 1,080 seconds. Open readers and checkpoints keep
+the deleted bytes readable and charged for as long as they exist, so WRITE
+stays refused until the last of them is gone.
+
+One case still keeps acknowledged data in memory. If a member's filesystem
+refuses a write it reported room for, because another writer filled it or it
+stops short of its reported free space, the pool marks the member full and
+tries the next member. When every member refuses, fsync answers ENOSPC and the
+retained data stays bounded. It is at most `max_inflight_seals` sealed
+segments plus one open segment per write lane, each no larger than the seal
+threshold plus one write. New WRITEs are refused while the marks last, and a
+later fsync publishes the retained data once a member reports more room.
+Deleting files through ZeroFS does not help then, because the deletion can
+become durable only after the retained segments are published, and with the
+writeback journal a deletion is never sent to the pool ahead of an earlier
+unplaced segment. Room has to come from outside: the filesystem freeing bytes,
+a grown quota, or another member. A raw member reports its exact free space,
+so it does not reach this case.
+
+Claims and leases live in memory. A restart forgets them with the unflushed
+data they covered. When the writeback store attaches to the pool it leases
+every segment its journal holds but has not placed, so new writes cannot take
+that room after a restart. `pool status` reports each member's outstanding
+claims and leases as `admitted_bytes`, and `available_bytes` excludes them.
+
+On raw members the same ledger covers two more costs. Each claim, lease and
+reservation counts its exact raw allocation, record and alignment included,
+not just its payload bytes. Metadata survival writes its generations into the
+members' own logs. Each of those PUTs first claims its allocation on that
+member and holds the claim until the PUT returns. It must fit above the
+member's reserve beside every promise on that member, but it counts against
+no quota. Raw members never share a device, so promises on other members do
+not count against it. When it does not fit, it is refused and writes
+nothing. So a survival write never takes the room an admitted WRITE was
+promised. The payload that retained survival generations pin stays charged as
+cleanup debt. With survival enabled, a deleted file's room therefore returns
+only after the generations that map it retire.
+
+Each raw member also keeps a metadata headroom above its reserve, set by
+`[storage.pool.metadata_survival] headroom_bytes`. It defaults to 4 GiB
+(4,294,967,296 bytes) when survival is enabled on a raw P3 authority, and is 0
+otherwise. WRITE claims, segment leases and catalog reservations must leave
+the reserve plus the headroom free. Survival writes may use the headroom, but
+never the reserve, which the raw store enforces on every write. So when
+segment data fills the pool, WRITE answers ENOSPC while the next generations
+still commit, and mutations stay open. A generation is refused as full, which
+latches mutations with EIO, only when the generations themselves outgrow the
+headroom. Room that deletions free refills the headroom first, so WRITE room
+returns only once more than the generations' share of the headroom is freed.
+Configuration is refused unless the reserve plus the headroom fit within every
+member's capacity. See [metadata survival](metadata-survival.md).
+
+`zerofs pool status` and the admin JSON report each member's
+`space.filesystem_free_bytes`, `space.filesystem_total_bytes` and
+`space.full`. The last one is null, `write_returned_no_space` with the time
+it filled, or `below_free_space_reserve`, which counts the metadata headroom
+as part of the reserve. `space.metadata_headroom_used_bytes` and
+`space.metadata_headroom_remaining_bytes` split the headroom into the part
+generations have taken and the part still free.
+
+A declared capacity larger than the filesystem's total size is legitimate
+with thin provisioning or a quota that will grow. The server logs a warning
+at startup that names the member and both numbers, sets
+`space.declared_exceeds_filesystem`, and starts.
+
 The first version owns its local catalog exclusively. It supports one server,
 including a read-only or checkpoint server when the writer is stopped, and
 rejects HA replication. Adding members and maintenance require a server restart
 or a stopped server. It does not perform background cold-data migration or
 per-file pinning; explicit migration controls placement.
+
+## Raw member interface
+
+At raw-device commit `b615aace`, `RawStore` is an object log keyed by name.
+The pool still routes by logical member ID. The existing directory adapter
+uses mount and path checks, marker files, `statvfs`, and staging-file rename.
+Raw-member integration and qualification are pending.
+
+- **Degraded start.** `open` validates size and the on-device
+  `Identity { pool_uuid, member_uuid, role }` without writing. Provisioning
+  requires a blank device and is separate from startup. The adapter must
+  discover and exclusively claim the device, check its serial or WWN, and
+  distinguish an absent device from a mismatched or corrupt one. It must
+  exclude an unavailable data member and return bounded read errors while
+  still requiring the authority and catalog.
+- **Admission and reclaim.** Use `geometry().free` at the append tail, including
+  unflushed appends, and charge record and alignment overhead, reserve, quota,
+  and outstanding reservations. Ask for an exact append-cost and reservation
+  interface plus allocation health. Write or sync failures poison the store
+  until reopen. Deletes append tombstones and overwrites append new records.
+  There is no reclamation, so logical deletion never restores capacity.
+  Binding-preserving compaction needs explicit reclamation semantics.
+- **Publication and verification.** `put` becomes durable after successful
+  `flush`. The adapter must enforce immutable conditional creation and flush
+  before publishing a catalog locator. `get` verifies whole-object SHA-256 and
+  `scrub` detects corruption. The pool still needs length and bounded
+  exact-generation reads with typed failures for its member verifier.
+  Affected-file reporting already uses only catalog and extent metadata.
 
 ## SFTP members
 
@@ -291,6 +477,34 @@ Inspect a running server through its existing admin RPC socket:
 zerofs pool status --endpoint unix:/run/zerofs/admin.sock
 zerofs pool affected --endpoint unix:/run/zerofs/admin.sock --member disk1
 ```
+
+For an existing pool, set `allow_degraded_start = true` in `[storage.pool]` to
+open with one initialized local data member unavailable. Keep its member
+declaration. The authority, its identity marker, the catalog, and the other
+readiness roles are still required. With strict readiness configured, the
+mount and device identity checks apply to every remaining role. A directory
+at the missing mount path without the matching pool member marker cannot
+receive segments. For raw disks, the claim broker must confirm that the
+designated HDD is absent. A disk that is present but fails its claim or
+identity checks still stops startup. Without the opt-in, a confirmed missing
+raw HDD causes `zerofs run` to exit with operator-required status 10. The
+raw P3 authority is required in either mode. Status sets `unavailable_at_startup` for the excluded member.
+Its mapped segments return I/O errors on cold reads. Restart after restoring
+the member to have it checked again.
+
+Run a full check of the committed segment bodies on one member with the
+server stopped:
+
+```sh
+zerofs pool verify --config zerofs.toml --member disk1
+```
+
+The command reads the exact catalog generations in bounded ranges and compares
+their SHA-256 digests with the committed catalog digests. It outputs a JSON
+count and failures keyed by logical segment path, and exits unsuccessfully if
+any committed body fails verification. Use `pool affected` on the running
+server to identify live and retained-checkpoint file references for the member,
+including when its bodies cannot be read.
 
 Offline `pool status --config zerofs.toml` still takes the catalog's exclusive
 lock and requires a stopped server. Opening storage or running an offline command

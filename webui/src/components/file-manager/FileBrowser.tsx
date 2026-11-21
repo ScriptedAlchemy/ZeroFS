@@ -11,8 +11,6 @@ import { InlineInput } from "./InlineInput";
 import { useDragAndDrop } from "./hooks/use-drag-drop";
 import { useKeyboardNav } from "./hooks/use-keyboard-nav";
 
-const DRAG_MIME = "application/x-zerofs-entry";
-
 interface FileBrowserProps {
   entries: FileEntry[];
   currentPath: string;
@@ -23,7 +21,7 @@ interface FileBrowserProps {
   onSelectAll: () => void;
   onClearSelection: () => void;
   getContextActions: (entry: FileEntry) => ContextMenuAction[];
-  onMoveToDir: (entryName: string, targetDir: string) => void;
+  onMoveToDir: (sourcePath: string, targetDir: string) => void;
   renameTarget: string | null;
   onRename: (newName: string) => void;
   onRenameCancel: () => void;
@@ -79,7 +77,7 @@ function SortIndicator({ column, sortKey, sortDir }: { column: SortKey; sortKey:
   );
 }
 
-export { DRAG_MIME };
+export { DRAG_MIME } from "./drag-data";
 
 export function FileBrowser({
   entries,

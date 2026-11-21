@@ -9,10 +9,14 @@ export interface TransferHandle {
   fail: (error: string) => void;
 }
 
+// False keeps the failed transfer visible when retry needs a user decision or
+// cannot start from the current page. Existing fire-and-forget retries return void.
+export type TransferRetry = () => void | boolean | Promise<void | boolean>;
+
 export interface TransferContextValue {
-  startDownload: (name: string, retry?: () => void) => TransferHandle;
-  startUpload: (name: string, total: number, retry?: () => void) => TransferHandle;
-  startDelete: (name: string, retry?: () => void) => TransferHandle;
+  startDownload: (name: string, retry?: TransferRetry) => TransferHandle;
+  startUpload: (name: string, total: number, retry?: TransferRetry) => TransferHandle;
+  startDelete: (name: string, retry?: TransferRetry) => TransferHandle;
 }
 
 const noop: TransferHandle = {

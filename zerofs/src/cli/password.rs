@@ -52,10 +52,12 @@ pub async fn change_password(
         store: object_store,
         path: path_from_url,
         sftp_pool,
-        pool: _,
+        pool,
+        ..
     } = crate::storage_backend::open_storage(settings)
         .await
         .map_err(|e| PasswordError::Other(e.to_string()))?;
+    let refused = crate::metadata_survival::refuse_password_change(settings, pool.as_ref()).await;
 
     let object_store = with_storage_class(
         Arc::from(object_store),
@@ -63,13 +65,18 @@ pub async fn change_password(
     );
     let db_path = Path::from(path_from_url.to_string());
 
-    let change = key_management::change_encryption_password(
-        &object_store,
-        &db_path,
-        current_password,
-        &new_password,
-    )
-    .await;
+    let change = match refused {
+        Ok(()) => {
+            key_management::change_encryption_password(
+                &object_store,
+                &db_path,
+                current_password,
+                &new_password,
+            )
+            .await
+        }
+        Err(refusal) => Err(refusal),
+    };
     let shutdown = match sftp_pool {
         Some(pool) => pool.shutdown().await,
         None => Ok(()),

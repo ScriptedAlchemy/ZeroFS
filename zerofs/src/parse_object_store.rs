@@ -217,7 +217,7 @@ where
     let path = Path::parse(path)?;
 
     if scheme == ObjectStoreScheme::Sftp {
-        return build_sftp_store(url, path, sftp_config).await;
+        return build_sftp_store(url, path, sftp_config, SftpStartup::Warm).await;
     }
 
     let store: Box<dyn ObjectStore> = match scheme {
@@ -334,22 +334,19 @@ fn validate_sftp_url(url: &Url) -> Result<(), Error> {
     Ok(())
 }
 
-/// Build the native async SFTP transport, pool, and store.
+pub(crate) enum SftpStartup {
+    Warm,
+    Deferred,
+}
+
+/// Build the native SFTP store. Standalone backends warm their sessions before
+/// returning. Pool members defer dialing until first access so an offline
+/// remote member does not prevent opening the local pool.
 pub(crate) async fn build_sftp_store(
     url: &Url,
     path: Path,
     sftp_config: Option<&crate::config::SftpConfig>,
-) -> Result<ParsedStore, object_store::Error> {
-    build_sftp_store_with_warmup(url, path, sftp_config, true).await
-}
-
-/// Pool members connect on first access, so a remote outage does not prevent
-/// opening metadata and reading segments on an independent local member.
-pub(crate) async fn build_sftp_store_with_warmup(
-    url: &Url,
-    path: Path,
-    sftp_config: Option<&crate::config::SftpConfig>,
-    warmup: bool,
+    startup: SftpStartup,
 ) -> Result<ParsedStore, object_store::Error> {
     validate_sftp_url(url)?;
     crate::sftp_object_store::SftpObjectStore::validate_prefix(&path)?;
@@ -382,10 +379,10 @@ pub(crate) async fn build_sftp_store_with_warmup(
             source: Box::new(source),
         })?,
     );
-    let pool = if warmup {
-        crate::sftp_transport::SftpSessionPool::from_config_writable(factory, &config).await
-    } else {
-        crate::sftp_transport::SftpSessionPool::from_config_writable_deferred(factory, &config)
+    use crate::sftp_transport::SftpSessionPool;
+    let pool = match startup {
+        SftpStartup::Warm => SftpSessionPool::from_config_writable(factory, &config).await,
+        SftpStartup::Deferred => SftpSessionPool::from_config_writable_deferred(factory, &config),
     }
     .map_err(|source| object_store::Error::Generic {
         store: "SFTP",

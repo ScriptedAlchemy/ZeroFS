@@ -1,3 +1,13 @@
+mod xattr;
+use xattr::XattrFid;
+
+#[cfg(test)]
+mod creation_gid_tests;
+#[cfg(test)]
+mod io_context_tests;
+#[cfg(test)]
+mod rename_fid_tests;
+
 use super::errors::{P9Error, P9Result};
 use super::lock_manager::{FileLock, FileLockManager, LockGuard};
 #[cfg(feature = "failpoints")]
@@ -6,7 +16,9 @@ use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId, MAX_DEVICE_MAJOR, MAX_DEVICE_MINOR};
 use crate::fs::mutation::overlay::IdentifiedWrite;
 use crate::fs::mutation::types::{RequestIdentity, RequestLifetime};
-use crate::fs::permissions::{AccessMode, Credentials, check_access};
+use crate::fs::name_mode::NameMatch;
+use crate::fs::permissions::acl::PosixAcl;
+use crate::fs::permissions::{AccessMode, Credentials, check_access_with_acl};
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{
     AuthContext, FallocateMode, FileAttributes, FileType, InodeWithId, SetAttributes, SetGid,
@@ -129,7 +141,8 @@ fn is_terminal_dedup_error(error: P9Error) -> bool {
                 | FsError::InvalidData
                 | FsError::LeaderLeaseExpired
                 | FsError::LeaderRejectedBeforeApply
-                | FsError::ShuttingDown,
+                | FsError::ShuttingDown
+                | FsError::Abandoned,
         )
     )
 }
@@ -161,6 +174,10 @@ impl SuccessDedupOwner {
 /// the walk ping-pong forever. Capping it turns that liveness hole into a safe
 /// clamp/deny. The bound is far above any real directory depth.
 const MAX_ANCESTOR_HOPS: u32 = 100_000;
+
+/// A reconstructed attach-root path must fit the wire's u16-sized aname.
+/// Bound both names and separators before retaining a repaired fid path.
+const MAX_WALK_ROOT_PATH_BYTES: usize = u16::MAX as usize;
 
 // Represents an open file handle
 #[derive(Debug, Clone)]
@@ -198,6 +215,10 @@ pub struct FidSlot {
     /// Present once the fid takes its first byte-range lock; releases the fid's
     /// locks on drop.
     pub lock_guard: Option<LockGuard>,
+    xattr: Option<XattrFid>,
+    /// The create that opened this fid. Its clunk ends that create's inode
+    /// protection; see `DedupCache::release_create_protection`.
+    create_op: Option<crate::dedup::OpId>,
 }
 
 impl FidSlot {
@@ -208,6 +229,8 @@ impl FidSlot {
             directory_pin: None,
             replay_reopen: false,
             lock_guard: None,
+            xattr: None,
+            create_op: None,
         }
     }
 }
@@ -216,6 +239,7 @@ impl FidSlot {
 struct SessionState {
     msize: u32,
     zerofs_protocol: bool,
+    create_umask: bool,
     fids: HashMap<u32, FidSlot>,
     /// Blocks installation of new resource-bearing fid slots.
     disconnected: bool,
@@ -233,6 +257,15 @@ struct SetattrFidContext {
     creds: Credentials,
     state: SetattrFidState,
     allows_read: bool,
+}
+
+/// Read/write state copied under the session lock. The fid slot retains its
+/// open-handle pin; bulk I/O does not need an owned copy of the pathname.
+struct IoFidContext {
+    inode_id: InodeId,
+    creds: Credentials,
+    allows_read: bool,
+    allows_write: bool,
 }
 
 struct OpenFidContext {
@@ -347,6 +380,7 @@ fn parse_rebind_credentials(n_uname: u32, payload: &[u8]) -> P9Result<Option<Cre
         groups,
         groups_count,
         groups_complete,
+        groups_truncated: false,
     }))
 }
 
@@ -356,7 +390,12 @@ fn parse_rebind_credentials(n_uname: u32, payload: &[u8]) -> P9Result<Option<Cre
 /// client can satisfy a read from its inode-wide page cache without sending a
 /// subsequent `Tread`, so deferring permission enforcement until I/O would let
 /// one user's cached pages bypass another user's access check.
-fn check_open_access(inode: &Inode, creds: &Credentials, flags: u32) -> P9Result<()> {
+fn check_open_access(
+    inode: &Inode,
+    creds: &Credentials,
+    flags: u32,
+    acl: Option<&PosixAcl>,
+) -> P9Result<()> {
     let access_mode = flags & LINUX_O_ACCMODE;
     if access_mode == LINUX_O_ACCMODE {
         return Err(P9Error::InvalidArgument);
@@ -367,12 +406,14 @@ fn check_open_access(inode: &Inode, creds: &Credentials, flags: u32) -> P9Result
     if flags & LINUX_O_PATH != 0 {
         return Ok(());
     }
-    if access_mode != LINUX_O_WRONLY {
-        check_access(inode, creds, AccessMode::Read)?;
-    }
-    if access_mode == LINUX_O_WRONLY || access_mode == LINUX_O_RDWR || flags & LINUX_O_TRUNC != 0 {
-        check_access(inode, creds, AccessMode::Write)?;
-    }
+    let required = if access_mode == LINUX_O_WRONLY {
+        AccessMode::Write
+    } else if access_mode == LINUX_O_RDWR || flags & LINUX_O_TRUNC != 0 {
+        AccessMode::ReadWrite
+    } else {
+        AccessMode::Read
+    };
+    check_access_with_acl(inode, creds, required, acl)?;
     Ok(())
 }
 
@@ -409,6 +450,41 @@ fn fid_allows_write(fid: &Fid) -> bool {
     flags & LINUX_O_PATH == 0 && matches!(flags & LINUX_O_ACCMODE, LINUX_O_WRONLY | LINUX_O_RDWR)
 }
 
+/// Settings one 9P listener applies to every session it accepts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ListenerPolicy {
+    /// Replaces the client-supplied credentials on attach.
+    pub credential_override: Option<(u32, u32)>,
+    /// Name matching for standard `9P2000.L` sessions.
+    pub standard_lookup: NameMatch,
+}
+
+/// The inode selected by a walk component. A detached ancestor chain can
+/// jump directly to the attach root instead of traversing one parent.
+#[derive(Debug)]
+struct WalkTarget {
+    id: InodeId,
+    replacement_path: Option<Vec<Bytes>>,
+}
+
+impl WalkTarget {
+    fn relative(id: InodeId) -> Self {
+        Self {
+            id,
+            replacement_path: None,
+        }
+    }
+}
+
+/// One resolved walk component.
+struct WalkStep {
+    id: InodeId,
+    inode: Inode,
+    replacement_path: Option<Vec<Bytes>>,
+    /// A directory pin taken under the parent lock by an exact match.
+    exact_pin: Option<OpenHandle>,
+}
+
 #[derive(Clone)]
 pub struct NinePHandler {
     filesystem: Arc<ZeroFS>,
@@ -417,6 +493,13 @@ pub struct NinePHandler {
     handler_id: u64,
     /// If set, overrides the client-provided credentials on attach.
     credential_override: Option<(u32, u32)>,
+    /// Name matching for standard `9P2000.L` sessions. Read only by
+    /// [`Self::request_name_match`].
+    standard_lookup: NameMatch,
+    #[cfg(test)]
+    exact_lookup_pause: Arc<Mutex<Option<SuccessTerminalPause>>>,
+    #[cfg(test)]
+    exact_pin_pause: Arc<Mutex<Option<SuccessTerminalPause>>>,
 }
 
 /// Retires a transport session on exit or unwind.
@@ -456,6 +539,25 @@ impl NinePHandler {
             lock_manager,
             handler_id: HANDLER_COUNTER.fetch_add(1, AtomicOrdering::SeqCst),
             credential_override: None,
+            standard_lookup: NameMatch::Folded,
+            #[cfg(test)]
+            exact_lookup_pause: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            exact_pin_pause: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// A session handler configured by its listener.
+    pub fn for_listener(
+        filesystem: Arc<ZeroFS>,
+        lock_manager: Arc<FileLockManager>,
+        policy: ListenerPolicy,
+    ) -> Self {
+        let handler =
+            Self::new(filesystem, lock_manager).with_standard_lookup(policy.standard_lookup);
+        match policy.credential_override {
+            Some((uid, gid)) => handler.with_credential_override(uid, gid),
+            None => handler,
         }
     }
 
@@ -463,6 +565,13 @@ impl NinePHandler {
     /// trusting the client-provided credentials in Tattach.
     pub fn with_credential_override(mut self, uid: u32, gid: u32) -> Self {
         self.credential_override = Some((uid, gid));
+        self
+    }
+
+    /// Set how standard `9P2000.L` sessions match names. The private ZeroFS
+    /// dialects ignore it because their clients choose per request.
+    pub fn with_standard_lookup(mut self, standard_lookup: NameMatch) -> Self {
+        self.standard_lookup = standard_lookup;
         self
     }
 
@@ -476,6 +585,15 @@ impl NinePHandler {
         self.session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Session table for a change the client will observe. Passing here ends
+    /// the request's abandonable phase (`crate::abandonment`): a fid installed
+    /// or released by a request that then went unanswered would contradict
+    /// the client's view after `Rflush`.
+    fn session_for_update(&self) -> P9Result<MutexGuard<'_, SessionState>> {
+        crate::abandonment::pass_point_of_no_return().map_err(FsError::from)?;
+        self.connected_session()
     }
 
     fn connected_session(&self) -> P9Result<MutexGuard<'_, SessionState>> {
@@ -496,6 +614,7 @@ impl NinePHandler {
         self.session_state()
             .fids
             .get(&fid)
+            .filter(|slot| slot.xattr.is_none())
             .ok_or(P9Error::BadFid)
             .map(|slot| OpenFidContext {
                 fid: slot.fid.clone(),
@@ -511,7 +630,8 @@ impl NinePHandler {
         }
     }
 
-    /// Publish an opened compound-operation fid under the session lock.
+    /// Publish the exact fid snapshot that passed authorization, even if an
+    /// in-place walk replaced the slot while authorization awaited the inode lock.
     fn install_open_fid(
         &self,
         state: &mut SessionState,
@@ -523,6 +643,8 @@ impl NinePHandler {
         let slot = match state.fids.entry(newfid) {
             Entry::Vacant(entry) => entry.insert(FidSlot::unopened(fid)),
             Entry::Occupied(_) if newfid != replace_fid => return Err(P9Error::FidInUse),
+            // A concurrent xattrcreate owns this slot's staged value and inode pin.
+            Entry::Occupied(entry) if entry.get().xattr.is_some() => return Err(P9Error::BadFid),
             Entry::Occupied(entry) if entry.get().fid.opened => {
                 return Err(P9Error::FidAlreadyOpen);
             }
@@ -571,9 +693,19 @@ impl NinePHandler {
         directory_pin: Option<OpenHandle>,
     ) -> P9Result<()> {
         let replaced = {
-            let mut state = self.connected_session()?;
+            let mut state = self.session_for_update()?;
             if source != newfid && state.fids.contains_key(&newfid) {
                 return Err(P9Error::FidInUse);
+            }
+            // A walk may have snapshotted an ordinary fid before a concurrent
+            // xattrcreate converted it. Never discard that staged value or its
+            // inode pin when publishing the old walk's result.
+            if state
+                .fids
+                .get(&newfid)
+                .is_some_and(|slot| slot.xattr.is_some())
+            {
+                return Err(P9Error::BadFid);
             }
             state.fids.insert(
                 newfid,
@@ -590,6 +722,25 @@ impl NinePHandler {
     /// Whether this connection negotiated the private ZeroFS dialect.
     pub fn zerofs_protocol_enabled(&self) -> bool {
         self.session_state().zerofs_protocol
+    }
+
+    /// The one place that decides how a request matches client-supplied
+    /// names against stored entries.
+    ///
+    /// Private-dialect clients choose per request: only `Twalkgetattrexact`
+    /// asks for the stored spelling. Standard `9P2000.L` sessions use the
+    /// listener's `standard_lookup`. On a sensitive filesystem the lookup
+    /// key is the spelling, so both rules agree and the cheaper folded path
+    /// serves every request.
+    fn request_name_match(&self, zerofs_protocol: bool, msg: &Message) -> NameMatch {
+        if self.filesystem.name_mode() == crate::fs::name_mode::NameMode::Sensitive {
+            return NameMatch::Folded;
+        }
+        match msg {
+            Message::Twalkgetattrexact(_) => NameMatch::Exact,
+            _ if zerofs_protocol => NameMatch::Folded,
+            _ => self.standard_lookup,
+        }
     }
 
     /// Reserve a valid FIRST mutation before task detachment.
@@ -641,7 +792,9 @@ impl NinePHandler {
 
     /// Returns the effective GID for a create-type operation. When a credential
     /// override is active, the server-configured GID is used instead of
-    /// whatever the client sent.
+    /// whatever the client sent. This is only a new-entry group hint: parent
+    /// authorization keeps the fid's original credentials, and a setgid
+    /// parent's group still wins.
     fn effective_gid(&self, client_gid: u32, fid_creds: &Credentials) -> u32 {
         if self.credential_override.is_some() {
             fid_creds.gid
@@ -660,8 +813,23 @@ impl NinePHandler {
         self.session_state()
             .fids
             .get(&fid)
+            .filter(|slot| slot.xattr.is_none())
             .ok_or(P9Error::BadFid)
             .map(|s| s.fid.clone())
+    }
+
+    fn get_fid_io_context(&self, fid: u32) -> P9Result<IoFidContext> {
+        self.session_state()
+            .fids
+            .get(&fid)
+            .filter(|slot| slot.xattr.is_none())
+            .ok_or(P9Error::BadFid)
+            .map(|slot| IoFidContext {
+                inode_id: slot.fid.inode_id,
+                creds: slot.fid.creds,
+                allows_read: fid_allows_read(&slot.fid),
+                allows_write: fid_allows_write(&slot.fid),
+            })
     }
 
     /// Snapshot only the fid fields needed by attribute mutations. Unlike
@@ -670,6 +838,7 @@ impl NinePHandler {
         self.session_state()
             .fids
             .get(&fid)
+            .filter(|slot| slot.xattr.is_none())
             .ok_or(P9Error::BadFid)
             .map(|slot| {
                 let state = if !slot.fid.opened {
@@ -786,7 +955,9 @@ impl NinePHandler {
         let is_retry = op_flags & ninep_proto::P9_OP_FLAG_RETRY != 0;
 
         // Pre-dispatch rejection is CLEAN; loss during dispatch is ambiguous.
-        let lease_gated = !matches!(msg, Message::Tversion(_));
+        // Tflush only cancels local work and reports no filesystem state, and
+        // flush(5) forbids answering it with an error.
+        let lease_gated = !matches!(msg, Message::Tversion(_) | Message::Tflush(_));
         if lease_gated && !self.filesystem.db.permits_successful_response() {
             return P9Message::new(
                 tag,
@@ -856,15 +1027,16 @@ impl NinePHandler {
             };
         }
         let success_dedup_owner = SuccessDedupOwner::for_message(&msg);
+        let name_match = self.request_name_match(zerofs_protocol, &msg);
         let result = match msg {
             Message::Tversion(tv) => self.version(tv).await,
             Message::Tattach(ta) => self.attach(ta).await,
-            Message::Twalk(tw) => self.walk(tw).await,
+            Message::Twalk(tw) => self.walk(tw, name_match).await,
             Message::Tlopen(tl) => self.lopen(tl).await,
             Message::Tlcreate(tc) => self.lcreate(tc, op_id).await,
             Message::Tread(tr) => self.read(tr).await,
             Message::Twrite(tw) => self.write(tw, op_id, op_origin_epoch).await,
-            Message::Tclunk(tc) => Ok(self.clunk(tc).await),
+            Message::Tclunk(tc) => self.clunk(tc).await,
             Message::Treaddir(tr) => self.readdir(tr).await,
             Message::Tgetattr(tg) => self.getattr(tg).await,
             Message::Tsetattr(ts) => self.setattr(ts, op_id).await,
@@ -875,19 +1047,22 @@ impl NinePHandler {
             Message::Treadlink(tr) => self.readlink(tr).await,
             Message::Tlink(tl) => self.link(tl, op_id).await,
             Message::Trename(tr) => self.rename(tr, op_id).await,
-            Message::Trenameat(tr) => self.renameat(tr, op_id).await,
+            Message::Trenameat(tr) => self.renameat(tr, name_match, op_id).await,
             Message::Trenamenoreplace(tr) => self.renameat_noreplace(tr, op_id).await,
-            Message::Tunlinkat(tu) => self.unlinkat(tu, op_id).await,
+            Message::Tunlinkat(tu) => self.unlinkat(tu, name_match, op_id).await,
             Message::Tfsync(tf) => self.fsync(tf).await,
             Message::Tfsyncdur(tf) => self.fsyncdur(tf).await,
             Message::Tgetlineage(_) => self.getlineage().await,
             Message::Tflush(_) => Ok(Message::Rflush(Rflush)),
-            Message::Txattrwalk(_) => Err(P9Error::NotSupported),
+            Message::Txattrwalk(tx) => self.xattrwalk(tx).await,
+            Message::Txattrcreate(tx) => self.xattrcreate(tx).await,
             Message::Tstatfs(ts) => self.statfs(ts).await,
             Message::Tlock(tl) => self.lock(tl).await,
             Message::Tgetlock(tg) => self.getlock(tg).await,
             Message::Trebind(tr) => self.rebind(tr).await,
-            Message::Twalkgetattr(tw) => self.walk_getattr(tw).await,
+            Message::Twalkgetattr(tw) | Message::Twalkgetattrexact(tw) => {
+                self.walk_getattr(tw, name_match).await
+            }
             Message::Treaddirattr(tr) => self.readdir_attr(tr).await,
             Message::Tlopenat(tl) => self.lopenat(tl).await,
             Message::Tlopenatread(tl) => self.lopenatread(tl).await,
@@ -968,13 +1143,22 @@ impl NinePHandler {
         let fids = {
             let mut state = self.session_state();
             state.zerofs_protocol = false;
+            state.create_umask = false;
             std::mem::take(&mut state.fids)
         };
         drop(fids);
         self.lock_manager.release_session_locks(self.handler_id);
 
         let requested = version_str.as_bytes();
-        if requested != VERSION_9P2000L && requested != VERSION_9P2000L_ZEROFS {
+        let create_umask = matches!(
+            requested,
+            VERSION_9P2000L_ZEROFS_UMASK | VERSION_9P2000L_ZEROFS_CI_UMASK
+        );
+        if requested != VERSION_9P2000L
+            && requested != VERSION_9P2000L_ZEROFS
+            && requested != VERSION_9P2000L_ZEROFS_CI
+            && !create_umask
+        {
             debug!("Client requested an unsupported 9P dialect, returning unknown");
             return Ok(Message::Rversion(Rversion {
                 msize: tv.msize,
@@ -983,14 +1167,27 @@ impl NinePHandler {
         }
 
         let msize = tv.msize.min(P9_MAX_MSIZE);
-        let zerofs_protocol = requested == VERSION_9P2000L_ZEROFS;
+        let zerofs_protocol = requested != VERSION_9P2000L;
         let mut state = self.session_state();
         state.msize = msize;
         state.zerofs_protocol = zerofs_protocol;
+        state.create_umask = create_umask;
 
+        let advertised = if zerofs_protocol {
+            match (self.filesystem.name_mode(), create_umask) {
+                (crate::fs::name_mode::NameMode::Sensitive, false) => VERSION_9P2000L_ZEROFS,
+                (crate::fs::name_mode::NameMode::Insensitive, false) => VERSION_9P2000L_ZEROFS_CI,
+                (crate::fs::name_mode::NameMode::Sensitive, true) => VERSION_9P2000L_ZEROFS_UMASK,
+                (crate::fs::name_mode::NameMode::Insensitive, true) => {
+                    VERSION_9P2000L_ZEROFS_CI_UMASK
+                }
+            }
+        } else {
+            VERSION_9P2000L
+        };
         Ok(Message::Rversion(Rversion {
             msize,
-            version: P9String::new(requested.to_vec()),
+            version: P9String::new(advertised.to_vec()),
         }))
     }
 
@@ -1028,6 +1225,7 @@ impl NinePHandler {
             groups,
             groups_count,
             groups_complete: gid_known,
+            groups_truncated: false,
         }
     }
 
@@ -1094,7 +1292,7 @@ impl NinePHandler {
         let qid = inode_to_qid(&root_inode, root_id);
         let directory_pin = self.pin_walked_directory(root_id).await?;
 
-        let mut state = self.session_state();
+        let mut state = self.session_for_update()?;
         if state.fids.contains_key(&ta.fid) {
             return Err(P9Error::FidInUse);
         }
@@ -1153,7 +1351,9 @@ impl NinePHandler {
             if !parent.is_directory() {
                 return Err(Self::rebind_authorization_error(replay));
             }
-            check_access(&parent, creds, AccessMode::Execute)
+            self.filesystem
+                .check_inode_access(parent_id, &parent, creds, AccessMode::Execute)
+                .await
                 .map_err(|_| Self::rebind_authorization_error(replay))?;
             current_id = parent_id;
             current = parent;
@@ -1211,7 +1411,9 @@ impl NinePHandler {
             // Keep hardlink rebinding O(1). Resolving an arbitrary alias would
             // require a namespace-wide reverse search because hardlinked
             // inodes intentionally retain no parent pointer.
-            check_access(&root, &creds, AccessMode::Execute)
+            self.filesystem
+                .check_inode_access(tr.root_inode, &root, &creds, AccessMode::Execute)
+                .await
                 .map_err(|_| Self::rebind_authorization_error(replay))?;
         } else if tr.inode_id != tr.root_inode {
             self.authorize_rebind_ancestry(&creds, tr.inode_id, tr.root_inode, &inode, replay)
@@ -1231,7 +1433,7 @@ impl NinePHandler {
         // OPENED records only that reconnect expects an in-place reopen next.
         // The client-supplied replay flag grants no access or opened-file pin;
         // the actual open still performs DAC checks and installs that handle.
-        let mut state = self.connected_session()?;
+        let mut state = self.session_for_update()?;
         if state.fids.contains_key(&tr.fid) {
             return Err(P9Error::FidInUse);
         }
@@ -1257,6 +1459,8 @@ impl NinePHandler {
                 directory_pin,
                 replay_reopen,
                 lock_guard: None,
+                xattr: None,
+                create_op: None,
             },
         );
         Ok(Message::Rrebind(Rrebind { qid }))
@@ -1266,24 +1470,32 @@ impl NinePHandler {
     /// directory's parent pointer, clamped at `root_id` (the fid's attach
     /// root): walking `..` at the subtree root yields the subtree root itself,
     /// exactly mirroring the inode-0 clamp readdir applies at the filesystem
-    /// root. Everything else is a plain lookup.
+    /// root. `.` stays on the current searchable directory; other names use
+    /// the directory-entry lookup.
     async fn walk_component(
         &self,
         creds: &Credentials,
         root_id: InodeId,
         current_id: InodeId,
         name: &[u8],
-    ) -> P9Result<InodeId> {
-        if name != b".." {
-            return Ok(self.filesystem.lookup(creds, current_id, name).await?);
+    ) -> P9Result<WalkTarget> {
+        if !matches!(name, b"." | b"..") {
+            return Ok(WalkTarget::relative(
+                self.filesystem.lookup(creds, current_id, name).await?,
+            ));
         }
         let inode = self.filesystem.inode_store.get(current_id).await?;
         let Inode::Directory(dir) = &inode else {
             return Err(P9Error::NotADirectory);
         };
-        check_access(&inode, creds, AccessMode::Execute)?;
+        self.filesystem
+            .check_inode_access(current_id, &inode, creds, AccessMode::Execute)
+            .await?;
+        if name == b"." {
+            return Ok(WalkTarget::relative(current_id));
+        }
         if current_id == root_id {
-            return Ok(current_id);
+            return Ok(WalkTarget::relative(current_id));
         }
         // On an aname-rooted fid the parent pointer alone is not enough: a
         // concurrent rename can re-point an ancestor outside the subtree, so
@@ -1300,48 +1512,210 @@ impl NinePHandler {
                     // concurrently re-pointed chain) without passing the attach
                     // root: clamp to the root, the same safe direction as a
                     // detached chain.
-                    return Ok(root_id);
+                    return self.clamped_walk_root(root_id).await;
                 }
                 hops += 1;
                 let Inode::Directory(d) = self.filesystem.inode_store.get(ancestor).await? else {
-                    return Ok(root_id);
+                    return self.clamped_walk_root(root_id).await;
                 };
                 ancestor = d.parent;
             }
         }
-        Ok(dir.parent)
+        Ok(WalkTarget::relative(dir.parent))
+    }
+
+    /// Rebuild the absolute path only when a detached walk jumps to its
+    /// attach root. Popping one component would leave the old subtree's path
+    /// attached to the root inode and break later pathname-based rename.
+    /// Following parent pointers also accounts for a renamed attach root;
+    /// ordinary walk steps do not perform this extra ancestry read.
+    async fn clamped_walk_root(&self, root_id: InodeId) -> P9Result<WalkTarget> {
+        // Dot components hold no inode or parent guard here, preserving the
+        // rename lock order. Keep parent/name pairs stable across this walk.
+        let _topology_guard = self.filesystem.directory_rename_lock.lock().await;
+        let mut path = Vec::new();
+        let mut path_bytes = 0usize;
+        let mut ancestor = root_id;
+        let mut hops = 0u32;
+        while ancestor != 0 {
+            if hops >= MAX_ANCESTOR_HOPS {
+                return Err(FsError::StaleHandle.into());
+            }
+            hops += 1;
+            let inode =
+                self.filesystem
+                    .inode_store
+                    .get(ancestor)
+                    .await
+                    .map_err(|error| match error {
+                        FsError::NotFound => FsError::StaleHandle,
+                        other => other,
+                    })?;
+            let Inode::Directory(dir) = inode else {
+                return Err(FsError::StaleHandle.into());
+            };
+            if dir.nlink == 0 {
+                return Err(FsError::StaleHandle.into());
+            }
+            let name = dir.name.ok_or(FsError::StaleHandle)?;
+            path_bytes = path_bytes
+                .checked_add(name.len())
+                .and_then(|length| length.checked_add(usize::from(!path.is_empty())))
+                .filter(|length| *length <= MAX_WALK_ROOT_PATH_BYTES)
+                .ok_or(FsError::NameTooLong)?;
+            // Rmdir is not a topology move and can still detach an empty
+            // root. Refuse a missing/replaced link instead of caching a path
+            // that no longer identifies this inode; preserve real I/O errors.
+            match self
+                .filesystem
+                .directory_store
+                .get_exact(dir.parent, &name)
+                .await
+            {
+                Ok(id) if id == ancestor => {}
+                Ok(_) | Err(FsError::NotFound) => return Err(FsError::StaleHandle.into()),
+                Err(error) => return Err(error.into()),
+            }
+            path.push(Bytes::from(name));
+            ancestor = dir.parent;
+        }
+        path.reverse();
+        Ok(WalkTarget {
+            id: root_id,
+            replacement_path: Some(path),
+        })
     }
 
     /// Keep a fid's absolute path in step with a walk: `..` pops a component
-    /// (unless clamped at the attach root, where `current_id == root`), any
-    /// other name appends. Shared by `walk` and `walk_getattr`.
+    /// (unless clamped at the attach root, where `current_id == root`), `.`
+    /// stays in place, and other names append. Shared by `walk` and
+    /// `walk_getattr`.
     fn step_path(path: &mut Vec<Bytes>, name: Bytes, current_id: InodeId, root: InodeId) {
-        if name.as_ref() == b".." {
-            if current_id != root {
+        match name.as_ref() {
+            b"." => {}
+            b".." if current_id != root => {
                 path.pop();
             }
-        } else {
-            path.push(name);
+            b".." => {}
+            _ => path.push(name),
         }
     }
 
-    async fn walk(&self, tw: Twalk) -> P9Result<Message> {
+    /// Resolve one walk component under `rule`.
+    ///
+    /// An exact match holds the directory's namespace lock from the folded
+    /// lookup through the spelling check, the inode read, and the pin of a
+    /// directory child. An atomic replacement or case-only rename therefore
+    /// cannot land between the folded lookup and the spelling check, which
+    /// would make a continuously present name return ENOENT. `.` and `..`
+    /// have no stored spelling and resolve as before.
+    async fn resolve_walk_component(
+        &self,
+        creds: &Credentials,
+        root_id: InodeId,
+        current_id: InodeId,
+        name: &[u8],
+        rule: NameMatch,
+    ) -> P9Result<WalkStep> {
+        let check_spelling = rule == NameMatch::Exact && !matches!(name, b"." | b"..");
+        let _directory_guard = if check_spelling {
+            Some(self.filesystem.lock_manager.acquire(current_id).await)
+        } else {
+            None
+        };
+        let target = self
+            .walk_component(creds, root_id, current_id, name)
+            .await?;
+        let id = target.id;
+        #[cfg(test)]
+        if rule == NameMatch::Exact {
+            let pause = self.exact_lookup_pause.lock().unwrap().take();
+            if let Some(pause) = pause {
+                let _ = pause.reached.send(());
+                let _ = pause.resume.await;
+            }
+        }
+        if check_spelling
+            && self
+                .filesystem
+                .directory_store
+                .get_exact(current_id, name)
+                .await?
+                != id
+        {
+            return Err(FsError::NotFound.into());
+        }
+        // Resolve data and metadata in one snapshot while the exact lookup
+        // still owns its parent lock. Rereading after releasing that lock can
+        // lose the original inode to an atomic replacement and turn a
+        // continuously present name into ENOENT.
+        let inode = self.filesystem.visible_inode(id).await?;
+        // Pin under the parent lock so final validation can wait for the
+        // child lock without losing this directory to a replacement.
+        let exact_pin = if check_spelling && inode.is_directory() {
+            Some(self.filesystem.new_open_handle(id))
+        } else {
+            None
+        };
+        Ok(WalkStep {
+            id,
+            inode,
+            replacement_path: target.replacement_path,
+            exact_pin,
+        })
+    }
+
+    /// Take the pin a walked fid needs once every component has resolved.
+    ///
+    /// Only a directory gets a pin. A target already known to be something
+    /// else skips the inode read, so a file replaced after its component
+    /// resolved cannot turn a successful walk into ENOENT.
+    /// `walked_directory` is `None` when the walk resolved no component.
+    /// `pending` is the pin an exact match took under the parent lock. It is
+    /// released only after the child-lock validation has taken its own.
+    async fn pin_walk_target(
+        &self,
+        target: InodeId,
+        walked_directory: Option<bool>,
+        pending: Option<OpenHandle>,
+    ) -> P9Result<Option<OpenHandle>> {
+        let pin = if walked_directory == Some(false) {
+            None
+        } else {
+            self.pin_walked_directory(target).await?
+        };
+        drop(pending);
+        Ok(pin)
+    }
+
+    #[cfg(test)]
+    async fn pause_before_exact_walk_pin(&self, rule: NameMatch) {
+        if rule == NameMatch::Exact {
+            let pause = self.exact_pin_pause.lock().unwrap().take();
+            if let Some(pause) = pause {
+                let _ = pause.reached.send(());
+                let _ = pause.resume.await;
+            }
+        }
+    }
+
+    async fn walk(&self, tw: Twalk, rule: NameMatch) -> P9Result<Message> {
         let src_fid = self.get_fid(tw.fid)?;
 
         let mut current_path = src_fid.path;
         let mut current_id = src_fid.inode_id;
         let mut wqids = Vec::new();
+        let mut pending_directory_pin = None;
+        let mut walked_directory = None;
         let has_wnames = !tw.wnames.is_empty();
 
         for (i, wname) in tw.wnames.into_iter().enumerate() {
             let name_bytes = Bytes::from(wname.data);
-
-            let creds = src_fid.creds;
-            let child_id = match self
-                .walk_component(&creds, src_fid.root, current_id, &name_bytes)
+            let step = match self
+                .resolve_walk_component(&src_fid.creds, src_fid.root, current_id, &name_bytes, rule)
                 .await
             {
-                Ok(id) => id,
+                Ok(step) => step,
                 Err(e) => {
                     // The first failed component is an error; a later failure
                     // returns the successfully walked prefix.
@@ -1355,22 +1729,20 @@ impl NinePHandler {
                 }
             };
 
-            let child_inode = match self.filesystem.inode_store.get(child_id).await {
-                Ok(inode) => inode,
-                Err(e) => {
-                    if i == 0 {
-                        return Err(e.into());
-                    }
-                    return Ok(Message::Rwalk(Rwalk {
-                        nwqid: wqids.len() as u16,
-                        wqids,
-                    }));
-                }
-            };
-
-            Self::step_path(&mut current_path, name_bytes, current_id, src_fid.root);
-            wqids.push(inode_to_qid(&child_inode, child_id));
-            current_id = child_id;
+            if let Some(path) = step.replacement_path {
+                current_path = path;
+            } else {
+                Self::step_path(&mut current_path, name_bytes, current_id, src_fid.root);
+            }
+            wqids.push(inode_to_qid(&step.inode, step.id));
+            // A self step such as `.` must keep the previous exact lookup's
+            // directory pin until final validation takes its own. A different
+            // target always replaces or clears the previous pin.
+            if step.id != current_id || step.exact_pin.is_some() {
+                pending_directory_pin = step.exact_pin;
+            }
+            current_id = step.id;
+            walked_directory = Some(step.inode.is_directory());
         }
 
         // Only create newfid if the walk fully succeeded
@@ -1384,8 +1756,12 @@ impl NinePHandler {
                 mode: None,
                 creds: src_fid.creds, // Inherit credentials from source fid
             };
+            #[cfg(test)]
+            self.pause_before_exact_walk_pin(rule).await;
+            let directory_pin = self
+                .pin_walk_target(current_id, walked_directory, pending_directory_pin)
+                .await?;
             // In-place replacement drops the old slot's resource guards.
-            let directory_pin = self.pin_walked_directory(current_id).await?;
             self.install_walk_fid(tw.fid, tw.newfid, new_fid, directory_pin)?;
         }
 
@@ -1398,32 +1774,54 @@ impl NinePHandler {
     // ZeroFS fast path: a full walk that also returns the final inode's stat, so
     // the client's lookup costs one round trip instead of walk + getattr. Unlike
     // Twalk there is no partial result. Any miss is a hard error.
-    async fn walk_getattr(&self, tw: Twalkgetattr) -> P9Result<Message> {
+    async fn walk_getattr(&self, tw: Twalkgetattr, rule: NameMatch) -> P9Result<Message> {
         let src_fid = self.get_fid(tw.fid)?;
 
         let mut current_path = src_fid.path;
         let mut current_id = src_fid.inode_id;
         let mut wqids = Vec::new();
         let mut last_inode = None;
+        let mut pending_directory_pin = None;
 
         for wname in tw.wnames {
             let name_bytes = Bytes::from(wname.data);
-            let child_id = self
-                .walk_component(&src_fid.creds, src_fid.root, current_id, &name_bytes)
+            let step = self
+                .resolve_walk_component(&src_fid.creds, src_fid.root, current_id, &name_bytes, rule)
                 .await?;
-            let child_inode = self.filesystem.inode_store.get(child_id).await?;
-            Self::step_path(&mut current_path, name_bytes, current_id, src_fid.root);
-            wqids.push(inode_to_qid(&child_inode, child_id));
-            current_id = child_id;
-            last_inode = Some(child_inode);
+            if let Some(path) = step.replacement_path {
+                current_path = path;
+            } else {
+                Self::step_path(&mut current_path, name_bytes, current_id, src_fid.root);
+            }
+            wqids.push(inode_to_qid(&step.inode, step.id));
+            if step.id != current_id || step.exact_pin.is_some() {
+                pending_directory_pin = step.exact_pin;
+            }
+            current_id = step.id;
+            last_inode = Some(step.inode);
         }
 
-        // Complete fallible reads before publishing `newfid`.
+        #[cfg(test)]
+        self.pause_before_exact_walk_pin(rule).await;
+        // A named walk already owns its visible snapshot from resolution.
+        // Only an empty clone needs a fresh read before publishing `newfid`.
         let stat_inode = match last_inode {
             Some(inode) => inode,
-            None => self.filesystem.inode_store.get(current_id).await?,
+            None => self.filesystem.visible_inode(current_id).await?,
         };
-        let directory_pin = self.pin_walked_directory(current_id).await?;
+        // The visible write preview can advance mtime, which is the Qid
+        // version. The final walk entry, installed fid and stat share one view.
+        let final_qid = inode_to_qid(&stat_inode, current_id);
+        if let Some(qid) = wqids.last_mut() {
+            *qid = final_qid;
+        }
+        let directory_pin = self
+            .pin_walk_target(
+                current_id,
+                Some(stat_inode.is_directory()),
+                pending_directory_pin,
+            )
+            .await?;
         self.install_walk_fid(
             tw.fid,
             tw.newfid,
@@ -1431,7 +1829,7 @@ impl NinePHandler {
                 path: current_path,
                 inode_id: current_id,
                 root: src_fid.root,
-                qid: wqids.last().copied().unwrap_or(src_fid.qid),
+                qid: final_qid,
                 opened: false,
                 mode: None,
                 creds: src_fid.creds,
@@ -1469,33 +1867,25 @@ impl NinePHandler {
         let qid = {
             let _guard = self.filesystem.lock_manager.acquire(inode_id).await;
             let inode = self.filesystem.inode_store.get(inode_id).await?;
+            let (inode, acl) = self
+                .filesystem
+                .inode_access_context(inode_id, &inode, &creds)
+                .await?;
             if replay_reopen && inode.nlink() == 0 {
                 return Err(FsError::StaleHandle.into());
             }
-            check_open_access(&inode, &creds, tl.flags)
+            check_open_access(&inode, &creds, tl.flags, acl.as_ref())
                 .map_err(|error| Self::map_replay_open_error(replay_reopen, error))?;
             let qid = inode_to_qid(&inode, inode_id);
-            let mut state = self.connected_session()?;
-            match state.fids.get_mut(&tl.fid) {
-                Some(slot) => {
-                    // Publish the exact fid snapshot whose inode and
-                    // credentials were authorized. A racing in-place walk may
-                    // have replaced the table entry while the inode lock was
-                    // awaited; mutating that replacement would attach A's
-                    // authorization and handle to B's identity.
-                    if slot.fid.opened {
-                        return Err(P9Error::FidAlreadyOpen);
-                    }
-                    fid_entry.qid = qid;
-                    fid_entry.opened = true;
-                    fid_entry.mode = Some(tl.flags);
-                    slot.fid = fid_entry;
-                    slot.replay_reopen = false;
-                    slot.handle = Some(self.filesystem.new_open_handle(inode_id));
-                    slot.directory_pin = None;
-                }
-                None => return Err(P9Error::BadFid),
+            let mut state = self.session_for_update()?;
+            // Unlike a compound open, Tlopen may not recreate a clunked fid.
+            if !state.fids.contains_key(&tl.fid) {
+                return Err(P9Error::BadFid);
             }
+            fid_entry.qid = qid;
+            fid_entry.opened = true;
+            fid_entry.mode = Some(tl.flags);
+            self.install_open_fid(&mut state, tl.fid, tl.fid, fid_entry)?;
             qid
         };
 
@@ -1524,13 +1914,17 @@ impl NinePHandler {
         let qid = {
             let _guard = self.filesystem.lock_manager.acquire(src_fid.inode_id).await;
             let inode = self.filesystem.inode_store.get(src_fid.inode_id).await?;
+            let (inode, acl) = self
+                .filesystem
+                .inode_access_context(src_fid.inode_id, &inode, &src_fid.creds)
+                .await?;
             if replay_reopen && inode.nlink() == 0 {
                 return Err(FsError::StaleHandle.into());
             }
-            check_open_access(&inode, &src_fid.creds, tl.flags)
+            check_open_access(&inode, &src_fid.creds, tl.flags, acl.as_ref())
                 .map_err(|error| Self::map_replay_open_error(replay_reopen, error))?;
             let qid = inode_to_qid(&inode, src_fid.inode_id);
-            let mut state = self.connected_session()?;
+            let mut state = self.session_for_update()?;
             let new_fid = Fid {
                 path: src_fid.path.clone(),
                 inode_id: src_fid.inode_id,
@@ -1599,11 +1993,17 @@ impl NinePHandler {
         }))
     }
 
-    async fn clunk(&self, tc: Tclunk) -> Message {
+    async fn clunk(&self, tc: Tclunk) -> P9Result<Message> {
         let slot = self.session_state().fids.remove(&tc.fid);
-        // Release resources outside the session lock.
-        drop(slot);
-        Message::Rclunk(Rclunk)
+        if let Some(slot) = slot {
+            // Before the handle drops, so its last-close reclaim sees no
+            // protection left.
+            if let Some(op_id) = &slot.create_op {
+                self.filesystem.dedup.release_create_protection(op_id);
+            }
+            self.commit_xattr(slot).await?;
+        }
+        Ok(Message::Rclunk(Rclunk))
     }
 
     /// Implicitly clunk every fid, as required by Tversion.
@@ -1630,6 +2030,9 @@ impl NinePHandler {
                         slot.handle.take(),
                         slot.directory_pin.take(),
                         slot.lock_guard.take(),
+                        slot.xattr
+                            .as_mut()
+                            .map(|xattr| std::mem::replace(xattr, XattrFid::Closed)),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1758,6 +2161,15 @@ impl NinePHandler {
         ))
     }
 
+    fn decode_create_mode(&self, mode: u32) -> (u32, u32) {
+        if self.session_state().create_umask {
+            let umask = (mode >> CREATE_UMASK_SHIFT) & CREATE_UMASK_MASK;
+            (mode & 0o177777, umask)
+        } else {
+            (mode, 0)
+        }
+    }
+
     /// Create a regular file under `parent_fid`, returning the new inode's id
     /// and post-op attributes. Shared by Tlcreate and Tlcreateattr.
     async fn create_child(
@@ -1767,21 +2179,23 @@ impl NinePHandler {
         mode: u32,
         client_gid: u32,
         op_id: crate::dedup::OpId,
+        umask: u32,
     ) -> P9Result<(InodeId, FileAttributes)> {
         let gid = self.effective_gid(client_gid, &parent_fid.creds);
         Ok(self
             .filesystem
-            .create_idempotent(
-                &parent_fid.creds.with_gid(gid),
+            .create_with_umask(
+                &parent_fid.creds,
                 parent_fid.inode_id,
                 name,
                 &SetAttributes {
                     mode: SetMode::Set(mode),
                     uid: SetUid::Set(parent_fid.creds.uid),
-                    gid: SetGid::Set(gid),
+                    gid: SetGid::InheritOr(gid),
                     ..Default::default()
                 },
                 op_id,
+                umask,
             )
             .await?)
     }
@@ -1794,7 +2208,7 @@ impl NinePHandler {
         }
 
         let (child_id, post_attr) = self
-            .create_child(&parent_fid, &tc.name.data, tc.mode, tc.gid, op_id)
+            .create_child(&parent_fid, &tc.name.data, tc.mode, tc.gid, op_id, 0)
             .await?;
 
         let qid = attrs_to_qid(&post_attr, child_id);
@@ -1807,8 +2221,11 @@ impl NinePHandler {
                 Err(FsError::NotFound) => return Err(FsError::StaleHandle.into()),
                 Err(error) => return Err(error.into()),
             }
-            let mut state = self.connected_session()?;
+            let mut state = self.session_for_update()?;
             let slot = state.fids.get_mut(&tc.fid).ok_or(P9Error::BadFid)?;
+            if slot.xattr.is_some() {
+                return Err(P9Error::BadFid);
+            }
             // Serialize racing creates under the session lock.
             if slot.fid.opened {
                 return Err(P9Error::FidAlreadyOpen);
@@ -1823,6 +2240,7 @@ impl NinePHandler {
             slot.replay_reopen = false;
             slot.handle = Some(self.filesystem.new_open_handle(child_id));
             slot.directory_pin = None;
+            slot.create_op = crate::dedup::has_op_id(&op_id).then_some(op_id);
         }
 
         Ok(Message::Rlcreate(Rlcreate {
@@ -1841,8 +2259,9 @@ impl NinePHandler {
             return Err(P9Error::FidInUse);
         }
 
+        let (mode, umask) = self.decode_create_mode(tc.mode);
         let (child_id, post_attr) = self
-            .create_child(&parent_fid, &tc.name.data, tc.mode, tc.gid, op_id)
+            .create_child(&parent_fid, &tc.name.data, mode, tc.gid, op_id, umask)
             .await?;
 
         let mut path = parent_fid.path;
@@ -1855,7 +2274,7 @@ impl NinePHandler {
                 Err(FsError::NotFound) => return Err(FsError::StaleHandle.into()),
                 Err(error) => return Err(error.into()),
             }
-            let mut state = self.connected_session()?;
+            let mut state = self.session_for_update()?;
             let new_fid = Fid {
                 path,
                 inode_id: child_id,
@@ -1866,6 +2285,9 @@ impl NinePHandler {
                 creds: parent_fid.creds,
             };
             self.install_open_fid(&mut state, tc.newfid, tc.dfid, new_fid)?;
+            if let Some(slot) = state.fids.get_mut(&tc.newfid) {
+                slot.create_op = crate::dedup::has_op_id(&op_id).then_some(op_id);
+            }
         }
 
         Ok(Message::Rlcreateattr(Rlcreateattr {
@@ -1875,9 +2297,12 @@ impl NinePHandler {
     }
 
     async fn read(&self, tr: Tread) -> P9Result<Message> {
-        let fid_entry = self.get_fid(tr.fid)?;
+        if let Some(result) = self.read_xattr(&tr) {
+            return result;
+        }
+        let fid_entry = self.get_fid_io_context(tr.fid)?;
 
-        if !fid_allows_read(&fid_entry) {
+        if !fid_entry.allows_read {
             return Err(P9Error::BadFid);
         }
 
@@ -1903,9 +2328,12 @@ impl NinePHandler {
         op_id: crate::dedup::OpId,
         op_origin_epoch: u64,
     ) -> P9Result<Message> {
-        let fid_entry = self.get_fid(tw.fid)?;
+        if let Some(result) = self.write_xattr(&tw) {
+            return result;
+        }
+        let fid_entry = self.get_fid_io_context(tw.fid)?;
 
-        if !fid_allows_write(&fid_entry) {
+        if !fid_entry.allows_write {
             return Err(P9Error::BadFid);
         }
 
@@ -2077,6 +2505,7 @@ impl NinePHandler {
         &self,
         tm: &Tmkdir,
         op_id: crate::dedup::OpId,
+        with_attr: bool,
     ) -> P9Result<(InodeId, FileAttributes)> {
         let parent_fid = self.get_fid(tm.dfid)?;
 
@@ -2092,32 +2521,38 @@ impl NinePHandler {
         );
 
         let gid = self.effective_gid(tm.gid, &parent_fid.creds);
+        let (mode, umask) = if with_attr {
+            self.decode_create_mode(tm.mode)
+        } else {
+            (tm.mode, 0)
+        };
         Ok(self
             .filesystem
             .mkdir_idempotent(
-                &parent_fid.creds.with_gid(gid),
+                &parent_fid.creds,
                 parent_fid.inode_id,
                 &tm.name.data,
                 &SetAttributes {
-                    mode: SetMode::Set(tm.mode),
+                    mode: SetMode::Set(mode),
                     uid: SetUid::Set(parent_fid.creds.uid),
-                    gid: SetGid::Set(gid),
+                    gid: SetGid::InheritOr(gid),
                     ..Default::default()
                 },
                 op_id,
+                umask,
             )
             .await?)
     }
 
     async fn mkdir(&self, tm: Tmkdir, op_id: crate::dedup::OpId) -> P9Result<Message> {
-        let (new_id, post_attr) = self.make_dir(&tm, op_id).await?;
+        let (new_id, post_attr) = self.make_dir(&tm, op_id, false).await?;
         Ok(Message::Rmkdir(Rmkdir {
             qid: attrs_to_qid(&post_attr, new_id),
         }))
     }
 
     async fn mkdir_attr(&self, tm: Tmkdir, op_id: crate::dedup::OpId) -> P9Result<Message> {
-        let (new_id, post_attr) = self.make_dir(&tm, op_id).await?;
+        let (new_id, post_attr) = self.make_dir(&tm, op_id, true).await?;
         Ok(Message::Rmkdirattr(Rmkdirattr {
             stat: attrs_to_stat(&post_attr, new_id)?,
         }))
@@ -2136,14 +2571,14 @@ impl NinePHandler {
         Ok(self
             .filesystem
             .symlink_idempotent(
-                &parent_fid.creds.with_gid(gid),
+                &parent_fid.creds,
                 parent_fid.inode_id,
                 &ts.name.data,
                 &ts.symtgt.data,
                 &SetAttributes {
                     mode: SetMode::Set(SYMLINK_DEFAULT_MODE),
                     uid: SetUid::Set(parent_fid.creds.uid),
-                    gid: SetGid::Set(gid),
+                    gid: SetGid::InheritOr(gid),
                     ..Default::default()
                 },
                 op_id,
@@ -2171,10 +2606,21 @@ impl NinePHandler {
         &self,
         tm: &Tmknod,
         op_id: crate::dedup::OpId,
+        with_attr: bool,
     ) -> P9Result<(InodeId, FileAttributes)> {
         let parent_fid = self.get_fid(tm.dfid)?;
 
         let file_type = tm.mode & 0o170000; // S_IFMT
+        let (mode, umask) = if with_attr {
+            self.decode_create_mode(tm.mode)
+        } else {
+            (tm.mode, 0)
+        };
+        if with_attr && file_type == S_IFREG {
+            return self
+                .create_child(&parent_fid, &tm.name.data, mode, tm.gid, op_id, umask)
+                .await;
+        }
         let device_type = match file_type {
             S_IFCHR => FileType::CharDevice,
             S_IFBLK => FileType::BlockDevice,
@@ -2191,31 +2637,32 @@ impl NinePHandler {
         Ok(self
             .filesystem
             .mknod_idempotent(
-                &parent_fid.creds.with_gid(gid),
+                &parent_fid.creds,
                 parent_fid.inode_id,
                 &tm.name.data,
                 device_type,
                 &SetAttributes {
-                    mode: SetMode::Set(tm.mode & 0o7777),
+                    mode: SetMode::Set(mode & 0o7777),
                     uid: SetUid::Set(parent_fid.creds.uid),
-                    gid: SetGid::Set(gid),
+                    gid: SetGid::InheritOr(gid),
                     ..Default::default()
                 },
                 rdev,
                 op_id,
+                umask,
             )
             .await?)
     }
 
     async fn mknod(&self, tm: Tmknod, op_id: crate::dedup::OpId) -> P9Result<Message> {
-        let (child_id, post_attr) = self.make_node(&tm, op_id).await?;
+        let (child_id, post_attr) = self.make_node(&tm, op_id, false).await?;
         Ok(Message::Rmknod(Rmknod {
             qid: attrs_to_qid(&post_attr, child_id),
         }))
     }
 
     async fn mknod_attr(&self, tm: Tmknod, op_id: crate::dedup::OpId) -> P9Result<Message> {
-        let (child_id, post_attr) = self.make_node(&tm, op_id).await?;
+        let (child_id, post_attr) = self.make_node(&tm, op_id, true).await?;
         Ok(Message::Rmknodattr(Rmknodattr {
             stat: attrs_to_stat(&post_attr, child_id)?,
         }))
@@ -2227,8 +2674,14 @@ impl NinePHandler {
         let inode = self.filesystem.visible_inode(fid_entry.inode_id).await?;
 
         match inode {
+            // A 9P string carries at most `u16::MAX` bytes. NFS can store a
+            // longer target; refuse it rather than send a reply whose length
+            // field disagrees with its payload.
+            Inode::Symlink(s) if s.target.len() > usize::from(u16::MAX) => {
+                Err(FsError::NameTooLong.into())
+            }
             Inode::Symlink(s) => Ok(Message::Rreadlink(Rreadlink {
-                target: P9String::new(s.target.clone()),
+                target: P9String::new(s.target),
             })),
             _ => Err(P9Error::NotASymlink),
         }
@@ -2304,33 +2757,75 @@ impl NinePHandler {
 
         let new_name_bytes = Bytes::copy_from_slice(&tr.name.data);
 
+        // Preserve ENOTDIR for a valid non-directory destination fid rather
+        // than classifying it as a broken directory ancestry chain below.
+        if dest_fid.qid.type_ & QID_TYPE_DIR == 0 {
+            return Err(P9Error::NotADirectory);
+        }
+
+        // A directory fid remains bound to its inode after another client
+        // renames that directory. Reconstruct its current parent chain rather
+        // than copying the destination fid's possibly stale cached path.
+        // Do all fallible path work before committing the namespace change.
+        let mut renamed_path = self
+            .clamped_walk_root(dest_parent_id)
+            .await?
+            .replacement_path
+            .ok_or(FsError::StaleHandle)?;
+        renamed_path.push(new_name_bytes.clone());
+
         let auth = AuthContext::from(&creds);
 
-        self.filesystem
-            .rename_idempotent(
+        let moved = self
+            .filesystem
+            .rename_inode_idempotent(
                 &auth,
                 source_parent_id,
                 source_name,
                 dest_parent_id,
                 &new_name_bytes,
+                source_fid.inode_id,
                 op_id,
             )
             .await?;
 
+        if moved {
+            // Do not overwrite a fid concurrently walked/rebound to another
+            // object. A successful same-inode hard-link rename leaves the
+            // source entry intact and must not switch this fid to its alias.
+            if let Some(slot) = self.session_state().fids.get_mut(&tr.fid)
+                && slot.xattr.is_none()
+                && slot.fid.inode_id == source_fid.inode_id
+                && slot.fid.root == source_fid.root
+                && slot.fid.path == source_fid.path
+            {
+                slot.fid.path = renamed_path;
+            }
+        }
+
         Ok(Message::Rrename(Rrename))
     }
 
-    async fn renameat(&self, tr: Trenameat, op_id: crate::dedup::OpId) -> P9Result<Message> {
+    /// `rule` applies to the source name only. The destination always
+    /// resolves by the folded key, so a fold-equal destination is either the
+    /// source itself (a case-only rename) or an entry to replace.
+    async fn renameat(
+        &self,
+        tr: Trenameat,
+        rule: NameMatch,
+        op_id: crate::dedup::OpId,
+    ) -> P9Result<Message> {
         let old_dir_fid = self.get_fid(tr.olddirfid)?;
         let new_dir_fid = self.get_fid(tr.newdirfid)?;
 
         let auth = AuthContext::from(&old_dir_fid.creds);
 
         self.filesystem
-            .rename_idempotent(
+            .rename_idempotent_matching(
                 &auth,
                 old_dir_fid.inode_id,
                 &tr.oldname.data,
+                rule,
                 new_dir_fid.inode_id,
                 &tr.newname.data,
                 op_id,
@@ -2364,7 +2859,12 @@ impl NinePHandler {
         Ok(Message::Rrenameat(Rrenameat))
     }
 
-    async fn unlinkat(&self, tu: Tunlinkat, op_id: crate::dedup::OpId) -> P9Result<Message> {
+    async fn unlinkat(
+        &self,
+        tu: Tunlinkat,
+        rule: NameMatch,
+        op_id: crate::dedup::OpId,
+    ) -> P9Result<Message> {
         if tu.flags & !AT_REMOVEDIR != 0 {
             return Err(P9Error::InvalidArgument);
         }
@@ -2389,6 +2889,7 @@ impl NinePHandler {
                 &auth,
                 parent_id,
                 &tu.name.data,
+                rule,
                 op_id,
                 tu.flags & AT_REMOVEDIR != 0,
             )
@@ -2466,7 +2967,11 @@ impl NinePHandler {
             return Err(P9Error::BadFid);
         }
 
-        let (used_bytes, used_inodes) = self.filesystem.global_stats.get_totals();
+        let (used_bytes, used_inodes) = self
+            .filesystem
+            .global_stats
+            .known_totals()
+            .ok_or(FsError::IoError)?;
 
         const BLOCK_SIZE: u32 = 4096; // 4KB blocks
 
@@ -2501,6 +3006,7 @@ impl NinePHandler {
         let fid = self.get_fid(tl.fid)?;
 
         if matches!(tl.lock_type, LockType::Unlock) {
+            crate::abandonment::pass_point_of_no_return().map_err(FsError::from)?;
             self.lock_manager.unlock_range(
                 fid.inode_id,
                 tl.fid,
@@ -2515,7 +3021,7 @@ impl NinePHandler {
         }
 
         // Publish lock state and its guard under the session lock.
-        let mut state = self.connected_session()?;
+        let mut state = self.session_for_update()?;
         let slot = match state.fids.get_mut(&tl.fid) {
             Some(slot) => slot,
             None => return Err(P9Error::BadFid),
@@ -2567,7 +3073,7 @@ impl NinePHandler {
             start: tg.start,
             length: tg.length,
             proc_id: tg.proc_id,
-            client_id: tg.client_id.data.clone(),
+            client_id: tg.client_id.data,
             fid: tg.fid,
             inode_id: fid.inode_id,
         };
@@ -2581,7 +3087,7 @@ impl NinePHandler {
                 start: conflicting_lock.start,
                 length: conflicting_lock.length,
                 proc_id: conflicting_lock.proc_id,
-                client_id: P9String::new(conflicting_lock.client_id.clone()),
+                client_id: P9String::new(conflicting_lock.client_id),
             }))
         } else {
             Ok(Message::Rgetlock(Rgetlock {
@@ -2802,6 +3308,39 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn name_mode_selects_a_dialect_the_kernel_can_refuse() {
+        for mode in [
+            crate::fs::name_mode::NameMode::Sensitive,
+            crate::fs::name_mode::NameMode::Insensitive,
+        ] {
+            let fs = Arc::new(ZeroFS::new_in_memory_with_name_mode(mode).await.unwrap());
+            let handler = NinePHandler::new(fs, Arc::new(FileLockManager::new()));
+            let response = negotiate(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS).await;
+            let Message::Rversion(version) = response.body else {
+                panic!("expected version reply")
+            };
+            assert_eq!(
+                ninep_proto::kernel_dialect_supported(&version.version.data),
+                mode == crate::fs::name_mode::NameMode::Sensitive
+            );
+            assert_eq!(
+                version.version.data,
+                if mode == crate::fs::name_mode::NameMode::Sensitive {
+                    VERSION_9P2000L_ZEROFS
+                } else {
+                    VERSION_9P2000L_ZEROFS_CI
+                }
+            );
+            assert!(handler.zerofs_protocol_enabled());
+            let response = negotiate(&handler, DEFAULT_MSIZE, VERSION_9P2000L).await;
+            let Message::Rversion(version) = response.body else {
+                panic!("expected version reply")
+            };
+            assert_eq!(version.version.data, VERSION_9P2000L);
+        }
+    }
+
     async fn start_plain_session(handler: &NinePHandler) {
         start_session(handler, DEFAULT_MSIZE, VERSION_9P2000L, b"").await;
     }
@@ -2900,6 +3439,81 @@ mod tests {
         ));
     }
 
+    /// A create keeps its inode for a retry whose reply was lost. A session
+    /// that clunks the fid the create opened already has that reply, so
+    /// removing the file afterwards must free its space at once rather than
+    /// after the retry retention period.
+    #[tokio::test]
+    async fn removing_a_created_file_after_its_clunk_frees_its_space() {
+        let mut fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.max_bytes = 4096;
+        fs.quota = crate::fs::quota::LogicalQuota::new(4096, 0);
+        let fs = Arc::new(fs);
+        let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+
+        for (round, op_id) in [[0x41u8; 16], [0x42; 16]].into_iter().enumerate() {
+            let tag = 10 * round as u16 + 2;
+            let created = handler
+                .handle_message_with_op_id(
+                    tag,
+                    op_id,
+                    Message::Tlcreateattr(Tlcreateattr {
+                        dfid: 1,
+                        newfid: 2,
+                        name: P9String::new(b"spc".to_vec()),
+                        flags: O_RDWR as u32,
+                        mode: 0o644,
+                        gid: 1000,
+                    }),
+                )
+                .await;
+            assert!(
+                matches!(created.body, Message::Rlcreateattr(_)),
+                "round {round}: {:?}",
+                created.body
+            );
+            let written = request(
+                &handler,
+                tag + 1,
+                Message::Twrite(Twrite {
+                    fid: 2,
+                    offset: 0,
+                    count: 4096,
+                    data: DekuBytes::from(vec![b'x'; 4096]),
+                }),
+            )
+            .await;
+            assert!(
+                matches!(written.body, Message::Rwrite(Rwrite { count: 4096 })),
+                "round {round}: {:?}",
+                written.body
+            );
+            let clunked = request(&handler, tag + 2, Message::Tclunk(Tclunk { fid: 2 })).await;
+            assert!(matches!(clunked.body, Message::Rclunk(_)));
+            let removed = request(
+                &handler,
+                tag + 3,
+                Message::Tunlinkat(Tunlinkat {
+                    dirfid: 1,
+                    name: P9String::new(b"spc".to_vec()),
+                    flags: 0,
+                }),
+            )
+            .await;
+            assert!(
+                matches!(removed.body, Message::Runlinkat(_)),
+                "round {round}: {:?}",
+                removed.body
+            );
+            assert_eq!(
+                fs.quota.committed_bytes(),
+                0,
+                "round {round}: the removed file still holds its space"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn standard_attach_uses_unknown_group_dac_without_group_credentials() {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
@@ -2910,14 +3524,33 @@ mod tests {
             gid: SetGid::Set(group),
             ..Default::default()
         };
-        fs.create(&test_creds(), 0, b"group-file", &attrs)
-            .await
-            .unwrap();
-        fs.mkdir(&test_creds(), 0, b"group-directory", &attrs)
-            .await
-            .unwrap();
         fs.create(
-            &test_creds(),
+            &Credentials {
+                uid: 0,
+                ..test_creds()
+            },
+            0,
+            b"group-file",
+            &attrs,
+        )
+        .await
+        .unwrap();
+        fs.mkdir(
+            &Credentials {
+                uid: 0,
+                ..test_creds()
+            },
+            0,
+            b"group-directory",
+            &attrs,
+        )
+        .await
+        .unwrap();
+        fs.create(
+            &Credentials {
+                uid: 0,
+                ..test_creds()
+            },
             0,
             b"denied",
             &SetAttributes {
@@ -2930,7 +3563,10 @@ mod tests {
         .await
         .unwrap();
         fs.create(
-            &test_creds(),
+            &Credentials {
+                uid: 0,
+                ..test_creds()
+            },
             0,
             b"other-readable",
             &SetAttributes {
@@ -3140,6 +3776,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_open_publication_cannot_retarget_a_staged_xattr() {
+        for opening in [
+            Message::Tlopen(Tlopen {
+                fid: 1,
+                flags: O_RDONLY as u32,
+            }),
+            Message::Tlopenat(Tlopenat {
+                fid: 1,
+                newfid: 1,
+                flags: O_RDONLY as u32,
+            }),
+            Message::Tlopenatread(Tlopenatread {
+                fid: 1,
+                newfid: 1,
+                flags: O_RDONLY as u32,
+                count: 1,
+            }),
+            Message::Tlcreate(Tlcreate {
+                fid: 1,
+                name: P9String::new(b"created".to_vec()),
+                flags: O_RDWR as u32,
+                mode: 0o600,
+                gid: 0,
+            }),
+            Message::Tlcreateattr(Tlcreateattr {
+                dfid: 1,
+                newfid: 1,
+                name: P9String::new(b"created".to_vec()),
+                flags: O_RDWR as u32,
+                mode: 0o600,
+                gid: 0,
+            }),
+        ] {
+            let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+            let root_creds = Credentials {
+                uid: 0,
+                ..test_creds()
+            };
+            let (target, _) = fs
+                .create(&test_creds(), 0, b"target", &SetAttributes::default())
+                .await
+                .unwrap();
+            let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()))
+                .with_credential_override(0, 0);
+            start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+
+            // Suspend publication after the operation snapshots the root fid.
+            // The same numeric fid becomes an xattr on a different inode
+            // before that old ordinary open/create resumes.
+            let root_guard = fs.lock_manager.acquire(0).await;
+            let mut opening = Box::pin(request(&handler, 2, opening));
+            assert!(futures::poll!(opening.as_mut()).is_pending());
+            expect_walk(&handler, 3, 1, 1, &[b"target"]).await;
+            assert!(matches!(
+                request(
+                    &handler,
+                    4,
+                    Message::Txattrcreate(Txattrcreate {
+                        fid: 1,
+                        name: P9String::new(b"user.race".to_vec()),
+                        size: 1,
+                        flags: 0,
+                    })
+                )
+                .await
+                .body,
+                Message::Rxattrcreate(_)
+            ));
+            assert!(matches!(
+                request(
+                    &handler,
+                    5,
+                    Message::Twrite(Twrite {
+                        fid: 1,
+                        offset: 0,
+                        count: 1,
+                        data: Bytes::from_static(b"x").into(),
+                    })
+                )
+                .await
+                .body,
+                Message::Rwrite(_)
+            ));
+            drop(root_guard);
+            assert_eq!(errno(&opening.await), Some(P9Error::BadFid.to_errno()));
+            {
+                let state = handler.session_state();
+                let slot = state.fids.get(&1).unwrap();
+                assert_eq!(slot.fid.inode_id, target);
+                assert!(!slot.fid.opened);
+                assert!(matches!(&slot.xattr, Some(XattrFid::Write { .. })));
+            }
+            assert!(matches!(
+                request(&handler, 6, Message::Tclunk(Tclunk { fid: 1 }))
+                    .await
+                    .body,
+                Message::Rclunk(_)
+            ));
+            let name = crate::fs::XattrName::new(b"user.race").unwrap();
+            assert_eq!(
+                fs.get_xattr(&root_creds, target, &name).await.unwrap(),
+                b"x"[..]
+            );
+            assert_eq!(
+                fs.get_xattr(&root_creds, 0, &name).await,
+                Err(FsError::NoData)
+            );
+            if let Ok(created) = fs.lookup(&test_creds(), 0, b"created").await {
+                assert_eq!(
+                    fs.get_xattr(&root_creds, created, &name).await,
+                    Err(FsError::NoData)
+                );
+                assert_eq!(fs.open_handle_count(created), 0);
+            }
+            assert_eq!(fs.open_handle_count(target), 0);
+            assert_eq!(fs.open_handle_count(0), 0);
+        }
+    }
+
+    #[tokio::test]
     async fn compound_opens_authorize_before_installing_newfid() {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
         let creds = test_creds();
@@ -3325,16 +4081,35 @@ mod tests {
             ..Default::default()
         };
         let (file_id, _) = fs
-            .create(&test_creds(), 0, b"group-file", &attrs)
+            .create(
+                &Credentials {
+                    uid: 0,
+                    ..test_creds()
+                },
+                0,
+                b"group-file",
+                &attrs,
+            )
             .await
             .unwrap();
         let (directory_id, _) = fs
-            .mkdir(&test_creds(), 0, b"group-directory", &attrs)
+            .mkdir(
+                &Credentials {
+                    uid: 0,
+                    ..test_creds()
+                },
+                0,
+                b"group-directory",
+                &attrs,
+            )
             .await
             .unwrap();
         let (known_group_denied_id, _) = fs
             .create(
-                &test_creds(),
+                &Credentials {
+                    uid: 0,
+                    ..test_creds()
+                },
                 0,
                 b"known-group-denied",
                 &SetAttributes {
@@ -3439,6 +4214,7 @@ mod tests {
             groups: [0; P9_MAX_GROUPS],
             groups_count: 1,
             groups_complete: true,
+            groups_truncated: false,
         };
         let contents = b"open capability";
         let (file_id, _) = fs
@@ -3807,6 +4583,1043 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn walk_publication_preserves_a_concurrently_staged_xattr() {
+        for (compound, empty) in [(false, false), (true, false), (true, true)] {
+            let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+            let creds = test_creds();
+            let (source, _) = fs
+                .mkdir(&creds, 0, b"source", &SetAttributes::default())
+                .await
+                .unwrap();
+            let (target, _) = fs
+                .mkdir(&creds, source, b"target", &SetAttributes::default())
+                .await
+                .unwrap();
+            let handler = NinePHandler::new(fs.clone(), Arc::new(FileLockManager::new()));
+            start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+            handler
+                .walk(
+                    Twalk {
+                        fid: 1,
+                        newfid: 2,
+                        nwname: 1,
+                        wnames: vec![P9String::new(b"source".to_vec())],
+                    },
+                    NameMatch::Folded,
+                )
+                .await
+                .unwrap();
+
+            // The old walk has resolved its target but has not published its
+            // result. Converting that same fid to an xattr must survive it.
+            let (reached, reached_rx) = tokio::sync::oneshot::channel();
+            let (resume, resume_rx) = tokio::sync::oneshot::channel();
+            *handler.exact_pin_pause.lock().unwrap() = Some(SuccessTerminalPause {
+                reached,
+                resume: resume_rx,
+            });
+            let walking_handler = handler.clone();
+            let walking = tokio::spawn(async move {
+                let wnames = if empty {
+                    Vec::new()
+                } else {
+                    vec![P9String::new(b"target".to_vec())]
+                };
+                if compound {
+                    walking_handler
+                        .walk_getattr(
+                            Twalkgetattr {
+                                fid: 2,
+                                newfid: 2,
+                                nwname: wnames.len() as u16,
+                                wnames,
+                            },
+                            NameMatch::Exact,
+                        )
+                        .await
+                } else {
+                    walking_handler
+                        .walk(
+                            Twalk {
+                                fid: 2,
+                                newfid: 2,
+                                nwname: wnames.len() as u16,
+                                wnames,
+                            },
+                            NameMatch::Exact,
+                        )
+                        .await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(2), reached_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            handler
+                .xattrcreate(Txattrcreate {
+                    fid: 2,
+                    name: P9String::new(b"user.race".to_vec()),
+                    size: 1,
+                    flags: 0,
+                })
+                .await
+                .unwrap();
+            handler
+                .write(
+                    Twrite {
+                        fid: 2,
+                        offset: 0,
+                        count: 1,
+                        data: Bytes::from_static(b"x").into(),
+                    },
+                    [0; 16],
+                    0,
+                )
+                .await
+                .unwrap();
+            resume.send(()).unwrap();
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(2), walking)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                Err(P9Error::BadFid)
+            ));
+            assert_eq!(fs.open_handle_count(source), 1);
+            assert_eq!(fs.open_handle_count(target), 0);
+            handler.clunk(Tclunk { fid: 2 }).await.unwrap();
+            let name = crate::fs::XattrName::new(b"user.race").unwrap();
+            assert_eq!(fs.get_xattr(&creds, source, &name).await.unwrap(), b"x"[..]);
+            assert_eq!(
+                fs.get_xattr(&creds, target, &name).await,
+                Err(FsError::NoData)
+            );
+            assert_eq!(fs.open_handle_count(source), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn volatile_empty_writes_preserve_open_file_attributes() {
+        use crate::fs::mutation::config::{
+            ClientDurabilityTarget, FilesystemWriteAckMode, FilesystemWriteAckSettings,
+            FilesystemWriteAckSource,
+        };
+
+        let mut fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.write_ack = FilesystemWriteAckSettings {
+            mode: FilesystemWriteAckMode::VolatileMemory,
+            volatile_memory_bytes: 8 * 1024 * 1024,
+            volatile_max_operations: 1024,
+            source: FilesystemWriteAckSource::Filesystem,
+            client_durability_target: ClientDurabilityTarget::LocalSsd,
+        };
+        let fs = Arc::new(fs);
+        let handler = NinePHandler::new(fs.clone(), Arc::new(FileLockManager::new()));
+        let creds = test_creds();
+        let auth = AuthContext::from(&creds);
+        let (file, _) = fs
+            .create(&creds, 0, b"empty-write", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.write(&auth, file, 0, &Bytes::from_static(b"payload"))
+            .await
+            .unwrap();
+        fs.setattr(
+            &creds,
+            file,
+            &SetAttributes {
+                mode: SetMode::Set(0o6777),
+                mtime: SetTime::SetToClientTime(Timestamp {
+                    seconds: 1,
+                    nanoseconds: 2,
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        handler
+            .attach(Tattach {
+                fid: 1,
+                afid: u32::MAX,
+                uname: P9String::new(b"test".to_vec()),
+                aname: P9String::new(Vec::new()),
+                n_uname: 1000,
+            })
+            .await
+            .unwrap();
+        handler
+            .walk(
+                Twalk {
+                    fid: 1,
+                    newfid: 2,
+                    nwname: 1,
+                    wnames: vec![P9String::new(b"empty-write".to_vec())],
+                },
+                NameMatch::Folded,
+            )
+            .await
+            .unwrap();
+        handler
+            .lopen(Tlopen {
+                fid: 2,
+                flags: O_WRONLY as u32,
+            })
+            .await
+            .unwrap();
+        let before = inode_to_stat(&fs.visible_inode(file).await.unwrap(), file).unwrap();
+
+        for offset in [0, u64::MAX] {
+            let response = handler
+                .write(
+                    Twrite {
+                        fid: 2,
+                        offset,
+                        count: 0,
+                        data: DekuBytes::default(),
+                    },
+                    [0; 16],
+                    0,
+                )
+                .await
+                .expect("a zero-byte 9P write is a successful no-op");
+            assert!(matches!(response, Message::Rwrite(Rwrite { count: 0 })));
+            assert_eq!(
+                inode_to_stat(&fs.visible_inode(file).await.unwrap(), file).unwrap(),
+                before,
+                "empty write at {offset} changed visible attributes"
+            );
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), fs.quiesce_overlay_inode(file))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            inode_to_stat(&fs.inode_store.get(file).await.unwrap(), file).unwrap(),
+            before
+        );
+        assert_eq!(
+            fs.read_file(&auth, file, 0, 7).await.unwrap().0,
+            Bytes::from_static(b"payload")
+        );
+    }
+
+    #[tokio::test]
+    async fn walk_getattr_projects_pending_write_metadata_and_matching_qids() {
+        use crate::fs::mutation::config::{
+            ClientDurabilityTarget, FilesystemWriteAckMode, FilesystemWriteAckSettings,
+            FilesystemWriteAckSource,
+        };
+
+        let mut fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.write_ack = FilesystemWriteAckSettings {
+            mode: FilesystemWriteAckMode::VolatileMemory,
+            volatile_memory_bytes: 8 * 1024 * 1024,
+            volatile_max_operations: 1024,
+            source: FilesystemWriteAckSource::Filesystem,
+            client_durability_target: ClientDurabilityTarget::LocalSsd,
+        };
+        let fs = Arc::new(fs);
+        let handler = NinePHandler::new(fs.clone(), Arc::new(FileLockManager::new()));
+        let auth = AuthContext::from(&test_creds());
+        let (file, _) = fs
+            .create(&test_creds(), 0, b"pending-stat", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.write(&auth, file, 0, &Bytes::from_static(b"abcd"))
+            .await
+            .unwrap();
+        fs.setattr(
+            &test_creds(),
+            file,
+            &SetAttributes {
+                mode: SetMode::Set(0o6777),
+                mtime: SetTime::SetToClientTime(Timestamp {
+                    seconds: 1,
+                    nanoseconds: 0,
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+
+        let release_apply = fs
+            .materializer
+            .get()
+            .unwrap()
+            .hold_inode_lane_for_test(file)
+            .await;
+        let writer = AuthContext {
+            uid: 1001,
+            gid: 1001,
+            ..auth.clone()
+        };
+        let acknowledged = fs
+            .write_ack(&writer, file, 0, &Bytes::from_static(b"wxyz"))
+            .await
+            .unwrap();
+        assert_eq!(acknowledged.mode & 0o6000, 0);
+
+        for (fid, newfid, names) in [
+            (1, 2, vec![P9String::new(b"pending-stat".to_vec())]),
+            (2, 3, Vec::new()),
+        ] {
+            let count = names.len() as u16;
+            let response = request(
+                &handler,
+                2,
+                Message::Twalkgetattr(Twalkgetattr {
+                    fid,
+                    newfid,
+                    nwname: count,
+                    wnames: names,
+                }),
+            )
+            .await;
+            let Message::Rwalkgetattr(reply) = response.body else {
+                panic!("expected walk attributes, got {:?}", response.body);
+            };
+            assert_eq!(reply.nwqid, count);
+            assert_eq!(reply.stat.mode & 0o7777, acknowledged.mode);
+            assert_eq!(reply.stat.size, acknowledged.size);
+            assert_eq!(reply.stat.mtime_sec, acknowledged.mtime.seconds);
+            assert_eq!(
+                reply.stat.mtime_nsec,
+                u64::from(acknowledged.mtime.nanoseconds)
+            );
+            assert_eq!(reply.stat.ctime_sec, acknowledged.ctime.seconds);
+            assert_eq!(
+                reply.stat.ctime_nsec,
+                u64::from(acknowledged.ctime.nanoseconds)
+            );
+            assert_eq!(reply.stat.qid.version, acknowledged.mtime.seconds as u32);
+            if let Some(final_qid) = reply.wqids.last() {
+                assert_eq!(*final_qid, reply.stat.qid);
+            }
+            assert_eq!(handler.get_fid(newfid).unwrap().qid, reply.stat.qid);
+        }
+
+        release_apply.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), fs.quiesce_overlay_inode(file))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_walk_preserves_folded_walks_and_execute_only_directories() {
+        use crate::fs::name_mode::NameMode;
+        use crate::fs::types::SetMode;
+        let fs = Arc::new(
+            ZeroFS::new_in_memory_with_name_mode(NameMode::Insensitive)
+                .await
+                .unwrap(),
+        );
+        let creds = test_creds();
+        let (directory, _) = fs
+            .mkdir(&creds, 0, b"Dir", &SetAttributes::default())
+            .await
+            .unwrap();
+        let (inode, _) = fs
+            .create(&creds, directory, b"Foo", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.link(&AuthContext::from(&creds), inode, directory, b"Other")
+            .await
+            .unwrap();
+        fs.setattr(
+            &creds,
+            directory,
+            &SetAttributes {
+                mode: SetMode::Set(0o111),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let handler = NinePHandler::new(fs.clone(), Arc::new(FileLockManager::new()));
+        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+        for (name, exact, found) in [
+            (b"Foo".as_slice(), true, true),
+            (b"foo", true, false),
+            (b"foo", false, true),
+            (b"Other", true, true),
+            (b"other", true, false),
+        ] {
+            let walk = Twalkgetattr {
+                fid: 1,
+                newfid: 2,
+                nwname: 2,
+                wnames: vec![P9String::new(b"Dir".to_vec()), P9String::new(name.to_vec())],
+            };
+            let body = if exact {
+                Message::Twalkgetattrexact(walk)
+            } else {
+                Message::Twalkgetattr(walk)
+            };
+            let response = request(&handler, 2, body).await;
+            if found {
+                assert!(
+                    matches!(response.body, Message::Rwalkgetattr(ref reply) if reply.stat.qid.path == inode),
+                    "{name:?}: {:?}",
+                    response.body
+                );
+                request(&handler, 3, Message::Tclunk(Tclunk { fid: 2 })).await;
+            } else {
+                assert!(
+                    matches!(response.body, Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::ENOENT)
+                );
+                assert!(handler.get_fid(2).is_err());
+            }
+        }
+    }
+
+    /// The two ways a session asks for an exact-spelling walk.
+    #[derive(Clone, Copy, Debug)]
+    enum ExactWalkSession {
+        /// The private dialect's per-request `Twalkgetattrexact`.
+        Private,
+        /// A plain `9P2000.L` `Twalk` on a listener set to exact lookup.
+        Standard,
+    }
+
+    impl ExactWalkSession {
+        const ALL: [Self; 2] = [Self::Private, Self::Standard];
+
+        async fn start(self, fs: &Arc<ZeroFS>, version: &[u8]) -> NinePHandler {
+            let handler = NinePHandler::new(fs.clone(), Arc::new(FileLockManager::new()));
+            let (handler, version) = match self {
+                Self::Private => (handler, version),
+                Self::Standard => (
+                    handler.with_standard_lookup(NameMatch::Exact),
+                    VERSION_9P2000L,
+                ),
+            };
+            start_session(&handler, DEFAULT_MSIZE, version, b"").await;
+            handler
+        }
+
+        fn walk(self, names: &[&[u8]]) -> Message {
+            let wnames: Vec<_> = names
+                .iter()
+                .map(|name| P9String::new(name.to_vec()))
+                .collect();
+            let nwname = wnames.len() as u16;
+            match self {
+                Self::Private => Message::Twalkgetattrexact(Twalkgetattr {
+                    fid: 1,
+                    newfid: 2,
+                    nwname,
+                    wnames,
+                }),
+                Self::Standard => Message::Twalk(Twalk {
+                    fid: 1,
+                    newfid: 2,
+                    nwname,
+                    wnames,
+                }),
+            }
+        }
+
+        /// The inode the walk reached, or `None` for an error reply.
+        fn reached(response: &Message) -> Option<u64> {
+            match response {
+                Message::Rwalkgetattr(reply) => Some(reply.stat.qid.path),
+                Message::Rwalk(reply) => reply.wqids.last().map(|qid| qid.path),
+                _ => None,
+            }
+        }
+    }
+
+    async fn exact_walk_replacement_at_pause(
+        session: ExactWalkSession,
+        before_pin: bool,
+        directory: bool,
+        volatile: bool,
+        trailing_dot: bool,
+    ) {
+        use crate::fs::mutation::config::{
+            ClientDurabilityTarget, FilesystemWriteAckMode, FilesystemWriteAckSettings,
+            FilesystemWriteAckSource,
+        };
+        use crate::fs::name_mode::NameMode;
+
+        let mut fs = ZeroFS::new_in_memory_with_name_mode(NameMode::Insensitive)
+            .await
+            .unwrap();
+        if volatile {
+            fs.write_ack = FilesystemWriteAckSettings {
+                mode: FilesystemWriteAckMode::VolatileMemory,
+                volatile_memory_bytes: 8 * 1024 * 1024,
+                volatile_max_operations: 1024,
+                source: FilesystemWriteAckSource::Filesystem,
+                client_durability_target: ClientDurabilityTarget::LocalSsd,
+            };
+        }
+        let fs = Arc::new(fs);
+        let creds = test_creds();
+        let (original, _) = if directory {
+            fs.mkdir(&creds, 0, b"Foo", &SetAttributes::default()).await
+        } else {
+            fs.create(&creds, 0, b"Foo", &SetAttributes::default())
+                .await
+        }
+        .unwrap();
+        let (replacement, _) = if directory {
+            fs.mkdir(&creds, 0, b"replacement", &SetAttributes::default())
+                .await
+        } else {
+            fs.create(&creds, 0, b"replacement", &SetAttributes::default())
+                .await
+        }
+        .unwrap();
+        let handler = session.start(&fs, VERSION_9P2000L_ZEROFS_CI).await;
+        let (reached, reached_rx) = tokio::sync::oneshot::channel();
+        let (resume, resume_rx) = tokio::sync::oneshot::channel();
+        let pause = if before_pin {
+            &handler.exact_pin_pause
+        } else {
+            &handler.exact_lookup_pause
+        };
+        *pause.lock().unwrap() = Some(SuccessTerminalPause {
+            reached,
+            resume: resume_rx,
+        });
+        let lookup_handler = handler.clone();
+        let lookup = tokio::spawn(async move {
+            let names: &[&[u8]] = if trailing_dot {
+                &[b"Foo", b"."]
+            } else {
+                &[b"Foo"]
+            };
+            request(&lookup_handler, 2, session.walk(names)).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), reached_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        if before_pin && directory {
+            assert_eq!(
+                fs.open_handle_count(original),
+                1,
+                "the resolved directory must stay pinned across trailing self steps"
+            );
+        }
+        // Without the directory lock, complete the replacement between the
+        // lookup and spelling read. With it, rename must wait for this walk.
+        let directory_locked = fs.lock_manager.is_locked_for_test(0);
+        let auth = AuthContext::from(&creds);
+        let rename = fs.rename(&auth, 0, b"replacement", 0, b"Foo");
+        tokio::pin!(rename);
+        if directory_locked {
+            assert!(futures::poll!(&mut rename).is_pending());
+        } else {
+            tokio::time::timeout(std::time::Duration::from_secs(10), &mut rename)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        resume.send(()).unwrap();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), lookup)
+            .await
+            .unwrap()
+            .unwrap();
+        if directory_locked {
+            tokio::time::timeout(std::time::Duration::from_secs(10), rename)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let expected = if before_pin || directory_locked {
+            original
+        } else {
+            replacement
+        };
+        assert_eq!(
+            ExactWalkSession::reached(&response.body),
+            Some(expected),
+            "{session:?}: an atomic replacement must remain visible: {:?}",
+            response.body
+        );
+        if directory && (before_pin || directory_locked) {
+            assert!(fs.inode_store.get(original).await.unwrap().is_directory());
+            assert_eq!(handler.get_fid(2).unwrap().inode_id, original);
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_walk_survives_atomic_replacement() {
+        for session in ExactWalkSession::ALL {
+            for directory in [false, true] {
+                exact_walk_replacement_at_pause(session, false, directory, false, false).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_file_walk_survives_replacement_before_pin() {
+        for session in ExactWalkSession::ALL {
+            for volatile in [false, true] {
+                exact_walk_replacement_at_pause(session, true, false, volatile, false).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_directory_walk_survives_replacement_before_pin() {
+        for session in ExactWalkSession::ALL {
+            exact_walk_replacement_at_pause(session, true, true, false, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_directory_dot_walk_survives_replacement_before_pin() {
+        for session in ExactWalkSession::ALL {
+            exact_walk_replacement_at_pause(session, true, true, false, true).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_walk_waits_for_atomic_replacement_to_apply() {
+        for session in ExactWalkSession::ALL {
+            exact_walk_waits_for_replacement(session).await;
+        }
+    }
+
+    async fn exact_walk_waits_for_replacement(session: ExactWalkSession) {
+        use crate::fs::name_mode::NameMode;
+        let fs = Arc::new(
+            ZeroFS::new_in_memory_with_name_mode(NameMode::Insensitive)
+                .await
+                .unwrap(),
+        );
+        let creds = test_creds();
+        fs.create(&creds, 0, b"Foo", &SetAttributes::default())
+            .await
+            .unwrap();
+        let replacement = fs
+            .create(&creds, 0, b"replacement", &SetAttributes::default())
+            .await
+            .unwrap()
+            .0;
+        let handler = session.start(&fs, VERSION_9P2000L_ZEROFS).await;
+
+        // Hold the rename after it has queued the old inode's deletion but
+        // before the namespace transaction applies. Foo exists throughout.
+        let block_apply = fs.db.flush_barrier().write_owned().await;
+        let apply_reached = fs.write_coordinator.probe_next_apply();
+        let renaming_fs = fs.clone();
+        let renaming = tokio::spawn(async move {
+            renaming_fs
+                .rename(&AuthContext::from(&creds), 0, b"replacement", 0, b"Foo")
+                .await
+        });
+        apply_reached.await.unwrap();
+        let mut walking = Box::pin(request(&handler, 2, session.walk(&[b"Foo"])));
+        assert!(
+            futures::poll!(walking.as_mut()).is_pending(),
+            "{session:?}: exact lookup observed an unapplied replacement"
+        );
+        drop(block_apply);
+        renaming.await.unwrap().unwrap();
+        let response = walking.await;
+        assert_eq!(
+            ExactWalkSession::reached(&response.body),
+            Some(replacement),
+            "{session:?}: {:?}",
+            response.body
+        );
+    }
+
+    /// The errno of an error reply, or `None` for any other reply.
+    fn errno(response: &P9Message) -> Option<u32> {
+        match response.body {
+            Message::Rlerror(Rlerror { ecode }) => Some(ecode),
+            _ => None,
+        }
+    }
+
+    /// An insensitive filesystem behind a plain `9P2000.L` session whose
+    /// listener uses `rule`. Fid 1 is the attach root.
+    async fn standard_session(
+        mode: crate::fs::name_mode::NameMode,
+        rule: Option<NameMatch>,
+    ) -> (Arc<ZeroFS>, NinePHandler) {
+        let fs = Arc::new(ZeroFS::new_in_memory_with_name_mode(mode).await.unwrap());
+        let mut handler = NinePHandler::new(fs.clone(), Arc::new(FileLockManager::new()));
+        if let Some(rule) = rule {
+            handler = handler.with_standard_lookup(rule);
+        }
+        start_plain_session(&handler).await;
+        assert!(!handler.zerofs_protocol_enabled());
+        (fs, handler)
+    }
+
+    async fn make_entry(fs: &ZeroFS, parent: InodeId, name: &[u8], directory: bool) -> InodeId {
+        let creds = test_creds();
+        if directory {
+            fs.mkdir(&creds, parent, name, &SetAttributes::default())
+                .await
+        } else {
+            fs.create(&creds, parent, name, &SetAttributes::default())
+                .await
+        }
+        .unwrap()
+        .0
+    }
+
+    /// Walk from fid 1 to fid 2 and return the reached inode, then clunk
+    /// fid 2. An error reply returns its errno and must leave fid 2 unused.
+    async fn walk_to(handler: &NinePHandler, names: &[&[u8]]) -> Result<u64, u32> {
+        let response = walk_fid(handler, 10, 1, 2, names).await;
+        if let Some(ecode) = errno(&response) {
+            assert!(handler.get_fid(2).is_err(), "{names:?}");
+            return Err(ecode);
+        }
+        let Message::Rwalk(reply) = response.body else {
+            panic!("{names:?}: expected a walk reply");
+        };
+        assert_eq!(reply.wqids.len(), names.len(), "{names:?}");
+        request(handler, 11, Message::Tclunk(Tclunk { fid: 2 })).await;
+        Ok(reply.wqids.last().unwrap().path)
+    }
+
+    async fn unlink_at(handler: &NinePHandler, name: &[u8], directory: bool) -> P9Message {
+        request(
+            handler,
+            12,
+            Message::Tunlinkat(Tunlinkat {
+                dirfid: 1,
+                name: P9String::new(name.to_vec()),
+                flags: if directory { AT_REMOVEDIR } else { 0 },
+            }),
+        )
+        .await
+    }
+
+    async fn rename_at(handler: &NinePHandler, from: &[u8], to: &[u8]) -> P9Message {
+        request(
+            handler,
+            13,
+            Message::Trenameat(Trenameat {
+                olddirfid: 1,
+                oldname: P9String::new(from.to_vec()),
+                newdirfid: 1,
+                newname: P9String::new(to.to_vec()),
+            }),
+        )
+        .await
+    }
+
+    /// Stored spellings in the attach root, through an opened clone of fid 1.
+    async fn root_listing(handler: &NinePHandler) -> Vec<(Vec<u8>, u64)> {
+        expect_walk(handler, 14, 1, 20, &[]).await;
+        open_fid(handler, 15, 20, O_RDONLY as u32).await;
+        let response = request(
+            handler,
+            16,
+            Message::Treaddir(Treaddir {
+                fid: 20,
+                offset: 0,
+                count: 8192,
+            }),
+        )
+        .await;
+        let Message::Rreaddir(reply) = response.body else {
+            panic!("expected a readdir reply: {:?}", response.body);
+        };
+        request(handler, 17, Message::Tclunk(Tclunk { fid: 20 })).await;
+        reply
+            .to_entries()
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.name.data, entry.qid.path))
+            .filter(|(name, _)| name != b"." && name != b"..")
+            .collect()
+    }
+
+    /// Every create-type request for `name` in the attach root, each paired
+    /// with its reply. `link_source` is a walkable regular file.
+    async fn create_each_kind(
+        handler: &NinePHandler,
+        name: &[u8],
+        link_source: &[u8],
+    ) -> Vec<(&'static str, P9Message)> {
+        let name = || P9String::new(name.to_vec());
+        expect_walk(handler, 30, 1, 21, &[]).await;
+        expect_walk(handler, 31, 1, 22, &[link_source]).await;
+        let replies = vec![
+            (
+                "Tlcreate",
+                request(
+                    handler,
+                    32,
+                    Message::Tlcreate(Tlcreate {
+                        fid: 21,
+                        name: name(),
+                        flags: O_RDWR as u32,
+                        mode: 0o644,
+                        gid: 1000,
+                    }),
+                )
+                .await,
+            ),
+            (
+                "Tmkdir",
+                request(
+                    handler,
+                    33,
+                    Message::Tmkdir(Tmkdir {
+                        dfid: 1,
+                        name: name(),
+                        mode: 0o755,
+                        gid: 1000,
+                    }),
+                )
+                .await,
+            ),
+            (
+                "Tmknod",
+                request(
+                    handler,
+                    34,
+                    Message::Tmknod(Tmknod {
+                        dfid: 1,
+                        name: name(),
+                        mode: S_IFIFO | 0o644,
+                        major: 0,
+                        minor: 0,
+                        gid: 1000,
+                    }),
+                )
+                .await,
+            ),
+            (
+                "Tsymlink",
+                request(
+                    handler,
+                    35,
+                    Message::Tsymlink(Tsymlink {
+                        dfid: 1,
+                        name: name(),
+                        symtgt: P9String::new(b"target".to_vec()),
+                        gid: 1000,
+                    }),
+                )
+                .await,
+            ),
+            (
+                "Tlink",
+                request(
+                    handler,
+                    36,
+                    Message::Tlink(Tlink {
+                        dfid: 1,
+                        fid: 22,
+                        name: name(),
+                    }),
+                )
+                .await,
+            ),
+        ];
+        request(handler, 37, Message::Tclunk(Tclunk { fid: 21 })).await;
+        request(handler, 38, Message::Tclunk(Tclunk { fid: 22 })).await;
+        replies
+    }
+
+    #[tokio::test]
+    async fn standard_exact_lookup_matches_the_stored_spelling() {
+        use crate::fs::name_mode::NameMode;
+        use crate::linux_errno::{EEXIST, ENOENT};
+        for directory in [false, true] {
+            let kind = if directory { "directory" } else { "file" };
+            let (fs, handler) =
+                standard_session(NameMode::Insensitive, Some(NameMatch::Exact)).await;
+            let id = make_entry(&fs, 0, b"Foo", directory).await;
+            make_entry(&fs, 0, b"Other", false).await;
+
+            assert_eq!(walk_to(&handler, &[b"foo"]).await, Err(ENOENT), "{kind}");
+            assert_eq!(walk_to(&handler, &[b"Foo"]).await, Ok(id), "{kind}");
+
+            // A name that matches only by case does not name the entry.
+            let response = unlink_at(&handler, b"foo", directory).await;
+            assert_eq!(errno(&response), Some(ENOENT), "{kind}");
+            let response = rename_at(&handler, b"foo", b"Moved").await;
+            assert_eq!(errno(&response), Some(ENOENT), "{kind}");
+            assert_eq!(walk_to(&handler, &[b"Foo"]).await, Ok(id), "{kind}");
+            assert_eq!(walk_to(&handler, &[b"Moved"]).await, Err(ENOENT));
+
+            // The filesystem's uniqueness rule still rejects a fold-equal name.
+            for (request, response) in create_each_kind(&handler, b"foo", b"Other").await {
+                assert_eq!(errno(&response), Some(EEXIST), "{kind}: {request}");
+            }
+
+            // A case-only rename reaches the filesystem and takes effect.
+            let response = rename_at(&handler, b"Foo", b"foo").await;
+            assert!(
+                matches!(response.body, Message::Rrenameat(_)),
+                "{kind}: {:?}",
+                response.body
+            );
+            let listing = root_listing(&handler).await;
+            assert!(listing.contains(&(b"foo".to_vec(), id)), "{kind}");
+            assert!(!listing.iter().any(|(name, _)| name == b"Foo"), "{kind}");
+            assert_eq!(walk_to(&handler, &[b"foo"]).await, Ok(id), "{kind}");
+            assert_eq!(walk_to(&handler, &[b"Foo"]).await, Err(ENOENT), "{kind}");
+
+            // Unlink by the stored spelling works.
+            let response = unlink_at(&handler, b"foo", directory).await;
+            assert!(
+                matches!(response.body, Message::Runlinkat(_)),
+                "{kind}: {:?}",
+                response.body
+            );
+            assert!(matches!(
+                fs.lookup(&test_creds(), 0, b"FOO").await,
+                Err(FsError::NotFound)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn standard_exact_rename_onto_another_entrys_spelling_replaces_it() {
+        use crate::fs::name_mode::NameMode;
+        use crate::linux_errno::ENOENT;
+        for directory in [false, true] {
+            let kind = if directory { "directory" } else { "file" };
+            let (fs, handler) =
+                standard_session(NameMode::Insensitive, Some(NameMatch::Exact)).await;
+            let source = make_entry(&fs, 0, b"Source", directory).await;
+            let victim = make_entry(&fs, 0, b"Victim", directory).await;
+
+            let response = rename_at(&handler, b"Source", b"victim").await;
+            assert!(
+                matches!(response.body, Message::Rrenameat(_)),
+                "{kind}: {:?}",
+                response.body
+            );
+            let listing = root_listing(&handler).await;
+            assert_eq!(listing, vec![(b"victim".to_vec(), source)], "{kind}");
+            assert_eq!(walk_to(&handler, &[b"victim"]).await, Ok(source));
+            assert_eq!(walk_to(&handler, &[b"Victim"]).await, Err(ENOENT));
+            assert!(fs.inode_store.get(victim).await.is_err(), "{kind}");
+        }
+    }
+
+    #[tokio::test]
+    async fn standard_exact_walk_checks_every_component() {
+        use crate::fs::name_mode::NameMode;
+        use crate::linux_errno::ENOENT;
+        let (fs, handler) = standard_session(NameMode::Insensitive, Some(NameMatch::Exact)).await;
+        let parent = make_entry(&fs, 0, b"Parent", true).await;
+        let child = make_entry(&fs, parent, b"Child", false).await;
+
+        assert_eq!(walk_to(&handler, &[b"Parent", b"Child"]).await, Ok(child));
+        assert_eq!(walk_to(&handler, &[b"parent", b"Child"]).await, Err(ENOENT));
+        // A later miss returns the walked prefix and publishes no fid.
+        let response = walk_fid(&handler, 40, 1, 2, &[b"Parent", b"child"]).await;
+        let Message::Rwalk(reply) = response.body else {
+            panic!("expected a partial walk: {:?}", response.body);
+        };
+        assert_eq!(
+            reply.wqids.iter().map(|qid| qid.path).collect::<Vec<_>>(),
+            vec![parent]
+        );
+        assert!(handler.get_fid(2).is_err());
+    }
+
+    #[tokio::test]
+    async fn standard_lookup_defaults_to_folded_names() {
+        use crate::fs::name_mode::NameMode;
+        for rule in [None, Some(NameMatch::Folded)] {
+            for directory in [false, true] {
+                let (fs, handler) = standard_session(NameMode::Insensitive, rule).await;
+                let id = make_entry(&fs, 0, b"Foo", directory).await;
+                assert_eq!(walk_to(&handler, &[b"foo"]).await, Ok(id));
+                assert_eq!(walk_to(&handler, &[b"FOO"]).await, Ok(id));
+                let response = rename_at(&handler, b"foo", b"Bar").await;
+                assert!(matches!(response.body, Message::Rrenameat(_)));
+                assert_eq!(root_listing(&handler).await, vec![(b"Bar".to_vec(), id)]);
+                let response = unlink_at(&handler, b"bar", directory).await;
+                assert!(matches!(response.body, Message::Runlinkat(_)));
+                assert!(root_listing(&handler).await.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn private_dialect_ignores_the_standard_lookup_setting() {
+        use crate::fs::name_mode::NameMode;
+        use crate::linux_errno::ENOENT;
+        let fs = Arc::new(
+            ZeroFS::new_in_memory_with_name_mode(NameMode::Insensitive)
+                .await
+                .unwrap(),
+        );
+        let handler = NinePHandler::new(fs.clone(), Arc::new(FileLockManager::new()))
+            .with_standard_lookup(NameMatch::Exact);
+        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+        assert!(handler.zerofs_protocol_enabled());
+        let id = make_entry(&fs, 0, b"Foo", false).await;
+
+        assert_eq!(walk_to(&handler, &[b"foo"]).await, Ok(id));
+        for (body, found) in [
+            (ExactWalkSession::Private.walk(&[b"foo"]), false),
+            (
+                Message::Twalkgetattr(Twalkgetattr {
+                    fid: 1,
+                    newfid: 2,
+                    nwname: 1,
+                    wnames: vec![P9String::new(b"foo".to_vec())],
+                }),
+                true,
+            ),
+        ] {
+            let response = request(&handler, 41, body).await;
+            if found {
+                assert_eq!(ExactWalkSession::reached(&response.body), Some(id));
+                request(&handler, 42, Message::Tclunk(Tclunk { fid: 2 })).await;
+            } else {
+                assert_eq!(errno(&response), Some(ENOENT));
+            }
+        }
+        let response = rename_at(&handler, b"foo", b"Bar").await;
+        assert!(matches!(response.body, Message::Rrenameat(_)));
+        let response = unlink_at(&handler, b"bar", false).await;
+        assert!(matches!(response.body, Message::Runlinkat(_)));
+
+        // Renegotiating the standard dialect on the same connection applies it.
+        let id = make_entry(&fs, 0, b"Foo", false).await;
+        start_plain_session(&handler).await;
+        assert_eq!(walk_to(&handler, &[b"foo"]).await, Err(ENOENT));
+        assert_eq!(walk_to(&handler, &[b"Foo"]).await, Ok(id));
+    }
+
+    #[tokio::test]
+    async fn exact_standard_lookup_is_inert_on_a_sensitive_filesystem() {
+        use crate::fs::name_mode::NameMode;
+        use crate::linux_errno::ENOENT;
+        let (fs, handler) = standard_session(NameMode::Sensitive, Some(NameMatch::Exact)).await;
+        let upper = make_entry(&fs, 0, b"Foo", false).await;
+        assert_eq!(walk_to(&handler, &[b"Foo"]).await, Ok(upper));
+        assert_eq!(walk_to(&handler, &[b"foo"]).await, Err(ENOENT));
+        // Byte-distinct names stay distinct entries, as without the setting.
+        expect_walk(&handler, 43, 1, 23, &[]).await;
+        create_file(&handler, 44, 23, b"foo").await;
+        let lower = handler.get_fid(23).unwrap().inode_id;
+        assert_ne!(lower, upper);
+        assert_eq!(walk_to(&handler, &[b"foo"]).await, Ok(lower));
+        let response = rename_at(&handler, b"Foo", b"Bar").await;
+        assert!(matches!(response.body, Message::Rrenameat(_)));
+        let response = unlink_at(&handler, b"foo", false).await;
+        assert!(matches!(response.body, Message::Runlinkat(_)));
+        assert_eq!(root_listing(&handler).await, vec![(b"Bar".to_vec(), upper)]);
+    }
+
+    #[tokio::test]
     async fn failed_empty_walk_getattr_does_not_publish_newfid() {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
         let handler = NinePHandler::new(fs, Arc::new(FileLockManager::new()));
@@ -3820,12 +5633,15 @@ mod tests {
             .insert(2, FidSlot::unopened(stale));
         assert!(
             handler
-                .walk_getattr(Twalkgetattr {
-                    fid: 2,
-                    newfid: 3,
-                    nwname: 0,
-                    wnames: Vec::new(),
-                })
+                .walk_getattr(
+                    Twalkgetattr {
+                        fid: 2,
+                        newfid: 3,
+                        nwname: 0,
+                        wnames: Vec::new(),
+                    },
+                    NameMatch::Folded,
+                )
                 .await
                 .is_err()
         );
@@ -4369,6 +6185,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trename_does_not_move_a_replacement_at_the_fids_cached_path() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let creds = test_creds();
+        let auth = AuthContext::from(&creds);
+        let original = fs
+            .create(&creds, 0, b"source", &SetAttributes::default())
+            .await
+            .unwrap()
+            .0;
+        let destination = fs
+            .create(&creds, 0, b"destination", &SetAttributes::default())
+            .await
+            .unwrap()
+            .0;
+        let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+        expect_walk(&handler, 2, 1, 2, &[b"source"]).await;
+
+        // Another client moves the inode this fid identifies, then places a
+        // different inode at the cached path. Neither that replacement nor
+        // the destination may be changed by a rename of the original fid.
+        fs.rename(&auth, 0, b"source", 0, b"moved").await.unwrap();
+        let replacement = fs
+            .create(&creds, 0, b"source", &SetAttributes::default())
+            .await
+            .unwrap()
+            .0;
+        let response = request(
+            &handler,
+            3,
+            Message::Trename(Trename {
+                fid: 2,
+                dfid: 1,
+                name: P9String::new(b"destination".to_vec()),
+            }),
+        )
+        .await;
+        assert!(matches!(
+            response.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::ESTALE
+        ));
+        assert_eq!(fs.lookup(&creds, 0, b"source").await, Ok(replacement));
+        assert_eq!(fs.lookup(&creds, 0, b"moved").await, Ok(original));
+        assert_eq!(fs.lookup(&creds, 0, b"destination").await, Ok(destination));
+    }
+
+    #[tokio::test]
     async fn trename_retry_replays_after_source_parent_is_removed() {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
         let creds = test_creds();
@@ -4701,6 +6564,15 @@ mod tests {
             }
             _ => panic!("Expected Rlerror, got {:?}", invalid_resp.body),
         }
+
+        fs.global_stats.load_shard_record(3, b"bad");
+        let unknown_usage = handler
+            .handle_message(4, Message::Tstatfs(Tstatfs { fid: 1 }))
+            .await;
+        match unknown_usage.body {
+            Message::Rlerror(rerror) => assert_eq!(rerror.ecode, crate::linux_errno::EIO),
+            other => panic!("Expected EIO for unknown usage, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -4760,6 +6632,7 @@ mod tests {
             groups: [1000; 16],
             groups_count: 1,
             groups_complete: true,
+            groups_truncated: false,
         };
         for i in 0..10 {
             fs.create(
@@ -4829,6 +6702,7 @@ mod tests {
             groups: [1000; 16],
             groups_count: 1,
             groups_complete: true,
+            groups_truncated: false,
         };
         for i in 0..5 {
             fs.create(
@@ -4886,6 +6760,7 @@ mod tests {
             groups: [1000; 16],
             groups_count: 1,
             groups_complete: true,
+            groups_truncated: false,
         };
 
         for i in 0..1002 {
@@ -5025,6 +6900,7 @@ mod tests {
             groups: [1000; 16],
             groups_count: 1,
             groups_complete: true,
+            groups_truncated: false,
         };
         let (_empty_dir_id, _) = fs
             .mkdir(&creds, 0, b"emptydir", &SetAttributes::default())
@@ -5487,6 +7363,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disconnect_prevents_inflight_attach_from_repinning_directory() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let (directory_id, _) = fs
+            .mkdir(&test_creds(), 0, b"late-attach", &SetAttributes::default())
+            .await
+            .unwrap();
+        let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+        negotiate(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS).await;
+
+        // An attach can already be received when disconnect sweeps the
+        // session. Waiting for its subtree pin must not let it repopulate
+        // the retired session while other accepted work retains the handler.
+        let inode_guard = fs.lock_manager.acquire(directory_id).await;
+        let mut attaching = Box::pin(attach(&handler, 1, 1, b"test", b"late-attach", 1000));
+        assert!(futures::poll!(attaching.as_mut()).is_pending());
+        handler.close_for_disconnect();
+        drop(inode_guard);
+
+        let response = attaching.await;
+        assert!(matches!(
+            response.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == crate::linux_errno::ESTALE
+        ));
+        assert!(handler.get_fid(1).is_err());
+        assert_eq!(fs.open_handle_count(directory_id), 0);
+        handler.close_for_disconnect();
+        assert_eq!(fs.open_handle_count(directory_id), 0);
+    }
+
+    #[tokio::test]
     async fn disconnect_prevents_inflight_walk_from_repinning_directory() {
         for compound in [false, true] {
             let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
@@ -5564,6 +7470,8 @@ mod tests {
                 directory_pin: None,
                 replay_reopen: false,
                 lock_guard: None,
+                xattr: None,
+                create_op: None,
             },
         );
         assert_eq!(fs.open_handle_count(file_id), 1);
@@ -6166,6 +8074,7 @@ mod tests {
             groups: [root.gid(); P9_MAX_GROUPS],
             groups_count: 1,
             groups_complete: true,
+            groups_truncated: false,
         };
         fs.setattr(
             &root_owner,
@@ -7227,6 +9136,108 @@ mod tests {
         assert!(matches!(reply.body, Message::Rfsync(_)));
     }
 
+    /// Creates one entry of each kind through 9P with request gid 1000 under
+    /// a parent owned by group 2000, and returns each new entry's group.
+    async fn protocol_create_groups(parent_mode: u32) -> Vec<(&'static str, u32, u32)> {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let (parent, _) = fs
+            .mkdir(
+                &Credentials {
+                    uid: 0,
+                    ..test_creds()
+                },
+                0,
+                b"shared",
+                &SetAttributes {
+                    mode: SetMode::Set(parent_mode),
+                    uid: SetUid::Set(test_creds().uid),
+                    gid: SetGid::Set(2000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+        start_plain_session(&handler).await;
+        expect_walk(&handler, 2, 1, 2, &[b"shared"]).await;
+        expect_walk(&handler, 3, 2, 3, &[]).await;
+        let name = |name: &[u8]| P9String::new(name.to_vec());
+        let requests = [
+            Message::Tlcreate(Tlcreate {
+                fid: 3,
+                name: name(b"file"),
+                flags: 0x8002,
+                mode: 0o644,
+                gid: 1000,
+            }),
+            Message::Tmkdir(Tmkdir {
+                dfid: 2,
+                name: name(b"dir"),
+                mode: 0o755,
+                gid: 1000,
+            }),
+            Message::Tmknod(Tmknod {
+                dfid: 2,
+                name: name(b"fifo"),
+                mode: S_IFIFO | 0o644,
+                major: 0,
+                minor: 0,
+                gid: 1000,
+            }),
+            Message::Tsymlink(Tsymlink {
+                dfid: 2,
+                name: name(b"link"),
+                symtgt: name(b"file"),
+                gid: 1000,
+            }),
+        ];
+        for (tag, body) in (4..).zip(requests) {
+            let reply = request(&handler, tag, body).await;
+            assert!(
+                !matches!(reply.body, Message::Rlerror(_)),
+                "{:?}",
+                reply.body
+            );
+        }
+        let mut groups = Vec::new();
+        for entry in ["file", "dir", "fifo", "link"] {
+            let id = fs
+                .lookup(&test_creds(), parent, entry.as_bytes())
+                .await
+                .unwrap();
+            let inode = fs.inode_store.get(id).await.unwrap();
+            groups.push((entry, inode.gid(), inode.mode() & 0o2000));
+        }
+        groups
+    }
+
+    #[tokio::test]
+    async fn protocol_creates_under_a_setgid_parent_take_the_parent_group() {
+        assert_eq!(
+            protocol_create_groups(0o2777).await,
+            [
+                ("file", 2000, 0),
+                ("dir", 2000, 0o2000),
+                ("fifo", 2000, 0),
+                ("link", 2000, 0),
+            ],
+            "a setgid parent's group must win over the group in the request"
+        );
+    }
+
+    #[tokio::test]
+    async fn protocol_creates_under_a_plain_parent_keep_the_request_group() {
+        assert_eq!(
+            protocol_create_groups(0o777).await,
+            [
+                ("file", 1000, 0),
+                ("dir", 1000, 0),
+                ("fifo", 1000, 0),
+                ("link", 1000, 0),
+            ]
+        );
+    }
+
     fn test_creds() -> Credentials {
         Credentials {
             uid: 1000,
@@ -7235,6 +9246,7 @@ mod tests {
             groups: [1000; 16],
             groups_count: 1,
             groups_complete: true,
+            groups_truncated: false,
         }
     }
 }

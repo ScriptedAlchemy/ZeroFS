@@ -8,7 +8,7 @@ use crate::types::{
     SetTime, StatFs,
 };
 use bytes::{Bytes, BytesMut};
-use ninep_client::{NOFID, NinePClient, Target};
+use ninep_client::{NOFID, NinePClient, ReconnectTimeout, Target};
 use ninep_proto::Stat;
 use std::collections::VecDeque;
 use std::future::Future;
@@ -94,7 +94,15 @@ impl Client {
         target: &str,
         opts: &ConnectOptions,
     ) -> Result<Arc<Client>, ZeroFsError> {
-        let client = NinePClient::connect_multi(targets, opts.msize)
+        let reconnect_timeout =
+            ReconnectTimeout::new(Duration::from_millis(u64::from(opts.reconnect_timeout_ms)))
+                .ok_or_else(|| ZeroFsError::InvalidArgument {
+                    message: format!(
+                        "reconnect_timeout_ms must be in 1..={}",
+                        ReconnectTimeout::MAX.as_millis()
+                    ),
+                })?;
+        let client = NinePClient::connect_multi_with(targets, opts.msize, reconnect_timeout)
             .await
             .map_err(|error| connect_failed(format!("9P target set: {error}")))?;
         #[cfg(not(target_arch = "wasm32"))]

@@ -10,6 +10,7 @@ use crate::fs::inode::{Inode, InodeId};
 use crate::fs::lock_manager::MultiLockGuard;
 use crate::fs::types::{AuthContext, FileAttributes};
 use bytes::Bytes;
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 /// One member of a logical write request, before validation.
@@ -44,6 +45,8 @@ pub(crate) struct PreparedWriteMember {
     pub(crate) parent_name_for_update: Option<(InodeId, Vec<u8>)>,
     pub(crate) span: Option<(u64, u64)>,
     pub(crate) quota: Option<crate::fs::quota::ProvisionalQuotaReservation>,
+    /// Pool room for this member's frames, held from WRITE until apply.
+    pub(crate) capacity: Option<crate::pool_object_store::Claim>,
 }
 
 /// Outcome of [`prepare_write`](crate::fs::ops::write::prepare_write).
@@ -56,10 +59,23 @@ pub(crate) struct PreparedWriteBatch {
     pub(crate) start_time: Instant,
     pub(crate) members: Vec<PreparedWriteMember>,
     pub(crate) replayed: Option<PreparedBatchResult>,
-    pub(crate) guards: Option<MultiLockGuard<InodeId>>,
+    pub(crate) guards: Option<Arc<MultiLockGuard<InodeId>>>,
     /// Protocol replay ownership. Before submission it remains caller-owned;
     /// submission transfers the one typed owner into the canonical worker.
     pub(crate) commit_ownership: crate::fs::write_coordinator::CommitOwnership,
+    /// Materialized writes retain admission through their queued commit.
+    pub(crate) survival: Option<crate::metadata_survival::admission::OwnedAdmissionToken>,
+}
+
+/// The last published single-inode write projection, including its byte-range
+/// end (which may precede EOF). Only an outstanding prepared batch can keep the
+/// canonical inode lock alive. The hint alone never retains a lock.
+pub(crate) struct PendingAppend {
+    pub(crate) inode: Inode,
+    pub(crate) id: InodeId,
+    pub(crate) end: u64,
+    pub(crate) writes: usize,
+    pub(crate) guards: Weak<MultiLockGuard<InodeId>>,
 }
 
 /// One result boundary for the whole batch.
@@ -78,6 +94,7 @@ impl PreparedWriteBatch {
             replayed: Some(result),
             guards: None,
             commit_ownership: crate::fs::write_coordinator::CommitOwnership::None,
+            survival: None,
         }
     }
 

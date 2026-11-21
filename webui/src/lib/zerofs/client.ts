@@ -5,6 +5,7 @@ import initWasm, {
 } from "../../generated/zerofs-client/zerofs_client";
 import { pooled } from "../async";
 import { joinPath as join } from "../format";
+import { directoryListing, RawFilenameError, textPathEntries, type DirectoryListing } from "./directory-listing";
 import { readFileChunks } from "./read-pipeline";
 
 export type ConnectionState = "disconnected" | "connecting" | "connected";
@@ -16,6 +17,7 @@ export interface TrafficStats {
 }
 
 interface UploadOptions {
+  replace?: boolean;
   onProgress?: (sent: number, total: number) => void;
   signal?: AbortSignal;
   batch?: UploadBatch;
@@ -24,6 +26,7 @@ interface UploadOptions {
 interface UploadBatch {
   files: Set<SharedFile>;
   finished: boolean;
+  session: SharedClient | null;
 }
 
 interface WireTimestamp {
@@ -124,7 +127,7 @@ export interface SearchResult {
 const asBigInt = (value: bigint | number): bigint => BigInt(value);
 let temporaryFileSequence = 0;
 
-function isErrno(error: unknown, errno: number): boolean {
+export function isErrno(error: unknown, errno: number): boolean {
   return error instanceof Error && "ecode" in error && error.ecode === errno;
 }
 
@@ -178,7 +181,9 @@ let wasmReady: Promise<unknown> | undefined;
 export class ZeroFsClient {
   private client: SharedClient | null = null;
   private connectPromise: Promise<void> | null = null;
+  private connectionGeneration = 0;
   private reconnectUrl: string | null = null;
+  private restoreUrl: string | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private monitorTimer: ReturnType<typeof setInterval> | null = null;
   private stateListeners = new Set<(state: ConnectionState) => void>();
@@ -187,6 +192,20 @@ export class ZeroFsClient {
   private previousStats: WireTrafficStats = { bytes_sent: 0, bytes_received: 0, operations: 0 };
   private maxReadChunk = 1024 * 1024;
   private maxWriteChunk = 1024 * 1024;
+
+  constructor(pageLifetime?: Window) {
+    pageLifetime?.addEventListener("pagehide", (event) => {
+      const restoreUrl = event.persisted ? this.reconnectUrl : null;
+      void this.close();
+      this.restoreUrl = restoreUrl;
+    });
+    pageLifetime?.addEventListener("pageshow", (event) => {
+      if (!event.persisted) return;
+      const url = this.restoreUrl;
+      this.restoreUrl = null;
+      if (url) this.enableAutoReconnect(url);
+    });
+  }
 
   get state(): ConnectionState {
     return this._state;
@@ -242,30 +261,46 @@ export class ZeroFsClient {
   async connect(url: string): Promise<void> {
     if (this.client) return;
     if (this.connectPromise) return this.connectPromise;
+    const generation = this.connectionGeneration;
     this.setState("connecting");
-    this.connectPromise = (async () => {
+    const connecting = (async () => {
       wasmReady ??= initWasm().catch((error) => {
         wasmReady = undefined;
         throw error;
       });
       await wasmReady;
-      this.client = await SharedClient.connect(url);
-      const capabilities = this.client.capabilities() as WireCapabilities;
+      if (generation !== this.connectionGeneration) throw new DOMException("Connection closed", "AbortError");
+      const client = await SharedClient.connect(url);
+      if (generation !== this.connectionGeneration) {
+        // A WASM Promise cannot be cancelled from JS. It still owns its result
+        // after close(), so retire that result without touching a newer session.
+        try {
+          await client.close();
+        } catch (error) {
+          console.warn("ZeroFsClient: error closing superseded wasm client", error);
+        }
+        throw new DOMException("Connection closed", "AbortError");
+      }
+      this.client = client;
+      const capabilities = client.capabilities() as WireCapabilities;
       this.maxReadChunk = capabilities.max_read_chunk;
       this.maxWriteChunk = capabilities.max_write_chunk;
-      this.previousStats = this.client.trafficStats() as WireTrafficStats;
-      this.setState("connected");
+      this.previousStats = client.trafficStats() as WireTrafficStats;
       this.startMonitor();
+      this.setState("connected");
     })();
+    if (generation === this.connectionGeneration) this.connectPromise = connecting;
     try {
-      await this.connectPromise;
+      await connecting;
     } catch (error) {
-      this.client = null;
-      this.setState("disconnected");
-      this.scheduleInitialReconnect();
+      if (generation === this.connectionGeneration) {
+        this.client = null;
+        this.setState("disconnected");
+        this.scheduleInitialReconnect();
+      }
       throw error;
     } finally {
-      this.connectPromise = null;
+      if (this.connectPromise === connecting) this.connectPromise = null;
     }
   }
 
@@ -283,7 +318,10 @@ export class ZeroFsClient {
    * Safe to call even if never connected, and safe to call more than once.
    */
   async close(): Promise<void> {
+    this.connectionGeneration++;
+    this.connectPromise = null;
     this.reconnectUrl = null;
+    this.restoreUrl = null;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -325,14 +363,13 @@ export class ZeroFsClient {
     }
   }
 
-  private async writeAll(file: SharedFile, data: Uint8Array, signal?: AbortSignal): Promise<void> {
+  private async writeAll(file: SharedFile, data: Uint8Array): Promise<void> {
     let offset = 0;
-    while (offset < data.length && !signal?.aborted) {
+    while (offset < data.length) {
       const end = Math.min(data.length, offset + this.maxWriteChunk);
       await file.writeAt(BigInt(offset), data.subarray(offset, end));
       offset = end;
     }
-    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
   }
 
   private async readDirectoryEntries(fs: SharedClient, path: string, signal?: AbortSignal): Promise<WireDirEntry[]> {
@@ -351,11 +388,11 @@ export class ZeroFsClient {
     }
   }
 
-  async listDirectory(path: string, signal?: AbortSignal): Promise<FileEntry[]> {
+  async directoryListing(path: string, signal?: AbortSignal): Promise<DirectoryListing<FileEntry>> {
     const fs = await this.fs();
     const entries = await this.readDirectoryEntries(fs, path, signal);
     if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-    return entries.map((entry): FileEntry => {
+    return directoryListing(entries, (entry): FileEntry => {
       const metadata = entry.metadata;
       const isDir = entry.file_type === "Dir";
       return {
@@ -371,6 +408,10 @@ export class ZeroFsClient {
         nlink: asBigInt(metadata.nlink),
       };
     });
+  }
+
+  private async listDirectory(path: string, signal?: AbortSignal): Promise<FileEntry[]> {
+    return textPathEntries(await this.directoryListing(path, signal), path);
   }
 
   async stat(path: string): Promise<FileInfo> {
@@ -396,12 +437,6 @@ export class ZeroFsClient {
   ): Promise<{ applied: number; failed: number }> {
     const result = { applied: 0, failed: 0 };
     const visit = async (path: string): Promise<void> => {
-      try {
-        await this.setattr(path, opts);
-        result.applied++;
-      } catch {
-        result.failed++;
-      }
       const children = await this.listDirectory(path, signal);
       await pooled(children, 8, async (entry) => {
         if (signal?.aborted) return;
@@ -409,7 +444,8 @@ export class ZeroFsClient {
         if (entry.isDir) {
           try {
             await visit(child);
-          } catch {
+          } catch (error) {
+            if (error instanceof RawFilenameError) throw error;
             result.failed++;
           }
         } else {
@@ -421,6 +457,15 @@ export class ZeroFsClient {
           }
         }
       });
+      if (signal?.aborted) return;
+      // Descendants still need to search this directory by path. Apply its
+      // attributes last so a restrictive mode cannot block the remaining work.
+      try {
+        await this.setattr(path, opts);
+        result.applied++;
+      } catch {
+        result.failed++;
+      }
     };
     await visit(dirPath);
     return result;
@@ -446,7 +491,8 @@ export class ZeroFsClient {
             result.files++;
             onProgress?.({ ...result });
           }
-        } catch {
+        } catch (error) {
+          if (error instanceof RawFilenameError) throw error;
           // Skip inaccessible entries.
         }
       });
@@ -487,46 +533,49 @@ export class ZeroFsClient {
     return result;
   }
 
-  async writeFile(path: string, data: Uint8Array, mode = 0o644, signal?: AbortSignal): Promise<void> {
+  async createFile(path: string): Promise<void> {
     const fs = await this.fs();
-    const temporary = await this.createTemporaryFile(fs, path, mode);
-    let renamed = false;
+    const file = await fs.openFile(path, false, true, true, true, false, 0o644);
     try {
-      await this.writeAll(temporary.file, data, signal);
-      await fs.rename(temporary.path, path);
-      renamed = true;
       await fs.sync();
     } finally {
-      await temporary.file.close();
-      if (!renamed) {
-        try {
-          await fs.removeFile(temporary.path);
-        } catch {
-          // Best-effort cleanup after a failed or cancelled write.
-        }
-      }
+      await file.close();
     }
   }
 
   beginUploadBatch(): UploadBatch {
-    return { files: new Set(), finished: false };
+    return { files: new Set(), finished: false, session: null };
   }
 
   async finishUploadBatch(batch: UploadBatch): Promise<void> {
     if (batch.finished) return;
     batch.finished = true;
-    const fs = await this.fs();
     const files = [...batch.files];
     try {
+      const fs = await this.fs();
+      // A replacement logical session has none of the original session's
+      // lineage obligations. Its successful barrier cannot acknowledge them.
+      if (fs !== this.client || (batch.session && batch.session !== fs)) {
+        throw new Error("Upload session changed before its durability barrier");
+      }
       await fs.sync();
     } finally {
       batch.files.clear();
+      batch.session = null;
       await Promise.all(files.map((file) => file.close()));
     }
   }
 
   async saveFile(path: string, data: Uint8Array): Promise<void> {
-    await this.writeFile(path, data);
+    const fs = await this.fs();
+    const file = await fs.openFile(path, false, true, false, false, false, 0);
+    try {
+      await this.writeAll(file, data);
+      await file.setLen(BigInt(data.length));
+      await file.syncAll();
+    } finally {
+      await file.close();
+    }
   }
 
   async mkdir(path: string, mode = 0o755): Promise<void> {
@@ -555,33 +604,35 @@ export class ZeroFsClient {
         if (entry.isDir) {
           try {
             await visit(child);
-          } catch {
-            // It may already have disappeared or become inaccessible.
+          } catch (error) {
+            if (!isErrno(error, 2)) throw error;
           }
         } else {
           try {
             await this.remove(child);
-          } catch {
-            // It may already have disappeared.
+            onProgress?.(++deleted, child);
+          } catch (error) {
+            if (!isErrno(error, 2)) throw error;
           }
-          onProgress?.(++deleted, child);
         }
       });
       if (!signal?.aborted) {
         try {
           await this.removeDir(path);
-        } catch {
-          // It may already have disappeared.
+          onProgress?.(++deleted, path);
+        } catch (error) {
+          if (!isErrno(error, 2)) throw error;
         }
-        onProgress?.(++deleted, path);
       }
     };
     await visit(dirPath);
     return deleted;
   }
 
-  async rename(oldPath: string, newPath: string): Promise<void> {
-    await (await this.fs()).rename(oldPath, newPath);
+  async rename(oldPath: string, newPath: string, replace = false): Promise<void> {
+    const fs = await this.fs();
+    if (replace) await fs.rename(oldPath, newPath);
+    else await fs.renameNoReplace(oldPath, newPath);
   }
 
   async symlink(path: string, target: string): Promise<void> {
@@ -629,9 +680,16 @@ export class ZeroFsClient {
     URL.revokeObjectURL(url);
   }
 
-  async uploadBlob(targetPath: string, blob: Blob, { onProgress, signal, batch }: UploadOptions = {}): Promise<void> {
+  async uploadBlob(targetPath: string, blob: Blob, { onProgress, signal, batch, replace = false }: UploadOptions = {}): Promise<void> {
     if (batch?.finished) throw new Error("Upload batch has already finished");
     const fs = await this.fs();
+    if (fs !== this.client || (batch?.session && batch.session !== fs)) {
+      throw new Error("Upload session is no longer current");
+    }
+    if (batch) {
+      if (batch.finished) throw new Error("Upload batch has already finished");
+      batch.session = fs;
+    }
     const temporary = await this.createTemporaryFile(fs, targetPath, 0o644);
     const file = temporary.file;
     let offset = 0;
@@ -646,7 +704,12 @@ export class ZeroFsClient {
         onProgress?.(offset, blob.size);
       }
       if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-      await fs.rename(temporary.path, targetPath);
+      if (fs !== this.client) throw new Error("Upload session is no longer current");
+      if (batch?.finished) throw new Error("Upload batch finished while a file was still uploading");
+      // Retain the session that created the staged file through publication.
+      // Page restoration can install a new session while file I/O is awaited.
+      if (replace) await fs.rename(temporary.path, targetPath);
+      else await fs.renameNoReplace(temporary.path, targetPath);
       renamed = true;
       if (batch) {
         if (batch.finished) throw new Error("Upload batch finished while a file was still uploading");
@@ -708,7 +771,8 @@ export class ZeroFsClient {
       if (signal?.aborted) return;
       try {
         await this.searchDir(path, regex, onResult, signal, depth + 1, maxDepth);
-      } catch {
+      } catch (error) {
+        if (error instanceof RawFilenameError) throw error;
         // Skip inaccessible directories.
       }
     });
@@ -720,41 +784,31 @@ export class ZeroFsClient {
     onProgress: (file: string) => void,
     signal?: AbortSignal,
   ): Promise<{ path: string; data: Uint8Array }[]> {
-    if (signal?.aborted) return [];
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
     const entries = await this.listDirectory(dirPath, signal);
     const results: { path: string; data: Uint8Array }[] = [];
     await pooled(entries, 8, async (entry) => {
-      if (signal?.aborted) return;
+      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
       const child = join(dirPath, entry.name);
       const relative = basePath ? `${basePath}/${entry.name}` : entry.name;
-      try {
-        if (entry.isDir) {
-          results.push(...(await this.collectFiles(child, relative, onProgress, signal)));
-        } else {
-          onProgress(relative);
-          results.push({ path: relative, data: await this.readFile(child, signal) });
-        }
-      } catch (error) {
-        if (error instanceof DOMException && error.name === "AbortError") throw error;
+      // An archive must not silently omit unreadable files or subdirectories.
+      // pooled drains in-flight reads before propagating the first failure.
+      if (entry.isDir) {
+        results.push(...(await this.collectFiles(child, relative, onProgress, signal)));
+      } else {
+        onProgress(relative);
+        results.push({ path: relative, data: await this.readFile(child, signal) });
       }
     });
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
     return results;
   }
 }
 
-export const p9client = new ZeroFsClient();
-
 // `p9client` is a page-lifetime singleton: it is created once here and never
 // replaced or discarded during normal use (the underlying wasm session
 // reconnects itself internally rather than being swapped out from JS). The
-// only real teardown seam is the page going away, so close it best-effort
-// there rather than leaking the session until the transport times out.
-// `pagehide` fires reliably (including on bfcache navigation); `beforeunload`
-// is kept as a fallback for environments where `pagehide` is unavailable.
-if (typeof window !== "undefined") {
-  const closeOnTeardown = () => {
-    void p9client.close();
-  };
-  window.addEventListener("pagehide", closeOnTeardown);
-  window.addEventListener("beforeunload", closeOnTeardown);
-}
+// page lifecycle closes it on departure and resumes an enabled connection
+// after a back-forward-cache restore, when mounted hooks do not run again.
+// Avoid beforeunload: navigation can still be cancelled at that point.
+export const p9client = new ZeroFsClient(typeof window === "undefined" ? undefined : window);

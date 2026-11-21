@@ -1,0 +1,4 @@
+Engine and probe provenance: exact Git archive 056d41586ee925479e21d169294123a2acb8f565
+Spark command: scripts/test-raw-device-mounted.sh --spark OWNED_TRANSFER_DIRECTORY/bin
+mv: cannot move '/var/tmp/zerofs-raw-fixture.YW8q4yST/pin-zerofs' to '/var/tmp/zerofs-raw-fixture.YW8q4yST/bin/zerofs': Permission denied
+Removed owned Spark transfer directory /var/tmp/zerofs-raw-fixture.YW8q4yST

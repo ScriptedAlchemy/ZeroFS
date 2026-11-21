@@ -1,0 +1,110 @@
+{
+  "after": {
+    "affinity": [
+      0,
+      1
+    ],
+    "cpu.max": "max 100000",
+    "cpu.stat": {
+      "burst_usec": 0,
+      "core_sched.force_idle_usec": 0,
+      "nice_usec": 0,
+      "nr_bursts": 0,
+      "nr_periods": 0,
+      "nr_throttled": 0,
+      "system_usec": 2420457,
+      "throttled_usec": 0,
+      "usage_usec": 6606150,
+      "user_usec": 4185693
+    },
+    "cpuset.cpus.effective": "0-1",
+    "memory.current": "10809344",
+    "memory.events": {
+      "high": 0,
+      "low": 0,
+      "max": 0,
+      "oom": 0,
+      "oom_group_kill": 0,
+      "oom_kill": 0,
+      "sock_throttled": 0
+    },
+    "memory.events.local": {
+      "high": 0,
+      "low": 0,
+      "max": 0,
+      "oom": 0,
+      "oom_group_kill": 0,
+      "oom_kill": 0,
+      "sock_throttled": 0
+    },
+    "memory.max": "8589934592",
+    "memory.peak": "1107415040",
+    "memory.swap.current": "0",
+    "memory.swap.events": {
+      "fail": 0,
+      "high": 0,
+      "max": 0
+    },
+    "memory.swap.max": "0",
+    "memory.swap.peak": "0"
+  },
+  "before": {
+    "affinity": [
+      0,
+      1
+    ],
+    "cpu.max": "max 100000",
+    "cpu.stat": {
+      "burst_usec": 0,
+      "core_sched.force_idle_usec": 0,
+      "nice_usec": 0,
+      "nr_bursts": 0,
+      "nr_periods": 0,
+      "nr_throttled": 0,
+      "system_usec": 31013,
+      "throttled_usec": 0,
+      "usage_usec": 111048,
+      "user_usec": 80035
+    },
+    "cpuset.cpus.effective": "0-1",
+    "memory.current": "8114176",
+    "memory.events": {
+      "high": 0,
+      "low": 0,
+      "max": 0,
+      "oom": 0,
+      "oom_group_kill": 0,
+      "oom_kill": 0,
+      "sock_throttled": 0
+    },
+    "memory.events.local": {
+      "high": 0,
+      "low": 0,
+      "max": 0,
+      "oom": 0,
+      "oom_group_kill": 0,
+      "oom_kill": 0,
+      "sock_throttled": 0
+    },
+    "memory.max": "8589934592",
+    "memory.peak": "8114176",
+    "memory.swap.current": "0",
+    "memory.swap.events": {
+      "fail": 0,
+      "high": 0,
+      "max": 0
+    },
+    "memory.swap.max": "0",
+    "memory.swap.peak": "0"
+  },
+  "memory_event_delta": {
+    "high": 0,
+    "low": 0,
+    "max": 0,
+    "oom": 0,
+    "oom_group_kill": 0,
+    "oom_kill": 0,
+    "sock_throttled": 0
+  },
+  "workload_exit": 0
+}

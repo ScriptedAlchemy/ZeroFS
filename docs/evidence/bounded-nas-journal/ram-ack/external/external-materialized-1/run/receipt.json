@@ -1,0 +1,996 @@
+{
+  "accounting_scope": "Non-atomic scoped regular-file stat samples. Apparent bytes sum st_size. Allocated bytes sum st_blocks * 512. Component names use the first child beneath a role or its bucket namespace. No directories, ballast, cgroup, filesystem metadata, unlinked files or physical-media durability accounting.",
+  "binary_sha256": "93488a4e5a160de9fd0e170568a8dae05beddfc7ab64b615894e8a482d75bebb",
+  "cleanup_verified": true,
+  "client_after": {
+    "affinity": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "cpu.max": "max 100000",
+    "cpu.stat": "usage_usec 1962654\nuser_usec 1557898\nsystem_usec 404756\nnice_usec 0\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0",
+    "cpuset.cpus.effective": "2-7",
+    "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\nsock_throttled 0",
+    "memory.max": "2147483648",
+    "memory.peak": "283279360",
+    "memory.swap.current": "0",
+    "memory.swap.max": "0",
+    "memory.swap.peak": "0"
+  },
+  "client_before": {
+    "affinity": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "cpu.max": "max 100000",
+    "cpu.stat": "usage_usec 397405\nuser_usec 362843\nsystem_usec 34561\nnice_usec 0\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0",
+    "cpuset.cpus.effective": "2-7",
+    "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\nsock_throttled 0",
+    "memory.max": "2147483648",
+    "memory.peak": "26066944",
+    "memory.swap.current": "0",
+    "memory.swap.max": "0",
+    "memory.swap.peak": "0"
+  },
+  "client_phase_cpu": [
+    {
+      "monotonic_seconds": 937817.315847716,
+      "process_cpu_seconds": 1.22995388
+    },
+    {
+      "monotonic_seconds": 937818.066706312,
+      "process_cpu_seconds": 1.318802799
+    },
+    {
+      "monotonic_seconds": 937818.859240058,
+      "process_cpu_seconds": 1.660088079
+    },
+    {
+      "monotonic_seconds": 937818.946446822,
+      "process_cpu_seconds": 1.661267717
+    }
+  ],
+  "drained_writeback": {
+    "accepted_sequence": 32,
+    "dirty_ram_bytes": 0,
+    "dirty_ssd_capacity_bytes": 536870912,
+    "dirty_ssd_operations": 0,
+    "dirty_ssd_reserved_bytes": 0,
+    "local_sequence": 32,
+    "remote_bytes_completed_total": 237172352,
+    "remote_sequence": 32,
+    "retries_total": 0,
+    "ssd_admission_paced": 0,
+    "terminal_error": 0,
+    "volatile_overlay": {}
+  },
+  "engine_config_sha256": "9c0abefd27b36900f0176906d661c183ff57978af74dcb33592400f45184f5f5",
+  "external_files": [
+    {
+      "bytes": 37748736,
+      "cross_client_hash_verified_monotonic": 937818.765996928,
+      "file": "ext4-drain-00",
+      "fsync_completed_monotonic": 937818.946271919,
+      "fsync_started_monotonic": 937818.859641213,
+      "io_chunk_bytes": 1048552,
+      "sha256": "f19bdec84511d84c122bb2657a79d01e7d07f00e462e7fded00f5704cc42fcb2",
+      "write_acknowledged_monotonic": 937818.056467675,
+      "write_started_monotonic": 937817.315924067
+    },
+    {
+      "bytes": 37748736,
+      "cross_client_hash_verified_monotonic": 937818.771396344,
+      "file": "ext4-drain-01",
+      "fsync_completed_monotonic": 937818.946427942,
+      "fsync_started_monotonic": 937818.859377019,
+      "io_chunk_bytes": 1048552,
+      "sha256": "0837f172669aa1f02e4dfd3dae77909ea6abd8378ff54e7407a63332920c17be",
+      "write_acknowledged_monotonic": 937818.064376392,
+      "write_started_monotonic": 937817.316189369
+    },
+    {
+      "bytes": 37748736,
+      "cross_client_hash_verified_monotonic": 937818.680515014,
+      "file": "ext4-drain-02",
+      "fsync_completed_monotonic": 937818.94635904,
+      "fsync_started_monotonic": 937818.859687333,
+      "io_chunk_bytes": 1048552,
+      "sha256": "3b926508c4f9b12c0e50139fef7cf2aba7e9df5c77a0b10da1ffaf2dfe082254",
+      "write_acknowledged_monotonic": 937818.066689162,
+      "write_started_monotonic": 937817.316081779
+    },
+    {
+      "bytes": 37748736,
+      "cross_client_hash_verified_monotonic": 937818.601602684,
+      "file": "ext4-drain-03",
+      "fsync_completed_monotonic": 937818.946168688,
+      "fsync_started_monotonic": 937818.859495101,
+      "io_chunk_bytes": 1048552,
+      "sha256": "996af0012ccff1c1f2124708ed1d27cb866627e077fa318762ffd40474b57901",
+      "write_acknowledged_monotonic": 937817.849995298,
+      "write_started_monotonic": 937817.315986837
+    },
+    {
+      "bytes": 37748736,
+      "cross_client_hash_verified_monotonic": 937818.859232356,
+      "file": "ext4-drain-04",
+      "fsync_completed_monotonic": 937818.946315559,
+      "fsync_started_monotonic": 937818.859279787,
+      "io_chunk_bytes": 1048552,
+      "sha256": "b52e9b750b4087876d085456b0da8731e23d845ce87f39b189d0bc2c7bb39ec1",
+      "write_acknowledged_monotonic": 937817.984319498,
+      "write_started_monotonic": 937817.315957627
+    },
+    {
+      "bytes": 37748736,
+      "cross_client_hash_verified_monotonic": 937818.813192355,
+      "file": "ext4-drain-05",
+      "fsync_completed_monotonic": 937818.946227009,
+      "fsync_started_monotonic": 937818.859313987,
+      "io_chunk_bytes": 1048552,
+      "sha256": "87c9a4628afa6b4af21da59f9cdf32cbf3e4d107bd79951b46c5f0777690ac36",
+      "write_acknowledged_monotonic": 937818.022504923,
+      "write_started_monotonic": 937817.315880956
+    }
+  ],
+  "file_mib": 36,
+  "files": 6,
+  "fixture": "ExternalBurst",
+  "kernel": "7.0.0-28-generic",
+  "msize_bytes": 1048576,
+  "phase_cpu": [
+    {
+      "cgroup_cpu_stat": {
+        "burst_usec": 0,
+        "core_sched.force_idle_usec": 0,
+        "nice_usec": 0,
+        "nr_bursts": 0,
+        "nr_periods": 0,
+        "nr_throttled": 0,
+        "system_usec": 137436,
+        "throttled_usec": 0,
+        "usage_usec": 777719,
+        "user_usec": 640283
+      },
+      "elapsed_seconds": 2.3648194950073957,
+      "engine_cpu_seconds": 0.25,
+      "service_fixture_process_cpu_seconds": 0.496377141
+    },
+    {
+      "cgroup_cpu_stat": {
+        "burst_usec": 0,
+        "core_sched.force_idle_usec": 0,
+        "nice_usec": 0,
+        "nr_bursts": 0,
+        "nr_periods": 0,
+        "nr_throttled": 0,
+        "system_usec": 1152918,
+        "throttled_usec": 0,
+        "usage_usec": 3834875,
+        "user_usec": 2681957
+      },
+      "elapsed_seconds": 4.243210772052407,
+      "engine_cpu_seconds": 3.29,
+      "service_fixture_process_cpu_seconds": 0.515798234
+    }
+  ],
+  "scope": "two isolated containers using userspace 9P2000.L over a private Unix socket and two local ext4 directories",
+  "service_after": {
+    "affinity": [
+      0,
+      1
+    ],
+    "cpu.max": "max 100000",
+    "cpu.stat": "usage_usec 5848231\nuser_usec 3951980\nsystem_usec 1896251\nnice_usec 0\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0",
+    "cpuset.cpus.effective": "0-1",
+    "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\nsock_throttled 0",
+    "memory.max": "8589934592",
+    "memory.peak": "1192837120",
+    "memory.swap.current": "0",
+    "memory.swap.max": "0",
+    "memory.swap.peak": "0"
+  },
+  "service_before": {
+    "affinity": [
+      0,
+      1
+    ],
+    "cpu.max": "max 100000",
+    "cpu.stat": "usage_usec 453483\nuser_usec 414613\nsystem_usec 38870\nnice_usec 0\ncore_sched.force_idle_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0",
+    "cpuset.cpus.effective": "0-1",
+    "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\nsock_throttled 0",
+    "memory.max": "8589934592",
+    "memory.peak": "21196800",
+    "memory.swap.current": "0",
+    "memory.swap.max": "0",
+    "memory.swap.peak": "0"
+  },
+  "staging_events": [
+    {
+      "event": "CREATE",
+      "member": "member-b",
+      "order": 1,
+      "read_elapsed_seconds": 2.934059164021164,
+      "staging_file": "0c66f428-2c2b-4975-bfcd-a0009e01d571#1"
+    },
+    {
+      "event": "OPEN",
+      "member": "member-b",
+      "order": 2,
+      "read_elapsed_seconds": 2.934059164021164,
+      "staging_file": "0c66f428-2c2b-4975-bfcd-a0009e01d571#1"
+    },
+    {
+      "event": "CLOSE_WRITE",
+      "member": "member-b",
+      "order": 3,
+      "read_elapsed_seconds": 3.1367762540467083,
+      "staging_file": "0c66f428-2c2b-4975-bfcd-a0009e01d571#1"
+    },
+    {
+      "event": "CREATE",
+      "member": "member-a",
+      "order": 4,
+      "read_elapsed_seconds": 3.1367762540467083,
+      "staging_file": "b80a9ea6-3b55-4605-a110-edd2a2d4efef#1"
+    },
+    {
+      "event": "OPEN",
+      "member": "member-a",
+      "order": 5,
+      "read_elapsed_seconds": 3.1367762540467083,
+      "staging_file": "b80a9ea6-3b55-4605-a110-edd2a2d4efef#1"
+    },
+    {
+      "event": "CLOSE_WRITE",
+      "member": "member-a",
+      "order": 6,
+      "read_elapsed_seconds": 3.1367762540467083,
+      "staging_file": "b80a9ea6-3b55-4605-a110-edd2a2d4efef#1"
+    },
+    {
+      "event": "CREATE",
+      "member": "member-a",
+      "order": 7,
+      "read_elapsed_seconds": 3.2540349930059165,
+      "staging_file": "3a20dd71-4ae4-4d5a-a847-f73bde5cd44a#1"
+    },
+    {
+      "event": "OPEN",
+      "member": "member-a",
+      "order": 8,
+      "read_elapsed_seconds": 3.2540349930059165,
+      "staging_file": "3a20dd71-4ae4-4d5a-a847-f73bde5cd44a#1"
+    },
+    {
+      "event": "CLOSE_WRITE",
+      "member": "member-a",
+      "order": 9,
+      "read_elapsed_seconds": 3.2540349930059165,
+      "staging_file": "3a20dd71-4ae4-4d5a-a847-f73bde5cd44a#1"
+    },
+    {
+      "event": "CREATE",
+      "member": "member-a",
+      "order": 10,
+      "read_elapsed_seconds": 3.4842378350440413,
+      "staging_file": "801f3f91-1310-4735-896c-ac403d65a586#1"
+    },
+    {
+      "event": "OPEN",
+      "member": "member-a",
+      "order": 11,
+      "read_elapsed_seconds": 3.4842378350440413,
+      "staging_file": "801f3f91-1310-4735-896c-ac403d65a586#1"
+    },
+    {
+      "event": "CLOSE_WRITE",
+      "member": "member-a",
+      "order": 12,
+      "read_elapsed_seconds": 3.4842378350440413,
+      "staging_file": "801f3f91-1310-4735-896c-ac403d65a586#1"
+    },
+    {
+      "event": "CREATE",
+      "member": "member-b",
+      "order": 13,
+      "read_elapsed_seconds": 3.4842378350440413,
+      "staging_file": "82a595bf-23c2-4def-876c-f9e7381bc174#1"
+    },
+    {
+      "event": "OPEN",
+      "member": "member-b",
+      "order": 14,
+      "read_elapsed_seconds": 3.4842378350440413,
+      "staging_file": "82a595bf-23c2-4def-876c-f9e7381bc174#1"
+    },
+    {
+      "event": "CLOSE_WRITE",
+      "member": "member-b",
+      "order": 15,
+      "read_elapsed_seconds": 3.8171057840809226,
+      "staging_file": "82a595bf-23c2-4def-876c-f9e7381bc174#1"
+    },
+    {
+      "event": "CREATE",
+      "member": "member-b",
+      "order": 16,
+      "read_elapsed_seconds": 3.926031448994763,
+      "staging_file": "0fb9fac8-961c-4329-9e5c-6d4d58228d65#1"
+    },
+    {
+      "event": "OPEN",
+      "member": "member-b",
+      "order": 17,
+      "read_elapsed_seconds": 3.926031448994763,
+      "staging_file": "0fb9fac8-961c-4329-9e5c-6d4d58228d65#1"
+    },
+    {
+      "event": "CLOSE_WRITE",
+      "member": "member-b",
+      "order": 18,
+      "read_elapsed_seconds": 4.036972286994569,
+      "staging_file": "0fb9fac8-961c-4329-9e5c-6d4d58228d65#1"
+    },
+    {
+      "event": "CREATE",
+      "member": "member-a",
+      "order": 19,
+      "read_elapsed_seconds": 4.139482903061435,
+      "staging_file": "075cf31a-9021-42b3-9c96-89d08607a88a#1"
+    },
+    {
+      "event": "OPEN",
+      "member": "member-a",
+      "order": 20,
+      "read_elapsed_seconds": 4.139482903061435,
+      "staging_file": "075cf31a-9021-42b3-9c96-89d08607a88a#1"
+    },
+    {
+      "event": "CLOSE_WRITE",
+      "member": "member-a",
+      "order": 21,
+      "read_elapsed_seconds": 4.139482903061435,
+      "staging_file": "075cf31a-9021-42b3-9c96-89d08607a88a#1"
+    },
+    {
+      "event": "CREATE",
+      "member": "member-b",
+      "order": 22,
+      "read_elapsed_seconds": 4.139482903061435,
+      "staging_file": "877218dc-8e97-4f46-900d-8773ef7d56fb#1"
+    },
+    {
+      "event": "OPEN",
+      "member": "member-b",
+      "order": 23,
+      "read_elapsed_seconds": 4.139482903061435,
+      "staging_file": "877218dc-8e97-4f46-900d-8773ef7d56fb#1"
+    },
+    {
+      "event": "CLOSE_WRITE",
+      "member": "member-b",
+      "order": 24,
+      "read_elapsed_seconds": 4.139482903061435,
+      "staging_file": "877218dc-8e97-4f46-900d-8773ef7d56fb#1"
+    },
+    {
+      "event": "CREATE",
+      "member": "member-a",
+      "order": 25,
+      "read_elapsed_seconds": 4.139482903061435,
+      "staging_file": "a5c60764-ade7-4691-9101-810b38def63d#1"
+    },
+    {
+      "event": "OPEN",
+      "member": "member-a",
+      "order": 26,
+      "read_elapsed_seconds": 4.139482903061435,
+      "staging_file": "a5c60764-ade7-4691-9101-810b38def63d#1"
+    },
+    {
+      "event": "CLOSE_WRITE",
+      "member": "member-a",
+      "order": 27,
+      "read_elapsed_seconds": 4.139482903061435,
+      "staging_file": "a5c60764-ade7-4691-9101-810b38def63d#1"
+    },
+    {
+      "event": "CREATE",
+      "member": "member-b",
+      "order": 28,
+      "read_elapsed_seconds": 4.139482903061435,
+      "staging_file": "2a550cad-866c-478c-8b81-d595bd0acb47#1"
+    },
+    {
+      "event": "OPEN",
+      "member": "member-b",
+      "order": 29,
+      "read_elapsed_seconds": 4.139482903061435,
+      "staging_file": "2a550cad-866c-478c-8b81-d595bd0acb47#1"
+    },
+    {
+      "event": "CLOSE_WRITE",
+      "member": "member-b",
+      "order": 30,
+      "read_elapsed_seconds": 4.139482903061435,
+      "staging_file": "2a550cad-866c-478c-8b81-d595bd0acb47#1"
+    }
+  ],
+  "staging_observation": {
+    "cross_member_open_lifetime_overlap_observed": false,
+    "cross_member_overlap_pairs": 0,
+    "event_scope": "One Linux inotify queue, ordered OPEN and CLOSE_WRITE on canonical pool staging names. Timestamps record userspace reads. Both members share one ext4 device. Overlap describes file lifetimes on that device.",
+    "events_by_member": {
+      "member-a": {
+        "CLOSE_WRITE": 5,
+        "CREATE": 5,
+        "OPEN": 5
+      },
+      "member-b": {
+        "CLOSE_WRITE": 5,
+        "CREATE": 5,
+        "OPEN": 5
+      }
+    },
+    "first_overlap": null
+  },
+  "status": "passed",
+  "timeline": [
+    {
+      "elapsed_seconds": 1.0888844190631062,
+      "stage": "startup",
+      "writeback": {
+        "accepted_sequence": 9,
+        "dirty_ram_bytes": 0,
+        "dirty_ssd_capacity_bytes": 536870912,
+        "dirty_ssd_operations": 0,
+        "dirty_ssd_reserved_bytes": 0,
+        "local_sequence": 9,
+        "remote_bytes_completed_total": 1618,
+        "remote_sequence": 9,
+        "retries_total": 0,
+        "ssd_admission_paced": 0,
+        "terminal_error": 0,
+        "volatile_overlay": {}
+      }
+    },
+    {
+      "elapsed_seconds": 1.094262586091645,
+      "members": {
+        "member-a": {
+          "available_bytes": 1000000000,
+          "objects": 0,
+          "pending_uploads": 0,
+          "reserved_bytes": 0,
+          "space": {
+            "declared_exceeds_filesystem": false,
+            "filesystem_free_bytes": 368572375040,
+            "filesystem_total_bytes": 1351030112256,
+            "full": null
+          },
+          "used_bytes": 0
+        },
+        "member-b": {
+          "available_bytes": 1000000000,
+          "objects": 0,
+          "pending_uploads": 0,
+          "reserved_bytes": 0,
+          "space": {
+            "declared_exceeds_filesystem": false,
+            "filesystem_free_bytes": 368572375040,
+            "filesystem_total_bytes": 1351030112256,
+            "full": null
+          },
+          "used_bytes": 0
+        }
+      },
+      "stage": "startup"
+    },
+    {
+      "accounting": {
+        "cache": {
+          "allocated_bytes": 4096,
+          "apparent_bytes": 2147483754,
+          "components": {
+            "bucket_36bcefeb/.zerofs-clean-cache.lock": {
+              "allocated_bytes": 0,
+              "apparent_bytes": 0,
+              "regular_files": 1
+            },
+            "bucket_36bcefeb/hybrid_cache_v1": {
+              "allocated_bytes": 0,
+              "apparent_bytes": 1073741824,
+              "regular_files": 16
+            },
+            "bucket_36bcefeb/parts_cache_v1": {
+              "allocated_bytes": 4096,
+              "apparent_bytes": 1073741930,
+              "regular_files": 17
+            }
+          },
+          "regular_files": 34
+        },
+        "catalog": {
+          "allocated_bytes": 57344,
+          "apparent_bytes": 548864,
+          "components": {
+            "pool.lock": {
+              "allocated_bytes": 0,
+              "apparent_bytes": 0,
+              "regular_files": 1
+            },
+            "pool.redb": {
+              "allocated_bytes": 57344,
+              "apparent_bytes": 548864,
+              "regular_files": 1
+            }
+          },
+          "regular_files": 2
+        },
+        "journal": {
+          "allocated_bytes": 65536,
+          "apparent_bytes": 180224,
+          "components": {
+            "bucket_36bcefeb/LOCK": {
+              "allocated_bytes": 0,
+              "apparent_bytes": 0,
+              "regular_files": 1
+            },
+            "bucket_36bcefeb/journal.redb": {
+              "allocated_bytes": 65536,
+              "apparent_bytes": 180224,
+              "regular_files": 1
+            }
+          },
+          "regular_files": 2
+        },
+        "member-a": {
+          "allocated_bytes": 4096,
+          "apparent_bytes": 108,
+          "components": {
+            ".zerofs-pool": {
+              "allocated_bytes": 4096,
+              "apparent_bytes": 108,
+              "regular_files": 2
+            }
+          },
+          "regular_files": 2
+        },
+        "member-b": {
+          "allocated_bytes": 4096,
+          "apparent_bytes": 108,
+          "components": {
+            ".zerofs-pool": {
+              "allocated_bytes": 4096,
+              "apparent_bytes": 108,
+              "regular_files": 2
+            }
+          },
+          "regular_files": 2
+        },
+        "metadata": {
+          "allocated_bytes": 45056,
+          "apparent_bytes": 1900,
+          "components": {
+            "(root dotfiles)": {
+              "allocated_bytes": 4096,
+              "apparent_bytes": 36,
+              "regular_files": 2
+            },
+            ".zerofs-pool": {
+              "allocated_bytes": 4096,
+              "apparent_bytes": 122,
+              "regular_files": 2
+            },
+            "compacted": {
+              "allocated_bytes": 4096,
+              "apparent_bytes": 468,
+              "regular_files": 2
+            },
+            "compactions": {
+              "allocated_bytes": 12288,
+              "apparent_bytes": 110,
+              "regular_files": 4
+            },
+            "manifest": {
+              "allocated_bytes": 16384,
+              "apparent_bytes": 1040,
+              "regular_files": 5
+            },
+            "wal": {
+              "allocated_bytes": 0,
+              "apparent_bytes": 0,
+              "regular_files": 2
+            },
+            "zerofs.key": {
+              "allocated_bytes": 4096,
+              "apparent_bytes": 124,
+              "regular_files": 1
+            }
+          },
+          "regular_files": 18
+        }
+      },
+      "elapsed_seconds": 1.0993624799884856,
+      "stage": "startup"
+    },
+    {
+      "elapsed_seconds": 4.314411227009259,
+      "exit_signal": "SIGKILL",
+      "remote_cut_writeback": {
+        "accepted_sequence": 32,
+        "dirty_ram_bytes": 0,
+        "dirty_ssd_capacity_bytes": 536870912,
+        "dirty_ssd_operations": 0,
+        "dirty_ssd_reserved_bytes": 0,
+        "local_sequence": 32,
+        "remote_bytes_completed_total": 237172352,
+        "remote_sequence": 32,
+        "retries_total": 0,
+        "ssd_admission_paced": 0,
+        "terminal_error": 0,
+        "volatile_overlay": {}
+      },
+      "stage": "external-9p-burst"
+    },
+    {
+      "elapsed_seconds": 4.328145748004317,
+      "journal_payload_files": 0,
+      "members": {
+        "member-a": {
+          "available_bytes": 883704151,
+          "objects": 6,
+          "pending_uploads": 0,
+          "reserved_bytes": 0,
+          "space": {
+            "declared_exceeds_filesystem": false,
+            "filesystem_free_bytes": 368027238400,
+            "filesystem_total_bytes": 1351030112256,
+            "full": null
+          },
+          "used_bytes": 116295849
+        },
+        "member-b": {
+          "available_bytes": 879289622,
+          "objects": 6,
+          "pending_uploads": 0,
+          "reserved_bytes": 0,
+          "space": {
+            "declared_exceeds_filesystem": false,
+            "filesystem_free_bytes": 368027238400,
+            "filesystem_total_bytes": 1351030112256,
+            "full": null
+          },
+          "used_bytes": 120710378
+        }
+      },
+      "stage": "offline-destination"
+    },
+    {
+      "elapsed_seconds": 5.7232381760841236,
+      "files": [
+        {
+          "bytes": 1048576,
+          "file": "warm-0",
+          "sha256": "4dbaccc4d17d69897723fc27c841ef7b917f9b239549a903019e93c273c99b42"
+        },
+        {
+          "bytes": 1048576,
+          "file": "warm-1",
+          "sha256": "dae0dce84a3bc2c31e86a6f935f28963b4ee3d904dd5296c59f1e059b99a4fd9"
+        },
+        {
+          "bytes": 37748736,
+          "file": "ext4-drain-00",
+          "sha256": "f19bdec84511d84c122bb2657a79d01e7d07f00e462e7fded00f5704cc42fcb2"
+        },
+        {
+          "bytes": 37748736,
+          "file": "ext4-drain-01",
+          "sha256": "0837f172669aa1f02e4dfd3dae77909ea6abd8378ff54e7407a63332920c17be"
+        },
+        {
+          "bytes": 37748736,
+          "file": "ext4-drain-02",
+          "sha256": "3b926508c4f9b12c0e50139fef7cf2aba7e9df5c77a0b10da1ffaf2dfe082254"
+        },
+        {
+          "bytes": 37748736,
+          "file": "ext4-drain-03",
+          "sha256": "996af0012ccff1c1f2124708ed1d27cb866627e077fa318762ffd40474b57901"
+        },
+        {
+          "bytes": 37748736,
+          "file": "ext4-drain-04",
+          "sha256": "b52e9b750b4087876d085456b0da8731e23d845ce87f39b189d0bc2c7bb39ec1"
+        },
+        {
+          "bytes": 37748736,
+          "file": "ext4-drain-05",
+          "sha256": "87c9a4628afa6b4af21da59f9cdf32cbf3e4d107bd79951b46c5f0777690ac36"
+        }
+      ],
+      "fresh_read_only_verifier": true,
+      "parked_journal": true,
+      "stage": "verify-fresh-cache-read-only"
+    }
+  ],
+  "timeout_seconds": 600.0,
+  "transfer": {
+    "ack_to_hash_verified_seconds": 0.792543193907477,
+    "clients": 6,
+    "fsync_phase_seconds": 0.08714815496932715,
+    "logical_bytes": 226492416,
+    "outstanding_writes_per_client": 1,
+    "through_fsync_seconds": 1.6305469860089943,
+    "through_observed_drain_seconds": 1.8674418600276113,
+    "write_seconds": 0.7508082060376182
+  },
+  "verifier_config_sha256": "12910fb3e290b56f3817d97463eb204829c4ddab594a41a5551adfe423bda6a9",
+  "writeback_samples": [
+    {
+      "accepted_sequence": 17,
+      "dirty_ram_bytes": 0,
+      "dirty_ssd_capacity_bytes": 536870912,
+      "dirty_ssd_operations": 0,
+      "dirty_ssd_reserved_bytes": 0,
+      "local_sequence": 17,
+      "monotonic_seconds": 937817.307019356,
+      "remote_bytes_completed_total": 2183688,
+      "remote_sequence": 17,
+      "retries_total": 0,
+      "ssd_admission_paced": 0,
+      "terminal_error": 0,
+      "volatile_overlay": {}
+    },
+    {
+      "accepted_sequence": 17,
+      "dirty_ram_bytes": 0,
+      "dirty_ssd_capacity_bytes": 536870912,
+      "dirty_ssd_operations": 0,
+      "dirty_ssd_reserved_bytes": 0,
+      "local_sequence": 17,
+      "monotonic_seconds": 937817.409642262,
+      "remote_bytes_completed_total": 2183688,
+      "remote_sequence": 17,
+      "retries_total": 0,
+      "ssd_admission_paced": 0,
+      "terminal_error": 0,
+      "volatile_overlay": {}
+    },
+    {
+      "accepted_sequence": 17,
+      "dirty_ram_bytes": 33645150,
+      "dirty_ssd_capacity_bytes": 536870912,
+      "dirty_ssd_operations": 0,
+      "dirty_ssd_reserved_bytes": 0,
+      "local_sequence": 17,
+      "monotonic_seconds": 937817.541615753,
+      "remote_bytes_completed_total": 2183688,
+      "remote_sequence": 17,
+      "retries_total": 0,
+      "ssd_admission_paced": 0,
+      "terminal_error": 0,
+      "volatile_overlay": {}
+    },
+    {
+      "accepted_sequence": 19,
+      "dirty_ram_bytes": 67290273,
+      "dirty_ssd_capacity_bytes": 536870912,
+      "dirty_ssd_operations": 0,
+      "dirty_ssd_reserved_bytes": 67340433,
+      "local_sequence": 17,
+      "monotonic_seconds": 937817.652131626,
+      "remote_bytes_completed_total": 2183688,
+      "remote_sequence": 17,
+      "retries_total": 0,
+      "ssd_admission_paced": 0,
+      "terminal_error": 0,
+      "volatile_overlay": {}
+    },
+    {
+      "accepted_sequence": 19,
+      "dirty_ram_bytes": 33671882,
+      "dirty_ssd_capacity_bytes": 536870912,
+      "dirty_ssd_operations": 2,
+      "dirty_ssd_reserved_bytes": 67340433,
+      "local_sequence": 19,
+      "monotonic_seconds": 937817.771607923,
+      "remote_bytes_completed_total": 2183688,
+      "remote_sequence": 17,
+      "retries_total": 0,
+      "ssd_admission_paced": 0,
+      "terminal_error": 0,
+      "volatile_overlay": {}
+    },
+    {
+      "accepted_sequence": 22,
+      "dirty_ram_bytes": 101066860,
+      "dirty_ssd_capacity_bytes": 536870912,
+      "dirty_ssd_operations": 3,
+      "dirty_ssd_reserved_bytes": 168456542,
+      "local_sequence": 20,
+      "monotonic_seconds": 937817.976641563,
+      "remote_bytes_completed_total": 2183688,
+      "remote_sequence": 17,
+      "retries_total": 0,
+      "ssd_admission_paced": 0,
+      "terminal_error": 0,
+      "volatile_overlay": {}
+    },
+    {
+      "accepted_sequence": 23,
+      "dirty_ram_bytes": 101066860,
+      "dirty_ssd_capacity_bytes": 536870912,
+      "dirty_ssd_operations": 3,
+      "dirty_ssd_reserved_bytes": 202179495,
+      "local_sequence": 20,
+      "monotonic_seconds": 937818.093939971,
+      "remote_bytes_completed_total": 2183688,
+      "remote_sequence": 17,
+      "retries_total": 0,
+      "ssd_admission_paced": 0,
+      "terminal_error": 0,
+      "volatile_overlay": {}
+    },
+    {
+      "accepted_sequence": 23,
+      "dirty_ram_bytes": 0,
+      "dirty_ssd_capacity_bytes": 536870912,
+      "dirty_ssd_operations": 4,
+      "dirty_ssd_reserved_bytes": 134839062,
+      "local_sequence": 23,
+      "monotonic_seconds": 937818.202139117,
+      "remote_bytes_completed_total": 69473961,
+      "remote_sequence": 19,
+      "retries_total": 0,
+      "ssd_admission_paced": 0,
+      "terminal_error": 0,
+      "volatile_overlay": {}
+    },
+    {
+      "accepted_sequence": 23,
+      "dirty_ram_bytes": 0,
+      "dirty_ssd_capacity_bytes": 536870912,
+      "dirty_ssd_operations": 3,
+      "dirty_ssd_reserved_bytes": 101142100,
+      "local_sequence": 23,
+      "monotonic_seconds": 937818.319489576,
+      "remote_bytes_completed_total": 103145843,
+      "remote_sequence": 20,
+      "retries_total": 0,
+      "ssd_admission_paced": 0,
+      "terminal_error": 0,
+      "volatile_overlay": {}
+    },
+    {
+      "accepted_sequence": 23,
+      "dirty_ram_bytes": 0,
+      "dirty_ssd_capacity_bytes": 536870912,
+      "dirty_ssd_operations": 3,
+      "dirty_ssd_reserved_bytes": 101142100,
+      "local_sequence": 23,
+      "monotonic_seconds": 937818.442434894,
+      "remote_bytes_completed_total": 103145843,
+      "remote_sequence": 20,
+      "retries_total": 0,
+      "ssd_admission_paced": 0,
+      "terminal_error": 0,
+      "volatile_overlay": {}
+    },
+    {
+      "accepted_sequence": 23,
+      "dirty_ram_bytes": 0,
+      "dirty_ssd_capacity_bytes": 536870912,
+      "dirty_ssd_operations": 3,
+      "dirty_ssd_reserved_bytes": 101142100,
+      "local_sequence": 23,
+      "monotonic_seconds": 937818.548653484,
+      "remote_bytes_completed_total": 103145843,
+      "remote_sequence": 20,
+      "retries_total": 0,
+      "ssd_admission_paced": 0,
+      "terminal_error": 0,
+      "volatile_overlay": {}
+    },
+    {
+      "accepted_sequence": 23,
+      "dirty_ram_bytes": 0,
+      "dirty_ssd_capacity_bytes": 536870912,
+      "dirty_ssd_operations": 3,
+      "dirty_ssd_reserved_bytes": 101142100,
+      "local_sequence": 23,
+      "monotonic_seconds": 937818.656192413,
+      "remote_bytes_completed_total": 103145843,
+      "remote_sequence": 20,
+      "retries_total": 0,
+      "ssd_admission_paced": 0,
+      "terminal_error": 0,
+      "volatile_overlay": {}
+    },
+    {
+      "accepted_sequence": 23,
+      "dirty_ram_bytes": 0,
+      "dirty_ssd_capacity_bytes": 536870912,
+      "dirty_ssd_operations": 3,
+      "dirty_ssd_reserved_bytes": 101142100,
+      "local_sequence": 23,
+      "monotonic_seconds": 937818.761677314,
+      "remote_bytes_completed_total": 103145843,
+      "remote_sequence": 20,
+      "retries_total": 0,
+      "ssd_admission_paced": 0,
+      "terminal_error": 0,
+      "volatile_overlay": {}
+    },
+    {
+      "accepted_sequence": 23,
+      "dirty_ram_bytes": 0,
+      "dirty_ssd_capacity_bytes": 536870912,
+      "dirty_ssd_operations": 1,
+      "dirty_ssd_reserved_bytes": 33722953,
+      "local_sequence": 23,
+      "monotonic_seconds": 937818.876788386,
+      "remote_bytes_completed_total": 170514830,
+      "remote_sequence": 22,
+      "retries_total": 0,
+      "ssd_admission_paced": 0,
+      "terminal_error": 0,
+      "volatile_overlay": {}
+    },
+    {
+      "accepted_sequence": 27,
+      "dirty_ram_bytes": 32801842,
+      "dirty_ssd_capacity_bytes": 536870912,
+      "dirty_ssd_operations": 1,
+      "dirty_ssd_reserved_bytes": 66625115,
+      "local_sequence": 23,
+      "monotonic_seconds": 937818.97927615,
+      "remote_bytes_completed_total": 170514830,
+      "remote_sequence": 22,
+      "retries_total": 0,
+      "ssd_admission_paced": 0,
+      "terminal_error": 0,
+      "volatile_overlay": {}
+    },
+    {
+      "accepted_sequence": 32,
+      "dirty_ram_bytes": 0,
+      "dirty_ssd_capacity_bytes": 536870912,
+      "dirty_ssd_operations": 9,
+      "dirty_ssd_reserved_bytes": 33185331,
+      "local_sequence": 32,
+      "monotonic_seconds": 937819.081438519,
+      "remote_bytes_completed_total": 204212703,
+      "remote_sequence": 23,
+      "retries_total": 0,
+      "ssd_admission_paced": 0,
+      "terminal_error": 0,
+      "volatile_overlay": {}
+    },
+    {
+      "accepted_sequence": 32,
+      "dirty_ram_bytes": 0,
+      "dirty_ssd_capacity_bytes": 536870912,
+      "dirty_ssd_operations": 0,
+      "dirty_ssd_reserved_bytes": 0,
+      "local_sequence": 32,
+      "monotonic_seconds": 937819.183322816,
+      "remote_bytes_completed_total": 237172352,
+      "remote_sequence": 32,
+      "retries_total": 0,
+      "ssd_admission_paced": 0,
+      "terminal_error": 0,
+      "volatile_overlay": {}
+    }
+  ]
+}

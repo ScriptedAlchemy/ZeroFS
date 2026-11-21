@@ -22,7 +22,7 @@ ZeroFS differentiates itself from other "filesystem on S3" projects by:
 - Reaching near-raw-S3 throughput on large files, and scaling to workloads of hundreds of millions of small files
 - Handling tens of thousands of requests per second
 - Requiring no external database service (everything is stored on S3)
-- Being well tested (in CI we run [pjdfstest](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [xfstests](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [kernel builds](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [stress-ng](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [ZFS](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [Jepsen local-fs](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [Jepsen HA](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), and more)
+- Being well tested (in CI we run [pjdfstest](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [xfstests](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [kernel builds](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [stress-ng](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [Jepsen local-fs](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [Jepsen HA](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), and more)
 
 
 
@@ -34,7 +34,7 @@ ZeroFS differentiates itself from other "filesystem on S3" projects by:
 | **Compression** | zstd or lz4, before encryption. Codec changeable at any time without migration. |
 | **Caching** | Memory and disk tiers. |
 | **High availability** | Optional leader/standby over the same bucket for automatic failover. |
-| **Web UI** | File manager, dashboard, in-browser terminal. |
+| **Web UI** | File manager, live dashboard, read-only pool status, in-browser terminal. |
 | **Backends** | Amazon S3, Google Cloud Storage, Azure Blob, any S3-compatible store, local disk. |
 
 ## Quick Start
@@ -87,6 +87,38 @@ zerofs init            # Generate zerofs.toml
 $EDITOR zerofs.toml    # Set S3 credentials
 zerofs run -c zerofs.toml
 ```
+
+#### Exit status
+
+`zerofs run` exits with status 0 after a clean shutdown and with status 1 after
+an ordinary failure, such as a port in use, a config file that does not parse,
+an unreachable backend, a held lock or a rejected startup memory admission. A
+supervisor may restart the server after status 1.
+
+Status 10 means the server refuses to serve until a person decides what to do.
+Restarting refuses again, and serving anyway could lose acknowledged writes or
+mix up data. The error and its causes come first, and the last line on stderr
+is `zerofs stopped: this failure needs an operator decision, and restarting
+will refuse again`. A supervisor should stop restarting the server and alert an
+operator. The server exits with status 10 when:
+
+- the writeback journal database is damaged, is shorter than its last durable
+  commit describes, contradicts itself on reopen (a missing sequence or
+  committed blob), or belongs to another volume;
+- the local metadata store fails with a non-transient I/O error (EIO, EROFS,
+  EACCES and similar), at startup or while serving. A full metadata disk is not
+  in this class, and the server waits for space;
+- the pool catalog is missing, has no identity, was moved or copied, belongs to
+  another pool, did not finish `zerofs pool init`, or uses an unsupported format;
+- the pool authority marker or a member's identity marker is missing, oversized
+  or different, or a volume with a pool is opened without `[storage.pool]`;
+- strict storage readiness finds a different device serial, filesystem
+  identity or backing device set than the configuration declares, or a boot
+  device under a storage role;
+- the stored key envelope cannot be decoded, or its filesystem name mode
+  differs from the configured one.
+
+Other subcommands never exit with status 10.
 
 ### Direct file transfers (no mount)
 
@@ -197,7 +229,6 @@ supports x86-64 and little-endian arm64. See the
 - **[xfstests](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: the standard filesystem regression suite, over NFS, 9P, and FUSE.
 - **[Kernel build](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: the Linux kernel compiles with `make -j$(nproc)` on NFS, 9P, and FUSE mounts.
 - **[stress-ng](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: file-handling stressors run concurrently against live mounts.
-- **[ZFS](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: a ZFS pool on ZeroFS block devices; kernel source extraction, then a scrub.
 - **[Jepsen local-fs](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: random operation histories against a 9P mount, checked against a reference model ([local-fs](https://github.com/jepsen-io/local-fs)). A crash mode kills the server mid-run and verifies recovery matches the last fsync.
 - **[Jepsen HA](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: a Connected leader/standby pair over MinIO under a nemesis that kills or pauses nodes; no acknowledged write may be lost, resurrected, or corrupted across the tested failovers. The local-fs model checker also runs with failovers injected.
 - **[Deterministic simulation](https://github.com/Barre/ZeroFS/actions/workflows/rust.yml)**: data, namespace, segment-GC, and compaction paths run in a simulated world ([`zerofs/tests/dst`](https://github.com/Barre/ZeroFS/tree/main/zerofs/tests/dst)): virtual time, seeded storage latencies and transient faults, and crashes at arbitrary await points or narrow failpoint windows. Recovery is checked against byte-level and namespace reference models, a full metadata consistency scan, segment-accounting reconciliation, and an authoritative footprint scan. One seed is one exact schedule, so a failure reproduces identically.
@@ -224,7 +255,7 @@ The file manager speaks 9P over WebSocket. Drag-and-drop uploads work, including
   width="700">
 </p>
 
-The dashboard streams stats over gRPC-web, plus a file access tracer.
+The dashboard streams filesystem statistics and file-access events over gRPC-web. Open **Storage** for per-member capacity, health, and affected paths.
 
 <p align="center">
     <img src="https://raw.githubusercontent.com/Barre/ZeroFS/refs/heads/main/assets/webui/terminal.png" alt="ZeroFS Web UI Terminal"
@@ -291,6 +322,8 @@ A `[replication]` section runs a leader and a standby backed by the same bucket;
 ## Configuration
 
 TOML with `$VAR`/`${VAR}` environment substitution; all referenced variables must be set. `[cache]`, `[storage]`, and `[servers]` are required. Full option reference: [Configuration Guide](https://www.zerofs.net/configuration).
+
+The raw-parts read cache starts cold after every server restart and refills from storage as data is read. Its configured disk capacity remains available for caching during the new process. See [clean-cache recovery](docs/clean-cache-recovery.md) for the correctness rationale, migration behavior, and performance tradeoff.
 
 ```toml
 [cache]
@@ -444,8 +477,6 @@ nbd-client 127.0.0.1 10809 /dev/nbd0 -N device1 -persist -timeout 600 -connectio
 nbd-client -unix /tmp/zerofs.nbd.sock /dev/nbd1 -N device1 -persist -timeout 600 -connections 4
 
 mkfs.ext4 /dev/nbd0
-# or
-zpool create mypool /dev/nbd0
 ```
 
 The handshake advertises FLUSH, FUA, and multi-connection support. FLUSH and FUA on WRITE/TRIM wait for the configured ZeroFS client-flush barrier, and a FLUSH on any connection covers completed writes from every connection. With persistent writeback enabled, this is a local-journal barrier and does not imply that remote publication has completed. Details: [NBD devices](https://www.zerofs.net/nbd-devices).
@@ -457,7 +488,6 @@ New device files are picked up at runtime. Sizes are fixed at creation: to resiz
 ```bash
 fstrim /mnt/block                    # Manual
 mount -o discard /dev/nbd0 /mnt/block  # Automatic (filesystems)
-zpool set autotrim=on mypool         # Automatic (ZFS)
 ```
 
 TRIM deletes extent pointers and debits each segment's live-byte counter; a GC pass every 60 seconds deletes dead segments and repacks fragmented ones, reclaiming the space in S3.

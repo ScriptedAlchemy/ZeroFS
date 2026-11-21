@@ -1,3 +1,5 @@
+pub(crate) mod write_ack;
+
 use crate::config::WebUIConfig;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
@@ -7,8 +9,9 @@ use crate::fs::{VerifiedFileContent, VerifiedFileExpectation, VerifiedRenameOutc
 use crate::ninep::handler::{NinePHandler, SessionReleaseGuard};
 use crate::ninep::lock_manager::FileLockManager;
 use crate::ninep::server::{
-    InflightRegistry, P9AcceptedWorkTracker, P9GlobalAdmission, P9Response, P9TransportPermit,
-    dispatch_9p_frame, response_may_be_emitted, settle_request_tasks,
+    ConnectionContext, InflightRegistry, P9AcceptedWorkTracker, P9GlobalAdmission, P9PendingFrames,
+    P9Response, P9TransportPermit, response_may_be_emitted, settle_request_tasks,
+    with_response_authority,
 };
 use crate::rpc::proto;
 use crate::rpc::server::AdminRpcServer;
@@ -266,22 +269,26 @@ async fn handle_9p_ws(
     // Abort on early exit; normal teardown drains responses for a bounded interval.
     let mut writer = AbortOnDropHandle::new(spawn_named("9p-ws-writer", async move {
         use futures::SinkExt;
+        let _cancel_connection_on_exit = writer_authority_lost.clone().drop_guard();
         while let Some(response) = rx.recv().await {
             let (tag, response_bytes, admission) = response.into_guarded_parts();
-            if !response_may_be_emitted(&response_db, &response_bytes) {
-                warn!(
-                    "Dropping successful WebSocket 9P response for tag {tag} after serving \
-                     authority was lost; closing the connection"
-                );
-                writer_authority_lost.cancel();
-                break;
-            }
-            if ws_tx
-                .send(WsMessage::Binary(response_bytes.into()))
-                .await
-                .is_err()
+            let response_bytes = bytes::Bytes::from(response_bytes);
+            match with_response_authority(
+                ws_tx.send(WsMessage::Binary(response_bytes.clone())),
+                || response_may_be_emitted(&response_db, &response_bytes),
+            )
+            .await
             {
-                break;
+                None => {
+                    warn!(
+                        "Dropping successful WebSocket 9P response for tag {tag} after serving \
+                         authority was lost; closing the connection"
+                    );
+                    writer_authority_lost.cancel();
+                    break;
+                }
+                Some(Err(_)) => break,
+                Some(Ok(())) => {}
             }
             *writer_activity.lock().unwrap() = tokio::time::Instant::now();
             drop(admission);
@@ -289,24 +296,38 @@ async fn handle_9p_ws(
     }));
 
     use futures::StreamExt;
+    let context = ConnectionContext {
+        handler: &handler,
+        tx: &tx,
+        inflight: &inflight,
+        admission: &admission,
+        requests: &requests,
+        connection_shutdown: &response_authority_lost,
+        process_shutdown: &state.shutdown,
+    };
+    let mut pending = None;
     loop {
-        let admit = P9GlobalAdmission::shared().admit_websocket_receive(&state.shutdown);
-        let receive = tokio::select! {
-            biased;
-            _ = wait_for_idle_expiry(&last_activity, idle_timeout.unwrap_or_default()),
-                if idle_timeout.is_some() =>
-            {
-                reaped_idle = true;
-                break;
-            }
-            receive = admit => match receive {
-                Ok(receive) => receive,
-                Err(error) => {
-                    debug!("9P WebSocket receive admission ended: {error}");
+        if pending.is_none() {
+            let admit = P9GlobalAdmission::shared().admit_websocket_receive(&state.shutdown);
+            let receive = tokio::select! {
+                biased;
+                _ = response_authority_lost.cancelled() => break,
+                _ = wait_for_idle_expiry(&last_activity, idle_timeout.unwrap_or_default()),
+                    if idle_timeout.is_some() =>
+                {
+                    reaped_idle = true;
                     break;
                 }
-            },
-        };
+                receive = admit => match receive {
+                    Ok(receive) => receive,
+                    Err(error) => {
+                        debug!("9P WebSocket receive admission ended: {error}");
+                        break;
+                    }
+                },
+            };
+            pending = Some(P9PendingFrames::new(receive));
+        }
         let next = tokio::select! {
             biased;
             _ = state.shutdown.cancelled() => {
@@ -314,7 +335,7 @@ async fn handle_9p_ws(
                 break;
             }
             _ = response_authority_lost.cancelled() => {
-                debug!("9P WebSocket handler closing after serving authority loss");
+                debug!("9P WebSocket handler closing after its response writer ended");
                 break;
             }
             _ = wait_for_idle_expiry(&last_activity, idle_timeout.unwrap_or_default()),
@@ -330,18 +351,21 @@ async fn handle_9p_ws(
         }
         match next {
             Some(Ok(WsMessage::Binary(data))) => {
-                if let Err(e) = dispatch_9p_frame(
-                    data,
-                    &handler,
-                    &tx,
-                    &inflight,
-                    &admission,
-                    &requests,
-                    &state.shutdown,
-                    &state.shutdown,
-                )
-                .await
-                {
+                let dispatch = pending
+                    .as_ref()
+                    .expect("receive credit acquired")
+                    .dispatch(data, &context);
+                let result = tokio::select! {
+                    biased;
+                    _ = wait_for_idle_expiry(&last_activity, idle_timeout.unwrap_or_default()),
+                        if idle_timeout.is_some() =>
+                    {
+                        reaped_idle = true;
+                        break;
+                    }
+                    result = dispatch => result,
+                };
+                if let Err(e) = result {
                     error!("9P WebSocket dispatch error: {}", e);
                     break;
                 }
@@ -356,8 +380,8 @@ async fn handle_9p_ws(
             }
             _ => {} // ping/pong/text ignored
         }
-        drop(receive);
     }
+    drop(pending);
 
     if reaped_idle {
         metrics::counter!("zerofs_p9_ws_idle_sessions_reaped_total").increment(1);
@@ -492,6 +516,7 @@ fn upload_auth(state: &AppState) -> AuthContext {
         gid_known: true,
         gids: Vec::new(),
         groups_complete: true,
+        groups_truncated: false,
     }
 }
 
@@ -521,10 +546,12 @@ async fn upload_writeback_preflight(
 
 fn upload_fs_error(error: FsError) -> axum::response::Response {
     let status = match error {
-        FsError::NotFound | FsError::StaleHandle => StatusCode::NOT_FOUND,
+        FsError::NotFound | FsError::StaleHandle | FsError::NoData => StatusCode::NOT_FOUND,
         FsError::PermissionDenied
         | FsError::OperationNotPermitted
         | FsError::ReadOnlyFilesystem => StatusCode::FORBIDDEN,
+        FsError::TooBig => StatusCode::PAYLOAD_TOO_LARGE,
+        FsError::Range | FsError::NotSupported => StatusCode::BAD_REQUEST,
         FsError::Exists => StatusCode::CONFLICT,
         FsError::IsDirectory
         | FsError::NotDirectory
@@ -611,7 +638,16 @@ async fn upload_resolve_existing_entry(
     for component in dirs {
         dir = fs.lookup(creds, dir, component).await?;
     }
+    // The cookie lookup itself is internal and does not authorize pathname
+    // traversal. Hold the parent lock while checking its search permission
+    // and reading the final entry identity so chmod or replacement cannot
+    // separate that authorization from the identity retained by the caller.
+    let _parent_guard = fs.lock_manager.acquire(dir).await;
+    let expected = fs.lookup(creds, dir, &name[0]).await?;
     let (file, cookie) = fs.entry_identity(dir, &name[0]).await?;
+    if file != expected {
+        return Err(FsError::StaleHandle);
+    }
     Ok((dir, file, cookie))
 }
 
@@ -632,6 +668,10 @@ fn upload_admit_request(state: &AppState) -> Result<Arc<UploadRequestGuard>, FsE
     state.upload_ingress.try_request()
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "the error is the HTTP response the handler returns as it is"
+)]
 async fn upload_next_body_data(
     state: &AppState,
     body: &mut axum::body::Body,
@@ -930,7 +970,7 @@ fn upload_parse_sha256(value: &str) -> Option<[u8; 32]> {
         return None;
     }
     let mut digest = [0u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let pair = std::str::from_utf8(pair).ok()?;
         digest[index] = u8::from_str_radix(pair, 16).ok()?;
     }
@@ -1065,6 +1105,10 @@ async fn upload_assemble_segments(
     Ok(resolved_segments)
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "the error is the HTTP response the handler returns as it is"
+)]
 async fn upload_read_commit_request(
     state: &AppState,
     body: &mut axum::body::Body,
@@ -1301,11 +1345,17 @@ fn serve_asset(path: &str) -> axum::response::Response {
     }
 }
 
+/// Administration services installed alongside the file transport routes.
+pub struct AdminServices {
+    pub rpc: AdminRpcServer,
+    pub settings: Router,
+}
+
 pub fn start(
     config: &WebUIConfig,
     filesystem: Arc<ZeroFS>,
     lock_manager: Arc<FileLockManager>,
-    rpc_service: AdminRpcServer,
+    admin: AdminServices,
     shutdown: CancellationToken,
     accepted_work: P9AcceptedWorkTracker,
     writeback: Option<WritebackObjectStore>,
@@ -1327,7 +1377,7 @@ pub fn start(
     };
 
     // gRPC-web: wrap tonic service with GrpcWebService + CORS
-    let grpc_service = proto::admin_service_server::AdminServiceServer::new(rpc_service);
+    let grpc_service = proto::admin_service_server::AdminServiceServer::new(admin.rpc);
     let grpc_web_service = tower::ServiceBuilder::new()
         .layer(
             CorsLayer::new()
@@ -1348,7 +1398,8 @@ pub fn start(
         // Static assets and SPA fallback
         .route("/{*path}", get(serve_spa))
         .route("/", get(serve_index))
-        .with_state(state);
+        .with_state(state)
+        .merge(admin.settings);
 
     let mut handles = Vec::new();
     for &addr in &config.addresses {
@@ -1624,7 +1675,11 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn wasm_client_smoke() {
-        let filesystem = Arc::new(ZeroFS::new_in_memory().await.expect("in-memory filesystem"));
+        let filesystem = Arc::new(
+            ZeroFS::new_in_memory_with_name_mode(crate::fs::name_mode::NameMode::Insensitive)
+                .await
+                .expect("case-insensitive in-memory filesystem"),
+        );
         let state = SmokeState {
             app: AppState {
                 filesystem,
@@ -1810,6 +1865,328 @@ mod tests {
             write!(hex, "{byte:02x}").unwrap();
         }
         hex
+    }
+
+    async fn upload_private_source_fixture() -> (Arc<ZeroFS>, Router, InodeId, InodeId) {
+        use crate::fs::types::SetMode;
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let auth = AuthContext::default();
+        let creds = Credentials::from_auth_context(&auth);
+        let private = filesystem
+            .mkdir(
+                &creds,
+                0,
+                b"private",
+                &SetAttributes {
+                    mode: SetMode::Set(0o700),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .0;
+        let secret = filesystem
+            .create(
+                &creds,
+                private,
+                b"secret",
+                &SetAttributes {
+                    mode: SetMode::Set(0o644),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .0;
+        filesystem
+            .write(
+                &auth,
+                secret,
+                0,
+                &bytes::Bytes::from_static(b"private payload"),
+            )
+            .await
+            .unwrap();
+        let app = Router::new().merge(upload_router()).with_state(AppState {
+            filesystem: Arc::clone(&filesystem),
+            lock_manager: Arc::new(FileLockManager::new()),
+            uid: 1000,
+            gid: 1000,
+            shutdown: CancellationToken::new(),
+            ws_drain: TaskTracker::new(),
+            accepted_work: P9AcceptedWorkTracker::new(),
+            p9_idle_timeout: None,
+            upload_write_permits: upload_write_permits(),
+            upload_ingress: upload_ingress(),
+            writeback: None,
+        });
+        (filesystem, app, private, secret)
+    }
+
+    #[tokio::test]
+    async fn upload_status_requires_parent_search_but_not_file_read_access() {
+        use crate::fs::types::SetMode;
+        let (filesystem, app, private, secret) = upload_private_source_fixture().await;
+        let (status, body) = upload_request(
+            &app,
+            "GET",
+            "/api/v1/upload/private/secret/status",
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+        // Status exposes ordinary path metadata: parent search is required,
+        // while reading the file's contents is a separate permission.
+        let creds = Credentials::from_auth_context(&AuthContext::default());
+        for (inode, mode) in [(private, 0o711), (secret, 0)] {
+            filesystem
+                .setattr(
+                    &creds,
+                    inode,
+                    &SetAttributes {
+                        mode: SetMode::Set(mode),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let (status, body) = upload_request(
+            &app,
+            "GET",
+            "/api/v1/upload/private/secret/status",
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["size"], b"private payload".len() as u64);
+    }
+
+    #[tokio::test]
+    async fn upload_assembly_rejects_sources_inside_unsearchable_directories() {
+        use crate::fs::types::{SetGid, SetMode, SetUid};
+        let (filesystem, app, private, secret) = upload_private_source_fixture().await;
+        let auth = AuthContext::default();
+        let creds = Credentials::from_auth_context(&auth);
+        let public = filesystem
+            .mkdir(
+                &creds,
+                0,
+                b"public",
+                &SetAttributes {
+                    mode: SetMode::Set(0o777),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .0;
+        let target = filesystem
+            .create(
+                &creds,
+                public,
+                b"target",
+                &SetAttributes {
+                    mode: SetMode::Set(0o600),
+                    uid: SetUid::Set(1000),
+                    gid: SetGid::Set(1000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .0;
+        filesystem
+            .write(
+                &auth,
+                target,
+                0,
+                &bytes::Bytes::from_static(b"keep this staging file"),
+            )
+            .await
+            .unwrap();
+        let commit = serde_json::json!({
+            "size": b"private payload".len(),
+            "sha256": sha256_hex(b"private payload"),
+            "assemble_from": ["/private/secret"],
+        });
+        let (status, body) = upload_request(
+            &app,
+            "POST",
+            "/api/v1/upload/public/target/commit",
+            serde_json::to_vec(&commit).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(
+            filesystem
+                .read_file(&auth, target, 0, 1024)
+                .await
+                .unwrap()
+                .0
+                .as_ref(),
+            b"keep this staging file"
+        );
+        assert_eq!(
+            filesystem.lookup(&creds, private, b"secret").await,
+            Ok(secret)
+        );
+
+        filesystem
+            .setattr(
+                &creds,
+                private,
+                &SetAttributes {
+                    mode: SetMode::Set(0o711),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let (status, body) = upload_request(
+            &app,
+            "POST",
+            "/api/v1/upload/public/target/commit",
+            serde_json::to_vec(&commit).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["verified"], true);
+        assert_eq!(
+            filesystem
+                .read_file(&auth, target, 0, 1024)
+                .await
+                .unwrap()
+                .0
+                .as_ref(),
+            b"private payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_in_place_commit_does_not_require_namespace_mutation_access() {
+        use crate::fs::types::SetMode;
+
+        // An existing writable file remains writable in a non-writable parent,
+        // or in a sticky directory where this identity cannot remove it.
+        for parent_mode in [0o555, 0o1777] {
+            let (filesystem, app, parent, file) = upload_private_source_fixture().await;
+            let root = AuthContext::default();
+            let root_creds = Credentials::from_auth_context(&root);
+            for (inode, mode) in [(parent, parent_mode), (file, 0o666)] {
+                filesystem
+                    .setattr(
+                        &root_creds,
+                        inode,
+                        &SetAttributes {
+                            mode: SetMode::Set(mode),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            let payload = b"replacement contents";
+            let (status, body) = upload_request(
+                &app,
+                "PUT",
+                "/api/v1/upload/private/secret?offset=0",
+                payload.to_vec(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "parent={parent_mode:o}: {body}");
+
+            let auth = AuthContext {
+                uid: 1000,
+                gid: 1000,
+                gid_known: true,
+                gids: Vec::new(),
+                groups_complete: true,
+                groups_truncated: false,
+            };
+            assert!(
+                matches!(
+                    filesystem
+                        .rename(&auth, parent, b"secret", parent, b"secret")
+                        .await,
+                    Err(FsError::PermissionDenied | FsError::OperationNotPermitted)
+                ),
+                "ordinary same-name rename must retain namespace authorization"
+            );
+            let mut commit = serde_json::json!({
+                "size": payload.len(),
+                "sha256": sha256_hex(payload),
+                "publish_to": "/private/published",
+            });
+            let (status, body) = upload_request(
+                &app,
+                "POST",
+                "/api/v1/upload/private/secret/commit",
+                serde_json::to_vec(&commit).unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert_eq!(
+                filesystem.lookup(&root_creds, parent, b"published").await,
+                Err(FsError::NotFound)
+            );
+
+            commit.as_object_mut().unwrap().remove("publish_to");
+            let (status, body) = upload_request(
+                &app,
+                "POST",
+                "/api/v1/upload/private/secret/commit",
+                serde_json::to_vec(&commit).unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "parent={parent_mode:o}: {body}");
+            assert_eq!(body["verified"], true);
+            assert_eq!(body["sha256"], sha256_hex(payload));
+            assert_eq!(
+                filesystem.lookup(&root_creds, parent, b"secret").await,
+                Ok(file)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_in_place_commit_requires_parent_search_and_file_read() {
+        use crate::fs::types::SetMode;
+
+        for (parent_mode, file_mode) in [(0o700, 0o666), (0o555, 0o222)] {
+            let (filesystem, app, parent, file) = upload_private_source_fixture().await;
+            let creds = Credentials::from_auth_context(&AuthContext::default());
+            for (inode, mode) in [(parent, parent_mode), (file, file_mode)] {
+                filesystem
+                    .setattr(
+                        &creds,
+                        inode,
+                        &SetAttributes {
+                            mode: SetMode::Set(mode),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            let commit = serde_json::json!({
+                "size": b"private payload".len(),
+                "sha256": sha256_hex(b"private payload"),
+            });
+            let (status, body) = upload_request(
+                &app,
+                "POST",
+                "/api/v1/upload/private/secret/commit",
+                serde_json::to_vec(&commit).unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(
+                body.get("sha256").is_none(),
+                "denied contents must not be hashed"
+            );
+        }
     }
 
     #[tokio::test]

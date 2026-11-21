@@ -10,10 +10,20 @@ from dataclasses import dataclass
 from typing import Iterable
 
 
+# Each repository is followed by its GitHub mirror. kernel.org sometimes stops
+# answering a hosted runner, and the mirror carries the same release tags.
 TAG_REPOSITORIES = (
-    "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git",
-    "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git",
+    (
+        "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git",
+        "https://github.com/torvalds/linux.git",
+    ),
+    (
+        "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git",
+        "https://github.com/gregkh/linux.git",
+    ),
 )
+# Two repositories and two sources each must fit the job's five minutes.
+TAG_FETCH_TIMEOUT_SECONDS = 60
 VERSION_PATTERN = re.compile(
     r"^v?(?P<major>[1-9][0-9]*)\.(?P<minor>[0-9]+)"
     r"(?:\.(?P<patch>[0-9]+))?(?:-rc(?P<rc>[1-9][0-9]*))?$"
@@ -110,16 +120,28 @@ def resolve_matrix(tags: Iterable[str]) -> dict[str, list[dict[str, object]]]:
 
 def fetch_tags() -> set[str]:
     tags: set[str] = set()
-    for repository in TAG_REPOSITORIES:
-        result = subprocess.run(
-            ["git", "ls-remote", "--refs", "--tags", repository],
-            check=True,
-            stdout=subprocess.PIPE,
-            text=True,
-            timeout=120,
-        )
-        tags.update(parse_tag_refs(result.stdout))
+    for sources in TAG_REPOSITORIES:
+        tags.update(fetch_repository_tags(sources))
     return tags
+
+
+def fetch_repository_tags(sources: Iterable[str]) -> set[str]:
+    failure: Exception | None = None
+    for source in sources:
+        try:
+            result = subprocess.run(
+                ["git", "ls-remote", "--refs", "--tags", source],
+                check=True,
+                stdout=subprocess.PIPE,
+                text=True,
+                timeout=TAG_FETCH_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            print(f"upstream_kernels.py: {source}: {error}", file=sys.stderr)
+            failure = error
+            continue
+        return parse_tag_refs(result.stdout)
+    raise ResolutionError(f"no source answered for the release tags: {failure}")
 
 
 def main() -> int:

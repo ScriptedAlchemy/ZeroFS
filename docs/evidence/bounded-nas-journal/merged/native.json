@@ -1,0 +1,57 @@
+{
+  "source": "f1fc225a0509a15e33bfa146335d442407e57cc5",
+  "upstream": "c8556d63dc3af373cf1a1648d37f1766eb6870b5",
+  "engine_sha256": "bd87fd6e387afb775d5d7805e45b79b2d8c14854461c5ae88283fe4d1d3f83ee",
+  "webui_artifact_id": 14478670251,
+  "webui_sha256": "fe0892b89732e7cd0f7a3616a65058263d79f3ec9656b8e58153be479e50a5ea",
+  "runtime_image": "sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b",
+  "kernel": "Linux ubuntu-main 7.0.0-28-generic #28~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC Wed Jul  1 15:50:57 UTC 2 x86_64 x86_64 x86_64 GNU/Linux",
+  "rustc": "1.92.0",
+  "cases": {
+    "replay": {
+      "memory.max": 8589934592,
+      "memory.swap.max": 0,
+      "cpu.max": "200000 100000",
+      "memory.peak": 1424732160,
+      "memory.events": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0,
+        "sock_throttled": 0
+      }
+    },
+    "pressure": {
+      "memory.max": 8589934592,
+      "memory.swap.max": 0,
+      "cpu.max": "200000 100000",
+      "memory.peak": 2332876800,
+      "memory.events": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0,
+        "sock_throttled": 0
+      }
+    },
+    "disk": {
+      "memory.max": 8589934592,
+      "memory.swap.max": 0,
+      "cpu.max": "200000 100000",
+      "memory.peak": 1379737600,
+      "memory.events": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0,
+        "sock_throttled": 0
+      }
+    }
+  }
+}

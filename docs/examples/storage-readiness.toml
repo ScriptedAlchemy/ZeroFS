@@ -1,0 +1,82 @@
+[cache]
+dir = "/fixture/fast/cache"
+disk_size_gb = 1.0
+memory_size_gb = 0.125
+
+[storage]
+url = "file:///fixture/durable/authority"
+encryption_password = "synthetic-example-password"
+
+[storage.pool]
+catalog_dir = "/fixture/durable/catalog"
+
+[[storage.pool.members]]
+id = "data"
+url = "file:///fixture/durable/data"
+capacity_gb = 8.0
+reserve_free_gb = 1.0
+
+[storage.readiness]
+strict = true
+authority = "durable"
+catalog = "durable"
+cache = "fast"
+journal = "fast"
+
+[storage.readiness.members]
+data = "durable"
+
+[[storage.readiness.filesystems]]
+id = "durable"
+profile = "hdd-smr"
+mountpoint = "/fixture/durable"
+identity = { kind = "uuid", uuid = "0f5e7c2a-8b1d-4c3e-9a6f-2b4d6e8f0a1c" }
+
+[[storage.readiness.filesystems]]
+id = "fast"
+profile = "nvme"
+mountpoint = "/fixture/fast"
+identity = { kind = "uuid", uuid = "47166772-65c1-4ecf-8066-935452891add" }
+
+[[storage.readiness.reserves]]
+filesystem = "durable"
+bytes = 1000000000
+
+[[storage.readiness.reserves]]
+filesystem = "fast"
+bytes = 1000000000
+
+[[storage.readiness.devices]]
+serial = "EXAMPLE-HDD-0001"
+by_id = "/dev/disk/by-id/ata-EXAMPLE-HDD-0001"
+profile = "hdd-smr"
+roles = ["authority", "catalog", "member data"]
+boot = false
+
+[[storage.readiness.devices]]
+serial = "EXAMPLE-NVME-0001"
+by_id = "/dev/disk/by-id/nvme-EXAMPLE-NVME-0001"
+profile = "nvme"
+roles = ["cache", "journal"]
+boot = false
+rated_host_writes = { bytes = 220000000000000, source = "Synthetic vendor lifetime host-write rating" }
+
+[[storage.readiness.devices]]
+serial = "EXAMPLE-BOOT-0001"
+by_id = "/dev/disk/by-id/ata-EXAMPLE-BOOT-0001"
+profile = "hdd-cmr"
+roles = []
+boot = true
+
+[writeback]
+enabled = true
+dir = "/fixture/fast/journal"
+ack_mode = "ssd"
+memory_size_gb = 0.125
+disk_size_gb = 2.0
+min_free_gb = 1.0
+
+[servers]
+
+[telemetry]
+enabled = false

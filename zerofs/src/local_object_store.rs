@@ -20,7 +20,9 @@
 //! pool starvation. File publication and ETag generation remain the upstream
 //! implementation, preserving the existing on-disk layout and read semantics.
 
+mod listing;
 pub(crate) mod pool;
+mod worker;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -38,25 +40,40 @@ use std::fmt::{self, Display, Formatter};
 use std::fs::{File, OpenOptions};
 use std::ops::Range;
 use std::path::{Path as FsPath, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
-use tokio::sync::{Semaphore, oneshot};
+#[cfg(test)]
+use tokio::sync::oneshot;
+use worker::run_local;
 
 const STORE: &str = "LocalConditionalStore";
-const LOCK_FILE: &str = ".zerofs-local-mutations#0";
-const MAX_WORKERS: usize = 32;
+pub(crate) const LOCK_FILE: &str = ".zerofs-local-mutations#0";
 
 /// The same absolute object paths as `LocalFileSystem::new()`, with durable CAS.
 #[derive(Clone, Debug)]
 pub(crate) struct LocalConditionalStore {
     inner: LocalFileSystem,
+    readiness_root: Option<PathBuf>,
 }
 
 impl LocalConditionalStore {
     pub(crate) fn new() -> Self {
         Self {
             inner: LocalFileSystem::new().with_fsync(true),
+            readiness_root: None,
         }
+    }
+
+    pub(crate) fn with_readiness_root(mut self, root: PathBuf) -> Self {
+        self.readiness_root = Some(root);
+        self
+    }
+
+    fn check_location(&self, location: &Path) -> Result<()> {
+        check_readiness_path(
+            self.readiness_root.as_deref(),
+            &self.inner.path_to_filesystem(location)?,
+        )
     }
 }
 
@@ -71,6 +88,19 @@ fn generic(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Error
         store: STORE,
         source: source.into(),
     }
+}
+
+/// Recheck every existing component before LocalFileSystem opens a path.
+/// Replacements after this check can still race the path-based open.
+fn check_readiness_path(root: Option<&FsPath>, path: &FsPath) -> Result<()> {
+    if let Some(root) = root {
+        crate::storage_readiness::paths::existing_ancestor(root, path).map_err(generic)?;
+        if let Some(parent) = path.parent() {
+            crate::storage_readiness::paths::existing_ancestor(root, &parent.join(LOCK_FILE))
+                .map_err(generic)?;
+        }
+    }
+    Ok(())
 }
 
 /// LocalFileSystem's directory durability guarantee is supported on Unix.
@@ -129,33 +159,6 @@ fn lock_parents(paths: &[PathBuf]) -> Result<Vec<File>> {
     Ok(locks)
 }
 
-/// The detached worker owns the admission permit, operation, and any lock guards
-/// until I/O actually finishes, even when its result receiver is dropped.
-async fn run_local<T, F>(operation: F) -> Result<T>
-where
-    T: Send + 'static,
-    F: FnOnce() -> Result<T> + Send + 'static,
-{
-    static WORKERS: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    let permit = WORKERS
-        .get_or_init(|| Arc::new(Semaphore::new(MAX_WORKERS)))
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(generic)?;
-    let (sender, receiver) = oneshot::channel();
-    let _worker = std::thread::Builder::new()
-        .name("zerofs-local-store".into())
-        .spawn(move || {
-            let _permit = permit;
-            let _ = sender.send(operation());
-        })
-        .map_err(generic)?;
-    receiver
-        .await
-        .map_err(|_| generic("local storage worker stopped before returning a result"))?
-}
-
 #[async_trait]
 impl ObjectStore for LocalConditionalStore {
     async fn put_opts(
@@ -167,7 +170,9 @@ impl ObjectStore for LocalConditionalStore {
         let path = self.inner.path_to_filesystem(location)?;
         let location = location.clone();
         let inner = self.inner.clone();
+        let root = self.readiness_root.clone();
         run_local(move || {
+            check_readiness_path(root.as_deref(), &path)?;
             let _locks = lock_parents(std::slice::from_ref(&path))?;
             if opts.extensions.get::<pool::PoolObjectCreate>().is_some() {
                 if !matches!(opts.mode, PutMode::Create) {
@@ -214,22 +219,29 @@ impl ObjectStore for LocalConditionalStore {
         let path = self.inner.path_to_filesystem(location)?;
         let location = location.clone();
         let inner = self.inner.clone();
+        let root = self.readiness_root.clone();
+        let check_root = root.clone();
+        let check_path = path.clone();
         let upload = run_local(move || {
+            check_readiness_path(check_root.as_deref(), &check_path)?;
             futures::executor::block_on(inner.put_multipart_opts(&location, opts))
         })
         .await?;
         Ok(Box::new(LocalMultipartUpload {
             upload: Some(upload),
             path,
+            readiness_root: root,
             parts: Arc::new(Parts::default()),
         }))
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+        self.check_location(location)?;
         self.inner.get_opts(location, options).await
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        self.check_location(location)?;
         self.inner.get_ranges(location, ranges).await
     }
 
@@ -238,13 +250,16 @@ impl ObjectStore for LocalConditionalStore {
         locations: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>> {
         let inner = self.inner.clone();
+        let root = self.readiness_root.clone();
         locations
             .map(move |location| {
                 let inner = inner.clone();
+                let root = root.clone();
                 async move {
                     let location = location?;
                     let path = inner.path_to_filesystem(&location)?;
                     run_local(move || {
+                        check_readiness_path(root.as_deref(), &path)?;
                         let _locks = lock_parents(std::slice::from_ref(&path))?;
                         futures::executor::block_on(inner.delete(&location))?;
                         // Upstream's with_fsync(true) does not cover standalone
@@ -260,6 +275,9 @@ impl ObjectStore for LocalConditionalStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        if let Some(root) = &self.readiness_root {
+            return listing::list(root, prefix, None);
+        }
         self.inner.list(prefix)
     }
 
@@ -268,10 +286,16 @@ impl ObjectStore for LocalConditionalStore {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, Result<ObjectMeta>> {
+        if let Some(root) = &self.readiness_root {
+            return listing::list(root, prefix, Some(offset));
+        }
         self.inner.list_with_offset(prefix, offset)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+        if let Some(root) = &self.readiness_root {
+            return listing::list_with_delimiter(root, prefix).await;
+        }
         self.inner.list_with_delimiter(prefix).await
     }
 
@@ -282,7 +306,11 @@ impl ObjectStore for LocalConditionalStore {
         ];
         let (from, to) = (from.clone(), to.clone());
         let inner = self.inner.clone();
+        let root = self.readiness_root.clone();
         run_local(move || {
+            for path in &paths {
+                check_readiness_path(root.as_deref(), path)?;
+            }
             let _locks = lock_parents(&paths)?;
             futures::executor::block_on(inner.copy_opts(&from, &to, options))
         })
@@ -296,7 +324,11 @@ impl ObjectStore for LocalConditionalStore {
         ];
         let (from, to) = (from.clone(), to.clone());
         let inner = self.inner.clone();
+        let root = self.readiness_root.clone();
         run_local(move || {
+            for path in &paths {
+                check_readiness_path(root.as_deref(), path)?;
+            }
             let _locks = lock_parents(&paths)?;
             // Directories are namespace containers, not objects. In particular
             // a directory rename must not move another writer's lock files.
@@ -342,6 +374,7 @@ impl Drop for PartGuard {
 struct LocalMultipartUpload {
     upload: Option<Box<dyn MultipartUpload>>,
     path: PathBuf,
+    readiness_root: Option<PathBuf>,
     parts: Arc<Parts>,
 }
 
@@ -385,7 +418,9 @@ impl MultipartUpload for LocalMultipartUpload {
             .take()
             .ok_or_else(|| generic("multipart upload already finished"))?;
         let path = self.path.clone();
+        let root = self.readiness_root.clone();
         run_local(move || {
+            check_readiness_path(root.as_deref(), &path)?;
             let _locks = lock_parents(&[path])?;
             futures::executor::block_on(upload.complete())
         })
@@ -397,7 +432,13 @@ impl MultipartUpload for LocalMultipartUpload {
             .upload
             .take()
             .ok_or_else(|| generic("multipart upload already finished"))?;
-        run_local(move || futures::executor::block_on(upload.abort())).await
+        let path = self.path.clone();
+        let root = self.readiness_root.clone();
+        run_local(move || {
+            check_readiness_path(root.as_deref(), &path)?;
+            futures::executor::block_on(upload.abort())
+        })
+        .await
     }
 }
 
@@ -489,6 +530,53 @@ mod tests {
         let listing = store.list_with_delimiter(Some(&prefix)).await.unwrap();
         assert_eq!(listing.objects.len(), 1);
         assert!(listing.common_prefixes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn readiness_listings_check_the_tree_when_polled() {
+        let (directory, store, prefix) = fixture();
+        let store = store.with_readiness_root(directory.path().canonicalize().unwrap());
+        store
+            .put(&prefix.clone().join("object"), "payload".into())
+            .await
+            .unwrap();
+        let listing = store.list(Some(&prefix));
+        let offset_listing = store.list_with_offset(Some(&prefix), &prefix.clone().join("a"));
+
+        // Stream construction is lazy. The listing worker must reject a
+        // symlink added before polling.
+        let outside = TempDir::new().unwrap();
+        let link = directory.path().join("foreign");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        for result in [
+            listing.try_collect::<Vec<_>>().await,
+            offset_listing.try_collect::<Vec<_>>().await,
+        ] {
+            let error = result.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("readiness path contains a symlink")
+            );
+        }
+        assert!(
+            store
+                .list_with_delimiter(Some(&prefix))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("readiness path contains a symlink")
+        );
+        std::fs::remove_file(link).unwrap();
+        assert_eq!(
+            store
+                .list(Some(&prefix))
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

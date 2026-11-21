@@ -100,6 +100,17 @@ trait LocalJournalSink: Send + Sync + 'static {
             .collect()
     }
 
+    /// How many batches `stage_batch` may write payload bytes for at once,
+    /// ahead of their commits.
+    ///
+    /// A sink that stages nothing returns 0 and gains no overlap from
+    /// assembling a batch early. The drain then waits for the commit half to
+    /// go idle and hands it every ready record at once, so one durable commit
+    /// covers them all.
+    fn staging_writers(&self) -> usize {
+        0
+    }
+
     /// Make a batch's payload bytes durable without publishing anything.
     ///
     /// The default keeps the batch whole and does all the work in
@@ -116,8 +127,8 @@ trait LocalJournalSink: Send + Sync + 'static {
     fn commit_staged(&self, staged: StagedBatch) -> AnyResult<Vec<MutationRecord>> {
         match staged {
             StagedBatch::Unstaged(prepared) => self.publish_batch(prepared),
-            StagedBatch::Durable { .. } => {
-                anyhow::bail!("sink cannot commit a durably staged batch")
+            StagedBatch::Durable { .. } | StagedBatch::Logged { .. } => {
+                anyhow::bail!("sink cannot commit a staged batch")
             }
         }
     }
@@ -130,8 +141,8 @@ trait LocalJournalSink: Send + Sync + 'static {
                 }
                 Ok(())
             }
-            StagedBatch::Durable { .. } => {
-                anyhow::bail!("sink cannot discard a durably staged batch")
+            StagedBatch::Durable { .. } | StagedBatch::Logged { .. } => {
+                anyhow::bail!("sink cannot discard a staged batch")
             }
         }
     }
@@ -169,6 +180,16 @@ impl LocalJournalSink for Journal {
 
     fn publish_batch(&self, prepared: Vec<PreparedMutation>) -> AnyResult<Vec<MutationRecord>> {
         Journal::publish_batch(self, prepared)
+    }
+
+    fn staging_writers(&self) -> usize {
+        if self.is_raw() {
+            // The payload log is one sequential stream, written in commit
+            // order: one batch stages while the batch before it commits.
+            1
+        } else {
+            MAX_CONCURRENT_CONTAINER_WRITES
+        }
     }
 
     fn stage_batch(
@@ -225,13 +246,6 @@ const MAX_LOCAL_PUBLISH_BATCH_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 // to four is worth roughly another 8% at the cost of holding four containers'
 // payloads (256 MiB at the current batch cap) inside the admission budget.
 const MAX_CONCURRENT_CONTAINER_WRITES: usize = 2;
-// Total batches between assembly and commit. Without this the drain would
-// assemble as fast as records arrive and publish them one or two at a time;
-// letting only one batch queue behind the writers is what makes the backlog
-// accumulate into large containers under load, which is where the container's
-// amortization comes from.
-const MAX_IN_FLIGHT_PUBLICATION_BATCHES: usize = MAX_CONCURRENT_CONTAINER_WRITES + 1;
-
 #[derive(Clone)]
 pub struct LocalJournaler {
     inner: Arc<LocalJournalerInner>,
@@ -999,6 +1013,12 @@ async fn run_journaler(
         space,
     } = ownership;
     let prepare_concurrency = prepare_concurrency.max(1);
+    // A sink that stages nothing assembles only into an idle pipeline, so
+    // records arriving during a commit join the next one. Otherwise only one
+    // batch queues behind the writers: that is what lets a backlog collect
+    // into large batches under load.
+    let staging_writers = sink.staging_writers();
+    let in_flight_limit = staging_writers + 1;
     let mut next_admitted = local_sequence.saturating_add(1);
     let mut next_received = local_sequence.checked_add(1);
     let mut preparations: FuturesUnordered<JoinHandle<Preparation>> = FuturesUnordered::new();
@@ -1062,9 +1082,8 @@ async fn run_journaler(
         // sequence ranges, so the writes are independent; only the commits are
         // ordered.
         while terminal.is_none()
-            && staging.len() < MAX_CONCURRENT_CONTAINER_WRITES
-            && staging.len() + ready.len() + usize::from(committing.is_some())
-                < MAX_IN_FLIGHT_PUBLICATION_BATCHES
+            && staging.len() < staging_writers.max(1)
+            && staging.len() + ready.len() + usize::from(committing.is_some()) < in_flight_limit
         {
             match assemble_batch(&mut prepared, next_admitted) {
                 Err(error) => {
@@ -1345,6 +1364,7 @@ mod tests {
     use crate::writeback::admission::{Admission, AdmissionError};
     use crate::writeback::reservation::{SsdAdmission, SsdReservationRequest};
     use crate::writeback::space_sample::{PhysicalSpaceSample, PhysicalSpaceSampler};
+    use crate::writeback::test_util::assert_journal_payload;
 
     impl LocalJournaler {
         /// Test-only submit that mirrors the production admission path:
@@ -1456,6 +1476,7 @@ mod tests {
     /// durable.
     struct PublishParkingSink {
         prepared: tokio_mpsc::UnboundedSender<u64>,
+        collected: Option<tokio_mpsc::UnboundedSender<Sequence>>,
         publish_entered: tokio_mpsc::UnboundedSender<usize>,
         publish_release: Mutex<Option<mpsc::Receiver<()>>>,
         published_batches: Mutex<Vec<Vec<u64>>>,
@@ -1542,6 +1563,10 @@ mod tests {
             prepared: crate::writeback::journal::PreparedMutation,
         ) -> Result<MutationRecord> {
             self.journal.publish_prepared(prepared)
+        }
+
+        fn staging_writers(&self) -> usize {
+            self.journal.staging_writers()
         }
 
         fn stage_batch(
@@ -2129,6 +2154,12 @@ mod tests {
                 .into_iter()
                 .map(|sequence| put_record(sequence, b"x"))
                 .collect())
+        }
+
+        fn preparation_collected(&self, sequence: Sequence) {
+            if let Some(collected) = &self.collected {
+                collected.send(sequence).unwrap();
+            }
         }
     }
 
@@ -2855,6 +2886,7 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel();
         let sink = Arc::new(PublishParkingSink {
             prepared: prepared_tx,
+            collected: None,
             publish_entered: entered_tx,
             publish_release: Mutex::new(Some(release_rx)),
             published_batches: Mutex::new(Vec::new()),
@@ -2922,6 +2954,79 @@ mod tests {
         assert!(
             batches.iter().max().copied().unwrap_or(0) > PREPARE_CONCURRENCY,
             "publication batches stayed capped at the prepare concurrency: {batches:?}"
+        );
+        assert_eq!(admission.used_bytes(), 0);
+        journaler.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_sink_that_stages_nothing_commits_everything_queued_behind_a_commit_together() {
+        const RECORDS: u64 = 9;
+        // The production raw-journal prepare concurrency.
+        const PREPARE_CONCURRENCY: usize = 1;
+        let admission = Admission::new(RECORDS);
+        let (prepared_tx, _prepared_rx) = tokio_mpsc::unbounded_channel();
+        let (collected_tx, mut collected_rx) = tokio_mpsc::unbounded_channel();
+        let (entered_tx, mut entered_rx) = tokio_mpsc::unbounded_channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let sink = Arc::new(PublishParkingSink {
+            prepared: prepared_tx,
+            collected: Some(collected_tx),
+            publish_entered: entered_tx,
+            publish_release: Mutex::new(Some(release_rx)),
+            published_batches: Mutex::new(Vec::new()),
+        });
+        assert_eq!(sink.staging_writers(), 0);
+        let journaler = LocalJournaler::start_with_sink_and_observer(
+            sink.clone(),
+            admission.clone(),
+            0,
+            uuid::Uuid::nil(),
+            RECORDS as usize,
+            PREPARE_CONCURRENCY,
+            None,
+        );
+        let submit = |sequence| {
+            let journaler = journaler.clone();
+            let admission = admission.clone();
+            async move {
+                let ram = admission.reserve(1).await.unwrap().accept();
+                journaler
+                    .submit_for_test(
+                        put_record(sequence, b"x"),
+                        Some(VerifiedPayload::new(Bytes::from_static(b"x"))),
+                        Some(ram),
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        submit(1).await;
+        let first = tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("the first record never reached its commit")
+            .unwrap();
+        assert_eq!(first, 1);
+
+        // Everything acknowledged while that commit holds the device waits
+        // for it, then shares the next one.
+        for sequence in 2..=RECORDS {
+            submit(sequence).await;
+        }
+        for _ in 1..=RECORDS {
+            tokio::time::timeout(Duration::from_secs(5), collected_rx.recv())
+                .await
+                .expect("preparation stalled behind the parked commit")
+                .unwrap();
+        }
+        release_tx.send(()).unwrap();
+        journaler.barrier().wait_local(RECORDS).await.unwrap();
+
+        assert_eq!(
+            *sink.published_batches.lock().unwrap(),
+            vec![vec![1], (2..=RECORDS).collect::<Vec<_>>()]
         );
         assert_eq!(admission.used_bytes(), 0);
         journaler.shutdown().await.unwrap();
@@ -3159,8 +3264,8 @@ mod tests {
 
         let recovered = Journal::open(&root, identity).unwrap();
         assert_eq!(recovered.progress().unwrap().local_seq, 2);
-        assert_eq!(recovered.read_blob(1).unwrap(), b"x");
-        assert_eq!(recovered.read_blob(2).unwrap(), b"x");
+        assert_journal_payload(&recovered, 1, b"x");
+        assert_journal_payload(&recovered, 2, b"x");
     }
 
     #[tokio::test]
@@ -3515,7 +3620,7 @@ mod tests {
 
         barrier.wait_local(1).await.unwrap();
         assert_eq!(journal.progress().unwrap().local_seq, 1);
-        assert_eq!(journal.read_blob(1).unwrap(), b"payload");
+        assert_journal_payload(&journal, 1, b"payload");
         journaler.shutdown().await.unwrap();
     }
 
@@ -3605,8 +3710,8 @@ mod tests {
         release_tx.send(()).unwrap();
 
         barrier.wait_local(2).await.unwrap();
-        assert_eq!(journal.read_blob(1).unwrap(), b"payload");
-        assert_eq!(journal.read_blob(2).unwrap(), b"again");
+        assert_journal_payload(&journal, 1, b"payload");
+        assert_journal_payload(&journal, 2, b"again");
         journaler.shutdown().await.unwrap();
     }
 
@@ -3839,8 +3944,8 @@ mod tests {
         drop(commit_release_tx);
 
         barrier.wait_local(2).await.unwrap();
-        assert_eq!(journal.read_blob(1).unwrap(), b"payload");
-        assert_eq!(journal.read_blob(2).unwrap(), b"again");
+        assert_journal_payload(&journal, 1, b"payload");
+        assert_journal_payload(&journal, 2, b"again");
         journaler.shutdown().await.unwrap();
     }
 
@@ -3945,7 +4050,7 @@ mod tests {
         )
         .expect("the journal must reopen on the committed prefix");
         assert_eq!(recovered.progress().unwrap().local_seq, 1);
-        assert_eq!(recovered.read_blob(1).unwrap(), b"payload");
+        assert_journal_payload(&recovered, 1, b"payload");
         assert!(recovered.mutation(2).unwrap().is_none());
     }
 
@@ -3982,7 +4087,7 @@ mod tests {
 
         barrier.wait_local(1).await.unwrap();
         assert_eq!(journal.snapshot().unwrap().local_seq, 1);
-        assert_eq!(journal.read_blob(1).unwrap(), b"payload");
+        assert_journal_payload(&journal, 1, b"payload");
         assert_eq!(admission.used_bytes(), 0);
         journaler.shutdown().await.unwrap();
     }

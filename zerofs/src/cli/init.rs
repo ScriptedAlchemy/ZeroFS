@@ -42,6 +42,7 @@ struct StartupContext {
     /// the filesystem so the RPC server can stream backend requests (`otrace`).
     object_tracer: ObjectTracer,
     actual_db_path: String,
+    name_mode: crate::fs::name_mode::NameMode,
     block_transformer: Arc<dyn BlockTransformer>,
     segment_codec: crate::frame_codec::FrameCodec,
     cache_config: CacheConfig,
@@ -59,6 +60,8 @@ struct StartupContext {
     opening: Option<crate::replication::leader_record::OpeningToken>,
     /// Backend data-plane tuning, resolved once from the storage URL.
     store_profile: crate::config::StoreProfile,
+    /// Trips on the first non-transient local I/O error of the metadata store.
+    metadata_fault: crate::metadata_fault::MetadataFault,
 }
 
 async fn resolve_startup_bucket_identity(
@@ -71,7 +74,7 @@ async fn resolve_startup_bucket_identity(
         .as_ref()
         .and_then(|prometheus| prometheus.benchmark_authority.as_ref())
         .is_some();
-    if authority_enabled {
+    if authority_enabled || settings.raw_device_p3_nas_fit() {
         bucket_identity::BucketIdentity::load(object_store, db_path).await
     } else {
         bucket_identity::BucketIdentity::get_or_create(object_store, db_path).await
@@ -150,6 +153,7 @@ enum ReconcileOutcome {
 impl StartupContext {
     async fn prepare(settings: &Settings, db_mode: DatabaseMode) -> Result<Self> {
         let cache_config = CacheConfig {
+            memory_only: settings.raw_p3_authority(),
             root_folder: settings.cache.dir.clone(),
             max_cache_size_gb: settings.cache.disk_size_gb,
             memory_cache_size_gb: settings.cache.memory_size_gb,
@@ -164,12 +168,19 @@ impl StartupContext {
             path: path_from_url,
             sftp_pool,
             pool,
+            metadata_fault,
+            raw_journal,
         } = open_storage(settings)
             .await
             .context("Failed to connect to storage backend")?;
+        let startup_fault = metadata_fault.clone();
         let cleanup_pool = sftp_pool.clone();
         let cleanup_storage_pool = pool.clone();
         let prepared: Result<Self> = async {
+            anyhow::ensure!(
+                raw_journal.is_none() || !db_mode.is_read_only(),
+                "raw P3 journal requires a read-write server"
+            );
             let disk_monitor = match &pool {
                 Some(pool) => Some(
                     crate::disk_health::PreparedDiskMonitor::prepare(pool.clone(), settings)
@@ -197,6 +208,11 @@ impl StartupContext {
                 .await
                 .context("Failed to resolve bucket identity")?;
 
+            crate::storage_readiness::verify_bucket_paths(
+                settings,
+                &bucket.cache_directory_name(),
+            )?;
+            let writeback_settings = settings.writeback_settings(db_mode.into())?;
             let cache_config = CacheConfig {
                 root_folder: cache_config.root_folder.join(bucket.cache_directory_name()),
                 ..cache_config
@@ -222,11 +238,13 @@ impl StartupContext {
 
             info!("Loading or initializing encryption key from object store");
             let db_path = Path::from(actual_db_path.clone());
-            let encryption_key = key_management::load_or_init_encryption_key(
+            let name_mode = settings.name_mode();
+            let encryption_key = key_management::load_or_init_encryption_key_with_mode(
                 &object_store,
                 &db_path,
                 &password,
-                db_mode.is_read_only(),
+                name_mode,
+                db_mode.is_read_only() || settings.raw_device_p3_nas_fit(),
             )
             .await
             .context("Failed to load or initialize encryption key")?;
@@ -264,13 +282,7 @@ impl StartupContext {
             let retried_remote = Arc::new(crate::retrying_object_store::RetryingObjectStore::new(
                 traced_remote,
             )) as Arc<dyn object_store::ObjectStore>;
-            let (object_store, writeback) = match settings.writeback_settings(match db_mode {
-                DatabaseMode::ReadWrite => crate::writeback::config::WritebackAccessMode::ReadWrite,
-                DatabaseMode::ReadOnly => crate::writeback::config::WritebackAccessMode::ReadOnly,
-                DatabaseMode::Checkpoint(_) => {
-                    crate::writeback::config::WritebackAccessMode::Checkpoint
-                }
-            })? {
+            let (object_store, writeback) = match writeback_settings {
                 Some(writeback_settings) => {
                     let identity = writeback_journal_identity(
                         settings,
@@ -278,14 +290,36 @@ impl StartupContext {
                         &actual_db_path,
                         &encryption_key,
                     )?;
-                    let attached = crate::writeback::bootstrap::attach(
-                        retried_remote,
-                        writeback_settings,
-                        identity,
-                        &bucket.cache_directory_name(),
-                    )
-                    .await
+                    let namespace = bucket.cache_directory_name();
+                    let attached = match raw_journal {
+                        Some(region) => {
+                            crate::writeback::bootstrap::attach_raw(
+                                retried_remote,
+                                writeback_settings,
+                                identity,
+                                &namespace,
+                                region,
+                            )
+                            .await
+                        }
+                        None => {
+                            crate::writeback::bootstrap::attach(
+                                retried_remote,
+                                writeback_settings,
+                                identity,
+                                &namespace,
+                            )
+                            .await
+                        }
+                    }
                     .context("Failed to attach persistent writeback")?;
+                    if let Some(pool) = &pool {
+                        attached
+                            .lifecycle
+                            .set_pool(pool.clone())
+                            .await
+                            .context("Failed to lease journaled pool segments")?;
+                    }
                     (attached.store, Some(attached.lifecycle))
                 }
                 None => (retried_remote, None),
@@ -308,6 +342,7 @@ impl StartupContext {
                 wal_object_store,
                 object_tracer,
                 actual_db_path,
+                name_mode,
                 block_transformer,
                 segment_codec: crate::frame_codec::FrameCodec::new(
                     &encryption_key,
@@ -324,6 +359,7 @@ impl StartupContext {
                 recovering_handoff: false,
                 opening: None,
                 store_profile,
+                metadata_fault,
             })
         }
         .await;
@@ -331,6 +367,7 @@ impl StartupContext {
         match prepared {
             Ok(prepared) => Ok(prepared),
             Err(error) => {
+                let error = startup_fault.attribute(error);
                 if let Some(pool) = cleanup_storage_pool {
                     pool.settle().await;
                 }
@@ -908,6 +945,7 @@ impl ReconciledDb {
         self,
         mut startup: StartupContext,
         settings: &Settings,
+        write_ack: crate::fs::mutation::config::FilesystemWriteAckSettings,
     ) -> Result<InitResult> {
         let ReconciledDb {
             open,
@@ -952,6 +990,7 @@ impl ReconciledDb {
             wal_object_store,
             object_tracer,
             actual_db_path,
+            name_mode,
             block_transformer,
             segment_codec,
             cache_config: _,
@@ -964,6 +1003,7 @@ impl ReconciledDb {
             recovering_handoff: _,
             opening: _,
             store_profile: backend_profile,
+            metadata_fault,
         } = startup;
 
         let serving_writer_epoch = match &slatedb {
@@ -1150,64 +1190,19 @@ impl ReconciledDb {
             segment_codec,
             segment_warm,
             store_profile,
+            name_mode,
         )
         .await
         .context("Failed to initialize filesystem")?;
-        let access_mode = match db_mode {
-            DatabaseMode::ReadWrite => crate::writeback::config::WritebackAccessMode::ReadWrite,
-            DatabaseMode::ReadOnly => crate::writeback::config::WritebackAccessMode::ReadOnly,
-            DatabaseMode::Checkpoint(_) => {
-                crate::writeback::config::WritebackAccessMode::Checkpoint
-            }
-        };
-        fs.write_ack = settings
-            .filesystem_write_ack_settings(access_mode)
-            .context("Invalid filesystem write-acknowledgement configuration")?;
+        fs.write_ack = write_ack;
+        if let Some(pool) = &pool
+            && !db_mode.is_read_only()
+        {
+            fs.extent_store.set_admission(pool.clone());
+        }
 
-        if let Some(writeback) = writeback.clone() {
-            let barrier_store = writeback.clone();
-            fs.flush_coordinator
-                .set_local_durability_barrier(Arc::new(move || {
-                    let writeback = barrier_store.clone();
-                    Box::pin(async move {
-                        writeback
-                            .wait_local_through_accepted()
-                            .await
-                            .map_err(|error| {
-                                tracing::error!(
-                                    "writeback local durability barrier failed: {error}"
-                                );
-                                crate::fs::errors::FsError::IoError
-                            })
-                    })
-                }));
-            let captured = writeback.clone();
-            fs.flush_coordinator
-                .set_object_capture(std::sync::Arc::new(move || captured.object_coverage()));
-            let waited = writeback.clone();
-            fs.flush_coordinator
-                .set_object_wait(std::sync::Arc::new(move |coverage, target| {
-                    let writeback = waited.clone();
-                    Box::pin(async move {
-                        use crate::fs::mutation::durability::{
-                            DurabilityError, DurabilityTarget, ObjectCoverage,
-                        };
-                        match coverage {
-                            ObjectCoverage::DirectRemote => Ok(()),
-                            ObjectCoverage::Writeback {
-                                journal_incarnation,
-                                sequence,
-                            } => writeback
-                                .wait_coverage(
-                                    journal_incarnation.as_uuid(),
-                                    sequence,
-                                    matches!(target, DurabilityTarget::RemoteBackend),
-                                )
-                                .await
-                                .map_err(DurabilityError::Object),
-                        }
-                    })
-                }));
+        if let Some(writeback) = &writeback {
+            fs.flush_coordinator.attach_writeback(writeback);
         }
 
         let fs = Arc::new(fs);
@@ -1231,7 +1226,19 @@ impl ReconciledDb {
             );
         }
 
+        let survival = crate::metadata_survival::attach_writer(
+            settings,
+            &fs,
+            pool.as_ref(),
+            &object_store,
+            &actual_db_path,
+            writeback.as_ref(),
+        )
+        .await
+        .context("Failed to attach metadata survival")?;
+
         Ok(InitResult {
+            survival,
             block_transformer,
             fs,
             // Retry-wrapped for the consumers downstream (the GC's checkpoint-gate
@@ -1247,20 +1254,26 @@ impl ReconciledDb {
             db_path: actual_db_path,
             db_handle,
             authority,
+            metadata_fault,
             _cache_owner: cache_owner,
         })
     }
 }
 
-/// Run role election, database open, reconciliation, and activation.
+/// Run role election, database open, reconciliation, and activation using the
+/// write acknowledgement settings already validated by server memory admission.
 pub async fn initialize_filesystem(
     settings: &Settings,
     db_mode: DatabaseMode,
+    write_ack: crate::fs::mutation::config::FilesystemWriteAckSettings,
 ) -> Result<InitResult> {
     let startup = StartupContext::prepare(settings, db_mode).await?;
     let cleanup_writeback = startup.writeback.clone();
     let cleanup_pool = startup.sftp_pool.clone();
     let cleanup_storage_pool = startup.pool.clone();
+    // SlateDB retries a failed metadata read or write without limit. Once the
+    // local metadata store reports a non-transient error, stop waiting for it.
+    let metadata_fault = startup.metadata_fault.clone();
     let initialized = async move {
         let mut startup = startup.start_receiver()?;
         'role_election: loop {
@@ -1277,15 +1290,15 @@ pub async fn initialize_filesystem(
                 };
                 match db.reconcile_tail(&mut startup).await? {
                     ReconcileOutcome::Reconciled(db) => {
-                        return (*db).into_filesystem(startup, settings).await;
+                        return (*db).into_filesystem(startup, settings, write_ack).await;
                     }
                     ReconcileOutcome::RetryRole => continue 'role_election,
                     ReconcileOutcome::RetryWriter => continue,
                 }
             }
         }
-    }
-    .await;
+    };
+    let initialized = metadata_fault.bound(initialized).await;
 
     match initialized {
         Ok(initialized) => Ok(initialized),
@@ -1310,22 +1323,103 @@ pub async fn initialize_filesystem(
     }
 }
 
+/// Initialize the bucket, wrapped key and writeback identity once while pool
+/// init holds all three exclusive claims. A partial init requires recovery.
+pub(super) async fn raw_pool_journal(
+    settings: &Settings,
+    pool: &crate::pool_object_store::PoolObjectStore,
+    path: &Path,
+    region: zerofs_raw_device::journal_region::TransactionRegion,
+    initialize: bool,
+) -> Result<crate::writeback::journal::Journal> {
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(pool.clone());
+    let (bucket, key) = if initialize {
+        anyhow::ensure!(
+            region.is_empty()?,
+            "refusing to initialize an existing journal"
+        );
+        let bucket = bucket_identity::BucketIdentity::get_or_create(&store, path.as_ref()).await?;
+        let key = key_management::load_or_init_encryption_key_with_mode(
+            &store,
+            path,
+            &settings.storage.encryption_password,
+            settings.name_mode(),
+            false,
+        )
+        .await?;
+        (bucket, key)
+    } else {
+        anyhow::ensure!(!region.is_empty()?, "original raw journal is missing");
+        load_existing_bucket_and_key(settings, &store, path.as_ref()).await?
+    };
+    let identity = writeback_journal_identity(settings, &bucket, path.as_ref(), &key)?;
+    let writeback = settings
+        .writeback_settings(crate::writeback::config::WritebackAccessMode::ReadWrite)?
+        .context("raw journal settings are required")?;
+    crate::writeback::bootstrap::validate_raw_namespace(
+        &writeback,
+        &bucket.cache_directory_name(),
+    )?;
+    crate::writeback::bootstrap::validate_raw_budget(&region, &writeback)?;
+    tokio::task::spawn_blocking(move || {
+        crate::writeback::journal::Journal::open_raw(region, identity)
+    })
+    .await?
+}
+
+/// Create the empty writeback journal of a P3 rebuilt by metadata recovery.
+///
+/// The lost journal went with its device. The bucket identity and the key are
+/// the originals, already restored to `store`; neither is ever created here.
+pub(crate) async fn recreate_raw_pool_journal(
+    settings: &Settings,
+    store: &Arc<dyn object_store::ObjectStore>,
+    path: &Path,
+    region: zerofs_raw_device::journal_region::TransactionRegion,
+) -> Result<()> {
+    anyhow::ensure!(
+        region.is_empty()?,
+        "refusing to replace an existing journal"
+    );
+    let (bucket, key) = load_existing_bucket_and_key(settings, store, path.as_ref()).await?;
+    let identity = writeback_journal_identity(settings, &bucket, path.as_ref(), &key)?;
+    let writeback = settings
+        .writeback_settings(crate::writeback::config::WritebackAccessMode::ReadWrite)?
+        .context("raw journal settings are required")?;
+    crate::writeback::bootstrap::validate_raw_budget(&region, &writeback)?;
+    tokio::task::spawn_blocking(move || {
+        crate::writeback::journal::Journal::open_raw(region, identity).map(drop)
+    })
+    .await?
+}
+
 pub(crate) async fn load_existing_writeback_identity(
     settings: &Settings,
     object_store: &Arc<dyn object_store::ObjectStore>,
     database_prefix: &str,
 ) -> Result<crate::writeback::model::JournalIdentity> {
+    let (bucket, encryption_key) =
+        load_existing_bucket_and_key(settings, object_store, database_prefix).await?;
+    writeback_journal_identity(settings, &bucket, database_prefix, &encryption_key)
+}
+
+async fn load_existing_bucket_and_key(
+    settings: &Settings,
+    object_store: &Arc<dyn object_store::ObjectStore>,
+    database_prefix: &str,
+) -> Result<(bucket_identity::BucketIdentity, [u8; 32])> {
     let bucket = bucket_identity::BucketIdentity::load(object_store, database_prefix)
         .await
         .context("failed to load existing bucket identity for writeback recovery")?;
-    let encryption_key = key_management::load_existing_encryption_key(
+    let encryption_key = key_management::load_existing_encryption_key_with_mode(
         object_store,
         &Path::from(database_prefix),
         &settings.storage.encryption_password,
+        settings.name_mode(),
     )
     .await
     .context("failed to load existing encryption key for writeback recovery")?;
-    writeback_journal_identity(settings, &bucket, database_prefix, &encryption_key)
+    Ok((bucket, encryption_key))
 }
 
 fn writeback_journal_identity(
@@ -1440,6 +1534,9 @@ mod role_decision_tests {
             if pooled {
                 settings.storage.pool = Some(crate::config::StoragePoolConfig {
                     catalog_dir: temp.path().join("catalog"),
+                    segment_placement: Default::default(),
+                    allow_degraded_start: false,
+                    metadata_survival: None,
                     members: vec![crate::config::StoragePoolMemberConfig {
                         health_device: None,
                         id: "local".to_owned(),
@@ -1469,6 +1566,140 @@ mod role_decision_tests {
             assert!(startup.sftp_pool.is_none());
             drop(startup);
         }
+    }
+
+    #[tokio::test]
+    async fn raw_pool_verification_rejects_an_existing_directory_journal() {
+        use crate::pool_object_store::{PoolMember, PoolObjectStore};
+        use zerofs_raw_device::{Identity, Role, journal_region::TransactionRegion};
+
+        const CAPACITY: u64 = 64 << 20;
+        const REGION_ID: Identity = Identity {
+            pool_uuid: [1; 16],
+            member_uuid: [2; 16],
+            role: Role::Journal,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let path = Path::from("db");
+        let pool = PoolObjectStore::initialize(
+            Arc::new(InMemory::new()),
+            path.clone(),
+            root.join("catalog"),
+            vec![PoolMember {
+                id: "data".into(),
+                identity: "memory://data".into(),
+                store: Arc::new(InMemory::new()),
+                capacity_bytes: CAPACITY,
+                local_path: None,
+                min_free_bytes: 0,
+                metadata_headroom_bytes: 0,
+                health_device: None,
+                free_space: None,
+            }],
+        )
+        .await
+        .unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(pool.clone());
+        let mut settings = crate::config::Settings::generate_default();
+        settings.storage.url = "memory:///db".into();
+        settings.storage.encryption_password = "raw-preflight-password".into();
+        settings.aws = None;
+        settings.cache.dir = root.join("cache");
+        settings.writeback = Some(WritebackConfig {
+            enabled: true,
+            dir: root.join("writeback"),
+            ack_mode: AckMode::Memory,
+            memory_size_gb: 0.004,
+            disk_size_gb: 0.008,
+            min_free_gb: 0.001,
+            high_watermark_percent: 95,
+            resume_percent: 85,
+            upload_concurrency: Some(2),
+            local_concurrency: 1,
+            shutdown_flush: ShutdownFlush::Local,
+        });
+
+        // Exercise the real offline journal path on a regular temporary file;
+        // no loop device or physical-device claim is involved.
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(CAPACITY).unwrap();
+        let region = TransactionRegion::provision(
+            file.try_clone().unwrap(),
+            CAPACITY,
+            0,
+            CAPACITY,
+            REGION_ID,
+        )
+        .unwrap();
+        let journal = super::raw_pool_journal(&settings, &pool, &path, region, true)
+            .await
+            .unwrap();
+        let original_cursor = journal.startup_cursor().unwrap();
+        drop(journal);
+        let reopen_region = || {
+            TransactionRegion::open(file.try_clone().unwrap(), CAPACITY, 0, CAPACITY, REGION_ID)
+                .unwrap()
+        };
+        let bucket = crate::bucket_identity::BucketIdentity::load(&store, path.as_ref())
+            .await
+            .unwrap();
+        let namespace = bucket.cache_directory_name();
+        let writeback = settings
+            .writeback_settings(DatabaseMode::ReadWrite.into())
+            .unwrap()
+            .unwrap();
+        let previous = writeback.dir.join(&namespace);
+        std::fs::create_dir_all(&previous).unwrap();
+        let pending = previous.join("journal.redb");
+        std::fs::write(&pending, b"existing directory journal").unwrap();
+
+        // Existing key errors still take precedence over the new preflight.
+        let password = settings.storage.encryption_password.clone();
+        settings.storage.encryption_password = "wrong-password".into();
+        let error = super::raw_pool_journal(&settings, &pool, &path, reopen_region(), false)
+            .await
+            .expect_err("verification must reject the wrong encryption password");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to load existing encryption key for writeback recovery"),
+            "{error:#}"
+        );
+        settings.storage.encryption_password = password;
+
+        let offline_error =
+            super::raw_pool_journal(&settings, &pool, &path, reopen_region(), false)
+                .await
+                .expect_err("offline verification must refuse the directory journal");
+        let server_error = crate::writeback::bootstrap::attach_raw(
+            store,
+            writeback,
+            original_cursor.0.clone(),
+            &namespace,
+            reopen_region(),
+        )
+        .await
+        .err()
+        .expect("server attachment must refuse the directory journal");
+        assert!(
+            offline_error
+                .to_string()
+                .contains("drain and migrate it first"),
+            "{offline_error:#}"
+        );
+        assert_eq!(offline_error.to_string(), server_error.to_string());
+        assert_eq!(
+            std::fs::read(&pending).unwrap(),
+            b"existing directory journal"
+        );
+
+        std::fs::remove_file(pending).unwrap();
+        std::fs::remove_dir(previous).unwrap();
+        let journal = super::raw_pool_journal(&settings, &pool, &path, reopen_region(), false)
+            .await
+            .unwrap();
+        assert_eq!(journal.startup_cursor().unwrap(), original_cursor);
     }
 
     #[tokio::test]
@@ -1512,6 +1743,103 @@ mod role_decision_tests {
     }
 
     #[tokio::test]
+    async fn insensitive_key_refuses_legacy_parser_after_password_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let metadata = temp.path().join("metadata");
+        std::fs::create_dir(&metadata).unwrap();
+        let mut settings = crate::config::Settings::generate_default();
+        settings.storage.url = url::Url::from_directory_path(&metadata)
+            .unwrap()
+            .to_string();
+        settings.storage.encryption_password = "name-mode-startup-test".into();
+        settings.cache.dir = temp.path().join("cache");
+        settings.aws = None;
+        settings.filesystem = Some(toml::from_str("name_mode = 'insensitive'").unwrap());
+        let startup = StartupContext::prepare(&settings, DatabaseMode::ReadWrite)
+            .await
+            .unwrap();
+        let bytes = std::fs::read(metadata.join("zerofs.key")).unwrap();
+        assert!(bincode::deserialize::<crate::key_management::WrappedDataKey>(&bytes).is_err());
+        crate::key_management::change_encryption_password(
+            &startup.object_store,
+            &Path::from(startup.actual_db_path.clone()),
+            &settings.storage.encryption_password,
+            "new-name-mode-password",
+        )
+        .await
+        .unwrap();
+        let bytes = std::fs::read(metadata.join("zerofs.key")).unwrap();
+        assert!(bincode::deserialize::<crate::key_management::WrappedDataKey>(&bytes).is_err());
+        drop(startup);
+        settings.storage.encryption_password = "new-name-mode-password".into();
+        let startup = StartupContext::prepare(&settings, DatabaseMode::ReadWrite)
+            .await
+            .unwrap();
+        drop(startup);
+    }
+
+    #[tokio::test]
+    async fn name_mode_mismatch_refuses_before_receiver_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let metadata = root.join("metadata");
+        std::fs::create_dir(&metadata).unwrap();
+        let mut settings = crate::config::Settings::generate_default();
+        settings.storage.url = url::Url::from_directory_path(&metadata)
+            .unwrap()
+            .to_string();
+        settings.storage.encryption_password = "name-mode-startup-test".into();
+        settings.cache.dir = root.join("cache");
+        settings.aws = None;
+        settings.filesystem = Some(toml::from_str("name_mode = 'insensitive'").unwrap());
+        drop(
+            StartupContext::prepare(&settings, DatabaseMode::ReadWrite)
+                .await
+                .unwrap(),
+        );
+        let key_bytes = std::fs::read(metadata.join("zerofs.key")).unwrap();
+        settings.filesystem = None;
+        settings.replication = Some(crate::config::ReplicationConfig {
+            node_id: "mode-test-standby".into(),
+            role: ReplicationRole::Standby,
+            peers: Vec::new(),
+            replication_listen: Some("invalid-receiver-address".into()),
+            force_recovery: false,
+        });
+        for mode in [DatabaseMode::ReadWrite, DatabaseMode::ReadOnly] {
+            let write_ack = settings.filesystem_write_ack_settings(mode.into()).unwrap();
+            let error = super::initialize_filesystem(&settings, mode, write_ack)
+                .await
+                .err()
+                .unwrap();
+            assert!(
+                format!("{error:#}").contains("name mode mismatch"),
+                "{error:#}"
+            );
+            assert_eq!(
+                std::fs::read(metadata.join("zerofs.key")).unwrap(),
+                key_bytes
+            );
+        }
+        settings.filesystem = Some(toml::from_str("name_mode = 'insensitive'").unwrap());
+        let write_ack = settings
+            .filesystem_write_ack_settings(DatabaseMode::ReadWrite.into())
+            .unwrap();
+        let error = super::initialize_filesystem(&settings, DatabaseMode::ReadWrite, write_ack)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            format!("{error:#}").contains("invalid replication_listen address"),
+            "{error:#}"
+        );
+        assert!(metadata.join("zerofs.key").exists());
+        temp.close().unwrap();
+        assert!(!root.exists());
+        println!("name_mode_startup_fixture_removed={}", root.display());
+    }
+
+    #[tokio::test]
     async fn peer_silence_refreshes_ownership() {
         let (fault_store, faults) = FaultStore::new(Arc::new(InMemory::new()));
         let store: Arc<dyn ObjectStore> = fault_store;
@@ -1532,6 +1860,7 @@ mod role_decision_tests {
             wal_object_store: None,
             object_tracer: crate::object_trace::ObjectTracer::new(),
             actual_db_path: "db".into(),
+            name_mode: crate::fs::name_mode::NameMode::Sensitive,
             block_transformer: crate::block_transformer::ZeroFsBlockTransformer::new_arc(
                 &[0; 32],
                 CompressionConfig::default(),
@@ -1542,6 +1871,7 @@ mod role_decision_tests {
                 CompressionConfig::default(),
             ),
             cache_config: crate::fs::CacheConfig {
+                memory_only: false,
                 root_folder: std::env::temp_dir(),
                 max_cache_size_gb: 0.0,
                 memory_cache_size_gb: None,
@@ -1561,6 +1891,7 @@ mod role_decision_tests {
             recovering_handoff: false,
             opening: None,
             store_profile: crate::config::StoreProfile::default(),
+            metadata_fault: Default::default(),
         };
         let election = tokio::spawn(async move {
             startup.become_writer().await?;
@@ -1592,5 +1923,78 @@ mod role_decision_tests {
         assert!(recovering_handoff);
         assert!(elected_leader);
         assert!(faults.get_count() >= 3);
+    }
+}
+
+#[cfg(test)]
+mod storage_readiness_tests {
+    use super::*;
+    use crate::storage_readiness::tests::Fixture;
+
+    #[tokio::test]
+    async fn storage_readiness_refuses_symlinked_children_during_server_startup() {
+        for mode in [
+            DatabaseMode::ReadWrite,
+            DatabaseMode::ReadOnly,
+            DatabaseMode::Checkpoint(uuid::Uuid::nil()),
+        ] {
+            for (role, relative) in [
+                ("authority", ".zerofs-pool"),
+                ("member data", ".zerofs-pool"),
+                (
+                    "member data",
+                    ".zerofs-pool/00000000-0000-0000-0000-000000000001/objects",
+                ),
+                ("cache", "bucket_fixture/hybrid_cache"),
+                ("journal", "bucket_fixture/blobs/00"),
+            ] {
+                let mut fixture = Fixture::new();
+                fixture.document["storage"]["readiness"]["strict"] = serde_json::json!(false);
+                let settings = fixture.parse().unwrap();
+                let initialized = crate::storage_backend::open_pool_storage(&settings, true)
+                    .await
+                    .unwrap();
+                let store: Arc<dyn object_store::ObjectStore> = Arc::new(initialized.1.clone());
+                let namespace = bucket_identity::BucketIdentity::get_or_create(
+                    &store,
+                    initialized.0.path.as_ref(),
+                )
+                .await
+                .unwrap()
+                .cache_directory_name();
+                let pool_id = initialized.1.status().await.unwrap().pool_id;
+                drop(store);
+                drop(initialized);
+                let relative = relative
+                    .replace("bucket_fixture", &namespace)
+                    .replace("00000000-0000-0000-0000-000000000001", &pool_id);
+                let child = fixture.path(role).join(&relative);
+                std::fs::create_dir_all(child.parent().unwrap()).unwrap();
+                let outside = tempfile::tempdir().unwrap();
+                let target = outside.path().join("target");
+                if child.exists() {
+                    std::fs::rename(&child, &target).unwrap();
+                } else {
+                    std::fs::create_dir(&target).unwrap();
+                }
+                std::fs::write(target.join("sentinel"), b"unchanged").unwrap();
+                let target_entries = std::fs::read_dir(&target).unwrap().count();
+                std::os::unix::fs::symlink(&target, child).unwrap();
+                let error = StartupContext::prepare(&settings, mode)
+                    .await
+                    .err()
+                    .expect("server startup must refuse the symlink");
+                assert_eq!(
+                    std::fs::read_dir(&target).unwrap().count(),
+                    target_entries,
+                    "wrote through {role}/{relative}"
+                );
+                assert_eq!(
+                    std::fs::read(target.join("sentinel")).unwrap(),
+                    b"unchanged"
+                );
+                assert!(format!("{error:#}").contains("symlink"), "{error:#}");
+            }
+        }
     }
 }

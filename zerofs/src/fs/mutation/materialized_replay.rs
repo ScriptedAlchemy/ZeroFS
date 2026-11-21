@@ -7,7 +7,7 @@ use super::types::{
 };
 use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
-use crate::fs::ops::write::{apply_prepared_batch, prepare_write};
+use crate::fs::ops::write::apply_prepared_batch;
 
 /// Completion ownership transferred atomically with the canonical transaction.
 /// Dropping it before submission retracts the request-cache entry; after
@@ -65,7 +65,10 @@ impl ZeroFS {
                 return receipt(result);
             }
             RequestLookup::FingerprintMismatch => return Err(FsError::InvalidArgument),
-            RequestLookup::Backpressured => return Err(FsError::RetryLater),
+            RequestLookup::Backpressured => {
+                tracing::warn!("refused a client write: the materialized request cache is full");
+                return Err(FsError::RetryLater);
+            }
         };
         let retained = pending.retained();
         let accepted = pending.accept();
@@ -79,7 +82,7 @@ impl ZeroFS {
             op_id,
             check_permissions,
         };
-        let mut batch = match prepare_write(&self.write_prepare_context(), request).await {
+        let mut batch = match self.prepare_materialized_write(request).await {
             Ok(batch) => batch,
             Err(error) => {
                 self.materialized_request_cache

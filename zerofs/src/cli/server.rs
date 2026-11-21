@@ -9,7 +9,9 @@ use crate::fs::{CacheConfig, GarbageCollector, ZeroFS};
 use crate::length_checked_object_store::LengthCheckedObjectStore;
 use crate::nbd::{NBDServer, NbdExportGates};
 use crate::ninep::server::P9AcceptedWorkTracker;
-use crate::object_store_prefetch::PrefetchingObjectStore;
+use crate::object_store_prefetch::{
+    LEGACY_PARTS_CACHE_DIR, PARTS_CACHE_DIR, PARTS_CACHE_LAYOUT_FILE, PrefetchingObjectStore,
+};
 use crate::parse_object_store::{ParsedStore, parse_url_opts};
 use crate::storage_backend::{BackendSessions, OpenedStorage, open_storage};
 use crate::storage_class_object_store::with_storage_class;
@@ -37,6 +39,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+#[cfg(test)]
+mod cache_files_tests;
+pub(crate) mod cache_scan;
 mod mutation_lifecycle;
 use mutation_lifecycle::{LifecycleOwners, MutationLifecycle};
 
@@ -84,11 +89,13 @@ impl DatabaseMode {
 
 /// Access mode used to resolve the shared write-acknowledgement contract:
 /// volatile acknowledgement requires a read-write single-writer server.
-fn write_ack_access_mode(db_mode: DatabaseMode) -> crate::writeback::config::WritebackAccessMode {
-    match db_mode {
-        DatabaseMode::ReadWrite => crate::writeback::config::WritebackAccessMode::ReadWrite,
-        DatabaseMode::ReadOnly => crate::writeback::config::WritebackAccessMode::ReadOnly,
-        DatabaseMode::Checkpoint(_) => crate::writeback::config::WritebackAccessMode::Checkpoint,
+impl From<DatabaseMode> for crate::writeback::config::WritebackAccessMode {
+    fn from(db_mode: DatabaseMode) -> Self {
+        match db_mode {
+            DatabaseMode::ReadWrite => Self::ReadWrite,
+            DatabaseMode::ReadOnly => Self::ReadOnly,
+            DatabaseMode::Checkpoint(_) => Self::Checkpoint,
+        }
     }
 }
 
@@ -110,6 +117,8 @@ async fn resolve_checkpoint_name(settings: &Settings, name: &str) -> Result<uuid
         path: path_from_url,
         sftp_pool,
         pool: _,
+        raw_journal: _,
+        metadata_fault,
     } = open_storage(settings).await?;
     let object_store = with_storage_class(
         Arc::from(object_store),
@@ -134,12 +143,19 @@ async fn resolve_checkpoint_name(settings: &Settings, name: &str) -> Result<uuid
     }
     let admin = admin_builder.build();
 
-    let checkpoints = admin.list_checkpoints(Some(name)).await;
+    let checkpoints = metadata_fault
+        .bound(async {
+            admin
+                .list_checkpoints(Some(name))
+                .await
+                .context("Failed to list checkpoints")
+        })
+        .await;
     drop(admin);
     let checkpoints = finish_with_sftp_cleanup(
         sftp_pool.as_ref(),
         SFTP_CHECKPOINT_POOL_CLEANUP,
-        checkpoints.context("Failed to list checkpoints"),
+        checkpoints,
     )
     .await?;
 
@@ -204,7 +220,8 @@ fn start_ninep_servers(
     if let Some(addresses) = &config.addresses {
         for addr in addresses {
             info!("Starting 9P server on {}", addr);
-            let mut ninep_tcp_server = crate::ninep::NinePServer::new(Arc::clone(&fs), *addr);
+            let mut ninep_tcp_server = crate::ninep::NinePServer::new(Arc::clone(&fs), *addr)
+                .with_standard_lookup(config.standard_lookup);
             if let Some(identity) = config.shared_identity {
                 ninep_tcp_server =
                     ninep_tcp_server.with_credential_override(identity.uid, identity.gid);
@@ -226,7 +243,8 @@ fn start_ninep_servers(
         );
         let ninep_unix_fs = Arc::clone(&fs);
         let mut ninep_unix_server =
-            crate::ninep::NinePServer::new_unix(ninep_unix_fs, socket_path.clone());
+            crate::ninep::NinePServer::new_unix(ninep_unix_fs, socket_path.clone())
+                .with_standard_lookup(config.standard_lookup);
         if let Some(identity) = config.shared_identity {
             ninep_unix_server =
                 ninep_unix_server.with_credential_override(identity.uid, identity.gid);
@@ -251,6 +269,7 @@ async fn ensure_nbd_directory(fs: &Arc<ZeroFS>) -> Result<()> {
         groups: [0; 16],
         groups_count: 1,
         groups_complete: true,
+        groups_truncated: false,
     };
     let nbd_name = b".nbd";
 
@@ -722,9 +741,22 @@ fn foyer_build_error(context: &str, err: foyer::Error) -> anyhow::Error {
 
 const FOYER_PARTITION_PREFIX: &str = "foyer-storage-direct-fs-";
 
+/// The foyer partition ID a directory entry name encodes, if it is one.
+fn foyer_partition_id(name: &str) -> Option<u32> {
+    let id = name.strip_prefix(FOYER_PARTITION_PREFIX)?;
+    let partition_id = id.parse::<u32>().ok()?;
+    // Foyer pads its u32 ID to a minimum width of eight digits. Accept wider
+    // native IDs too, but never similarly named foreign files.
+    (id == format!("{partition_id:08}")).then_some(partition_id)
+}
+
+/// The file a server locks exclusively for as long as it uses a clean-cache
+/// namespace.
+pub(crate) const CLEAN_CACHE_LOCK_FILE: &str = ".zerofs-clean-cache.lock";
+
 #[derive(Debug)]
 pub(super) struct CleanCacheOwner {
-    _lock: File,
+    _lock: Option<File>,
 }
 
 impl Drop for CleanCacheOwner {
@@ -732,7 +764,9 @@ impl Drop for CleanCacheOwner {
         // A child's inherited descriptor can outlive this owner until exec.
         // Release the shared open file description when the last cache
         // ownership guard is dropped, rather than waiting for that descriptor.
-        if let Err(error) = FileExt::unlock(&self._lock) {
+        if let Some(lock) = &self._lock
+            && let Err(error) = FileExt::unlock(lock)
+        {
             tracing::warn!(%error, "failed to release clean cache ownership lock");
         }
     }
@@ -744,7 +778,7 @@ fn acquire_clean_cache_owner(root: &StdPath) -> Result<CleanCacheOwner> {
     if std::fs::symlink_metadata(root)?.file_type().is_symlink() {
         anyhow::bail!("clean cache root {} must not be a symlink", root.display());
     }
-    let lock_path = root.join(".zerofs-clean-cache.lock");
+    let lock_path = root.join(CLEAN_CACHE_LOCK_FILE);
     let mut options = OpenOptions::new();
     options.create(true).read(true).write(true);
     #[cfg(unix)]
@@ -769,7 +803,7 @@ fn acquire_clean_cache_owner(root: &StdPath) -> Result<CleanCacheOwner> {
             root.display()
         );
     }
-    Ok(CleanCacheOwner { _lock: lock })
+    Ok(CleanCacheOwner { _lock: Some(lock) })
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -790,18 +824,17 @@ fn prune_foyer_partitions(root: &StdPath, capacity: usize) -> Result<FoyerPruneR
     }
 
     let mut partitions = Vec::new();
+    let mut progress =
+        crate::storage_readiness::paths::ScanProgress::new("inspecting cache partitions", root);
     for entry in std::fs::read_dir(root)
         .with_context(|| format!("reading foyer cache directory {}", root.display()))?
     {
+        progress.entry();
         let entry = entry?;
         let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let Some(id) = name.strip_prefix(FOYER_PARTITION_PREFIX) else {
+        let Some(partition_id) = name.to_str().and_then(foyer_partition_id) else {
             continue;
         };
-        if id.len() != 8 || !id.bytes().all(|byte| byte.is_ascii_digit()) {
-            continue;
-        }
         let metadata = std::fs::symlink_metadata(entry.path())?;
         if !metadata.file_type().is_file() {
             anyhow::bail!(
@@ -811,7 +844,7 @@ fn prune_foyer_partitions(root: &StdPath, capacity: usize) -> Result<FoyerPruneR
         }
         let file = File::open(entry.path())?;
         partitions.push((
-            id.parse::<u32>()?,
+            partition_id,
             entry.path(),
             metadata.len(),
             file.allocated_size()?,
@@ -854,33 +887,39 @@ async fn build_block_hybrid(
     Arc<FoyerHybridCache>,
     foyer::HybridCache<slatedb::db_cache::CachedKey, slatedb::db_cache::CachedEntry>,
 )> {
-    tokio::fs::create_dir_all(hybrid_cache_root)
-        .await
-        .with_context(|| {
-            format!(
-                "creating foyer hybrid cache dir at {}",
-                hybrid_cache_root.display()
-            )
-        })?;
-
-    let hybrid = HybridCacheBuilder::new()
+    let builder = HybridCacheBuilder::new()
         .with_name("zerofs-slatedb-hybrid")
         .with_metrics_registry(Box::new(metrics))
         .memory(memory_bytes)
         .with_eviction_config(S3FifoConfig::default())
         .with_weighter(|_, v: &slatedb::db_cache::CachedEntry| v.size())
         .storage()
-        .with_spawner(Spawner::from(foyer_handle.clone()))
-        .with_io_engine_config(PsyncIoEngineConfig::new())
-        .with_engine_config(
-            BlockEngineConfig::new(
-                FsDeviceBuilder::new(hybrid_cache_root)
-                    .with_capacity(disk_bytes)
-                    .build()
-                    .map_err(|e| foyer_build_error("foyer device build failed", e))?,
+        .with_spawner(Spawner::from(foyer_handle.clone()));
+    let builder = if disk_bytes == 0 {
+        builder
+    } else {
+        tokio::fs::create_dir_all(hybrid_cache_root)
+            .await
+            .with_context(|| {
+                format!(
+                    "creating foyer hybrid cache dir at {}",
+                    hybrid_cache_root.display()
+                )
+            })?;
+
+        builder
+            .with_io_engine_config(PsyncIoEngineConfig::new())
+            .with_engine_config(
+                BlockEngineConfig::new(
+                    FsDeviceBuilder::new(hybrid_cache_root)
+                        .with_capacity(disk_bytes)
+                        .build()
+                        .map_err(|e| foyer_build_error("foyer device build failed", e))?,
+                )
+                .with_block_size(BLOCK_CACHE_BLOCK_SIZE),
             )
-            .with_block_size(64 * 1024 * 1024),
-        )
+    };
+    let hybrid = builder
         .build()
         .await
         .map_err(|e| foyer_build_error("foyer hybrid build failed", e))?;
@@ -893,6 +932,125 @@ async fn build_block_hybrid(
 /// Block size of the parts disk cache: foyer's eviction/reclaim unit, and the
 /// max cacheable entry size.
 const PARTS_BLOCK_SIZE: usize = 64 * 1024 * 1024;
+
+/// Block size of the decoded-block disk cache.
+const BLOCK_CACHE_BLOCK_SIZE: usize = 64 * 1024 * 1024;
+
+/// Before the patched foyer-storage in `vendor/`, foyer wrote each entry's
+/// page padding and each blob index tail as it found them in its I/O
+/// buffers: freed heap memory of this process, or bytes of earlier entries.
+/// Layouts that do not record this policy were written that way and are
+/// reset, so those bytes leave the cache disk.
+const CACHE_PADDING_POLICY: &str = "padding=zeroed\n";
+
+/// The decoded-block cache directory. Binaries whose foyer wrote undefined
+/// padding used [`LEGACY_BLOCK_CACHE_DIR`] and record no layout, so a
+/// separate directory keeps a rollback from writing into this one.
+pub(crate) const BLOCK_CACHE_DIR: &str = "hybrid_cache_v1";
+pub(crate) const LEGACY_BLOCK_CACHE_DIR: &str = "hybrid_cache";
+
+/// The layout marker a current parts cache of `disk_bytes` records.
+fn parts_cache_layout(disk_bytes: usize) -> String {
+    format!(
+        "zerofs-parts-cache-v1\nrecover=none\ntombstones=0\nblock_bytes={PARTS_BLOCK_SIZE}\ndisk_bytes={disk_bytes}\n{CACHE_PADDING_POLICY}"
+    )
+}
+
+/// Foyer's partition layout depends on the tombstone setting and capacity.
+/// Record both the geometry and recovery policy before opening its files, so
+/// older tombstone-enabled layouts cannot be mistaken for current data blocks.
+/// Clean-cache data that is unmarked or incompatible is disposable, not migratable.
+///
+/// The server holds its exclusive CleanCacheOwner before calling this helper
+/// and throughout the cache's lifetime. Test callers use owned temp directories.
+fn prepare_parts_cache_layout(parts_root: &StdPath, disk_bytes: usize) -> Result<()> {
+    use std::io::{Read, Write};
+
+    std::fs::create_dir_all(parts_root)
+        .with_context(|| format!("creating parts cache dir at {}", parts_root.display()))?;
+    if std::fs::symlink_metadata(parts_root)?
+        .file_type()
+        .is_symlink()
+    {
+        anyhow::bail!(
+            "parts cache directory {} must not be a symlink",
+            parts_root.display()
+        );
+    }
+    let expected = parts_cache_layout(disk_bytes);
+    let marker = parts_root.join(PARTS_CACHE_LAYOUT_FILE);
+    match std::fs::symlink_metadata(&marker) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                anyhow::bail!(
+                    "parts cache layout marker {} is not a regular file",
+                    marker.display()
+                );
+            }
+            let mut options = OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NOFOLLOW);
+            }
+            let file = options.open(&marker).with_context(|| {
+                format!("opening parts cache layout marker {}", marker.display())
+            })?;
+            if !file.metadata()?.file_type().is_file() {
+                anyhow::bail!(
+                    "parts cache layout marker {} is not a regular file",
+                    marker.display()
+                );
+            }
+            let mut actual = Vec::new();
+            file.take(expected.len() as u64 + 1)
+                .read_to_end(&mut actual)?;
+            if actual == expected.as_bytes() {
+                return Ok(());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("reading parts cache layout marker"),
+    }
+
+    // Make the old geometry unusable before deleting any of its partitions.
+    // A crash can persist only some unlinks (including the tombstone log), and
+    // reverting the configured capacity must not trust that incomplete cache.
+    match std::fs::remove_file(&marker) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("invalidating parts cache layout marker"),
+    }
+    #[cfg(unix)]
+    File::open(parts_root)?.sync_all()?;
+
+    // Pruning reuses the ownership and type checks. Foreign names remain
+    // intact, and a symlink or other non-file at a native partition name aborts
+    // the migration before the marker can be published.
+    let pruned = prune_foyer_partitions(parts_root, 0)?;
+    #[cfg(unix)]
+    File::open(parts_root)?.sync_all()?;
+
+    // Publish only after all old data has been removed durably. A failed or
+    // interrupted reset leaves no matching marker, so the next open retries it.
+    let mut temporary = tempfile::NamedTempFile::new_in(parts_root)?;
+    temporary.write_all(expected.as_bytes())?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(&marker)
+        .with_context(|| format!("publishing parts cache layout marker {}", marker.display()))?;
+    #[cfg(unix)]
+    File::open(parts_root)?.sync_all()?;
+    if pruned.removed_files > 0 {
+        info!(
+            removed_files = pruned.removed_files,
+            allocated_bytes_reclaimed = pruned.allocated_bytes_reclaimed,
+            "Discarded incompatible clean parts-cache partitions before opening Foyer"
+        );
+    }
+    Ok(())
+}
 
 /// Disk-engine knobs for the parts cache, scaled to the device.
 struct PartsEngineKnobs {
@@ -914,7 +1072,7 @@ fn parts_engine_knobs(disk_bytes: usize) -> PartsEngineKnobs {
     }
 }
 
-async fn build_parts_hybrid(
+pub(crate) async fn build_parts_hybrid(
     cache_root: &std::path::Path,
     memory_bytes: usize,
     disk_bytes: usize,
@@ -924,36 +1082,49 @@ async fn build_parts_hybrid(
     use crate::object_store_prefetch::PartKey;
     use bytes::Bytes;
 
-    let parts_root = cache_root.join("parts_cache");
-    tokio::fs::create_dir_all(&parts_root)
-        .await
-        .with_context(|| format!("creating parts cache dir at {}", parts_root.display()))?;
-
-    let knobs = parts_engine_knobs(disk_bytes);
-
-    HybridCacheBuilder::new()
+    let builder = HybridCacheBuilder::new()
         .with_name("zerofs-object-prefetch-parts")
         .with_metrics_registry(Box::new(metrics))
         .memory(memory_bytes)
         .with_eviction_config(S3FifoConfig::default())
         .with_weighter(|_: &PartKey, v: &Bytes| v.len())
         .storage()
-        .with_spawner(Spawner::from(foyer_handle.clone()))
-        .with_io_engine_config(PsyncIoEngineConfig::new())
-        .with_engine_config(
-            BlockEngineConfig::new(
-                FsDeviceBuilder::new(&parts_root)
-                    .with_capacity(disk_bytes)
-                    .build()
-                    .map_err(|e| foyer_build_error("parts foyer device build failed", e))?,
+        .with_spawner(Spawner::from(foyer_handle.clone()));
+    let builder = if disk_bytes == 0 {
+        builder
+    } else {
+        // Legacy binaries ignore our layout marker. Keep their files in a distinct
+        // namespace so a rollback cannot overwrite files belonging to this policy.
+        // Reclaim only their owned disposable files, under the caller's cache lock.
+        prune_foyer_partitions(&cache_root.join(LEGACY_PARTS_CACHE_DIR), 0)?;
+        let parts_root = cache_root.join(PARTS_CACHE_DIR);
+        prepare_parts_cache_layout(&parts_root, disk_bytes)?;
+
+        let knobs = parts_engine_knobs(disk_bytes);
+
+        builder
+            .with_io_engine_config(PsyncIoEngineConfig::new())
+            // Pinned Foyer 0.22.3 can lose tombstones on reopen or log wraparound.
+            // Start this disposable cache cold so invalidated parts cannot return.
+            .with_recover_mode(foyer::RecoverMode::None)
+            .with_engine_config(
+                BlockEngineConfig::new(
+                    FsDeviceBuilder::new(&parts_root)
+                        .with_capacity(disk_bytes)
+                        .build()
+                        .map_err(|e| foyer_build_error("parts foyer device build failed", e))?,
+                )
+                .with_block_size(PARTS_BLOCK_SIZE)
+                // Recovery is disabled, so no persistent deletion log is needed.
+                .with_tombstone_log(false)
+                .with_submit_queue_size_threshold(knobs.submit_queue_bytes)
+                .with_flushers(knobs.flushers)
+                .with_reclaimers(knobs.flushers)
+                .with_clean_block_threshold(knobs.clean_block_threshold)
+                .with_buffer_pool_size(knobs.buffer_pool_bytes),
             )
-            .with_block_size(PARTS_BLOCK_SIZE)
-            .with_submit_queue_size_threshold(knobs.submit_queue_bytes)
-            .with_flushers(knobs.flushers)
-            .with_reclaimers(knobs.flushers)
-            .with_clean_block_threshold(knobs.clean_block_threshold)
-            .with_buffer_pool_size(knobs.buffer_pool_bytes),
-        )
+    };
+    builder
         .build()
         .await
         .map_err(|e| foyer_build_error("parts foyer hybrid build failed", e))
@@ -1092,30 +1263,50 @@ pub async fn build_slatedb(
     let total_memory_cache_gb = cache_config.memory_cache_size_gb.unwrap_or(0.25);
 
     let total_disk_bytes = (total_disk_cache_gb * 1_000_000_000.0) as usize;
-    let (parts_disk_bytes, hybrid_disk_bytes) = split_disk_budget(total_disk_bytes);
-    let cache_owner = Arc::new(acquire_clean_cache_owner(&cache_config.root_folder)?);
-    for (name, root, capacity) in [
-        (
-            "decoded-blocks",
-            cache_config.root_folder.join("hybrid_cache"),
-            hybrid_disk_bytes,
-        ),
-        (
-            "raw-parts",
-            cache_config.root_folder.join("parts_cache"),
-            parts_disk_bytes,
-        ),
-    ] {
-        let pruned = prune_foyer_partitions(&root, capacity)?;
-        if pruned.removed_files > 0 {
-            info!(
-                cache = name,
-                removed_files = pruned.removed_files,
-                allocated_bytes_reclaimed = pruned.allocated_bytes_reclaimed,
-                "Pruned surplus clean-cache partitions before opening Foyer"
-            );
+    let (parts_disk_bytes, hybrid_disk_bytes, cache_owner) = if cache_config.memory_only {
+        anyhow::ensure!(
+            total_disk_cache_gb == 0.0,
+            "raw P3 currently requires zero persistent clean cache"
+        );
+        (0, 0, CleanCacheOwner { _lock: None })
+    } else {
+        let (parts_disk_bytes, hybrid_disk_bytes) = split_disk_budget(total_disk_bytes);
+        let cache_owner = acquire_clean_cache_owner(&cache_config.root_folder)?;
+        for (name, root, capacity) in [
+            (
+                "legacy-decoded-blocks",
+                cache_config.root_folder.join(LEGACY_BLOCK_CACHE_DIR),
+                0,
+            ),
+            (
+                "decoded-blocks",
+                cache_config.root_folder.join(BLOCK_CACHE_DIR),
+                hybrid_disk_bytes,
+            ),
+            (
+                "legacy-raw-parts",
+                cache_config.root_folder.join(LEGACY_PARTS_CACHE_DIR),
+                0,
+            ),
+            (
+                "raw-parts",
+                cache_config.root_folder.join(PARTS_CACHE_DIR),
+                parts_disk_bytes,
+            ),
+        ] {
+            let pruned = prune_foyer_partitions(&root, capacity)?;
+            if pruned.removed_files > 0 {
+                info!(
+                    cache = name,
+                    removed_files = pruned.removed_files,
+                    allocated_bytes_reclaimed = pruned.allocated_bytes_reclaimed,
+                    "Pruned surplus clean-cache partitions before opening Foyer"
+                );
+            }
         }
-    }
+        (parts_disk_bytes, hybrid_disk_bytes, cache_owner)
+    };
+    let cache_owner = Arc::new(cache_owner);
     let total_memory_bytes = (total_memory_cache_gb * 1_000_000_000.0) as usize;
     let (parts_memory_bytes, hybrid_memory_bytes, decoded_extent_memory_bytes) =
         split_memory_budget(total_memory_bytes);
@@ -1222,7 +1413,7 @@ pub async fn build_slatedb(
     // HA startup retries share the process-wide maintenance runtime.
     let maintenance_runtime = shared_maintenance_runtime().clone();
 
-    let hybrid_cache_root = cache_config.root_folder.join("hybrid_cache");
+    let hybrid_cache_root = cache_config.root_folder.join(BLOCK_CACHE_DIR);
     let foyer_metrics = FoyerMetricsRegistry::default();
     let (cache, block_cache_metrics) = build_block_hybrid(
         &hybrid_cache_root,
@@ -1387,6 +1578,10 @@ pub async fn build_slatedb(
 }
 
 pub struct InitResult {
+    /// The metadata-survival commit owner, when configured on a writer.
+    /// Held for the writer lifetime: dropping it stops interval commits and
+    /// releases every replica lock.
+    pub(crate) survival: Option<Arc<crate::metadata_survival::SurvivalManager>>,
     pub(crate) block_transformer: Arc<dyn BlockTransformer>,
     pub fs: Arc<ZeroFS>,
     pub object_store: Arc<dyn object_store::ObjectStore>,
@@ -1400,6 +1595,8 @@ pub struct InitResult {
     pub db_handle: SlateDbHandle,
     /// HA authority monitors retained through database close.
     pub authority: Option<crate::replication::AuthoritySupervisor>,
+    /// Trips on the first non-transient local I/O error of the metadata store.
+    pub(crate) metadata_fault: crate::metadata_fault::MetadataFault,
     pub(super) _cache_owner: Arc<CleanCacheOwner>,
 }
 
@@ -1453,28 +1650,41 @@ pub async fn run_server(
 
     info!("ZeroFS v{}", env!("CARGO_PKG_VERSION"));
 
-    let (settings, memory_budget) = load_and_validate_server_settings(&config_path)?;
+    let access_mode = match (read_only, checkpoint_name.is_some()) {
+        (false, false) => crate::writeback::config::WritebackAccessMode::ReadWrite,
+        (true, false) => crate::writeback::config::WritebackAccessMode::ReadOnly,
+        (false, true) => crate::writeback::config::WritebackAccessMode::Checkpoint,
+        (true, true) => anyhow::bail!("Cannot specify both --read-only and --checkpoint flags"),
+    };
+    let (settings, write_ack, memory_budget) =
+        load_and_validate_server_settings(&config_path, access_mode)?;
+    #[cfg(feature = "webui")]
+    let write_ack_router = settings
+        .servers
+        .webui
+        .as_ref()
+        .map(|_| {
+            crate::webui::write_ack::router(
+                &config_path,
+                &settings,
+                write_ack,
+                access_mode == crate::writeback::config::WritebackAccessMode::ReadWrite,
+            )
+        })
+        .transpose()?;
     install_validated_rss_cap(memory_budget.as_ref());
 
-    let db_mode = match (read_only, &checkpoint_name) {
-        (false, None) => DatabaseMode::ReadWrite,
-        (true, None) => DatabaseMode::ReadOnly,
-        (false, Some(name)) => {
+    let db_mode = match &checkpoint_name {
+        None if read_only => DatabaseMode::ReadOnly,
+        None => DatabaseMode::ReadWrite,
+        Some(name) => {
             let uuid = resolve_checkpoint_name(&settings, name)
                 .await
                 .with_context(|| format!("Failed to resolve checkpoint '{}'", name))?;
             DatabaseMode::Checkpoint(uuid)
         }
-        (true, Some(_)) => {
-            return Err(anyhow::anyhow!(
-                "Cannot specify both --read-only and --checkpoint flags"
-            ));
-        }
     };
     validate_nbd_database_mode(settings.servers.nbd.as_ref(), db_mode)?;
-    let write_ack = settings
-        .filesystem_write_ack_settings(write_ack_access_mode(db_mode))
-        .context("Invalid filesystem write-acknowledgement configuration")?;
     if write_ack.mode == crate::fs::mutation::config::FilesystemWriteAckMode::VolatileMemory {
         warn!(
             volatile_memory_bytes = write_ack.volatile_memory_bytes,
@@ -1492,9 +1702,12 @@ pub async fn run_server(
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    let init_result = crate::cli::init::initialize_filesystem(&settings, db_mode).await?;
+    let init_result =
+        crate::cli::init::initialize_filesystem(&settings, db_mode, write_ack).await?;
     let cache_owner = init_result._cache_owner.clone();
+    tokio::spawn(init_result.metadata_fault.clone().exit_when_tripped());
     let writeback_for_shutdown = init_result.writeback.clone();
+    let survival = init_result.survival.clone();
     let writeback_for_metrics = init_result.writeback.clone();
     let writeback_for_checkpoints = init_result.writeback.clone();
     let writeback_for_lifecycle = writeback_for_shutdown.clone();
@@ -1505,10 +1718,10 @@ pub async fn run_server(
     let health_workers_after = health_workers.clone();
     let sftp_pool = init_result.sftp_pool.clone();
     let sftp_pool_for_close = sftp_pool.clone();
-    let lifecycle_completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let lifecycle_completed_after = std::sync::Arc::clone(&lifecycle_completed);
+    let lifecycle_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let lifecycle_started_after = std::sync::Arc::clone(&lifecycle_started);
     let server_result: anyhow::Result<()> = async move {
-        let _cache_owner = cache_owner;
+        let cache_owner_guard = cache_owner;
         if let Some(pool) = &pool_health {
             let monitor = init_result.disk_monitor.expect("pool startup prepared native monitoring").start(health_failure.clone()).await?;
             let recovery = if !db_mode.is_read_only() { Some(crate::pool_object_store::PoolRecovery::start(pool.clone(), health_failure.clone())) } else { None };
@@ -1743,7 +1956,10 @@ pub async fn run_server(
                 webui_config,
                 Arc::clone(&fs),
                 webui_lock_manager,
-                webui_rpc_service,
+                crate::webui::AdminServices {
+                    rpc: webui_rpc_service,
+                    settings: write_ack_router.expect("configured WebUI settings route"),
+                },
                 shutdown.clone(),
                 p9_accepted_work.clone(),
                 writeback_for_metrics.clone(),
@@ -1804,7 +2020,12 @@ pub async fn run_server(
                     true,
                 )
                 .expect("an unexpected listener exit must be an error");
-                tracing::error!(error = %error, "server listener stopped; initiating shutdown");
+                // The alternate form prints the cause chain, which names the address or
+                // socket path and the operating system's reason.
+                tracing::error!(
+                    error = %format_args!("{error:#}"),
+                    "server listener stopped; initiating shutdown"
+                );
                 ServingStopCause::ListenerFailure(error)
             }
         };
@@ -1820,7 +2041,9 @@ pub async fn run_server(
         )
         .await;
         info!("Waiting for accepted 9P work to settle...");
-        p9_accepted_work.wait().await;
+        p9_accepted_work
+            .settle(crate::replication::RESPONSE_DRAIN_TIMEOUT)
+            .await;
 
         if stop_cause.is_leadership_lost() {
             if let Some(registry) = &nbd_runtime_registry {
@@ -1892,6 +2115,18 @@ pub async fn run_server(
                 SFTP_FINAL_WORKER_ABORT_TIMEOUT,
             )
             .await;
+            // Deferred orphan reclaims mutate metadata. Finish them while
+            // authority is still valid and before the final flush closes the
+            // database. Serving tasks are already joined, so their last open
+            // handles have queued their inodes.
+            info!("Waiting for deferred orphan reclaims to finish...");
+            tokio::select! {
+                biased;
+                _ = leadership_deposed.cancelled() => {
+                    return Err(leadership_lost_error());
+                }
+                _ = fs.shutdown_reclaim_drainer() => {}
+            }
             // Flush remains lease-gated while background tasks drain.
             if leadership_deposed.is_cancelled() {
                 return Err(leadership_lost_error());
@@ -1902,6 +2137,11 @@ pub async fn run_server(
                 monitor_result?;
                 recovery_result?;
             }
+            // Serving has stopped and reclaims have drained, so this is the
+            // last consistent cut the members can receive before the close.
+            if let Some(survival) = &survival {
+                survival.shutdown_commit().await;
+            }
             info!("Performing final flush and closing database...");
             let lifecycle = MutationLifecycle::new(LifecycleOwners::for_process(
                 shutdown.clone(),
@@ -1910,10 +2150,12 @@ pub async fn run_server(
                 writeback_for_lifecycle.clone(),
                 sftp_pool_for_close.clone(),
                 db_mode.is_read_only(),
-            ).with_pool(pool_health.clone()));
+            ).with_pool(pool_health.clone()).with_process_ownership(authority, cache_owner_guard));
             let target = crate::fs::mutation::durability::DurabilityTarget::from(
                 fs.write_ack.client_durability_target,
             );
+            lifecycle.start(target);
+            lifecycle_started.store(true, std::sync::atomic::Ordering::SeqCst);
             let deadline =
                 tokio::time::Instant::now() + SFTP_FINAL_DATABASE_CLOSE_TIMEOUT.saturating_mul(2);
             tokio::select! {
@@ -1926,28 +2168,9 @@ pub async fn run_server(
                     let _receipt = result.map_err(|error| {
                         anyhow::anyhow!("unified writeback close failed: {error}")
                     })?;
-                    lifecycle_completed.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
             }
 
-            if leadership_deposed.is_cancelled() {
-                return Err(leadership_lost_error());
-            }
-
-            // Retain authority monitors until the database is closed.
-            if let Some(authority) = authority {
-                tokio::time::timeout(
-                    SERVER_AUTHORITY_FINISH_TIMEOUT,
-                    authority.finish_after_close(),
-                )
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "authority shutdown timed out after {}s",
-                        SERVER_AUTHORITY_FINISH_TIMEOUT.as_secs()
-                    )
-                })?;
-            }
             if leadership_deposed.is_cancelled() {
                 return Err(leadership_lost_error());
             }
@@ -1980,8 +2203,11 @@ pub async fn run_server(
             Ok(())
         };
     let server_result = server_result.and(recovery_result);
-    let writeback_shutdown = if lifecycle_completed_after.load(std::sync::atomic::Ordering::SeqCst)
-    {
+    // Once started, the single close owner retains these dependencies even
+    // when its waiter reports a deadline or authority loss. A second teardown
+    // here would close admission underneath its materialization or final flush.
+    let lifecycle_started = lifecycle_started_after.load(std::sync::atomic::Ordering::SeqCst);
+    let writeback_shutdown = if lifecycle_started {
         Ok(())
     } else {
         match writeback_for_shutdown {
@@ -1992,10 +2218,10 @@ pub async fn run_server(
             None => Ok(()),
         }
     };
-    if let Some(pool) = pool_settlement {
+    if !lifecycle_started && let Some(pool) = pool_settlement {
         pool.settle().await;
     }
-    let sftp_shutdown = if lifecycle_completed_after.load(std::sync::atomic::Ordering::SeqCst) {
+    let sftp_shutdown = if lifecycle_started {
         Ok(())
     } else {
         match sftp_pool {
@@ -2017,24 +2243,29 @@ pub async fn run_server(
 
 fn load_and_validate_server_settings(
     config_path: &std::path::Path,
-) -> Result<(Settings, Option<super::memory_budget::MemoryBudgetReceipt>)> {
-    let settings = Settings::from_file(config_path)
+    access_mode: crate::writeback::config::WritebackAccessMode,
+) -> Result<(
+    Settings,
+    crate::fs::mutation::config::FilesystemWriteAckSettings,
+    Option<super::memory_budget::MemoryBudgetReceipt>,
+)> {
+    let settings = Settings::from_runtime_file(config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
     settings
         .servers
         .require_listener_endpoint()
         .context("Invalid [servers] configuration")?;
-    let volatile_write_bytes = settings
-        .servers
-        .nbd
-        .as_ref()
-        .map(crate::config::NbdConfig::volatile_memory_bytes)
-        .transpose()?
-        .unwrap_or(0);
-    let memory_budget =
-        super::memory_budget::validate_server_startup(&settings, volatile_write_bytes)
-            .context("Invalid startup memory budget")?;
-    Ok((settings, memory_budget))
+    if settings.memory.is_some() {
+        anyhow::bail!(
+            "[memory] is available for planning only; production enforcement is not enabled"
+        );
+    }
+    let write_ack = settings
+        .filesystem_write_ack_settings(access_mode)
+        .context("Invalid filesystem write-acknowledgement configuration")?;
+    let memory_budget = super::memory_budget::validate_server_startup(&settings)
+        .context("Invalid startup memory budget")?;
+    Ok((settings, write_ack, memory_budget))
 }
 
 #[cfg(test)]
@@ -2098,6 +2329,57 @@ mod tests {
         (store, transformer, checkpoint.id)
     }
 
+    /// The decoded-block cache moved directories when foyer's padding became
+    /// defined. Opening reclaims the old directory's partitions and leaves
+    /// other files there alone.
+    #[tokio::test]
+    async fn opening_reclaims_the_legacy_decoded_block_cache() {
+        let (store, transformer, _) = seeded_mode_cache_store().await;
+        let cache_root = tempfile::tempdir().expect("cache root");
+        let legacy = cache_root.path().join(LEGACY_BLOCK_CACHE_DIR);
+        std::fs::create_dir_all(&legacy).unwrap();
+        let partition = legacy.join(format!("{FOYER_PARTITION_PREFIX}00000000"));
+        std::fs::write(&partition, b"undefined padding").unwrap();
+        let foreign = legacy.join("operator-notes");
+        std::fs::write(&foreign, b"keep").unwrap();
+
+        let opened = build_slatedb(
+            store,
+            &crate::fs::CacheConfig {
+                memory_only: false,
+                root_folder: cache_root.path().to_owned(),
+                max_cache_size_gb: 0.0,
+                memory_cache_size_gb: Some(0.064),
+            },
+            "mode-cache-test".to_owned(),
+            DatabaseMode::ReadOnly,
+            None,
+            transformer,
+            None,
+            None,
+        )
+        .await
+        .expect("open reader");
+
+        assert!(!partition.exists());
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"keep");
+        assert!(
+            std::fs::read_dir(cache_root.path().join(BLOCK_CACHE_DIR))
+                .unwrap()
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| foyer_partition_id(name).is_some())),
+            "the decoded-block cache did not open in its new directory"
+        );
+        match &opened.data {
+            SlateDbHandle::ReadOnly(reader) => reader.load_full().close().await.unwrap(),
+            SlateDbHandle::ReadWrite(_) => panic!("reader mode opened a writer"),
+        }
+        opened.parts_cache.close().await.unwrap();
+    }
+
     async fn assert_mode_exports_attached_decoded_cache(mode: ReaderModeUnderTest) {
         let (store, transformer, checkpoint_id) = seeded_mode_cache_store().await;
         let mode = match mode {
@@ -2108,6 +2390,7 @@ mod tests {
         let opened = build_slatedb(
             store,
             &crate::fs::CacheConfig {
+                memory_only: false,
                 root_folder: cache_root.path().to_owned(),
                 max_cache_size_gb: 0.0,
                 memory_cache_size_gb: Some(0.064),
@@ -2173,6 +2456,9 @@ mod tests {
             required_bytes: 88 * gib,
             remaining_bytes: 8 * gib,
             rss_pressure_cap_bytes: validated_service_cap,
+            included_companion_bytes: 0,
+            accounting: "memory_policy=legacy reason=server test fixture".into(),
+            stored_state_qualification: None,
         };
 
         crate::alloc_rss::set_rss_cap_bytes(0);
@@ -2237,13 +2523,113 @@ addresses = ["127.0.0.1:20490"]
         )
         .unwrap();
 
-        let error = load_and_validate_server_settings(&config).unwrap_err();
+        let error = load_and_validate_server_settings(
+            &config,
+            crate::writeback::config::WritebackAccessMode::ReadWrite,
+        )
+        .unwrap_err();
 
         assert!(format!("{error:#}").contains("Invalid startup memory budget"));
         assert!(
             !backend.exists(),
             "memory guard reached backend initialization"
         );
+    }
+
+    #[test]
+    fn startup_memory_admission_charges_shared_only_volatile_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = temp.path().join("backend-must-not-exist");
+        let config = temp.path().join("zerofs.toml");
+        std::fs::write(
+            &config,
+            format!(
+                r#"
+[cache]
+dir = {cache:?}
+disk_size_gb = 1.0
+[runtime]
+memory_limit_gb = 0.25
+[storage]
+url = {storage:?}
+encryption_password = "test"
+[servers.nfs]
+addresses = ["127.0.0.1:20490"]
+[filesystem]
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 2.0
+[writeback]
+enabled = true
+dir = {journal:?}
+memory_size_gb = 1.0
+disk_size_gb = 8.0
+min_free_gb = 1.0
+"#,
+                cache = temp.path().join("cache"),
+                journal = temp.path().join("journal"),
+                storage = format!("file://{}", backend.display())
+            ),
+        )
+        .unwrap();
+        let error = load_and_validate_server_settings(
+            &config,
+            crate::writeback::config::WritebackAccessMode::ReadWrite,
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        // The configured 2 GB is charged once for each of the two ownership stages.
+        assert!(message.contains("4.00 GB volatile writes"), "{message}");
+        for mode in [
+            crate::writeback::config::WritebackAccessMode::ReadOnly,
+            crate::writeback::config::WritebackAccessMode::Checkpoint,
+        ] {
+            let error = load_and_validate_server_settings(&config, mode).unwrap_err();
+            assert!(
+                format!("{error:#}")
+                    .contains("Invalid filesystem write-acknowledgement configuration")
+            );
+        }
+        assert!(!backend.exists());
+        assert!(!temp.path().join("journal").exists());
+    }
+
+    #[test]
+    fn startup_memory_selector_cannot_enable_unbounded_serving() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = temp.path().join("backend-must-not-exist");
+        let config = temp.path().join("zerofs.toml");
+        std::fs::write(
+            &config,
+            format!(
+                r#"
+[cache]
+dir = {cache:?}
+disk_size_gb = 1.0
+[storage]
+url = {storage:?}
+encryption_password = "test"
+[servers.nfs]
+addresses = ["127.0.0.1:20490"]
+[memory]
+total = "4 GiB"
+"#,
+                cache = temp.path().join("cache"),
+                storage = format!("file://{}", backend.display())
+            ),
+        )
+        .unwrap();
+        let error = load_and_validate_server_settings(
+            &config,
+            crate::writeback::config::WritebackAccessMode::ReadWrite,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("production enforcement is not enabled")
+        );
+        assert!(!backend.exists());
+        assert!(!temp.path().join("cache").exists());
     }
 
     #[test]
@@ -2297,7 +2683,7 @@ min_free_gb = 256.0
             DatabaseMode::Checkpoint(uuid::Uuid::nil()),
         ] {
             let error = settings
-                .filesystem_write_ack_settings(write_ack_access_mode(db_mode))
+                .filesystem_write_ack_settings(db_mode.into())
                 .unwrap_err();
             assert!(
                 format!("{error:#}").contains("read-write"),
@@ -2305,7 +2691,7 @@ min_free_gb = 256.0
             );
         }
         settings
-            .filesystem_write_ack_settings(write_ack_access_mode(DatabaseMode::ReadWrite))
+            .filesystem_write_ack_settings(DatabaseMode::ReadWrite.into())
             .unwrap();
     }
 
@@ -2338,7 +2724,7 @@ min_free_gb = 256.0
         )
         .unwrap();
         let write_ack = settings
-            .filesystem_write_ack_settings(write_ack_access_mode(DatabaseMode::ReadWrite))
+            .filesystem_write_ack_settings(DatabaseMode::ReadWrite.into())
             .unwrap();
         assert_eq!(
             nbd_volatile_budget(write_ack),
@@ -2350,7 +2736,7 @@ min_free_gb = 256.0
             nbd.write_ack_mode,
             crate::config::NbdWriteAckMode::Materialized
         );
-        assert_eq!(nbd.volatile_memory_bytes().unwrap(), 0);
+        assert_eq!(nbd.volatile_memory_gb, 0.0);
     }
 
     #[test]
@@ -2890,25 +3276,232 @@ min_free_gb = 256.0
     }
 
     #[test]
+    fn foyer_prune_handles_wide_native_partition_ids() {
+        let root = tempfile::tempdir().unwrap();
+        for id in [0, 100_000_000, u32::MAX] {
+            let path = root.path().join(format!("{FOYER_PARTITION_PREFIX}{id:08}"));
+            std::fs::write(path, vec![0; 4096]).unwrap();
+        }
+        // Only Foyer's canonical u32 names belong to the cache. Similar names
+        // must remain untouched, including overflowing and overpadded IDs.
+        let foreign_ids = ["000000000", "0100000000", "4294967296", "1", "0000000x"];
+        for id in foreign_ids {
+            std::fs::write(
+                root.path().join(format!("{FOYER_PARTITION_PREFIX}{id}")),
+                b"keep",
+            )
+            .unwrap();
+        }
+
+        let result = prune_foyer_partitions(root.path(), 4096).unwrap();
+
+        assert_eq!(result.removed_files, 2);
+        assert!(
+            root.path()
+                .join("foyer-storage-direct-fs-00000000")
+                .exists()
+        );
+        for id in [100_000_000, u32::MAX] {
+            assert!(
+                !root
+                    .path()
+                    .join(format!("{FOYER_PARTITION_PREFIX}{id:08}"))
+                    .exists()
+            );
+        }
+        for id in foreign_ids {
+            assert_eq!(
+                std::fs::read(root.path().join(format!("{FOYER_PARTITION_PREFIX}{id}"))).unwrap(),
+                b"keep"
+            );
+        }
+    }
+
+    #[test]
     fn foyer_prune_rejects_symlinked_owned_partition() {
         #[cfg(unix)]
         {
             use std::os::unix::fs::symlink;
-            let root = tempfile::tempdir().unwrap();
-            let outside = tempfile::NamedTempFile::new().unwrap();
-            symlink(
-                outside.path(),
-                root.path().join("foyer-storage-direct-fs-00000000"),
+            for id in [0, 100_000_000, u32::MAX] {
+                let root = tempfile::tempdir().unwrap();
+                let outside = tempfile::NamedTempFile::new().unwrap();
+                symlink(
+                    outside.path(),
+                    root.path().join(format!("{FOYER_PARTITION_PREFIX}{id:08}")),
+                )
+                .unwrap();
+
+                let error = prune_foyer_partitions(root.path(), 0).unwrap_err();
+                assert!(
+                    error.to_string().contains("not a regular file"),
+                    "{error:#}"
+                );
+                assert!(outside.path().exists());
+            }
+        }
+    }
+
+    #[test]
+    fn parts_cache_layout_discards_legacy_data_and_preserves_compatible_partitions() {
+        let root = tempfile::tempdir().unwrap();
+        let _owner = acquire_clean_cache_owner(root.path()).unwrap();
+        let parts = root.path().join(PARTS_CACHE_DIR);
+        std::fs::create_dir_all(&parts).unwrap();
+        for id in [0, 1, 100_000_000] {
+            std::fs::write(
+                parts.join(format!("{FOYER_PARTITION_PREFIX}{id:08}")),
+                b"old",
             )
             .unwrap();
-
-            let error = prune_foyer_partitions(root.path(), 0).unwrap_err();
-            assert!(
-                error.to_string().contains("not a regular file"),
-                "{error:#}"
-            );
-            assert!(outside.path().exists());
         }
+        let foreign = parts.join("foyer-storage-direct-fs-backup");
+        std::fs::write(&foreign, b"keep").unwrap();
+
+        prepare_parts_cache_layout(&parts, 256 * 1024 * 1024).unwrap();
+        for id in [0, 1, 100_000_000] {
+            assert!(
+                !parts
+                    .join(format!("{FOYER_PARTITION_PREFIX}{id:08}"))
+                    .exists()
+            );
+        }
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"keep");
+        assert!(parts.join(PARTS_CACHE_LAYOUT_FILE).is_file());
+
+        let reusable = parts.join(format!("{FOYER_PARTITION_PREFIX}00000001"));
+        std::fs::write(&reusable, b"same geometry").unwrap();
+        prepare_parts_cache_layout(&parts, 256 * 1024 * 1024).unwrap();
+        assert_eq!(std::fs::read(&reusable).unwrap(), b"same geometry");
+    }
+
+    #[test]
+    fn parts_cache_layout_resets_changed_geometry_and_corrupt_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let _owner = acquire_clean_cache_owner(root.path()).unwrap();
+        let parts = root.path().join(PARTS_CACHE_DIR);
+        prepare_parts_cache_layout(&parts, 256 * 1024 * 1024).unwrap();
+        let partition = parts.join(format!("{FOYER_PARTITION_PREFIX}00000000"));
+        std::fs::write(&partition, b"old geometry").unwrap();
+        prepare_parts_cache_layout(&parts, 128 * 1024 * 1024).unwrap();
+        assert!(!partition.exists());
+
+        std::fs::write(&partition, b"unknown layout").unwrap();
+        std::fs::write(parts.join(PARTS_CACHE_LAYOUT_FILE), b"partial marker").unwrap();
+        prepare_parts_cache_layout(&parts, 128 * 1024 * 1024).unwrap();
+        assert!(!partition.exists());
+
+        // The preceding recovery policy used a tombstone log in partition 0.
+        std::fs::write(&partition, b"old tombstone log").unwrap();
+        std::fs::write(
+            parts.join(PARTS_CACHE_LAYOUT_FILE),
+            format!(
+                "zerofs-parts-cache-v1\ntombstones=1\nblock_bytes={PARTS_BLOCK_SIZE}\ndisk_bytes={}\n",
+                128 * 1024 * 1024
+            ),
+        )
+        .unwrap();
+        prepare_parts_cache_layout(&parts, 128 * 1024 * 1024).unwrap();
+        assert!(!partition.exists());
+    }
+
+    /// A parts cache written while foyer left its padding undefined carries
+    /// freed heap memory, so it is reset even at the same geometry.
+    #[test]
+    fn parts_cache_written_with_undefined_padding_is_reset() {
+        let root = tempfile::tempdir().unwrap();
+        let _owner = acquire_clean_cache_owner(root.path()).unwrap();
+        let parts = root.path().join(PARTS_CACHE_DIR);
+        std::fs::create_dir_all(&parts).unwrap();
+        let disk_bytes = 256 * 1024 * 1024;
+        std::fs::write(
+            parts.join(PARTS_CACHE_LAYOUT_FILE),
+            format!(
+                "zerofs-parts-cache-v1\nrecover=none\ntombstones=0\nblock_bytes={PARTS_BLOCK_SIZE}\ndisk_bytes={disk_bytes}\n"
+            ),
+        )
+        .unwrap();
+        let partition = parts.join(format!("{FOYER_PARTITION_PREFIX}00000000"));
+        std::fs::write(&partition, b"undefined padding").unwrap();
+
+        prepare_parts_cache_layout(&parts, disk_bytes).unwrap();
+        assert!(!partition.exists());
+        assert!(
+            std::fs::read_to_string(parts.join(PARTS_CACHE_LAYOUT_FILE))
+                .unwrap()
+                .ends_with(CACHE_PADDING_POLICY)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parts_cache_layout_invalidates_previous_geometry_before_reset() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let _owner = acquire_clean_cache_owner(root.path()).unwrap();
+        let parts = root.path().join(PARTS_CACHE_DIR);
+        prepare_parts_cache_layout(&parts, 256 * 1024 * 1024).unwrap();
+        let marker = parts.join(PARTS_CACHE_LAYOUT_FILE);
+        let partition = parts.join(format!("{FOYER_PARTITION_PREFIX}00000000"));
+        std::fs::write(&partition, b"old geometry").unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), b"outside").unwrap();
+        let unsafe_partition = parts.join(format!("{FOYER_PARTITION_PREFIX}00000001"));
+        symlink(outside.path(), &unsafe_partition).unwrap();
+
+        assert!(prepare_parts_cache_layout(&parts, 128 * 1024 * 1024).is_err());
+        assert!(
+            !marker.exists(),
+            "a failed reset must invalidate the old layout"
+        );
+        assert_eq!(std::fs::read(&partition).unwrap(), b"old geometry");
+        assert_eq!(std::fs::read(outside.path()).unwrap(), b"outside");
+
+        std::fs::remove_file(unsafe_partition).unwrap();
+        // Even returning to the previous geometry must complete the reset.
+        prepare_parts_cache_layout(&parts, 256 * 1024 * 1024).unwrap();
+        assert!(!partition.exists());
+        assert!(marker.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parts_cache_layout_rejects_symlinked_marker_and_partition() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let _owner = acquire_clean_cache_owner(root.path()).unwrap();
+        let parts = root.path().join(PARTS_CACHE_DIR);
+        std::fs::create_dir_all(&parts).unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), b"outside").unwrap();
+        let marker = parts.join(PARTS_CACHE_LAYOUT_FILE);
+        let partition = parts.join(format!("{FOYER_PARTITION_PREFIX}00000000"));
+        std::fs::write(&partition, b"cached").unwrap();
+        symlink(outside.path(), &marker).unwrap();
+        assert!(prepare_parts_cache_layout(&parts, 256 * 1024 * 1024).is_err());
+        assert_eq!(std::fs::read(&partition).unwrap(), b"cached");
+        assert_eq!(std::fs::read(outside.path()).unwrap(), b"outside");
+
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::create_dir(&marker).unwrap();
+        assert!(prepare_parts_cache_layout(&parts, 256 * 1024 * 1024).is_err());
+        assert_eq!(std::fs::read(&partition).unwrap(), b"cached");
+        std::fs::remove_dir(&marker).unwrap();
+        let unsafe_partition = parts.join(format!("{FOYER_PARTITION_PREFIX}00000001"));
+        symlink(outside.path(), &unsafe_partition).unwrap();
+        assert!(prepare_parts_cache_layout(&parts, 256 * 1024 * 1024).is_err());
+        assert!(
+            !marker.exists(),
+            "failed reset must not publish a layout marker"
+        );
+        assert_eq!(std::fs::read(&partition).unwrap(), b"cached");
+        assert_eq!(std::fs::read(outside.path()).unwrap(), b"outside");
+
+        std::fs::remove_file(unsafe_partition).unwrap();
+        prepare_parts_cache_layout(&parts, 256 * 1024 * 1024).unwrap();
+        assert!(
+            !partition.exists(),
+            "a subsequent open must retry the reset"
+        );
     }
 
     #[test]
@@ -2928,7 +3521,7 @@ min_free_gb = 256.0
         let live_owner = Arc::clone(&first);
         // A duplicate models the shared open file description inherited
         // between fork and exec without starting a child or relying on timing.
-        let inherited_lock = first._lock.try_clone().unwrap();
+        let inherited_lock = first._lock.as_ref().unwrap().try_clone().unwrap();
         let assert_locked = || {
             let error = acquire_clean_cache_owner(root.path()).unwrap_err();
             assert!(error.to_string().contains("already in use"), "{error:#}");

@@ -66,9 +66,12 @@ fn plan_read_ahead(
     if ahead >= READ_AHEAD_WINDOW_BYTES / 2 {
         return ((read_end, prefetched_to, seq), None);
     }
-    let target = read_end + READ_AHEAD_WINDOW_BYTES;
+    let target = read_end.saturating_add(READ_AHEAD_WINDOW_BYTES);
     let start = prefetched_to.max(read_end);
-    ((read_end, target, seq), Some((start, target)))
+    (
+        (read_end, target, seq),
+        (start < target).then_some((start, target)),
+    )
 }
 
 impl ExtentStore {
@@ -359,7 +362,7 @@ impl ExtentStore {
             let Ok(permit) = Arc::clone(&self.prefetch_sem).try_acquire_owned() else {
                 break;
             };
-            let next = (scheduled_to + READ_AHEAD_CHUNK_BYTES).min(end);
+            let next = scheduled_to.saturating_add(READ_AHEAD_CHUNK_BYTES).min(end);
             ranges.push((scheduled_to, next, permit));
             scheduled_to = next;
         }
@@ -403,7 +406,7 @@ impl ExtentStore {
         if length == 0 {
             return Ok(Bytes::new());
         }
-        let end = offset + length;
+        let end = offset.checked_add(length).ok_or(FsError::InvalidArgument)?;
         let start_extent = offset / EXTENT_SIZE as u64;
         let end_extent = (end - 1) / EXTENT_SIZE as u64;
         let start_offset = (offset % EXTENT_SIZE as u64) as usize;

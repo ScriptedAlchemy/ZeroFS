@@ -20,12 +20,16 @@ use crate::fs::inode::{Inode, InodeId};
 use crate::fs::mutation::config::FilesystemWriteAckMode;
 use crate::fs::mutation::request_cache::{RequestLookup, RetainedRequest};
 use crate::fs::mutation::types::{
-    ConflictKey, ConflictScope, MutationCutoff, MutationError, PrepareWriteMember,
+    ConflictKey, ConflictScope, MutationCutoff, MutationError, PendingAppend, PrepareWriteMember,
     PrepareWriteRequest, PreparedWriteBatch, RequestFingerprint, RequestIdentity, RequestLifetime,
 };
-use crate::fs::ops::write::{apply_prepared_batch, prepare_write};
+use crate::fs::ops::write::{apply_prepared_batch, prepare_write, prepare_write_with_append};
+use crate::fs::permissions::Credentials;
+use crate::fs::permissions::acl::PosixAcl;
+use crate::fs::tracing::FileOperation;
 use crate::fs::types::{AuthContext, FileAttributes};
 use bytes::Bytes;
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ops::Deref;
 #[cfg(test)]
@@ -46,6 +50,8 @@ pub(crate) struct FilesystemVolatileOverlay {
     fail_publish: AtomicBool,
     #[cfg(test)]
     publish_pause: Mutex<Option<PublicationPause>>,
+    #[cfg(test)]
+    metadata_read_pause: Mutex<Option<PublicationPause>>,
     fs: Weak<ZeroFS>,
 }
 
@@ -140,6 +146,7 @@ pub(crate) enum WriteAdmission {
 
 /// Why a write could not enter shared admission. Each protocol maps these
 /// onto its own error vocabulary; the sequence itself stays protocol-agnostic.
+#[derive(Debug)]
 pub(crate) enum WriteAdmissionError {
     /// The mutation coordinator or its request cache is gone.
     Unavailable,
@@ -149,6 +156,10 @@ pub(crate) enum WriteAdmissionError {
     FingerprintMismatch,
     /// Raw byte admission or the preparation gate refused the write.
     Mutation(MutationError),
+    /// Latched metadata-survival admission refused the write (EIO or EROFS),
+    /// or the durability tier failed terminally (EIO). A commit's cut only
+    /// delays a write.
+    Survival(FsError),
 }
 
 pub(crate) struct IdentifiedWrite<'a> {
@@ -212,6 +223,8 @@ impl FilesystemVolatileOverlay {
             fail_publish: AtomicBool::new(false),
             #[cfg(test)]
             publish_pause: Mutex::new(None),
+            #[cfg(test)]
+            metadata_read_pause: Mutex::new(None),
             fs,
         })
     }
@@ -355,6 +368,35 @@ impl FilesystemVolatileOverlay {
         attrs
     }
 
+    /// The caller pins this inode's runtime retirement before loading the
+    /// canonical inode. A preview can then disappear only after this read, or
+    /// before its canonical snapshot, never between the two metadata layers.
+    fn project_inode(&self, id: InodeId, inode: &mut Inode) {
+        let Inode::File(file) = inode else {
+            return;
+        };
+        let latest = self
+            .latest_attrs
+            .lock()
+            .expect("filesystem overlay poisoned");
+        let Some(attrs) = latest.get(&id).and_then(|attrs| {
+            attrs
+                .iter()
+                .rev()
+                .find(|entry| entry.visibility.is_published())
+        }) else {
+            return;
+        };
+        // Only writes' own metadata is projected. In particular, an automatic
+        // atime update may have committed after the prepared write's snapshot.
+        file.size = attrs.attrs.size;
+        file.mode = attrs.attrs.mode;
+        file.mtime = attrs.attrs.mtime.seconds;
+        file.mtime_nsec = attrs.attrs.mtime.nanoseconds;
+        file.ctime = attrs.attrs.ctime.seconds;
+        file.ctime_nsec = attrs.attrs.ctime.nanoseconds;
+    }
+
     async fn reserve(
         self: &Arc<Self>,
         inode: u64,
@@ -407,7 +449,22 @@ impl FilesystemVolatileOverlay {
             });
     }
 
-    pub(crate) fn retire_inode(&self, inode: u64) {
+    pub(crate) async fn retire_inode(&self, inode: u64) {
+        let runtime = self
+            .runtimes
+            .lock()
+            .expect("filesystem overlay poisoned")
+            .entries
+            .get(&inode)
+            .map(|entry| Arc::clone(&entry.runtime));
+        if let Some(runtime) = runtime {
+            runtime.retire_metadata(|| self.retire_attrs(inode)).await;
+        } else {
+            self.retire_attrs(inode);
+        }
+    }
+
+    fn retire_attrs(&self, inode: u64) {
         // Pending batches are owned by the apply worker that popped them.
         // Only drop the preview attributes once canonical apply owns the bytes.
         let mut latest = self
@@ -510,6 +567,9 @@ impl FilesystemVolatileOverlay {
         if members.is_empty() || admissions.len() != members.len() {
             return Err(OverlayError::InvalidArgument);
         }
+        // Staging publishes the write; from here it applies even if the
+        // request stops waiting.
+        crate::abandonment::pass_point_of_no_return().map_err(FsError::from)?;
         let visibility = WriteVisibility::staged();
         let member_ids = members.iter().map(|member| member.id).collect::<Vec<_>>();
         let (accepted_tx, accepted_rx) = oneshot::channel();
@@ -724,10 +784,36 @@ impl FilesystemVolatileOverlay {
         }
     }
 
-    #[cfg_attr(
-        feature = "hotpath-profile",
-        hotpath::measure(future = true, label = "zerofs.overlay.read")
-    )]
+    #[cfg(test)]
+    pub(crate) fn pause_metadata_read_for_test(
+        &self,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = oneshot::channel();
+        *self
+            .metadata_read_pause
+            .lock()
+            .expect("filesystem overlay poisoned") = Some(PublicationPause {
+            reached: reached_tx,
+            resume: resume_rx,
+        });
+        (reached_rx, resume_tx)
+    }
+
+    #[cfg(test)]
+    async fn pause_after_metadata_read_if_requested(&self) {
+        let pause = self
+            .metadata_read_pause
+            .lock()
+            .expect("filesystem overlay poisoned")
+            .take();
+        if let Some(pause) = pause {
+            let _ = pause.reached.send(());
+            let _ = pause.resume.await;
+        }
+    }
+
+    #[cfg(test)]
     async fn read(
         self: &Arc<Self>,
         inode: u64,
@@ -932,11 +1018,60 @@ impl ZeroFS {
     }
 
     pub(crate) async fn visible_inode(&self, id: InodeId) -> Result<Inode, FsError> {
+        let Some(overlay) = self.volatile_overlay.get() else {
+            return self.inode_store.get(id).await;
+        };
+        let Some(runtime) = overlay.runtime_if_present(id).map_err(overlay_fs_error)? else {
+            return self.inode_store.get(id).await;
+        };
+        let _read = runtime.read_guard().await;
         let mut inode = self.inode_store.get(id).await?;
-        if let Inode::File(file) = &mut inode {
-            file.size = self.overlay_visible_size(id, file.size);
-        }
+        #[cfg(test)]
+        overlay.pause_after_metadata_read_if_requested().await;
+        overlay.project_inode(id, &mut inode);
         Ok(inode)
+    }
+
+    /// Load coherent access fields and ACL entries while retaining the same
+    /// pending-write view used by getattr. Reading the ACL after visible_inode
+    /// could replace its acknowledged size and timestamps with committed data.
+    pub(crate) async fn visible_inode_access_context(
+        &self,
+        id: InodeId,
+        creds: &Credentials,
+    ) -> Result<(Inode, Option<PosixAcl>), FsError> {
+        let overlay = self.volatile_overlay.get();
+        let runtime = match overlay {
+            Some(overlay) => overlay.runtime_if_present(id).map_err(overlay_fs_error)?,
+            None => None,
+        };
+        let _read = match &runtime {
+            Some(runtime) => Some(runtime.read_guard().await),
+            None => None,
+        };
+        let inode = self.inode_store.get(id).await?;
+        let (access_inode, acl) = self.inode_access_context(id, &inode, creds).await?;
+        let mut inode = match access_inode {
+            Cow::Borrowed(_) => inode,
+            Cow::Owned(inode) => inode,
+        };
+        if let (Some(overlay), Some(_)) = (overlay, runtime.as_ref()) {
+            // The lease keeps a pending preview from retiring between the
+            // canonical pair read and projection, without draining writes or
+            // acquiring the canonical lock held by their preparation.
+            let canonical_mode = match &inode {
+                Inode::File(file) => file.mode,
+                _ => 0,
+            };
+            overlay.project_inode(id, &mut inode);
+            if let Inode::File(file) = &mut inode {
+                // Writes only clear setid bits. Retain the ACL snapshot's
+                // permission bits even if an idle runtime publishes a new
+                // write after a concurrent chmod changed those permissions.
+                file.mode = canonical_mode & (file.mode | !0o6000);
+            }
+        }
+        Ok((inode, acl))
     }
 
     /// RAM-ack write used by NFS, 9P, NBD, and WebUI. Materialized mode falls
@@ -987,7 +1122,7 @@ impl ZeroFS {
             check_permissions: true,
         };
         if self.volatile_overlay.get().is_none() {
-            let mut batch = prepare_write(&self.write_prepare_context(), request).await?;
+            let mut batch = self.prepare_materialized_write(request).await?;
             let result = apply_prepared_batch(&self.write_apply_context(), &mut batch).await?;
             return Ok(result.primary_attrs());
         }
@@ -1114,6 +1249,31 @@ impl ZeroFS {
         scope: ConflictScope,
         length: u64,
     ) -> Result<WriteAdmission, WriteAdmissionError> {
+        // Survival admission precedes every other admission step. It logs
+        // its own refusals with the latch reason.
+        let survival = self
+            .admit_mutation()
+            .await
+            .map_err(WriteAdmissionError::Survival)?;
+        self.admit_surviving_write(identity, fingerprint, lifetime, scope, length)
+            .await
+            .map(|admission| match admission {
+                WriteAdmission::Prepared(guard) => {
+                    WriteAdmission::Prepared(guard.with_survival(survival))
+                }
+                WriteAdmission::Joined(retained) => WriteAdmission::Joined(retained),
+            })
+            .inspect_err(|error| tracing::warn!(?error, length, "refused a client write"))
+    }
+
+    async fn admit_surviving_write(
+        &self,
+        identity: RequestIdentity,
+        fingerprint: RequestFingerprint,
+        lifetime: RequestLifetime,
+        scope: ConflictScope,
+        length: u64,
+    ) -> Result<WriteAdmission, WriteAdmissionError> {
         let coordinator = self
             .mutation_coordinator
             .get()
@@ -1130,6 +1290,7 @@ impl ZeroFS {
             }
             RequestLookup::Backpressured => return Err(WriteAdmissionError::Backpressured),
         };
+        let raw_waiting = std::time::Instant::now();
         let raw_permit = match coordinator.raw_budget().acquire(length).await {
             Ok(permit) => permit,
             Err(error) => {
@@ -1137,6 +1298,7 @@ impl ZeroFS {
                 return Err(WriteAdmissionError::Mutation(error));
             }
         };
+        crate::fs::metrics::record_write_stage("ack_admission_raw_budget", raw_waiting);
         PreparationGuard::new(coordinator.gate(), scope, raw_permit, pending)
             .map(WriteAdmission::Prepared)
             .map_err(WriteAdmissionError::Mutation)
@@ -1182,6 +1344,7 @@ impl ZeroFS {
             request_lifetime,
             fingerprint_context,
         } = write;
+        let started = std::time::Instant::now();
         let policy = identity.replay_policy();
         let fingerprint = if policy.fingerprints_request() {
             direct_write_fingerprint(
@@ -1196,6 +1359,7 @@ impl ZeroFS {
         } else {
             RequestFingerprint::from_bytes([0; 32])
         };
+        crate::fs::metrics::record_write_stage("ack_fingerprint", started);
         let replay_count = if policy.tracks_protocol_ledger() {
             Some(u32::try_from(data.len()).map_err(|_| FsError::InvalidArgument)?)
         } else {
@@ -1283,6 +1447,7 @@ impl ZeroFS {
                 cutoff: self.capture_mutation_cutoff(),
             });
         }
+        let admitting = std::time::Instant::now();
         let guard = match self
             .begin_write_admission(
                 identity,
@@ -1303,6 +1468,8 @@ impl ZeroFS {
                 });
             }
         };
+        crate::fs::metrics::record_write_stage("ack_admission", admitting);
+        let reserving = std::time::Instant::now();
         let admission = match overlay.reserve(id, data.len()).await {
             Ok(admission) => admission,
             Err(error) => {
@@ -1321,12 +1488,44 @@ impl ZeroFS {
             op_id,
             check_permissions,
         };
-        let batch = match prepare_write(&self.write_prepare_context(), request).await {
-            Ok(batch) => batch,
-            Err(error) => {
-                let _ = guard.abort(PreparationAbort::RequestFailure(error));
-                return Err(error);
-            }
+        let runtime = Arc::clone(
+            admission
+                .runtime
+                .runtime
+                .as_ref()
+                .expect("live runtime handle"),
+        );
+        // Serialize projection and publication for this one inode. Taking the
+        // hint first makes cancellation or failed publication fall back to the
+        // canonical lock. Other writers and striped batches acquire it normally.
+        crate::fs::metrics::record_write_stage("ack_volatile_reserve", reserving);
+        let preparing = std::time::Instant::now();
+        let mut append = runtime.append.lock().await;
+        let (batch, writes) =
+            match prepare_write_with_append(&self.write_prepare_context(), request, append.take())
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ = guard.abort(PreparationAbort::RequestFailure(error));
+                    return Err(error);
+                }
+            };
+        // The same guarded projection also covers contiguous overwrites
+        // inside an existing file. Track the written range's end rather
+        // than EOF so gaps and overlaps still acquire the canonical lock.
+        let next_append = match batch.members.as_slice() {
+            [member] if !member.data.is_empty() => Some(PendingAppend {
+                inode: member.inode.clone(),
+                id,
+                end: member
+                    .offset
+                    .checked_add(member.data.len() as u64)
+                    .expect("prepared write end was checked"),
+                writes,
+                guards: Arc::downgrade(batch.guards.as_ref().expect("prepared inode lock")),
+            }),
+            _ => None,
         };
         let attrs = batch
             .replayed
@@ -1339,6 +1538,8 @@ impl ZeroFS {
                     .map(|member| member.post_attrs.clone())
             })
             .expect("prepared batch has attributes");
+        crate::fs::metrics::record_write_stage("ack_prepare", preparing);
+        let accepting = std::time::Instant::now();
         let cutoff = overlay
             .accept(StagedWriteAccept {
                 inode: id,
@@ -1356,6 +1557,9 @@ impl ZeroFS {
             })
             .await
             .map_err(overlay_fs_error)?;
+        *append = next_append;
+        crate::fs::metrics::record_write_stage("ack_accept", accepting);
+        crate::fs::metrics::record_write_stage("ack_total", started);
         Ok(WriteAckReceipt { attrs, cutoff })
     }
 
@@ -1372,33 +1576,64 @@ impl ZeroFS {
                 .await;
         };
 
-        let inode = self.inode_store.get(id).await?;
+        let Some(runtime) = overlay.runtime_if_present(id).map_err(overlay_fs_error)? else {
+            return self
+                .read_file_inner_canonical(auth, id, offset, count)
+                .await;
+        };
+        // Keep the registry handle as well as the read lease: a replacement
+        // runtime must not take over between metadata and payload snapshots.
+        let read = runtime.read_guard().await;
+        let mut inode = self.inode_store.get(id).await?;
+        #[cfg(test)]
+        overlay.pause_after_metadata_read_if_requested().await;
+        let canonical_size = match &inode {
+            Inode::File(file) => file.size,
+            _ => 0,
+        };
+        overlay.project_inode(id, &mut inode);
         if let Some(auth) = auth {
             let creds = crate::fs::permissions::Credentials::from_auth_context(auth);
-            crate::fs::permissions::check_access(
-                &inode,
-                &creds,
-                crate::fs::permissions::AccessMode::Read,
-            )?;
+            self.check_inode_access(id, &inode, &creds, crate::fs::permissions::AccessMode::Read)
+                .await?;
         }
         let Inode::File(file) = &inode else {
             return Err(FsError::IsDirectory);
         };
-        let visible_size = overlay.visible_size(id, file.size);
+        let visible_size = file.size;
         if offset >= visible_size {
+            self.tracer.emit(
+                &self.inode_store,
+                id,
+                FileOperation::Read { offset, length: 0 },
+            );
             return Ok((Bytes::new(), true));
         }
         let read_len = std::cmp::min(count as u64, visible_size - offset) as usize;
-        let canonical_size = file.size;
         let filesystem = self.extent_store.clone();
-        let data = overlay
-            .read(id, offset, read_len, move || {
+        let data = read
+            .read(offset, read_len, move || {
                 Box::pin(async move {
                     canonical_read_base(&filesystem, id, offset, read_len, canonical_size).await
                 })
             })
             .await
             .map_err(overlay_fs_error)?;
+        // Extent reads do not perform filesystem-level accounting. Count the
+        // combined canonical/volatile payload once, as the canonical path does.
+        self.stats
+            .bytes_read
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        self.stats.read_operations.fetch_add(1, Ordering::Relaxed);
+        self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+        self.tracer.emit(
+            &self.inode_store,
+            id,
+            FileOperation::Read {
+                offset,
+                length: read_len as u64,
+            },
+        );
         Ok((data, offset + read_len as u64 >= visible_size))
     }
 }
@@ -1438,6 +1673,9 @@ async fn canonical_read_base(
 }
 
 #[cfg(test)]
+mod sequential_write_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::fs::mutation::config::{
@@ -1458,6 +1696,361 @@ mod tests {
             source: FilesystemWriteAckSource::Filesystem,
             client_durability_target: ClientDurabilityTarget::LocalSsd,
         }
+    }
+
+    #[tokio::test]
+    async fn volatile_reads_record_bytes_operations_and_access_events() {
+        use crate::fs::tracing::FileOperation;
+        use crate::fs::types::{SetAttributes, SetMode};
+
+        let mut fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.write_ack = volatile_settings();
+        let fs = Arc::new(fs);
+        fs.install_volatile_overlay();
+        let auth = AuthContext::from(&test_creds());
+        let file = fs
+            .create_exclusive(&auth, 0, b"observed-read")
+            .await
+            .unwrap();
+        fs.write(&auth, file, 0, &Bytes::from_static(b"base"))
+            .await
+            .unwrap();
+        fs.setattr(
+            &test_creds(),
+            file,
+            &SetAttributes {
+                mode: SetMode::Set(0o600),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let release = fs
+            .materializer
+            .get()
+            .unwrap()
+            .hold_inode_lane_for_test(file)
+            .await;
+        fs.write_ack(&auth, file, 4, &Bytes::from_static(b"tail"))
+            .await
+            .unwrap();
+
+        // Both credential-checked and already-opened reads must count the
+        // bytes returned across the canonical/volatile boundary exactly once.
+        let baseline = (
+            fs.stats.bytes_read.load(Ordering::Relaxed),
+            fs.stats.read_operations.load(Ordering::Relaxed),
+            fs.stats.total_operations.load(Ordering::Relaxed),
+        );
+        let mut events = fs.tracer.subscribe();
+        assert_eq!(
+            fs.read_file(&auth, file, 2, 8).await.unwrap(),
+            (Bytes::from_static(b"setail"), true)
+        );
+        assert_eq!(fs.stats.bytes_read.load(Ordering::Relaxed), baseline.0 + 6);
+        assert_eq!(
+            fs.stats.read_operations.load(Ordering::Relaxed),
+            baseline.1 + 1
+        );
+        assert_eq!(
+            fs.stats.total_operations.load(Ordering::Relaxed),
+            baseline.2 + 1
+        );
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.path, "/observed-read");
+        assert!(matches!(
+            event.operation,
+            FileOperation::Read {
+                offset: 2,
+                length: 6
+            }
+        ));
+
+        assert_eq!(
+            fs.read_file_opened(file, 0, 8).await.unwrap(),
+            (Bytes::from_static(b"basetail"), true)
+        );
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.path, "/observed-read");
+        assert!(matches!(
+            event.operation,
+            FileOperation::Read {
+                offset: 0,
+                length: 8
+            }
+        ));
+
+        // Match canonical EOF behavior: emit the access, but record no
+        // successful data operation or payload bytes at/past EOF.
+        assert_eq!(
+            fs.read_file(&auth, file, 8, 8).await.unwrap(),
+            (Bytes::new(), true)
+        );
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event.operation,
+            FileOperation::Read {
+                offset: 8,
+                length: 0
+            }
+        ));
+
+        let denied = AuthContext {
+            uid: 1001,
+            gid: 1001,
+            gids: vec![],
+            ..auth.clone()
+        };
+        assert_eq!(
+            fs.read_file(&denied, file, 0, 8).await,
+            Err(FsError::PermissionDenied)
+        );
+        assert_eq!(fs.stats.bytes_read.load(Ordering::Relaxed), baseline.0 + 14);
+        assert_eq!(
+            fs.stats.read_operations.load(Ordering::Relaxed),
+            baseline.1 + 2
+        );
+        assert_eq!(
+            fs.stats.total_operations.load(Ordering::Relaxed),
+            baseline.2 + 2
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        release.send(()).unwrap();
+        fs.quiesce_overlay_inode(file).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn volatile_write_at_maximum_file_size_materializes() {
+        let mut fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.write_ack = volatile_settings();
+        let fs = Arc::new(fs);
+        fs.install_volatile_overlay();
+        let auth = crate::fs::types::AuthContext::from(&test_creds());
+        let file = fs.create_exclusive(&auth, 0, b"last-extent").await.unwrap();
+        let release = fs
+            .materializer
+            .get()
+            .unwrap()
+            .hold_inode_lane_for_test(file)
+            .await;
+        let attrs = fs
+            .write_ack(&auth, file, u64::MAX - 4, &Bytes::from_static(b"edge"))
+            .await
+            .unwrap();
+        assert_eq!(attrs.size, u64::MAX);
+        let cutoff = fs.capture_mutation_cutoff();
+        assert_eq!(
+            fs.read_file(&auth, file, u64::MAX - 6, 6).await.unwrap(),
+            (Bytes::from_static(b"\0\0edge"), true)
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            fs.materialize_through_cutoff(cutoff),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        fs.quiesce_overlay_inode(file).await.unwrap();
+        assert_eq!(
+            fs.read_file(&auth, file, u64::MAX - 4, 4).await.unwrap(),
+            (Bytes::from_static(b"edge"), true)
+        );
+        fs.write_ack(&auth, file, u64::MAX - 1, &Bytes::from_static(b"!"))
+            .await
+            .unwrap();
+        fs.quiesce_overlay_inode(file).await.unwrap();
+        assert_eq!(
+            fs.read_file(&auth, file, u64::MAX - 4, 4).await.unwrap(),
+            (Bytes::from_static(b"edg!"), true)
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_volatile_write_preserves_metadata_and_replay() {
+        use crate::fs::types::{InodeWithId, SetAttributes, SetMode, SetTime, Timestamp};
+
+        let mut fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.write_ack = volatile_settings();
+        let fs = Arc::new(fs);
+        fs.install_volatile_overlay();
+        let owner = crate::fs::types::AuthContext::from(&test_creds());
+        let file = fs
+            .create_exclusive(&owner, 0, b"empty-write")
+            .await
+            .unwrap();
+        fs.write(&owner, file, 0, &Bytes::from_static(b"seed"))
+            .await
+            .unwrap();
+        let before = fs
+            .setattr(
+                &test_creds(),
+                file,
+                &SetAttributes {
+                    mode: SetMode::Set(0o6777),
+                    atime: SetTime::SetToClientTime(Timestamp {
+                        seconds: 1,
+                        nanoseconds: 2,
+                    }),
+                    mtime: SetTime::SetToClientTime(Timestamp {
+                        seconds: 3,
+                        nanoseconds: 4,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let writer = AuthContext {
+            uid: owner.uid + 1,
+            ..owner.clone()
+        };
+        let before_attrs = bincode::serialize(&before).unwrap();
+        let quota = (fs.quota.committed_bytes(), fs.quota.pending_bytes());
+        let writes = fs.stats.write_operations.load(Ordering::Relaxed);
+        let cutoff = fs.capture_mutation_cutoff();
+        let release = fs
+            .materializer
+            .get()
+            .unwrap()
+            .hold_inode_lane_for_test(file)
+            .await;
+        let empty = Bytes::new();
+        let request = || IdentifiedWrite {
+            auth: &writer,
+            id: file,
+            offset: u64::MAX,
+            data: &empty,
+            op_id: [0x34; 16],
+            check_permissions: true,
+            identity: RequestIdentity::NineP {
+                origin_epoch: 1,
+                operation_id: [0x34; 16],
+            },
+            request_lifetime: RequestLifetime::CanonicalDedup,
+            fingerprint_context: &[],
+        };
+        let receipt = fs.write_ack_identified(request()).await.unwrap();
+        assert_eq!(bincode::serialize(&receipt.attrs).unwrap(), before_attrs);
+        assert_eq!(receipt.cutoff.sequence, cutoff.sequence + 1);
+        assert_eq!(fs.overlay_visible_size(file, before.size), before.size);
+        let inode = fs.visible_inode(file).await.unwrap();
+        let visible: FileAttributes = InodeWithId {
+            inode: &inode,
+            id: file,
+        }
+        .into();
+        assert_eq!(bincode::serialize(&visible).unwrap(), before_attrs);
+        assert_eq!(
+            fs.read_file(&owner, file, 0, 16).await.unwrap().0.as_ref(),
+            b"seed"
+        );
+        assert_eq!(
+            (fs.quota.committed_bytes(), fs.quota.pending_bytes()),
+            quota
+        );
+        assert_eq!(fs.volatile_budget().unwrap().status().dirty_bytes, 0);
+        assert_eq!(fs.volatile_budget().unwrap().status().dirty_operations, 1);
+        let replay = fs.write_ack_identified(request()).await.unwrap();
+        assert_eq!(bincode::serialize(&replay.attrs).unwrap(), before_attrs);
+        assert_eq!(replay.cutoff, receipt.cutoff);
+        let mut materialized = Box::pin(fs.materialize_through_cutoff(receipt.cutoff));
+        assert!(futures::poll!(materialized.as_mut()).is_pending());
+
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), materialized)
+            .await
+            .unwrap()
+            .unwrap();
+        fs.quiesce_overlay_inode(file).await.unwrap();
+        assert_eq!(fs.stats.write_operations.load(Ordering::Relaxed), writes);
+        assert_eq!(
+            (fs.quota.committed_bytes(), fs.quota.pending_bytes()),
+            quota
+        );
+        assert_eq!(fs.volatile_budget().unwrap().status().dirty_operations, 0);
+        let after = fs.inode_store.get(file).await.unwrap();
+        let after: FileAttributes = InodeWithId {
+            inode: &after,
+            id: file,
+        }
+        .into();
+        assert_eq!(bincode::serialize(&after).unwrap(), before_attrs);
+
+        // Replaying the zero-byte operation after an append must preserve its
+        // original reply without shrinking or touching the newer contents.
+        fs.write_ack(&owner, file, before.size, &Bytes::from_static(b"+tail"))
+            .await
+            .unwrap();
+        fs.quiesce_overlay_inode(file).await.unwrap();
+        let replay = fs.write_ack_identified(request()).await.unwrap();
+        assert_eq!(bincode::serialize(&replay.attrs).unwrap(), before_attrs);
+        assert_eq!(
+            fs.read_file(&owner, file, 0, 16).await.unwrap().0.as_ref(),
+            b"seed+tail",
+        );
+        assert_eq!(fs.quota.committed_bytes(), 9);
+        assert_eq!(fs.quota.pending_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn write_metadata_projection_preserves_newer_canonical_atime() {
+        use crate::fs::types::{InodeWithId, Timestamp};
+
+        let mut fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.write_ack = volatile_settings();
+        let fs = Arc::new(fs);
+        fs.install_volatile_overlay();
+        let auth = crate::fs::types::AuthContext::from(&test_creds());
+        let file = fs
+            .create_exclusive(&auth, 0, b"projection-atime")
+            .await
+            .unwrap();
+        let acknowledged = fs
+            .write_ack(&auth, file, 0, &Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+        fs.quiesce_overlay_inode(file).await.unwrap();
+
+        // Model a committed write whose preview is still pinned by a reader.
+        // Automatic atime commits intentionally do not fence those previews.
+        let overlay = fs.volatile_overlay.get().unwrap();
+        let runtime = overlay.runtime(file).unwrap();
+        overlay.preview_attrs(file, acknowledged.clone());
+        let atime = Timestamp {
+            seconds: acknowledged.atime.seconds + 10,
+            nanoseconds: 123,
+        };
+        fs.record_access_time_idempotent(file, atime, [0x42; 16])
+            .await
+            .unwrap();
+        let inode = fs.visible_inode(file).await.unwrap();
+        let visible: FileAttributes = InodeWithId {
+            inode: &inode,
+            id: file,
+        }
+        .into();
+        assert_eq!(visible.atime, atime);
+        assert_eq!(visible.size, acknowledged.size);
+        assert_eq!(visible.mode, acknowledged.mode);
+        assert_eq!(visible.mtime, acknowledged.mtime);
+        assert_eq!(visible.ctime, acknowledged.ctime);
+        overlay.retire_inode(file).await;
+        drop(runtime);
+        assert_eq!(overlay.lifecycle_census_for_test().runtimes, 0);
+        assert_eq!(overlay.lifecycle_census_for_test().visible_attrs, 0);
     }
 
     #[tokio::test]

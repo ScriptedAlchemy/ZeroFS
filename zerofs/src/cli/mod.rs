@@ -10,13 +10,21 @@ pub mod debug;
 pub mod fatrace;
 pub mod flush;
 mod init;
-mod memory_budget;
+pub(crate) use init::recreate_raw_pool_journal;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) mod inventory;
+pub(crate) mod memory_budget;
+#[cfg(test)]
+mod metadata_fault_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod metadata_survival_raw_tests;
 pub mod monitor;
 pub mod nbd;
 pub mod otrace;
 pub mod password;
 pub mod pool;
 pub mod server;
+pub mod survival;
 pub(crate) mod transfer;
 
 #[derive(Parser)]
@@ -29,6 +37,26 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Inventory source metadata as JSON Lines without a server or configuration
+    ///
+    /// Reads may update atime; only a read-only mount prevents this. Exit 3 means
+    /// the inventory is incomplete. The name rule uses the ZeroFS insensitive fold.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Inventory {
+        root: PathBuf,
+        /// Read regular file contents to compute SHA-256 (disabled by default)
+        #[arg(long, value_enum)]
+        hash: Option<inventory::HashAlgorithm>,
+        /// Limit entry starts per second (unlimited by default)
+        #[arg(long)]
+        max_entries_per_second: Option<std::num::NonZeroU32>,
+        /// Existing scratch parent outside the source root, required when memory caps are exceeded
+        #[arg(long)]
+        work_dir: Option<PathBuf>,
+        /// Continue a partial manifest after its last complete directory, writing a new manifest
+        #[arg(long)]
+        resume_from: Option<PathBuf>,
+    },
     /// Upload a file or directory directly over ZeroFS 9P
     Upload {
         /// 9P server address: host[:port], tcp://host:port, unix:/path, or ws:// URL
@@ -70,6 +98,7 @@ pub enum Commands {
         path: PathBuf,
     },
     /// Run the filesystem server
+    #[command(after_help = crate::operator_required::run_exit_status_help())]
     Run {
         #[arg(short, long)]
         config: PathBuf,
@@ -79,6 +108,11 @@ pub enum Commands {
         /// Open from a specific checkpoint by name (read-only mode)
         #[arg(long, conflicts_with = "read_only")]
         checkpoint: Option<String>,
+    },
+    /// Report memory admission and empirical stored-state coverage as JSON
+    MemoryStatus {
+        #[arg(short, long)]
+        config: PathBuf,
     },
     /// Change the encryption password
     ///
@@ -95,6 +129,11 @@ pub enum Commands {
     Pool {
         #[command(subcommand)]
         subcommand: PoolCommands,
+    },
+    /// Metadata survival: per-replica generation status and offline recovery
+    Survival {
+        #[command(subcommand)]
+        subcommand: SurvivalCommands,
     },
     /// Debug commands for inspecting the database
     Debug {
@@ -176,7 +215,29 @@ pub enum Commands {
         /// filesystem. The directory must already exist.
         #[arg(long)]
         aname: Option<String>,
+        /// Seconds file operations wait for a lost 9P server before they fail
+        /// with EIO (1 to 120), counted from when the mount notices the loss.
+        /// A failover or restart inside this window is invisible to
+        /// applications. After it, operations fail promptly until a server
+        /// answers again. A process blocked on the mount, even one sent
+        /// SIGKILL, is released when this window ends.
+        #[arg(long, default_value = "30", value_parser = parse_reconnect_timeout)]
+        reconnect_timeout: ninep_client::ReconnectTimeout,
     },
+}
+
+#[cfg(target_os = "linux")]
+fn parse_reconnect_timeout(
+    value: &str,
+) -> std::result::Result<ninep_client::ReconnectTimeout, String> {
+    let max = ninep_client::ReconnectTimeout::MAX.as_secs();
+    value
+        .parse::<u64>()
+        .ok()
+        .and_then(|seconds| {
+            ninep_client::ReconnectTimeout::new(std::time::Duration::from_secs(seconds))
+        })
+        .ok_or_else(|| format!("reconnect timeout must be whole seconds from 1 to {max}"))
 }
 
 fn parse_transfer_jobs(value: &str) -> std::result::Result<usize, String> {
@@ -191,7 +252,65 @@ fn parse_transfer_jobs(value: &str) -> std::result::Result<usize, String> {
 }
 
 #[derive(Subcommand)]
+pub enum SurvivalCommands {
+    /// Report the last metadata generation on every replica
+    ///
+    /// Reads the replicas named by the configuration and authenticates their
+    /// records with the configured password. It never writes. On a raw-device
+    /// pool it claims the member devices, so the server must be stopped; a
+    /// running server reports the same state in `zerofs pool status`. It
+    /// does not need the authority device.
+    Status {
+        #[arg(short, long)]
+        config: PathBuf,
+    },
+    /// Recover the newest complete metadata generation after the authority device is lost
+    ///
+    /// Runs only when asked: ordinary startup never recovers. Sources are
+    /// never modified, every digest is verified before anything is written,
+    /// and the original key envelope is used. Prints a JSON report with the
+    /// selected generation, unavailable members and every lost file range.
+    ///
+    /// With --config, rebuilds a raw-device pool's authority onto the P3 the
+    /// configuration names, which must be freshly provisioned and blank. The
+    /// configuration must name the surviving members and carry the password.
+    ///
+    /// With --replica and --scratch, materializes a directory pool's
+    /// generation read-only into owned scratch and reads the password from
+    /// stdin.
+    Recover {
+        /// Configuration naming the raw members and the blank replacement P3
+        #[arg(short, long, conflicts_with_all = ["replicas", "scratch", "keep"])]
+        config: Option<PathBuf>,
+        /// A member that is also lost; its files are reported as unreadable (repeatable)
+        #[arg(long = "allow-missing-member", requires = "config")]
+        allow_missing: Vec<String>,
+        /// A surviving metadata replica directory (repeatable)
+        #[arg(long = "replica", requires = "scratch")]
+        replicas: Vec<PathBuf>,
+        /// A healthy directory for recovery scratch
+        #[arg(long, requires = "replicas")]
+        scratch: Option<PathBuf>,
+        /// Keep the materialized scratch for inspection instead of removing it
+        #[arg(long, requires = "scratch")]
+        keep: bool,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum PoolCommands {
+    /// Offline NAS-fit readiness, including held devices, original journal, and finite memory admission
+    VerifyRaw {
+        #[arg(short, long)]
+        config: PathBuf,
+    },
+    /// Count one file's indexed logical bytes per committed pool member
+    FilePlacement {
+        #[arg(long)]
+        endpoint: String,
+        /// Absolute path in the ZeroFS namespace
+        path: PathBuf,
+    },
     /// Report live and retained-checkpoint affected paths without reading data disks
     Affected {
         #[arg(long)]
@@ -220,6 +339,13 @@ pub enum PoolCommands {
     List {
         #[arg(short, long)]
         config: PathBuf,
+    },
+    /// Verify every committed segment on a member against its catalog SHA-256
+    Verify {
+        #[arg(short, long)]
+        config: PathBuf,
+        #[arg(long)]
+        member: String,
     },
     /// Move verified segments to another member, retaining the same filesystem
     Migrate {
@@ -269,6 +395,38 @@ pub enum DebugCommands {
     ListKeys {
         #[arg(short, long)]
         config: PathBuf,
+    },
+    /// Scan clean-cache files a server left behind for undefined bytes.
+    ///
+    /// Finds the raw-parts cache (parts_cache_v1) and the decoded-block cache
+    /// (hybrid_cache_v1) at or under PATH and checks that every blob index
+    /// tail past its last record, and every entry's padding up to the next
+    /// 4 KiB page, is zero. Those bytes carry no data, so the check decrypts
+    /// nothing and needs no password or key; this command takes none.
+    ///
+    /// It opens files read-only and changes, repairs or deletes nothing. It
+    /// refuses a cache whose ownership lock is missing or held by a running
+    /// server, because a blob being written can look torn; stop the server
+    /// first, or pass --live to scan a snapshot anyway. Caches written before the
+    /// zeroed padding are reported as such and counted only with --legacy.
+    ///
+    /// Exit status: 0 when every scanned byte is zero and every cache had
+    /// entries to scan; 3 when non-zero bytes were found; 4 when a cache had
+    /// no entries on disk, was not scanned, or held an incomplete blob, which
+    /// is not evidence that it is clean; 1 on an error.
+    ScanCacheFiles {
+        /// The [cache] dir from the server's config, one namespace inside it
+        /// (bucket_...), or one cache directory.
+        path: PathBuf,
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Scan even while a server holds the cache; the result is a snapshot.
+        #[arg(long)]
+        live: bool,
+        /// Also count the bytes of caches written by earlier builds.
+        #[arg(long)]
+        legacy: bool,
     },
     /// Explicitly repair one pruned writeback predecessor from remote HEAD.
     ///
@@ -520,6 +678,45 @@ mod tests {
         assert!(expected_local_sha256.starts_with("f999"));
         assert!(expected_remote_sha256.starts_with("0f3f"));
         assert!(confirm_abandon_maintenance_tail);
+    }
+
+    #[test]
+    fn scan_cache_files_takes_a_path_and_no_password() {
+        let cli = Cli::try_parse_from([
+            "zerofs",
+            "debug",
+            "scan-cache-files",
+            "/var/cache/zerofs",
+            "--json",
+            "--live",
+            "--legacy",
+        ])
+        .unwrap();
+        let Commands::Debug {
+            subcommand:
+                DebugCommands::ScanCacheFiles {
+                    path,
+                    json,
+                    live,
+                    legacy,
+                },
+        } = cli.command
+        else {
+            panic!("expected scan-cache-files command");
+        };
+        assert_eq!(path, PathBuf::from("/var/cache/zerofs"));
+        assert!(json && live && legacy);
+        assert!(
+            Cli::try_parse_from([
+                "zerofs",
+                "debug",
+                "scan-cache-files",
+                "/var/cache/zerofs",
+                "--password",
+                "x",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

@@ -11,13 +11,15 @@ use crate::fs::inode::{
     DirectoryInode, FileInode, Inode, InodeId, MAX_DEVICE_MAJOR, MAX_DEVICE_MINOR, SpecialInode,
 };
 use crate::fs::mutation::types::{ConflictKey, ConflictScope};
-use crate::fs::permissions::{AccessMode, Credentials, check_access, validate_mode};
+use crate::fs::permissions::{
+    AccessMode, Credentials, check_create_ownership, new_entry_gid, strip_sgid_unless_member,
+    validate_mode,
+};
 #[cfg(test)]
 use crate::fs::store::directory::COOKIE_FIRST_ENTRY;
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{
-    AuthContext, FileAttributes, FileType, InodeWithId, SetAttributes, SetGid, SetMode, SetTime,
-    SetUid,
+    AuthContext, FileAttributes, FileType, InodeWithId, SetAttributes, SetMode, SetTime, SetUid,
 };
 use crate::fs::{ZeroFS, get_current_time, validate_filename};
 use ::tracing::{debug, error};
@@ -52,6 +54,19 @@ impl ZeroFS {
         attr: &SetAttributes,
         op_id: crate::dedup::OpId,
     ) -> Result<(InodeId, FileAttributes), FsError> {
+        self.create_with_umask(creds, dirid, name, attr, op_id, 0)
+            .await
+    }
+
+    pub(crate) async fn create_with_umask(
+        &self,
+        creds: &Credentials,
+        dirid: InodeId,
+        name: &[u8],
+        attr: &SetAttributes,
+        op_id: crate::dedup::OpId,
+        umask: u32,
+    ) -> Result<(InodeId, FileAttributes), FsError> {
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_create)? {
             return Ok(result);
         }
@@ -63,10 +78,10 @@ impl ZeroFS {
             String::from_utf8_lossy(name)
         );
 
-        let _fence = self
+        let fence = self
             .fence_metadata(ConflictScope::single(ConflictKey::Directory(dirid)))
             .await?;
-        let _guard = self.lock_manager.acquire(dirid).await;
+        let guard = self.lock_manager.acquire(dirid).await;
         // Direct filesystem callers do not pass through the 9P single-flight.
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_create)? {
             return Ok(result);
@@ -86,8 +101,8 @@ impl ZeroFS {
         let (parent_and_name, cookie) = tokio::join!(parent_and_name, cookie_read);
         let (mut dir_inode, exists) = parent_and_name?;
 
-        check_access(&dir_inode, creds, AccessMode::Write)?;
-        check_access(&dir_inode, creds, AccessMode::Execute)?;
+        self.check_inode_access(dirid, &dir_inode, creds, AccessMode::WriteExecute)
+            .await?;
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
@@ -98,6 +113,7 @@ impl ZeroFS {
                     return Err(FsError::Exists);
                 }
 
+                check_create_ownership(dir, attr, creds)?;
                 let file_id = self.inode_store.allocate();
                 debug!(
                     "Allocated inode {} for file {}",
@@ -107,10 +123,16 @@ impl ZeroFS {
 
                 let (now_sec, now_nsec) = get_current_time();
 
-                let final_mode = match &attr.mode {
-                    SetMode::Set(m) => validate_mode(*m),
+                let new_gid = new_entry_gid(dir, &attr.gid, creds);
+                let mut final_mode = match attr.mode {
+                    SetMode::Set(mode) => validate_mode(mode),
                     SetMode::NoChange => 0o666,
                 };
+                let inherited_acls = self
+                    .inherited_acls(dirid, false, &mut final_mode, umask, |mode| {
+                        strip_sgid_unless_member(dir, mode, new_gid, creds)
+                    })
+                    .await?;
 
                 let file_inode = Inode::File(FileInode {
                     size: 0,
@@ -125,10 +147,7 @@ impl ZeroFS {
                         SetUid::Set(u) => *u,
                         SetUid::NoChange => creds.uid,
                     },
-                    gid: match &attr.gid {
-                        SetGid::Set(g) => *g,
-                        SetGid::NoChange => creds.gid,
-                    },
+                    gid: new_gid,
                     parent: Some(dirid),
                     name: Some(name.to_vec()),
                     nlink: 1,
@@ -152,6 +171,7 @@ impl ZeroFS {
                     },
                 );
                 self.inode_store.save(&mut txn, file_id, &file_inode)?;
+                inherited_acls.stage(self, &mut txn, file_id);
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::CREATE_AFTER_INODE);
@@ -181,9 +201,12 @@ impl ZeroFS {
 
                 txn.add_inode_count_delta(file_id, 1);
 
-                self.write_coordinator.commit(txn).await.inspect_err(|e| {
-                    error!("Failed to write batch: {:?}", e);
-                })?;
+                self.write_coordinator
+                    .commit_holding(txn, (fence, guard))
+                    .await
+                    .inspect_err(|e| {
+                        error!("Failed to write batch: {:?}", e);
+                    })?;
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::CREATE_AFTER_COMMIT);
@@ -232,7 +255,7 @@ impl ZeroFS {
         name: &[u8],
         attr: &SetAttributes,
     ) -> Result<(InodeId, FileAttributes), FsError> {
-        self.mkdir_idempotent(creds, dirid, name, attr, [0u8; 16])
+        self.mkdir_idempotent(creds, dirid, name, attr, [0u8; 16], 0)
             .await
     }
 
@@ -245,6 +268,7 @@ impl ZeroFS {
         name: &[u8],
         attr: &SetAttributes,
         op_id: crate::dedup::OpId,
+        umask: u32,
     ) -> Result<(InodeId, FileAttributes), FsError> {
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_mkdir)? {
             return Ok(result);
@@ -257,10 +281,10 @@ impl ZeroFS {
             String::from_utf8_lossy(name)
         );
 
-        let _fence = self
+        let fence = self
             .fence_metadata(ConflictScope::single(ConflictKey::Directory(dirid)))
             .await?;
-        let _guard = self.lock_manager.acquire(dirid).await;
+        let guard = self.lock_manager.acquire(dirid).await;
         // Direct filesystem callers do not pass through the 9P single-flight.
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_mkdir)? {
             return Ok(result);
@@ -270,8 +294,8 @@ impl ZeroFS {
             self.directory_store.exists(dirid, name)
         )?;
 
-        check_access(&dir_inode, creds, AccessMode::Write)?;
-        check_access(&dir_inode, creds, AccessMode::Execute)?;
+        self.check_inode_access(dirid, &dir_inode, creds, AccessMode::WriteExecute)
+            .await?;
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
@@ -282,35 +306,29 @@ impl ZeroFS {
                     return Err(FsError::Exists);
                 }
 
+                check_create_ownership(dir, attr, creds)?;
                 let new_dir_id = self.inode_store.allocate();
 
                 let (now_sec, now_nsec) = get_current_time();
 
                 let mut new_mode = match &attr.mode {
-                    SetMode::Set(m) => *m,
+                    SetMode::Set(m) => validate_mode(*m),
                     SetMode::NoChange => 0o777,
                 };
 
-                let parent_mode = dir.mode;
-                if parent_mode & 0o2000 != 0 {
+                if dir.mode & 0o2000 != 0 {
                     new_mode |= 0o2000;
                 }
+                let inherited_acls = self
+                    .inherited_acls(dirid, true, &mut new_mode, umask, |mode| mode)
+                    .await?;
 
                 let new_uid = match &attr.uid {
                     SetUid::Set(u) => *u,
                     SetUid::NoChange => creds.uid,
                 };
 
-                let new_gid = match &attr.gid {
-                    SetGid::Set(g) => *g,
-                    SetGid::NoChange => {
-                        if parent_mode & 0o2000 != 0 {
-                            dir.gid
-                        } else {
-                            creds.gid
-                        }
-                    }
-                };
+                let new_gid = new_entry_gid(dir, &attr.gid, creds);
 
                 let (atime_sec, atime_nsec) = match &attr.atime {
                     SetTime::SetToClientTime(ts) => (ts.seconds, ts.nanoseconds),
@@ -344,7 +362,7 @@ impl ZeroFS {
                     .allocate_cookie(dirid, &mut txn)
                     .await?;
 
-                let new_dir_inode_enum = Inode::Directory(new_dir_inode.clone());
+                let new_dir_inode_enum = Inode::Directory(new_dir_inode);
                 let attrs: FileAttributes = InodeWithId {
                     inode: &new_dir_inode_enum,
                     id: new_dir_id,
@@ -359,6 +377,7 @@ impl ZeroFS {
                 );
                 self.inode_store
                     .save(&mut txn, new_dir_id, &new_dir_inode_enum)?;
+                inherited_acls.stage(self, &mut txn, new_dir_id);
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::MKDIR_AFTER_INODE);
@@ -398,7 +417,9 @@ impl ZeroFS {
 
                 txn.add_inode_count_delta(new_dir_id, 1);
 
-                self.write_coordinator.commit(txn).await?;
+                self.write_coordinator
+                    .commit_holding(txn, (fence, guard))
+                    .await?;
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::MKDIR_AFTER_COMMIT);
@@ -412,9 +433,7 @@ impl ZeroFS {
                 self.tracer.emit(
                     &self.inode_store,
                     new_dir_id,
-                    FileOperation::Mkdir {
-                        mode: new_dir_inode.mode,
-                    },
+                    FileOperation::Mkdir { mode: new_mode },
                 );
 
                 Ok((new_dir_id, attrs))
@@ -434,7 +453,7 @@ impl ZeroFS {
         attr: &SetAttributes,
         rdev: Option<(u32, u32)>,
     ) -> Result<(InodeId, FileAttributes), FsError> {
-        self.mknod_idempotent(creds, dirid, name, ftype, attr, rdev, [0u8; 16])
+        self.mknod_idempotent(creds, dirid, name, ftype, attr, rdev, [0u8; 16], 0)
             .await
     }
 
@@ -450,6 +469,7 @@ impl ZeroFS {
         attr: &SetAttributes,
         rdev: Option<(u32, u32)>,
         op_id: crate::dedup::OpId,
+        umask: u32,
     ) -> Result<(InodeId, FileAttributes), FsError> {
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_mknod)? {
             return Ok(result);
@@ -470,10 +490,10 @@ impl ZeroFS {
             ftype
         );
 
-        let _fence = self
+        let fence = self
             .fence_metadata(ConflictScope::single(ConflictKey::Directory(dirid)))
             .await?;
-        let _guard = self.lock_manager.acquire(dirid).await;
+        let guard = self.lock_manager.acquire(dirid).await;
         // Direct filesystem callers do not pass through the 9P single-flight.
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_mknod)? {
             return Ok(result);
@@ -483,8 +503,8 @@ impl ZeroFS {
             self.directory_store.exists(dirid, name)
         )?;
 
-        check_access(&dir_inode, creds, AccessMode::Write)?;
-        check_access(&dir_inode, creds, AccessMode::Execute)?;
+        self.check_inode_access(dirid, &dir_inode, creds, AccessMode::WriteExecute)
+            .await?;
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
@@ -496,21 +516,28 @@ impl ZeroFS {
                     return Err(FsError::Exists);
                 }
 
+                check_create_ownership(dir, attr, creds)?;
                 let special_id = self.inode_store.allocate();
                 let (now_sec, now_nsec) = get_current_time();
 
                 let base_mode = match ftype {
-                    FileType::Fifo => 0o666,
-                    FileType::CharDevice | FileType::BlockDevice => 0o666,
-                    FileType::Socket => 0o666,
+                    FileType::Fifo
+                    | FileType::CharDevice
+                    | FileType::BlockDevice
+                    | FileType::Socket => 0o666,
                     _ => return Err(FsError::InvalidArgument),
                 };
 
-                let final_mode = if let SetMode::Set(m) = attr.mode {
-                    validate_mode(m)
-                } else {
-                    base_mode
+                let new_gid = new_entry_gid(dir, &attr.gid, creds);
+                let mut final_mode = match attr.mode {
+                    SetMode::Set(mode) => validate_mode(mode),
+                    SetMode::NoChange => base_mode,
                 };
+                let inherited_acls = self
+                    .inherited_acls(dirid, false, &mut final_mode, umask, |mode| {
+                        strip_sgid_unless_member(dir, mode, new_gid, creds)
+                    })
+                    .await?;
 
                 let special_inode = SpecialInode {
                     mtime: now_sec,
@@ -524,10 +551,7 @@ impl ZeroFS {
                         SetUid::Set(u) => u,
                         _ => creds.uid,
                     },
-                    gid: match attr.gid {
-                        SetGid::Set(g) => g,
-                        _ => creds.gid,
-                    },
+                    gid: new_gid,
                     parent: Some(dirid),
                     name: Some(name.to_vec()),
                     nlink: 1,
@@ -562,6 +586,7 @@ impl ZeroFS {
                 );
 
                 self.inode_store.save(&mut txn, special_id, &inode)?;
+                inherited_acls.stage(self, &mut txn, special_id);
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::MKNOD_AFTER_INODE);
@@ -591,7 +616,9 @@ impl ZeroFS {
 
                 txn.add_inode_count_delta(special_id, 1);
 
-                self.write_coordinator.commit(txn).await?;
+                self.write_coordinator
+                    .commit_holding(txn, (fence, guard))
+                    .await?;
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::MKNOD_AFTER_COMMIT);
@@ -615,12 +642,13 @@ impl ZeroFS {
 
 #[cfg(test)]
 mod tests {
+    use crate::fs::permissions::Credentials;
 
     use crate::fs::test_util::test_creds;
     use crate::fs::*;
     use crate::test_helpers::test_helpers_mod::test_auth;
 
-    use crate::fs::inode::Inode;
+    use crate::fs::inode::{Inode, InodeAttrs};
     use crate::fs::key_codec::KeyCodec;
 
     use crate::fs::types::{FileType, SetAttributes, SetGid, SetMode, SetSize, SetTime, SetUid};
@@ -756,6 +784,7 @@ mod tests {
                 b"dir",
                 &SetAttributes::default(),
                 mkdir_op,
+                0,
             )
             .await
             .unwrap();
@@ -771,6 +800,7 @@ mod tests {
                 b"dir",
                 &SetAttributes::default(),
                 mkdir_op,
+                0,
             )
             .await
             .unwrap();
@@ -788,6 +818,7 @@ mod tests {
                 &SetAttributes::default(),
                 None,
                 mknod_op,
+                0,
             )
             .await
             .unwrap();
@@ -812,6 +843,7 @@ mod tests {
                 &SetAttributes::default(),
                 None,
                 mknod_op,
+                0,
             )
             .await
             .unwrap();
@@ -844,7 +876,15 @@ mod tests {
         };
 
         let (_dir_id, fattr) = fs
-            .mkdir(&test_creds(), 0, b"customdir", &custom_attrs)
+            .mkdir(
+                &Credentials {
+                    uid: 0,
+                    ..test_creds()
+                },
+                0,
+                b"customdir",
+                &custom_attrs,
+            )
             .await
             .unwrap();
 
@@ -895,5 +935,203 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    /// Differs from `test_creds`'s gid so inheritance is observable.
+    const SETGID_PARENT_GID: u32 = 2000;
+
+    async fn setgid_dir(fs: &ZeroFS, name: &[u8]) -> InodeId {
+        let (id, _) = fs
+            .mkdir(
+                &Credentials {
+                    uid: 0,
+                    ..test_creds()
+                },
+                0,
+                name,
+                &SetAttributes {
+                    mode: SetMode::Set(0o2775),
+                    uid: SetUid::Set(test_creds().uid),
+                    gid: SetGid::Set(SETGID_PARENT_GID),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn create_and_mknod_strip_sgid_for_non_members() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let dir = setgid_dir(&fs, b"sgid-mode").await;
+        let non_member = test_creds();
+        let mut supplementary_member = non_member;
+        supplementary_member.groups[0] = SETGID_PARENT_GID;
+        supplementary_member.groups_count = 1;
+        let primary_member = non_member.with_gid(SETGID_PARENT_GID);
+        let mut root = non_member;
+        root.uid = 0;
+        let mut incomplete_groups = non_member;
+        incomplete_groups.groups_complete = false;
+
+        let cases = [
+            ("non_member", non_member, SetGid::NoChange, 2000, false),
+            (
+                "primary_member",
+                primary_member,
+                SetGid::NoChange,
+                2000,
+                true,
+            ),
+            (
+                "supplementary_member",
+                supplementary_member,
+                SetGid::NoChange,
+                2000,
+                true,
+            ),
+            ("root", root, SetGid::NoChange, 2000, true),
+            (
+                "incomplete_groups",
+                incomplete_groups,
+                SetGid::NoChange,
+                2000,
+                true,
+            ),
+            ("explicit_member", non_member, SetGid::Set(1000), 1000, true),
+        ];
+
+        for (name, creds, gid, expected_gid, keep_sgid) in cases {
+            let attr = SetAttributes {
+                mode: SetMode::Set(0o2755),
+                gid,
+                ..Default::default()
+            };
+            for is_mknod in [false, true] {
+                let entry = format!("{name}-{}", if is_mknod { "fifo" } else { "file" });
+                let (id, attrs) = if is_mknod {
+                    fs.mknod(&creds, dir, entry.as_bytes(), FileType::Fifo, &attr, None)
+                        .await
+                        .unwrap()
+                } else {
+                    fs.create(&creds, dir, entry.as_bytes(), &attr)
+                        .await
+                        .unwrap()
+                };
+                let expected_mode = if keep_sgid { 0o2755 } else { 0o755 };
+                assert_eq!(attrs.gid, expected_gid, "{entry}");
+                assert_eq!(attrs.mode, expected_mode, "{entry}");
+                let inode = fs.inode_store.get(id).await.unwrap();
+                assert_eq!(inode.gid(), expected_gid, "stored {entry}");
+                assert_eq!(inode.mode(), expected_mode, "stored {entry}");
+            }
+        }
+
+        // Dropping SGID is not sufficient when the requested group itself is
+        // unauthorized: ordinary group-owned files also carry access rights.
+        let attr = SetAttributes {
+            mode: SetMode::Set(0o2755),
+            gid: SetGid::Set(4242),
+            ..Default::default()
+        };
+        for is_mknod in [false, true] {
+            let name = if is_mknod {
+                b"foreign-node".as_slice()
+            } else {
+                b"foreign-file"
+            };
+            let result = if is_mknod {
+                fs.mknod(&primary_member, dir, name, FileType::Fifo, &attr, None)
+                    .await
+            } else {
+                fs.create(&primary_member, dir, name, &attr).await
+            };
+            assert_eq!(result.map(|_| ()), Err(FsError::OperationNotPermitted));
+            assert!(!fs.directory_store.exists(dir, name).await.unwrap());
+        }
+    }
+
+    /// Linux `mode_strip_sgid` (fs/inode.c) clears an inherited setgid bit
+    /// only when group execute is also set.
+    #[tokio::test]
+    async fn inherited_group_keeps_sgid_without_group_execute() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let dir = setgid_dir(&fs, b"sgid-no-exec").await;
+        let attr = SetAttributes {
+            mode: SetMode::Set(0o2644),
+            ..Default::default()
+        };
+        let (_, file) = fs.create(&test_creds(), dir, b"file", &attr).await.unwrap();
+        let (_, fifo) = fs
+            .mknod(&test_creds(), dir, b"fifo", FileType::Fifo, &attr, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            (file.gid, file.mode, fifo.gid, fifo.mode),
+            (SETGID_PARENT_GID, 0o2644, SETGID_PARENT_GID, 0o2644)
+        );
+    }
+
+    #[tokio::test]
+    async fn create_file_in_non_setgid_dir_keeps_caller_group() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (dir, _) = fs
+            .mkdir(&test_creds(), 0, b"plain", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let (_, attrs) = fs
+            .create(&test_creds(), dir, b"file", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        assert_eq!(attrs.gid, 1000, "gid should come from the caller");
+    }
+
+    #[tokio::test]
+    async fn create_file_inherits_through_nested_setgid_dirs() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let outer = setgid_dir(&fs, b"outer").await;
+        let (inner, inner_attrs) = fs
+            .mkdir(&test_creds(), outer, b"inner", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            inner_attrs.mode & 0o2000,
+            0o2000,
+            "subdirectory should inherit the setgid bit"
+        );
+
+        let (_, attrs) = fs
+            .create(&test_creds(), inner, b"file", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        assert_eq!(attrs.gid, SETGID_PARENT_GID);
+    }
+
+    #[tokio::test]
+    async fn mknod_in_non_setgid_dir_keeps_caller_group() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (dir, _) = fs
+            .mkdir(&test_creds(), 0, b"plain", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let (_, attrs) = fs
+            .mknod(
+                &test_creds(),
+                dir,
+                b"fifo",
+                FileType::Fifo,
+                &SetAttributes::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(attrs.gid, 1000);
     }
 }

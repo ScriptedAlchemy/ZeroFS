@@ -215,7 +215,6 @@ async fn open_writeback_fs(
     use crate::block_transformer::ZeroFsBlockTransformer;
     use crate::config::CompressionConfig;
     use crate::db::SlateDbHandle;
-    use crate::fs::mutation::durability::{DurabilityError, DurabilityTarget, ObjectCoverage};
 
     let attached = crate::writeback::bootstrap::attach(remote, settings, identity, namespace)
         .await
@@ -254,41 +253,7 @@ async fn open_writeback_fs(
     .expect("open ZeroFS over SSD writeback");
     fs.write_ack = volatile_local_settings();
 
-    let local = writeback.clone();
-    fs.flush_coordinator
-        .set_local_durability_barrier(Arc::new(move || {
-            let writeback = local.clone();
-            Box::pin(async move {
-                writeback
-                    .wait_local_through_accepted()
-                    .await
-                    .map_err(|_| crate::fs::errors::FsError::IoError)
-            })
-        }));
-    let captured = writeback.clone();
-    fs.flush_coordinator
-        .set_object_capture(Arc::new(move || captured.object_coverage()));
-    let waited = writeback.clone();
-    fs.flush_coordinator
-        .set_object_wait(Arc::new(move |coverage, target| {
-            let writeback = waited.clone();
-            Box::pin(async move {
-                match coverage {
-                    ObjectCoverage::DirectRemote => Ok(()),
-                    ObjectCoverage::Writeback {
-                        journal_incarnation,
-                        sequence,
-                    } => writeback
-                        .wait_coverage(
-                            journal_incarnation.as_uuid(),
-                            sequence,
-                            matches!(target, DurabilityTarget::RemoteBackend),
-                        )
-                        .await
-                        .map_err(DurabilityError::Object),
-                }
-            })
-        }));
+    fs.flush_coordinator.attach_writeback(&writeback);
 
     let fs = Arc::new(fs);
     fs.install_volatile_overlay();
@@ -423,6 +388,63 @@ async fn assert_stable_write_waits(requested_stability: stable_how, xid: u32) {
         .expect("stable NFS WRITE task panicked")
         .expect("stable NFS WRITE failed");
     assert_eq!(result.committed, stable_how::FILE_SYNC);
+}
+
+#[tokio::test]
+async fn volatile_empty_writes_preserve_attributes_and_stability() {
+    let (fs, adapter, file) = volatile_adapter(b"empty-write").await;
+    let auth = nfs_auth(1000);
+    let before = adapter.write(&auth, file, 0, b"payload").await.unwrap();
+    fs.quiesce_overlay_inode(file).await.unwrap();
+
+    let assert_unchanged = |attributes: fattr3| {
+        assert_eq!(attributes.size, before.size);
+        assert_eq!(attributes.used, before.used);
+        assert_eq!(attributes.mode, before.mode);
+        assert_eq!(attributes.mtime.seconds, before.mtime.seconds);
+        assert_eq!(attributes.mtime.nseconds, before.mtime.nseconds);
+        assert_eq!(attributes.ctime.seconds, before.ctime.seconds);
+        assert_eq!(attributes.ctime.nseconds, before.ctime.nseconds);
+    };
+    assert_unchanged(
+        adapter
+            .write(&auth, file, u64::MAX, b"")
+            .await
+            .expect("a zero-byte NFS write is a successful no-op"),
+    );
+    for (xid, requested) in [
+        (900, stable_how::UNSTABLE),
+        (901, stable_how::DATA_SYNC),
+        (902, stable_how::FILE_SYNC),
+    ] {
+        let context = write_context(xid, 99, requested);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            adapter.write_with_context(&context, &auth, file, u64::MAX, b""),
+        )
+        .await
+        .expect("zero-byte NFS write did not settle")
+        .expect("zero-byte contextual NFS write failed");
+        assert_unchanged(result.attributes);
+        assert_eq!(
+            result.committed,
+            if requested == stable_how::UNSTABLE {
+                stable_how::UNSTABLE
+            } else {
+                stable_how::FILE_SYNC
+            }
+        );
+        assert_eq!(result.verifier, adapter.get_write_verf());
+        let replay = adapter
+            .write_with_context(&context, &auth, file, u64::MAX, b"")
+            .await
+            .expect("zero-byte NFS retry failed");
+        assert_unchanged(replay.attributes);
+        assert_eq!(replay.committed, result.committed);
+        assert_eq!(replay.verifier, result.verifier);
+    }
+    fs.quiesce_overlay_inode(file).await.unwrap();
+    assert_eq!(adapter.read(&auth, file, 0, 7).await.unwrap().0, b"payload");
 }
 
 #[tokio::test]
@@ -564,6 +586,7 @@ async fn commit_covers_prior_cross_adapter_cutoff() {
         gid_known: true,
         gids: vec![100, 20],
         groups_complete: true,
+        groups_truncated: false,
     };
     let direct_file = fs
         .create_exclusive(&auth, 0, b"direct-writer")
@@ -632,6 +655,40 @@ async fn write_and_commit_share_service_verifier() {
     assert_ne!(write.verifier, [0; 8]);
     assert_eq!(write.verifier, commit.verifier);
     assert_eq!(write.verifier, adapter.get_write_verf());
+}
+
+#[tokio::test]
+async fn tcp_pathconf_reports_the_volume_name_mode() {
+    use crate::fs::name_mode::NameMode;
+
+    for mode in [NameMode::Sensitive, NameMode::Insensitive] {
+        let fs = ZeroFS::new_in_memory_with_name_mode(mode).await.unwrap();
+        let adapter = NFSAdapter::new(Arc::new(fs));
+        let mut call = rpc_call_prefix(1, 20);
+        let handle = adapter.id_to_fh(adapter.root_dir());
+        call.extend_from_slice(&(handle.data.len() as u32).to_be_bytes());
+        call.extend_from_slice(&handle.data);
+        let listener = NFSTcpListener::bind("127.0.0.1:0".parse().unwrap(), adapter)
+            .await
+            .unwrap();
+        let port = listener.get_listen_port();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let signal = shutdown.clone();
+        let server = tokio::spawn(async move { listener.handle_with_shutdown(signal).await });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let reply = rpc_roundtrip(&mut client, &call).await;
+        assert_eq!(parse_nfs_status(&reply, 1), nfsstat3::NFS3_OK as u32);
+        // The last two PATHCONF3resok fields are the two XDR case flags.
+        let mut offset = reply.len() - 8;
+        assert_eq!(
+            take_u32(&reply, &mut offset),
+            u32::from(mode == NameMode::Insensitive)
+        );
+        assert_eq!(take_u32(&reply, &mut offset), 1);
+        drop(client);
+        shutdown.cancel();
+        server.await.unwrap().unwrap();
+    }
 }
 
 #[tokio::test]
@@ -782,6 +839,7 @@ async fn shipping_tcp_write_commit_survive_writeback_restart_with_new_verifier()
         gid_known: true,
         gids: vec![0],
         groups_complete: true,
+        groups_truncated: false,
     };
     let (bytes, _) = recovered
         .read_file(&auth, file, 0, payload.len() as u32)
@@ -874,4 +932,60 @@ async fn shipping_nfs_listener_rejects_ignore_fsync() {
 
     let error = result.expect_err("NFS must fail closed when fsync is disabled");
     assert!(format!("{error:#}").contains("ignore_fsync"));
+}
+
+/// Once the writeback tier is terminal, nothing it would have to persist is
+/// acknowledged: mutations fail with EIO and leave the namespace unchanged.
+#[tokio::test]
+async fn poisoned_writeback_refuses_mutations_instead_of_acknowledging_them() {
+    use crate::fs::errors::FsError;
+
+    let temp = tempfile::tempdir().expect("temporary SSD writeback directory");
+    let (fs, writeback) = open_writeback_fs(
+        Arc::new(InMemory::new()),
+        writeback_settings(temp.path().join("writeback")),
+        writeback_identity(),
+        "nfs_poisoned_test",
+    )
+    .await;
+    let auth: AuthContext = (&nfs_auth(1000)).into();
+    let creds = Credentials::from_auth_context(&auth);
+    let (kept, _) = fs
+        .create(&creds, 0, b"kept", &SetAttributes::default())
+        .await
+        .expect("create before the writeback failure");
+
+    // What the remote scheduler publishes when writeback becomes terminal.
+    writeback
+        .ssd_admission()
+        .poison("remote writeback entered terminal state (test)");
+
+    assert_eq!(fs.remove(&auth, 0, b"kept").await, Err(FsError::IoError));
+    assert_eq!(
+        fs.rename(&auth, 0, b"kept", 0, b"moved").await,
+        Err(FsError::IoError)
+    );
+    assert_eq!(
+        fs.create(&creds, 0, b"fresh", &SetAttributes::default())
+            .await
+            .map(|_| ()),
+        Err(FsError::IoError)
+    );
+    assert_eq!(
+        fs.mkdir(&creds, 0, b"made", &SetAttributes::default())
+            .await
+            .map(|_| ()),
+        Err(FsError::IoError)
+    );
+    assert_eq!(
+        fs.write(&auth, kept, 0, &bytes::Bytes::from_static(b"volatile"))
+            .await
+            .map(|_| ()),
+        Err(FsError::IoError)
+    );
+
+    assert_eq!(fs.lookup(&creds, 0, b"kept").await, Ok(kept));
+    for absent in [&b"moved"[..], b"fresh", b"made"] {
+        assert_eq!(fs.lookup(&creds, 0, absent).await, Err(FsError::NotFound));
+    }
 }

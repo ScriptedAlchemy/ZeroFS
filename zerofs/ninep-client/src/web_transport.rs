@@ -15,6 +15,26 @@ use web_sys::{BinaryType, Event, MessageEvent, WebSocket};
 const MAX_BUFFERED_BYTES: u32 = 4 * 1024 * 1024;
 const BUFFER_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
+/// Own the browser socket and its opening callbacks across the first await.
+/// Dropping a cancelled connect must detach the JS callbacks before their
+/// Rust closures are freed, and close the socket that has no transport owner.
+struct OpeningWebSocket {
+    socket: WebSocket,
+    _open: Closure<dyn FnMut(Event)>,
+    _error: Closure<dyn FnMut(Event)>,
+    transferred: bool,
+}
+
+impl Drop for OpeningWebSocket {
+    fn drop(&mut self) {
+        self.socket.set_onopen(None);
+        self.socket.set_onerror(None);
+        if !self.transferred {
+            let _ = self.socket.close();
+        }
+    }
+}
+
 pub(super) struct WebSocketIo {
     socket: WebSocket,
     incoming: mpsc::UnboundedReceiver<ClientResult<Bytes>>,
@@ -52,19 +72,21 @@ pub(super) async fn connect(url: &str) -> ClientResult<WebSocketIo> {
     }) as Box<dyn FnMut(Event)>);
     socket.set_onopen(Some(on_open.as_ref().unchecked_ref()));
     socket.set_onerror(Some(on_open_error.as_ref().unchecked_ref()));
+    let mut opening = OpeningWebSocket {
+        socket: socket.clone(),
+        _open: on_open,
+        _error: on_open_error,
+        transferred: false,
+    };
 
     let opened = runtime::timeout(Duration::from_secs(3), opened_rx).await;
-    socket.set_onopen(None);
-    socket.set_onerror(None);
-    drop(on_open);
-    drop(on_open_error);
     match opened {
-        Ok(Ok(true)) => {}
-        _ => {
-            let _ = socket.close();
-            return Err(ClientError::Disconnected);
-        }
+        Ok(Ok(true)) => opening.transferred = true,
+        _ => return Err(ClientError::Disconnected),
     }
+    // Replace opening callbacks only after their guard has detached them.
+    // There is no cancellation point before WebSocketIo takes ownership below.
+    drop(opening);
 
     let (incoming_tx, incoming) = mpsc::unbounded_channel();
     let message_tx = incoming_tx.clone();

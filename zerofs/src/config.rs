@@ -1,3 +1,5 @@
+pub(crate) mod write_ack;
+
 use crate::fs::mutation::config::{
     FilesystemWriteAckMode, FilesystemWriteAckRequest, FilesystemWriteAckSettings,
     NBD_MAX_WRITE_BYTES, NFS_MAX_WRITE_BYTES, NINEP_MAX_WRITE_BYTES, WEBUI_MAX_WRITE_BYTES,
@@ -138,10 +140,11 @@ pub struct Settings {
     pub(crate) cache: CacheConfig,
     pub(crate) storage: StorageConfig,
     pub(crate) servers: ServerConfig,
-    /// Process-level resource limits used when container namespaces hide the
-    /// parent cgroup envelope.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     runtime: Option<RuntimeConfig>,
+    /// Parsed for planning. Explicit budget enforcement is not enabled yet.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub(crate) memory: Option<crate::memory::MemorySelector>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub(crate) filesystem: Option<FilesystemConfig>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -172,14 +175,46 @@ pub struct Settings {
     pub(crate) replication: Option<ReplicationConfig>,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+enum RuntimeProfile {
+    #[serde(rename = "small-nas-journal-v1")]
+    SmallNasJournal,
+    #[serde(rename = "raw-device-p3-candidate-v1")]
+    RawDeviceP3Candidate,
+    #[serde(rename = "raw-device-p3-nas-fit-v1")]
+    RawDeviceP3NasFit,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    profile: Option<RuntimeProfile>,
     /// Administrator-declared ZeroFS-dedicated memory envelope in decimal GB.
     /// Use this when a container namespace hides the dedicated service limit.
     /// A shared parent cgroup is only a ceiling and cannot supply this budget.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     memory_limit_gb: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    unmodeled_residency_reserve_gb: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    engine_headroom_gb: Option<f64>,
+}
+
+fn runtime_memory_bytes(name: &str, value: f64) -> Result<u64> {
+    if !value.is_finite() || value <= 0.0 {
+        anyhow::bail!("[runtime] {name} must be a finite positive number");
+    }
+    let bytes = (value * 1_000_000_000.0).round();
+    if bytes >= u64::MAX as f64 {
+        anyhow::bail!("[runtime] {name} is too large");
+    }
+    if bytes < 1.0 {
+        anyhow::bail!(
+            "[runtime] {name} must be a finite positive number resolving to at least one byte"
+        );
+    }
+    Ok(bytes as u64)
 }
 
 /// In-process SSH implementation used for SFTP sessions.
@@ -289,10 +324,50 @@ pub struct StoreProfile {
     pub seal_threshold: Option<usize>,
     /// Segment seals allowed in flight at once.
     pub max_inflight_seals: Option<usize>,
+    /// Maximum plaintext in one segment reservation within a file transaction.
+    pub max_segment_append_bytes: Option<usize>,
     /// Clean-cache budget for decoded plaintext extents.
     pub decoded_extent_cache_bytes: Option<usize>,
     /// Cold segment-read prefetch geometry.
     pub prefetch: crate::object_store_prefetch::PrefetchProfile,
+}
+
+impl StoreProfile {
+    pub(crate) const NAS_JOURNAL_SEAL_BYTES: usize = 32 * 1024 * 1024;
+    pub(crate) const NAS_JOURNAL_INFLIGHT: usize = 2;
+    pub(crate) const RAW_CANDIDATE_SEAL_BYTES: usize = 4 * 1024 * 1024;
+    pub(crate) const RAW_CANDIDATE_INFLIGHT: usize = 1;
+    /// Smallest writeback journal entry segments can be sized to. Half of it
+    /// reaches compaction's one-MiB packed-object floor.
+    pub(crate) const MIN_JOURNAL_ENTRY_BYTES: u64 = 2 << 20;
+
+    /// Bound the seal geometry so every segment fits one writeback journal
+    /// entry of `entry_bytes`. A lane seals once its buffer reaches the
+    /// threshold, after at most one more append, so half the entry for the
+    /// threshold and a quarter for one append leave the last quarter for
+    /// frame, directory and footer encoding. Larger writes split across
+    /// segments and wait for journal room instead of failing at flush.
+    fn fit_journal_entry(self, entry_bytes: u64) -> Result<Self> {
+        anyhow::ensure!(
+            entry_bytes >= Self::MIN_JOURNAL_ENTRY_BYTES,
+            "[writeback] memory_size_gb and disk_size_gb must each be at least {} bytes so one sealed segment fits the journal",
+            Self::MIN_JOURNAL_ENTRY_BYTES
+        );
+        let half = usize::try_from(entry_bytes / 2).unwrap_or(usize::MAX);
+        let seal_threshold = self
+            .seal_threshold
+            .unwrap_or(crate::fs::store::extent::SEAL_THRESHOLD)
+            .min(half);
+        let max_segment_append_bytes = self
+            .max_segment_append_bytes
+            .unwrap_or(usize::MAX)
+            .min(half / 2);
+        Ok(Self {
+            seal_threshold: Some(seal_threshold),
+            max_segment_append_bytes: Some(max_segment_append_bytes),
+            ..self
+        })
+    }
 }
 
 impl From<SftpDataProfile> for StoreProfile {
@@ -300,6 +375,7 @@ impl From<SftpDataProfile> for StoreProfile {
         Self {
             seal_threshold: Some(profile.segment_size_bytes),
             max_inflight_seals: Some(profile.max_inflight_seals),
+            max_segment_append_bytes: None,
             decoded_extent_cache_bytes: None,
             prefetch: crate::object_store_prefetch::PrefetchProfile::tuned(
                 profile.read_cache_part_size_bytes,
@@ -663,16 +739,45 @@ pub struct StorageConfig {
     /// Permanent segment placement across local disks and remote stores.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pool: Option<StoragePoolConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) readiness: Option<crate::storage_readiness::ReadinessConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct StoragePoolConfig {
     /// Authoritative placement database; this is data, never an evictable cache.
-    #[serde(deserialize_with = "deserialize_expandable_path")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_expandable_path",
+        skip_serializing_if = "path_is_empty"
+    )]
     pub(crate) catalog_dir: PathBuf,
-    /// First member with sufficient capacity receives each new segment.
+    /// Placement policy for newly created immutable segments.
+    #[serde(default, skip_serializing_if = "SegmentPlacement::is_first_fit")]
+    pub(crate) segment_placement: SegmentPlacement,
+    /// Allow one initialized local data member to be unavailable at open.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) allow_degraded_start: bool,
     pub(crate) members: Vec<StoragePoolMemberConfig>,
+    /// Redundant recovery generations for the namespace, catalog and key
+    /// envelope. See `docs/metadata-survival-design.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) metadata_survival: Option<crate::metadata_survival::MetadataSurvivalConfig>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SegmentPlacement {
+    #[default]
+    FirstFit,
+    RoundRobinLocal,
+}
+
+impl SegmentPlacement {
+    fn is_first_fit(&self) -> bool {
+        *self == Self::FirstFit
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -760,10 +865,34 @@ fn pool_gb_to_bytes(value: f64, name: &str, allow_zero: bool) -> Result<u64> {
     Ok(bytes.floor() as u64)
 }
 
+fn path_is_empty(path: &std::path::Path) -> bool {
+    path.as_os_str().is_empty()
+}
+
 impl StoragePoolConfig {
     fn validate(&self, settings: &Settings) -> Result<()> {
+        if let Some(survival) = &self.metadata_survival {
+            survival
+                .validate(settings, self)
+                .context("Invalid [storage.pool.metadata_survival] configuration")?;
+        }
         let authority = url::Url::parse(&settings.storage.url)?;
-        if authority.scheme() != "file" || authority.to_file_path().is_err() {
+        let p3 = if crate::storage_backend::raw::is_p3(authority.scheme()) {
+            anyhow::ensure!(
+                settings.cache.disk_size_gb == 0.0,
+                "raw P3 requires cache.disk_size_gb=0 until persistent raw clean caching is supported"
+            );
+            let binding = crate::storage_backend::raw::RawBinding::parse(&authority)?;
+            if !path_is_empty(&self.catalog_dir) || settings.storage.readiness.is_some() {
+                anyhow::bail!(
+                    "a raw P3 authority owns its placement catalog and cannot use catalog_dir or directory readiness"
+                );
+            }
+            Some(binding)
+        } else {
+            None
+        };
+        if p3.is_none() && (authority.scheme() != "file" || authority.to_file_path().is_err()) {
             anyhow::bail!(
                 "[storage.pool] requires a local file:// [storage].url for authoritative metadata"
             );
@@ -778,11 +907,12 @@ impl StoragePoolConfig {
                 "set storage_class on individual pool members, not the local metadata store"
             );
         }
-        if !self.catalog_dir.is_absolute()
-            || self
-                .catalog_dir
-                .components()
-                .any(|part| matches!(part, std::path::Component::ParentDir))
+        if p3.is_none()
+            && (!self.catalog_dir.is_absolute()
+                || self
+                    .catalog_dir
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir)))
         {
             anyhow::bail!(
                 "[storage.pool] catalog_dir must be an absolute path without parent components"
@@ -793,6 +923,23 @@ impl StoragePoolConfig {
         }
         let mut ids = HashSet::new();
         let mut urls = HashSet::new();
+        let mut designations = HashSet::new();
+        let deployed_raw = p3
+            .as_ref()
+            .is_some_and(|b| b.kind != crate::storage_backend::raw::RawKind::SmallLoop);
+        anyhow::ensure!(
+            deployed_raw == settings.raw_device_p3_nas_fit(),
+            "large or physical raw devices require the raw-device-p3-nas-fit-v1 profile"
+        );
+        if deployed_raw {
+            anyhow::ensure!(
+                self.members.len() == 2
+                    && settings.writeback.as_ref().is_some_and(|w| w.enabled)
+                    && settings.wal.is_none(),
+                "raw NAS-fit requires two raw payloads, the P3 journal and no external WAL"
+            );
+        }
+        let mut raw_pool = p3.as_ref().map(|binding| binding.pool);
         let mut account_connections =
             std::collections::HashMap::<(String, u16, String), usize>::new();
         for member in &self.members {
@@ -813,6 +960,47 @@ impl StoragePoolConfig {
             member.reserve_free_bytes()?;
             let url = url::Url::parse(&member.url)
                 .with_context(|| format!("invalid URL for pool member {}", member.id))?;
+            if crate::storage_backend::raw::is_payload(url.scheme()) {
+                let binding = crate::storage_backend::raw::RawBinding::parse(&url)?;
+                anyhow::ensure!(
+                    p3.as_ref().map_or(
+                        binding.kind == crate::storage_backend::raw::RawKind::SmallLoop,
+                        |a| a.kind == binding.kind
+                    ),
+                    "mixed raw claim types are not supported"
+                );
+                if binding.kind == crate::storage_backend::raw::RawKind::Physical {
+                    anyhow::ensure!(
+                        binding.node == std::path::Path::new("/").join(&member.id)
+                            && designations.insert(binding.node.clone()),
+                        "duplicate or mismatched HDD designation"
+                    );
+                }
+                if p3.as_ref().is_some_and(|p3| p3.member == binding.member) {
+                    anyhow::bail!("raw P3 and payload devices require different member UUIDs");
+                }
+                if raw_pool
+                    .replace(binding.pool)
+                    .is_some_and(|old| old != binding.pool)
+                    || !urls.insert(binding.locator())
+                {
+                    anyhow::bail!("raw members must have unique UUIDs in the same raw pool");
+                }
+                if member.health_device.is_some()
+                    || member.storage_class.is_some()
+                    || member.sftp.is_some()
+                    || !member.cloud_provider_env_vars().is_empty()
+                    || settings.storage.readiness.is_some()
+                {
+                    anyhow::bail!(
+                        "raw members require device claims and cannot use directory readiness or provider options"
+                    );
+                }
+                continue;
+            }
+            if p3.is_some() {
+                anyhow::bail!("raw P3 authority requires raw payload members");
+            }
             if url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
                 anyhow::bail!(
                     "pool member URLs must not contain passwords, queries, or fragments; configure credentials in provider sections"
@@ -887,6 +1075,7 @@ impl fmt::Debug for StorageConfig {
             .field("encryption_password", &"[REDACTED]")
             .field("storage_class", &self.storage_class)
             .field("pool", &self.pool)
+            .field("readiness", &self.readiness)
             .finish()
     }
 }
@@ -898,7 +1087,9 @@ impl Serialize for StorageConfig {
     {
         let mut state = serializer.serialize_struct(
             "StorageConfig",
-            2 + usize::from(self.storage_class.is_some()) + usize::from(self.pool.is_some()),
+            2 + usize::from(self.storage_class.is_some())
+                + usize::from(self.pool.is_some())
+                + usize::from(self.readiness.is_some()),
         )?;
         state.serialize_field("url", &redacted_storage_url(&self.url))?;
         state.serialize_field("encryption_password", &self.encryption_password)?;
@@ -907,6 +1098,9 @@ impl Serialize for StorageConfig {
         }
         if let Some(pool) = &self.pool {
             state.serialize_field("pool", pool)?;
+        }
+        if let Some(readiness) = &self.readiness {
+            state.serialize_field("readiness", readiness)?;
         }
         state.end()
     }
@@ -975,6 +1169,9 @@ fn backend_capabilities(url: &str) -> BackendCapabilities {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct FilesystemConfig {
+    /// Experimental lookup mode, fixed at creation. Omission keeps byte-exact names.
+    #[serde(default)]
+    pub(crate) name_mode: crate::fs::name_mode::NameMode,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     max_size_gb: Option<f64>,
     /// Compression algorithm for extent data: "zstd-{level}" (default: "zstd-3", level 1-22) or "lz4"
@@ -1392,6 +1589,15 @@ pub struct NinePConfig {
     /// Optional all-client identity for a shared writable namespace.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) shared_identity: Option<NfsSharedIdentity>,
+    /// Name matching for standard `9P2000.L` sessions on an insensitive
+    /// filesystem. ZeroFS-dialect clients choose per request. A sensitive
+    /// filesystem accepts either value and matches exact bytes.
+    #[serde(default, skip_serializing_if = "is_default_name_match")]
+    pub(crate) standard_lookup: crate::fs::name_mode::NameMatch,
+}
+
+fn is_default_name_match(value: &crate::fs::name_mode::NameMatch) -> bool {
+    *value == crate::fs::name_mode::NameMatch::default()
 }
 
 /// Shared endpoint check for the server configs that expose an optional
@@ -1468,18 +1674,6 @@ impl NbdConfig {
             }
             _ => Ok(()),
         }
-    }
-
-    pub(crate) fn volatile_memory_bytes(&self) -> Result<u64> {
-        self.validate()?;
-        if self.write_ack_mode == NbdWriteAckMode::Materialized {
-            return Ok(0);
-        }
-        let bytes = self.volatile_memory_gb * 1_000_000_000.0;
-        if bytes > u64::MAX as f64 {
-            anyhow::bail!("[servers.nbd] volatile_memory_gb exceeds this platform's address space");
-        }
-        Ok(bytes.round() as u64)
     }
 }
 
@@ -1923,6 +2117,13 @@ where
 }
 
 impl Settings {
+    pub(crate) fn name_mode(&self) -> crate::fs::name_mode::NameMode {
+        self.filesystem
+            .as_ref()
+            .map(|fs| fs.name_mode)
+            .unwrap_or_default()
+    }
+
     pub(crate) fn max_bytes(&self) -> u64 {
         self.filesystem
             .as_ref()
@@ -1938,21 +2139,30 @@ impl Settings {
     }
 
     pub(crate) fn runtime_memory_limit_bytes(&self) -> Result<Option<u64>> {
-        let Some(value) = self
-            .runtime
+        self.runtime
             .as_ref()
             .and_then(|runtime| runtime.memory_limit_gb)
-        else {
-            return Ok(None);
-        };
-        if !value.is_finite() || value <= 0.0 {
-            anyhow::bail!("[runtime] memory_limit_gb must be a finite positive number");
-        }
-        let bytes = value * 1_000_000_000.0;
-        if bytes > u64::MAX as f64 {
-            anyhow::bail!("[runtime] memory_limit_gb is too large");
-        }
-        Ok(Some(bytes.round() as u64))
+            .map(|value| runtime_memory_bytes("memory_limit_gb", value))
+            .transpose()
+    }
+
+    pub(crate) fn runtime_memory_reserve_bytes(&self) -> Result<(Option<u64>, Option<u64>)> {
+        let residency = self
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.unmodeled_residency_reserve_gb);
+        let headroom = self
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.engine_headroom_gb);
+        Ok((
+            residency
+                .map(|value| runtime_memory_bytes("unmodeled_residency_reserve_gb", value))
+                .transpose()?,
+            headroom
+                .map(|value| runtime_memory_bytes("engine_headroom_gb", value))
+                .transpose()?,
+        ))
     }
 
     pub(crate) fn from_file(config_path: impl AsRef<std::path::Path>) -> Result<Self> {
@@ -1976,8 +2186,20 @@ impl Settings {
     pub(crate) fn validate(&self) -> Result<()> {
         self.servers.validate()?;
         self.runtime_memory_limit_bytes()?;
+        if self.memory.is_some()
+            && self
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.memory_limit_gb.is_some())
+        {
+            anyhow::bail!("[memory] conflicts with [runtime] memory_limit_gb; declare one budget");
+        }
+        self.runtime_memory_reserve_bytes()?;
         if let Some(pool) = &self.storage.pool {
             pool.validate(self)?;
+        }
+        if let Some(readiness) = &self.storage.readiness {
+            readiness.validate(self)?;
         }
         if let Some(prometheus) = &self.prometheus
             && let Some(authority) = &prometheus.benchmark_authority
@@ -2086,6 +2308,9 @@ impl Settings {
         access_mode: crate::writeback::config::WritebackAccessMode,
     ) -> Result<Option<crate::writeback::config::WritebackSettings>> {
         let Some(writeback) = &self.writeback else {
+            if self.small_nas_journal() {
+                anyhow::bail!("small-nas-journal-v1 requires enabled [writeback]");
+            }
             return Ok(None);
         };
         let sftp_write_concurrency = if self.sftp_endpoint()?.is_some() {
@@ -2099,12 +2324,60 @@ impl Settings {
         } else {
             None
         };
-        writeback.normalize(
+        let settings = writeback.normalize(
             &self.cache.dir,
             sftp_write_concurrency,
             access_mode,
             self.replication.is_some(),
-        )
+        )?;
+        if self.small_nas_journal() {
+            use crate::writeback::config::{AckMode, ShutdownFlush};
+            let wb = settings
+                .as_ref()
+                .context("small-nas-journal-v1 requires enabled [writeback]")?;
+            if wb.ack_mode != AckMode::Memory
+                || wb.shutdown_flush != ShutdownFlush::Local
+                || wb.memory_bytes != 128 << 20
+                || wb.disk_bytes != 512 << 20
+                || wb.min_free_bytes < 64 << 20
+                || wb.local_concurrency != 1
+                || wb.upload_concurrency != 2
+                || wb.high_watermark_percent != 95
+                || wb.resume_percent != 85
+            {
+                anyhow::bail!(
+                    "small-nas-journal-v1 requires memory acknowledgement, local shutdown, 128 MiB dirty RAM, 512 MiB dirty journal, at least 64 MiB free, one local and two upload workers, and 95/85 watermarks"
+                );
+            }
+            let pool = self
+                .storage
+                .pool
+                .as_ref()
+                .context("small-nas-journal-v1 requires a local pool")?;
+            let local_path = |value: &str| -> Result<PathBuf> {
+                url::Url::parse(value)?
+                    .to_file_path()
+                    .map_err(|_| anyhow::anyhow!("small-nas-journal-v1 requires local directories"))
+            };
+            let mut directories = vec![
+                self.cache.dir.clone(),
+                pool.catalog_dir.clone(),
+                local_path(&self.storage.url)?,
+            ];
+            for member in &pool.members {
+                directories.push(local_path(&member.url)?);
+            }
+            for path in directories {
+                let path =
+                    crate::writeback::config::normalize_absolute_path(&path, "storage directory")?;
+                if path.starts_with(&wb.dir) || wb.dir.starts_with(&path) {
+                    anyhow::bail!(
+                        "small-nas-journal-v1 requires a journal directory disjoint from cache, catalog, authority and member roots"
+                    );
+                }
+            }
+        }
+        Ok(settings)
     }
 
     /// Resolve the shared write-acknowledgement contract once, merging the
@@ -2153,9 +2426,77 @@ impl Settings {
         .max_by_key(|(_, bytes)| *bytes)
     }
 
-    /// Data-plane tuning for the configured backend. SFTP publishes its own
-    /// profile; every other backend runs on the defaults.
+    pub(crate) fn small_nas_journal(&self) -> bool {
+        self.runtime.as_ref().and_then(|runtime| runtime.profile)
+            == Some(RuntimeProfile::SmallNasJournal)
+    }
+
+    pub(crate) fn raw_p3_authority(&self) -> bool {
+        url_scheme(&self.storage.url)
+            .is_some_and(|scheme| crate::storage_backend::raw::is_p3(&scheme.to_ascii_lowercase()))
+    }
+
+    /// Room each pool member keeps free for metadata-survival generations.
+    /// Generations live on the members only on a raw P3 authority.
+    pub(crate) fn metadata_headroom_bytes(&self) -> u64 {
+        if !self.raw_p3_authority() {
+            return 0;
+        }
+        self.storage
+            .pool
+            .as_ref()
+            .and_then(|pool| pool.metadata_survival.as_ref())
+            .map_or(
+                0,
+                crate::metadata_survival::MetadataSurvivalConfig::member_headroom_bytes,
+            )
+    }
+
+    pub(crate) fn raw_device_p3_candidate(&self) -> bool {
+        self.runtime.as_ref().and_then(|runtime| runtime.profile)
+            == Some(RuntimeProfile::RawDeviceP3Candidate)
+    }
+
+    pub(crate) fn raw_device_p3_nas_fit(&self) -> bool {
+        self.runtime.as_ref().and_then(|runtime| runtime.profile)
+            == Some(RuntimeProfile::RawDeviceP3NasFit)
+    }
+
+    /// Resolve segment tuning from the runtime profile and storage backends,
+    /// bounded so each sealed segment fits one writeback journal entry.
     pub(crate) fn store_profile(&self) -> Result<StoreProfile> {
+        let profile = self.backend_store_profile()?;
+        match self
+            .writeback
+            .as_ref()
+            .map(crate::writeback::config::WritebackConfig::entry_capacity_bytes)
+            .transpose()?
+            .flatten()
+        {
+            Some(entry_bytes) => profile.fit_journal_entry(entry_bytes),
+            None => Ok(profile),
+        }
+    }
+
+    fn backend_store_profile(&self) -> Result<StoreProfile> {
+        if self.raw_device_p3_candidate() || self.raw_device_p3_nas_fit() {
+            return Ok(StoreProfile {
+                seal_threshold: Some(StoreProfile::RAW_CANDIDATE_SEAL_BYTES),
+                max_inflight_seals: Some(StoreProfile::RAW_CANDIDATE_INFLIGHT),
+                // Split large protocol writes into bounded reservations so a
+                // seal exceeds its threshold by at most one append plus frame
+                // and directory encoding.
+                max_segment_append_bytes: Some(StoreProfile::RAW_CANDIDATE_SEAL_BYTES / 2),
+                ..StoreProfile::default()
+            });
+        }
+        if self.small_nas_journal() {
+            return Ok(StoreProfile {
+                seal_threshold: Some(StoreProfile::NAS_JOURNAL_SEAL_BYTES),
+                max_inflight_seals: Some(StoreProfile::NAS_JOURNAL_INFLIGHT),
+                ..StoreProfile::default()
+            });
+        }
         if let Some(pool) = &self.storage.pool {
             let profile = pool
                 .members
@@ -2247,6 +2588,7 @@ impl Settings {
                 encryption_password: "${ZEROFS_PASSWORD}".to_string(),
                 storage_class: None,
                 pool: None,
+                readiness: None,
             },
             servers: ServerConfig {
                 nfs: Some(NfsConfig {
@@ -2257,6 +2599,7 @@ impl Settings {
                     addresses: Some(default_9p_addresses()),
                     unix_socket: Some(PathBuf::from("/tmp/zerofs.9p.sock")),
                     shared_identity: None,
+                    standard_lookup: Default::default(),
                 }),
                 nbd: Some(NbdConfig {
                     addresses: Some(default_nbd_addresses()),
@@ -2276,6 +2619,7 @@ impl Settings {
                 }),
             },
             runtime: None,
+            memory: None,
             filesystem: None,
             lsm: None,
             gc: None,
@@ -2872,7 +3216,7 @@ write_ack_mode = "volatile_memory"
     }
 
     #[test]
-    fn nbd_volatile_memory_ack_normalizes_its_byte_budget() {
+    fn nbd_volatile_memory_ack_parses_its_legacy_budget() {
         let settings = write_and_load(
             r#"
 [cache]
@@ -2887,13 +3231,23 @@ encryption_password = "test"
 addresses = ["127.0.0.1:10809"]
 write_ack_mode = "volatile_memory"
 volatile_memory_gb = 2.0
+
+[writeback]
+enabled = true
+dir = "/tmp/writeback"
+memory_size_gb = 1.0
+disk_size_gb = 8.0
+min_free_gb = 1.0
 "#,
         )
         .unwrap();
 
         let nbd = settings.servers.nbd.as_ref().unwrap();
         assert_eq!(nbd.write_ack_mode, NbdWriteAckMode::VolatileMemory);
-        assert_eq!(nbd.volatile_memory_bytes().unwrap(), 2_000_000_000);
+        let resolved = settings
+            .filesystem_write_ack_settings(crate::writeback::config::WritebackAccessMode::ReadWrite)
+            .unwrap();
+        assert_eq!(resolved.volatile_memory_bytes, 2_000_000_000);
     }
 
     #[test]
@@ -3054,6 +3408,40 @@ encryption_password = "test-password"
     }
 
     #[test]
+    fn memory_selector_parses_without_enabling_enforcement() {
+        let config = writeback_sftp_config(1.0, "[memory]\ntotal = '4 GiB'\n");
+        let settings = write_and_load(&config).unwrap();
+        assert_eq!(
+            settings.memory,
+            Some(crate::memory::MemorySelector::Total(4 * 1024 * 1024 * 1024))
+        );
+        assert!(settings.runtime_memory_limit_bytes().unwrap().is_none());
+        let serialized = toml::to_string(&settings).unwrap();
+        let roundtrip: Settings = toml::from_str(&serialized).unwrap();
+        assert_eq!(roundtrip.memory, settings.memory);
+    }
+
+    #[test]
+    fn memory_selector_rejects_a_second_legacy_budget() {
+        let config = writeback_sftp_config(
+            1.0,
+            "[memory]\ntotal = '4 GiB'\n[runtime]\nmemory_limit_gb = 4.0\n",
+        );
+        let error = write_and_load(&config).unwrap_err();
+        assert!(error.to_string().contains("conflicts with [runtime]"));
+    }
+
+    #[test]
+    fn memory_selector_rejects_an_empty_table_and_conflicting_selectors() {
+        for table in [
+            "[memory]",
+            "[memory]\ntotal = '4 GiB'\nfraction_of_limit = 0.5",
+        ] {
+            assert!(write_and_load(&writeback_sftp_config(1.0, table)).is_err());
+        }
+    }
+
+    #[test]
     fn runtime_memory_limit_is_an_explicit_decimal_gb_fallback() {
         let config = writeback_sftp_config(1.0, "").replace(
             "[storage]",
@@ -3162,6 +3550,25 @@ min_free_gb = 256.0"#,
             writeback.upload_concurrency, 2,
             "a defaulted upload concurrency must follow a lowered SFTP write budget \
              instead of failing validation"
+        );
+    }
+
+    #[test]
+    fn a_writeback_journal_too_small_for_one_segment_is_refused() {
+        let error = write_and_load(&writeback_sftp_config(
+            16.0,
+            r#"[writeback]
+enabled = true
+dir = "/var/cache/zerofs-writeback"
+memory_size_gb = 0.002
+disk_size_gb = 512.0
+min_free_gb = 256.0"#,
+        ))
+        .and_then(|settings| settings.store_profile())
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("one sealed segment fits the journal"),
+            "{error:#}"
         );
     }
 
@@ -3519,6 +3926,7 @@ known_hosts = "${ZEROFS_TEST_KNOWN_HOSTS}""#,
             encryption_password: "volume-encryption-secret".to_owned(),
             storage_class: None,
             pool: None,
+            readiness: None,
         };
 
         let debug = format!("{storage:?}");
@@ -4100,6 +4508,38 @@ sync_writes = true"#,
                 "expected {bad} to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn filesystem_name_mode_is_opt_in_and_rejects_unknown_values() {
+        use crate::fs::name_mode::NameMode;
+        let config: FilesystemConfig = toml::from_str("").unwrap();
+        assert_eq!(config.name_mode, NameMode::Sensitive);
+        let config: FilesystemConfig = toml::from_str("name_mode = 'insensitive'").unwrap();
+        assert_eq!(config.name_mode, NameMode::Insensitive);
+        assert!(toml::from_str::<FilesystemConfig>("name_mode = 'fold'").is_err());
+    }
+
+    #[test]
+    fn ninep_standard_lookup_defaults_to_folded_and_rejects_unknown_values() {
+        use crate::fs::name_mode::NameMatch;
+        let endpoint = "unix_socket = '/tmp/9p.sock'\n";
+        let config: NinePConfig = toml::from_str(endpoint).unwrap();
+        assert_eq!(config.standard_lookup, NameMatch::Folded);
+        assert!(
+            !toml::to_string(&config)
+                .unwrap()
+                .contains("standard_lookup")
+        );
+        for (value, expected) in [("folded", NameMatch::Folded), ("exact", NameMatch::Exact)] {
+            let config: NinePConfig =
+                toml::from_str(&format!("{endpoint}standard_lookup = '{value}'")).unwrap();
+            assert_eq!(config.standard_lookup, expected);
+        }
+        assert!(
+            toml::from_str::<NinePConfig>(&format!("{endpoint}standard_lookup = 'insensitive'"))
+                .is_err()
+        );
     }
 
     #[test]

@@ -1,0 +1,878 @@
+use super::config::DiskProfile;
+use super::*;
+use serde_json::{Value, json};
+use std::cell::Cell;
+use std::collections::BTreeMap;
+
+const FAST_UUID: &str = "47166772-65c1-4ecf-8066-935452891add";
+const DURABLE_UUID: &str = "9d4c1a52-3c0e-4f43-9a8b-1f3d2b6c7e10";
+const OTHER_UUID: &str = "c3a8e9f1-6b2d-4e7a-8c5f-0d9b1e2a3f4c";
+
+pub(crate) struct Fixture {
+    _temp: tempfile::TempDir,
+    pub(crate) document: Value,
+    facts: BTreeMap<PathBuf, MountedFilesystem>,
+    calls: Cell<usize>,
+}
+
+impl Fixture {
+    pub(crate) fn new() -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let durable = base.join("durable");
+        let fast = base.join("fast");
+        let paths = [
+            durable.join("authority"),
+            durable.join("catalog"),
+            durable.join("data"),
+            fast.join("cache"),
+            fast.join("journal"),
+        ];
+        for path in &paths {
+            std::fs::create_dir_all(path).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let document = json!({
+            "cache": { "dir": paths[3], "disk_size_gb": 0.001 },
+            "storage": {
+                "url": url::Url::from_directory_path(&paths[0]).unwrap().as_str(),
+                "encryption_password": "synthetic-readiness-password",
+                "pool": {
+                    "catalog_dir": paths[1],
+                    "members": [{ "id": "data", "url": url::Url::from_directory_path(&paths[2]).unwrap().as_str(),
+                        "capacity_gb": 0.01, "reserve_free_gb": 0.001 }]
+                },
+                "readiness": {
+                    "strict": true, "authority": "durable", "catalog": "durable", "cache": "fast", "journal": "fast",
+                    "members": { "data": "durable" },
+                    "reserves": [{"filesystem": "durable", "bytes": 1_000_000}, {"filesystem": "fast", "bytes": 1_000_000}],
+                    "filesystems": [
+                        { "id": "durable", "profile": "hdd-cmr", "mountpoint": durable,
+                            "identity": { "kind": "uuid", "uuid": DURABLE_UUID } },
+                        { "id": "fast", "profile": "nvme", "mountpoint": fast,
+                            "identity": { "kind": "uuid", "uuid": FAST_UUID } }
+                    ]
+                }
+            },
+            "writeback": { "enabled": true, "dir": paths[4], "memory_size_gb": 0.004,
+                "disk_size_gb": 0.008, "min_free_gb": 0.001 },
+            "servers": {}, "telemetry": { "enabled": false }
+        });
+        let mut facts = BTreeMap::new();
+        for (index, path) in paths.into_iter().enumerate() {
+            let is_fast = index >= 3;
+            facts.insert(
+                path,
+                MountedFilesystem {
+                    mountpoint: if is_fast {
+                        fast.clone()
+                    } else {
+                        durable.clone()
+                    },
+                    filesystem_root: "/".into(),
+                    identity: FilesystemIdentity::Uuid {
+                        uuid: if is_fast { FAST_UUID } else { DURABLE_UUID }.into(),
+                    },
+                    writable: true,
+                    unlocked: true,
+                },
+            );
+        }
+        Self {
+            _temp: temp,
+            document,
+            facts,
+            calls: Cell::new(0),
+        }
+    }
+
+    pub(crate) fn parse(&self) -> Result<Settings> {
+        let settings: Settings = toml::from_str(&toml::to_string(&self.document)?)?;
+        settings.validate()?;
+        Ok(settings)
+    }
+
+    pub(crate) fn path(&self, role: &str) -> PathBuf {
+        let settings = self.parse().unwrap();
+        let roots = settings
+            .storage
+            .readiness
+            .as_ref()
+            .unwrap()
+            .validated_roots(&settings)
+            .unwrap();
+        roots
+            .iter()
+            .find(|root| root.role.to_string() == role)
+            .unwrap()
+            .path
+            .clone()
+    }
+
+    fn verify(&self) -> Result<()> {
+        verify_with(&self.parse()?, self)
+    }
+}
+
+impl IdentityProvider for Fixture {
+    fn filesystem_size(&self, _root: &Path) -> Result<u64> {
+        Ok(100_000_000)
+    }
+
+    fn observe(&self, root: &Path) -> Result<MountedFilesystem> {
+        self.calls.set(self.calls.get() + 1);
+        self.facts
+            .get(root)
+            .cloned()
+            .context("synthetic identity unavailable")
+    }
+}
+
+fn open_role(name: &str) -> RoleName {
+    RoleName::try_from(name.to_owned()).unwrap()
+}
+
+fn error_contains(result: Result<()>, expected: &str) {
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(
+        error.contains(expected),
+        "expected {expected:?}, got {error}"
+    );
+}
+
+#[test]
+fn declared_profiles_roundtrip_and_never_accept_detection_or_unknown_values() {
+    for (name, expected) in [
+        ("nvme", DiskProfile::Nvme),
+        ("hdd-cmr", DiskProfile::HddCmr),
+        ("hdd-smr", DiskProfile::HddSmr),
+    ] {
+        let profile: DiskProfile = serde_json::from_value(json!(name)).unwrap();
+        assert_eq!(profile, expected);
+        assert_eq!(serde_json::to_value(profile).unwrap(), json!(name));
+    }
+    for name in ["auto", "ssd", "hdd", "HDD-CMR", ""] {
+        assert!(serde_json::from_value::<DiskProfile>(json!(name)).is_err());
+    }
+    let mut fixture = Fixture::new();
+    fixture.document["storage"]["readiness"]["filesystems"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("profile");
+    assert!(fixture.parse().is_err());
+}
+
+#[test]
+fn verifies_every_active_role_with_injected_facts_and_shared_control_filesystem() {
+    let fixture = Fixture::new();
+    fixture.verify().unwrap();
+    assert_eq!(fixture.calls.get(), 5);
+    let mut smr = Fixture::new();
+    smr.document["storage"]["readiness"]["filesystems"][0]["profile"] = json!("hdd-smr");
+    smr.verify().unwrap();
+}
+
+#[test]
+fn ordinary_deployments_and_explicitly_disabled_checks_never_probe_identity() {
+    let mut fixture = Fixture::new();
+    fixture.document["storage"]["readiness"]["strict"] = json!(false);
+    fixture.verify().unwrap();
+    fixture.document["storage"]
+        .as_object_mut()
+        .unwrap()
+        .remove("readiness");
+    fixture.verify().unwrap();
+    assert_eq!(fixture.calls.get(), 0);
+}
+
+#[test]
+fn declarations_survive_file_load_and_settings_serialization() {
+    let fixture = Fixture::new();
+    let path = fixture._temp.path().join("config.toml");
+    std::fs::write(&path, toml::to_string(&fixture.document).unwrap()).unwrap();
+    let settings = Settings::from_file(&path).unwrap();
+    let serialized = toml::to_string(&settings).unwrap();
+    let reloaded: Settings = toml::from_str(&serialized).unwrap();
+    reloaded.validate().unwrap();
+    verify_with(&reloaded, &fixture).unwrap();
+    assert_eq!(fixture.calls.get(), 5);
+}
+
+#[test]
+fn documented_config_round_trips_and_rejects_noncanonical_uuids() {
+    let source = include_str!("../../../docs/examples/storage-readiness.toml");
+    let settings: Settings = toml::from_str(source).unwrap();
+    settings.validate().unwrap();
+    let serialized = toml::to_string(&settings).unwrap();
+    let roundtrip: Settings = toml::from_str(&serialized).unwrap();
+    roundtrip.validate().unwrap();
+    let uuid = "0f5e7c2a-8b1d-4c3e-9a6f-2b4d6e8f0a1c";
+    let declaration = &roundtrip.storage.readiness.as_ref().unwrap().filesystems[0];
+    assert_eq!(
+        declaration.identity,
+        FilesystemIdentity::Uuid { uuid: uuid.into() }
+    );
+    for invalid in [
+        "00000000-0000-0000-0000-000000000000",
+        "0F5E7C2A-8B1D-4C3E-9A6F-2B4D6E8F0A1C",
+        "0f5e7c2a8b1d4c3e9a6f2b4d6e8f0a1c",
+        "guessed",
+    ] {
+        let text = source.replace(uuid, invalid);
+        let parsed: Settings = toml::from_str(&text).unwrap();
+        assert!(parsed.validate().is_err(), "accepted UUID {invalid}");
+    }
+    let foreign = source.replace(r#"kind = "uuid""#, r#"kind = "foreign""#);
+    assert!(toml::from_str::<Settings>(&foreign).is_err());
+}
+
+#[test]
+fn missing_wrong_locked_readonly_or_unknown_identity_fails_for_each_role() {
+    for role in ["authority", "catalog", "member data", "journal", "cache"] {
+        for failure in [
+            "missing",
+            "wrong-identity",
+            "unmounted",
+            "locked",
+            "readonly",
+            "unknown",
+        ] {
+            let mut fixture = Fixture::new();
+            let path = fixture.path(role);
+            match failure {
+                "missing" => std::fs::remove_dir(&path).unwrap(),
+                "unknown" => {
+                    fixture.facts.remove(&path);
+                }
+                _ => {
+                    let fact = fixture.facts.get_mut(&path).unwrap();
+                    match failure {
+                        "wrong-identity" => {
+                            fact.identity = FilesystemIdentity::Uuid {
+                                uuid: OTHER_UUID.into(),
+                            }
+                        }
+                        "unmounted" => fact.mountpoint = "/".into(),
+                        "locked" => fact.unlocked = false,
+                        "readonly" => fact.writable = false,
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            let error = format!("{:#}", fixture.verify().unwrap_err());
+            assert!(error.contains(role), "{failure} / {role}: {error}");
+            if failure == "missing" {
+                assert!(!path.exists());
+            }
+        }
+    }
+}
+
+#[test]
+fn empty_fallback_directory_is_not_a_mounted_filesystem() {
+    let mut fixture = Fixture::new();
+    for facts in fixture.facts.values_mut() {
+        facts.mountpoint = "/".into();
+    }
+    error_contains(fixture.verify(), "declared mounted filesystem root");
+}
+
+#[test]
+fn changed_uuid_binding_is_rejected() {
+    let mut fixture = Fixture::new();
+    fixture.document["storage"]["readiness"]["filesystems"][1]["identity"]["uuid"] =
+        json!("202a7f25-f539-4b30-8bb1-0b36331fde71");
+    error_contains(fixture.verify(), "identity changed");
+}
+
+#[test]
+fn bind_subdirectories_and_nested_mounts_are_not_the_declared_root() {
+    let mut fixture = Fixture::new();
+    let path = fixture.path("member data");
+    fixture.facts.get_mut(&path).unwrap().filesystem_root = "/some/subdir".into();
+    error_contains(fixture.verify(), "declared mounted filesystem root");
+    fixture.facts.get_mut(&path).unwrap().filesystem_root = "/".into();
+    fixture.facts.get_mut(&path).unwrap().mountpoint = path.clone();
+    error_contains(fixture.verify(), "declared mounted filesystem root");
+}
+
+#[test]
+fn missing_extra_and_disabled_journal_role_bindings_are_rejected() {
+    for key in ["authority", "catalog", "cache", "journal"] {
+        let mut fixture = Fixture::new();
+        fixture.document["storage"]["readiness"]
+            .as_object_mut()
+            .unwrap()
+            .remove(key);
+        assert!(fixture.parse().is_err(), "missing {key}");
+    }
+    let mut fixture = Fixture::new();
+    fixture.document["storage"]["readiness"]["members"] = json!({"other": "durable"});
+    error_contains(fixture.parse().map(|_| ()), "missing readiness binding");
+    fixture.document["storage"]["readiness"]["members"] =
+        json!({"data": "durable", "other": "durable"});
+    error_contains(fixture.parse().map(|_| ()), "exactly every");
+    let mut fixture = Fixture::new();
+    fixture.document["writeback"]["enabled"] = json!(false);
+    error_contains(fixture.parse().map(|_| ()), "requires enabled writeback");
+    fixture.document["storage"]["readiness"]
+        .as_object_mut()
+        .unwrap()
+        .remove("journal");
+    fixture.verify().unwrap();
+    assert_eq!(fixture.calls.get(), 4);
+}
+
+#[test]
+fn remote_roles_separate_wal_and_nvme_durable_roles_are_rejected() {
+    let mut fixture = Fixture::new();
+    fixture.document["storage"]["pool"]["members"][0]["url"] = json!("s3://synthetic/member");
+    error_contains(fixture.parse().map(|_| ()), "local file://");
+    let mut fixture = Fixture::new();
+    fixture.document["wal"] = json!({"url": "file:///synthetic/wal"});
+    error_contains(fixture.parse().map(|_| ()), "separate WAL");
+    for index in [0, 1] {
+        let mut fixture = Fixture::new();
+        fixture.document["storage"]["readiness"]["filesystems"][index]["profile"] =
+            json!(if index == 0 { "nvme" } else { "hdd-smr" });
+        assert!(fixture.parse().is_err());
+    }
+}
+
+#[test]
+fn duplicate_member_capacity_is_rejected() {
+    let mut fixture = Fixture::new();
+    let data = fixture.path("member data");
+    let mut member = fixture.document["storage"]["pool"]["members"][0].clone();
+    member["id"] = json!("other");
+    member["url"] = json!(
+        url::Url::from_directory_path(data.with_file_name("other-data"))
+            .unwrap()
+            .as_str()
+    );
+    fixture.document["storage"]["pool"]["members"]
+        .as_array_mut()
+        .unwrap()
+        .push(member);
+    fixture.document["storage"]["readiness"]["members"]["other"] = json!("durable");
+    error_contains(fixture.parse().map(|_| ()), "capacity domain");
+}
+
+#[test]
+fn independent_hdd_member_is_accepted() {
+    let mut fixture = Fixture::new();
+    let mountpoint = fixture._temp.path().canonicalize().unwrap().join("second");
+    let path = mountpoint.join("data");
+    std::fs::create_dir_all(&path).unwrap();
+    let mut member = fixture.document["storage"]["pool"]["members"][0].clone();
+    member["id"] = json!("other");
+    member["url"] = json!(url::Url::from_directory_path(&path).unwrap().as_str());
+    fixture.document["storage"]["pool"]["members"]
+        .as_array_mut()
+        .unwrap()
+        .push(member);
+    fixture.document["storage"]["readiness"]["members"]["other"] = json!("other");
+    fixture.document["storage"]["readiness"]["filesystems"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id": "other", "profile": "hdd-smr", "mountpoint": mountpoint,
+            "identity": { "kind": "uuid", "uuid": OTHER_UUID }
+        }));
+    fixture.document["storage"]["readiness"]["reserves"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"filesystem": "other", "bytes": 1_000_000}));
+    fixture.facts.insert(
+        path,
+        MountedFilesystem {
+            mountpoint,
+            filesystem_root: "/".into(),
+            identity: FilesystemIdentity::Uuid {
+                uuid: OTHER_UUID.into(),
+            },
+            writable: true,
+            unlocked: true,
+        },
+    );
+    fixture.verify().unwrap();
+    assert_eq!(fixture.calls.get(), 6);
+}
+
+#[test]
+fn invalid_and_aliased_declarations_fail_without_host_probes() {
+    for (pointer, value) in [
+        ("/storage/readiness/authority", json!("unknown")),
+        (
+            "/storage/readiness/filesystems/0/identity/uuid",
+            json!("guessed"),
+        ),
+        (
+            "/storage/readiness/filesystems/1/identity/uuid",
+            json!("guessed"),
+        ),
+        (
+            "/storage/readiness/filesystems/1/identity/uuid",
+            json!("00000000-0000-0000-0000-000000000000"),
+        ),
+        ("/storage/readiness/filesystems/1/id", json!("durable")),
+        (
+            "/storage/readiness/filesystems/0/mountpoint",
+            json!("relative"),
+        ),
+        (
+            "/storage/readiness/filesystems/0/mountpoint",
+            json!("/tmp/../wrong"),
+        ),
+    ] {
+        let mut fixture = Fixture::new();
+        *fixture.document.pointer_mut(pointer).unwrap() = value;
+        assert!(fixture.parse().is_err(), "accepted {pointer}");
+        assert_eq!(fixture.calls.get(), 0);
+    }
+    let mut fixture = Fixture::new();
+    fixture.document["storage"]["readiness"]["filesystems"][1]["identity"] =
+        fixture.document["storage"]["readiness"]["filesystems"][0]["identity"].clone();
+    error_contains(fixture.parse().map(|_| ()), "aliases");
+}
+
+#[test]
+fn symlinked_roots_cannot_overlap() {
+    use std::os::unix::fs::symlink;
+    let mut fixture = Fixture::new();
+    let authority = fixture.path("authority");
+    let alias = authority.with_file_name("catalog-alias");
+    symlink(&authority, &alias).unwrap();
+    fixture.document["storage"]["pool"]["catalog_dir"] = json!(alias);
+    error_contains(fixture.verify(), "must not overlap");
+}
+
+#[test]
+fn symlinked_mountpoint_fails_runtime_canonical_check() {
+    use std::os::unix::fs::symlink;
+    let mut fixture = Fixture::new();
+    let original = fixture.path("authority").parent().unwrap().to_path_buf();
+    let alias = original.with_file_name("mount-alias");
+    symlink(&original, &alias).unwrap();
+    fixture.document["storage"]["readiness"]["filesystems"][0]["mountpoint"] = json!(alias);
+    fixture.document["storage"]["url"] = json!(
+        url::Url::from_directory_path(alias.join("authority"))
+            .unwrap()
+            .as_str()
+    );
+    fixture.document["storage"]["pool"]["catalog_dir"] = json!(alias.join("catalog"));
+    fixture.document["storage"]["pool"]["members"][0]["url"] = json!(
+        url::Url::from_directory_path(alias.join("data"))
+            .unwrap()
+            .as_str()
+    );
+    error_contains(fixture.verify(), "mountpoint must be canonical");
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tokio::test]
+async fn unsupported_host_stops_normal_open_and_explicit_init_before_any_storage_mutation() {
+    let fixture = Fixture::new();
+    let settings = fixture.parse().unwrap();
+    for initialize in [false, true] {
+        let error = crate::storage_backend::open_pool_storage(&settings, initialize)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("no host identity adapter"));
+    }
+    let error = crate::storage_backend::open_storage(&settings)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("no host identity adapter"));
+    for role in ["authority", "catalog", "member data", "journal", "cache"] {
+        assert_eq!(
+            std::fs::read_dir(fixture.path(role)).unwrap().count(),
+            0,
+            "mutated {role}"
+        );
+    }
+}
+
+#[test]
+fn real_open_paths_are_verified_without_creating_missing_children() {
+    let fixture = Fixture::new();
+    let settings = fixture.parse().unwrap();
+    let paths = ["authority", "catalog", "member data", "cache", "journal"]
+        .into_iter()
+        .map(|role| (open_role(role), fixture.path(role).join("actual-child")))
+        .collect::<Vec<_>>();
+    verify_open_paths_with(&settings, &fixture, &paths).unwrap();
+    for (_, path) in paths {
+        assert!(!path.exists());
+    }
+}
+
+#[test]
+fn a_real_open_path_cannot_escape_its_declared_role_or_filesystem() {
+    use std::os::unix::fs::symlink;
+    for role in ["authority", "catalog", "member data", "cache", "journal"] {
+        let mut fixture = Fixture::new();
+        let root = fixture.path(role);
+        let child = root.join("actual-child");
+        std::fs::create_dir(&child).unwrap();
+        let mut facts = fixture.facts[&root].clone();
+        facts.identity = FilesystemIdentity::Uuid {
+            uuid: "202a7f25-f539-4b30-8bb1-0b36331fde71".into(),
+        };
+        fixture.facts.insert(child.clone(), facts);
+        error_contains(
+            verify_open_paths_with(
+                &fixture.parse().unwrap(),
+                &fixture,
+                &[(open_role(role), child.clone())],
+            ),
+            "identity changed",
+        );
+        std::fs::remove_dir(&child).unwrap();
+        let outside = fixture._temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, &child).unwrap();
+        error_contains(
+            verify_open_paths_with(
+                &fixture.parse().unwrap(),
+                &fixture,
+                &[(open_role(role), child)],
+            ),
+            "symlink",
+        );
+    }
+}
+#[path = "device_tests.rs"]
+mod device_tests;
+
+#[path = "scan_tests.rs"]
+mod scan_tests;
+
+#[tokio::test]
+async fn readiness_symlinks_refuse_pool_init_and_server_backend_open_before_writes() {
+    use std::os::unix::fs::symlink;
+    for initialize in [true, false] {
+        for (role, relative) in [
+            ("authority", ".zerofs-pool"),
+            ("member data", ".zerofs-pool"),
+            (
+                "member data",
+                ".zerofs-pool/00000000-0000-0000-0000-000000000001/objects",
+            ),
+            ("catalog", "pool.lock"),
+        ] {
+            let mut fixture = Fixture::new();
+            fixture.document["storage"]["readiness"]["strict"] = json!(false);
+            let settings = fixture.parse().unwrap();
+            let mut relative = relative.to_owned();
+            if !initialize || relative.contains("00000000-0000-0000-0000-000000000001") {
+                let initialized = crate::storage_backend::open_pool_storage(&settings, true)
+                    .await
+                    .unwrap();
+                let pool_id = initialized.1.status().await.unwrap().pool_id;
+                relative = relative.replace("00000000-0000-0000-0000-000000000001", &pool_id);
+                drop(initialized);
+            }
+            let child = fixture.path(role).join(&relative);
+            if child.is_dir() {
+                std::fs::remove_dir_all(&child).unwrap();
+            } else if child.exists() {
+                std::fs::remove_file(&child).unwrap();
+            }
+            std::fs::create_dir_all(child.parent().unwrap()).unwrap();
+            let outside = fixture._temp.path().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            std::fs::write(outside.join("sentinel"), b"unchanged").unwrap();
+            symlink(&outside, &child).unwrap();
+            let result = if initialize {
+                let config = fixture._temp.path().join("config.toml");
+                std::fs::write(&config, toml::to_string(&settings).unwrap()).unwrap();
+                crate::cli::pool::run(crate::cli::PoolCommands::Init { config }).await
+            } else {
+                crate::storage_backend::open_storage(&settings)
+                    .await
+                    .map(|_| ())
+            };
+            assert_eq!(
+                std::fs::read_dir(&outside).unwrap().count(),
+                1,
+                "wrote through {role}/{relative}"
+            );
+            assert_eq!(
+                std::fs::read(outside.join("sentinel")).unwrap(),
+                b"unchanged"
+            );
+            error_contains(result, "symlink");
+            let mut strict_settings = settings.clone();
+            strict_settings.storage.readiness.as_mut().unwrap().strict = true;
+            error_contains(
+                verify_open_paths_with(&strict_settings, &fixture, &[(open_role(role), child)]),
+                "symlink",
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn readiness_member_payload_write_refuses_a_symlink_added_after_open() {
+    use object_store::{PutMode, PutOptions};
+    for replace_marker in [true, false] {
+        let mut fixture = Fixture::new();
+        fixture.document["storage"]["readiness"]["strict"] = json!(false);
+        let settings = fixture.parse().unwrap();
+        let (opened, pool) = crate::storage_backend::open_pool_storage(&settings, true)
+            .await
+            .unwrap();
+        let pool_id = pool.status().await.unwrap().pool_id;
+        let member = fixture.path("member data");
+        let child = if replace_marker {
+            member.join(".zerofs-pool")
+        } else {
+            member.join(format!(".zerofs-pool/{pool_id}/objects"))
+        };
+        let outside = fixture._temp.path().join("outside");
+        if replace_marker {
+            std::fs::rename(&child, &outside).unwrap();
+        } else {
+            std::fs::create_dir(&outside).unwrap();
+        }
+        std::os::unix::fs::symlink(&outside, &child).unwrap();
+        let mut options = PutOptions::from(PutMode::Create);
+        options
+            .extensions
+            .insert(crate::segment_store::GeneratedSegmentCreate);
+        let key = object_store::path::Path::from(format!(
+            "{}/{}",
+            opened.path,
+            crate::segment::Segid::new(97, 1).object_key()
+        ));
+        let result = opened
+            .store
+            .put_opts(&key, "must stay local".into(), options)
+            .await;
+        let objects = if replace_marker {
+            outside.join(format!("{pool_id}/objects"))
+        } else {
+            outside.clone()
+        };
+        assert!(
+            !objects.exists() || std::fs::read_dir(objects).unwrap().count() == 0,
+            "payload reached symlink target"
+        );
+        assert!(format!("{:#}", result.unwrap_err()).contains("symlink"));
+    }
+}
+
+#[test]
+fn reserve_above_configured_member_capacity_is_rejected_in_both_strict_modes() {
+    for strict in [true, false] {
+        let mut fixture = Fixture::new();
+        fixture.document["storage"]["readiness"]["strict"] = json!(strict);
+        fixture.document["storage"]["readiness"]["reserves"][1]["bytes"] = json!(10_000_001);
+        fixture.document["storage"]["readiness"]["reserves"][0]["bytes"] = json!(10_000_000);
+        fixture.parse().unwrap();
+        fixture.document["storage"]["readiness"]["reserves"][0]["bytes"] = json!(10_000_001);
+        error_contains(fixture.parse().map(|_| ()), "configured member capacity");
+    }
+}
+
+#[test]
+fn reserve_above_observed_size_or_unavailable_size_refuses_strict_open() {
+    struct SizeProvider<'a> {
+        fixture: &'a Fixture,
+        root: PathBuf,
+        size: Option<u64>,
+    }
+    impl IdentityProvider for SizeProvider<'_> {
+        fn observe(&self, path: &Path) -> Result<MountedFilesystem> {
+            self.fixture.observe(path)
+        }
+        fn filesystem_size(&self, path: &Path) -> Result<u64> {
+            if path == self.root {
+                self.size.context("synthetic filesystem size unavailable")
+            } else {
+                Ok(100_000_000)
+            }
+        }
+    }
+    let fixture = Fixture::new();
+    let settings = fixture.parse().unwrap();
+    for role in ["authority", "catalog", "member data", "cache", "journal"] {
+        let root = fixture.path(role);
+        verify_with(
+            &settings,
+            &SizeProvider {
+                fixture: &fixture,
+                root: root.clone(),
+                size: Some(1_000_000),
+            },
+        )
+        .unwrap();
+        for (size, expected) in [
+            (Some(999_999), "observed filesystem size"),
+            (None, "filesystem size unavailable"),
+        ] {
+            let error = verify_with(
+                &settings,
+                &SizeProvider {
+                    fixture: &fixture,
+                    root: root.clone(),
+                    size,
+                },
+            )
+            .unwrap_err();
+            let error = format!("{error:#}");
+            assert!(error.contains(role) && error.contains(expected), "{error}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn readiness_refuses_internal_and_dangling_symlinks_below_every_role() {
+    use futures::TryStreamExt;
+    use object_store::{ObjectStore, ObjectStoreExt};
+    for role in ["authority", "catalog", "member data", "cache", "journal"] {
+        for dangling in [true, false] {
+            let mut fixture = Fixture::new();
+            let root = fixture.path(role);
+            let target = root.join("target");
+            if !dangling {
+                std::fs::create_dir(&target).unwrap();
+            }
+            let link = root.join("child");
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            for strict in [true, false] {
+                fixture.document["storage"]["readiness"]["strict"] = json!(strict);
+                if matches!(role, "authority" | "member data") {
+                    // Arbitrary object names are checked at use, not enumerated
+                    // during startup. Keep both operation and listing coverage.
+                    fixture.verify().unwrap();
+                    let store = crate::local_object_store::LocalConditionalStore::new()
+                        .with_readiness_root(root.clone());
+                    let prefix = object_store::path::Path::from_absolute_path(&root).unwrap();
+                    let object = prefix.clone().join("child").join("object");
+                    assert!(
+                        store
+                            .get(&object)
+                            .await
+                            .unwrap_err()
+                            .to_string()
+                            .contains("symlink")
+                    );
+                    assert!(
+                        store
+                            .list(Some(&prefix))
+                            .try_collect::<Vec<_>>()
+                            .await
+                            .unwrap_err()
+                            .to_string()
+                            .contains("symlink")
+                    );
+                } else {
+                    error_contains(
+                        verify_open_paths_with(
+                            &fixture.parse().unwrap(),
+                            &fixture,
+                            &[(open_role(role), link.clone())],
+                        ),
+                        "symlink",
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn readiness_symlinks_refuse_cache_and_journal_namespace_opens() {
+    for (role, relative) in [
+        ("cache", "bucket_fixture/hybrid_cache"),
+        (
+            "cache",
+            "bucket_fixture/parts_cache/foyer-storage-direct-fs-00000000",
+        ),
+        (
+            "cache",
+            "bucket_fixture/parts_cache/foyer-storage-direct-fs-100000000",
+        ),
+        ("cache", "bucket_fixture/parts_cache_v1"),
+        (
+            "cache",
+            "bucket_fixture/parts_cache_v1/.zerofs-parts-cache-layout",
+        ),
+        (
+            "cache",
+            "bucket_fixture/parts_cache_v1/foyer-storage-direct-fs-00000000",
+        ),
+        (
+            "cache",
+            "bucket_fixture/parts_cache_v1/foyer-storage-direct-fs-100000000",
+        ),
+        ("journal", "bucket_fixture/blobs/00"),
+        ("journal", "bucket_fixture/tmp"),
+    ] {
+        let mut fixture = Fixture::new();
+        fixture.document["storage"]["readiness"]["strict"] = json!(false);
+        let root = fixture.path(role);
+        let link = root.join(relative);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("sentinel"), b"unchanged").unwrap();
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        error_contains(
+            verify_bucket_paths(&fixture.parse().unwrap(), "bucket_fixture"),
+            "symlink",
+        );
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read(outside.path().join("sentinel")).unwrap(),
+            b"unchanged"
+        );
+    }
+}
+
+#[test]
+fn statvfs_size_requires_nonzero_representable_bytes() {
+    assert_eq!(checked_filesystem_size(2, 4096).unwrap(), 8192);
+    for (blocks, fragment_size) in [(0, 4096), (1, 0), (u64::MAX, 2)] {
+        error_contains(
+            checked_filesystem_size(blocks, fragment_size).map(|_| ()),
+            "unavailable",
+        );
+    }
+    let fixture = Fixture::new();
+    assert!(
+        HostIdentityProvider
+            .filesystem_size(fixture._temp.path())
+            .unwrap()
+            > 0
+    );
+    error_contains(
+        HostIdentityProvider
+            .filesystem_size(&fixture._temp.path().join("missing"))
+            .map(|_| ()),
+        "unavailable",
+    );
+}
+
+#[test]
+fn degraded_readiness_keeps_authority_and_catalog_identity_checks() {
+    let mut fixture = Fixture::new();
+    let settings = fixture.parse().unwrap();
+    let member = fixture.path("member data");
+    let authority = fixture.path("authority");
+    let catalog = fixture.path("catalog");
+    fixture.facts.get_mut(&member).unwrap().identity = FilesystemIdentity::Uuid {
+        uuid: OTHER_UUID.into(),
+    };
+
+    assert!(verify_with(&settings, &fixture).is_err());
+    verify_except(&settings, &fixture, Some("data")).unwrap();
+
+    for required in [authority, catalog] {
+        let facts = fixture.facts.remove(&required).unwrap();
+        assert!(verify_except(&settings, &fixture, Some("data")).is_err());
+        fixture.facts.insert(required, facts);
+    }
+}

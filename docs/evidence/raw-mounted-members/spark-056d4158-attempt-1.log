@@ -1,0 +1,12 @@
+Engine and probe provenance: exact Git archive 056d41586ee925479e21d169294123a2acb8f565
+Spark command: scripts/test-raw-device-mounted.sh --spark OWNED_TRANSFER_DIRECTORY
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr.com.apple.provenance'
+/var/tmp/zerofs-raw-fixture.Y5Xxypq4/zerofs: OK
+/var/tmp/zerofs-raw-fixture.Y5Xxypq4/zerofs-raw-device: OK
+Docker host: gx10-6a8d aarch64 130594021376 (unix:///var/run/docker.sock)
+Docker image: linux/arm64 sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea rust@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
+python3: can't open file '/h/mounted.py': [Errno 13] Permission denied
+Removed the owned Docker fixture and its CID directory.
+Removed owned Spark transfer directory /var/tmp/zerofs-raw-fixture.Y5Xxypq4

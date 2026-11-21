@@ -1,4 +1,5 @@
-use super::{PoolMember, PoolObjectStore};
+use super::{MemberPreflight, PoolMember, PoolObjectStore, SegmentTarget};
+use crate::config::SegmentPlacement;
 use crate::segment::Segid;
 use crate::segment_store::{ConditionalMultipartCreate, GeneratedSegmentCreate};
 use bytes::Bytes;
@@ -15,6 +16,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Notify;
+
+mod admission_cancellation;
 
 fn segment(counter: u64) -> Path {
     Path::from(format!("db/{}", Segid::new(41, counter).object_key()))
@@ -102,12 +105,40 @@ impl Fixture {
             capacity_bytes: self.capacity,
             local_path: None,
             min_free_bytes: 0,
+            metadata_headroom_bytes: 0,
             health_device: None,
+            free_space: None,
         }
     }
 
     fn members(&self) -> Vec<PoolMember> {
         vec![self.member(true), self.member(false)]
+    }
+
+    fn local_members(&self) -> Vec<PoolMember> {
+        self.members()
+            .into_iter()
+            .map(|mut member| {
+                let root = self.catalog.path().join(&member.id);
+                std::fs::create_dir_all(&root).unwrap();
+                member.local_path = Some(root);
+                member
+            })
+            .collect()
+    }
+
+    async fn open_balanced(&self, members: Vec<PoolMember>, initialize: bool) -> PoolObjectStore {
+        PoolObjectStore::open_with_preflight(
+            self.authority.clone(),
+            Path::from("db"),
+            self.catalog.path().join("catalog"),
+            members,
+            SegmentPlacement::RoundRobinLocal,
+            initialize,
+            |_| Ok(MemberPreflight::Lazy),
+        )
+        .await
+        .unwrap()
     }
 
     async fn initialize(&self) -> PoolObjectStore {
@@ -130,6 +161,313 @@ impl Fixture {
         )
         .await
     }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_full_raw_member_reuses_space_after_pool_segment_retirement() {
+    use crate::raw_member::RawMemberStore;
+    use crate::storage_backend::raw::RawSpace;
+    use std::fs::OpenOptions;
+    use zerofs_raw_device::{Identity, RawStore, Role};
+
+    const SIZE: u64 = 1 << 20;
+    let fixture = Fixture::new(SIZE);
+    let backing = fixture.catalog.path().join("raw");
+    let file = || {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&backing)
+            .unwrap()
+    };
+    std::fs::File::create(&backing)
+        .unwrap()
+        .set_len(SIZE)
+        .unwrap();
+    let identity = Identity {
+        pool_uuid: [1; 16],
+        member_uuid: [2; 16],
+        role: Role::Data,
+    };
+    let member = |raw| {
+        let raw = RawMemberStore::new(raw, (), 8192).unwrap();
+        let mut member = fixture.member(true);
+        member.store = Arc::new(raw.clone());
+        member.min_free_bytes = 8192;
+        member.free_space = Some(Arc::new(RawSpace::new(1, raw)));
+        member
+    };
+    let raw = RawStore::provision(file(), SIZE, identity).unwrap();
+    let pool = fixture.open_balanced(vec![member(raw)], true).await;
+    let body: &[u8] = &[1; 60_000];
+    let first = pool.status().await.unwrap().members[0].available_bytes;
+    let cost = RawStore::put_cost(body.len() as u64).unwrap();
+    let count = first / cost;
+    assert!(count > 3);
+    for id in 1..=count {
+        create(&pool, &segment(id), body).await;
+    }
+    assert!(
+        pool.put_opts(
+            &segment(count + 1),
+            Bytes::from_static(body).into(),
+            create_options()
+        )
+        .await
+        .is_err()
+    );
+    let full = pool.status().await.unwrap().members[0].available_bytes;
+    assert!(full < cost);
+    assert_eq!(first - full, count * cost);
+
+    for id in 1..=count / 2 {
+        pool.delete(&segment(id)).await.unwrap();
+    }
+    assert_eq!(
+        pool.status().await.unwrap().members[0].available_bytes,
+        full + (count / 2) * cost
+    );
+    for id in count + 1..=count + count / 2 {
+        create(&pool, &segment(id), body).await;
+    }
+    drop(pool);
+    let raw = RawStore::open(file(), SIZE, identity).unwrap();
+    let pool = fixture.open_balanced(vec![member(raw)], false).await;
+    for id in 1..=count / 2 {
+        assert!(matches!(
+            pool.get(&segment(id)).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+    }
+    for id in count / 2 + 1..=count + count / 2 {
+        assert_eq!(read(&pool, &segment(id)).await, body);
+    }
+    assert_eq!(
+        pool.status().await.unwrap().members[0].available_bytes,
+        full
+    );
+}
+
+/// A metadata-survival write into a raw member never takes room promised to
+/// segment data, even while the member itself still has those bytes free. A
+/// refused survival write leaves nothing behind, and the promised segment is
+/// placed afterwards.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn survival_writes_never_take_room_promised_to_segments() {
+    use crate::raw_member::RawMemberStore;
+    use crate::retrying_object_store::is_no_space;
+    use crate::storage_backend::raw::RawSpace;
+    use zerofs_raw_device::{Identity, RawStore, Role};
+
+    const SIZE: u64 = 1 << 20;
+    const RESERVE: u64 = 8192;
+    let fixture = Fixture::new(SIZE);
+    let backing = fixture.catalog.path().join("raw");
+    std::fs::File::create(&backing)
+        .unwrap()
+        .set_len(SIZE)
+        .unwrap();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&backing)
+        .unwrap();
+    let identity = Identity {
+        pool_uuid: [1; 16],
+        member_uuid: [2; 16],
+        role: Role::Data,
+    };
+    let raw = RawMemberStore::new(
+        RawStore::provision(file, SIZE, identity).unwrap(),
+        (),
+        RESERVE,
+    )
+    .unwrap();
+    let mut member = fixture.member(true);
+    member.store = Arc::new(raw.clone());
+    member.min_free_bytes = RESERVE;
+    member.free_space = Some(Arc::new(RawSpace::new(1, raw.clone())));
+    let id = member.id.clone();
+    let pool = fixture.open_balanced(vec![member], true).await;
+
+    // Promise all but one survival object's room to one segment.
+    let object = RawStore::put_cost(1).unwrap();
+    let room = pool.status().await.unwrap().members[0].available_bytes;
+    let leased = (1..=room - object)
+        .rev()
+        .find(|bytes| RawStore::put_cost(*bytes).unwrap() <= room - object)
+        .unwrap();
+    assert!(room - object - RawStore::put_cost(leased).unwrap() < object);
+    let claim = pool.admit(leased, None).await.unwrap();
+    // Nothing is written for the claim yet, so the member alone would take
+    // two more objects.
+    assert!(raw.capacity().unwrap().admissible_bytes >= 2 * object);
+
+    let survival = |name: &str| Path::from(format!(".zerofs-survival/v1/{name}"));
+    let put = |name: &'static str| {
+        let pool = pool.clone();
+        let id = id.clone();
+        async move {
+            pool.put_survival(
+                &id,
+                &survival(name),
+                Bytes::from_static(b"m").into(),
+                PutOptions::default(),
+            )
+            .await
+        }
+    };
+    put("first").await.unwrap();
+    assert!(is_no_space(&put("second").await.unwrap_err()));
+    assert!(matches!(
+        raw.head(&survival("second")).await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+
+    claim.fund(Segid::new(41, 950), leased).unwrap();
+    drop(claim);
+    let body = Bytes::from(vec![5; leased as usize]);
+    pool.put_opts(&segment(950), body.clone().into(), create_options())
+        .await
+        .unwrap();
+    assert_eq!(read(&pool, &segment(950)).await, body);
+    assert_eq!(
+        raw.get(&survival("first"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+        Bytes::from_static(b"m")
+    );
+}
+
+/// Segment data fills one raw member to its write floor while a WRITE claim
+/// larger than the headroom waits on the other. Ordinary admission refuses
+/// the full member, and survival writes still fit in its headroom.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn survival_writes_use_the_headroom_that_segment_data_may_not() {
+    use crate::raw_member::RawMemberStore;
+    use crate::retrying_object_store::is_no_space;
+    use crate::storage_backend::raw::RawSpace;
+    use zerofs_raw_device::{Identity, RawStore, Role};
+
+    const SIZE: u64 = 1 << 20;
+    const RESERVE: u64 = 8192;
+    const HEADROOM: u64 = 64 << 10;
+    let fixture = Fixture::new(SIZE);
+    let mut raws = Vec::new();
+    let mut members = Vec::new();
+    for (index, first) in [true, false].into_iter().enumerate() {
+        let backing = fixture.catalog.path().join(format!("raw-{index}"));
+        std::fs::File::create(&backing)
+            .unwrap()
+            .set_len(SIZE)
+            .unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&backing)
+            .unwrap();
+        let identity = Identity {
+            pool_uuid: [1; 16],
+            member_uuid: [index as u8 + 2; 16],
+            role: Role::Data,
+        };
+        let raw = RawMemberStore::new(
+            RawStore::provision(file, SIZE, identity).unwrap(),
+            (),
+            RESERVE,
+        )
+        .unwrap();
+        let mut member = fixture.member(first);
+        member.store = Arc::new(raw.clone());
+        member.min_free_bytes = RESERVE;
+        member.metadata_headroom_bytes = HEADROOM;
+        member.free_space = Some(Arc::new(RawSpace::new(index as u64 + 1, raw.clone())));
+        raws.push(raw);
+        members.push(member);
+    }
+    let pool = fixture.open_balanced(members, true).await;
+
+    // Fill hdd-a with one segment as large as ordinary admission allows.
+    let room = pool.status().await.unwrap().members[0].available_bytes;
+    let filled = (1..=room)
+        .rev()
+        .find(|bytes| RawStore::put_cost(*bytes).unwrap() <= room)
+        .unwrap();
+    let claim = pool.admit(filled, Some("hdd-a".into())).await.unwrap();
+    assert_eq!(claim.member(), "hdd-a");
+    claim.fund(Segid::new(41, 960), filled).unwrap();
+    drop(claim);
+    let body = Bytes::from(vec![6; filled as usize]);
+    pool.put_opts(&segment(960), body.clone().into(), create_options())
+        .await
+        .unwrap();
+    assert_eq!(placement(&pool, &segment(960)).await, "hdd-a");
+    let status = pool.status().await.unwrap();
+    assert!(status.members[0].available_bytes < RawStore::put_cost(1).unwrap());
+    assert_eq!(
+        status.members[0].space.metadata_headroom_remaining_bytes,
+        HEADROOM
+    );
+
+    // A WRITE claim larger than the headroom lands on hdd-b instead.
+    let pending = pool
+        .admit(2 * HEADROOM, Some("hdd-a".into()))
+        .await
+        .unwrap();
+    assert_eq!(pending.member(), "hdd-b");
+
+    let survival = |name: &str| Path::from(format!(".zerofs-survival/v1/{name}"));
+    let generation = Bytes::from(vec![7; (HEADROOM / 2) as usize]);
+    pool.put_survival(
+        "hdd-a",
+        &survival("generation"),
+        generation.clone().into(),
+        PutOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        raws[0]
+            .get(&survival("generation"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+        generation
+    );
+    let status = pool.status().await.unwrap();
+    let space = &status.members[0].space;
+    assert!(space.metadata_headroom_used_bytes >= HEADROOM / 2);
+    assert_eq!(
+        space.metadata_headroom_used_bytes + space.metadata_headroom_remaining_bytes,
+        HEADROOM
+    );
+
+    // Survival still never takes the reserve.
+    assert!(is_no_space(
+        &pool
+            .put_survival(
+                "hdd-a",
+                &survival("too-large"),
+                Bytes::from(vec![8; HEADROOM as usize]).into(),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap_err()
+    ));
+    drop(pending);
+
+    // Deleting the segment frees WRITE room on hdd-a again.
+    pool.delete(&segment(960)).await.unwrap();
+    let claim = pool.admit(filled / 2, Some("hdd-a".into())).await.unwrap();
+    assert_eq!(claim.member(), "hdd-a");
 }
 
 #[derive(Debug, Default)]
@@ -353,6 +691,113 @@ async fn metadata_stays_on_authority_while_segments_fill_members_in_order() {
 }
 
 #[tokio::test]
+async fn round_robin_local_accounts_for_concurrent_multipart_reservations() {
+    let fixture = Fixture::new(32);
+    let pool = fixture.open_balanced(fixture.local_members(), true).await;
+    let paths = [segment(1), segment(2), segment(3), segment(4)];
+    let uploads =
+        futures::future::join_all(paths.iter().map(|path| multipart(&pool, path, 4))).await;
+
+    assert_eq!(usage(&pool, "hdd-a").await, (0, 8, 0));
+    assert_eq!(usage(&pool, "hdd-b").await, (0, 8, 0));
+    futures::future::join_all(uploads.into_iter().map(|mut upload| async move {
+        upload
+            .put_part(Bytes::from_static(b"data").into())
+            .await
+            .unwrap();
+        upload.complete().await.unwrap();
+    }))
+    .await;
+    assert_eq!(usage(&pool, "hdd-a").await, (8, 0, 2));
+    assert_eq!(usage(&pool, "hdd-b").await, (8, 0, 2));
+    assert_eq!(pool.placements().await.unwrap().len(), paths.len());
+    for path in paths {
+        assert_eq!(read(&pool, &path).await, "data");
+    }
+}
+
+#[tokio::test]
+async fn round_robin_local_resumes_after_reopen_with_imbalanced_occupancy() {
+    let fixture = Fixture::new(16);
+    let pool = fixture.open_balanced(fixture.local_members(), true).await;
+    create(&pool, &segment(1), b"12345678").await;
+    assert_eq!(placement(&pool, &segment(1)).await, "hdd-a");
+    drop(pool);
+
+    let pool = fixture.open_balanced(fixture.local_members(), false).await;
+    create(&pool, &segment(2), b"ab").await;
+    create(&pool, &segment(3), b"cdef").await;
+    assert_eq!(placement(&pool, &segment(2)).await, "hdd-b");
+    assert_eq!(placement(&pool, &segment(1)).await, "hdd-a");
+    assert_eq!(placement(&pool, &segment(3)).await, "hdd-a");
+    assert_eq!(usage(&pool, "hdd-a").await, (12, 0, 2));
+    assert_eq!(usage(&pool, "hdd-b").await, (2, 0, 1));
+    let result = pool
+        .put_opts(
+            &segment(1),
+            Bytes::from_static(b"other").into(),
+            create_options(),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(object_store::Error::AlreadyExists { .. })
+    ));
+    assert_eq!(read(&pool, &segment(1)).await, "12345678");
+    assert_eq!(usage(&pool, "hdd-a").await, (12, 0, 2));
+    assert_eq!(usage(&pool, "hdd-b").await, (2, 0, 1));
+    create(&pool, &segment(4), b"gh").await;
+    assert_eq!(placement(&pool, &segment(4)).await, "hdd-b");
+}
+
+#[tokio::test]
+async fn round_robin_local_skips_full_and_quarantined_members() {
+    let fixture = Fixture::new(4);
+    let mut locals = fixture.local_members();
+    let mut overflow = fixture.member(true);
+    overflow.id = "remote-overflow".into();
+    overflow.identity = "memory://remote-overflow".into();
+    overflow.store = Arc::new(InMemory::new());
+    locals[0].min_free_bytes = u64::MAX;
+    let mut members = vec![overflow];
+    members.extend(locals);
+    let pool = fixture.open_balanced(members, true).await;
+
+    create(&pool, &segment(1), b"full").await;
+    assert_eq!(placement(&pool, &segment(1)).await, "hdd-b");
+    create(&pool, &segment(2), b"a").await;
+    assert_eq!(placement(&pool, &segment(2)).await, "remote-overflow");
+    pool.delete(&segment(1)).await.unwrap();
+    pool.quarantine("hdd-b", "media fault").await.unwrap();
+    create(&pool, &segment(3), b"b").await;
+    assert_eq!(placement(&pool, &segment(3)).await, "remote-overflow");
+    assert_eq!(usage(&pool, "hdd-a").await, (0, 0, 0));
+    assert_eq!(usage(&pool, "hdd-b").await, (0, 0, 0));
+}
+
+#[tokio::test]
+async fn status_carries_the_server_time_of_its_catalog_snapshot() {
+    let fixture = Fixture::new(8);
+    let pool = fixture.initialize().await;
+    pool.observe_health(
+        "hdd-a",
+        crate::pool_object_store::SmartSample::default(),
+        None,
+    )
+    .await
+    .unwrap();
+    let before = chrono::Utc::now().timestamp_millis();
+    let status = pool.status().await.unwrap();
+    let after = chrono::Utc::now().timestamp_millis();
+    assert!((before..=after).contains(&status.generated_ms));
+    let member = status.members.iter().find(|m| m.id == "hdd-a").unwrap();
+    let observed = member.health.observed_ms.unwrap();
+    assert!(observed <= status.generated_ms);
+    let json = serde_json::to_value(&status).unwrap();
+    assert_eq!(json["generated_ms"], status.generated_ms);
+}
+
+#[tokio::test]
 async fn adding_and_reordering_members_does_not_move_existing_segments() {
     let fixture = Fixture::new(8);
     let pool = PoolObjectStore::initialize(
@@ -457,6 +902,68 @@ async fn multipart_reserves_bytes_before_parts_and_publishes_only_on_completion(
     upload.complete().await.unwrap();
     assert_eq!(read(&pool, &path).await, "abcdef");
     assert_eq!(usage(&pool, "hdd-a").await, (6, 0, 1));
+}
+
+#[tokio::test]
+async fn capacity_refusals_require_a_healthy_member_that_can_run_out_of_space() {
+    use crate::retrying_object_store::{has_capacity_source, has_permanent_source, is_no_space};
+
+    let fixture = Fixture::new(4);
+    let pool = fixture.initialize().await;
+    pool.quarantine("hdd-a", "media fault").await.unwrap();
+    create(&pool, &segment(1), b"full").await;
+    assert_eq!(placement(&pool, &segment(1)).await, "hdd-b");
+
+    for capacity_limited in [true, false] {
+        if !capacity_limited {
+            pool.quarantine("hdd-b", "media fault").await.unwrap();
+        }
+        let failure = pool
+            .put_opts(
+                &segment(2),
+                Bytes::from_static(b"x").into(),
+                create_options(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(has_capacity_source(&failure), capacity_limited, "{failure}");
+        assert_eq!(is_no_space(&failure), capacity_limited, "{failure}");
+        assert!(has_permanent_source(&failure));
+        assert!(!super::is_prepublication_allocation_refusal(&failure));
+        assert!(!pool.inner.safety_failure.is_cancelled());
+    }
+}
+
+#[tokio::test]
+async fn missing_member_space_readings_do_not_report_a_full_pool() {
+    let fixture = Fixture::new(4);
+    let mut members = fixture.members();
+    for member in &mut members {
+        member.local_path = Some(fixture.catalog.path().join(&member.id));
+    }
+    let pool = PoolObjectStore::initialize(
+        fixture.authority.clone(),
+        Path::from("db"),
+        fixture.catalog.path().join("catalog"),
+        members,
+    )
+    .await
+    .unwrap();
+    let failure = pool
+        .put_opts(
+            &segment(1),
+            Bytes::from_static(b"x").into(),
+            create_options(),
+        )
+        .await
+        .unwrap_err();
+    assert!(!crate::retrying_object_store::is_no_space(&failure));
+    assert!(
+        failure
+            .to_string()
+            .contains("could not read filesystem space")
+    );
+    assert!(!pool.inner.safety_failure.is_cancelled());
 }
 
 #[tokio::test]
@@ -1078,7 +1585,7 @@ async fn disk_health_quarantine_fences_reserved_start_and_late_multipart() {
     pool.quarantine("hdd-a", "media fault").await.unwrap();
     let id = upload.id.clone();
     assert!(
-        pool.catalog(move |c| c.mark_started_for_migration(&id, false))
+        pool.catalog(move |c| c.mark_started_for_migration(&id, false, None))
             .await
             .is_err()
     );
@@ -1513,7 +2020,9 @@ async fn two_through_five_physical_roots_preserve_exact_unique_placements() {
                 capacity_bytes: 8,
                 local_path: Some(directory.canonicalize().unwrap()),
                 min_free_bytes: 0,
+                metadata_headroom_bytes: 0,
                 health_device: None,
+                free_space: None,
             });
         }
         let pool = PoolObjectStore::initialize(
@@ -1807,7 +2316,9 @@ async fn persistent_pool(root: &std::path::Path, initialize: bool) -> PoolObject
             capacity_bytes: 1024 * 1024,
             local_path: Some(root.join(id)),
             min_free_bytes: 0,
+            metadata_headroom_bytes: 0,
             health_device: None,
+            free_space: None,
         })
         .collect();
     if initialize {
@@ -1846,7 +2357,7 @@ async fn native_staging_recovery_reclaims_owned_files_before_releasing_reservati
             .await
             .unwrap();
         let id = upload.id.clone();
-        pool.catalog(move |catalog| catalog.mark_started_for_migration(&id, false))
+        pool.catalog(move |catalog| catalog.mark_started_for_migration(&id, false, None))
             .await
             .unwrap();
         pool.ensure_member("hdd-b", true).await.unwrap();
@@ -1909,7 +2420,7 @@ async fn native_staging_cleanup_failure_keeps_capacity_charged_and_pull_blocked(
         .await
         .unwrap();
     let id = upload.id.clone();
-    pool.catalog(move |catalog| catalog.mark_started_for_migration(&id, false))
+    pool.catalog(move |catalog| catalog.mark_started_for_migration(&id, false, None))
         .await
         .unwrap();
     pool.ensure_member("hdd-b", true).await.unwrap();
@@ -1961,7 +2472,7 @@ async fn native_recovery_timeout_keeps_cleanup_owned_until_catalog_settlement() 
         .unwrap();
     let id = upload.id.clone();
     let mark = id.clone();
-    pool.catalog(move |catalog| catalog.mark_started_for_migration(&mark, false))
+    pool.catalog(move |catalog| catalog.mark_started_for_migration(&mark, false, None))
         .await
         .unwrap();
     pool.ensure_member("hdd-b", true).await.unwrap();
@@ -2115,6 +2626,87 @@ async fn pull_ready_cancelled_stale_native_cleanup_keeps_worker_and_shutdown_own
             .iter()
             .all(|member| member.safe_to_remove)
     );
+    assert!(!pool.inner.safety_failure.is_cancelled());
+}
+
+#[tokio::test]
+async fn native_garbage_reconciles_after_startup_wait_times_out() {
+    let temp = tempfile::tempdir().unwrap();
+    for directory in ["authority", "hdd-a", "hdd-b"] {
+        std::fs::create_dir(temp.path().join(directory)).unwrap();
+    }
+    let pool = persistent_pool(temp.path(), true).await;
+    let path = segment(2408);
+    create(&pool, &path, b"original").await;
+    let previous = pool.visible(&path).await.unwrap().unwrap();
+    let body = temp.path().join("hdd-a").join(previous.physical.key());
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(body.parent().unwrap().join(".zerofs-local-mutations#0"))
+        .unwrap();
+    fs4::fs_std::FileExt::lock_exclusive(&lock).unwrap();
+
+    let key = path.to_string();
+    pool.catalog(move |catalog| catalog.retire(&key, &previous))
+        .await
+        .unwrap();
+    pool.recover_pending().await.unwrap();
+    assert!(body.exists());
+    assert!(pool.key_lock(&path).try_write_owned().is_err());
+    assert_eq!(pool.status().await.unwrap().pending_operations, 1);
+
+    drop(lock);
+    pool.settle().await;
+    assert!(!body.exists());
+    assert_eq!(pool.status().await.unwrap().pending_operations, 0);
+    assert!(!pool.inner.safety_failure.is_cancelled());
+}
+
+#[tokio::test]
+async fn legacy_native_garbage_reconciles_after_startup_wait_times_out() {
+    let temp = tempfile::tempdir().unwrap();
+    for directory in ["authority", "hdd-a", "hdd-b"] {
+        std::fs::create_dir(temp.path().join(directory)).unwrap();
+    }
+    let pool = persistent_pool(temp.path(), true).await;
+    let path = segment(2409);
+    pool.inner
+        .authority
+        .put(&path, Bytes::from_static(b"legacy").into())
+        .await
+        .unwrap();
+    let previous = pool.visible(&path).await.unwrap().unwrap();
+    assert!(matches!(previous.physical, super::Physical::Legacy { .. }));
+    let body = temp.path().join("authority").join(path.as_ref());
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(body.parent().unwrap().join(".zerofs-local-mutations#0"))
+        .unwrap();
+    fs4::fs_std::FileExt::lock_exclusive(&lock).unwrap();
+
+    let key = path.to_string();
+    pool.catalog(move |catalog| catalog.retire(&key, &previous))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), pool.recover_pending())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(body.exists());
+    assert!(pool.key_lock(&path).try_write_owned().is_err());
+    assert_eq!(pool.status().await.unwrap().pending_operations, 1);
+
+    drop(lock);
+    // The original cleanup owns the delete and settlement; no second pass is
+    // needed after the one-second startup wait stops awaiting the native I/O.
+    tokio::time::timeout(Duration::from_secs(5), pool.settle())
+        .await
+        .unwrap();
+    assert!(!body.exists());
+    assert_eq!(pool.status().await.unwrap().pending_operations, 0);
+    assert!(pool.key_lock(&path).try_write_owned().is_ok());
     assert!(!pool.inner.safety_failure.is_cancelled());
 }
 
@@ -2486,7 +3078,7 @@ async fn disk_health_catalog_publication_is_fenced_after_upload_start() {
     let path = segment(2006);
     let upload = pool.reserve(&path, 4, Some("hdd-a".into())).await.unwrap();
     let id = upload.id.clone();
-    pool.catalog(move |c| c.mark_started_for_migration(&id, false))
+    pool.catalog(move |c| c.mark_started_for_migration(&id, false, None))
         .await
         .unwrap();
     pool.quarantine("hdd-a", "media failure after start")
@@ -2509,7 +3101,7 @@ async fn disk_health_catalog_publication_is_fenced_after_upload_start() {
     };
     let id = upload.id.clone();
     assert!(
-        pool.catalog(move |c| c.publish_for_migration(&id, &entry, None, false))
+        pool.catalog(move |c| c.publish_for_migration(&id, &entry, None, false, None))
             .await
             .is_err()
     );
@@ -2577,7 +3169,7 @@ async fn disk_health_zero_byte_debts_prevent_safe_removal_until_cleaned() {
         .await
         .unwrap();
     let id = upload.id.clone();
-    pool.catalog(move |c| c.mark_started_for_migration(&id, false))
+    pool.catalog(move |c| c.mark_started_for_migration(&id, false, None))
         .await
         .unwrap();
     f.first
@@ -2806,4 +3398,1015 @@ async fn evacuation_capacity_ignores_already_moved_bodies_awaiting_source_cleanu
     let status = pool.status().await.unwrap();
     assert_eq!(status.members[0].objects, 0);
     assert_eq!(status.members[1].objects, 2);
+}
+
+#[tokio::test]
+async fn segment_target_survives_capacity_refusal_reopen_and_replay() {
+    let fixture = Fixture::new(8);
+    let pool = fixture.initialize().await;
+    let occupant = segment(701);
+    let mut options = create_options();
+    options.extensions.insert(SegmentTarget("hdd-b".into()));
+    pool.put_opts(
+        &occupant,
+        Bytes::from_static(b"occupied").into(),
+        options.clone(),
+    )
+    .await
+    .unwrap();
+
+    let pending = segment(702);
+    let failure = pool
+        .put_opts(&pending, Bytes::from_static(b"payload").into(), options)
+        .await
+        .unwrap_err();
+    assert!(crate::retrying_object_store::is_no_space(&failure));
+    pool.settle().await;
+    drop(pool);
+
+    let pool = fixture.reopen().await.unwrap();
+    let failure = pool
+        .put_opts(
+            &pending,
+            Bytes::from_static(b"payload").into(),
+            create_options(),
+        )
+        .await
+        .unwrap_err();
+    assert!(crate::retrying_object_store::is_no_space(&failure));
+    assert_eq!(pool.placements().await.unwrap().len(), 1);
+
+    pool.delete(&occupant).await.unwrap();
+    create(&pool, &pending, b"payload").await;
+    let placements = pool.placements().await.unwrap();
+    assert_eq!(placements.len(), 1);
+    assert_eq!(placements[0].member_id, "hdd-b");
+    assert_eq!(
+        pool.get(&pending).await.unwrap().bytes().await.unwrap(),
+        Bytes::from_static(b"payload")
+    );
+    assert!(pool.migrate(&pending, "hdd-a").await.is_err());
+    assert_eq!(pool.placements().await.unwrap()[0].member_id, "hdd-b");
+}
+
+#[tokio::test]
+async fn quarantined_segment_target_refuses_creation_without_spilling() {
+    let fixture = Fixture::new(32);
+    let pool = fixture.initialize().await;
+    let location = segment(703);
+    pool.quarantine("hdd-b", "synthetic offline member")
+        .await
+        .unwrap();
+    let mut options = PutMultipartOptions::default();
+    let capability = ConditionalMultipartCreate::for_payload_len(4);
+    options.extensions.insert(capability.clone());
+    options.extensions.insert(SegmentTarget("hdd-b".into()));
+    assert!(pool.put_multipart_opts(&location, options).await.is_err());
+    assert!(!capability.is_acknowledged());
+    assert!(
+        pool.put_opts(
+            &location,
+            Bytes::from_static(b"data").into(),
+            create_options()
+        )
+        .await
+        .is_err()
+    );
+    assert!(pool.placements().await.unwrap().is_empty());
+    create(&pool, &segment(704), b"healthy").await;
+    assert_eq!(pool.placements().await.unwrap()[0].member_id, "hdd-a");
+}
+
+#[tokio::test]
+async fn segment_target_cannot_override_an_inflight_multipart_reservation() {
+    let fixture = Fixture::new(32);
+    let pool = fixture.initialize().await;
+    let location = segment(705);
+    let mut upload = multipart(&pool, &location, 4).await;
+    let mut options = create_options();
+    options.extensions.insert(SegmentTarget("hdd-b".into()));
+    assert!(
+        pool.put_opts(
+            &location,
+            Bytes::from_static(b"data").into(),
+            options.clone()
+        )
+        .await
+        .is_err()
+    );
+    upload.abort().await.unwrap();
+    pool.put_opts(&location, Bytes::from_static(b"data").into(), options)
+        .await
+        .unwrap();
+    assert_eq!(placement(&pool, &location).await, "hdd-b");
+}
+
+#[tokio::test]
+async fn writeback_replays_segment_to_persisted_member_before_any_pool_put() {
+    use crate::writeback::config::{AckMode, ShutdownFlush, WritebackSettings};
+    use crate::writeback::model::JournalIdentity;
+
+    let fixture = Fixture::new(1024);
+    let pool = fixture.initialize().await;
+    let occupying_key = segment(708);
+    let mut occupying_options = create_options();
+    occupying_options
+        .extensions
+        .insert(SegmentTarget("hdd-b".into()));
+    pool.put_opts(
+        &occupying_key,
+        Bytes::from(vec![0; 1024]).into(),
+        occupying_options,
+    )
+    .await
+    .unwrap();
+    let settings = WritebackSettings {
+        dir: fixture.catalog.path().canonicalize().unwrap().join("dirty"),
+        ack_mode: AckMode::Memory,
+        memory_bytes: 1_000_000,
+        disk_bytes: 10_000_000,
+        min_free_bytes: 1,
+        high_watermark_percent: 95,
+        resume_percent: 85,
+        upload_concurrency: 1,
+        local_concurrency: 1,
+        shutdown_flush: ShutdownFlush::Local,
+    };
+    let identity = JournalIdentity {
+        format_version: 1,
+        bucket_id: "pool-target-fixture".into(),
+        backend_endpoint: "memory://pool-target-fixture".into(),
+        database_prefix: "db".into(),
+        backend_kind: "pool".into(),
+        encryption_key_identity_sha256: [0x86; 32],
+    };
+    let attached = crate::writeback::bootstrap::attach(
+        Arc::new(pool.clone()),
+        settings.clone(),
+        identity.clone(),
+        "target-fixture",
+    )
+    .await
+    .unwrap();
+    attached.lifecycle.set_pool(pool.clone()).await.unwrap();
+    let segid = Segid::new(41, 706);
+    let key = segment(segid.counter);
+    let body = Bytes::from_static(b"durable before the first pool put");
+    let segments = crate::segment_store::SegmentStore::new(
+        Arc::new(object_store::prefix::PrefixStore::new(
+            Arc::clone(&attached.store),
+            Path::from("db"),
+        )),
+        crate::frame_codec::FrameCodec::new(
+            &[0x86; 32],
+            crate::segment::SEGMENT_INFO,
+            crate::config::CompressionConfig::default(),
+        ),
+        segid.epoch,
+        None,
+    );
+    segments
+        .put_segment(segid, body.clone(), Some(&SegmentTarget("hdd-b".into())))
+        .await
+        .unwrap();
+    drop(segments);
+    attached
+        .lifecycle
+        .wait_local_through_accepted()
+        .await
+        .unwrap();
+    assert_eq!(pool.placements().await.unwrap().len(), 1);
+    attached.lifecycle.shutdown().await.unwrap();
+    drop(attached);
+    pool.settle().await;
+    drop(pool);
+
+    let pool = fixture.reopen().await.unwrap();
+    let replay = crate::writeback::bootstrap::attach(
+        Arc::new(pool.clone()),
+        settings,
+        identity,
+        "target-fixture",
+    )
+    .await
+    .unwrap();
+    assert_eq!(pool.placements().await.unwrap().len(), 1);
+    replay.lifecycle.activate_remote().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = replay.lifecycle.status().unwrap();
+            assert_eq!(status.local_seq, 1);
+            assert_eq!(status.remote_seq, 0);
+            if status.retries > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("full target must retain journal debt instead of spilling");
+    assert_eq!(pool.placements().await.unwrap().len(), 1);
+    assert_eq!(
+        replay.store.get(&key).await.unwrap().bytes().await.unwrap(),
+        body
+    );
+    pool.delete(&occupying_key).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), replay.lifecycle.wait_remote(1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(placement(&pool, &key).await, "hdd-b");
+    assert_eq!(read(&pool, &key).await, body);
+    replay.lifecycle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn targeted_seal_refuses_identical_bytes_already_on_another_member() {
+    let fixture = Fixture::new(1024);
+    let pool = fixture.initialize().await;
+    let segid = Segid::new(41, 707);
+    let key = segment(segid.counter);
+    let publisher = crate::segment_store::SegmentStore::new(
+        Arc::new(object_store::prefix::PrefixStore::new(
+            Arc::new(pool.clone()),
+            Path::from("db"),
+        )),
+        crate::frame_codec::FrameCodec::new(
+            &[0x87; 32],
+            crate::segment::SEGMENT_INFO,
+            crate::config::CompressionConfig::default(),
+        ),
+        segid.epoch,
+        None,
+    );
+    let body = Bytes::from_static(b"same bytes");
+    publisher
+        .put_segment(segid, body.clone(), None)
+        .await
+        .unwrap();
+    assert!(
+        publisher
+            .put_segment(segid, body, Some(&SegmentTarget("hdd-b".into())))
+            .await
+            .is_err()
+    );
+    assert_eq!(placement(&pool, &key).await, "hdd-a");
+}
+
+#[tokio::test]
+async fn member_verification_rejects_replaced_empty_and_nonempty_generations() {
+    let cases: [&'static [u8]; 2] = [b"", b"unchanged bytes"];
+    for (index, data) in cases.into_iter().enumerate() {
+        let fixture = Fixture::new(1024);
+        let pool = fixture.initialize().await;
+        let location = segment(707 + index as u64);
+        create(&pool, &location, data).await;
+        let before = pool.verify_member("hdd-a").await.unwrap();
+        assert_eq!(before.verified_segments, 1);
+        assert!(before.failures.is_empty());
+        let entry = pool.visible(&location).await.unwrap().unwrap();
+        let expected_tag = entry.physical.versions().0;
+        let replacement = fixture
+            .first
+            .inner
+            .put(
+                &Path::from(entry.physical.key()),
+                Bytes::from_static(data).into(),
+            )
+            .await
+            .unwrap();
+        assert!(expected_tag.is_some());
+        assert_ne!(replacement.e_tag, expected_tag);
+
+        // Identical bytes do not authorize reading a different generation.
+        // Empty payloads must enforce the same condition as ranged reads.
+        let after = pool.verify_member("hdd-a").await.unwrap();
+        assert_eq!(after.verified_segments, 0);
+        assert!(after.failures.contains_key(location.as_ref()));
+    }
+}
+
+#[tokio::test]
+async fn degraded_member_counts_once_in_automatic_evacuation_fences() {
+    let missing_payloads: [&'static [u8]; 2] = [b"", b"source-a"];
+    for missing_payload in missing_payloads {
+        for previously_quarantined in [false, true] {
+            let fixture = Fixture::new(8);
+            let mut members = fixture.members();
+            members.push(PoolMember {
+                id: "hdd-c".into(),
+                identity: "memory://hdd-c".into(),
+                store: Arc::new(InMemory::new()),
+                capacity_bytes: 128,
+                local_path: None,
+                min_free_bytes: 0,
+                metadata_headroom_bytes: 0,
+                health_device: None,
+                free_space: None,
+            });
+            let pool = PoolObjectStore::initialize(
+                fixture.authority.clone(),
+                Path::from("db"),
+                fixture.catalog.path().join("catalog"),
+                members.clone(),
+            )
+            .await
+            .unwrap();
+            let missing = segment(709);
+            let source = segment(710);
+            create(&pool, &missing, missing_payload).await;
+            create(&pool, &source, b"source-b").await;
+            pool.migrate(&source, "hdd-b").await.unwrap();
+            if previously_quarantined {
+                pool.quarantine("hdd-a", "failure recorded before restart")
+                    .await
+                    .unwrap();
+            }
+            pool.settle().await;
+            drop(pool);
+
+            let pool = PoolObjectStore::open_with_preflight(
+                fixture.authority.clone(),
+                Path::from("db"),
+                fixture.catalog.path().join("catalog"),
+                members,
+                SegmentPlacement::FirstFit,
+                false,
+                |_| {
+                    Ok(MemberPreflight::CheckLocal {
+                        allow_degraded: true,
+                        missing: Some("hdd-a".into()),
+                    })
+                },
+            )
+            .await
+            .unwrap();
+            // A missing member already carrying a quarantine is one failure.
+            pool.catalog(|catalog| catalog.require_automatic_evacuation(Some("hdd-a")))
+                .await
+                .unwrap();
+            assert!(pool.get(&missing).await.is_err());
+            pool.quarantine("hdd-b", "second failure after degraded startup")
+                .await
+                .unwrap();
+            pool.evacuate_pass(&tokio_util::sync::CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(placement(&pool, &missing).await, "hdd-a");
+            assert_eq!(placement(&pool, &source).await, "hdd-b");
+            assert_eq!(usage(&pool, "hdd-c").await, (0, 0, 0));
+            let status = pool.status().await.unwrap();
+            for member in &status.members[..2] {
+                assert_eq!(member.evacuation, "failed_multiple_devices");
+                assert_eq!(
+                    member.health.evacuation_error.as_deref(),
+                    Some("multiple_sick_members")
+                );
+                assert!(!member.safe_to_remove);
+                assert!(!member.safe_to_pull_with_known_loss);
+            }
+            assert_eq!(
+                status.members[0].health.quarantine.is_some(),
+                previously_quarantined,
+                "startup exclusion must not synthesize a persisted quarantine"
+            );
+            assert!(
+                pool.migrate_automatic(&source, "hdd-c", "hdd-b".into())
+                    .await
+                    .is_err()
+            );
+
+            // Independently exercise both transactional fences, not only the
+            // scheduler's initial snapshot. A failed fence must retain ownership.
+            let upload = pool
+                .reserve(&source, 8, Some("hdd-c".into()))
+                .await
+                .unwrap();
+            let id = upload.id.clone();
+            assert!(
+                pool.catalog(move |catalog| {
+                    catalog.mark_started_for_migration(&id, true, Some("hdd-a"))
+                })
+                .await
+                .is_err()
+            );
+            let id = upload.id.clone();
+            pool.catalog(move |catalog| catalog.mark_started_for_migration(&id, false, None))
+                .await
+                .unwrap();
+            let previous = pool.visible(&source).await.unwrap().unwrap();
+            let mut destination = previous.clone();
+            destination.physical = super::Physical::Member {
+                member_id: "hdd-c".into(),
+                key: upload.physical_key.clone(),
+                e_tag: None,
+                version: None,
+            };
+            let id = upload.id.clone();
+            assert!(
+                pool.catalog(move |catalog| {
+                    catalog.publish_for_migration(
+                        &id,
+                        &destination,
+                        Some(&previous),
+                        true,
+                        Some("hdd-a"),
+                    )
+                })
+                .await
+                .is_err()
+            );
+            assert_eq!(placement(&pool, &source).await, "hdd-b");
+            assert_eq!(usage(&pool, "hdd-c").await, (0, 8, 0));
+            pool.cleanup_upload(&upload).await.unwrap();
+            assert_eq!(usage(&pool, "hdd-c").await, (0, 0, 0));
+            assert_eq!(read(&pool, &source).await, "source-b");
+            assert!(!pool.inner.safety_failure.is_cancelled());
+        }
+    }
+}
+
+async fn check_writeback_target_reconciliation(body_len: usize, already_remote: bool) {
+    use crate::writeback::config::{AckMode, ShutdownFlush, WritebackSettings};
+    use crate::writeback::model::JournalIdentity;
+
+    let fixture = Fixture::new(256 * 1024 * 1024);
+    let pool = fixture.initialize().await;
+    let segid = Segid::new(41, 711);
+    let key = segment(segid.counter);
+    let body = Bytes::from(vec![0x71; body_len]);
+    let original_target = SegmentTarget("hdd-a".into());
+    if already_remote {
+        let mut options = create_options();
+        options.extensions.insert(original_target.clone());
+        pool.put_opts(&key, body.clone().into(), options)
+            .await
+            .unwrap();
+    }
+    let attached = crate::writeback::bootstrap::attach(
+        Arc::new(pool.clone()),
+        WritebackSettings {
+            dir: fixture.catalog.path().canonicalize().unwrap().join("dirty"),
+            ack_mode: AckMode::Memory,
+            memory_bytes: 256 * 1024 * 1024,
+            disk_bytes: 512 * 1024 * 1024,
+            min_free_bytes: 1,
+            high_watermark_percent: 95,
+            resume_percent: 85,
+            upload_concurrency: 1,
+            local_concurrency: 1,
+            shutdown_flush: ShutdownFlush::Local,
+        },
+        JournalIdentity {
+            format_version: 1,
+            bucket_id: "target-reconciliation".into(),
+            backend_endpoint: "memory://target-reconciliation".into(),
+            database_prefix: "db".into(),
+            backend_kind: "pool".into(),
+            encryption_key_identity_sha256: [0x71; 32],
+        },
+        "target-reconciliation",
+    )
+    .await
+    .unwrap();
+    attached.lifecycle.set_pool(pool.clone()).await.unwrap();
+    let publisher = crate::segment_store::SegmentStore::new(
+        Arc::new(object_store::prefix::PrefixStore::new(
+            Arc::clone(&attached.store),
+            Path::from("db"),
+        )),
+        crate::frame_codec::FrameCodec::new(
+            &[0x71; 32],
+            crate::segment::SEGMENT_INFO,
+            crate::config::CompressionConfig::default(),
+        ),
+        segid.epoch,
+        None,
+    );
+    if !already_remote {
+        publisher
+            .put_segment(segid, body.clone(), Some(&original_target))
+            .await
+            .unwrap();
+        assert!(pool.placements().await.unwrap().is_empty());
+    }
+    let before = attached.lifecycle.status().unwrap();
+    assert!(
+        publisher
+            .put_segment(segid, body.clone(), Some(&SegmentTarget("hdd-b".into())))
+            .await
+            .is_err(),
+        "identical bytes must not reconcile a different target (length={body_len}, remote={already_remote})"
+    );
+    if !already_remote {
+        assert!(
+            publisher
+                .put_segment(
+                    segid,
+                    Bytes::from(vec![0x72; body_len]),
+                    Some(&original_target),
+                )
+                .await
+                .is_err(),
+            "a pending create retry must match the original digest, not only its size"
+        );
+    }
+    // A retry against the original target remains idempotent, without a new
+    // journal sequence or a second accepted copy of the segment.
+    publisher
+        .put_segment(segid, body.clone(), Some(&original_target))
+        .await
+        .unwrap();
+    let after = attached.lifecycle.status().unwrap();
+    assert_eq!(after.accepted_seq, before.accepted_seq);
+    assert_eq!(after.remote_seq, before.remote_seq);
+    assert_eq!(read(attached.store.as_ref(), &key).await, body);
+    attached
+        .lifecycle
+        .wait_local_through_accepted()
+        .await
+        .unwrap();
+    attached.lifecycle.activate_remote().unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        attached.lifecycle.wait_remote(before.accepted_seq),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(placement(&pool, &key).await, "hdd-a");
+    assert_eq!(read(&pool, &key).await, body);
+    attached.lifecycle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn writeback_target_retry_does_not_reconcile_pending_bytes_on_another_member() {
+    check_writeback_target_reconciliation(64, false).await;
+}
+
+#[tokio::test]
+async fn writeback_multipart_target_retry_does_not_reconcile_pending_bytes_on_another_member() {
+    // Exercise the public publisher's real multipart threshold.
+    check_writeback_target_reconciliation(64 * 1024 * 1024, false).await;
+}
+
+#[tokio::test]
+async fn writeback_multipart_target_refusal_does_not_reconcile_remote_bytes() {
+    check_writeback_target_reconciliation(64 * 1024 * 1024, true).await;
+}
+
+#[tokio::test]
+async fn writeback_segment_retry_waits_for_original_remote_ack() {
+    use crate::segment_store::GeneratedSegmentCreate;
+    use crate::writeback::config::{AckMode, ShutdownFlush, WritebackSettings};
+    use crate::writeback::model::JournalIdentity;
+
+    let fixture = Fixture::new(1024);
+    let pool = fixture.initialize().await;
+    let attached = crate::writeback::bootstrap::attach(
+        Arc::new(pool.clone()),
+        WritebackSettings {
+            dir: fixture.catalog.path().canonicalize().unwrap().join("dirty"),
+            ack_mode: AckMode::Remote,
+            memory_bytes: 1024 * 1024,
+            disk_bytes: 8 * 1024 * 1024,
+            min_free_bytes: 1,
+            high_watermark_percent: 95,
+            resume_percent: 85,
+            upload_concurrency: 1,
+            local_concurrency: 1,
+            shutdown_flush: ShutdownFlush::Local,
+        },
+        JournalIdentity {
+            format_version: 1,
+            bucket_id: "target-retry-ack".into(),
+            backend_endpoint: "memory://target-retry-ack".into(),
+            database_prefix: "db".into(),
+            backend_kind: "pool".into(),
+            encryption_key_identity_sha256: [0x72; 32],
+        },
+        "target-retry-ack",
+    )
+    .await
+    .unwrap();
+    attached.lifecycle.set_pool(pool.clone()).await.unwrap();
+    let key = segment(712);
+    let body = Bytes::from_static(b"same pending segment");
+    let mut options = create_options();
+    options.extensions.insert(GeneratedSegmentCreate);
+    options.extensions.insert(SegmentTarget("hdd-a".into()));
+    let put = || {
+        let store = Arc::clone(&attached.store);
+        let key = key.clone();
+        let body = body.clone();
+        let options = options.clone();
+        tokio::spawn(async move { store.put_opts(&key, body.into(), options).await })
+    };
+    let first = put();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while attached.lifecycle.status().unwrap().accepted_seq != 1 {
+            tokio::task::yield_now().await;
+        }
+        attached
+            .lifecycle
+            .wait_local_through_accepted()
+            .await
+            .unwrap();
+    })
+    .await
+    .unwrap();
+    let mut retry = put();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut retry)
+            .await
+            .is_err(),
+        "matching bytes must still wait for the original remote durability barrier"
+    );
+    assert!(!first.is_finished());
+    assert_eq!(attached.lifecycle.status().unwrap().accepted_seq, 1);
+    assert_eq!(attached.lifecycle.status().unwrap().remote_seq, 0);
+    assert!(pool.placements().await.unwrap().is_empty());
+    attached.lifecycle.activate_remote().unwrap();
+    let (first, retry) = tokio::time::timeout(Duration::from_secs(10), async {
+        (first.await.unwrap().unwrap(), retry.await.unwrap().unwrap())
+    })
+    .await
+    .unwrap();
+    assert_eq!(retry.e_tag, first.e_tag);
+    assert_eq!(retry.version, first.version);
+    assert_eq!(attached.lifecycle.status().unwrap().accepted_seq, 1);
+    assert_eq!(attached.lifecycle.status().unwrap().remote_seq, 1);
+    assert_eq!(placement(&pool, &key).await, "hdd-a");
+    assert_eq!(read(&pool, &key).await, body);
+    attached.lifecycle.shutdown().await.unwrap();
+}
+
+async fn check_writeback_retry_with_full_ssd(queue_ram_owner: bool) {
+    use crate::segment_store::GeneratedSegmentCreate;
+    use crate::writeback::config::{AckMode, ShutdownFlush, WritebackSettings};
+    use crate::writeback::model::{JournalIdentity, MutationRecord};
+
+    let fixture = Fixture::new(1024);
+    let pool = fixture.initialize().await;
+    let key = segment(713);
+    let body = Bytes::from_static(b"one accepted segment");
+    let disk_bytes =
+        MutationRecord::ssd_reservation_estimate(key.as_ref(), None, body.len() as u64).unwrap();
+    let attached = crate::writeback::bootstrap::attach(
+        Arc::new(pool.clone()),
+        WritebackSettings {
+            dir: fixture.catalog.path().canonicalize().unwrap().join("dirty"),
+            ack_mode: AckMode::Ssd,
+            memory_bytes: body.len() as u64,
+            disk_bytes,
+            min_free_bytes: 1,
+            high_watermark_percent: 100,
+            resume_percent: 50,
+            upload_concurrency: 1,
+            local_concurrency: 1,
+            shutdown_flush: ShutdownFlush::Local,
+        },
+        JournalIdentity {
+            format_version: 1,
+            bucket_id: "target-retry-full-ssd".into(),
+            backend_endpoint: "memory://target-retry-full-ssd".into(),
+            database_prefix: "db".into(),
+            backend_kind: "pool".into(),
+            encryption_key_identity_sha256: [0x73; 32],
+        },
+        "target-retry-full-ssd",
+    )
+    .await
+    .unwrap();
+    attached.lifecycle.set_pool(pool.clone()).await.unwrap();
+    let mut options = create_options();
+    options.extensions.insert(GeneratedSegmentCreate);
+    options.extensions.insert(SegmentTarget("hdd-a".into()));
+    let first = attached
+        .store
+        .put_opts(&key, body.clone().into(), options.clone())
+        .await
+        .unwrap();
+    let status = attached.lifecycle.status().unwrap();
+    assert_eq!(status.local_seq, 1);
+    assert_eq!(status.remote_seq, 0);
+    assert_eq!(status.dirty_ssd_reserved_bytes, disk_bytes);
+    assert_eq!(status.dirty_ram_bytes, 0);
+
+    // A different writer may own the entire RAM budget while waiting for the
+    // full SSD journal to drain. An idempotent retry needs neither budget.
+    let queued = if queue_ram_owner {
+        let store = Arc::clone(&attached.store);
+        let queued_body = body.clone();
+        let options = options.clone();
+        let queued = tokio::spawn(async move {
+            store
+                .put_opts(&segment(714), queued_body.into(), options)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while attached.lifecycle.status().unwrap().dirty_ram_bytes != body.len() as u64 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(attached.lifecycle.status().unwrap().accepted_seq, 1);
+        Some(queued)
+    } else {
+        None
+    };
+    let retry_store = Arc::clone(&attached.store);
+    let retry_key = key.clone();
+    let retry_body = body.clone();
+    let mut retry = tokio::spawn(async move {
+        retry_store
+            .put_opts(&retry_key, retry_body.into(), options)
+            .await
+    });
+    let before_drain = tokio::time::timeout(Duration::from_secs(1), &mut retry).await;
+    let completed_before_drain = before_drain.is_ok();
+    let paused_status = attached.lifecycle.status().unwrap();
+
+    // Drain and join even when the regression is present, so a failing test
+    // does not leave an owned put waiting for admission in the background.
+    attached.lifecycle.activate_remote().unwrap();
+    if let Some(queued) = queued {
+        tokio::time::timeout(Duration::from_secs(10), queued)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+    if !completed_before_drain {
+        let _ = tokio::time::timeout(Duration::from_secs(10), retry)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let accepted = attached.lifecycle.status().unwrap().accepted_seq;
+    attached.lifecycle.wait_remote(accepted).await.unwrap();
+    attached.lifecycle.shutdown().await.unwrap();
+
+    let retried = before_drain
+        .expect("an identical accepted create must complete while remote replay is paused and the SSD budget is full")
+        .unwrap()
+        .unwrap();
+    assert_eq!(retried.e_tag, first.e_tag);
+    assert_eq!(retried.version, first.version);
+    assert_eq!(paused_status.accepted_seq, 1);
+    assert_eq!(paused_status.remote_seq, 0);
+    assert_eq!(paused_status.dirty_ssd_reserved_bytes, disk_bytes);
+    assert_eq!(read(&pool, &key).await, body);
+    assert_eq!(placement(&pool, &key).await, "hdd-a");
+}
+
+#[tokio::test]
+async fn writeback_segment_retry_needs_no_second_ssd_reservation() {
+    check_writeback_retry_with_full_ssd(false).await;
+}
+
+#[tokio::test]
+async fn writeback_segment_retry_bypasses_a_ram_owner_waiting_for_full_ssd() {
+    check_writeback_retry_with_full_ssd(true).await;
+}
+
+#[tokio::test]
+async fn bound_segment_refusal_does_not_stop_other_automatic_evacuation() {
+    let fixture = Fixture::new(1024);
+    let pool = fixture.initialize().await;
+    let bound = segment(720);
+    let movable = segment(721);
+    let mut options = create_options();
+    options.extensions.insert(SegmentTarget("hdd-a".into()));
+    pool.put_opts(&bound, Bytes::from_static(b"bound").into(), options)
+        .await
+        .unwrap();
+    create(&pool, &movable, b"movable").await;
+    pool.quarantine("hdd-a", "synthetic member failure")
+        .await
+        .unwrap();
+
+    // A pinned segment cannot move to hdd-b. This is an expected allocation
+    // refusal, not a catalog failure that should terminate the recovery worker.
+    pool.evacuate_pass(&tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(placement(&pool, &bound).await, "hdd-a");
+    assert_eq!(placement(&pool, &movable).await, "hdd-b");
+    assert_eq!(read(&pool, &bound).await, "bound");
+    assert_eq!(read(&pool, &movable).await, "movable");
+    assert!(pool.faults().await.unwrap().is_empty());
+    assert!(!pool.status().await.unwrap().members[0].safe_to_remove);
+    assert!(!pool.inner.safety_failure.is_cancelled());
+}
+
+fn admitted(status: &super::PoolStatus, id: &str) -> u64 {
+    status
+        .members
+        .iter()
+        .find(|member| member.id == id)
+        .unwrap()
+        .admitted_bytes
+}
+
+/// A claim holds room until it is dropped. Claims, leases and reservations
+/// never promise the same bytes, and a leased segment's own reservation does
+/// not count its lease a second time.
+#[tokio::test]
+async fn claims_and_leases_share_room_with_reservations_exactly() {
+    let fixture = Fixture::new(1024);
+    let pool = fixture.initialize().await;
+    let first = pool.admit(600, None).await.unwrap();
+    let second = pool.admit(600, None).await.unwrap();
+    assert_ne!(first.member(), second.member());
+    let refused = pool.admit(600, None).await.unwrap_err();
+    assert!(crate::retrying_object_store::is_no_space(&refused));
+    // A plain PUT may not take the claimed room either.
+    let location = segment(901);
+    let error = pool
+        .put_opts(
+            &location,
+            Bytes::from(vec![7; 600]).into(),
+            create_options(),
+        )
+        .await
+        .unwrap_err();
+    assert!(crate::retrying_object_store::is_no_space(&error));
+    drop(second);
+    pool.admit(600, None).await.unwrap();
+
+    // `first` funds a 600-byte lease. Placing that segment needs no room
+    // beyond its own lease, and placement releases the lease.
+    let leased = Segid::new(41, 902);
+    first.fund(leased, 600).unwrap();
+    assert_eq!(pool.lease_member(leased), Some(first.member()));
+    drop(first);
+    let member = pool.lease_member(leased).unwrap();
+    assert_eq!(admitted(&pool.status().await.unwrap(), &member), 600);
+    pool.put_opts(
+        &segment(902),
+        Bytes::from(vec![9; 600]).into(),
+        create_options(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(placement(&pool, &segment(902)).await, member);
+    assert_eq!(pool.lease_member(leased), None);
+    let status = pool.status().await.unwrap();
+    assert_eq!(admitted(&status, &member), 0);
+    assert_eq!(usage(&pool, &member).await.0, 600);
+}
+
+/// A WRITE that claimed room on one member can keep filling a segment
+/// leased on another while that member has room, and not past it.
+#[tokio::test]
+async fn a_lease_grows_on_its_own_member_while_that_member_has_room() {
+    let fixture = Fixture::new(1024);
+    let pool = fixture.initialize().await;
+    let leased = Segid::new(41, 920);
+    assert!(!pool.extend_lease(leased, 300).await.unwrap());
+
+    let first = pool.admit(300, Some("hdd-a".into())).await.unwrap();
+    first.fund(leased, 300).unwrap();
+    drop(first);
+    let other = pool.admit(300, Some("hdd-b".into())).await.unwrap();
+    assert_eq!(other.member(), "hdd-b");
+    assert!(other.fund(leased, 600).is_err());
+
+    assert!(pool.extend_lease(leased, 600).await.unwrap());
+    assert_eq!(pool.lease_member(leased).as_deref(), Some("hdd-a"));
+    assert_eq!(admitted(&pool.status().await.unwrap(), "hdd-a"), 600);
+    // The member holds 1024 bytes: the lease cannot grow past them, and a
+    // refused growth leaves it as it was.
+    assert!(!pool.extend_lease(leased, 1025).await.unwrap());
+    assert_eq!(admitted(&pool.status().await.unwrap(), "hdd-a"), 600);
+    assert!(!pool.inner.safety_failure.is_cancelled());
+}
+
+/// A WRITE is admitted while a placement holds, or waits for, the catalog
+/// writer: admission reads committed rows and the ledger only.
+#[tokio::test]
+async fn admission_does_not_wait_for_a_placement_commit() {
+    let fixture = Fixture::new(1024);
+    let pool = fixture.initialize().await;
+    let writer = pool.inner.catalog.writer();
+    let placing = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            pool.put_opts(
+                &segment(910),
+                Bytes::from(vec![1; 100]).into(),
+                create_options(),
+            )
+            .await
+        }
+    });
+    // Let the placement queue behind the writer.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let claim = tokio::time::timeout(Duration::from_secs(10), pool.admit(600, None)).await;
+    let survival = tokio::time::timeout(
+        Duration::from_secs(10),
+        pool.put_survival(
+            "hdd-a",
+            &Path::from(".zerofs-survival/v1/held-writer"),
+            Bytes::from_static(b"generation").into(),
+            PutOptions::default(),
+        ),
+    )
+    .await;
+    writer.abort().unwrap();
+    claim
+        .expect("admission waited for the catalog writer")
+        .unwrap();
+    survival
+        .expect("survival admission waited for the catalog writer")
+        .unwrap();
+    placing.await.unwrap().unwrap();
+}
+
+/// A journaled segment the pool has not placed keeps its room across a
+/// restart: attaching the writeback store leases it again, and placing it
+/// releases the lease.
+#[tokio::test]
+async fn a_restart_leases_segments_the_journal_has_not_placed() {
+    use crate::writeback::config::{AckMode, ShutdownFlush, WritebackSettings};
+    use crate::writeback::model::JournalIdentity;
+
+    let fixture = Fixture::new(1024);
+    let pool = fixture.initialize().await;
+    let settings = WritebackSettings {
+        dir: fixture.catalog.path().canonicalize().unwrap().join("dirty"),
+        ack_mode: AckMode::Memory,
+        memory_bytes: 1_000_000,
+        disk_bytes: 10_000_000,
+        min_free_bytes: 1,
+        high_watermark_percent: 95,
+        resume_percent: 85,
+        upload_concurrency: 1,
+        local_concurrency: 1,
+        shutdown_flush: ShutdownFlush::Local,
+    };
+    let identity = JournalIdentity {
+        format_version: 1,
+        bucket_id: "lease-fixture".into(),
+        backend_endpoint: "memory://lease-fixture".into(),
+        database_prefix: "db".into(),
+        backend_kind: "pool".into(),
+        encryption_key_identity_sha256: [0x87; 32],
+    };
+    let attached = crate::writeback::bootstrap::attach(
+        Arc::new(pool.clone()),
+        settings.clone(),
+        identity.clone(),
+        "lease-fixture",
+    )
+    .await
+    .unwrap();
+    attached.lifecycle.set_pool(pool.clone()).await.unwrap();
+    let key = segment(903);
+    let body = Bytes::from(vec![3; 600]);
+    attached
+        .store
+        .put_opts(&key, body.clone().into(), create_options())
+        .await
+        .unwrap();
+    attached
+        .lifecycle
+        .wait_local_through_accepted()
+        .await
+        .unwrap();
+    attached.lifecycle.shutdown().await.unwrap();
+    drop(attached);
+    pool.settle().await;
+    drop(pool);
+
+    let pool = fixture.reopen().await.unwrap();
+    let replay = crate::writeback::bootstrap::attach(
+        Arc::new(pool.clone()),
+        settings,
+        identity,
+        "lease-fixture",
+    )
+    .await
+    .unwrap();
+    replay.lifecycle.set_pool(pool.clone()).await.unwrap();
+    let leased = pool.lease_member(Segid::new(41, 903)).unwrap();
+    assert_eq!(admitted(&pool.status().await.unwrap(), &leased), 600);
+    // The other member still has room; the leased one does not.
+    let other = pool.admit(600, None).await.unwrap();
+    assert_ne!(other.member(), leased);
+    assert!(pool.admit(600, None).await.is_err());
+    drop(other);
+
+    replay.lifecycle.activate_remote().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), replay.lifecycle.wait_remote(1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(placement(&pool, &key).await, leased);
+    assert_eq!(read(&pool, &key).await, body);
+    assert_eq!(admitted(&pool.status().await.unwrap(), &leased), 0);
+    assert_eq!(usage(&pool, &leased).await.0, 600);
+    replay.lifecycle.shutdown().await.unwrap();
 }

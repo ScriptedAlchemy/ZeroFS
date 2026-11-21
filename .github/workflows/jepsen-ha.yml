@@ -7,8 +7,34 @@ permissions:
   contents: read
 
 jobs:
+  dependencies:
+    name: Prepare Jepsen dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Cache the verified Jepsen dependencies
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/jepsen-ha-deps.tar
+          key: jepsen-ha-${{ runner.os }}-${{ runner.arch }}-jdk17-${{ hashFiles('jepsen/ha/project.clj', 'scripts/ci/prepare-jepsen-deps.sh', 'scripts/ci/retry-lein-deps.sh') }}
+      - name: Resolve Jepsen dependencies with bounded retries
+        working-directory: jepsen/ha
+        run: bash "$GITHUB_WORKSPACE/scripts/ci/prepare-jepsen-deps.sh"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jepsen-ha-deps
+          path: ${{ runner.temp }}/jepsen-ha-deps.tar
+          if-no-files-found: error
+          compression-level: 0
+
   jepsen-ha:
     name: HA suite (${{ matrix.mount-client }})
+    needs: dependencies
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout }}
     strategy:
@@ -38,6 +64,12 @@ jobs:
           name: zerofs-ci-bin
           path: zerofs/target/ci
 
+      - name: Fetch the resolved Jepsen dependencies
+        uses: actions/download-artifact@v4
+        with:
+          name: jepsen-ha-deps
+          path: ${{ runner.temp }}
+
       - name: Cache the Ubuntu guest image
         if: matrix.mount-client == 'native'
         uses: actions/cache@v4
@@ -57,7 +89,7 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Install Leiningen + FUSE + gnuplot
+      - name: Install FUSE and gnuplot
         if: matrix.mount-client == 'fuse'
         run: |
           sudo apt-get update
@@ -65,40 +97,28 @@ jobs:
           # default perf checker shells out to it; without it the verdict drops
           # to :unknown.
           sudo apt-get install -y fuse3 gnuplot-nox
-          curl -fsSL https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein \
-            -o /usr/local/bin/lein
-          sudo chmod +x /usr/local/bin/lein
-          lein version
 
-      - name: Install guest JDK, Leiningen, and gnuplot
+      - name: Install guest JDK and gnuplot
         if: matrix.mount-client == 'native'
         timeout-minutes: 10
         run: |
           bash "$GITHUB_WORKSPACE/scripts/ci/install-jepsen-native-deps.sh"
-          sudo curl -fsSL \
-            https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein \
-            -o /usr/local/bin/lein
-          sudo chmod +x /usr/local/bin/lein
-          lein version
 
-      # Verify lifecycle and takeover contracts before mounted HA scenarios.
-      # Dependency transport failures must not rerun or mask durability assertions.
-      - name: Resolve Jepsen dependencies with bounded retries
+      - name: Install the resolved Jepsen dependencies
         run: |
-          cd "$GITHUB_WORKSPACE/jepsen/ha"
-          lein=(lein)
           if [[ "${{ matrix.mount-client }}" == fuse ]]; then
-            lein=(sudo env HOME=/root LEIN_ROOT=1 JAVA_HOME="$JAVA_HOME" /usr/local/bin/lein)
+            sudo tar -xf "$RUNNER_TEMP/jepsen-ha-deps.tar" -C /root
+          else
+            tar -xf "$RUNNER_TEMP/jepsen-ha-deps.tar" -C "$HOME"
           fi
-          bash "$GITHUB_WORKSPACE/scripts/ci/retry-lein-deps.sh" "${lein[@]}"
 
       - name: Test HA harness contracts
         run: |
           cd "$GITHUB_WORKSPACE/jepsen/ha"
-          lein=(lein)
+          lein=("$HOME/lein" -o)
           if [[ "${{ matrix.mount-client }}" == fuse ]]; then
             lein=(sudo env HOME=/root LEIN_ROOT=1 JAVA_HOME="$JAVA_HOME"
-              /usr/local/bin/lein)
+              /root/lein -o)
           fi
           "${lein[@]}" test
 
@@ -117,10 +137,10 @@ jobs:
       - name: HA test (fsync, kill/heal nemesis)
         run: |
           cd "$GITHUB_WORKSPACE/jepsen/ha"
-          lein=(lein)
+          lein=("$HOME/lein" -o)
           if [[ "${{ matrix.mount-client }}" == fuse ]]; then
             lein=(sudo env HOME=/root LEIN_ROOT=1 JAVA_HOME="$JAVA_HOME"
-              /usr/local/bin/lein)
+              /root/lein -o)
           fi
           "${lein[@]}" run test \
             --time-limit 300 \
@@ -135,10 +155,10 @@ jobs:
       - name: HA test (--no-fsync, semi-sync of un-fsynced writes)
         run: |
           cd "$GITHUB_WORKSPACE/jepsen/ha"
-          lein=(lein)
+          lein=("$HOME/lein" -o)
           if [[ "${{ matrix.mount-client }}" == fuse ]]; then
             lein=(sudo env HOME=/root LEIN_ROOT=1 JAVA_HOME="$JAVA_HOME"
-              /usr/local/bin/lein)
+              /root/lein -o)
           fi
           "${lein[@]}" run test \
             --time-limit 90 \
@@ -225,6 +245,7 @@ jobs:
   # durability it cannot provide (ESTALE over a lost write, never a false success).
   durability:
     name: Durability (${{ matrix.mount-client }}, ${{ matrix.scenario }})
+    needs: dependencies
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout }}
     strategy:
@@ -268,6 +289,12 @@ jobs:
           name: zerofs-ci-bin
           path: zerofs/target/ci
 
+      - name: Fetch the resolved Jepsen dependencies
+        uses: actions/download-artifact@v4
+        with:
+          name: jepsen-ha-deps
+          path: ${{ runner.temp }}
+
       - name: Cache the Ubuntu guest image
         if: matrix.mount-client == 'native'
         uses: actions/cache@v4
@@ -287,35 +314,25 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Install Leiningen + FUSE + gnuplot
+      - name: Install FUSE and gnuplot
         if: matrix.mount-client == 'fuse'
         run: |
           sudo apt-get update
           sudo apt-get install -y fuse3 gnuplot-nox
-          curl -fsSL https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein \
-            -o /usr/local/bin/lein
-          sudo chmod +x /usr/local/bin/lein
 
-      - name: Install guest JDK, Leiningen, and gnuplot
+      - name: Install guest JDK and gnuplot
         if: matrix.mount-client == 'native'
         timeout-minutes: 10
         run: |
           bash "$GITHUB_WORKSPACE/scripts/ci/install-jepsen-native-deps.sh"
-          sudo curl -fsSL \
-            https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein \
-            -o /usr/local/bin/lein
-          sudo chmod +x /usr/local/bin/lein
-          lein version
 
-      # Dependency transport failures must not rerun or mask durability assertions.
-      - name: Resolve Jepsen dependencies with bounded retries
+      - name: Install the resolved Jepsen dependencies
         run: |
-          cd "$GITHUB_WORKSPACE/jepsen/ha"
-          lein=(lein)
           if [[ "${{ matrix.mount-client }}" == fuse ]]; then
-            lein=(sudo env HOME=/root LEIN_ROOT=1 JAVA_HOME="$JAVA_HOME" /usr/local/bin/lein)
+            sudo tar -xf "$RUNNER_TEMP/jepsen-ha-deps.tar" -C /root
+          else
+            tar -xf "$RUNNER_TEMP/jepsen-ha-deps.tar" -C "$HOME"
           fi
-          bash "$GITHUB_WORKSPACE/scripts/ci/retry-lein-deps.sh" "${lein[@]}"
 
       - name: Build pinned MinIO fixture
         uses: ./.github/actions/build-minio-fixture
@@ -329,10 +346,10 @@ jobs:
       - name: Run --${{ matrix.scenario }}
         run: |
           cd "$GITHUB_WORKSPACE/jepsen/ha"
-          lein=(lein)
+          lein=("$HOME/lein" -o)
           if [[ "${{ matrix.mount-client }}" == fuse ]]; then
             lein=(sudo env HOME=/root LEIN_ROOT=1 JAVA_HOME="$JAVA_HOME"
-              /usr/local/bin/lein)
+              /root/lein -o)
           fi
           "${lein[@]}" run test \
             --${{ matrix.scenario }} \

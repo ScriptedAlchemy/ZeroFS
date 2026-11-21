@@ -413,6 +413,19 @@ impl Inode {
     pub(crate) fn is_directory(&self) -> bool {
         matches!(self, Inode::Directory(_))
     }
+
+    pub(crate) fn set_ctime(&mut self, sec: u64, nsec: u32) {
+        let (ctime, ctime_nsec) = match self {
+            Inode::Directory(i) => (&mut i.ctime, &mut i.ctime_nsec),
+            Inode::File(i) => (&mut i.ctime, &mut i.ctime_nsec),
+            Inode::Symlink(i) => (&mut i.ctime, &mut i.ctime_nsec),
+            Inode::Fifo(i) | Inode::Socket(i) | Inode::CharDevice(i) | Inode::BlockDevice(i) => {
+                (&mut i.ctime, &mut i.ctime_nsec)
+            }
+        };
+        *ctime = sec;
+        *ctime_nsec = nsec;
+    }
 }
 
 #[cfg(test)]

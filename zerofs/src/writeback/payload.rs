@@ -166,7 +166,7 @@ impl VerifiedPayload {
         }
     }
 
-    pub(crate) fn write_to(&self, output: &mut File) -> std::io::Result<()> {
+    pub(crate) fn write_to(&self, output: &mut impl Write) -> std::io::Result<()> {
         match &self.source {
             PayloadSource::Memory(payload) => {
                 for chunk in payload {

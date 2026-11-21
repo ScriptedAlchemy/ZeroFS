@@ -1,7 +1,7 @@
 use crate::segment_store::ConditionalMultipartCreate;
 use crate::writeback::admission::Admission;
 use crate::writeback::barrier::{BarrierError, SequenceBarrier, SequenceProgress};
-use crate::writeback::journal::Journal;
+use crate::writeback::journal::{Journal, JournalBlobIntegrityError};
 use crate::writeback::journaler::{LocalBarrier, LocalBarrierError};
 use crate::writeback::model::{
     FenceClass, LocalEtag, MutationKind, MutationMode, MutationRecord, Sequence,
@@ -994,6 +994,20 @@ async fn recover_publication_result(
 }
 
 fn is_terminal_remote_error(error: &object_store::Error) -> bool {
+    // Pool capacity refusals end a foreground attempt immediately, but the
+    // durable journal still owns its payload and may retry after space returns.
+    // Do not exempt arbitrary ENOSPC causes: a permanent cleanup failure can
+    // contain one while still requiring the scheduler to stop.
+    if crate::retrying_object_store::has_capacity_source(error) {
+        return false;
+    }
+    // Quarantine may reject a selected member before placement publication.
+    // Replay can select a fresh member while the pool retains any cleanup debt
+    // for the refused generation. Only this typed refusal proves that boundary;
+    // media, identity, and uncertain catalog commit failures remain terminal.
+    if crate::pool_object_store::is_prepublication_allocation_refusal(error) {
+        return false;
+    }
     if crate::retrying_object_store::has_permanent_source(error) {
         return true;
     }
@@ -1454,30 +1468,34 @@ async fn stream_record_to_remote(
     }
 
     let sequence = record.sequence;
-    let blob_journal = Arc::clone(&journal);
-    let blob = tokio::task::spawn_blocking(move || blob_journal.open_verified_blob(sequence))
+    if record
+        .payload()
+        .is_some_and(|(payload_len, _)| payload_len <= REMOTE_SINGLE_PUT_BYTES)
+    {
+        // Keep the complete, already-bounded payload in the same buffer that
+        // was hashed. Both file I/O and SHA-256 stay on the blocking worker,
+        // and corrupt bytes are rejected before backend publication.
+        let blob_journal = Arc::clone(&journal);
+        let (collected, sha256) = tokio::task::spawn_blocking(move || {
+            blob_journal.read_blob_digested(sequence, REMOTE_SINGLE_PUT_BYTES)
+        })
         .await
-        .map_err(|error| generic_error(format!("journal open task failed: {error}")))?
-        .map_err(|error| generic_error(format!("journal blob open failed: {error:#}")))?;
-    let mut chunks = blob
-        .range_stream(0..blob.len(), REMOTE_STREAM_CHUNK_BYTES)
-        .map_err(|error| generic_error(format!("journal blob stream failed: {error:#}")))?;
-    if blob.len() <= REMOTE_SINGLE_PUT_BYTES {
-        let mut collected = Vec::new();
-        while let Some(chunk) = chunks.next().await {
-            collected.push(chunk.map_err(|error| {
-                generic_error(format!("journal blob stream failed: {error:#}"))
-            })?);
-        }
+        .map_err(|error| generic_error(format!("journal read task failed: {error}")))?
+        .map_err(|error| journal_blob_error("journal blob read failed", error))?;
         let mut options = PutOptions::from(mode.clone());
         options
             .extensions
             .insert(crate::retrying_object_store::CallerOwnsRetries);
+        // The read just checked these bytes against this digest, so the
+        // stores below record it without hashing the payload again.
+        options
+            .extensions
+            .insert(crate::segment_store::PayloadSha256(sha256));
         let result = bounded_remote_step_with_timeout(
             record,
             "bounded atomic put",
             REMOTE_PUBLICATION_TIMEOUT,
-            remote.put_opts(target, PutPayload::from_iter(collected), options),
+            remote.put_opts(target, collected.into(), options),
         )
         .await;
         return match result {
@@ -1491,6 +1509,14 @@ async fn stream_record_to_remote(
             Err(error) => Err(error),
         };
     }
+    let blob_journal = Arc::clone(&journal);
+    let blob = tokio::task::spawn_blocking(move || blob_journal.open_verified_blob(sequence))
+        .await
+        .map_err(|error| generic_error(format!("journal open task failed: {error}")))?
+        .map_err(|error| journal_blob_error("journal blob open failed", error))?;
+    let mut chunks = blob
+        .range_stream(0..blob.len(), REMOTE_STREAM_CHUNK_BYTES)
+        .map_err(|error| journal_blob_error("journal blob stream failed", error))?;
     if matches!(mode, PutMode::Update(_)) {
         return Err(object_store::Error::NotSupported {
             source: Box::new(crate::retrying_object_store::PermanentError::new(
@@ -1536,7 +1562,7 @@ async fn stream_record_to_remote(
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(error) => {
-                let source = generic_error(format!("journal blob stream failed: {error:#}"));
+                let source = journal_blob_error("journal blob stream failed", error);
                 return abort_remote_multipart(&mut owner, record, source).await;
             }
         };
@@ -1600,15 +1626,19 @@ async fn abort_remote_multipart<T>(
     match bounded_remote_step(record, "multipart abort", owner.abort()).await {
         Ok(()) => Err(error),
         Err(abort_error) => {
-            if crate::sftp_object_store::recover_transient_staging_cleanup(&abort_error).await? {
-                // Preserve the original publication error, including permanent
-                // failures; settling a transient cleanup must never mask it.
-                Err(error)
-            } else {
-                Err(generic_error(format!(
-                    "{error}; remote multipart abort also failed: {abort_error}"
-                )))
+            if !crate::sftp_object_store::recover_transient_staging_cleanup(&abort_error).await? {
+                tracing::warn!(
+                    sequence = record.sequence,
+                    path = %record.path,
+                    error = %error,
+                    %abort_error,
+                    "remote multipart abort failed; retaining upload for cleanup"
+                );
             }
+            // The owner still queues the unresolved upload for cleanup, which
+            // independently fences replay. Preserve the original error's type:
+            // a later successful abort cannot make a permanent failure retryable.
+            Err(error)
         }
     }
 }
@@ -1756,13 +1786,25 @@ async fn verify_existing(
     let blob = tokio::task::spawn_blocking(move || blob_journal.open_verified_blob(sequence))
         .await
         .map_err(|error| generic_error(format!("journal open task failed: {error}")))?
-        .map_err(|error| generic_error(format!("journal blob open failed: {error:#}")))?;
+        .map_err(|error| journal_blob_error("journal blob open failed", error))?;
     if meta.size != blob.len() {
         return Err(object_store::Error::AlreadyExists {
             path: target.to_string(),
             source: Box::new(RemoteContentDivergence),
         });
     }
+    // Keep one cursor over the entire committed payload. Independent partial
+    // range streams do not rehash their bytes, so a journal changed after the
+    // initial verification could otherwise reconcile against the same wrong
+    // remote contents and then be retired as durable.
+    let mut local_stream = blob
+        .range_stream(0..blob.len(), REMOTE_STREAM_CHUNK_BYTES)
+        .map_err(|error| journal_blob_error("journal range failed", error))?;
+    // The local stream's items carry no size contract: a raw P3 journal yields
+    // its 60 KiB payload chunks whatever chunk size is requested. Compare byte
+    // for byte across item boundaries, so only different bytes are reported as
+    // divergence and never a different chunking of the same bytes.
+    let mut local = bytes::Bytes::new();
     let mut offset = 0u64;
     while offset < blob.len() {
         let end = offset
@@ -1774,26 +1816,55 @@ async fn verify_existing(
             range: Some(GetRange::Bounded(offset..end)),
             ..GetOptions::default()
         };
-        let remote_range = bounded_remote_step(record, "reconciliation range read", async {
+        let mut remote_range = bounded_remote_step(record, "reconciliation range read", async {
             remote.get_opts(target, options).await?.bytes().await
         })
         .await?;
-        let mut local_stream = blob
-            .range_stream(offset..end, REMOTE_STREAM_CHUNK_BYTES)
-            .map_err(|error| generic_error(format!("journal range failed: {error:#}")))?;
-        let local_range = local_stream
-            .next()
-            .await
-            .transpose()
-            .map_err(|error| generic_error(format!("journal range read failed: {error:#}")))?
-            .unwrap_or_default();
-        if local_stream.next().await.is_some() || remote_range != local_range {
+        if remote_range.len() as u64 != end - offset {
             return Err(object_store::Error::AlreadyExists {
                 path: target.to_string(),
                 source: Box::new(RemoteContentDivergence),
             });
         }
+        while !remote_range.is_empty() {
+            if local.is_empty() {
+                // The verified stream fails instead of ending short, so a
+                // missing item here is local corruption, not remote divergence.
+                local = local_stream
+                    .next()
+                    .await
+                    .transpose()
+                    .map_err(|error| journal_blob_error("journal range read failed", error))?
+                    .ok_or_else(|| {
+                        journal_blob_error(
+                            "journal range read failed",
+                            JournalBlobIntegrityError::LengthMismatch.into(),
+                        )
+                    })?;
+            }
+            let count = local.len().min(remote_range.len());
+            if local.split_to(count) != remote_range.split_to(count) {
+                return Err(object_store::Error::AlreadyExists {
+                    path: target.to_string(),
+                    source: Box::new(RemoteContentDivergence),
+                });
+            }
+        }
         offset = end;
+    }
+    // Exhaust the verifier even for an empty payload, and propagate a final
+    // integrity error rather than treating any extra item as mere divergence.
+    if local_stream
+        .next()
+        .await
+        .transpose()
+        .map_err(|error| journal_blob_error("journal range read failed", error))?
+        .is_some()
+    {
+        return Err(object_store::Error::AlreadyExists {
+            path: target.to_string(),
+            source: Box::new(RemoteContentDivergence),
+        });
     }
     Ok(PutResult {
         e_tag: meta.e_tag,
@@ -1865,6 +1936,34 @@ fn generic_error(message: impl Into<String>) -> object_store::Error {
     }
 }
 
+#[derive(Debug)]
+struct JournalBlobFailure(anyhow::Error);
+
+impl std::fmt::Display for JournalBlobFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for JournalBlobFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+fn journal_blob_error(context: &'static str, error: anyhow::Error) -> object_store::Error {
+    let corrupt = error.is::<JournalBlobIntegrityError>();
+    let source = JournalBlobFailure(error.context(context));
+    object_store::Error::Generic {
+        store: "ZeroFSWritebackRemote",
+        source: if corrupt {
+            Box::new(crate::retrying_object_store::PermanentError::new(source))
+        } else {
+            Box::new(source)
+        },
+    }
+}
+
 fn precondition(path: &str, message: &'static str) -> object_store::Error {
     object_store::Error::Precondition {
         path: path.to_owned(),
@@ -1884,6 +1983,15 @@ fn missing_remote_predecessor(
         }),
     }
 }
+
+#[cfg(test)]
+mod capacity_tests;
+
+#[cfg(test)]
+mod cleanup_tests;
+
+#[cfg(test)]
+mod placement_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1985,6 +2093,107 @@ mod tests {
             2,
             "reconciliation performs one bounded HEAD and one bounded range GET"
         );
+    }
+
+    fn raw_journal(capacity: u64) -> Journal {
+        use zerofs_raw_device::{Identity, Role, journal_region::TransactionRegion};
+
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(capacity).unwrap();
+        let region = TransactionRegion::provision(
+            file,
+            capacity,
+            0,
+            capacity,
+            Identity {
+                pool_uuid: [9; 16],
+                member_uuid: [10; 16],
+                role: Role::Journal,
+            },
+        )
+        .unwrap();
+        Journal::open_raw(
+            region,
+            JournalIdentity {
+                format_version: 1,
+                bucket_id: "raw-bucket".to_owned(),
+                backend_endpoint: "raw-pool".to_owned(),
+                database_prefix: "db".to_owned(),
+                backend_kind: "raw".to_owned(),
+                encryption_key_identity_sha256: [0x77; 32],
+            },
+        )
+        .unwrap()
+    }
+
+    /// A raw P3 journal streams a payload in its own 60 KiB chunks, not in the
+    /// 16 MiB ranges reconciliation reads from the remote. Identical bytes must
+    /// reconcile whatever the chunking, across a remote range boundary too.
+    #[tokio::test]
+    async fn verify_existing_reconciles_a_raw_journal_payload_across_its_payload_chunks() {
+        // One byte past a raw payload chunk; a few chunks; and more than one
+        // 16 MiB remote range, ending off both chunk grids.
+        for len in [
+            60 * 1024 + 1,
+            200 << 10,
+            super::REMOTE_STREAM_CHUNK_BYTES + 60 * 1024 + 1,
+        ] {
+            let journal = Arc::new(raw_journal(128 << 20));
+            let target = Path::from("db/segments/64/0000000000000003/0000000000000b64");
+            let expected = Bytes::from((0..len).map(|n| (n % 251) as u8).collect::<Vec<_>>());
+            let record = put_record(1, target.as_ref(), &expected);
+            journal.commit_put(record.clone(), &expected).unwrap();
+            let remote = InMemory::new();
+            let created = remote
+                .put(&target, PutPayload::from(expected.clone()))
+                .await
+                .unwrap();
+
+            let reconciled = verify_existing(&remote, &journal, &record, &target)
+                .await
+                .unwrap_or_else(|error| panic!("{len} identical bytes must reconcile: {error}"));
+            assert_eq!(reconciled.e_tag, created.e_tag);
+        }
+    }
+
+    /// Reconciliation still fails closed on a raw journal: a remote object of
+    /// the same length that differs in any payload chunk is a permanent
+    /// divergence, and so is one of another length.
+    #[tokio::test]
+    async fn verify_existing_rejects_different_bytes_under_a_raw_journal() {
+        let len = super::REMOTE_STREAM_CHUNK_BYTES + 60 * 1024 + 1;
+        let journal = Arc::new(raw_journal(128 << 20));
+        let target = Path::from("db/segments/64/0000000000000003/0000000000000b64");
+        let expected = (0..len).map(|n| (n % 251) as u8).collect::<Vec<_>>();
+        let record = put_record(1, target.as_ref(), &expected);
+        journal.commit_put(record.clone(), &expected).unwrap();
+
+        let mut candidates = Vec::new();
+        // First byte, a byte inside a later payload chunk of the first remote
+        // range, the first byte of the second remote range, and the last byte.
+        for flipped in [0, 60 * 1024 + 7, super::REMOTE_STREAM_CHUNK_BYTES, len - 1] {
+            let mut different = expected.clone();
+            different[flipped] ^= 1;
+            candidates.push(different);
+        }
+        candidates.push(expected[..len - 1].to_vec());
+        candidates.push([expected.as_slice(), &[0]].concat());
+        for different in candidates {
+            let remote = InMemory::new();
+            remote
+                .put(&target, PutPayload::from(Bytes::from(different)))
+                .await
+                .unwrap();
+            let error = verify_existing(&remote, &journal, &record, &target)
+                .await
+                .expect_err("different remote bytes must never reconcile");
+            assert!(
+                matches!(&error, object_store::Error::AlreadyExists { source, .. }
+                    if source.is::<super::RemoteContentDivergence>()),
+                "{error}"
+            );
+            assert!(is_terminal_remote_error(&error));
+        }
     }
 
     #[tokio::test]
@@ -2515,6 +2724,43 @@ mod tests {
             )),
         };
         assert!(is_terminal_remote_error(&permanent));
+    }
+
+    #[test]
+    fn scheduler_classifier_rejects_typed_journal_corruption_but_retries_io_errors() {
+        use crate::writeback::journal::JournalBlobIntegrityError;
+
+        for source in [
+            JournalBlobIntegrityError::HashMismatch,
+            JournalBlobIntegrityError::LengthMismatch,
+            JournalBlobIntegrityError::ChangedWhileStreaming,
+        ] {
+            let message = source.to_string();
+            let error = super::journal_blob_error(
+                "journal blob read failed",
+                anyhow::Error::new(source).context("nested read context"),
+            );
+            assert!(is_terminal_remote_error(&error), "{error}");
+            assert!(error.to_string().contains(&message), "{error}");
+        }
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Interrupted,
+        ] {
+            let error = super::journal_blob_error(
+                "journal blob read failed",
+                std::io::Error::from(kind).into(),
+            );
+            assert!(!is_terminal_remote_error(&error), "{error}");
+        }
+        let error = super::journal_blob_error(
+            "journal blob read failed",
+            anyhow::anyhow!("committed blob hash mismatch"),
+        );
+        assert!(
+            !is_terminal_remote_error(&error),
+            "untyped message text must not determine the retry contract"
+        );
     }
 
     #[tokio::test]

@@ -5,7 +5,7 @@ use crate::fs::inode::Inode;
 use crate::fs::mutation::durability::DurabilityTarget;
 use crate::fs::mutation::overlay::IdentifiedWrite;
 use crate::fs::mutation::types::{RequestIdentity, RequestLifetime};
-use crate::fs::permissions::Credentials;
+use crate::fs::permissions::{AccessMode, Credentials, check_access_with_acl};
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{AuthContext, FileType, InodeWithId, SetAttributes, SetGid, SetUid};
 use async_trait::async_trait;
@@ -15,13 +15,14 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 use zerofs_nfsserve::nfs::{
-    FSF_CANSETTIME, FSF_HOMOGENEOUS, FSF_LINK, FSF_SYMLINK, fattr3, fileid3, filename3, fsinfo3,
-    fsstat3, ftype3, nfspath3, nfsstat3, nfstime3, post_op_attr, sattr3, specdata3, stable_how,
-    writeverf3,
+    ACCESS3_ALL, ACCESS3_DELETE, ACCESS3_EXECUTE, ACCESS3_EXTEND, ACCESS3_LOOKUP, ACCESS3_MODIFY,
+    ACCESS3_READ, FSF_CANSETTIME, FSF_HOMOGENEOUS, FSF_LINK, FSF_SYMLINK, fattr3, fileid3,
+    filename3, fsinfo3, fsstat3, ftype3, nfspath3, nfsstat3, nfstime3, post_op_attr, sattr3,
+    specdata3, stable_how, writeverf3,
 };
 use zerofs_nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use zerofs_nfsserve::vfs::{
-    AuthContext as NfsAuthContext, CommitRequestContext, CommitResult, NFSFileSystem,
+    AccessResult, AuthContext as NfsAuthContext, CommitRequestContext, CommitResult, NFSFileSystem,
     VFSCapabilities, WriteRequestContext, WriteResult,
 };
 
@@ -108,6 +109,7 @@ impl NFSAdapter {
                 gid_known: true,
                 gids: Vec::new(),
                 groups_complete: true,
+                groups_truncated: false,
             },
             None => auth.into(),
         }
@@ -117,7 +119,9 @@ impl NFSAdapter {
         let mut attr = SetAttributes::from(attr);
         if let Some(identity) = self.shared_identity {
             attr.uid = SetUid::Set(identity.uid);
-            attr.gid = SetGid::Set(identity.gid);
+            // The identity's group is in the credentials, so a setgid
+            // parent's group still wins.
+            attr.gid = SetGid::NoChange;
         }
         attr
     }
@@ -174,12 +178,20 @@ impl NFSAdapter {
 
 #[async_trait]
 impl NFSFileSystem for NFSAdapter {
+    fn case_insensitive(&self) -> bool {
+        self.fs.name_mode() == crate::fs::name_mode::NameMode::Insensitive
+    }
+
     fn root_dir(&self) -> fileid3 {
         0
     }
 
     fn capabilities(&self) -> VFSCapabilities {
-        VFSCapabilities::ReadWrite
+        if self.fs.db.is_read_only() {
+            VFSCapabilities::ReadOnly
+        } else {
+            VFSCapabilities::ReadWrite
+        }
     }
 
     async fn lookup(
@@ -205,6 +217,51 @@ impl NFSFileSystem for NFSAdapter {
         debug!("getattr called: id={}", id);
         let inode = self.fs.visible_inode(id).await?;
         Ok(InodeWithId { inode: &inode, id }.into())
+    }
+
+    async fn access(
+        &self,
+        auth: &NfsAuthContext,
+        id: fileid3,
+        requested: u32,
+    ) -> Result<AccessResult, nfsstat3> {
+        let auth = self.auth_context(auth);
+        let creds = Credentials::from_auth_context(&auth);
+        let (inode, acl) = if requested & ACCESS3_ALL != 0 {
+            self.fs.visible_inode_access_context(id, &creds).await?
+        } else {
+            (self.fs.visible_inode(id).await?, None)
+        };
+        let allows = |mode| check_access_with_acl(&inode, &creds, mode, acl.as_ref()).is_ok();
+        // NFS ACCESS reports each requested right independently. A directory
+        // mutation still needs one ACL entry granting both write and search.
+        let mut access = 0;
+        if requested & ACCESS3_READ != 0 && allows(AccessMode::Read) {
+            access |= ACCESS3_READ;
+        }
+        let execute = if inode.is_directory() {
+            ACCESS3_LOOKUP
+        } else {
+            ACCESS3_EXECUTE
+        };
+        if requested & execute != 0 && allows(AccessMode::Execute) {
+            access |= execute;
+        }
+        let (write, mode) = if inode.is_directory() {
+            (
+                ACCESS3_MODIFY | ACCESS3_EXTEND | ACCESS3_DELETE,
+                AccessMode::WriteExecute,
+            )
+        } else {
+            (ACCESS3_MODIFY | ACCESS3_EXTEND, AccessMode::Write)
+        };
+        if !self.fs.db.is_read_only() && requested & write != 0 && allows(mode) {
+            access |= requested & write;
+        }
+        Ok(AccessResult {
+            attributes: InodeWithId { inode: &inode, id }.into(),
+            access,
+        })
     }
 
     async fn read(
@@ -610,7 +667,11 @@ impl NFSFileSystem for NFSAdapter {
             }
         };
 
-        let (used_bytes, used_inodes) = self.fs.global_stats.get_totals();
+        let (used_bytes, used_inodes) = self
+            .fs
+            .global_stats
+            .known_totals()
+            .ok_or(nfsstat3::NFS3ERR_IO)?;
 
         // Fixed, signed-safe inode capacity (see fs::TOTAL_INODES): a u64::MAX-based
         // count renders negative under GNU `stat`/`df`. `available` = capacity - in-use.
@@ -637,6 +698,9 @@ impl NFSFileSystem for NFSAdapter {
         Ok(res)
     }
 }
+
+#[cfg(test)]
+mod access_tests;
 
 // Landed-but-not-wired entry point kept alongside the service-identity variant.
 #[allow(dead_code)]
@@ -822,6 +886,215 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((attrs.uid, attrs.gid), (501, 20));
+    }
+
+    #[tokio::test]
+    async fn shared_identity_creates_under_a_setgid_parent_take_the_parent_group() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let shared_adapter = NFSAdapter::new(Arc::clone(&fs))
+            .with_shared_identity(Some(NfsSharedIdentity { uid: 501, gid: 20 }));
+        let auth = NfsAuthContext {
+            uid: 1000,
+            gid: 1000,
+            gids: Vec::new(),
+        };
+        let root_auth = NfsAuthContext {
+            uid: 0,
+            gid: 0,
+            gids: Vec::new(),
+        };
+        let mut groups = Vec::new();
+        for (parent_name, parent_mode) in [(b"plain".as_slice(), 0o777), (b"sgid", 0o2777)] {
+            let (parent, _) = NFSAdapter::new(Arc::clone(&fs))
+                .mkdir(
+                    &root_auth,
+                    0,
+                    &filename(parent_name),
+                    &sattr3 {
+                        mode: set_mode3::mode(parent_mode),
+                        gid: set_gid3::gid(2000),
+                        ..sattr3::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let (_, file) = shared_adapter
+                .create(&auth, parent, &filename(b"file"), sattr3::default())
+                .await
+                .unwrap();
+            let (_, dir) = shared_adapter
+                .mkdir(&auth, parent, &filename(b"dir"), &sattr3::default())
+                .await
+                .unwrap();
+            let (_, link) = shared_adapter
+                .symlink(
+                    &auth,
+                    parent,
+                    &filename(b"link"),
+                    &nfspath3 {
+                        0: b"file".to_vec(),
+                    },
+                    &sattr3::default(),
+                )
+                .await
+                .unwrap();
+            let (_, fifo) = shared_adapter
+                .mknod(
+                    &auth,
+                    parent,
+                    &filename(b"fifo"),
+                    ftype3::NF3FIFO,
+                    &sattr3::default(),
+                    None,
+                )
+                .await
+                .unwrap();
+            groups.push([file.gid, dir.gid, link.gid, fifo.gid]);
+        }
+        assert_eq!(groups, [[20; 4], [2000; 4]]);
+    }
+
+    #[tokio::test]
+    async fn creates_reject_forged_ownership_and_preserve_authorized_groups() {
+        async fn create_kind(
+            adapter: &NFSAdapter,
+            auth: &NfsAuthContext,
+            parent: fileid3,
+            name: &filename3,
+            attr: sattr3,
+            kind: usize,
+        ) -> Result<(fileid3, fattr3), nfsstat3> {
+            match kind {
+                0 => adapter.create(auth, parent, name, attr).await,
+                1 => adapter.mkdir(auth, parent, name, &attr).await,
+                2 => {
+                    adapter
+                        .symlink(
+                            auth,
+                            parent,
+                            name,
+                            &nfspath3 {
+                                0: b"target".to_vec(),
+                            },
+                            &attr,
+                        )
+                        .await
+                }
+                3 => {
+                    adapter
+                        .mknod(auth, parent, name, ftype3::NF3FIFO, &attr, None)
+                        .await
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let adapter = NFSAdapter::new(Arc::clone(&fs));
+        let actor = NfsAuthContext {
+            uid: 1000,
+            gid: 1000,
+            gids: vec![3000],
+        };
+        let root = NfsAuthContext {
+            uid: 0,
+            gid: 0,
+            gids: vec![],
+        };
+        for kind in 0..4 {
+            for (index, attr) in [
+                sattr3 {
+                    uid: set_uid3::uid(0),
+                    ..sattr3::default()
+                },
+                sattr3 {
+                    gid: set_gid3::gid(0),
+                    ..sattr3::default()
+                },
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let name = filename(format!("forged-{kind}-{index}").as_bytes());
+                assert!(matches!(
+                    create_kind(&adapter, &actor, 0, &name, attr, kind).await,
+                    Err(nfsstat3::NFS3ERR_PERM)
+                ));
+                assert!(matches!(
+                    adapter.lookup(&actor, 0, &name).await,
+                    Err(nfsstat3::NFS3ERR_NOENT)
+                ));
+            }
+            for gid in [1000, 3000] {
+                let (_, attrs) = create_kind(
+                    &adapter,
+                    &actor,
+                    0,
+                    &filename(format!("allowed-{kind}-{gid}").as_bytes()),
+                    sattr3 {
+                        uid: set_uid3::uid(1000),
+                        gid: set_gid3::gid(gid),
+                        ..sattr3::default()
+                    },
+                    kind,
+                )
+                .await
+                .unwrap();
+                assert_eq!((attrs.uid, attrs.gid), (1000, gid));
+            }
+            let (_, attrs) = create_kind(
+                &adapter,
+                &root,
+                0,
+                &filename(format!("root-{kind}").as_bytes()),
+                sattr3 {
+                    uid: set_uid3::uid(1001),
+                    gid: set_gid3::gid(4000),
+                    ..sattr3::default()
+                },
+                kind,
+            )
+            .await
+            .unwrap();
+            assert_eq!((attrs.uid, attrs.gid), (1001, 4000));
+        }
+
+        let (parent, _) = adapter
+            .mkdir(
+                &root,
+                0,
+                &filename(b"foreign-setgid-parent"),
+                &sattr3 {
+                    mode: set_mode3::mode(0o2777),
+                    gid: set_gid3::gid(4000),
+                    ..sattr3::default()
+                },
+            )
+            .await
+            .unwrap();
+        for kind in 0..4 {
+            for explicit in [false, true] {
+                let attr = sattr3 {
+                    gid: if explicit {
+                        set_gid3::gid(4000)
+                    } else {
+                        set_gid3::Void
+                    },
+                    ..sattr3::default()
+                };
+                let (_, attrs) = create_kind(
+                    &adapter,
+                    &actor,
+                    parent,
+                    &filename(format!("inherited-{kind}-{explicit}").as_bytes()),
+                    attr,
+                    kind,
+                )
+                .await
+                .unwrap();
+                assert_eq!((attrs.uid, attrs.gid), (1000, 4000));
+            }
+        }
     }
 
     #[tokio::test]

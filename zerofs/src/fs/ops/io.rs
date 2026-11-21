@@ -9,7 +9,7 @@ use crate::dedup::DedupResult;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
 use crate::fs::mutation::types::{ConflictKey, ConflictScope};
-use crate::fs::permissions::{AccessMode, Credentials, check_access};
+use crate::fs::permissions::{AccessMode, Credentials, mode_after_content_change};
 use crate::fs::quota::QuotaSettlement;
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{AuthContext, FallocateMode, FileAttributes, InodeWithId};
@@ -55,7 +55,8 @@ impl ZeroFS {
 
         if let Some(auth) = auth {
             let creds = Credentials::from_auth_context(auth);
-            check_access(&inode, &creds, AccessMode::Read)?;
+            self.check_inode_access(id, &inode, &creds, AccessMode::Read)
+                .await?;
         }
 
         match &inode {
@@ -112,16 +113,17 @@ impl ZeroFS {
             id, offset, length
         );
 
-        let _fence = self
+        let fence = self
             .fence_metadata(ConflictScope::single(ConflictKey::Inode(id)))
             .await?;
-        let _guard = self.lock_manager.acquire(id).await;
+        let guard = self.lock_manager.acquire(id).await;
         let inode = self.inode_store.get(id).await?;
         let creds = Credentials::from_auth_context(auth);
 
         match &inode {
             Inode::File(file) if creds.uid != file.uid => {
-                check_access(&inode, &creds, AccessMode::Write)?;
+                self.check_inode_access(id, &inode, &creds, AccessMode::Write)
+                    .await?;
             }
             Inode::File(_) => {}
             _ => return Err(FsError::IsDirectory),
@@ -137,9 +139,12 @@ impl ZeroFS {
         self.extent_store
             .zero_range(&mut txn, id, offset, length, file_size)
             .await?;
-        self.write_coordinator.commit(txn).await.inspect_err(|e| {
-            error!("Failed to commit trim batch: {}", e);
-        })?;
+        self.write_coordinator
+            .commit_holding(txn, (fence, guard))
+            .await
+            .inspect_err(|e| {
+                error!("Failed to commit trim batch: {}", e);
+            })?;
 
         self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
         self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
@@ -208,10 +213,10 @@ impl ZeroFS {
         }
         let end = offset.checked_add(length).ok_or(FsError::InvalidArgument)?;
 
-        let _fence = self
+        let fence = self
             .fence_metadata(ConflictScope::single(ConflictKey::Inode(id)))
             .await?;
-        let _guard = self.lock_manager.acquire(id).await;
+        let guard = self.lock_manager.acquire(id).await;
         // Direct filesystem callers do not pass through the 9P single-flight.
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_fallocate)? {
             return Ok(result);
@@ -262,11 +267,7 @@ impl ZeroFS {
             file.ctime = now_sec;
             file.ctime_nsec = now_nsec;
 
-            // Match the write path: a non-owner changing file state must not
-            // leave a privileged executable carrying stale SUID/SGID bits.
-            if creds.uid != file.uid && creds.uid != 0 {
-                file.mode &= !0o6000;
-            }
+            file.mode = mode_after_content_change(file.mode, &creds);
         }
 
         self.inode_store.save(&mut txn, id, &inode)?;
@@ -288,7 +289,11 @@ impl ZeroFS {
         );
 
         self.write_coordinator
-            .commit_with_quota(txn, growth_reservation.map(QuotaSettlement::Growth))
+            .commit_with_quota(
+                txn,
+                growth_reservation.map(QuotaSettlement::Growth),
+                (fence, guard),
+            )
             .await
             .inspect_err(|e| {
                 error!("Failed to commit fallocate batch: {}", e);
@@ -998,6 +1003,7 @@ mod tests {
             gid_known: true,
             gids: Vec::new(),
             groups_complete: true,
+            groups_truncated: false,
         };
         let attrs = fs
             .fallocate_opened(&non_owner, file_id, 0, 1, FallocateMode::PunchHole)

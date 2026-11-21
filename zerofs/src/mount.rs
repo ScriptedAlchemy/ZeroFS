@@ -20,12 +20,15 @@ use fuser::{
     ReplyLseek, ReplyOpen, ReplyPoll, ReplyStatfs, ReplyWrite, ReplyXattr, Request, Session,
     SessionACL, TimeOrNow,
 };
-use ninep_client::{ClientError, NinePClient, ReaddirState, SetattrBuilder, SetattrTime, Target};
+use ninep_client::{
+    ClientError, NinePClient, ReaddirState, ReconnectTimeout, SetattrBuilder, SetattrTime, Target,
+};
+use ninep_proto::{
+    CREATE_UMASK_MASK, CREATE_UMASK_SHIFT, GETATTR_ALL, LockStatus, LockType, P9_LOCK_FLAGS_BLOCK,
+    P9_MAX_GROUPS, Stat, classify_fallocate_mode,
+};
 #[cfg(test)]
 use ninep_proto::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE};
-use ninep_proto::{
-    GETATTR_ALL, LockStatus, LockType, P9_LOCK_FLAGS_BLOCK, Stat, classify_fallocate_mode,
-};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -145,6 +148,10 @@ pub struct MountOptions {
     /// Server-side directory the mount is rooted at (9P attach aname). Empty
     /// (or "/") mounts the whole filesystem.
     pub aname: String,
+    /// How long a FUSE request waits for a lost 9P server before the kernel
+    /// gets `EIO`. The kernel releases the calling process, including one
+    /// sent SIGKILL, only when this daemon answers the request.
+    pub reconnect_timeout: ReconnectTimeout,
 }
 
 /// Who may access the mount.
@@ -162,15 +169,106 @@ pub enum MountAccess {
 struct UserIdentity {
     uid: u32,
     gid: u32,
+    groups: Option<SupplementaryGroups>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct SupplementaryGroups {
+    ids: [u32; P9_MAX_GROUPS],
+    len: usize,
 }
 
 impl UserIdentity {
     fn from_request(req: &Request) -> Self {
+        let uid = req.uid();
+        let gid = req.gid();
         Self {
-            uid: req.uid(),
-            gid: req.gid(),
+            uid,
+            gid,
+            groups: supplementary_groups(req.pid(), uid, gid),
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn supplementary_groups(tid: u32, uid: u32, gid: u32) -> Option<SupplementaryGroups> {
+    use std::sync::OnceLock;
+    static OVERFLOW_GID: OnceLock<Option<u32>> = OnceLock::new();
+
+    if tid == 0 || uid == 0 {
+        return None;
+    }
+    let overflow_gid = (*OVERFLOW_GID.get_or_init(|| {
+        let status = std::fs::read_to_string("/proc/thread-self/status").ok()?;
+        let ns_pid = status_field(&status, "NSpid:")?
+            .trim()
+            .parse::<u32>()
+            .ok()?;
+        // A single namespace-relative ID confirms that /proc and FUSE use
+        // the mount process's PID namespace. An ancestor procfs can alias TIDs.
+        if ns_pid != unsafe { libc::gettid() } as u32 {
+            return None;
+        }
+        std::fs::read_to_string("/proc/sys/kernel/overflowgid")
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }))?;
+
+    // The kernel keeps a synchronous request's thread waiting once it delivers
+    // the request to userspace. Read its filesystem credentials before replying.
+    // Use the thread ID, since different threads can have different credentials.
+    let status = std::fs::read_to_string(format!("/proc/{tid}/status")).ok()?;
+    parse_supplementary_groups(&status, uid, gid, overflow_gid)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn status_field<'a>(status: &'a str, field: &str) -> Option<&'a str> {
+    status.lines().find_map(|line| line.strip_prefix(field))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_supplementary_groups(
+    status: &str,
+    uid: u32,
+    gid: u32,
+    overflow_gid: u32,
+) -> Option<SupplementaryGroups> {
+    let filesystem_id = |field| {
+        status_field(status, field)?
+            .split_ascii_whitespace()
+            .nth(3)?
+            .parse()
+            .ok()
+    };
+    if filesystem_id("Uid:") != Some(uid) || filesystem_id("Gid:") != Some(gid) {
+        return None;
+    }
+
+    let mut groups = SupplementaryGroups {
+        ids: [0; P9_MAX_GROUPS],
+        len: 0,
+    };
+    for group in status_field(status, "Groups:")?.split_ascii_whitespace() {
+        let group = group.parse::<u32>().ok()?;
+        // procfs substitutes this ID for unmapped groups. The group list is
+        // incomplete if any membership cannot be represented unambiguously.
+        if group == overflow_gid {
+            return None;
+        }
+        if group != gid && !groups.ids[..groups.len].contains(&group) {
+            *groups.ids.get_mut(groups.len)? = group;
+            groups.len += 1;
+        }
+    }
+    groups.ids[..groups.len].sort_unstable();
+    Some(groups)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn supplementary_groups(_tid: u32, _uid: u32, _gid: u32) -> Option<SupplementaryGroups> {
+    None
 }
 
 #[derive(Default)]
@@ -180,8 +278,8 @@ struct InodeEntry {
     /// Open prefetches remain usable only while this value is unchanged.
     content_generation: u64,
     /// One fid per filesystem identity that holds this inode. Every request acts
-    /// as its caller (v9fs `access=user` semantics), so a uid using a different
-    /// primary gid gets a distinct server-side fid.
+    /// as its caller (v9fs `access=user` semantics), so distinct filesystem
+    /// credentials get distinct server-side fids.
     fids: HashMap<UserIdentity, u32>,
     /// Open fids for this inode, mapped to the uid that opened them. Verified
     /// fsync checks every handle because `fsync(fd)` persists writes issued
@@ -225,6 +323,7 @@ struct Fuse9P {
     prefetch: Arc<DashMap<u64, OpenPrefetch>>,
     /// Attribute/entry cache lifetime returned to the kernel.
     ttl: Duration,
+    negative_ttl: Duration,
     /// When true, request the FUSE writeback cache so the kernel buffers writes
     /// and flushes them asynchronously (instead of synchronous write-through).
     writeback: bool,
@@ -261,6 +360,10 @@ fn name_too_long(name: &OsStr) -> bool {
 
 fn clamp_nsec(nsec: u64) -> u32 {
     nsec.min(999_999_999) as u32
+}
+
+fn create_mode(mode: u32, file_type: u32, umask: u32) -> u32 {
+    (mode & 0o7777) | file_type | ((umask & CREATE_UMASK_MASK) << CREATE_UMASK_SHIFT)
 }
 
 fn kind_from_mode(mode: u32) -> FileType {
@@ -389,12 +492,26 @@ async fn user_fid(
         // is stale.
         None => return Err(ClientError::Errno(libc::ESTALE as u32)),
     };
-    // FUSE exposes only the request's primary gid, not supplementary groups.
     let newfid = client.alloc_fid();
-    if let Err(e) = client
-        .rebind_with_primary_group(newfid, server_inode, identity.uid, identity.gid)
-        .await
-    {
+    let rebound = match identity.groups {
+        Some(groups) => {
+            client
+                .rebind_with_credentials(
+                    newfid,
+                    server_inode,
+                    identity.uid,
+                    identity.gid,
+                    &groups.ids[..groups.len],
+                )
+                .await
+        }
+        None => {
+            client
+                .rebind_with_primary_group(newfid, server_inode, identity.uid, identity.gid)
+                .await
+        }
+    };
+    if let Err(e) = rebound {
         client.free_fid(newfid);
         return Err(e);
     }
@@ -485,6 +602,35 @@ fn tracked_handle_fid(
         .map(|owner_uid| (fid, owner_uid))
 }
 
+/// Stop tracking an open handle on its inode (on release), so a later fsync
+/// does not present a fid the client may have freed and recycled. The inode
+/// keeps what the handle still owes: `fsync(fd)` answers for writes made
+/// through a descriptor that is already closed. Both happen under the entry
+/// lock, so `forget` cannot run between them and leave the debt behind.
+fn untrack_handle(client: &NinePClient, inodes: &DashMap<u64, InodeEntry>, ino: u64, fid: u32) {
+    if let Some(mut e) = inodes.get_mut(&ino) {
+        e.handles.remove(&fid);
+        client.keep_closed_unsynced(fid, ino);
+    }
+}
+
+/// The fids a verified fsync of `ino` presents, `primary` first. Mutations
+/// for one inode may use its per-user fid or any open handle.
+fn inode_fsync_fids(inodes: &DashMap<u64, InodeEntry>, ino: u64, primary: u32) -> Vec<u32> {
+    let mut fids = vec![primary];
+    if let Some(entry) = inodes.get(&ino) {
+        fids.extend(
+            entry
+                .fids
+                .values()
+                .chain(entry.handles.keys())
+                .copied()
+                .filter(|&fid| fid != primary),
+        );
+    }
+    fids
+}
+
 /// Return an open handle only when it belongs to the current request uid.
 /// File descriptors can be passed between users, while 9P fids retain the
 /// uid that opened them. A primary-gid change does not revoke an open
@@ -510,7 +656,7 @@ async fn resolve_child(
     name: &[u8],
 ) -> Result<(FileAttr, Option<u32>), ClientError> {
     let nf = client.alloc_fid();
-    let stat = match client.walk_getattr(parent_fid, nf, &[name]).await {
+    let stat = match client.walk_getattr_exact(parent_fid, nf, &[name]).await {
         Ok((_qids, stat)) => stat,
         Err(e) => {
             client.free_fid(nf);
@@ -553,6 +699,16 @@ impl Filesystem for Fuse9P {
         // Ask the kernel to forward fcntl byte-range locks to us; without this
         // capability it handles POSIX locks locally and never calls getlk/setlk.
         let _ = config.add_capabilities(InitFlags::FUSE_POSIX_LOCKS);
+
+        // Have the kernel evaluate the server's POSIX ACLs in its permission
+        // checks. Without this, `default_permissions` checks mode bits only,
+        // so a named-user or named-group ACL grant would be denied locally.
+        // The server applies either the default ACL or the umask, under the
+        // parent lock. Request the original mode so both inputs reach it.
+        let _ = config.add_capabilities(InitFlags::FUSE_DONT_MASK);
+        if let Err(unsupported) = config.add_capabilities(InitFlags::FUSE_POSIX_ACL) {
+            debug!("kernel does not support FUSE_POSIX_ACL ({unsupported:?}); mode bits only");
+        }
 
         // PARALLEL_DIROPS adds no staleness, so it is always on; it
         // only removes a client-side bottleneck.
@@ -606,6 +762,7 @@ impl Filesystem for Fuse9P {
         let client = Arc::clone(&self.client);
         let inodes = Arc::clone(&self.inodes);
         let ttl = self.ttl;
+        let negative_ttl = self.negative_ttl;
         let identity = UserIdentity::from_request(req);
         let name = name.as_bytes().to_vec();
         let parent = parent.0;
@@ -628,9 +785,9 @@ impl Filesystem for Fuse9P {
                         client.free_fid(fid);
                     }
                 }
-                // Cache misses only in relaxed mode.
-                Err(e) if !ttl.is_zero() && e.to_errno() == libc::ENOENT => {
-                    reply.entry(&ttl, &negative_attr(), Generation(0));
+                // Cache a negative entry only when the negotiated name mode permits it.
+                Err(e) if !negative_ttl.is_zero() && e.to_errno() == libc::ENOENT => {
+                    reply.entry(&negative_ttl, &negative_attr(), Generation(0));
                 }
                 Err(e) => {
                     reply.error(errno(&e));
@@ -652,7 +809,17 @@ impl Filesystem for Fuse9P {
         // Live handles are normally cleared by release/releasedir before the final
         // forget, so `handles` is empty here; clunking it anyway is leak-hygiene if a
         // handle outlived its release.
-        if let Some((_, entry)) = self.inodes.remove_if(&ino, |_, e| e.lookup == 0) {
+        let forgotten = self.inodes.remove_if(&ino, |_, e| {
+            let gone = e.lookup == 0;
+            if gone {
+                // No descriptor can fsync this inode again. Dropping what its
+                // closed handles owed under the entry lock keeps a release
+                // from adding to it afterwards.
+                self.client.forget_closed_unsynced(ino);
+            }
+            gone
+        });
+        if let Some((_, entry)) = forgotten {
             // Drop prefetches before this inode number can be registered again
             // at generation zero.
             for fid in entry.handles.keys() {
@@ -799,7 +966,7 @@ impl Filesystem for Fuse9P {
         let gid = identity.gid;
         let name = name.as_bytes().to_vec();
         let parent = parent.0;
-        let mode = (mode & 0o7777 & !umask) | libc::S_IFDIR;
+        let mode = create_mode(mode, libc::S_IFDIR, umask);
         self.rt.spawn(async move {
             let parent_fid = match user_fid(&client, &inodes, identity, parent).await {
                 Ok(f) => f,
@@ -840,7 +1007,7 @@ impl Filesystem for Fuse9P {
         let gid = identity.gid;
         let name = name.as_bytes().to_vec();
         let parent = parent.0;
-        let mode = (mode & 0o7777 & !umask) | (mode & libc::S_IFMT);
+        let mode = create_mode(mode, mode & libc::S_IFMT, umask);
         // FUSE delivers rdev pre-encoded with the kernel's new_encode_dev(); split
         // it into major/minor with new_decode_dev() (matching what v9fs sends as
         // MAJOR()/MINOR()). The previous (rdev >> 8 / rdev & 0xff) split only
@@ -1335,7 +1502,7 @@ impl Filesystem for Fuse9P {
         let gid = identity.gid;
         let name = name.as_bytes().to_vec();
         let parent = parent.0;
-        let mode = (mode & 0o7777 & !umask) | libc::S_IFREG;
+        let mode = create_mode(mode, libc::S_IFREG, umask);
         // Strip O_APPEND (append is kernel-managed via the write offset; see
         // open_inner) and, as there, upgrade O_WRONLY to O_RDWR under writeback
         // so read-modify-write can read through the backing fid.
@@ -1584,34 +1751,91 @@ impl Filesystem for Fuse9P {
     #[allow(clippy::too_many_arguments)]
     fn setxattr(
         &self,
-        _req: &Request,
-        _ino: INodeNo,
-        _name: &OsStr,
-        _value: &[u8],
-        _flags: i32,
-        _position: u32,
+        req: &Request,
+        ino: INodeNo,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        position: u32,
         reply: ReplyEmpty,
     ) {
-        reply.error(Errno::ENOSYS);
+        if position != 0 {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+        let client = Arc::clone(&self.client);
+        let inodes = Arc::clone(&self.inodes);
+        let identity = UserIdentity::from_request(req);
+        let name = name.as_bytes().to_vec();
+        let value = value.to_vec();
+        self.rt.spawn(async move {
+            let result = async {
+                let fid = user_fid(&client, &inodes, identity, ino.0).await?;
+                client.set_xattr(fid, &name, &value, flags as u32).await
+            }
+            .await;
+            match result {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
     }
 
-    fn getxattr(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        _name: &OsStr,
-        _size: u32,
-        reply: ReplyXattr,
-    ) {
-        reply.error(Errno::ENOSYS);
+    fn getxattr(&self, req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        let client = Arc::clone(&self.client);
+        let inodes = Arc::clone(&self.inodes);
+        let identity = UserIdentity::from_request(req);
+        let name = name.as_bytes().to_vec();
+        self.rt.spawn(async move {
+            let result = async {
+                let fid = user_fid(&client, &inodes, identity, ino.0).await?;
+                client.get_xattr(fid, &name).await
+            }
+            .await;
+            match result {
+                Ok(value) if size == 0 => reply.size(value.len() as u32),
+                Ok(value) if value.len() > size as usize => reply.error(Errno::ERANGE),
+                Ok(value) => reply.data(&value),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
     }
 
-    fn listxattr(&self, _req: &Request, _ino: INodeNo, _size: u32, reply: ReplyXattr) {
-        reply.error(Errno::ENOSYS);
+    fn listxattr(&self, req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        let client = Arc::clone(&self.client);
+        let inodes = Arc::clone(&self.inodes);
+        let identity = UserIdentity::from_request(req);
+        self.rt.spawn(async move {
+            let result = async {
+                let fid = user_fid(&client, &inodes, identity, ino.0).await?;
+                client.list_xattrs(fid).await
+            }
+            .await;
+            match result {
+                Ok(value) if size == 0 => reply.size(value.len() as u32),
+                Ok(value) if value.len() > size as usize => reply.error(Errno::ERANGE),
+                Ok(value) => reply.data(&value),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
     }
 
-    fn removexattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
-        reply.error(Errno::ENOSYS);
+    fn removexattr(&self, req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let client = Arc::clone(&self.client);
+        let inodes = Arc::clone(&self.inodes);
+        let identity = UserIdentity::from_request(req);
+        let name = name.as_bytes().to_vec();
+        self.rt.spawn(async move {
+            let result = async {
+                let fid = user_fid(&client, &inodes, identity, ino.0).await?;
+                client.remove_xattr(fid, &name).await
+            }
+            .await;
+            match result {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
     }
 
     fn bmap(&self, _req: &Request, _ino: INodeNo, _blocksize: u32, _idx: u64, reply: ReplyBmap) {
@@ -1823,12 +2047,8 @@ impl Fuse9P {
         });
     }
 
-    /// Stop tracking an open handle on its inode (on release), so a later fsync
-    /// does not present a fid the client may have freed and recycled.
     fn drop_handle(&self, ino: u64, fh: FileHandle) {
-        if let Some(mut e) = self.inodes.get_mut(&ino) {
-            e.handles.remove(&(fh.0 as u32));
-        }
+        untrack_handle(&self.client, &self.inodes, ino, fh.0 as u32);
     }
 
     fn release_inner(&self, fh: FileHandle, reply: ReplyEmpty) {
@@ -1848,19 +2068,11 @@ impl Fuse9P {
         let inodes = Arc::clone(&self.inodes);
         let primary = fh.0 as u32;
         self.rt.spawn(async move {
-            // Mutations for one inode may use its per-user fid or any open handle.
-            let mut fids = vec![primary];
-            if let Some(entry) = inodes.get(&ino) {
-                fids.extend(
-                    entry
-                        .fids
-                        .values()
-                        .chain(entry.handles.keys())
-                        .copied()
-                        .filter(|&fid| fid != primary),
-                );
-            }
-            match client.fsync_inode(&fids, primary, datasync as u32).await {
+            let fids = inode_fsync_fids(&inodes, ino, primary);
+            match client
+                .fsync_inode(ino, &fids, primary, datasync as u32)
+                .await
+            {
                 Ok(()) => reply.ok(),
                 Err(e) => reply.error(errno(&e)),
             }
@@ -1899,10 +2111,14 @@ impl Fuse9P {
     }
 }
 
-async fn connect(target: &str, msize: u32) -> Result<Arc<NinePClient>> {
+async fn connect(
+    target: &str,
+    msize: u32,
+    reconnect_timeout: ReconnectTimeout,
+) -> Result<Arc<NinePClient>> {
     // A comma-separated list is an HA node set (dials the leader, re-routes on failover).
     let targets = Target::parse_list(target).map_err(anyhow::Error::msg)?;
-    NinePClient::connect_multi(targets, msize)
+    NinePClient::connect_multi_with(targets, msize, reconnect_timeout)
         .await
         .with_context(|| format!("connecting to 9P server(s) {target}"))
 }
@@ -1932,7 +2148,7 @@ pub async fn run(target: String, mountpoint: PathBuf, opts: MountOptions) -> Res
         .with_writer(std::io::stderr)
         .try_init();
 
-    let client = connect(&target, opts.msize).await?;
+    let client = connect(&target, opts.msize, opts.reconnect_timeout).await?;
     let msize = client.msize();
 
     // Every request binds its own per-user fid by inode id; without --aname
@@ -1969,6 +2185,11 @@ pub async fn run(target: String, mountpoint: PathBuf, opts: MountOptions) -> Res
     // also forces write-through (the writeback cache delays write visibility) and
     // a zero attribute-cache TTL (every lookup/getattr revalidates).
     let strict = !opts.relaxed_consistency;
+    let negative_ttl = if strict || client.case_insensitive() {
+        Duration::ZERO
+    } else {
+        ATTR_TTL
+    };
     let fs = Fuse9P {
         client,
         rt: Handle::current(),
@@ -1979,6 +2200,7 @@ pub async fn run(target: String, mountpoint: PathBuf, opts: MountOptions) -> Res
         dir_reads_plus: Arc::new(DashMap::new()),
         prefetch: Arc::new(DashMap::new()),
         ttl: if strict { Duration::ZERO } else { ATTR_TTL },
+        negative_ttl,
         writeback: opts.writeback && !strict,
         strict,
     };
@@ -2118,6 +2340,27 @@ mod consistency_tests {
     }
 
     #[test]
+    fn proc_groups_require_matching_filesystem_ids_and_a_complete_list() {
+        let status =
+            "Uid:\t2100 2100 2100 1000\nGid:\t2200 2200 2200 2000\nGroups:\t4000 2000 3000 3000\n";
+        let groups = parse_supplementary_groups(status, 1000, 2000, 65534).unwrap();
+        assert_eq!(&groups.ids[..groups.len], &[3000, 4000]);
+        assert!(parse_supplementary_groups(status, 2100, 2000, 65534).is_none());
+        assert!(parse_supplementary_groups(status, 1000, 2200, 65534).is_none());
+        assert!(parse_supplementary_groups(status, 1000, 2000, 3000).is_none());
+        assert!(parse_supplementary_groups(status, 1000, 2000, 2000).is_none());
+
+        let ids = status.split_once("Groups:").unwrap().0;
+        assert!(parse_supplementary_groups(ids, 1000, 2000, 65534).is_none());
+        let group_list = (3000..=3000 + P9_MAX_GROUPS)
+            .map(|gid| gid.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let too_many = format!("{ids}Groups:\t{group_list}");
+        assert!(parse_supplementary_groups(&too_many, 1000, 2000, 65534).is_none());
+    }
+
+    #[test]
     fn open_flags_precedence() {
         // Default: let the kernel cache normally.
         assert_eq!(handle_open_flags(false, false), FopenFlags::empty());
@@ -2199,6 +2442,7 @@ mod consistency_tests {
         let owner = UserIdentity {
             uid: 1000,
             gid: 2000,
+            groups: None,
         };
         entry.handles.insert(42, owner.uid);
         inodes.insert(7, entry);
@@ -2216,6 +2460,7 @@ mod consistency_tests {
                 UserIdentity {
                     uid: 1000,
                     gid: 2001,
+                    groups: None,
                 },
                 handle
             ),
@@ -2228,6 +2473,7 @@ mod consistency_tests {
                 UserIdentity {
                     uid: 1001,
                     gid: 2000,
+                    groups: None,
                 },
                 handle
             ),
@@ -2272,14 +2518,17 @@ mod consistency_tests {
         let first = UserIdentity {
             uid: 1000,
             gid: 2000,
+            groups: None,
         };
         let other_gid = UserIdentity {
             uid: 1000,
             gid: 2001,
+            groups: None,
         };
         let other_uid = UserIdentity {
             uid: 1001,
             gid: 2000,
+            groups: None,
         };
         assert_eq!(register_entry(&inodes, first, Some(10), &stat).1, None);
         assert_eq!(register_entry(&inodes, first, Some(11), &stat).1, Some(11));
@@ -3651,6 +3900,7 @@ mod client_tests {
             gid_known: true,
             gids: Vec::new(),
             groups_complete: true,
+            groups_truncated: false,
         };
         let root_creds = Credentials::from_auth_context(&root_auth);
 
@@ -3825,6 +4075,132 @@ mod client_tests {
         let rf2 = c2.alloc_fid();
         let q = c2.rebind(rf2, vol_qid.path, 0).await.unwrap();
         assert_eq!(q.path, vol_qid.path);
+
+        shutdown.cancel();
+    }
+
+    /// A filesystem holding an empty `/f`, served under durability lineage
+    /// `lineage`, and the file's inode id.
+    async fn file_on_lineage(lineage: u64) -> (Arc<ZeroFS>, u64) {
+        let mut fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.lineage_token = lineage;
+        let fs = Arc::new(fs);
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("create.9p.sock");
+        let shutdown = start_server(Arc::clone(&fs), sock.clone());
+        let client = connect_with_retry(&sock).await;
+        client
+            .attach(ROOT_FID_TEST, NOFID, "root", "", 0)
+            .await
+            .unwrap();
+        let fid = client.alloc_fid();
+        client.walk(ROOT_FID_TEST, fid, &[]).await.unwrap();
+        let (qid, _) = client
+            .lcreate(
+                fid,
+                b"f",
+                (libc::O_RDWR | libc::O_CREAT) as u32,
+                libc::S_IFREG | 0o644,
+                0,
+            )
+            .await
+            .unwrap();
+        client.clunk(fid).await.unwrap();
+        shutdown.cancel();
+        (fs, qid.path)
+    }
+
+    /// `fsync(fd)` answers for every write to the file, including one made
+    /// through a descriptor that has since been closed. Samba and unfsd open
+    /// and close handles constantly, so the write and the fsync often arrive
+    /// on different ones.
+    #[tokio::test]
+    async fn fsync_reports_a_write_lost_after_its_handle_was_released() {
+        use super::{InodeEntry, UserIdentity, ino_of, inode_fsync_fids, untrack_handle};
+        use dashmap::DashMap;
+
+        // One server before and after it lost its unflushed writes: the file
+        // is there, the bytes are not, and the lineage has moved on.
+        let (before, inode) = file_on_lineage(41).await;
+        let (after, inode_after) = file_on_lineage(42).await;
+        assert_eq!(inode, inode_after);
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("release.9p.sock");
+        let shutdown = start_server(before, sock.clone());
+        let client = connect_with_retry(&sock).await;
+        client
+            .attach(ROOT_FID_TEST, NOFID, "root", "", 0)
+            .await
+            .unwrap();
+
+        // What the mount holds for a file open twice.
+        let identity = UserIdentity {
+            uid: 0,
+            gid: 0,
+            groups: None,
+        };
+        let ino = ino_of(inode);
+        let inode_fid = client.alloc_fid();
+        client
+            .walk(ROOT_FID_TEST, inode_fid, &[b"f"])
+            .await
+            .unwrap();
+        let inodes = DashMap::new();
+        let mut entry = InodeEntry {
+            lookup: 1,
+            ..InodeEntry::default()
+        };
+        entry.fids.insert(identity, inode_fid);
+        inodes.insert(ino, entry);
+        let mut open = Vec::new();
+        for _ in 0..2 {
+            let fid = client.alloc_fid();
+            client
+                .open_clone(inode_fid, fid, libc::O_RDWR as u32, None)
+                .await
+                .unwrap();
+            inodes
+                .get_mut(&ino)
+                .unwrap()
+                .handles
+                .insert(fid, identity.uid);
+            open.push(fid);
+        }
+        let (written, kept) = (open[0], open[1]);
+
+        // write(fd1), close(fd1): `release` untracks the handle, clunks it
+        // and returns its number.
+        assert_eq!(client.write(written, 0, b"lost").await.unwrap(), 4);
+        untrack_handle(&client, &inodes, ino, written);
+        client.clunk(written).await.unwrap();
+        client.free_fid(written);
+
+        shutdown.cancel();
+        for _ in 0..200 {
+            if UnixStream::connect(&sock).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let _ = std::fs::remove_file(&sock);
+        let shutdown = start_server(after, sock.clone());
+
+        // fsync(fd2).
+        let fids = inode_fsync_fids(&inodes, ino, kept);
+        let fsync = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.fsync_inode(ino, &fids, kept, 0),
+        )
+        .await
+        .expect("fsync timed out waiting for the reconnect");
+        match fsync {
+            Err(ClientError::Errno(e)) => assert_eq!(e, libc::ESTALE as u32),
+            other => panic!(
+                "fsync must report the write the server lost after its handle closed, got {other:?}"
+            ),
+        }
+        assert_eq!(client.read(kept, 0, 16).await.unwrap(), b"");
 
         shutdown.cancel();
     }

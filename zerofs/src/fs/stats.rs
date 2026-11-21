@@ -2,8 +2,8 @@ use super::STATS_SHARDS;
 use super::inode::InodeId;
 use super::key_codec::KeyCodec;
 use bytes::Bytes;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct StatsShardData {
@@ -14,16 +14,24 @@ pub struct StatsShardData {
 pub struct StatsShard {
     used_bytes: AtomicU64,
     used_inodes: AtomicU64,
+    // Keep an unreadable persisted value intact. Applying a delta to the
+    // zero fallback cannot reconstruct the original counters, and writing
+    // that partial sum would falsely make totals known after a restart.
+    unreadable_record: OnceLock<Bytes>,
 }
 
 pub struct FileSystemGlobalStats {
     shards: Vec<StatsShard>,
     key_codec: Arc<KeyCodec>,
+    /// Set when a persisted shard could not be decoded at boot. That shard
+    /// starts from zero, so the totals are unknown for this process's life.
+    unreadable_shard: AtomicBool,
 }
 
-/// Absolute shard values staged by the commit worker for one batch. The
-/// encoded value goes into the batch itself; once the batch is in the
-/// memtable, `publish` makes the same values the visible in-memory counters.
+/// Absolute shard values staged by the commit worker for one batch. Healthy
+/// shards persist the encoded counters; unreadable shards retain their damaged
+/// record so a partial runtime sum cannot become authoritative on restart.
+/// Once the batch is in the memtable, `publish` updates the runtime counters.
 pub(crate) struct StagedShard {
     shard_id: usize,
     pub(crate) key: Bytes,
@@ -49,9 +57,19 @@ impl FileSystemGlobalStats {
             .map(|_| StatsShard {
                 used_bytes: AtomicU64::new(0),
                 used_inodes: AtomicU64::new(0),
+                unreadable_record: OnceLock::new(),
             })
             .collect();
-        Self { shards, key_codec }
+        Self {
+            shards,
+            key_codec,
+            unreadable_shard: AtomicBool::new(false),
+        }
+    }
+
+    /// The totals, or `None` when a persisted shard could not be read at boot.
+    pub fn known_totals(&self) -> Option<(u64, u64)> {
+        (!self.unreadable_shard.load(Ordering::Relaxed)).then(|| self.get_totals())
     }
 
     pub fn get_totals(&self) -> (u64, u64) {
@@ -68,7 +86,8 @@ impl FileSystemGlobalStats {
         inode_id as usize % STATS_SHARDS
     }
 
-    /// Compute the absolute shard value after applying an aggregated delta.
+    /// Compute the absolute runtime shard value after an aggregated delta.
+    /// An unreadable persisted record is preserved until explicitly repaired.
     /// Only the commit worker may call this and [`publish`]: being the single
     /// writer of the shard counters is what makes the lock-free
     /// read-modify-write sound.
@@ -89,15 +108,17 @@ impl FileSystemGlobalStats {
         StagedShard {
             shard_id,
             key: self.key_codec.stats_shard_key(shard_id),
-            value: Bytes::from(
-                bincode::serialize(&data).expect("StatsShardData serialization cannot fail"),
-            ),
+            value: shard.unreadable_record.get().cloned().unwrap_or_else(|| {
+                Bytes::from(
+                    bincode::serialize(&data).expect("StatsShardData serialization cannot fail"),
+                )
+            }),
             data,
         }
     }
 
-    /// Make staged values the visible in-memory counters, after the batch
-    /// carrying them was written.
+    /// Make staged runtime values visible after the batch was written. These
+    /// remain partial and non-authoritative when a persisted shard is unreadable.
     pub(crate) fn publish(&self, staged: &StagedShard) {
         let shard = &self.shards[staged.shard_id];
         shard
@@ -106,6 +127,25 @@ impl FileSystemGlobalStats {
         shard
             .used_inodes
             .store(staged.data.used_inodes, Ordering::Relaxed);
+    }
+
+    /// Load one persisted shard record. A record that does not decode leaves
+    /// the shard at zero and marks the totals unknown.
+    pub(crate) fn load_shard_record(&self, shard_id: usize, raw: &[u8]) {
+        match bincode::deserialize::<StatsShardData>(raw) {
+            Ok(data) => self.load_shard(shard_id, &data),
+            Err(error) => {
+                tracing::error!(
+                    shard_id,
+                    %error,
+                    "stats shard record is unreadable; usage totals are unknown until it is repaired"
+                );
+                if let Some(shard) = self.shards.get(shard_id) {
+                    let _ = shard.unreadable_record.set(Bytes::copy_from_slice(raw));
+                }
+                self.unreadable_shard.store(true, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Load statistics from persistent storage
@@ -120,6 +160,10 @@ impl FileSystemGlobalStats {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "stats/recovery_tests.rs"]
+mod recovery_tests;
 
 #[cfg(test)]
 mod tests {

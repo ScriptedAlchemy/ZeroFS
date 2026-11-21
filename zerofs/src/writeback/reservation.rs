@@ -634,6 +634,14 @@ impl SsdAdmission {
         lock(&self.inner.state).used_ssd_bytes
     }
 
+    /// Check terminal state without allocating bytes or joining the FIFO queue.
+    pub(crate) fn check_available(&self) -> Result<(), ReservationError> {
+        match &lock(&self.inner.state).terminal {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn used_operations(&self) -> u64 {
         lock(&self.inner.state).used_operations

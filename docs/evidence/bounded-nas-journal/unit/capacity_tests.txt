@@ -1,0 +1,8 @@
+    Finished `ci` profile [optimized] target(s) in 0.38s
+     Running unittests src/lib.rs (/var/tmp/zerofs-nas-journal.1XHScyY3/target/ci/deps/zerofs-59b7112322a285ce)
+
+running 2 tests
+test writeback::remote::capacity_tests::full_pool_drain_keeps_queued_payload_and_recovers_without_restart ... ok
+test writeback::remote::capacity_tests::only_explicit_capacity_refusals_are_retryable_after_a_permanent_error ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 2720 filtered out; finished in 0.42s

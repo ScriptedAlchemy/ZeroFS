@@ -2,6 +2,7 @@ use crate::db::{Db, Transaction};
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
 use crate::fs::key_codec::{KeyCodec, ParsedKey};
+use crate::fs::name_mode::NameMatch;
 use crate::fs::store::read_cache::{InvalidationGuard, MetadataCache};
 use bytes::Bytes;
 use futures::Stream;
@@ -119,10 +120,49 @@ impl DirectoryStore {
         }
     }
 
+    fn cache_name(&self, name: &[u8]) -> Bytes {
+        Bytes::from(self.key_codec.name_key(name).into_owned())
+    }
+
     pub(crate) async fn get(&self, dir_id: InodeId, name: &[u8]) -> Result<InodeId, FsError> {
         self.get_entry_with_cookie(dir_id, name)
             .await
             .map(|(inode_id, _)| inode_id)
+    }
+
+    /// Check the stored spelling with a point read, without directory read access.
+    /// The caller holds the directory's namespace lock through this check and
+    /// any preceding folded lookup so a replacement cannot split the reads.
+    pub(crate) async fn get_exact(&self, dir_id: InodeId, name: &[u8]) -> Result<InodeId, FsError> {
+        self.get_entry_matching(dir_id, name, NameMatch::Exact)
+            .await
+            .map(|(inode_id, _)| inode_id)
+    }
+
+    /// Resolve `name` to its entry under `rule`. `Exact` adds the stored
+    /// spelling check that [`Self::get_exact`] describes, under the same lock
+    /// requirement.
+    pub(crate) async fn get_entry_matching(
+        &self,
+        dir_id: InodeId,
+        name: &[u8],
+        rule: NameMatch,
+    ) -> Result<(InodeId, u64), FsError> {
+        let (inode_id, cookie) = self.get_entry_with_cookie(dir_id, name).await?;
+        if rule == NameMatch::Folded {
+            return Ok((inode_id, cookie));
+        }
+        let scan = self
+            .db
+            .get_bytes(&self.key_codec.dir_scan_key(dir_id, cookie))
+            .await
+            .map_err(|error| FsError::from_db_error(&error))?
+            .ok_or(FsError::NotFound)?;
+        let (stored, value) = decode_dir_scan_value(&scan)?;
+        if stored != name || value.inode_id() != inode_id {
+            return Err(FsError::NotFound);
+        }
+        Ok((inode_id, cookie))
     }
 
     async fn load_entry(&self, dir_id: InodeId, name: &[u8]) -> Result<EntryCacheValue, FsError> {
@@ -175,7 +215,7 @@ impl DirectoryStore {
     }
 
     pub(crate) async fn exists(&self, dir_id: InodeId, name: &[u8]) -> Result<bool, FsError> {
-        let cache_key = (dir_id, Bytes::copy_from_slice(name));
+        let cache_key = (dir_id, self.cache_name(name));
         if self.entry_cache.get(&cache_key)?.is_some() {
             return Ok(true);
         }
@@ -302,7 +342,7 @@ impl DirectoryStore {
     ) {
         let entry_key = self.key_codec.dir_entry_key(dir_id, name);
         txn.put_bytes(&entry_key, KeyCodec::encode_dir_entry(entry_id, cookie));
-        let cache_name = Bytes::copy_from_slice(name);
+        let cache_name = self.cache_name(name);
         txn.update_cached_directory_entry(dir_id, cache_name, Some((entry_id, cookie)));
 
         let scan_value = match inode {
@@ -326,7 +366,7 @@ impl DirectoryStore {
     ) {
         let entry_key = self.key_codec.dir_entry_key(dir_id, name);
         txn.delete_bytes(&entry_key);
-        let cache_name = Bytes::copy_from_slice(name);
+        let cache_name = self.cache_name(name);
         txn.update_cached_directory_entry(dir_id, cache_name, None);
 
         let scan_key = self.key_codec.dir_scan_key(dir_id, cookie);
@@ -343,7 +383,7 @@ impl DirectoryStore {
         dir_id: InodeId,
         name: &[u8],
     ) -> Result<(InodeId, u64), FsError> {
-        let key = (dir_id, Bytes::copy_from_slice(name));
+        let key = (dir_id, self.cache_name(name));
         self.entry_cache
             .get_or_load(key, || self.load_entry(dir_id, name))
             .await
@@ -358,8 +398,7 @@ impl DirectoryStore {
 
     #[cfg(test)]
     fn cached_entry(&self, dir_id: InodeId, name: &[u8]) -> Option<(InodeId, u64)> {
-        self.entry_cache
-            .peek(&(dir_id, Bytes::copy_from_slice(name)))
+        self.entry_cache.peek(&(dir_id, self.cache_name(name)))
     }
 
     #[cfg(test)]

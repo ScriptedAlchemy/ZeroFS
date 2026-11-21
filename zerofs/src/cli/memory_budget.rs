@@ -1,15 +1,24 @@
 use crate::config::Settings;
+#[cfg(test)]
+use crate::memory::cgroup::unescape_mountinfo;
+use crate::memory::cgroup::{map_cgroup2_mounts, parse_cgroup2_mounts, parse_unified_cgroup};
 use crate::writeback::config::WritebackAccessMode;
 use anyhow::{Context, Result, bail};
-use std::ffi::OsString;
+use std::collections::BTreeSet;
 use std::io::ErrorKind;
-#[cfg(unix)]
-use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
 const GIB: u64 = 1024 * 1024 * 1024;
 const UNMODELED_RESIDENCY_RESERVE_BYTES: u64 = 32 * GIB;
 const COMPANION_PROCESS_RESERVE_BYTES: u64 = 8 * GIB;
+
+#[cfg(test)]
+#[path = "memory_admission_tests.rs"]
+mod admission_tests;
+#[path = "memory_package_policy.rs"]
+mod package_policy;
+#[path = "memory_raw_policy.rs"]
+mod raw_policy;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct StartupMemoryTiers {
@@ -34,15 +43,284 @@ impl StartupMemoryTiers {
         let object_writeback_bytes = settings
             .writeback_settings(WritebackAccessMode::ReadWrite)?
             .map_or(0, |writeback| writeback.memory_bytes);
-
         Ok(Self {
             clean_cache_bytes,
             object_writeback_bytes,
-            // The caller supplies the one normalized volatile-write budget. In
-            // configurations that retain a legacy NBD alias, it must not be
-            // added a second time here.
-            volatile_write_bytes,
+            volatile_write_bytes: volatile_write_bytes
+                .checked_mul(2)
+                .context("volatile-write ownership-stage allowance overflowed")?,
         })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MemoryPolicyProfile {
+    Legacy { reason: &'static str },
+    SmallNasPackage,
+    SmallNasJournal,
+    RawDeviceP3Candidate,
+    RawDeviceP3NasFit,
+}
+
+struct MemoryPolicy {
+    profile: MemoryPolicyProfile,
+    residency_bytes: u64,
+    headroom_bytes: u64,
+    residency_source: String,
+    headroom_source: String,
+}
+
+impl MemoryPolicy {
+    fn legacy(reason: &'static str) -> Self {
+        Self {
+            profile: MemoryPolicyProfile::Legacy { reason },
+            residency_bytes: UNMODELED_RESIDENCY_RESERVE_BYTES,
+            headroom_bytes: COMPANION_PROCESS_RESERVE_BYTES,
+            residency_source: "computed legacy 32 GiB from fork ad6835d5/4b2b645d".into(),
+            headroom_source:
+                "computed legacy mixed process/companion 8 GiB from fork ad6835d5/4b2b645d".into(),
+        }
+    }
+
+    fn from_settings(
+        settings: &Settings,
+        tiers: StartupMemoryTiers,
+        write_ack: crate::fs::mutation::config::FilesystemWriteAckSettings,
+    ) -> Result<Self> {
+        let mut policy = if settings.raw_device_p3_candidate() {
+            raw_policy::validate(settings, tiers.clean_cache_bytes, write_ack)
+                .with_context(|| format!("{} configuration rejected", raw_policy::NAME))?;
+            Self {
+                profile: MemoryPolicyProfile::RawDeviceP3Candidate,
+                residency_bytes: package_policy::RESIDENCY_BYTES + raw_policy::RAW_RESIDENCY_BYTES,
+                headroom_bytes: package_policy::HEADROOM_BYTES + raw_policy::COMPANION_BYTES,
+                residency_source: format!(
+                    "directory package baseline input plus 2 GiB provisional raw recovery/index allowance; {}",
+                    package_policy::EVIDENCE
+                ),
+                headroom_source: format!(
+                    "baseline kernel/allocator input plus 1 GiB provisional companion and loop-backing allowance; {}",
+                    package_policy::EVIDENCE
+                ),
+            }
+        } else if settings.raw_device_p3_nas_fit() {
+            raw_policy::validate(settings, tiers.clean_cache_bytes, write_ack)
+                .with_context(|| format!("{} configuration rejected", raw_policy::NAS_FIT_NAME))?;
+            Self {
+                profile: MemoryPolicyProfile::RawDeviceP3NasFit,
+                residency_bytes: package_policy::RESIDENCY_BYTES
+                    + raw_policy::NAS_FIT_RESIDENCY_BYTES,
+                headroom_bytes: package_policy::HEADROOM_BYTES
+                    + raw_policy::NAS_FIT_COMPANION_BYTES,
+                residency_source: format!(
+                    "directory package baseline plus 2,112 MiB for raw allocation bitmaps, live indexes, retirement and database caches; {}",
+                    package_policy::EVIDENCE
+                ),
+                headroom_source: format!(
+                    "baseline kernel/allocator input plus 1.5 GiB app allowance; {}",
+                    package_policy::EVIDENCE
+                ),
+            }
+        } else {
+            let exclusion = package_policy::exclusion(settings, tiers.clean_cache_bytes, write_ack);
+            match exclusion {
+                Some(reason) if settings.small_nas_journal() => {
+                    bail!("small-nas-journal-v1 configuration rejected: {reason}")
+                }
+                Some(reason) => Self::legacy(reason),
+                None if settings.small_nas_journal() => Self {
+                    profile: MemoryPolicyProfile::SmallNasJournal,
+                    // Charge an extra two full journal budgets for metadata, redb and worker
+                    // buffers, in addition to the accepted RAM tier and segment geometry.
+                    residency_bytes: package_policy::RESIDENCY_BYTES + GIB,
+                    headroom_bytes: package_policy::HEADROOM_BYTES,
+                    residency_source: format!(
+                        "baseline plus 1 GiB journal workers/replay allowance; {}",
+                        package_policy::EVIDENCE
+                    ),
+                    headroom_source: package_policy::EVIDENCE.into(),
+                },
+                None => Self {
+                    profile: MemoryPolicyProfile::SmallNasPackage,
+                    residency_bytes: package_policy::RESIDENCY_BYTES,
+                    headroom_bytes: package_policy::HEADROOM_BYTES,
+                    residency_source: package_policy::EVIDENCE.into(),
+                    headroom_source: package_policy::EVIDENCE.into(),
+                },
+            }
+        };
+        let (residency, headroom) = settings.runtime_memory_reserve_bytes()?;
+        for (configured, computed, source, field) in [
+            (
+                residency,
+                &mut policy.residency_bytes,
+                &mut policy.residency_source,
+                "unmodeled_residency_reserve_gb",
+            ),
+            (
+                headroom,
+                &mut policy.headroom_bytes,
+                &mut policy.headroom_source,
+                "engine_headroom_gb",
+            ),
+        ] {
+            if let Some(value) = configured {
+                if value < *computed {
+                    bail!(
+                        "[runtime] {field} resolves to {value} bytes, below computed minimum {} bytes from {source}",
+                        *computed
+                    );
+                }
+                *source = format!(
+                    "[runtime] {field} upward override; computed minimum {} bytes from {source}",
+                    *computed
+                );
+                *computed = value;
+            }
+        }
+        Ok(policy)
+    }
+
+    fn name(&self) -> &'static str {
+        match self.profile {
+            MemoryPolicyProfile::Legacy { .. } => "legacy",
+            MemoryPolicyProfile::SmallNasPackage => "small-nas-package-v1",
+            MemoryPolicyProfile::SmallNasJournal => "small-nas-journal-v1",
+            MemoryPolicyProfile::RawDeviceP3Candidate => raw_policy::NAME,
+            MemoryPolicyProfile::RawDeviceP3NasFit => raw_policy::NAS_FIT_NAME,
+        }
+    }
+
+    fn reason(&self) -> &'static str {
+        match self.profile {
+            MemoryPolicyProfile::RawDeviceP3Candidate => {
+                "synthetic raw geometry candidate; end-to-end peak and event qualification pending"
+            }
+            MemoryPolicyProfile::RawDeviceP3NasFit => {
+                "bounded file-backed fixture or designated hardware geometry; hardware qualification pending"
+            }
+            MemoryPolicyProfile::Legacy { reason } => reason,
+            MemoryPolicyProfile::SmallNasJournal => {
+                "explicit bounded journal fixture geometry; application-wide qualification required"
+            }
+            MemoryPolicyProfile::SmallNasPackage => {
+                "all measured configuration bounds matched; one SMB client and CLI jobs <= 8 are operational conditions"
+            }
+        }
+    }
+
+    fn direct_segment_bytes(&self) -> u64 {
+        match self.profile {
+            MemoryPolicyProfile::RawDeviceP3Candidate | MemoryPolicyProfile::RawDeviceP3NasFit => {
+                use crate::config::StoreProfile;
+                // A claim can carry the open lane past the threshold.
+                // Charge two allocation stages and the full volatile write
+                // budget as an overrun allowance for each open/retained lane.
+                let lanes = crate::fs::store::extent::OPEN_SEGMENT_LANES
+                    + StoreProfile::RAW_CANDIDATE_INFLIGHT;
+                2 * lanes as u64
+                    * (StoreProfile::RAW_CANDIDATE_SEAL_BYTES as u64 + 16 * 1024 * 1024)
+            }
+            MemoryPolicyProfile::Legacy { .. } => 0,
+            MemoryPolicyProfile::SmallNasJournal => {
+                use crate::config::StoreProfile;
+                ((crate::fs::store::extent::OPEN_SEGMENT_LANES
+                    + StoreProfile::NAS_JOURNAL_INFLIGHT)
+                    * StoreProfile::NAS_JOURNAL_SEAL_BYTES) as u64
+            }
+            MemoryPolicyProfile::SmallNasPackage => {
+                crate::fs::store::extent::DEFAULT_DIRECT_SEGMENT_BYTES
+            }
+        }
+    }
+
+    fn headroom_label(&self) -> &'static str {
+        match self.profile {
+            MemoryPolicyProfile::Legacy { .. } => "companion/process reserve",
+            MemoryPolicyProfile::RawDeviceP3Candidate | MemoryPolicyProfile::RawDeviceP3NasFit => {
+                "engine/companion headroom"
+            }
+            MemoryPolicyProfile::SmallNasPackage | MemoryPolicyProfile::SmallNasJournal => {
+                "engine kernel/allocator headroom"
+            }
+        }
+    }
+
+    fn brake_headroom(&self) -> Result<u64> {
+        match self.profile {
+            MemoryPolicyProfile::Legacy { .. } => self
+                .residency_bytes
+                .checked_add(self.headroom_bytes)
+                .context("startup memory policy reserves overflowed"),
+            MemoryPolicyProfile::SmallNasPackage
+            | MemoryPolicyProfile::SmallNasJournal
+            | MemoryPolicyProfile::RawDeviceP3Candidate
+            | MemoryPolicyProfile::RawDeviceP3NasFit => Ok(self.headroom_bytes),
+        }
+    }
+
+    fn qualification(&self) -> Option<StoredStateQualification> {
+        match self.profile {
+            MemoryPolicyProfile::Legacy { .. }
+            | MemoryPolicyProfile::SmallNasJournal
+            | MemoryPolicyProfile::RawDeviceP3Candidate
+            | MemoryPolicyProfile::RawDeviceP3NasFit => None,
+            MemoryPolicyProfile::SmallNasPackage => Some(StoredStateQualification {
+                logical_bytes: package_policy::QUALIFIED_LOGICAL_BYTES,
+                regular_files: package_policy::QUALIFIED_REGULAR_FILES,
+                enforcement: "empirical_not_enforced",
+            }),
+        }
+    }
+
+    fn included_companion_bytes(&self) -> u64 {
+        match self.profile {
+            MemoryPolicyProfile::RawDeviceP3Candidate => raw_policy::COMPANION_BYTES,
+            MemoryPolicyProfile::RawDeviceP3NasFit => raw_policy::NAS_FIT_COMPANION_BYTES,
+            // Legacy headroom mixes process and companion use without an
+            // independently identifiable companion allocation.
+            _ => 0,
+        }
+    }
+
+    fn accounting(&self, tiers: StartupMemoryTiers, source: &str) -> String {
+        let qualification = match self.qualification() {
+            Some(state) => format!(
+                "qualification_stored_logical_bytes={} qualification_regular_files={} {}",
+                state.logical_bytes, state.regular_files, state.enforcement
+            ),
+            None => "stored_state_qualification=unavailable for selected policy".into(),
+        };
+        let companions = match self.profile {
+            MemoryPolicyProfile::RawDeviceP3Candidate => format!(
+                "companion_allowance_bytes={} included in headroom; clean_cache_disk_bytes=0",
+                self.included_companion_bytes(),
+            ),
+            MemoryPolicyProfile::RawDeviceP3NasFit => format!(
+                "companion_allowance_bytes={} included in headroom; clean_cache_disk_bytes=0; raw_backing=block or non-RAM file-backed loops; kernel file cache is reclaimable",
+                self.included_companion_bytes(),
+            ),
+            MemoryPolicyProfile::Legacy { .. } => "external_companions=mixed legacy reserve with no separately creditable companion allowance".into(),
+            _ => "external_companions=excluded from measured engine reserves, subtract FUSE/smbd and file cache from container limit before runtime.memory_limit_gb".into(),
+        };
+        format!(
+            "memory_policy={} reason={}; clean_cache_bytes={} source=resolved cache split with three 32 MiB floors; \
+             object_writeback_bytes={} source=resolved writeback RAM or disabled; \
+             volatile_write_bytes={} source=resolved shared write-ack setting times two ownership stages; \
+             direct_segment_bytes={} source=selected store geometry (open plus retained segments); \
+             unmodeled_residency_reserve_bytes={} source={}; engine_headroom_bytes={} source={}; \
+             hard_limit_source={source}; {companions}; {qualification}",
+            self.name(),
+            self.reason(),
+            tiers.clean_cache_bytes,
+            tiers.object_writeback_bytes,
+            tiers.volatile_write_bytes,
+            self.direct_segment_bytes(),
+            self.residency_bytes,
+            self.residency_source,
+            self.headroom_bytes,
+            self.headroom_source,
+        )
     }
 }
 
@@ -58,81 +336,157 @@ pub(crate) struct CgroupMemoryLimits {
     shared_ceiling: Option<MemoryEnvelope>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct StoredStateQualification {
+    pub(crate) logical_bytes: u64,
+    pub(crate) regular_files: u64,
+    pub(crate) enforcement: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct MemoryBudgetReceipt {
     pub(crate) hard_limit_bytes: u64,
     pub(crate) required_bytes: u64,
     pub(crate) remaining_bytes: u64,
     pub(crate) rss_pressure_cap_bytes: u64,
+    pub(crate) included_companion_bytes: u64,
+    pub(crate) accounting: String,
+    pub(crate) stored_state_qualification: Option<StoredStateQualification>,
 }
 
-pub(crate) fn validate_server_startup(
+pub(crate) fn validate_server_startup(settings: &Settings) -> Result<Option<MemoryBudgetReceipt>> {
+    validate_server_startup_with_limits(settings, detect_process_cgroup_v2_memory_limit()?)
+}
+
+fn validate_server_startup_with_limits(
     settings: &Settings,
-    volatile_write_bytes: u64,
+    detected: CgroupMemoryLimits,
 ) -> Result<Option<MemoryBudgetReceipt>> {
-    let tiers = StartupMemoryTiers::from_settings(settings, volatile_write_bytes)?;
-    let detected = detect_process_cgroup_v2_memory_limit()?;
+    if settings.memory.is_some() {
+        bail!("[memory] is available for planning only; production enforcement is not enabled");
+    }
+    let write_ack = settings.filesystem_write_ack_settings(WritebackAccessMode::ReadWrite)?;
+    let tiers = StartupMemoryTiers::from_settings(settings, write_ack.volatile_memory_bytes)?;
+    let policy = MemoryPolicy::from_settings(settings, tiers, write_ack)?;
     let configured = settings.runtime_memory_limit_bytes()?;
+    if settings.raw_device_p3_candidate() || settings.raw_device_p3_nas_fit() {
+        let name = policy.name();
+        let dedicated = detected
+            .dedicated
+            .as_ref()
+            .with_context(|| format!("{name} requires a dedicated cgroup-v2 memory.max"))?;
+        if settings.raw_device_p3_nas_fit() {
+            if dedicated.hard_limit_bytes != 8 * GIB {
+                bail!("{name} requires cgroup memory.max of exactly 8 GiB");
+            }
+        } else if !(raw_policy::MIN_CGROUP_BYTES..=raw_policy::MAX_CGROUP_BYTES)
+            .contains(&dedicated.hard_limit_bytes)
+        {
+            bail!("{name} requires cgroup memory.max from 8 through 16 GiB");
+        }
+        if configured.is_some_and(|value| value < dedicated.hard_limit_bytes) {
+            bail!("{name} uses the dedicated cgroup limit as its envelope");
+        }
+        let swap_path = dedicated.source.with_file_name("memory.swap.max");
+        let swap = std::fs::read_to_string(&swap_path).with_context(|| {
+            format!(
+                "reading raw candidate swap limit at {}",
+                swap_path.display()
+            )
+        })?;
+        if swap.trim() != "0" {
+            bail!("{name} requires memory.swap.max = 0");
+        }
+    }
     let Some(envelope) = select_memory_limit(detected, configured)? else {
+        if settings.small_nas_journal() {
+            bail!("small-nas-journal-v1 requires a finite dedicated memory envelope");
+        }
         tracing::warn!(
+            accounting = policy.accounting(tiers, "unavailable"),
             "no cgroup-v2 memory ceiling or [runtime] memory_limit_gb; startup memory defense-in-depth admission is unavailable"
         );
         return Ok(None);
     };
     let source = envelope.source.display().to_string();
-    let receipt = validate_memory_budget(tiers, envelope.hard_limit_bytes, &source)?;
+    let receipt =
+        validate_resolved_memory_budget(tiers, policy, envelope.hard_limit_bytes, &source)?;
     tracing::info!(
-        hard_limit_bytes = envelope.hard_limit_bytes,
+        hard_limit_bytes = receipt.hard_limit_bytes,
         required_bytes = receipt.required_bytes,
         remaining_bytes = receipt.remaining_bytes,
         rss_pressure_cap_bytes = receipt.rss_pressure_cap_bytes,
-        unmodeled_residency_reserve_bytes = UNMODELED_RESIDENCY_RESERVE_BYTES,
-        companion_process_reserve_bytes = COMPANION_PROCESS_RESERVE_BYTES,
+        accounting = receipt.accounting,
         source,
         "startup memory defense-in-depth admission passed"
     );
     Ok(Some(receipt))
 }
 
+#[cfg(test)]
 fn validate_memory_budget(
     tiers: StartupMemoryTiers,
     hard_limit_bytes: u64,
     source: &str,
 ) -> Result<MemoryBudgetReceipt> {
-    // The production OOM reproduced roughly 28.6 GiB of residency above the
-    // charged cache/writeback tiers. Round that unmodeled excess up to 32 GiB,
-    // then retain a separate 8 GiB allowance for GC, protocol companions and
-    // the rest of the process. These are conservative admission reserves, not
-    // proofs that every allocation path is bounded.
+    validate_resolved_memory_budget(
+        tiers,
+        MemoryPolicy::legacy("legacy arithmetic fixture"),
+        hard_limit_bytes,
+        source,
+    )
+}
+
+fn validate_resolved_memory_budget(
+    tiers: StartupMemoryTiers,
+    policy: MemoryPolicy,
+    hard_limit_bytes: u64,
+    source: &str,
+) -> Result<MemoryBudgetReceipt> {
+    let direct_segment_bytes = policy.direct_segment_bytes();
     let required_bytes = tiers
         .clean_cache_bytes
         .checked_add(tiers.object_writeback_bytes)
         .and_then(|total| total.checked_add(tiers.volatile_write_bytes))
-        .and_then(|total| total.checked_add(UNMODELED_RESIDENCY_RESERVE_BYTES))
-        .and_then(|total| total.checked_add(COMPANION_PROCESS_RESERVE_BYTES))
+        .and_then(|total| total.checked_add(direct_segment_bytes))
+        .and_then(|total| total.checked_add(policy.residency_bytes))
+        .and_then(|total| total.checked_add(policy.headroom_bytes))
         .context("startup memory budget overflowed")?;
+    let accounting = policy.accounting(tiers, source);
     if required_bytes > hard_limit_bytes {
+        let residency_label = match policy.profile {
+            MemoryPolicyProfile::RawDeviceP3Candidate | MemoryPolicyProfile::RawDeviceP3NasFit => {
+                "provisional residency reserve"
+            }
+            _ => "observed-unmodeled reserve",
+        };
         bail!(
             "startup memory admission rejected: {:.2} GB clean cache + {:.2} GB object writeback + \
-             {:.2} GB volatile writes + 32.00 GiB observed-unmodeled reserve + 8.00 GiB \
-             companion/process reserve require {:.2} GiB, above the {:.2} GiB hard limit \
-             from {source}",
+             {:.2} GB volatile writes + {:.2} GiB {residency_label} + {:.2} GiB \
+             {headroom_label} + {:.2} GiB direct segments require {:.2} GiB, above the {:.2} GiB hard limit \
+             from {source}; required_bytes={required_bytes}; hard_limit_bytes={hard_limit_bytes}; {accounting}",
             decimal_gb(tiers.clean_cache_bytes),
             decimal_gb(tiers.object_writeback_bytes),
             decimal_gb(tiers.volatile_write_bytes),
+            gib(policy.residency_bytes),
+            gib(policy.headroom_bytes),
+            gib(direct_segment_bytes),
             gib(required_bytes),
             gib(hard_limit_bytes),
+            headroom_label = policy.headroom_label(),
         );
     }
     let rss_pressure_cap_bytes = hard_limit_bytes
-        .checked_sub(UNMODELED_RESIDENCY_RESERVE_BYTES)
-        .and_then(|cap| cap.checked_sub(COMPANION_PROCESS_RESERVE_BYTES))
-        .context("startup memory envelope is smaller than its fixed policy reserves")?;
+        .checked_sub(policy.brake_headroom()?)
+        .context("startup memory envelope is smaller than its policy headroom")?;
     Ok(MemoryBudgetReceipt {
         hard_limit_bytes,
         required_bytes,
         remaining_bytes: hard_limit_bytes - required_bytes,
         rss_pressure_cap_bytes,
+        included_companion_bytes: policy.included_companion_bytes(),
+        accounting,
+        stored_state_qualification: policy.qualification(),
     })
 }
 
@@ -209,162 +563,58 @@ fn detect_cgroup_v2_memory_limit(
         return Ok(CgroupMemoryLimits::default());
     }
     let current = parse_unified_cgroup(&cgroup)?;
-    let Some((mountpoint, mut path)) = select_cgroup2_mount(&current, &mounts) else {
-        return Ok(CgroupMemoryLimits::default());
-    };
     let mut limits = CgroupMemoryLimits::default();
-    let mut is_current = true;
-    loop {
-        let limit_path = path.join("memory.max");
-        match std::fs::read_to_string(&limit_path) {
-            Ok(raw) => {
-                let value = raw.trim();
-                if value != "max" {
-                    let hard_limit_bytes = value.parse::<u64>().with_context(|| {
-                        format!(
-                            "invalid cgroup memory limit {value:?} in {}",
-                            limit_path.display()
-                        )
-                    })?;
-                    let slot = if is_current {
-                        &mut limits.dedicated
-                    } else {
-                        &mut limits.shared_ceiling
-                    };
-                    if slot
-                        .as_ref()
-                        .is_none_or(|current| hard_limit_bytes < current.hard_limit_bytes)
-                    {
-                        *slot = Some(MemoryEnvelope {
-                            hard_limit_bytes,
-                            source: limit_path,
-                        });
+    let mut seen = BTreeSet::new();
+    for (mountpoint, mut path) in map_cgroup2_mounts(&current, &mounts) {
+        let mut is_current = true;
+        loop {
+            let limit_path = path.join("memory.max");
+            if seen.insert(limit_path.clone()) {
+                match std::fs::read_to_string(&limit_path) {
+                    Ok(raw) => {
+                        let value = raw.trim();
+                        if value != "max" {
+                            let hard_limit_bytes = value.parse::<u64>().with_context(|| {
+                                format!(
+                                    "invalid cgroup memory limit {value:?} in {}",
+                                    limit_path.display()
+                                )
+                            })?;
+                            let slot = if is_current {
+                                &mut limits.dedicated
+                            } else {
+                                &mut limits.shared_ceiling
+                            };
+                            if slot
+                                .as_ref()
+                                .is_none_or(|current| hard_limit_bytes < current.hard_limit_bytes)
+                            {
+                                *slot = Some(MemoryEnvelope {
+                                    hard_limit_bytes,
+                                    source: limit_path,
+                                });
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("reading {}", limit_path.display()));
                     }
                 }
             }
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| format!("reading {}", limit_path.display()));
+            if path == mountpoint {
+                break;
             }
+            path = path
+                .parent()
+                .filter(|parent| parent.starts_with(&mountpoint))
+                .context("cgroup path escaped its cgroup2 mount")?
+                .to_path_buf();
+            is_current = false;
         }
-        if path == mountpoint {
-            break;
-        }
-        path = path
-            .parent()
-            .filter(|parent| parent.starts_with(&mountpoint))
-            .context("cgroup path escaped its cgroup2 mount")?
-            .to_path_buf();
-        is_current = false;
     }
     Ok(limits)
-}
-
-fn parse_unified_cgroup(contents: &[u8]) -> Result<PathBuf> {
-    for line in contents.split(|byte| *byte == b'\n') {
-        let mut fields = line.splitn(3, |byte| *byte == b':');
-        if fields.next() == Some(b"0".as_slice()) && fields.next() == Some(b"".as_slice()) {
-            let path = fields.next().context("cgroup-v2 entry has no path")?;
-            return Ok(PathBuf::from(os_string_from_bytes(path.to_vec())?));
-        }
-    }
-    bail!("/proc/self/cgroup contains no unified cgroup-v2 entry")
-}
-
-fn parse_cgroup2_mounts(contents: &[u8]) -> Result<Vec<(PathBuf, PathBuf)>> {
-    let mut mounts = Vec::new();
-    for line in contents.split(|byte| *byte == b'\n') {
-        let fields: Vec<_> = line
-            .split(|byte| *byte == b' ')
-            .filter(|field| !field.is_empty())
-            .collect();
-        let Some(separator) = fields.iter().position(|field| *field == b"-") else {
-            continue;
-        };
-        if fields.get(separator + 1).copied() != Some(b"cgroup2".as_slice()) {
-            continue;
-        }
-        let root = fields
-            .get(3)
-            .context("cgroup2 mountinfo entry has no root")?;
-        let mountpoint = fields
-            .get(4)
-            .context("cgroup2 mountinfo entry has no mountpoint")?;
-        mounts.push((
-            PathBuf::from(unescape_mountinfo(root)?),
-            PathBuf::from(unescape_mountinfo(mountpoint)?),
-        ));
-    }
-    Ok(mounts)
-}
-
-fn select_cgroup2_mount(
-    current: &Path,
-    mounts: &[(PathBuf, PathBuf)],
-) -> Option<(PathBuf, PathBuf)> {
-    let exact = mounts
-        .iter()
-        .filter_map(|(root, mountpoint)| {
-            current
-                .strip_prefix(root)
-                .ok()
-                .map(|relative| (root, mountpoint, relative))
-        })
-        .max_by_key(|(root, _, _)| root.components().count());
-    if let Some((_, mountpoint, relative)) = exact {
-        return Some((mountpoint.clone(), mountpoint.join(relative)));
-    }
-
-    // A private cgroup namespace exposes its own root as `/`, while mountinfo
-    // may retain the host-side subtree in the mount root field. In that case,
-    // the process cgroup path is already relative to the mounted subtree. A
-    // deeper root is a nested bind, not the namespace root; prefer the
-    // shallowest root and retain mountinfo order as the deterministic tie-break.
-    mounts
-        .iter()
-        .min_by_key(|(root, _)| root.components().count())
-        .map(|(_, mountpoint)| {
-            let relative = current.strip_prefix(Path::new("/")).unwrap_or(current);
-            (mountpoint.clone(), mountpoint.join(relative))
-        })
-}
-
-fn unescape_mountinfo(value: &[u8]) -> Result<OsString> {
-    let mut output = Vec::with_capacity(value.len());
-    let mut index = 0;
-    while index < value.len() {
-        if value[index] == b'\\' {
-            let octal = value
-                .get(index + 1..index + 4)
-                .context("truncated mountinfo escape")?;
-            if !octal.iter().all(u8::is_ascii_digit) || octal.iter().any(|byte| *byte > b'7') {
-                bail!(
-                    "invalid mountinfo escape in {:?}",
-                    String::from_utf8_lossy(value)
-                );
-            }
-            let decoded = (octal[0] - b'0') * 64 + (octal[1] - b'0') * 8 + (octal[2] - b'0');
-            output.push(decoded);
-            index += 4;
-        } else {
-            output.push(value[index]);
-            index += 1;
-        }
-    }
-    os_string_from_bytes(output)
-}
-
-fn os_string_from_bytes(value: Vec<u8>) -> Result<OsString> {
-    #[cfg(unix)]
-    {
-        Ok(OsString::from_vec(value))
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(String::from_utf8(value)
-            .context("Linux cgroup path is not valid UTF-8 on this platform")?
-            .into())
-    }
 }
 
 fn decimal_gb_to_bytes(name: &str, value: f64) -> Result<u64> {
@@ -386,9 +636,17 @@ fn gib(bytes: u64) -> f64 {
     bytes as f64 / GIB as f64
 }
 
+pub(crate) fn print_status(config: &Path) -> Result<()> {
+    let settings = Settings::from_runtime_file(config)?;
+    let receipt = validate_server_startup(&settings)?;
+    println!("{}", serde_json::to_string_pretty(&receipt)?);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::fs;
 
     const GIB: u64 = 1024 * 1024 * 1024;
@@ -574,7 +832,7 @@ mod tests {
     }
 
     #[test]
-    fn cgroup_discovery_selects_the_most_specific_matching_mount() {
+    fn cgroup_discovery_preserves_all_matching_mounts() {
         let current = Path::new("/system.slice/zerofs.service");
         let mounts = vec![
             (PathBuf::from("/"), PathBuf::from("/sys/fs/cgroup")),
@@ -584,13 +842,60 @@ mod tests {
             ),
         ];
 
-        let selected = select_cgroup2_mount(current, &mounts).unwrap();
+        let selected = map_cgroup2_mounts(current, &mounts);
 
-        assert_eq!(selected.0, PathBuf::from("/run/zerofs-cgroup"));
         assert_eq!(
-            selected.1,
-            PathBuf::from("/run/zerofs-cgroup/zerofs.service")
+            selected,
+            vec![
+                (
+                    PathBuf::from("/sys/fs/cgroup"),
+                    PathBuf::from("/sys/fs/cgroup/system.slice/zerofs.service")
+                ),
+                (
+                    PathBuf::from("/run/zerofs-cgroup"),
+                    PathBuf::from("/run/zerofs-cgroup/zerofs.service")
+                ),
+            ]
         );
+    }
+
+    #[test]
+    fn nested_cgroup_bind_cannot_hide_a_tighter_visible_parent_from_startup() {
+        let temp = tempfile::tempdir().unwrap();
+        let outer = temp.path().join("outer");
+        let nested = temp.path().join("nested");
+        fs::create_dir_all(outer.join("parent/service")).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(outer.join("parent/service/memory.max"), "8589934592").unwrap();
+        fs::write(nested.join("memory.max"), "8589934592").unwrap();
+        fs::write(outer.join("parent/memory.max"), "4294967296").unwrap();
+        let proc_cgroup = temp.path().join("cgroup.txt");
+        fs::write(&proc_cgroup, "0::/parent/service").unwrap();
+        let mountinfo = temp.path().join("mountinfo.txt");
+        for reverse in [false, true] {
+            let mut mounts = [
+                format!("36 25 0:32 / {} rw - cgroup2 cgroup rw", outer.display()),
+                format!(
+                    "37 25 0:32 /parent/service {} rw - cgroup2 cgroup rw",
+                    nested.display()
+                ),
+            ];
+            if reverse {
+                mounts.reverse();
+            }
+            fs::write(&mountinfo, mounts.join("\n")).unwrap();
+            let detected = detect_cgroup_v2_memory_limit(&proc_cgroup, &mountinfo).unwrap();
+            assert_eq!(
+                detected.shared_ceiling.as_ref().unwrap().hard_limit_bytes,
+                4 * GIB
+            );
+            assert_eq!(
+                detected.shared_ceiling.as_ref().unwrap().source,
+                outer.join("parent/memory.max")
+            );
+            let error = select_memory_limit(detected, None).unwrap_err();
+            assert!(error.to_string().contains("exceeds the shared ancestor"));
+        }
     }
 
     #[test]
@@ -607,7 +912,7 @@ mod tests {
             ),
         ];
 
-        let selected = select_cgroup2_mount(current, &mounts).unwrap();
+        let selected = map_cgroup2_mounts(current, &mounts).remove(0);
 
         assert_eq!(selected.0, PathBuf::from("/sys/fs/cgroup"));
         assert_eq!(selected.1, PathBuf::from("/sys/fs/cgroup"));
@@ -667,7 +972,7 @@ mod tests {
         let mount = PathBuf::from(OsString::from_vec(b"/sys/cgroup-\xfe".to_vec()));
         let current = root.join("zerofs");
 
-        let selected = select_cgroup2_mount(&current, &[(root, mount.clone())]).unwrap();
+        let selected = map_cgroup2_mounts(&current, &[(root, mount.clone())]).remove(0);
 
         assert_eq!(
             selected.0.as_os_str().as_bytes(),
@@ -754,7 +1059,7 @@ mod tests {
     }
 
     #[test]
-    fn tier_accounting_counts_the_normalized_volatile_budget_once() {
+    fn tier_accounting_charges_raw_input_and_accepted_overlay_stages() {
         let mut settings = crate::config::Settings::generate_default();
         settings.cache.dir = "/tmp/zerofs-clean".into();
         settings.cache.memory_size_gb = Some(64.0);
@@ -774,6 +1079,6 @@ mod tests {
 
         assert_eq!(tiers.clean_cache_bytes, 64_000_000_000);
         assert_eq!(tiers.object_writeback_bytes, 4_000_000_000);
-        assert_eq!(tiers.volatile_write_bytes, 7_000_000_000);
+        assert_eq!(tiers.volatile_write_bytes, 14_000_000_000);
     }
 }

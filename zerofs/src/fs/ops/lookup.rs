@@ -3,7 +3,7 @@
 use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
-use crate::fs::permissions::{AccessMode, Credentials, check_access};
+use crate::fs::permissions::{AccessMode, Credentials};
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{AuthContext, DirEntry, InodeWithId, ReadDirResult};
 use ::tracing::{debug, error};
@@ -40,7 +40,8 @@ impl ZeroFS {
 
         match dir_inode {
             Inode::Directory(_) => {
-                check_access(&dir_inode, creds, AccessMode::Execute)?;
+                self.check_inode_access(dirid, &dir_inode, creds, AccessMode::Execute)
+                    .await?;
 
                 match entry_result {
                     Ok(inode_id) => {
@@ -79,8 +80,9 @@ impl ZeroFS {
 
     /// Page through `dirid` starting after cookie `start_after` (0 starts at
     /// `.` and `..`), up to `max_entries`. Attributes come from the entry's
-    /// embedded inode when current, else a point lookup; entries whose inode
-    /// vanished mid-scan are skipped.
+    /// embedded inode in materialized mode; volatile regular files and missing
+    /// embedded values use the visible inode view. Entries whose inode vanished
+    /// mid-scan are skipped.
     pub(crate) async fn readdir(
         &self,
         auth: &AuthContext,
@@ -118,7 +120,8 @@ impl ZeroFS {
 
         if let Some(auth) = auth {
             let creds = Credentials::from_auth_context(auth);
-            check_access(&dir_inode, &creds, AccessMode::Read)?;
+            self.check_inode_access(dirid, &dir_inode, &creds, AccessMode::Read)
+                .await?;
         }
 
         use crate::fs::store::directory::{COOKIE_DOT, COOKIE_DOTDOT};
@@ -204,10 +207,16 @@ impl ZeroFS {
                     }
                 }
 
+                let volatile = self.volatile_overlay.get().is_some();
                 let lookup_indices: Vec<usize> = dir_entries
                     .iter()
                     .enumerate()
-                    .filter(|(_, (_, _, _, inode))| inode.is_none())
+                    .filter(|(_, (_, _, _, inode))| {
+                        // A scan may have captured this embedded inode before
+                        // an acknowledged write materialized and retired. A
+                        // current dirty check cannot make that snapshot fresh.
+                        inode.is_none() || (volatile && matches!(inode, Some(Inode::File(_))))
+                    })
                     .map(|(i, _)| i)
                     .collect();
 
@@ -221,7 +230,7 @@ impl ZeroFS {
 
                     let inode_futures =
                         stream::iter(lookup_entries).map(|(idx, inode_id)| async move {
-                            match self.inode_store.get(inode_id).await {
+                            match self.visible_inode(inode_id).await {
                                 Ok(inode) => Ok::<_, FsError>((idx, Some(inode))),
                                 Err(FsError::NotFound) => {
                                     debug!("readdir: skipping deleted entry (inode {})", inode_id);

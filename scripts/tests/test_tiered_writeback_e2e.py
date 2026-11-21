@@ -88,7 +88,6 @@ CONTRACT_SCENARIOS = frozenset(
         "kernel-compile-nfs",
         "kernel-compile-ninep",
         "xfs-over-nbd-restart",
-        "zfs-over-nbd-restart",
         "crash-boundary-matrix",
         "local-receipt-restart",
         "remote-receipt-clean-cache-restart",
@@ -214,7 +213,6 @@ class FakeProbes:
         self.listening_ports: set[int] = set()
         self.active_mounts: set[str] = set()
         self.attached_devices: set[str] = set()
-        self.pools: set[str] = set()
         self.socket_probe_results: list[bool] = []
 
     def process_alive(self, pid: int) -> bool:
@@ -234,9 +232,6 @@ class FakeProbes:
 
     def device_attached(self, device: str) -> bool:
         return device in self.attached_devices
-
-    def pool_exists(self, name: str) -> bool:
-        return name in self.pools
 
     def unix_socket_ready(self, path: str) -> bool:
         _ = path
@@ -482,12 +477,9 @@ class ResourceLedgerTests(HarnessCase):
         with self.assertRaises(UnownedResourceError):
             ledger.record_resource("listener", 22)
         with self.assertRaises(UnownedResourceError):
-            ledger.record_resource("pool", "tank")
-        with self.assertRaises(UnownedResourceError):
             ledger.record_resource("prefix", "someone-elses/prefix")
         with self.assertRaises(UnownedResourceError):
             ledger.record_resource("path", "/var/tmp/other")
-        ledger.record_resource("pool", f"zerofs-tiered-{RUN_UUID}")
         with self.assertRaises(UnownedResourceError):
             ledger.record_resource("process", 4321)
         _ = config
@@ -678,26 +670,22 @@ class CleanupTests(HarnessCase):
         self.assertFalse(config.resource_root.exists())
         lifecycle.cleanup(ResourceLedger.load(config.ledger_path))
 
-    def test_cleanup_tears_down_recorded_processes_mounts_devices_pools(self) -> None:
+    def test_cleanup_tears_down_recorded_processes_mounts_and_devices(self) -> None:
         config = self.make_config()
         lifecycle, runner, probes, ledger = self.setup_run(config)
         mountpoint = config.resource_root / "mnt" / "nfs"
-        pool = f"zerofs-tiered-{RUN_UUID}"
         ledger.record_resource("unit", config.unit_name)
         ledger.record_resource("process", 4242, unit=config.unit_name)
         ledger.record_resource("listener", 12049)
         ledger.record_resource("mount", str(mountpoint))
         ledger.record_resource("device", "/dev/nbd7")
-        ledger.record_resource("pool", pool)
         probes.alive_pids.add(4242)  # PID was reused by an unrelated process.
         probes.active_units.add(config.unit_name)
         probes.unit_pids[config.unit_name] = 99999
         probes.active_mounts.add(str(mountpoint))
         probes.attached_devices.add("/dev/nbd7")
-        probes.pools.add(pool)
         lifecycle.cleanup(ledger)
         commands = [args for args, _ in runner.calls]
-        self.assertIn(("zpool", "destroy", pool), commands)
         self.assertIn((NBD_CLIENT, "-d", "/dev/nbd7"), commands)
         self.assertIn(("umount", str(mountpoint)), commands)
         self.assertNotIn(("kill", "-9", "4242"), commands)
@@ -976,21 +964,13 @@ class ScenarioPlanTests(HarnessCase):
                         {(resource.kind, resource.value) for resource in step.acquires},
                     )
 
-    def test_crash_plans_ledger_mount_pool_device_and_listener_lifecycles(self) -> None:
+    def test_crash_plans_ledger_mount_device_and_listener_lifecycles(self) -> None:
         xfs = SCENARIOS["xfs-over-nbd-restart"](self.context())
-        zfs = SCENARIOS["zfs-over-nbd-restart"](self.context())
         matrix = SCENARIOS["crash-boundary-matrix"](self.context())
         self.assertTrue(
             any(
                 resource.kind == "mount"
                 for step in xfs.steps
-                for resource in step.acquires
-            )
-        )
-        self.assertTrue(
-            any(
-                resource.kind == "pool"
-                for step in zfs.steps
                 for resource in step.acquires
             )
         )
@@ -1222,26 +1202,6 @@ class LinuxSuiteTests(HarnessCase):
             },
         )
 
-    def test_kernel_archive_pin_matches_the_contract(self) -> None:
-        self.assertEqual(
-            linux_suites.KERNEL_ARCHIVE_URL,
-            "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.tar.xz",
-        )
-        self.assertEqual(
-            linux_suites.KERNEL_ARCHIVE_SHA256,
-            "9106a4605da9e31ff17659d958782b815f9591ab308d03b0ee21aad6c7dced4b",
-        )
-
-    def test_kernel_archive_verification_rejects_a_mismatched_hash(self) -> None:
-        archive = self.base / "linux-6.18.tar.xz"
-        archive.write_bytes(b"definitely not the kernel")
-        with self.assertRaises(IntegrityError):
-            linux_suites.verify_kernel_archive(archive)
-        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-        self.assertEqual(
-            linux_suites.verify_kernel_archive(archive, expected=digest), digest
-        )
-
     def test_kernel_plans_verify_the_archive_before_extraction(self) -> None:
         config = self.make_config()
         context = ScenarioContext(
@@ -1250,18 +1210,26 @@ class LinuxSuiteTests(HarnessCase):
             zerofs_config=self.zerofs_config,
         )
         plan = SCENARIOS["kernel-compile-nfs"](context)
-        rendered = [" ".join(step.argv) for step in plan.steps]
-        verify_index = next(
-            index
-            for index, text in enumerate(rendered)
-            if linux_suites.KERNEL_ARCHIVE_SHA256 in text
+        download = next(
+            (index, step.argv)
+            for index, step in enumerate(plan.steps)
+            if len(step.argv) > 1 and Path(step.argv[1]).name == "fetch-linux-source.py"
         )
-        extract_index = next(
-            index for index, text in enumerate(rendered) if text.startswith("tar ")
+        extract = next(
+            (index, step.argv)
+            for index, step in enumerate(plan.steps)
+            if step.argv[0] == "tar"
         )
-        self.assertLess(verify_index, extract_index)
-        download = next(text for text in rendered if "curl" in text)
-        self.assertIn(linux_suites.KERNEL_ARCHIVE_URL, download)
+        self.assertLess(download[0], extract[0])
+        archive = config.tools_root / "linux-6.18.tar.xz"
+        self.assertEqual(
+            download[1][2:],
+            (
+                "--version", "6.18", "--output", str(archive), "--sha256",
+                "9106a4605da9e31ff17659d958782b815f9591ab308d03b0ee21aad6c7dced4b",
+            ),
+        )
+        self.assertEqual(extract[1][-1], str(archive))
 
     def test_tool_checkouts_stay_under_the_resource_root_tools_dir(self) -> None:
         config = self.make_config()
@@ -1494,7 +1462,6 @@ class RunScenarioTests(HarnessCase):
     def test_every_crash_plan_balances_its_runtime_resources(self) -> None:
         for scenario in (
             "xfs-over-nbd-restart",
-            "zfs-over-nbd-restart",
             "crash-boundary-matrix",
             "local-receipt-restart",
             "remote-receipt-clean-cache-restart",
@@ -1874,7 +1841,6 @@ TIERED_WORKFLOW_LEGS = {
         "stress-ng-nfs-ninep",
         False,
     ),
-    "zfs-test.yml": ("zfs-test", "zfs-test-tiered", "zfs-over-nbd-restart", True),
     "xfs-nbd.yml": ("xfs-nbd", "xfs-nbd-tiered", "xfs-over-nbd-restart", True),
 }
 

@@ -52,12 +52,11 @@ separate failures; transport retry must not conceal them.
 
 ## FreeBSD journal inspection
 
-FreeBSD uses `/dev/fd` to reopen the already validated, pinned journal descriptor
-for read-only identity checks. Mount `fdescfs` at `/dev/fd` before running ZeroFS;
-plain `devfs` exposes only descriptors 0–2. A missing descriptor path fails closed
-and never falls back to reopening the journal by its mutable filename. The native
-FreeBSD cross-compile job mounts `fdescfs` and runs the existing descriptor test,
-which replaces the pathname and checks both original identity and writer locking.
+Offline recovery reads the persisted identity through a pinned read-only file
+descriptor while holding the journal's owner lock. The FreeBSD CI guest runs
+the shipping recovery CLI against a temporary journal. It verifies that a live
+lock and a mismatched identity each prevent mutation, then seeds a predecessor
+using the matching config after the lock is released.
 
 ## Regression evidence
 

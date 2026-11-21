@@ -1,0 +1,61 @@
+# Parser/admission test only. The credentials and UUIDs are synthetic.
+[runtime]
+profile = "raw-device-p3-nas-fit-v1"
+
+[cache]
+dir = "/fixture/unused-clean-cache"
+disk_size_gb = 0.0
+memory_size_gb = 0.064
+warm_metadata = "off"
+
+[storage]
+url = "raw+p3-disk:///nvme?pool=10000000-0000-0000-0000-000000000000&member=20000000-0000-0000-0000-000000000000&layout_bytes=64424509440,134217728,3221225472,16777216,33554432,932374601728"
+encryption_password = "disposable-raw-mounted-fixture"
+
+[storage.pool]
+segment_placement = "round_robin_local"
+
+[[storage.pool.members]]
+id = "hdd6"
+url = "raw+disk:///hdd6?pool=10000000-0000-0000-0000-000000000000&member=30000000-0000-0000-0000-000000000000"
+capacity_gb = 6001.175126016
+reserve_free_gb = 61.0
+
+[[storage.pool.members]]
+id = "hdd18"
+url = "raw+disk:///hdd18?pool=10000000-0000-0000-0000-000000000000&member=40000000-0000-0000-0000-000000000000"
+capacity_gb = 18000.207937536
+reserve_free_gb = 181.0
+
+[writeback]
+enabled = true
+dir = "/fixture/unused-directory-journal"
+ack_mode = "memory"
+memory_size_gb = 0.100663296
+disk_size_gb = 10.73741824
+min_free_gb = 4.294967296
+local_concurrency = 1
+upload_concurrency = 2
+shutdown_flush = "local"
+
+[filesystem]
+name_mode = "insensitive"
+compression = "lz4"
+ignore_fsync = false
+write_ack_mode = "volatile_memory"
+volatile_memory_gb = 0.016777216
+volatile_max_operations = 128
+
+[servers.ninep]
+unix_socket = "/fixture/9p.sock"
+
+[servers.rpc]
+unix_socket = "/fixture/admin.sock"
+
+[servers.webui]
+addresses = ["127.0.0.1:8080"]
+uid = 1000
+gid = 1000
+
+[telemetry]
+enabled = false

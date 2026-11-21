@@ -1,0 +1,6 @@
+PROBE first fsync Err(NoSpace)
+PROBE round 0 tombstone_gc=Ok(()) reclaim=Err(NoSpace) fsync=Err(NoSpace) used_a=25214053 used_b=0 retained=(1, 33618396)
+PROBE round 1 tombstone_gc=Ok(()) reclaim=Err(NoSpace) fsync=Err(NoSpace) used_a=25214053 used_b=0 retained=(1, 33618396)
+PROBE round 2 tombstone_gc=Ok(()) reclaim=Err(NoSpace) fsync=Err(NoSpace) used_a=25214053 used_b=0 retained=(1, 33618396)
+PROBE round 3 tombstone_gc=Ok(()) reclaim=Err(NoSpace) fsync=Err(NoSpace) used_a=25214053 used_b=0 retained=(1, 33618396)
+PROBE round 4 tombstone_gc=Ok(()) reclaim=Err(NoSpace) fsync=Err(NoSpace) used_a=25214053 used_b=0 retained=(1, 33618396)

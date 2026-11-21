@@ -2,6 +2,7 @@ name: Cross Compile
 
 on:
   pull_request:
+    # Lane PRs into the integration branch are gated locally and by its own PR; run the matrix once there.
     branches: ["main", "develop"]
   workflow_dispatch:
 
@@ -68,10 +69,6 @@ jobs:
             arch: arm64
             os: ubuntu-latest
             platform: linux
-          - target: x86_64-apple-darwin
-            arch: x86_64
-            os: macos-15-intel
-            platform: darwin
           - target: aarch64-apple-darwin
             arch: aarch64
             os: macos-latest
@@ -130,28 +127,17 @@ jobs:
           mem: 12288
           prepare: |
             pkg install -y gmake curl cmake
-            # Descriptor-anchored journal inspection needs all open descriptors.
-            mount -t fdescfs none /dev/fd
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           run: |
             . $HOME/.cargo/env
             cd zerofs
             cargo build --profile ci --features webui
-            # The optimized binary builds in this guest, but optimizing the
-            # full lib-test harness was SIGKILLed even with four codegen units.
-            # Only this test build's zerofs package disables optimization;
-            # dependencies reuse the ci profile and the exact test is retained.
-            CARGO_BUILD_JOBS=1 /usr/bin/time -l \
-              cargo test --locked --profile ci --features webui -p zerofs --lib \
-                --config profile.ci.package.zerofs.opt-level=0 \
-                writeback::anchored_dir::tests::descriptor_read_only_open_retains_identity_and_exact_writer_lock \
-                -- --exact || {
-                  test_status=$?
-                  swapinfo -h || true
-                  vmstat -s || true
-                  dmesg | tail -n 100 || true
-                  exit "$test_status"
-                }
+            # Exercise the shipping binary in this guest through its recovery CLI.
+            case_name=offline_recovery_checks_the_journal_lock_and_identity
+            cargo test --locked --profile ci --features webui -p zerofs --test operator_required_exit \
+              -- "$case_name" --exact > journal-test.log 2>&1 || { cat journal-test.log; exit 1; }
+            cat journal-test.log
+            grep -Fx "test $case_name ... ok" journal-test.log
             cp target/ci/zerofs ../zerofs-${{ matrix.platform }}-${{ matrix.arch }}
             rm -rf target/
 

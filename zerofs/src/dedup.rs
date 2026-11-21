@@ -281,6 +281,11 @@ struct TimedResult {
     /// The entry remains only while already-issued replay guards are pinned,
     /// so their drops can balance the replay-pin counters.
     retracted: bool,
+
+    /// This result still holds its inode's replay protection. It stops when
+    /// the creating session shows it has the reply; see
+    /// [`DedupCache::release_create_protection`].
+    protects_inode: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -368,7 +373,15 @@ impl Inner {
         let Some(OpState::Complete(entry)) = self.entries.remove(op_id) else {
             unreachable!("remove_result is only called for a completed entry")
         };
-        let inode_id = entry.value.replay_inode()?;
+        if !entry.protects_inode {
+            return None;
+        }
+        self.unprotect_inode(entry.value.replay_inode()?)
+    }
+
+    /// Drops one reference to an inode's replay protection. Returns the inode
+    /// when that was the last one and an unlink deferred its reclaim.
+    fn unprotect_inode(&mut self, inode_id: InodeId) -> Option<InodeId> {
         let protection = self.protected_inodes.get_mut(&inode_id).unwrap();
         protection.refs -= 1;
         if protection.refs == 0 {
@@ -785,6 +798,7 @@ impl DedupCache {
 
         let expires_at = now + self.retention;
         inner.protect_result_inode(&result, expires_at);
+        let protects_inode = result.replay_inode().is_some();
         let previous = inner.entries.insert(
             op_id,
             OpState::Complete(TimedResult {
@@ -794,6 +808,7 @@ impl DedupCache {
                 write_request,
                 materialization_pending,
                 retracted: false,
+                protects_inode,
             }),
         );
         self.expiry_tx
@@ -956,6 +971,27 @@ impl DedupCache {
 
     pub(crate) fn protects_replay_inode(&self, inode_id: InodeId) -> bool {
         self.replay_inode_protected_until(inode_id).is_some()
+    }
+
+    /// Ends the inode protection of the create `op_id` once the session that
+    /// sent it clunks the fid the create opened. A client resends a create
+    /// only while its caller still waits for the reply, so after that clunk
+    /// no retry of this create can arrive and an unlink need not keep the
+    /// inode, or its bytes, for the rest of the retention period. The result
+    /// itself stays until it expires. A session that ends without the clunk
+    /// keeps the protection, since its reply may have been lost.
+    pub(crate) fn release_create_protection(&self, op_id: &OpId) {
+        let mut inner = self.inner.lock().unwrap();
+        let inode_id = match inner.entries.get_mut(op_id) {
+            Some(OpState::Complete(entry)) if entry.protects_inode => {
+                entry.protects_inode = false;
+                entry.value.replay_inode()
+            }
+            _ => None,
+        };
+        let reclaim = inode_id.and_then(|inode_id| inner.unprotect_inode(inode_id));
+        drop(inner);
+        self.notify_reclaim(reclaim);
     }
 
     /// Schedule reclaim when the inode's final replay protection expires.
@@ -1405,6 +1441,35 @@ mod tests {
         }
         assert_eq!(cache.stats().retained_results, EXPIRY_REAP_BATCH * 2 + 17);
         assert!(cache.protects_replay_inode(44));
+
+        tokio::time::advance(retention).await;
+        wait_for_retained_results(&cache, 0).await;
+        assert!(!cache.protects_replay_inode(44));
+    }
+
+    /// Releasing one create's protection keeps another create's protection
+    /// of the same inode, and expiry after a release drops nothing twice.
+    #[tokio::test(start_paused = true)]
+    async fn released_create_protection_is_not_dropped_again_at_expiry() {
+        let retention = Duration::from_secs(10);
+        let cache = delay_queue_cache(retention, true);
+        let create = || DedupResult::Create {
+            inode_id: 44,
+            attrs: FileAttributes::default(),
+        };
+        cache.record_result(numbered_id(1), create());
+        cache.record_result(numbered_id(2), create());
+
+        cache.release_create_protection(&numbered_id(1));
+        cache.release_create_protection(&numbered_id(1));
+        assert!(
+            cache.protects_replay_inode(44),
+            "the second create still protects the inode"
+        );
+        assert!(cache.get(&numbered_id(1)).is_some(), "the result stays");
+
+        cache.release_create_protection(&numbered_id(2));
+        assert!(!cache.protects_replay_inode(44));
 
         tokio::time::advance(retention).await;
         wait_for_retained_results(&cache, 0).await;

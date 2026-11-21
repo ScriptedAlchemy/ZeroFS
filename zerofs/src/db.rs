@@ -104,12 +104,18 @@ pub static DST_PANIC_ON_WRITE_ERROR: std::sync::atomic::AtomicBool =
 /// Fatal handler for SlateDB write errors.
 /// After a write failure, the database state is unknown. Exit and let
 /// the eventual orchestrator restart the service to rebuild from a known-good state.
-pub(crate) fn exit_on_write_error(err: impl std::fmt::Display) -> ! {
+/// A write that failed because the local metadata store refused it carries
+/// that refusal in its causes, and exits with the status that asks for an
+/// operator instead, because a restart reads the same failing device.
+pub(crate) fn exit_on_write_error(
+    err: impl Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
+) -> ! {
+    let err = err.into();
     if DST_PANIC_ON_WRITE_ERROR.load(std::sync::atomic::Ordering::Relaxed) {
         panic!("dst: simulated process death on write error: {err}");
     }
     tracing::error!("Fatal write error, exiting: {}", err);
-    std::process::exit(1)
+    crate::operator_required::ServerExit::exit_now(err.as_ref())
 }
 
 enum TxOp {
@@ -592,12 +598,101 @@ impl Db {
         false
     }
 
+    /// The underlying SlateDB writer, for checkpoint creation by the
+    /// metadata-survival owner. `None` for a read-only reader.
+    pub(crate) fn raw_writer(&self) -> Option<Arc<slatedb::Db>> {
+        match &self.inner {
+            SlateDbHandle::ReadWrite(db) => Some(Arc::clone(db)),
+            SlateDbHandle::ReadOnly(_) => None,
+        }
+    }
+
     pub(crate) fn is_read_only(&self) -> bool {
         self.inner.is_read_only()
     }
 
     pub async fn get_bytes(&self, key: &Bytes) -> Result<Option<Bytes>> {
         self.get_bytes_at(key, DurabilityLevel::Memory).await
+    }
+
+    /// Read two distinct, ascending keys from one committed view. Permission
+    /// checks use this to keep inode mode/ownership and its ACL in agreement.
+    pub(crate) async fn get_pair_snapshot(
+        &self,
+        first: &Bytes,
+        second: &Bytes,
+    ) -> Result<(Option<Bytes>, Option<Bytes>)> {
+        self.get_pair_snapshot_after_first(first, second, std::future::ready(()))
+            .await
+    }
+
+    /// The hook lets regressions commit or refresh the database between reads;
+    /// the serving path uses an immediately ready future.
+    async fn get_pair_snapshot_after_first(
+        &self,
+        first: &Bytes,
+        second: &Bytes,
+        after_first: impl std::future::Future<Output = ()>,
+    ) -> Result<(Option<Bytes>, Option<Bytes>)> {
+        self.check_lease()?;
+        anyhow::ensure!(
+            first < second,
+            "snapshot pair keys must be strictly ascending"
+        );
+        let pair = match &self.inner {
+            SlateDbHandle::ReadWrite(db) => {
+                let snapshot = db.snapshot().await?;
+                let options = ReadOptions {
+                    durability_filter: DurabilityLevel::Memory,
+                    cache_blocks: true,
+                    ..Default::default()
+                };
+                let first_value = snapshot.get_with_options(first, &options).await?;
+                after_first.await;
+                let second_value = snapshot.get_with_options(second, &options).await?;
+                (first_value, second_value)
+            }
+            SlateDbHandle::ReadOnly(readers) => {
+                // DbReader has no point-read snapshot API. One scan retains
+                // its immutable reader state and sequence through seek, even
+                // if background refresh or a reader swap runs between keys.
+                let reader = readers.load_full();
+                let options = ScanOptions {
+                    durability_filter: DurabilityLevel::Memory,
+                    read_ahead_bytes: 1,
+                    cache_blocks: true,
+                    max_fetch_tasks: 1,
+                    ..Default::default()
+                };
+                let mut iter = reader
+                    .scan_with_options(first.clone()..=second.clone(), &options)
+                    .await?;
+                let row = iter.next().await?;
+                after_first.await;
+                let pair = match row {
+                    None => (None, None),
+                    // If the first key is absent, the first row may already
+                    // be the second key. Seeking backward to it is invalid.
+                    Some(row) if row.key == *second => (None, Some(row.value)),
+                    Some(row) => {
+                        let first_value = (row.key == *first).then_some(row.value);
+                        iter.seek(second).await?;
+                        let second_value = iter
+                            .next()
+                            .await?
+                            .filter(|row| row.key == *second)
+                            .map(|row| row.value);
+                        (first_value, second_value)
+                    }
+                };
+                drop(iter);
+                drop(reader);
+                pair
+            }
+        };
+        // Never publish values captured across loss of serving authority.
+        self.check_lease()?;
+        Ok(pair)
     }
 
     /// Point read for commit-worker internal work.
@@ -697,23 +792,7 @@ impl Db {
     pub(crate) async fn scan_metadata_snapshot(
         &self,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<(Bytes, Bytes)>> + Send + '_>>> {
-        self.check_lease()?;
-        let options = ScanOptions {
-            read_ahead_bytes: 1,
-            cache_blocks: false,
-            max_fetch_tasks: 1,
-            ..Default::default()
-        };
-        let (iter, snapshot) = match &self.inner {
-            SlateDbHandle::ReadWrite(db) => {
-                let snapshot = db.snapshot().await?;
-                let iter = snapshot.scan_with_options(.., &options).await?;
-                (iter, Some(snapshot))
-            }
-            SlateDbHandle::ReadOnly(reader) => {
-                (reader.load().scan_with_options(.., &options).await?, None)
-            }
-        };
+        let (iter, snapshot) = self.metadata_snapshot_range(..).await?;
         Ok(Box::pin(futures::stream::try_unfold(
             (iter, snapshot),
             |(mut iter, snapshot)| async move {
@@ -723,6 +802,30 @@ impl Db {
                 }
             },
         )))
+    }
+
+    pub(crate) async fn metadata_snapshot_range<R: slatedb::ByteRangeBounds + Send>(
+        &self,
+        range: R,
+    ) -> Result<(slatedb::DbIterator, Option<Arc<slatedb::DbSnapshot>>)> {
+        self.check_lease()?;
+        let options = ScanOptions {
+            read_ahead_bytes: 1,
+            cache_blocks: false,
+            max_fetch_tasks: 1,
+            ..Default::default()
+        };
+        Ok(match &self.inner {
+            SlateDbHandle::ReadWrite(db) => {
+                let snapshot = db.snapshot().await?;
+                let iter = snapshot.scan_with_options(range, &options).await?;
+                (iter, Some(snapshot))
+            }
+            SlateDbHandle::ReadOnly(reader) => (
+                reader.load().scan_with_options(range, &options).await?,
+                None,
+            ),
+        })
     }
 
     pub(crate) async fn scan_bounded<R: slatedb::ByteRangeBounds + Send>(
@@ -1182,6 +1285,9 @@ async fn forward_scan<S: ScanSource>(
         }
     }
 }
+
+#[cfg(test)]
+mod permission_snapshot_tests;
 
 #[cfg(test)]
 mod warm_tracker_tests {

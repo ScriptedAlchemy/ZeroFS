@@ -3,6 +3,7 @@ name: fuzz
 on:
   # Short smoke on relevant PRs, plus a longer nightly run.
   pull_request:
+    # Lane PRs into the integration branch are gated locally and by its own PR; run the matrix once there.
     branches: ["main", "develop"]
     paths:
       - "zerofs/ninep-proto/**"

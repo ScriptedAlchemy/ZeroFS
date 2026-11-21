@@ -1,0 +1,545 @@
+import { Code } from "@connectrpc/connect";
+
+export type Value<T> = { state: "known"; value: T } | { state: "unavailable"; reason: string };
+
+export const known = <T>(value: T): Value<T> => ({ state: "known", value });
+export const unavailable = (reason: string): { state: "unavailable"; reason: string } => ({
+  state: "unavailable",
+  reason,
+});
+
+type JsonObject = Record<string, unknown>;
+const object = (value: unknown): JsonObject | undefined =>
+  value !== null && typeof value === "object" && !Array.isArray(value) ? (value as JsonObject) : undefined;
+
+function field<T>(row: JsonObject, key: string, accepts: (value: unknown) => value is T): Value<T> {
+  if (!(key in row)) return unavailable(`${key} was not reported by the server`);
+  return accepts(row[key]) ? known(row[key]) : unavailable(`${key} has an unsupported value`);
+}
+
+const text = (value: unknown): value is string => typeof value === "string";
+const count = (value: unknown): value is number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+const flag = (value: unknown): value is boolean => typeof value === "boolean";
+const nullableText = (value: unknown): value is string | null => value === null || text(value);
+
+function list<T>(row: JsonObject, key: string, parse: (value: unknown) => Value<T>): Value<T[]> {
+  const raw = row[key];
+  if (!Array.isArray(raw)) return unavailable(`${key} was not reported as an array`);
+  const result: T[] = [];
+  for (const item of raw) {
+    const parsed = parse(item);
+    if (parsed.state === "unavailable") return unavailable(`${key}: ${parsed.reason}`);
+    result.push(parsed.value);
+  }
+  return known(result);
+}
+
+const stringValue = (raw: unknown): Value<string> => (text(raw) ? known(raw) : unavailable("expected text"));
+
+/** One unreadable segment record from the pool catalog. */
+export interface SegmentFault {
+  location: string;
+  memberId: string;
+  reason: string;
+  attempts: number;
+  /** Server wall-clock milliseconds when the fault was last recorded. */
+  observedMs: number;
+  /** Server wall-clock milliseconds before which the read is not retried. */
+  nextRetryMs: number;
+}
+
+// Every field is required. A fault that cannot be shown whole makes the list unavailable rather than
+// being dropped or shown with a guessed reason, attempt count or retry time.
+function segmentFault(raw: unknown): Value<SegmentFault> {
+  const row = object(raw);
+  if (!row) return unavailable("invalid fault record");
+  const location = field(row, "location", text);
+  if (location.state === "unavailable") return location;
+  const memberId = field(row, "member_id", text);
+  if (memberId.state === "unavailable") return memberId;
+  const reason = field(row, "reason", text);
+  if (reason.state === "unavailable") return reason;
+  const attempts = field(row, "attempts", count);
+  if (attempts.state === "unavailable") return attempts;
+  const observedMs = field(row, "observed_ms", count);
+  if (observedMs.state === "unavailable") return observedMs;
+  const nextRetryMs = field(row, "next_retry_ms", count);
+  if (nextRetryMs.state === "unavailable") return nextRetryMs;
+  return known({
+    location: location.value,
+    memberId: memberId.value,
+    reason: reason.value,
+    attempts: attempts.value,
+    observedMs: observedMs.value,
+    nextRetryMs: nextRetryMs.value,
+  });
+}
+
+type FullReason = { reason: "write_returned_no_space"; sinceMs: Value<number> } | { reason: "below_free_space_reserve" };
+
+function fullReason(raw: unknown): Value<FullReason | null> {
+  if (raw === null) return known(null);
+  const full = object(raw);
+  if (full?.reason === "write_returned_no_space")
+    return known({ reason: full.reason, sinceMs: field(full, "since_ms", count) });
+  if (full?.reason === "below_free_space_reserve") return known({ reason: full.reason });
+  return unavailable(raw === undefined ? "full was not reported by the server" : "unrecognized full condition");
+}
+
+interface SmartSample {
+  device: Value<string>;
+  failed: Value<boolean>;
+  reallocated: Value<number | null>;
+  pending: Value<number | null>;
+  uncorrectable: Value<number | null>;
+  crc: Value<number | null>;
+}
+
+export interface MemberStatus {
+  id: Value<string>;
+  capacity: Value<number>;
+  filesystemFree: Value<number | null>;
+  filesystemTotal: Value<number | null>;
+  declaredExceedsFilesystem: Value<boolean>;
+  full: Value<FullReason | null>;
+  used: Value<number>;
+  reserved: Value<number>;
+  available: Value<number>;
+  objects: Value<number>;
+  pendingUploads: Value<number>;
+  cleanupDebts: Value<number>;
+  unreadableObjects: Value<number>;
+  evacuation: Value<string>;
+  safeToRemove: Value<boolean>;
+  safeToPullWithKnownLoss: Value<boolean>;
+  readableEvacuated: Value<boolean>;
+  quarantine: Value<string | null>;
+  /** When the current quarantine began. Null means the server recorded no start time. */
+  quarantineSinceMs: Value<number | null>;
+  monitoringError: Value<string | null>;
+  warning: Value<string | null>;
+  evacuationError: Value<string | null>;
+  /** Free text from the server's kernel error watcher. Null means it has never reported. */
+  kernelCoverage: Value<string | null>;
+  /** Counters retained by the server across samples, including individually absent readings. */
+  smartSample: Value<SmartSample | null>;
+  crcIncreases: Value<number>;
+  evacuationRequired: Value<number>;
+  evacuationReserved: Value<number>;
+  evacuationAvailable: Value<number>;
+  evacuationCapacitySufficient: Value<boolean>;
+  /** Members whose binding or free-space check failed when the server computed evacuation capacity. */
+  unavailableMembers: Value<string[]>;
+  observedMs: Value<number>;
+  /** How long before the status was assembled the health observation was made, on the server's clock. */
+  observationAgeMs: Value<number>;
+  /** This member's unreadable segment records, taken from the pool's fault list. */
+  faults: Value<SegmentFault[]>;
+}
+
+const nullableCount = (value: unknown): value is number | null => value === null || count(value);
+
+function member(raw: unknown, poolFaults: Value<SegmentFault[]>, generatedMs: Value<number>): Value<MemberStatus> {
+  const row = object(raw);
+  if (!row) return unavailable("invalid member record");
+  const id = field(row, "id", text);
+  const health = object(row.health);
+  const sample = object(health?.last_sample);
+  const space = object(row.space) ?? {};
+  const evacuationCapacity = object(row.evacuation_capacity);
+  const observedMs: Value<number> =
+    health?.observed_ms === null
+      ? unavailable("No health observation has been reported")
+      : health
+        ? field(health, "observed_ms", count)
+        : unavailable("health was not reported");
+  const healthText = (key: string) =>
+    health ? field(health, key, nullableText) : unavailable("health was not reported");
+  return known({
+    id,
+    capacity: field(row, "capacity_bytes", count),
+    filesystemFree: field(space, "filesystem_free_bytes", nullableCount),
+    filesystemTotal: field(space, "filesystem_total_bytes", nullableCount),
+    declaredExceedsFilesystem: field(space, "declared_exceeds_filesystem", flag),
+    full: fullReason(space.full),
+    used: field(row, "used_bytes", count),
+    reserved: field(row, "reserved_bytes", count),
+    available: field(row, "available_bytes", count),
+    objects: field(row, "objects", count),
+    pendingUploads: field(row, "pending_uploads", count),
+    cleanupDebts: field(row, "cleanup_debts", count),
+    unreadableObjects: field(row, "unreadable_objects", count),
+    evacuation: field(row, "evacuation", text),
+    safeToRemove: field(row, "safe_to_remove", flag),
+    safeToPullWithKnownLoss: field(row, "safe_to_pull_with_known_loss", flag),
+    readableEvacuated: field(row, "readable_evacuated", flag),
+    quarantine: healthText("quarantine"),
+    quarantineSinceMs: health ? field(health, "since_ms", nullableCount) : unavailable("health was not reported"),
+    monitoringError: healthText("monitoring_error"),
+    warning: healthText("warning"),
+    evacuationError: healthText("evacuation_error"),
+    kernelCoverage: healthText("kernel_coverage"),
+    smartSample: sample
+      ? known({
+          device: field(sample, "device", text),
+          failed: field(sample, "failed", flag),
+          reallocated: field(sample, "reallocated", nullableCount),
+          pending: field(sample, "pending", nullableCount),
+          uncorrectable: field(sample, "uncorrectable", nullableCount),
+          crc: field(sample, "crc", nullableCount),
+        })
+      : health?.last_sample === null
+        ? known(null)
+        : unavailable(health?.last_sample === undefined ? "last_sample was not reported by the server" : "last_sample has an unsupported value"),
+    crcIncreases: field(health ?? {}, "crc_increases", count),
+    evacuationRequired: field(evacuationCapacity ?? {}, "required_bytes", count),
+    evacuationReserved: field(evacuationCapacity ?? {}, "reserved_destination_bytes", count),
+    evacuationAvailable: field(evacuationCapacity ?? {}, "available_bytes", count),
+    evacuationCapacitySufficient: evacuationCapacity
+      ? field(evacuationCapacity, "sufficient", flag)
+      : unavailable("evacuation_capacity was not reported by the server"),
+    unavailableMembers: evacuationCapacity
+      ? list(evacuationCapacity, "unavailable_members", stringValue)
+      : unavailable("evacuation_capacity was not reported by the server"),
+    observedMs,
+    observationAgeMs:
+      observedMs.state === "unavailable"
+        ? observedMs
+        : generatedMs.state === "unavailable"
+          ? generatedMs
+          : known(generatedMs.value - observedMs.value),
+    faults:
+      poolFaults.state === "unavailable"
+        ? poolFaults
+        : id.state === "unavailable"
+          ? unavailable("member id was not reported, so its faults cannot be matched")
+          : known(poolFaults.value.filter((fault) => fault.memberId === id.value)),
+  });
+}
+
+export interface PoolStatus {
+  id: Value<string>;
+  /** Server wall-clock milliseconds when the status was assembled. */
+  generatedMs: Value<number>;
+  members: Value<MemberStatus[]>;
+  pendingOperations: Value<number>;
+  mappedObjects: Value<number>;
+  unreadableObjects: Value<number>;
+  /** Faults whose member id names no reported member, such as legacy objects in the authority store. */
+  unattributedFaults: Value<SegmentFault[]>;
+  quarantinedLeftovers: Value<number>;
+}
+
+function arrayLength(row: JsonObject, key: string): Value<number> {
+  return Array.isArray(row[key]) ? known(row[key].length) : unavailable(`${key} was not reported as an array`);
+}
+
+export function parsePoolStatus(json: string): Value<PoolStatus> {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(json);
+  } catch {
+    return unavailable("Pool status is not valid JSON");
+  }
+  const row = object(raw);
+  if (!row) return unavailable("Pool status is not an object");
+  const faults = list(row, "unreadable", segmentFault);
+  const generatedMs = field(row, "generated_ms", count);
+  const members = list(row, "members", (raw) => member(raw, faults, generatedMs));
+  const ids = new Set(
+    members.state === "known" ? members.value.flatMap((m) => (m.id.state === "known" ? [m.id.value] : [])) : [],
+  );
+  return known({
+    id: field(row, "pool_id", text),
+    generatedMs,
+    members,
+    pendingOperations: field(row, "pending_operations", count),
+    mappedObjects: field(row, "mapped_objects", count),
+    unreadableObjects: arrayLength(row, "unreadable"),
+    unattributedFaults:
+      faults.state === "unavailable"
+        ? faults
+        : members.state === "unavailable"
+          ? unavailable("members were not reported, so faults cannot be matched to them")
+          : known(faults.value.filter((fault) => !ids.has(fault.memberId))),
+    quarantinedLeftovers: arrayLength(row, "quarantined_leftovers"),
+  });
+}
+
+export type PoolResult =
+  | { state: "pool"; pool: PoolStatus }
+  | { state: "no-pool"; reason: string }
+  | { state: "unavailable"; reason: string };
+
+export function rpcFailure(error: unknown): { reason: string; noPool: boolean } {
+  const row = object(error);
+  const reason = error instanceof Error ? error.message : "Admin RPC failed";
+  return { reason, noPool: row?.code === Code.FailedPrecondition && row.rawMessage === "no permanent pool configured" };
+}
+
+export async function loadPoolStatus(request: () => Promise<{ json: string }>): Promise<PoolResult> {
+  try {
+    const result = parsePoolStatus((await request()).json);
+    return result.state === "known" ? { state: "pool", pool: result.value } : result;
+  } catch (error) {
+    const failure = rpcFailure(error);
+    return failure.noPool ? { state: "no-pool", reason: failure.reason } : unavailable(failure.reason);
+  }
+}
+
+export interface BytePath {
+  display: string;
+  hex: string;
+  utf8: boolean;
+}
+
+function bytePath(raw: unknown): Value<BytePath> {
+  if (!Array.isArray(raw) || !raw.every((byte) => count(byte) && byte <= 255) || raw[0] !== 47 || raw.includes(0)) {
+    return unavailable("path is not an absolute pathname byte array");
+  }
+  const bytes = Uint8Array.from(raw);
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(" ");
+  try {
+    const decoded = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+    const display = JSON.stringify(decoded)
+      .slice(1, -1)
+      .replace(/[\u007f-\u009f]/g, (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`);
+    return known({ display, hex, utf8: true });
+  } catch {
+    const display = Array.from(bytes, (byte) =>
+      byte >= 32 && byte <= 126 && byte !== 92 ? String.fromCharCode(byte) : `\\x${byte.toString(16).padStart(2, "0")}`,
+    ).join("");
+    return known({ display, hex, utf8: false });
+  }
+}
+
+export interface AffectedReference {
+  inode: Value<number>;
+  extent: Value<number>;
+  segment: Value<string>;
+  paths: Value<BytePath[]>;
+}
+
+export interface AffectedView {
+  name: Value<string>;
+  references: Value<AffectedReference[]>;
+  unresolvedSegments: Value<string[]>;
+}
+
+export interface AffectedStatus {
+  member: Value<string>;
+  complete: Value<boolean>;
+  errors: Value<string[]>;
+  coverage: Value<string>;
+  views: Value<AffectedView[]>;
+  pathCount: Value<number>;
+}
+
+function reference(raw: unknown): Value<AffectedReference> {
+  const row = object(raw);
+  return row
+    ? known({
+        inode: field(row, "inode", count),
+        extent: field(row, "extent", count),
+        segment: field(row, "segment", text),
+        paths: list(row, "paths", bytePath),
+      })
+    : unavailable("invalid reference record");
+}
+
+function view(raw: unknown): Value<AffectedView> {
+  const row = object(raw);
+  return row
+    ? known({
+        name: field(row, "view", text),
+        references: list(row, "references", reference),
+        unresolvedSegments: list(row, "unresolved_segments", stringValue),
+      })
+    : unavailable("invalid view record");
+}
+
+function affectedCount(status: Omit<AffectedStatus, "pathCount">): Value<number> {
+  if (status.complete.state !== "known" || !status.complete.value)
+    return unavailable("Affected-path scan is incomplete or its completeness was not reported");
+  if (status.errors.state !== "known" || status.errors.value.length)
+    return unavailable("Affected-path scan errors are present or unavailable");
+  if (status.views.state !== "known" || !status.views.value.length)
+    return unavailable("No coherent metadata views were reported");
+  let total = 0;
+  for (const item of status.views.value) {
+    if (item.name.state !== "known" || item.references.state !== "known" || item.unresolvedSegments.state !== "known")
+      return unavailable("A metadata view is incomplete");
+    const paths = new Set<string>();
+    for (const ref of item.references.value) {
+      if (
+        ref.inode.state !== "known" ||
+        ref.extent.state !== "known" ||
+        ref.segment.state !== "known" ||
+        ref.paths.state !== "known"
+      )
+        return unavailable("An affected reference is incomplete");
+      for (const path of ref.paths.value) paths.add(path.hex);
+    }
+    total += paths.size;
+  }
+  return known(total);
+}
+
+export function parseAffectedStatus(json: string, expectedMember: string): Value<AffectedStatus> {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(json);
+  } catch {
+    return unavailable("Affected-path status is not valid JSON");
+  }
+  const row = object(raw);
+  if (!row) return unavailable("Affected-path status is not an object");
+  const memberId = field(row, "member", text);
+  if (memberId.state !== "known" || memberId.value !== expectedMember)
+    return unavailable("Affected-path response does not identify the requested member");
+  const status = {
+    member: memberId,
+    complete: field(row, "complete", flag),
+    errors: list(row, "errors", stringValue),
+    coverage: field(row, "coverage", text),
+    views: list(row, "views", view),
+  };
+  return known({ ...status, pathCount: affectedCount(status) });
+}
+
+export interface CapacityBreakdown {
+  capacity: number;
+  used: number;
+  reserved: number;
+  available: number;
+  /** Capacity that is neither charged, reserved nor allocatable, such as the free-space reserve. */
+  held: number;
+}
+
+export function capacityBreakdown(member: MemberStatus): Value<CapacityBreakdown> {
+  const { capacity, used, reserved, available } = member;
+  for (const part of [capacity, used, reserved, available]) if (part.state === "unavailable") return part;
+  if (capacity.state !== "known" || used.state !== "known" || reserved.state !== "known" || available.state !== "known")
+    return unavailable("capacity was not reported");
+  if (capacity.value === 0) return unavailable("configured capacity is zero");
+  const held = capacity.value - used.value - reserved.value - available.value;
+  if (held < 0) return unavailable("reported usage exceeds the configured capacity");
+  return known({
+    capacity: capacity.value,
+    used: used.value,
+    reserved: reserved.value,
+    available: available.value,
+    held,
+  });
+}
+
+// The disk monitor sleeps 60 s between passes (poll_interval in zerofs/src/disk_health.rs) and each pass
+// runs smartctl on every monitored member in turn under a 10 s limit before recording the observation.
+// A pass therefore ends within 60 s plus 10 s per member, so a pool of up to 24 monitored members
+// refreshes every observation within five minutes even when every smartctl run hits its limit. An older
+// observation was not refreshed, for example because the member is no longer monitored but its last
+// observation is still in the catalog.
+export const STALE_OBSERVATION_MS = 5 * 60_000;
+
+export function formatAge(ms: number): string {
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) return `${seconds} s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  return hours < 24 ? `${hours} h` : `${Math.floor(hours / 24)} d`;
+}
+
+// The kernel watcher reports this text while it is reading the current boot's kernel ring.
+// Any other text means the watcher is missing, behind or broken.
+const KERNEL_WATCHER_RUNNING = "current boot kernel ring";
+
+export interface MemberHealth {
+  /** Problems the server reported. */
+  issues: { label: string; text: string }[];
+  /** Monitoring that is not running or has not reported, so "no issues" would overstate what is known. */
+  limits: { label: string; text: string }[];
+  unavailable: { label: string; reason: string }[];
+}
+
+/** Sorts health observations into reported problems, monitoring limits and fields the server did not supply. */
+export function memberHealth(member: MemberStatus): MemberHealth {
+  const health: MemberHealth = { issues: [], limits: [], unavailable: [] };
+  for (const [label, value] of [
+    ["Quarantine", member.quarantine],
+    ["Monitoring error", member.monitoringError],
+    ["Warning", member.warning],
+    ["Evacuation error", member.evacuationError],
+  ] as const) {
+    if (value.state === "unavailable") health.unavailable.push({ label, reason: value.reason });
+    else if (value.value !== null) health.issues.push({ label, text: value.value });
+  }
+  if (member.faults.state === "unavailable")
+    health.unavailable.push({ label: "Segment fault details", reason: member.faults.reason });
+  const unreadable = member.unreadableObjects;
+  if (unreadable.state === "unavailable")
+    health.unavailable.push({ label: "Unreadable objects", reason: unreadable.reason });
+  else if (unreadable.value > 0)
+    health.issues.push({ label: "Unreadable objects", text: unreadable.value.toLocaleString("en-US") });
+  const gone = member.unavailableMembers;
+  if (gone.state === "unavailable") health.unavailable.push({ label: "Member availability", reason: gone.reason });
+  else if (member.id.state === "known" && gone.value.includes(member.id.value))
+    health.issues.push({ label: "Member unavailable", text: "its storage binding or free-space check failed" });
+  const capacity = member.evacuationCapacitySufficient;
+  if (capacity.state === "unavailable")
+    health.unavailable.push({ label: "Evacuation capacity", reason: capacity.reason });
+  else if (!capacity.value)
+    health.limits.push({ label: "Evacuation capacity", text: "not enough healthy space to evacuate this member" });
+  const kernel = member.kernelCoverage;
+  if (kernel.state === "unavailable")
+    health.unavailable.push({ label: "Kernel error monitoring", reason: kernel.reason });
+  else if (kernel.value === null) health.limits.push({ label: "Kernel error monitoring", text: "has not reported" });
+  else if (!kernel.value.startsWith(KERNEL_WATCHER_RUNNING))
+    health.limits.push({ label: "Kernel error monitoring", text: kernel.value });
+  const age = member.observationAgeMs;
+  if (age.state === "unavailable") {
+    if (member.observedMs.state === "known") health.unavailable.push({ label: "Observation age", reason: age.reason });
+  } else if (age.value < 0)
+    health.limits.push({
+      label: "Health observation",
+      text: "is dated after the status was assembled, so the server clock moved back",
+    });
+  else if (age.value > STALE_OBSERVATION_MS)
+    health.limits.push({
+      label: "Health observation",
+      text: `last made ${formatAge(age.value)} before this status; the disk monitor normally refreshes it about once a minute`,
+    });
+  const smart = member.smartSample;
+  if (smart.state === "unavailable") health.unavailable.push({ label: "SMART sample", reason: smart.reason });
+  else if (smart.value === null) health.limits.push({ label: "SMART", text: "no sample recorded" });
+  return health;
+}
+
+export interface AffectedPath {
+  path: BytePath;
+  extents: number;
+}
+
+export interface ViewSummary {
+  paths: AffectedPath[];
+  /** References whose inode has no reachable pathname in this view. */
+  unreachableReferences: number;
+}
+
+/** Collapses a view's per-extent references into one row per pathname. */
+export function summarizeView(view: AffectedView): Value<ViewSummary> {
+  if (view.references.state === "unavailable") return view.references;
+  const paths = new Map<string, AffectedPath>();
+  let unreachableReferences = 0;
+  for (const ref of view.references.value) {
+    if (ref.paths.state === "unavailable") return ref.paths;
+    if (ref.paths.value.length === 0) unreachableReferences += 1;
+    for (const path of ref.paths.value) {
+      const seen = paths.get(path.hex);
+      if (seen) seen.extents += 1;
+      else paths.set(path.hex, { path, extents: 1 });
+    }
+  }
+  return known({ paths: [...paths.values()], unreachableReferences });
+}

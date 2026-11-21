@@ -7,7 +7,42 @@ permissions:
   contents: read
 
 jobs:
+  build-stress-ng:
+    name: Build the filesystem stress fixture
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ColinIanKing/stress-ng
+          ref: 00559dcb1bae3ef12295a1420683094a7d1389e0  # V0.20.01
+          path: stress-ng-src
+          persist-credentials: false
+
+      - name: Build patched stress-ng
+        working-directory: stress-ng-src
+        run: |
+          git apply "$GITHUB_WORKSPACE/scripts/ci/stress-ng-filesystem.patch"
+          python3 "$GITHUB_WORKSPACE/scripts/ci/test-stress-metamix-eintr.py" stress-metamix.c --scratch "$RUNNER_TEMP"
+          make -j"$(nproc)" STATIC=1
+
+      - name: Exercise the fixture on the runner filesystem
+        timeout-minutes: 10
+        working-directory: ${{ runner.temp }}
+        shell: bash
+        run: |
+          sudo "$GITHUB_WORKSPACE/stress-ng-src/stress-ng" --job "$GITHUB_WORKSPACE/.github/stress-ng-filesystem.job" 2>&1 | tee stress-ng.log
+          grep -F '] passed: 17:' stress-ng.log
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stress-ng-ci-bin
+          path: stress-ng-src/stress-ng
+          if-no-files-found: error
+          retention-days: 1
+
   stress-ng-nfs:
+    needs: build-stress-ng
     name: Run stress-ng test on NFS
     runs-on: ${{ matrix.os }}
     strategy:
@@ -48,7 +83,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y nfs-common stress-ng
+          sudo apt-get install -y nfs-common
 
       - name: Setup MinIO bucket
         run: |
@@ -57,12 +92,18 @@ jobs:
           ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
           ./mc mb myminio/zerofs-stress-test || true
 
+      - name: Fetch the filesystem stress fixture
+        uses: actions/download-artifact@v4
+        with:
+          name: stress-ng-ci-bin
+          path: zerofs/target/ci
+
       - name: Fetch the prebuilt ZeroFS binary
         uses: actions/download-artifact@v4
         with:
           name: zerofs-ci-bin
           path: zerofs/target/ci
-      - run: chmod +x zerofs/target/ci/zerofs
+      - run: chmod +x zerofs/target/ci/{zerofs,stress-ng}
 
       - name: Start ZeroFS
         working-directory: zerofs
@@ -99,7 +140,7 @@ jobs:
 
           # Wait for ZeroFS to start
           echo "Waiting for ZeroFS to start..."
-          for i in {1..30}; do
+          for _ in {1..30}; do
             if nc -z 127.0.0.1 2049; then
               echo "ZeroFS is ready"
               break
@@ -128,7 +169,7 @@ jobs:
         timeout-minutes: 10
         run: |
           cd /mnt/zerofs-nfs
-          sudo stress-ng --job "$GITHUB_WORKSPACE/.github/stress-ng-filesystem.job"
+          sudo "$GITHUB_WORKSPACE/zerofs/target/ci/stress-ng" --job "$GITHUB_WORKSPACE/.github/stress-ng-filesystem.job"
 
       - name: Cleanup
         if: always()
@@ -140,6 +181,7 @@ jobs:
           pkill -f "zerofs run -c zerofs-ci.toml" || true
 
   stress-ng-9p:
+    needs: build-stress-ng
     name: Run filesystem metadata stress test (${{ matrix.client }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -161,15 +203,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Fetch the filesystem stress fixture
+        uses: actions/download-artifact@v4
+        with:
+          name: stress-ng-ci-bin
+          path: zerofs/target/ci
+
       - name: Fetch the prebuilt ZeroFS binary
         uses: actions/download-artifact@v4
         with:
           name: zerofs-ci-bin
           path: zerofs/target/ci
 
-      - name: Make the ZeroFS binary executable
+      - name: Make the binaries executable
         shell: bash
-        run: chmod +x zerofs/target/ci/zerofs
+        run: chmod +x zerofs/target/ci/{zerofs,stress-ng}
 
       - name: Cache the Ubuntu guest image
         if: matrix.client == 'native'
@@ -214,11 +262,6 @@ jobs:
             fi
             sleep 1
           done
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y stress-ng
 
       - name: Load v9fs kernel modules
         if: matrix.client == 'v9fs'
@@ -270,11 +313,13 @@ jobs:
           EOF
 
           # Start ZeroFS in the background with 9P enabled
-          ./target/ci/zerofs run -c zerofs-ci.toml &
+          # Keep the log: when a stress run fails, it is the only record of what the
+          # server did, and this step's output ends before the stress run starts.
+          ./target/ci/zerofs run -c zerofs-ci.toml > /tmp/zerofs-ci.log 2>&1 &
 
           # Wait for ZeroFS to start (9P runs on port 5564)
           echo "Waiting for ZeroFS 9P server to start..."
-          for i in {1..30}; do
+          for _ in {1..30}; do
             if nc -z 127.0.0.1 5564 2>/dev/null; then
               echo "ZeroFS 9P server is ready"
               break
@@ -312,7 +357,13 @@ jobs:
         timeout-minutes: 10
         run: |
           cd /mnt/zerofs-9p
-          sudo stress-ng --job "$GITHUB_WORKSPACE/.github/stress-ng-filesystem.job"
+          sudo "$GITHUB_WORKSPACE/zerofs/target/ci/stress-ng" --job "$GITHUB_WORKSPACE/.github/stress-ng-filesystem.job"
+
+      - name: Show the server log and kernel messages after a failure
+        if: failure()
+        run: |
+          tail -n 300 /tmp/zerofs-ci.log || true
+          sudo dmesg | tail -n 150 || true
 
       - name: Cleanup
         if: always()
@@ -333,6 +384,7 @@ jobs:
         run: ./kernel/ci/qemu-vm.sh stop
 
   stress-ng-fuse:
+    needs: build-stress-ng
     name: Run stress-ng test on zerofs mount (FUSE)
     runs-on: ${{ matrix.os }}
     strategy:
@@ -373,7 +425,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y stress-ng fuse3
+          sudo apt-get install -y fuse3
 
       - name: Setup MinIO bucket
         run: |
@@ -382,12 +434,18 @@ jobs:
           ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
           ./mc mb myminio/zerofs-stress-test || true
 
+      - name: Fetch the filesystem stress fixture
+        uses: actions/download-artifact@v4
+        with:
+          name: stress-ng-ci-bin
+          path: zerofs/target/ci
+
       - name: Fetch the prebuilt ZeroFS binary
         uses: actions/download-artifact@v4
         with:
           name: zerofs-ci-bin
           path: zerofs/target/ci
-      - run: chmod +x zerofs/target/ci/zerofs
+      - run: chmod +x zerofs/target/ci/{zerofs,stress-ng}
 
       - name: Start ZeroFS with 9P support
         working-directory: zerofs
@@ -424,7 +482,7 @@ jobs:
 
           # Wait for ZeroFS to start (9P runs on port 5564)
           echo "Waiting for ZeroFS 9P server to start..."
-          for i in {1..30}; do
+          for _ in {1..30}; do
             if nc -z 127.0.0.1 5564 2>/dev/null; then
               echo "ZeroFS 9P server is ready"
               break
@@ -447,7 +505,7 @@ jobs:
           sudo ./target/ci/zerofs mount --access all 127.0.0.1:5564 /mnt/zerofs-fuse &
 
           echo "Waiting for the FUSE mount..."
-          for i in {1..60}; do
+          for _ in {1..60}; do
             mountpoint -q /mnt/zerofs-fuse && break
             sleep 0.5
           done
@@ -458,7 +516,7 @@ jobs:
         timeout-minutes: 10
         run: |
           cd /mnt/zerofs-fuse
-          sudo stress-ng --job "$GITHUB_WORKSPACE/.github/stress-ng-filesystem.job"
+          sudo "$GITHUB_WORKSPACE/zerofs/target/ci/stress-ng" --job "$GITHUB_WORKSPACE/.github/stress-ng-filesystem.job"
 
       - name: Cleanup
         if: always()
@@ -480,7 +538,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y nfs-common stress-ng
+          sudo apt-get install -y nfs-common
 
       - name: Load v9fs kernel modules
         run: |
