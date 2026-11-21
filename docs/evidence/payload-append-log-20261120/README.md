@@ -30,10 +30,11 @@ The P3 Journal region's data bytes are split at their midpoint.
   device. A record is acknowledged only after it returns.
 - Draining a record frees its log bytes from the tail. A reader pins its extent
   so a new batch cannot overwrite it.
-- After power loss redb can hold a commit whose payload bytes did not all reach
-  the device. Each commit stores the watermark that the previous flush covered,
-  so the records above it belong to the last commit. If one of them fails its
-  digest on open, all of them are dropped. None was acknowledged.
+- The measured implementation discarded a checksum-failing final commit using
+  a watermark from the previous flush. That watermark cannot establish whether
+  the final commit was acknowledged. PR review corrected recovery to stop on
+  any pending committed-payload mismatch and preserve the records for repair.
+  The measurements below predate that recovery correction.
 
 ## Fixture
 
@@ -232,8 +233,8 @@ not known either, so it may bound the copy before the lane does.
 
 ## Durability tests
 
-In `zerofs/src/writeback/journal.rs`, on a copy of the device bytes taken at
-the cut:
+The measured revision ran these tests in `zerofs/src/writeback/journal.rs`,
+on a copy of the device bytes taken at the cut:
 
 - `a_torn_payload_tail_is_never_replayed_and_replay_stops_at_the_last_durable_batch`
 - `a_power_cut_after_the_flush_keeps_the_whole_last_batch`
@@ -247,6 +248,12 @@ the cut:
 - `payloads_left_in_redb_by_an_earlier_engine_replay_and_drain`
 - `a_database_an_earlier_engine_grew_into_the_log_is_compacted_on_open`
 - `raw_prefix_retirement_needs_no_flush_and_a_power_cut_keeps_every_acknowledged_put`
+
+The first test's automatic rollback policy was later replaced by
+`a_torn_raw_tail_requires_repair_without_discarding_committed_records` and
+`a_damaged_last_acknowledged_raw_batch_is_not_silently_discarded`. These
+regressions require a readable commit's records and byte counters to survive a
+payload verification failure. They do not add physical power-loss evidence.
 
 `the_payload_reserve_is_fenced_from_the_file_and_survives_reopen` covers the
 region in `zerofs/raw-device`.

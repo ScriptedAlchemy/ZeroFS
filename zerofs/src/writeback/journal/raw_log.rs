@@ -8,9 +8,10 @@
 //!
 //! A batch is staged past the head in whole blocks and is not synced here,
 //! so its bytes can reach the device while the batch before it commits. The
-//! redb commit that records the batch flushes the device once for both, and
-//! only then does the head move over it. Until that commit is durable no row
-//! names the batch, so after a power cut its bytes are free space.
+//! redb commit that records the batch flushes the device once for both;
+//! the in-memory head advances only after that commit succeeds. On reopen,
+//! bytes staged beyond the recorded head are reusable. A recorded payload
+//! that fails verification stops recovery.
 //!
 //! Space is reclaimed from the tail. The tail follows the oldest row the
 //! journal still holds and never passes an extent a reader has pinned.

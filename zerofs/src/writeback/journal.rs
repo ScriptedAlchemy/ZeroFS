@@ -139,13 +139,10 @@
 //! flush covers the payload bytes too, because both are writes to one
 //! device. A record is ACKable only after that flush returns.
 //!
-//! A power cut during the flush can leave the commit readable in redb while
-//! some of its payload bytes never reached the device. Each commit stores
-//! the watermark the flush before it covered, so the records above that
-//! watermark are exactly the last commit's. On open, if one of them fails
-//! its digest, all of them are dropped: none was acknowledged, and replay
-//! ends at the commit before. A digest failure at or below that watermark is
-//! damage to acknowledged data and needs an operator.
+//! A payload mismatch cannot distinguish an interrupted flush from later
+//! damage to acknowledged data. Every pending committed payload must verify
+//! on open; a mismatch requires operator repair and preserves the records
+//! and watermarks. Bytes staged without a committed record remain reusable.
 //!
 //! The drain retires records at or below the remote watermark, and the log's
 //! tail follows the oldest record left. Journals written before the log keep
@@ -202,10 +199,6 @@ const REMOTE_RETRIES_KEY: &str = "remote_retries";
 const FENCE_CLASSIFICATION_VERSION_KEY: &str = "fence_classification_version";
 /// Raw journals: the payload log position after the last recorded batch.
 const PAYLOAD_LOG_HEAD_KEY: &str = "payload_log_head";
-/// Raw journals: every record at or below this sequence was covered by a
-/// device flush that completed. A later commit records it, so the records of
-/// the last commit before a power cut sit above it.
-const PAYLOAD_LOG_FLUSHED_SEQ_KEY: &str = "payload_log_flushed_seq";
 const FENCE_CLASSIFICATION_VERSION: u32 = 2;
 
 /// The large raw disk budget may hold many metadata-only mutations. Keep
@@ -1223,77 +1216,12 @@ impl Journal {
             #[cfg(test)]
             remote_mark_pause: Mutex::new(None),
         };
-        journal.discard_torn_raw_tail()?;
         let remote_seq = journal.progress()?.remote_seq;
         if remote_seq > 0 {
             journal.remove_remote_prefix(remote_seq)?;
         }
         journal.validate_recovery_state()?;
         Ok(journal)
-    }
-
-    /// Drop the records of a commit that a power cut interrupted.
-    ///
-    /// A commit flushes the device once, for its payload bytes in the log and
-    /// for the redb pages that record them. A cut during that flush can leave
-    /// the redb commit readable and the payload bytes missing. No such commit
-    /// was acknowledged. Every commit records the sequence the flush before it
-    /// covered, so only the last commit's records sit above that sequence.
-    /// When one of them fails its digest, none of them were acknowledged and
-    /// replay ends at the commit before. A read error is not a torn write and
-    /// is returned.
-    fn discard_torn_raw_tail(&self) -> Result<()> {
-        let (flushed, local_seq) = {
-            let read = self.database.begin_read()?;
-            let meta = read.open_table(META)?;
-            let Some(flushed) = read_optional::<u64>(&meta, PAYLOAD_LOG_FLUSHED_SEQ_KEY)? else {
-                return Ok(());
-            };
-            (flushed, read_required::<u64>(&meta, LOCAL_SEQ_KEY)?)
-        };
-        let mut torn = None;
-        for sequence in flushed.saturating_add(1)..=local_seq {
-            let record = self.blob_record(sequence).map_err(operator_required)?;
-            if record.blob_path().is_none() {
-                continue;
-            }
-            match self.open_raw_payload(sequence, u64::MAX) {
-                Ok(_) => {}
-                Err(error) if error.is::<JournalBlobIntegrityError>() => {
-                    torn = Some(sequence);
-                    break;
-                }
-                Err(error) => return Err(operator_required(error)),
-            }
-        }
-        let Some(torn) = torn else {
-            return Ok(());
-        };
-        let _write = self.write_gate.lock();
-        let mut transaction = self.database.begin_write()?;
-        transaction.set_durability(Durability::Immediate)?;
-        {
-            let mut meta = transaction.open_table(META)?;
-            let mut mutations = transaction.open_table(MUTATIONS)?;
-            let mut dropped_bytes = 0_u64;
-            for entry in mutations.extract_from_if(flushed.saturating_add(1).., |_, _| true)? {
-                let record: MutationRecord = bincode::deserialize(entry?.1.value())?;
-                dropped_bytes += record.payload().map_or(0, |(len, _)| len);
-            }
-            let completed = read_required::<u64>(&meta, LOCAL_BYTES_COMPLETED_KEY)?
-                .checked_sub(dropped_bytes)
-                .context("local completed byte counter is below the torn commit")?;
-            write_value(&mut meta, LOCAL_SEQ_KEY, &flushed)?;
-            write_value(&mut meta, LOCAL_BYTES_COMPLETED_KEY, &completed)?;
-        }
-        transaction.commit()?;
-        tracing::warn!(
-            first_torn_sequence = torn,
-            replay_ends_at = flushed,
-            dropped_through = local_seq,
-            "dropped the unacknowledged records of a commit that power loss interrupted"
-        );
-        Ok(())
     }
 
     /// Bytes of `region` a raw journal gives its payload log.
@@ -2207,12 +2135,6 @@ impl Journal {
             transaction
                 .set_durability(Durability::Immediate)
                 .context("failed to set journal durability")?;
-            if self.is_raw() {
-                // The flush of every earlier commit has returned.
-                let mut meta = transaction.open_table(META)?;
-                let flushed = read_required::<u64>(&meta, LOCAL_SEQ_KEY)?;
-                write_value(&mut meta, PAYLOAD_LOG_FLUSHED_SEQ_KEY, &flushed)?;
-            }
             let mut log_head = None;
             for slot in group {
                 match &slot.write {
@@ -7956,11 +7878,10 @@ mod tests {
         assert!(format!("{error:#}").contains("hash mismatch"), "{error:#}");
     }
 
-    /// A power cut during a commit's flush can leave the redb commit readable
-    /// and its payload bytes missing. Nothing in that commit was acknowledged,
-    /// so replay ends at the commit before it and the journal keeps working.
+    /// A readable commit with a missing payload is indistinguishable from
+    /// later damage to an acknowledged batch. Recovery preserves its records.
     #[test]
-    fn a_torn_payload_tail_is_never_replayed_and_replay_stops_at_the_last_durable_batch() {
+    fn a_torn_raw_tail_requires_repair_without_discarding_committed_records() {
         let media = RawMedia::provision(64 << 20);
         let journal = media.open().unwrap();
         let payloads = (1..=4)
@@ -7969,31 +7890,30 @@ mod tests {
         let put = |sequence: u64| raw_put(&journal, sequence, &payloads[sequence as usize - 1]);
         journal.publish_batch(vec![put(1), put(2)]).unwrap();
         journal.publish_batch(vec![put(3), put(4)]).unwrap();
+        let records = journal.snapshot().unwrap().records;
 
         // The second commit's last block never reached the device.
         let cut = media.power_cut();
         cut.tear_log_byte(log_position(&journal, 4) + 299_999);
         drop(journal);
 
-        let journal = cut.open().unwrap();
-        let progress = journal.progress().unwrap();
-        assert_eq!(progress.local_seq, 2);
-        assert_eq!(progress.local_bytes_completed, 600_000);
-        assert!(journal.mutation(3).unwrap().is_none());
-        assert!(journal.mutation(4).unwrap().is_none());
-        for sequence in 1..=2 {
-            assert_journal_payload(&journal, sequence, &payloads[sequence as usize - 1]);
+        let error = cut.open().map(drop).unwrap_err();
+        assert!(crate::operator_required::requires_operator(error.as_ref()));
+        let read = cut.legacy_database().begin_read().unwrap();
+        let meta = read.open_table(META).unwrap();
+        assert_eq!(read_required::<u64>(&meta, LOCAL_SEQ_KEY).unwrap(), 4);
+        assert_eq!(
+            read_required::<u64>(&meta, LOCAL_BYTES_COMPLETED_KEY).unwrap(),
+            1_200_000
+        );
+        let mutations = read.open_table(MUTATIONS).unwrap();
+        assert_eq!(mutations.len().unwrap(), 4);
+        for record in records {
+            assert_eq!(
+                mutations.get(record.sequence).unwrap().unwrap().value(),
+                bincode::serialize(&record).unwrap()
+            );
         }
-
-        let replacement = raw_payload(9, 200_000);
-        journal
-            .publish_batch(vec![raw_put(&journal, 3, &replacement)])
-            .unwrap();
-        drop(journal);
-        let journal = cut.open().unwrap();
-        assert_eq!(journal.progress().unwrap().local_seq, 3);
-        assert_journal_payload(&journal, 3, &replacement);
-        assert_journal_payload(&journal, 1, &payloads[0]);
     }
 
     /// The same cut with every byte on the device keeps the whole commit.
@@ -8050,6 +7970,50 @@ mod tests {
             3
         );
         assert_eq!(read.open_table(MUTATIONS).unwrap().len().unwrap(), 3);
+    }
+
+    #[test]
+    fn a_damaged_last_acknowledged_raw_batch_is_not_silently_discarded() {
+        let media = RawMedia::provision(16 << 20);
+        let journal = media.open().unwrap();
+        let payload = raw_payload(1, 300_000);
+        journal
+            .publish_batch(vec![raw_put(&journal, 1, &payload)])
+            .unwrap();
+        // An older engine can leave this marker behind. It cannot prove
+        // that a later successful commit was unacknowledged.
+        let transaction = journal.database.begin_write().unwrap();
+        write_value(
+            &mut transaction.open_table(META).unwrap(),
+            "payload_log_flushed_seq",
+            &0_u64,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        let position = log_position(&journal, 1);
+        let record = journal.mutation(1).unwrap().unwrap();
+        drop(journal);
+
+        // This commit returned success before the payload was damaged.
+        media.tear_log_byte(position + 7);
+        let error = media.open().map(drop).unwrap_err();
+        assert!(crate::operator_required::requires_operator(error.as_ref()));
+        let read = media.legacy_database().begin_read().unwrap();
+        let meta = read.open_table(META).unwrap();
+        assert_eq!(read_required::<u64>(&meta, LOCAL_SEQ_KEY).unwrap(), 1);
+        assert_eq!(
+            read_required::<u64>(&meta, LOCAL_BYTES_COMPLETED_KEY).unwrap(),
+            payload.len() as u64
+        );
+        assert_eq!(
+            read.open_table(MUTATIONS)
+                .unwrap()
+                .get(1)
+                .unwrap()
+                .unwrap()
+                .value(),
+            bincode::serialize(&record).unwrap()
+        );
     }
 
     /// Payload bytes written before a cut, with no commit recording them,
