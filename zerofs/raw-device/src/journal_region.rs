@@ -5,6 +5,8 @@
 //! The v2 checkpoints may carry a checksummed high-water offset for backing
 //! verified blank at provisioning. Beyond it the initial zero bytes remain
 //! untouched. Older v2 writers discard the optional field when checkpointing.
+//! A region provisioned without that scan, as on a P3, carries no offset and
+//! zeroes every range it grows into.
 //! The database owns transaction ordering and page reclamation. In particular
 //! its durable metadata must stop referencing truncated bytes before it calls
 //! `set_len`. Ordinary writes are durable only once `sync_data` succeeds.
@@ -24,6 +26,8 @@ use std::{
 };
 
 const DATA_START: u64 = 2 * BLOCK_SIZE;
+/// The checkpoint blocks, the only bytes an open reads before it writes them.
+pub(crate) const HEADER_BYTES: u64 = DATA_START;
 const JOURNAL_MAGIC: [u8; 8] = *b"ZWBREG02";
 const CATALOG_MAGIC: [u8; 8] = *b"ZCTREG02";
 const ZERO_FRONTIER_MAGIC: [u8; 8] = *b"ZTRZERO1";
@@ -87,10 +91,30 @@ impl TransactionRegion {
     ) -> Result<Self> {
         let (region, binding) = Self::bind(file, device_len, start, region_len, identity)?;
         crate::store::require_blank(&region)?;
+        Self::label(region, binding, Some(0))
+    }
+
+    /// Initialize a subregion whose data bytes may hold anything. Only the
+    /// two checkpoint blocks must be zero, so this reads 8 KiB whatever the
+    /// region size. It records no blank suffix: every growth zeroes the
+    /// bytes it exposes before publishing the new length.
+    pub(crate) fn provision_unproven(
+        file: File,
+        device_len: u64,
+        start: u64,
+        region_len: u64,
+        identity: Identity,
+    ) -> Result<Self> {
+        let (region, binding) = Self::bind(file, device_len, start, region_len, identity)?;
+        crate::store::require_zero(&region, HEADER_BYTES)?;
+        Self::label(region, binding, None)
+    }
+
+    fn label(region: Region, binding: Binding, zero_from: Option<u64>) -> Result<Self> {
         let length = Length {
             generation: 1,
             len: 0,
-            zero_from: Some(0),
+            zero_from,
         };
         checkpoint(&region, binding, length)?;
         Ok(Self::new(region, binding, length, None))

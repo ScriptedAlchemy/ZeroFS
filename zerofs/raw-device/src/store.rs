@@ -19,6 +19,9 @@ use std::sync::{Arc, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SCAN_CHUNK: usize = 1 << 20;
+/// Both label slots and the first log block: what provisioning requires to
+/// be zero. Open reads nothing else before writing it.
+pub(crate) const HEADER_BYTES: u64 = LOG_START + BLOCK_SIZE;
 const VERIFY_CHUNK: u64 = 1 << 20;
 const MAX_PENDING_KEYS: usize = 4096;
 
@@ -197,9 +200,7 @@ impl RawStore {
                 });
             }
         }
-        if let Some(offset) = first_nonzero(&file, LOG_START + BLOCK_SIZE)? {
-            return Err(Error::NotBlank { offset });
-        }
+        require_zero(&file, HEADER_BYTES)?;
 
         let label = Label {
             generation: 1,
@@ -754,7 +755,12 @@ fn random_nonce() -> Result<[u8; 16]> {
 }
 
 pub(crate) fn require_blank(file: &Region) -> Result<()> {
-    if let Some(offset) = first_nonzero(file, file.len)? {
+    require_zero(file, file.len)
+}
+
+/// Require the first `len` bytes of the region to be zero.
+pub(crate) fn require_zero(file: &Region, len: u64) -> Result<()> {
+    if let Some(offset) = first_nonzero(file, len)? {
         return Err(Error::NotBlank { offset });
     }
     Ok(())

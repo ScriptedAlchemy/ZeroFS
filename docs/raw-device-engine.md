@@ -26,7 +26,7 @@ When FLUSH returns, both labels reference the new index, so either can survive a
 
 The allocator consumes any free 4 KiB blocks, so aggregate free bytes above reserve can fund a new payload even across disjoint holes. A replacement still needs space for its new allocation until the commit. The pool reserves the exact allocation cost and continues to track catalog cleanup debt. The raw member's preallocated index banks cover tombstones, so segment retirement now restores usable physical capacity. The same path handles reserved metadata keys and repeated publication and retirement of generations.
 
-V1 object regions are explicitly refused. V2 requires fresh media. The bounded HDD blank check and the binding checks still run. The separate P3 transactional journal and catalog region formats retain their own labels. The standalone landing probe still verifies the destination before retiring its durable pending object.
+V1 object regions are explicitly refused. V2 requires fresh media. The bounded HDD and P3 header checks and the binding checks still run. The separate P3 transactional journal and catalog region formats retain their own labels. The standalone landing probe still verifies the destination before retiring its durable pending object.
 
 ### Memory and qualification
 

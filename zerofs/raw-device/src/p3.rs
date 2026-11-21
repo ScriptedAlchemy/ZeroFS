@@ -12,6 +12,17 @@ pub const ROLES: [Role; 6] = [
     Role::Cache,
 ];
 
+/// The leading bytes [`P3Layout::provision_v2`] requires to be zero: the
+/// larger of the transactional and object-region headers, as for an HDD.
+pub const FRESH_BYTES: u64 = crate::store::HEADER_BYTES;
+
+fn header_bytes(role: Role) -> u64 {
+    match role {
+        Role::Journal | Role::Catalog => crate::journal_region::HEADER_BYTES,
+        _ => crate::store::HEADER_BYTES,
+    }
+}
+
 /// Byte capacities in the order of ROLES. The complete device must be
 /// accounted for, including the labels and append overhead in each region.
 pub struct P3Layout {
@@ -109,14 +120,30 @@ impl P3Layout {
     }
 
     /// Explicit v2 layout for a reusable transactional journal and catalog.
-    /// A v1 device, including an interrupted v1 initialization, fails the
-    /// whole-device blank check before the first label write.
+    ///
+    /// Reads and writes only the region headers, so the time does not depend
+    /// on the device size. The first [`FRESH_BYTES`] must be zero. Every P3
+    /// initialization, v1 or v2, writes there first, so a provisioned or
+    /// partially initialized device is refused before any write. Old bytes
+    /// elsewhere are allowed. The device is discarded where it supports
+    /// that, and every region header is zeroed. No region claims a blank
+    /// suffix, so transactional growth zeroes what it exposes and object
+    /// replay stops at the durable tail. The journal checkpoint at offset 0
+    /// is written last, so an interrupted run can be repeated.
     pub fn provision_v2(&self, file: File, pool: [u8; 16], device: [u8; 16]) -> Result<()> {
         let whole = Region::whole(file.try_clone()?, self.device_len)?;
-        crate::store::require_blank(&whole)?;
-        for (offset, len, id) in self.bindings(pool, device) {
+        crate::store::require_zero(&whole, FRESH_BYTES)?;
+        whole.discard()?;
+        let bindings: Vec<_> = self.bindings(pool, device).collect();
+        let zeros = [0; FRESH_BYTES as usize];
+        for &(offset, _, id) in &bindings {
+            whole.write_all_at(&zeros[..header_bytes(id.role) as usize], offset)?;
+        }
+        whole.sync_data()?;
+        // Each region rereads its own header and refuses a nonzero byte.
+        for (offset, len, id) in bindings.into_iter().rev() {
             if matches!(id.role, Role::Journal | Role::Catalog) {
-                crate::journal_region::TransactionRegion::provision(
+                crate::journal_region::TransactionRegion::provision_unproven(
                     file.try_clone()?,
                     self.device_len,
                     offset,
@@ -226,4 +253,226 @@ pub struct P3v2 {
     pub keys: RawStore,
     pub scratch: RawStore,
     pub cache: RawStore,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::BLOCK_SIZE;
+    use crate::journal_region::TransactionRegion;
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::{FileExt, MetadataExt};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const MIB: u64 = 1 << 20;
+    const POOL: [u8; 16] = [0x51; 16];
+    const MEMBER: [u8; 16] = [0x52; 16];
+    /// Bytes an earlier use of the device left behind.
+    const OLD: u8 = 0xa5;
+
+    struct Media {
+        path: std::path::PathBuf,
+        file: File,
+    }
+
+    impl Media {
+        /// A sparse device of `len` zero bytes.
+        fn new(len: u64) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "zerofs-p3-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed),
+            ));
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            file.set_len(len).unwrap();
+            Self { path, file }
+        }
+
+        /// A device holding old bytes everywhere except the leading bytes a
+        /// quick wipe clears.
+        fn used(len: u64) -> Self {
+            let media = Self::new(len);
+            let old = vec![OLD; MIB as usize];
+            for offset in (0..len).step_by(old.len()) {
+                media.file.write_all_at(&old, offset).unwrap();
+            }
+            media
+                .file
+                .write_all_at(&[0; FRESH_BYTES as usize], 0)
+                .unwrap();
+            media
+        }
+
+        fn file(&self) -> File {
+            self.file.try_clone().unwrap()
+        }
+
+        fn all(&self) -> Vec<u8> {
+            std::fs::read(&self.path).unwrap()
+        }
+    }
+
+    impl Drop for Media {
+        fn drop(&mut self) {
+            std::fs::remove_file(&self.path).unwrap();
+        }
+    }
+
+    fn layout() -> P3Layout {
+        P3Layout::new(12 * MIB, [4, 2, 2, 1, 1, 2].map(|n| n * MIB)).unwrap()
+    }
+
+    fn assert_zero(region: &TransactionRegion, len: u64) {
+        let mut chunk = vec![0; 64 << 10];
+        for offset in (0..len).step_by(chunk.len()) {
+            let n = (len - offset).min(chunk.len() as u64) as usize;
+            region.read(offset, &mut chunk[..n]).unwrap();
+            if let Some(at) = chunk[..n].iter().position(|&b| b != 0) {
+                panic!(
+                    "{:?} exposed an old byte at file offset {}",
+                    region.identity().role,
+                    offset + at as u64
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn provisioning_over_old_bytes_never_exposes_them() {
+        let media = Media::used(12 * MIB);
+        let layout = layout();
+        layout.provision_v2(media.file(), POOL, MEMBER).unwrap();
+
+        let roles = layout.open_v2(media.file(), POOL, MEMBER).unwrap();
+        for store in [&roles.metadata, &roles.keys, &roles.scratch, &roles.cache] {
+            assert!(store.is_empty());
+        }
+        // Growth into old bytes zeroes them, including after a shrink and a
+        // reopen.
+        for region in [&roles.journal, &roles.catalog] {
+            assert!(region.is_empty().unwrap());
+            let capacity = region.capacity();
+            region.set_len(capacity).unwrap();
+            assert_zero(region, capacity);
+            region.write(capacity - 1, &[0x42]).unwrap();
+            region.sync_data().unwrap();
+            region.set_len(BLOCK_SIZE).unwrap();
+        }
+        drop(roles);
+
+        let roles = layout.open_v2(media.file(), POOL, MEMBER).unwrap();
+        for region in [&roles.catalog, &roles.journal] {
+            let capacity = region.capacity();
+            region.set_len(capacity).unwrap();
+            assert_zero(region, capacity);
+            region.set_len(0).unwrap();
+        }
+        // The journal as the engine opens it, with the payload log above
+        // the redb file.
+        let ceiling = roles.journal.capacity() / 2 / BLOCK_SIZE * BLOCK_SIZE;
+        let journal = roles.journal.with_payload_reserve(ceiling).unwrap();
+        journal.set_len(ceiling).unwrap();
+        assert_zero(&journal, ceiling);
+
+        // Object regions replay nothing past their durable tail.
+        let mut metadata = roles.metadata;
+        let mut cache = roles.cache;
+        metadata.put(b"m", b"meta").unwrap();
+        metadata.flush().unwrap();
+        cache.put(b"c", &[7; 5000]).unwrap();
+        cache.flush().unwrap();
+        drop((
+            metadata,
+            cache,
+            roles.catalog,
+            roles.keys,
+            roles.scratch,
+            journal,
+        ));
+        let roles = layout.open_v2(media.file(), POOL, MEMBER).unwrap();
+        assert_eq!(
+            roles.metadata.get(b"m").unwrap().as_deref(),
+            Some(&b"meta"[..])
+        );
+        assert_eq!(roles.cache.get(b"c").unwrap(), Some(vec![7; 5000]));
+        assert!(roles.keys.is_empty() && roles.scratch.is_empty());
+    }
+
+    #[test]
+    fn provisioning_refuses_nonzero_leading_bytes_or_an_earlier_p3_without_writing() {
+        let layout = layout();
+        let refused = |media: &Media, expected: u64| {
+            let before = media.all();
+            match layout.provision_v2(media.file(), POOL, MEMBER) {
+                Err(Error::NotBlank { offset }) => assert_eq!(offset, expected),
+                other => panic!("expected NotBlank at {expected}, got {other:?}"),
+            }
+            assert!(media.all() == before, "a refused provisioning wrote");
+        };
+        for offset in [
+            0,
+            BLOCK_SIZE - 1,
+            BLOCK_SIZE,
+            2 * BLOCK_SIZE,
+            FRESH_BYTES - 1,
+        ] {
+            let media = Media::used(12 * MIB);
+            media.file.write_all_at(&[1], offset).unwrap();
+            refused(&media, offset);
+        }
+
+        let media = Media::used(12 * MIB);
+        layout.provision_v2(media.file(), POOL, MEMBER).unwrap();
+        refused(&media, 0);
+
+        // A v1 layout, which a v2 open refuses, is not reinitialized either.
+        let media = Media::new(12 * MIB);
+        layout.provision(media.file(), POOL, MEMBER).unwrap();
+        refused(&media, 0);
+    }
+
+    #[test]
+    fn an_interrupted_provisioning_can_be_repeated() {
+        let media = Media::used(12 * MIB);
+        let layout = layout();
+        layout.provision_v2(media.file(), POOL, MEMBER).unwrap();
+        // A cut before the journal checkpoint, the last write, leaves every
+        // other region labelled and the device unopenable.
+        media
+            .file
+            .write_all_at(&[0; FRESH_BYTES as usize], 0)
+            .unwrap();
+        assert!(layout.open_v2(media.file(), POOL, MEMBER).is_err());
+        layout.provision_v2(media.file(), POOL, MEMBER).unwrap();
+        let roles = layout.open_v2(media.file(), POOL, MEMBER).unwrap();
+        assert!(roles.journal.is_empty().unwrap() && roles.metadata.is_empty());
+    }
+
+    #[test]
+    fn provisioning_touches_only_region_headers_whatever_the_device_size() {
+        // The NAS-fit loop fixture and the exact size of the N5's P3.
+        for len in [P3Layout::NAS_FIT_FIXTURE_BYTES, 1_000_204_886_016] {
+            let media = Media::new(len);
+            let layout = P3Layout::nas_fit(len).unwrap();
+            let started = std::time::Instant::now();
+            layout.provision_v2(media.file(), POOL, MEMBER).unwrap();
+            let elapsed = started.elapsed();
+            let allocated = media.file.metadata().unwrap().blocks() * 512;
+            assert!(
+                allocated <= MIB,
+                "{len}-byte device: provisioning allocated {allocated} bytes"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(10),
+                "{len}-byte device: provisioning took {elapsed:?}"
+            );
+            layout.open_v2(media.file(), POOL, MEMBER).unwrap();
+        }
+    }
 }
