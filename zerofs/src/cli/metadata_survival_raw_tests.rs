@@ -733,6 +733,218 @@ async fn a_lost_p3_is_rebuilt_from_the_hdds_and_serves_every_file_byte_for_byte(
     Ok(())
 }
 
+fn database_admin(running: &Running) -> slatedb::admin::Admin {
+    slatedb::admin::AdminBuilder::new(
+        object_store::path::Path::from(running.init.db_path.clone()),
+        Arc::clone(&running.init.object_store),
+    )
+    .build()
+}
+
+/// Sorted runs in the newest manifest, over every segment.
+async fn sorted_runs(admin: &slatedb::admin::Admin) -> Result<usize> {
+    let manifest = admin
+        .read_manifest(None)
+        .await?
+        .context("the database has no manifest")?;
+    Ok(manifest.compacted().len()
+        + manifest
+            .segments()
+            .iter()
+            .map(|segment| segment.compacted().len())
+            .sum::<usize>())
+}
+
+/// The highest compactions version the database collector has retired, as
+/// the database sees it. The mark reaches the authority with the next drain.
+async fn compactions_boundary(running: &Running) -> Result<u64> {
+    let location = object_store::path::Path::from(running.init.db_path.clone())
+        .join("gc")
+        .join("compactions.boundary");
+    let bytes = running
+        .init
+        .object_store
+        .get(&location)
+        .await
+        .context("the collector wrote no compactions boundary")?
+        .bytes()
+        .await?;
+    Ok(std::str::from_utf8(&bytes)?.trim().parse()?)
+}
+
+/// The N5 E5 drill rebuilt a P3 that had served for a day, and ordinary
+/// startup then failed with "transactional object (e.g. manifest) version
+/// already exists". SlateDB's collector retires manifest and compactions
+/// versions older than a minute and records how far it got; the first rebuild
+/// test stops before that minute passes. This pool has compacted L0 tables
+/// into a sorted run and has had its old versions retired before the
+/// generation is cut, and the generation also lists manifests newer than its
+/// checkpoint.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_p3_lost_after_compaction_and_collection_is_rebuilt_and_opens_read_write() -> Result<()> {
+    use crate::metadata_survival::{CommitObserver, CommitPoint, Side};
+
+    /// Writes three manifests after the generation's checkpoint and before
+    /// the generation lists the authority.
+    struct ManifestsPastTheCheckpoint {
+        admin: slatedb::admin::Admin,
+        manifests: Vec<u64>,
+        error: Option<slatedb::Error>,
+        reached: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl CommitObserver for ManifestsPastTheCheckpoint {
+        async fn reach(&mut self, point: CommitPoint, side: Side, _: &str, _: &std::path::Path) {
+            if point != CommitPoint::CheckpointSynced || side != Side::After || self.reached {
+                return;
+            }
+            self.reached = true;
+            for _ in 0..3 {
+                match self
+                    .admin
+                    .create_detached_checkpoint(&slatedb::config::CheckpointOptions {
+                        lifetime: Some(Duration::from_secs(60)),
+                        source: None,
+                        name: None,
+                    })
+                    .await
+                {
+                    Ok(checkpoint) => self.manifests.push(checkpoint.manifest_id),
+                    Err(error) => {
+                        self.error = Some(error);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut fixture = Fixture::new().await;
+    let running = fixture.start().await?;
+    write_tree(&running).await?;
+    // Every flush writes one L0 table, and the compactor merges four or more.
+    for index in 0..12_u8 {
+        write_file(
+            running.fs(),
+            0,
+            &format!("small-{index}"),
+            (0o644, 0, 0),
+            &payload(40 + index, 2000),
+        )
+        .await?;
+    }
+    let admin = database_admin(&running);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while sorted_runs(&admin).await? == 0 {
+        ensure!(
+            Instant::now() < deadline,
+            "the compactor never merged the L0 tables into a sorted run"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let expected = namespace(running.fs()).await?;
+    ensure!(expected.len() == 18, "fixture namespace: {expected:?}");
+
+    // One pass of the database collector with its one-minute age limit
+    // removed, as the periodic pass does on a pool that has run for a while.
+    let every_old_version = slatedb::config::GarbageCollectorDirectoryOptions {
+        interval: None,
+        min_age: Duration::ZERO,
+        dry_run: false,
+    };
+    admin
+        .run_gc_once(slatedb::config::GarbageCollectorOptions {
+            manifest_options: Some(every_old_version),
+            compactions_options: Some(every_old_version),
+            wal_options: None,
+            wal_fence_options: None,
+            compacted_options: None,
+            detach_options: None,
+            ..Default::default()
+        })
+        .await?;
+    let retired = compactions_boundary(&running).await?;
+    ensure!(retired >= 1, "the collector retired no compactions version");
+
+    let mut observer = ManifestsPastTheCheckpoint {
+        admin: database_admin(&running),
+        manifests: Vec::new(),
+        error: None,
+        reached: false,
+    };
+    let receipt = running.survival().commit_observed(&mut observer).await?;
+    ensure!(
+        observer.error.is_none() && observer.manifests.len() == 3,
+        "manifests past the checkpoint: {:?}, {:?}",
+        observer.manifests,
+        observer.error
+    );
+    // Both admins hold the pool's devices open through its store.
+    drop((admin, observer));
+    write_file(
+        running.fs(),
+        0,
+        "after-checkpoint.bin",
+        (0o644, 0, 0),
+        &payload(9, 70_000),
+    )
+    .await?;
+    running.stop().await;
+
+    fixture.replace_lost_p3();
+    let report = fixture.rebuild(&[]).await?;
+    ensure!(report.sequence == receipt.sequence);
+    ensure!(report.unavailable_members.is_empty() && report.unreadable_files.is_empty());
+
+    let running = fixture
+        .start()
+        .await
+        .context("open the rebuilt P3 read-write")?;
+    ensure!(
+        sorted_runs(&database_admin(&running)).await? > 0,
+        "the rebuilt database lost its sorted runs"
+    );
+    let recovered = namespace(running.fs()).await?;
+    ensure!(
+        recovered == expected,
+        "recovered namespace differs:\n{recovered:#?}\nexpected:\n{expected:#?}"
+    );
+
+    // The rebuilt database keeps flushing, and its compactor state and
+    // manifests start again from versions the lost device had retired.
+    let mut expected_after = expected.clone();
+    for index in 0..6_u8 {
+        let data = payload(80 + index, 3000);
+        write_file(
+            running.fs(),
+            0,
+            &format!("after-recovery-{index}"),
+            (0o600, 7, 7),
+            &data,
+        )
+        .await?;
+        expected_after.insert(
+            format!("/after-recovery-{index}"),
+            Node {
+                directory: false,
+                mode: 0o600,
+                uid: 7,
+                gid: 7,
+                size: 3000,
+                sha256: Sha256::digest(&data).into(),
+            },
+        );
+    }
+    let next = running.survival().commit_and_report().await?;
+    ensure!(next.sequence == receipt.sequence + 1);
+    running.stop().await;
+    let running = fixture.start().await?;
+    ensure!(namespace(running.fs()).await? == expected_after);
+    running.stop().await;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_torn_generation_falls_back_to_the_previous_one() -> Result<()> {
     let mut fixture = Fixture::new().await;
